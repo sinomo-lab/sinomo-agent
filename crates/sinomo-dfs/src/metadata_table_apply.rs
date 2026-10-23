@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -21,7 +21,7 @@ use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{read_sobj_optional, write_sobj_atomic};
 use crate::metadata_journal::{
     durable_journal_entries_since_limited, metadata_prefix_proof_after_exact_frame,
-    prune_segmented_journal_before_checkpoint, read_segmented_journal_frame_at_sequence,
+    prune_segmented_journal_before_checkpoint,
 };
 use crate::metadata_lock::{
     MetadataWriteActivity, metadata_checkpoint_write_lock, metadata_write_activity,
@@ -37,7 +37,8 @@ use crate::metadata_table_store::{
     rotate_metadata_table_log_for_checkpoint_at_replay_boundary,
 };
 use crate::metadata_tables::{
-    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableSnapshotFingerprint,
+    DfsMetadataTableRollback, DfsMetadataTables, MetadataTableReadSnapshotCache,
+    MetadataTableSnapshotFingerprint,
 };
 
 static METADATA_TABLE_CHECKPOINT_WORKERS: OnceLock<MetadataTableCheckpointWorkerRegistry> =
@@ -200,8 +201,11 @@ impl MetadataTableCheckpointTrigger {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MetadataTableCheckpointWorkerState {
+    // Reuse the current backend's existing read image. A weak reference owns
+    // neither the backend, DATA custody nor any publication/admission permit.
+    read_snapshot_cache: Option<Weak<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
     revision: u64,
     requested_at: Instant,
     last_activity_at: Instant,
@@ -550,6 +554,7 @@ fn preserve_metadata_table_logical_checkpoint_deadline(
 }
 
 pub(crate) struct TableMaterializationState<'a> {
+    pub(crate) read_snapshot_cache: Option<&'a Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
     pub(crate) tables: &'a mut DfsMetadataTables,
     pub(crate) table_log_offset: &'a mut u64,
 
@@ -647,6 +652,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     tables: &DfsMetadataTables,
     max_log_bytes: u64,
     table_log_offset: u64,
+    read_snapshot_cache: Option<&Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
 ) -> Result<()> {
     let logical_pressure =
         metadata_table_logical_checkpoint_pressure(table_log_offset, max_log_bytes);
@@ -685,6 +691,9 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(worker) = workers.get_mut(root) {
+                if let Some(cache) = read_snapshot_cache {
+                    worker.read_snapshot_cache = Some(Arc::downgrade(cache));
+                }
                 worker.revision = worker.revision.saturating_add(1);
                 worker.last_activity_at = Instant::now();
                 worker.has_pending_prepared_operations = has_pending_prepared_operations;
@@ -702,6 +711,9 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(worker) = workers.get_mut(&root) {
+            if let Some(cache) = read_snapshot_cache {
+                worker.read_snapshot_cache = Some(Arc::downgrade(cache));
+            }
             let now = Instant::now();
             let was_physical_checkpoint_required = worker.physical_checkpoint_required;
             worker.revision = worker.revision.saturating_add(1);
@@ -759,6 +771,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
         let initial_physical_checkpoint_required =
             checkpoint_generation_present || physical_checkpoint_required;
         let mut worker = MetadataTableCheckpointWorkerState {
+            read_snapshot_cache: read_snapshot_cache.map(Arc::downgrade),
             revision: 1,
             requested_at,
             last_activity_at: requested_at,
@@ -984,7 +997,7 @@ fn next_metadata_table_checkpoint_worker_request(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     loop {
-        let worker = *workers.get(root)?;
+        let worker = workers.get(root)?;
         if worker.physical_checkpoint_required {
             let now = Instant::now();
             if now >= worker.physical_checkpoint_not_before {
@@ -1614,7 +1627,6 @@ fn run_metadata_table_checkpoint_worker(
     let journal_admission =
         crate::metadata_journal::admission::capture_owned_checkpoint_admission(root)?;
     staged.install(root)?;
-    drop(tables);
     remove_metadata_table_checkpoint_log(root)?;
     advance_activated_handoff_rebind_checkpoint(root, &prefix_proof)?;
     // The installed snapshot and newer table-log suffix are durable before
@@ -1624,6 +1636,54 @@ fn run_metadata_table_checkpoint_worker(
     prune_segmented_journal_before_checkpoint(root, checkpoint_sequence)?;
     if let Some(admission) = journal_admission {
         admission.record_installed(&prefix_proof)?;
+    }
+    // The checkpoint just decoded and validated this image. Hand that same
+    // owned image to the existing reader cache instead of making the next
+    // replica RPC decode the replacement snapshot while holding admission.
+    // Extend through the actual active suffix using the ordinary checked reader;
+    // publication, journal pruning and physical writer custody remain unchanged.
+    let read_snapshot_cache = METADATA_TABLE_CHECKPOINT_WORKERS
+        .get()
+        .and_then(|registry| {
+            registry
+                .workers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(root)
+                .and_then(|worker| worker.read_snapshot_cache.as_ref())
+                .and_then(Weak::upgrade)
+        });
+    if let Some(cache) = read_snapshot_cache {
+        let mut tables = tables;
+        let mut offset = 0;
+        let mut sequence = checkpoint_sequence;
+        let mut fingerprint = metadata_table_snapshot_fingerprint(root)?;
+        let mut prefix = Some(prefix_proof.clone());
+        crate::metadata_read_snapshot::refresh_metadata_tables(
+            root,
+            &mut tables,
+            &mut offset,
+            &mut sequence,
+            &mut fingerprint,
+            &mut prefix,
+        )?;
+        let generation = crate::metadata_table_store::metadata_table_storage_generation(root)?;
+        if let Ok(mut cached) = cache.lock() {
+            *cached = Some(MetadataTableReadSnapshotCache {
+                storage_generation: Some(generation),
+                snapshot_fingerprint: fingerprint,
+                checkpoint_fingerprint: None,
+                table_log_offset: offset,
+                materialized_through_sequence: Some(sequence),
+                snapshot_format_version: Some(
+                    crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+                ),
+                prefix_proof: prefix,
+                tables: Arc::new(tables),
+            });
+        }
+    } else {
+        drop(tables);
     }
     let publish_ms = publish_started.elapsed().as_millis();
     Ok(MetadataTableCheckpointRun {
@@ -1727,10 +1787,21 @@ fn advance_activated_handoff_rebind_checkpoint(
                 )));
             }
             let previous_sequence = reconstructed.journal_sequence;
-            for entry in entries {
-                if entry.sequence > checkpoint.journal_sequence {
-                    break;
-                }
+            let entries = entries
+                .into_iter()
+                .take_while(|entry| entry.sequence <= checkpoint.journal_sequence)
+                .collect::<Vec<_>>();
+            // The caller owns the journal writer for this entire cut. Reuse
+            // the existing bounded exact-frame reader instead of reopening
+            // and revalidating the same segment for every entry.
+            let frames = crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+                root,
+                &entries
+                    .iter()
+                    .map(|entry| entry.sequence)
+                    .collect::<Vec<_>>(),
+            )?;
+            for (entry, frame) in entries.into_iter().zip(frames) {
                 if entry.sequence != reconstructed.journal_sequence.saturating_add(1) {
                     return Err(MetadataBackendError::Serde(format!(
                         "metadata shard handoff {} at {} has a journal gap after sequence {}",
@@ -1739,15 +1810,14 @@ fn advance_activated_handoff_rebind_checkpoint(
                         reconstructed.journal_sequence
                     )));
                 }
-                let frame = read_segmented_journal_frame_at_sequence(root, entry.sequence)?
-                    .ok_or_else(|| {
-                        MetadataBackendError::Serde(format!(
-                            "metadata shard handoff {} at {} has no exact frame for rebind entry {}",
-                            freeze.handoff_id,
-                            root.display(),
-                            entry.sequence
-                        ))
-                    })?;
+                let frame = frame.ok_or_else(|| {
+                    MetadataBackendError::Serde(format!(
+                        "metadata shard handoff {} at {} has no exact frame for rebind entry {}",
+                        freeze.handoff_id,
+                        root.display(),
+                        entry.sequence
+                    ))
+                })?;
                 if frame.entry() != &entry {
                     return Err(MetadataBackendError::Serde(format!(
                         "metadata shard handoff {} at {} has divergent exact frame for rebind entry {}",
@@ -1929,6 +1999,7 @@ fn append_table_batch(
         state.tables,
         max_log_bytes,
         *state.table_log_offset,
+        state.read_snapshot_cache,
     )
 }
 
@@ -2112,6 +2183,7 @@ mod tests {
         max_log_bytes: u64,
     ) -> MetadataTableCheckpointWorkerState {
         let mut worker = MetadataTableCheckpointWorkerState {
+            read_snapshot_cache: None,
             revision: 1,
             requested_at,
             last_activity_at: requested_at,
@@ -2189,7 +2261,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(root.path())
-            .copied()
+            .cloned()
             .expect("newer append request remains registered");
         assert_eq!(worker.revision, appended_revision);
         assert_eq!(worker.replay_cost_bytes, 301);
@@ -2475,6 +2547,129 @@ mod tests {
     }
 
     #[test]
+    fn native_rebind_checkpoint_verifies_complete_history_with_bounded_segment_reads() {
+        use crate::DfsMetadataBackend;
+        fn copy_native_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                let target = to.join(entry.file_name());
+                if kind.is_dir() {
+                    copy_native_tree(&entry.path(), &target);
+                } else {
+                    assert!(kind.is_file());
+                    fs::copy(entry.path(), &target).unwrap();
+                    assert_eq!(fs::read(entry.path()).unwrap(), fs::read(target).unwrap());
+                }
+            }
+        }
+        let (mut native, client, initial) = crate::test_support::current_native_metadata_service(
+            "native-rebind-checkpoint-source-reads",
+            2,
+            "/services",
+        )
+        .unwrap();
+        drop(client);
+        let promoted = initial.replica_node_ids[0].clone();
+        let current = native
+            .reassign_metadata_shard(
+                &initial.file_system_id,
+                &initial.shard_id,
+                promoted.clone(),
+                vec![initial.primary_node_id.clone()],
+            )
+            .unwrap();
+        // The retiring participant owns the activated checkpoint marker.
+        // The promoted participant has a distinct promotion marker.
+        let retiring = initial.primary_node_id.clone();
+        let source = crate::default_dfs_metadata_shards_root(native.data_dir(&retiring))
+            .join(&current.shard_id);
+        let original_marker = read_sobj_optional::<DfsMetadataShardWriteFreeze>(
+            &membership_handoff_write_freeze_path(&source),
+        )
+        .unwrap()
+        .expect("actual activated retiring-primary handoff marker");
+        assert_eq!(original_marker.activated_epoch, Some(current.epoch));
+        let original_marker_bytes =
+            fs::read(membership_handoff_write_freeze_path(&source)).unwrap();
+        let mut writer = native.client(&promoted).unwrap();
+        let mut written = Vec::new();
+        for index in 0..64 {
+            written.push(
+                writer
+                    .posix_write_file(
+                        &format!("/services/rebind-source-{index}"),
+                        format!("native record {index}").as_bytes(),
+                        crate::DfsWriteOptions::replicated_eventual(vec![promoted.clone()]),
+                    )
+                    .unwrap(),
+            );
+        }
+        // A normal full-shard prepare carries the preceding 64 commits to
+        // the replica without replacing any receiver evidence.
+        writer
+            .posix_mkdir_all("/services/rebind-source-barrier")
+            .unwrap();
+        drop(writer);
+        native.stop_node(&retiring).unwrap();
+        let copy = sinomo_testdir::TestDir::new("native-rebind-checkpoint-source-copy");
+        copy_native_tree(&source, copy.path());
+        native.close().unwrap();
+        let shard = DfsMetadataShardId::new(current.shard_id);
+        // Replay only the actual accepted journal in this fresh copy; no
+        // runtime owner or publication capability is created here.
+        let inspected = crate::LocalSobjMetadataBackend::new(shard.clone(), copy.path()).unwrap();
+        let target = inspected.metadata_prefix_proof().unwrap();
+        for stat in &written {
+            let object = DfsMetadataBackend::get_object(&inspected, &stat.object_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(object.version, stat.version);
+            assert_eq!(object.content_hash, stat.content_hash);
+        }
+        drop(inspected);
+        let expected_frames =
+            target.journal_sequence - original_marker.rebind_prefix_proof.journal_sequence;
+        assert!(
+            expected_frames >= 128,
+            "all 64 native writes must be covered"
+        );
+        // A stale checkpoint marker with a later durable suffix is a real
+        // recovery state. Restore only the saved ACTUAL marker in this fresh
+        // copy; no native authority or successful publication is fabricated.
+        fs::write(
+            membership_handoff_write_freeze_path(copy.path()),
+            original_marker_bytes,
+        )
+        .unwrap();
+        let _writer = metadata_checkpoint_write_lock(
+            copy.path().to_path_buf(),
+            journal_write_lock_path(copy.path()),
+        )
+        .unwrap();
+        crate::metadata_journal::reset_metadata_journal_exact_read_counters();
+        advance_activated_handoff_rebind_checkpoint(copy.path(), &target).unwrap();
+        let segment_opens = crate::metadata_journal::metadata_journal_exact_segment_opens();
+        let frame_decodes = crate::metadata_journal::metadata_journal_exact_frame_decodes();
+        let marker = read_sobj_optional::<DfsMetadataShardWriteFreeze>(
+            &membership_handoff_write_freeze_path(copy.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(marker.rebind_prefix_proof, target);
+        assert_eq!(marker.handoff_id, original_marker.handoff_id);
+        assert_eq!(marker.retiring_epoch, original_marker.retiring_epoch);
+        assert_eq!(marker.activated_epoch, original_marker.activated_epoch);
+        assert_eq!(frame_decodes as u64, expected_frames);
+        assert!(
+            segment_opens <= 2 * expected_frames.div_ceil(1024) as usize,
+            "bounded native history opened {segment_opens} segments for {expected_frames} frames"
+        );
+    }
+
+    #[test]
     fn background_checkpoint_preserves_native_journal_admission_certificate() {
         fn copy_native_tree(from: &Path, to: &Path) {
             fs::create_dir_all(to).unwrap();
@@ -2606,6 +2801,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -2767,6 +2963,7 @@ mod tests {
             .insert(
                 root.path().to_path_buf(),
                 MetadataTableCheckpointWorkerState {
+                    read_snapshot_cache: None,
                     revision: 1,
                     requested_at,
                     last_activity_at: requested_at,
@@ -2820,6 +3017,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -2841,7 +3039,7 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        schedule_metadata_table_checkpoint_if_needed(root.path(), &tables, u64::MAX, 0)
+        schedule_metadata_table_checkpoint_if_needed(root.path(), &tables, u64::MAX, 0, None)
             .expect("schedule crash-resumed checkpoint");
         let registry = METADATA_TABLE_CHECKPOINT_WORKERS
             .get()
@@ -2895,6 +3093,7 @@ mod tests {
         let error = append_table_batch(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -2935,6 +3134,7 @@ mod tests {
         let error = append_preapplied_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -2980,6 +3180,7 @@ mod tests {
         append_preapplied_table_ops(
             &blocked_root,
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3015,6 +3216,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3074,6 +3276,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3179,6 +3382,7 @@ mod tests {
             append_and_apply_table_ops(
                 root,
                 TableMaterializationState {
+                    read_snapshot_cache: None,
                     tables: &mut tables,
                     table_log_offset: &mut table_log_offset,
 
@@ -3216,6 +3420,7 @@ mod tests {
             &first_tables,
             first_offset.saturating_sub(1),
             first_offset,
+            None,
         )
         .expect("schedule physical fold");
         schedule_metadata_table_checkpoint_if_needed(
@@ -3225,6 +3430,7 @@ mod tests {
             // genuine pressure instead of an obsolete inflated replay price.
             second_offset.saturating_sub(1),
             second_offset,
+            None,
         )
         .expect("schedule second physical fold");
         let registry = METADATA_TABLE_CHECKPOINT_WORKERS
@@ -3268,6 +3474,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 
@@ -3297,6 +3504,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
 

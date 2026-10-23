@@ -678,10 +678,24 @@ pub(crate) async fn admit_daemon_dfs_message(
     execution_scope: &DfsMessageExecutionScope,
     preempt_maintenance: bool,
 ) -> Result<DaemonDfsMutationAdmission, DaemonError> {
-    if preempt_maintenance && !matches!(execution_scope, DfsMessageExecutionScope::ReadOnly) {
-        scheduler.request_foreground_admission();
+    if !preempt_maintenance || matches!(execution_scope, DfsMessageExecutionScope::ReadOnly) {
+        return scheduler.admit(execution_scope).await.map_err(Into::into);
     }
-    scheduler.admit(execution_scope).await.map_err(Into::into)
+    scheduler.request_foreground_admission();
+    let mut admission = std::pin::pin!(scheduler.admit(execution_scope));
+    std::future::poll_fn(|cx| {
+        let result = std::future::Future::poll(admission.as_mut(), cx);
+        if result.is_pending() {
+            // A later maintenance turn can queue its global writer while this
+            // request waits for its shard. Renew the existing notification
+            // after each actual pending admission, including that transition
+            // to the global read queue. No extra waiter or authority is retained.
+            scheduler.request_foreground_admission();
+        }
+        result
+    })
+    .await
+    .map_err(Into::into)
 }
 
 pub(crate) fn daemon_dfs_metadata_publish_lane_scheduler(
@@ -1782,8 +1796,8 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle_for_replica_contex
         &peer_snapshot.local_node_id,
         Some(runtime),
     )?;
-    let (observed_generation, context_matches) =
-        metadata_authority_generation.replica_context_state(context)?;
+    let ((observed_generation, storage_generation), context_matches) =
+        metadata_authority_generation.replica_context_lifecycle_state(context)?;
     if !context_matches {
         return Ok(None);
     }
@@ -1808,7 +1822,12 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle_for_replica_contex
     entry.replica_admission_handle(
         peer_snapshot,
         &metadata_authority_generation,
-        observed_generation,
+        &DaemonDfsMessageServiceSignature {
+            cluster_id: peer_snapshot.cluster_id.clone(),
+            local_node_id: peer_snapshot.local_node_id.clone(),
+            metadata_authority_generation: observed_generation,
+            metadata_storage_generation: storage_generation,
+        },
         context,
     )
 }
@@ -2124,6 +2143,22 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     deadline: tokio::time::Instant,
     #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
 ) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
+    warm_daemon_dfs_metadata_projection_before_deadline(
+        authority_generation,
+        deadline,
+        true,
+        #[cfg(test)]
+        native_read_observer,
+    )
+    .await
+}
+
+async fn warm_daemon_dfs_metadata_projection_before_deadline(
+    authority_generation: Arc<DaemonDfsMetadataAuthorityGeneration>,
+    deadline: tokio::time::Instant,
+    require_write_configuration: bool,
+    #[cfg(test)] native_read_observer: Option<&(dyn Fn(&'static str) + Send + Sync)>,
+) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
     let timeout_authority = Arc::clone(&authority_generation);
     let expected_generation = authority_generation.generation();
     tokio::time::timeout_at(deadline, async move {
@@ -2134,7 +2169,7 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
     #[cfg(test)] native_read_observer,
 )
             .await;
-        if proof.is_some() {
+        if proof.is_some() && require_write_configuration {
             // The shared refresh publishes its filesystem prefix before the
             // complete configuration bundle. Join that same owner before
             // handing a supposedly ready service to synchronous execution.
@@ -2164,6 +2199,32 @@ pub(crate) async fn warm_daemon_dfs_metadata_authority_before_deadline(
                 message: format!("DFS metadata authority preflight projection deadline elapsed (expected_generation={expected_generation} current_generation={current_generation} current_ready={current_ready})"),
         }
     })?
+}
+
+/// Replica ingestion consumes the exact current filesystem/shard proof, not
+/// placement-provider configuration used to author new writes. Its existing
+/// physical-store/context checks remain mandatory. Cold initialization still
+/// uses the general retained-authority check and full preflight on typed retry.
+pub(super) async fn warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    runtime: &tokio::runtime::Handle,
+    deadline: tokio::time::Instant,
+) -> Result<DaemonDfsMetadataAuthorityPreflight, sinomo_dfs::DfsError> {
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        cluster_paths,
+        &peer_snapshot.cluster_id,
+        &peer_snapshot.local_node_id,
+        Some(runtime),
+    )?;
+    warm_daemon_dfs_metadata_projection_before_deadline(
+        authority,
+        deadline,
+        false,
+        #[cfg(test)]
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(

@@ -495,6 +495,7 @@ fn attachments_compact_batch_and_enforce_producer_ownership() {
         .unwrap()
         .object_count;
     let mut first = None;
+    let mut checkpointed = 0;
     for i in 0..128 {
         let result = stored(
             dfs.file_attachment_as(
@@ -512,6 +513,11 @@ fn attachments_compact_batch_and_enforce_producer_ownership() {
         );
         if i == 0 {
             first = Some(result);
+        }
+        if (i + 1) % 16 == 0 {
+            // Retain every native RPC in verified windows while preserving
+            // the fixed 4096-record live buffer and all 128 catalog writes.
+            checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
         }
     }
     // One catalog and a bounded number of bucket directories, not 128 files.
@@ -576,6 +582,12 @@ fn attachments_compact_batch_and_enforce_producer_ownership() {
     );
     dfs.file_attachment_as("component:two", extra, Some(options(&node)))
         .unwrap();
+    checkpointed += runtime.checkpoint_rpc_observation_window().unwrap();
+    assert!(
+        checkpointed > 4096,
+        "the full workload exceeds one capture window"
+    );
+    assert_eq!(runtime.observation_dropped_count(), 0);
     drop(dfs);
     runtime.close().unwrap();
 }

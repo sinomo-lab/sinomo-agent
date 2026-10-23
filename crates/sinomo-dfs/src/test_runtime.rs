@@ -4884,6 +4884,7 @@ struct NativeConfigurationFault {
     lose_delta_key: Option<String>,
     remaining_delta_loss: AtomicUsize,
     dropped_delta: Mutex<Option<sinomo_core::kv::ClusterKvCommittedDelta>>,
+    pause_rebuild: AtomicBool,
     pause_used: AtomicBool,
     entered: Mutex<bool>,
     reached: std::sync::Condvar,
@@ -4999,7 +5000,7 @@ pub(crate) async fn pause_native_configuration_rebuild(
     let Some(fault) = configuration_fault(authority) else {
         return;
     };
-    if fault.lose_delta_key.is_none()
+    if !fault.pause_rebuild.load(Ordering::Acquire)
         || fault.remaining_delta_loss.load(Ordering::Acquire) != 0
         || fault.pause_used.swap(true, Ordering::AcqRel)
     {
@@ -5060,6 +5061,17 @@ impl DfsTestRuntime {
     ) -> Result<DfsTestNativeConfigurationFault, String> {
         self.install_configuration_fault(node, Some(key), false)
     }
+    /// Pause only the next actual configuration rebuild. The triggering commit
+    /// and all native observations remain intact; releasing this fault resumes
+    /// the same owner without supplying a projection or authority.
+    pub fn pause_next_configuration_rebuild(
+        &self,
+        node: &NodeId,
+    ) -> Result<DfsTestNativeConfigurationFault, String> {
+        let fault = self.install_configuration_fault(node, None, false)?;
+        fault.fault.pause_rebuild.store(true, Ordering::Release);
+        Ok(fault)
+    }
     /// Deny this actual authority's floor-read return only. No synthetic floor
     /// or replacement positive result can be supplied by the hook.
     pub fn deny_configuration_floor(
@@ -5106,6 +5118,7 @@ impl DfsTestRuntime {
         }
         let fault = Arc::new(NativeConfigurationFault {
             authority: Arc::downgrade(&authority),
+            pause_rebuild: AtomicBool::new(lose_delta_key.is_some()),
             remaining_delta_loss: AtomicUsize::new(usize::from(lose_delta_key.is_some())),
             lose_delta_key,
             dropped_delta: Mutex::new(None),

@@ -24,6 +24,16 @@ type DirectoryOverlayKey = (DfsFileSystemId, String);
 type DirectoryParentKey = (DfsFileSystemId, DfsInodeId);
 type VisiblePathKey = (DfsFileSystemId, String);
 
+#[cfg(test)]
+std::thread_local! {
+    static REFERENCE_PLAN_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn namespace_reference_plan_clone_count() -> u64 {
+    REFERENCE_PLAN_CLONES.get()
+}
+
 fn transaction_receipt_op(transaction: &DfsNamespaceTransaction) -> DfsMetadataTableOp {
     DfsMetadataTableOp::PutNamespaceTransactionReceipt {
         receipt: DfsNamespaceTransactionReceipt::from_transaction(
@@ -525,6 +535,8 @@ pub(crate) fn plan_namespace_transaction_table_ops_at(
             record,
         );
     }
+    #[cfg(test)]
+    REFERENCE_PLAN_CLONES.set(REFERENCE_PLAN_CLONES.get().saturating_add(1));
     let mut scratch = tables.clone();
     let mut table_ops = Vec::new();
     let mut table_op_sink = Some(&mut table_ops);
@@ -557,20 +569,22 @@ pub(crate) fn preapply_namespace_transaction_table_ops(
         tables,
         transaction,
         transaction.created_at,
-        table_ops,
+        Some(table_ops),
         rollback,
     );
 }
 
-#[cfg(test)]
+/// Apply the shared ordered plan to an exclusively owned table state. Compact
+/// commit replay needs no expanded operation vector; callers that need one can
+/// provide its existing sink. The same undo log covers every changed key.
 pub(crate) fn preapply_namespace_transaction_table_ops_at(
     tables: &mut DfsMetadataTables,
     transaction: &DfsNamespaceTransaction,
     committed_at: time::OffsetDateTime,
-    table_ops: &mut Vec<DfsMetadataTableOp>,
+    table_ops: Option<&mut Vec<DfsMetadataTableOp>>,
     rollback: &mut DfsMetadataTableRollback,
 ) {
-    let mut table_op_sink = Some(table_ops);
+    let mut table_op_sink = table_ops;
     let mut rollback = Some(rollback);
     plan_namespace_transaction_table_ops_in_place_with_record(
         tables,

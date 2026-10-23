@@ -82,6 +82,13 @@ pub(crate) fn install_metadata_read_snapshot_post_read_hook(action: impl FnOnce(
     });
 }
 
+#[cfg(test)]
+pub(crate) fn clear_metadata_read_snapshot_post_read_hook() {
+    METADATA_READ_SNAPSHOT_POST_READ_HOOK.with(|hook| {
+        hook.borrow_mut().take();
+    });
+}
+
 fn replay_incremental_table_suffix(
     root: &Path,
     path: &Path,
@@ -365,7 +372,7 @@ pub(crate) fn pin_current_tables_snapshot<'a>(
         });
         let generation_after = metadata_table_storage_generation(root)?;
         if generation_before.is_compatible_with(&generation_after) {
-            if let Ok(DfsMetadataTablesSnapshot::Shared(tables)) = &outcome
+            if let Ok(DfsMetadataTablesSnapshot::Shared { tables, .. }) = &outcome
                 && let Ok(mut cached) = read_snapshot_cache.lock()
                 && let Some(cache) = cached.as_mut()
                 && Arc::ptr_eq(tables, &cache.tables)
@@ -441,7 +448,7 @@ fn current_tables_snapshot_once<'a>(
         let path = metadata_table_path(root);
         let current_snapshot_fingerprint = metadata_table_snapshot_fingerprint(root)?;
         let table_log_offset = metadata_table_log_len(&path)?;
-        if let Some(tables) = cached_or_advanced_read_snapshot(
+        if let Some(snapshot) = cached_or_advanced_read_snapshot(
             read_snapshot_cache,
             root,
             &path,
@@ -449,7 +456,7 @@ fn current_tables_snapshot_once<'a>(
             &checkpoint_fingerprint,
             table_log_offset,
         )? {
-            return Ok(DfsMetadataTablesSnapshot::Shared(tables));
+            return Ok(snapshot);
         }
         #[cfg(test)]
         METADATA_CHECKPOINT_SNAPSHOT_DECODES
@@ -476,7 +483,7 @@ fn current_tables_snapshot_once<'a>(
                 return Ok(DfsMetadataTablesSnapshot::Borrowed(live_tables));
             }
             Some(len) => {
-                if let Some(tables) = cached_or_advanced_read_snapshot(
+                if let Some(snapshot) = cached_or_advanced_read_snapshot(
                     read_snapshot_cache,
                     root,
                     &path,
@@ -484,7 +491,7 @@ fn current_tables_snapshot_once<'a>(
                     &None,
                     len,
                 )? {
-                    return Ok(DfsMetadataTablesSnapshot::Shared(tables));
+                    return Ok(snapshot);
                 }
                 if len < table_log_offset {
                     let state = read_stable_table_snapshot(root, full_state_read)?;
@@ -510,7 +517,7 @@ fn current_tables_snapshot_once<'a>(
         }
     }
     let table_log_offset = metadata.as_ref().map(fs::Metadata::len).unwrap_or(0);
-    if let Some(tables) = cached_or_advanced_read_snapshot(
+    if let Some(snapshot) = cached_or_advanced_read_snapshot(
         read_snapshot_cache,
         root,
         &path,
@@ -518,7 +525,7 @@ fn current_tables_snapshot_once<'a>(
         &None,
         table_log_offset,
     )? {
-        return Ok(DfsMetadataTablesSnapshot::Shared(tables));
+        return Ok(snapshot);
     }
     let state = read_stable_table_snapshot(root, full_state_read)?;
     Ok(snapshot_from_state(read_snapshot_cache, state, None))
@@ -532,14 +539,14 @@ fn read_stable_table_snapshot(
     read_metadata_table_state_lenient(root)
 }
 
-fn cached_or_advanced_read_snapshot(
+fn cached_or_advanced_read_snapshot<'a>(
     read_snapshot_cache: &Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>,
     root: &Path,
     path: &Path,
     snapshot_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     checkpoint_fingerprint: &Option<MetadataTableSnapshotFingerprint>,
     table_log_offset: u64,
-) -> Result<Option<Arc<DfsMetadataTables>>> {
+) -> Result<Option<DfsMetadataTablesSnapshot<'a>>> {
     let Ok(mut cached) = read_snapshot_cache.lock() else {
         return Ok(None);
     };
@@ -580,7 +587,13 @@ fn cached_or_advanced_read_snapshot(
             cache.prefix_proof = replay.prefix_proof;
         }
     }
-    Ok(Some(Arc::clone(&cache.tables)))
+    // The owned table cut can outlive or be evicted from this optional cache.
+    // Capture its proof under the SAME lock, never by a later cache lookup.
+    Ok(Some(DfsMetadataTablesSnapshot::Shared {
+        tables: Arc::clone(&cache.tables),
+        prefix_proof: cache.prefix_proof.clone(),
+        materialized_through_sequence: cache.materialized_through_sequence,
+    }))
 }
 
 fn snapshot_from_state<'a>(
@@ -589,6 +602,8 @@ fn snapshot_from_state<'a>(
     checkpoint_fingerprint: Option<MetadataTableSnapshotFingerprint>,
 ) -> DfsMetadataTablesSnapshot<'a> {
     let tables = Arc::new(state.tables);
+    let prefix_proof = state.prefix_proof.clone();
+    let materialized_through_sequence = state.materialized_through_sequence;
     if let Ok(mut cache) = read_snapshot_cache.lock() {
         *cache = Some(MetadataTableReadSnapshotCache {
             storage_generation: None,
@@ -602,7 +617,11 @@ fn snapshot_from_state<'a>(
             tables: Arc::clone(&tables),
         });
     }
-    DfsMetadataTablesSnapshot::Shared(tables)
+    DfsMetadataTablesSnapshot::Shared {
+        tables,
+        prefix_proof,
+        materialized_through_sequence,
+    }
 }
 
 fn metadata_table_checkpoint_fingerprint(
@@ -818,7 +837,7 @@ mod tests {
 
     fn shared_tables(snapshot: DfsMetadataTablesSnapshot<'_>) -> Arc<DfsMetadataTables> {
         match snapshot {
-            DfsMetadataTablesSnapshot::Shared(tables) => tables,
+            DfsMetadataTablesSnapshot::Shared { tables, .. } => tables,
             DfsMetadataTablesSnapshot::Borrowed(_) => {
                 panic!("rotated checkpoint snapshot must be owned")
             }
@@ -1147,7 +1166,7 @@ mod tests {
                         .contains_key(&checkpoint_file_system.file_system_id)
                 );
             }
-            DfsMetadataTablesSnapshot::Shared(_) => {
+            DfsMetadataTablesSnapshot::Shared { .. } => {
                 panic!("an exact loaded checkpoint generation must borrow its live tables")
             }
         }
@@ -1197,7 +1216,7 @@ mod tests {
                         .contains_key(&checkpoint_file_system.file_system_id)
                 );
             }
-            DfsMetadataTablesSnapshot::Shared(_) => {
+            DfsMetadataTablesSnapshot::Shared { .. } => {
                 panic!("an exact active-to-checkpoint rotation must borrow its live tables")
             }
         }

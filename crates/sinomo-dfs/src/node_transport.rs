@@ -827,6 +827,18 @@ impl DfsCommitPromotionIdentity {
 }
 
 impl DeferredDfsPeerSend {
+    fn eligible_for_target_policy(&self, deferred_target_node_ids: &BTreeSet<NodeId>) -> bool {
+        // Required content fetches and completed write replies are protocol
+        // progress for an existing operation, even in Main's detached owner.
+        // Advisory maintenance exclusion must not park them. The ordinary RPC
+        // still enforces its deadline, peer identity and payload checks.
+        matches!(
+            &self.routed_message.message,
+            DfsNetworkMessage::FetchBlob(_)
+        ) || self.is_replay_safe_completed_write_response()
+            || !deferred_target_node_ids.contains(&self.target_node_id)
+    }
+
     fn record_retry_failure(&mut self) -> Duration {
         self.retry_attempts = self.retry_attempts.saturating_add(1);
         dfs_detached_send_retry_delay(self.retry_attempts)
@@ -2764,13 +2776,13 @@ impl DfsNodeTransport {
         let next_retry_not_before = outbox.cooling_retries.iter().find_map(|(at, sends)| {
             sends
                 .iter()
-                .any(|send| !deferred_target_node_ids.contains(&send.target_node_id))
+                .any(|send| send.eligible_for_target_policy(deferred_target_node_ids))
                 .then_some(*at)
         });
         let ready = outbox
             .ready_sends
             .iter()
-            .any(|send| !deferred_target_node_ids.contains(&send.target_node_id))
+            .any(|send| send.eligible_for_target_policy(deferred_target_node_ids))
             || next_retry_not_before.is_some_and(|retry_not_before| retry_not_before <= now);
         let generation = self
             .detached_send_state
@@ -2807,7 +2819,7 @@ impl DfsNodeTransport {
         let ready_sends = std::mem::take(&mut outbox.ready_sends);
         let (eligible, deferred): (VecDeque<_>, VecDeque<_>) = ready_sends
             .into_iter()
-            .partition(|send| !deferred_target_node_ids.contains(&send.target_node_id));
+            .partition(|send| send.eligible_for_target_policy(deferred_target_node_ids));
         outbox.ready_sends = deferred;
         Ok(eligible)
     }

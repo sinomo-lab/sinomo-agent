@@ -188,6 +188,14 @@ leaves the operation pending or unavailable. Content receipt threshold `W`
 cannot substitute for metadata evidence, and cluster KV cannot mint a
 metadata recovery permit.
 
+Replica ingestion uses the complete current filesystem/shard proof and the
+exact resident store's physical generation. It does not join an unrelated
+writer-configuration rebuild before acknowledging the same validated prepare.
+This grants no authoring authority: ordinary writes and cold resident
+initialization still require the full configuration view. A cold or changed
+context releases admission before joining that existing refresh owner, within
+the original deadline and retry bound.
+
 KV access on DFS operation paths is explicit. Namespace routing and policy reads
 reuse the existing retained configuration projections; peer routing and connection
 health remain owned by the network layer. Current protocol support is checked
@@ -1710,7 +1718,12 @@ set parks the worker.
 An authority-checked placement mutation hands its exact missing targets to the
 durable daemon queue and emits the repair wake. Replay repeats that handoff
 without rewriting settled metadata, rebuilding unrelated historical intents or
-resetting the queue's retry backoff. The bounded selector coalesces older
+resetting the queue's retry backoff. After primary handoff, an unchanged
+committed placement may need its first producer on the new owner even though
+no metadata commit is necessary. The current authority enrolls that producer
+through the existing durable enrollment path before capturing derived queue
+work; existing named or unknown transfer custody is preserved.
+The bounded selector coalesces older
 pending adaptive observations when a newer authoritative job covers the same
 scope. Replacement selection uses creation time independently of queue
 priority; explicit jobs and saved scan progress remain intact, and retirement

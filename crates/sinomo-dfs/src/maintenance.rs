@@ -2248,6 +2248,9 @@ pub struct DfsMaintenanceTickOptions {
 /// This is deliberately separate from durable DFS topology and retry
 /// suppression. A later pass with a different reachability view can execute
 /// the same durable repair or metadata-replication backlog immediately.
+/// Required metadata propagation uses the ordinary bounded transport even
+/// under these advisory hints; only idle metadata verification is parked.
+/// An attempted send never substitutes for the receiver's validated ACK.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DfsMaintenanceExecutionExclusions {
     target_node_ids: BTreeSet<NodeId>,

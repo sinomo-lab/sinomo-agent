@@ -289,7 +289,7 @@ async fn run_daemon_dfs_maintenance_tick_kind_inner(
     let local_advertisement = cached_daemon_dfs_local_content_advertisement(
         &data_dir,
         &preflight_cluster_state.local_node_id,
-        daemon_dfs_local_zone(),
+        daemon_dfs_local_zone(&data_dir),
     );
     let mut advertisement_control_plane =
         DaemonDfsControlPlaneKvClient::new_daemon_client_on_runtime(&cluster_paths, runtime);

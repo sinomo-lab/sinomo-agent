@@ -166,15 +166,16 @@ impl DfsMetadataTables {
             || record.transaction.file_version_pins.is_some()
             || record.transaction.content_reference_identity.is_some()
         {
-            let ops =
-                crate::metadata_namespace_transaction::plan_namespace_transaction_table_ops_at(
-                    self,
-                    &record.transaction,
-                    entry.created_at,
-                );
-            for op in ops {
-                self.apply_checked_with_rollback(op, rollback)?;
-            }
+            // The commit already owns exclusive mutable tables and a rollback
+            // for the complete replay batch. Use the same ordered planner once
+            // instead of copying unrelated history and applying its result again.
+            crate::metadata_namespace_transaction::preapply_namespace_transaction_table_ops_at(
+                self,
+                &record.transaction,
+                entry.created_at,
+                None,
+                rollback,
+            );
         }
         if let Some(terminal) = &record.terminal_intent {
             // The same commit publishes the complete terminal write witness.

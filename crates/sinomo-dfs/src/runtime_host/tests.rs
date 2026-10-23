@@ -1,4 +1,5 @@
 use super::*;
+mod effect_open_configuration;
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsMessageTransport, DfsPosixSyncKind,
@@ -27,6 +28,9 @@ use sinomo_dfs::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
+
+#[path = "tests/replica_progress_boundaries.rs"]
+mod replica_progress_boundaries;
 
 #[test]
 fn daemon_dfs_peer_transport_traits_share_one_adapter() {

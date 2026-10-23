@@ -38,6 +38,24 @@ pub(super) fn daemon_dfs_metadata_publish_discovery_schedule_options()
     }
 }
 
+async fn admit_daemon_dfs_background_generation_refresh(
+    scheduler: &Arc<DaemonDfsMutationScheduler>,
+) -> Result<DaemonDfsMutationAdmission, String> {
+    // A queued global writer also blocks later exact readers. Background cache
+    // refresh must use the same preemption edge as maintenance, or a publisher
+    // on another shard can wait for an acknowledgement trapped behind it.
+    // Yield only before admission: the existing publish owner retains its work
+    // and retries, while admitted initialization remains protected to completion.
+    let foreground = scheduler.begin_maintenance_interest();
+    crate::runtime_admission::acquire_dfs_maintenance_admission_until_foreground_waits(
+        &foreground,
+        scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+    )
+    .await
+    .map_err(|error| format!("DFS metadata generation admission failed: {error}"))?
+    .ok_or_else(|| "DFS metadata generation refresh yielded to foreground protocol work".into())
+}
+
 pub(super) fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
     for line in sinomo_dfs::dfs_metadata_replication_notice_lines(&report) {
         tracing::warn!("sinomo daemon {line}");
@@ -501,10 +519,7 @@ async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
         daemon_dfs_mutation_scheduler(&data_dir).map_err(|error| error.to_string())?;
     let mut preflight = preflight;
     for replan in 0..=2 {
-        let admission = mutation_scheduler
-            .admit(&DfsMessageExecutionScope::GlobalExclusive)
-            .await
-            .map_err(|error| format!("DFS metadata idle-generation admission failed: {error}"))?;
+        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
         let initialize_peer_snapshot = peer_snapshot.clone();
@@ -933,10 +948,7 @@ async fn ensure_daemon_dfs_metadata_publish_resident_generation_before_deadline(
 
         // Authority can advance while global admission waits. Only a typed
         // retained-proof rejection before any publication replans this owner.
-        let admission = mutation_scheduler
-            .admit(&DfsMessageExecutionScope::GlobalExclusive)
-            .await
-            .map_err(|error| format!("DFS metadata resident initialization failed: {error}"))?;
+        let admission = admit_daemon_dfs_background_generation_refresh(&mutation_scheduler).await?;
         let initialize_data_dir = data_dir.clone();
         let initialize_cluster_paths = cluster_paths.clone();
         let initialize_peer_snapshot = peer_snapshot.clone();

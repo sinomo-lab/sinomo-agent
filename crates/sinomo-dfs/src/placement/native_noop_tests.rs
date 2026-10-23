@@ -748,6 +748,334 @@ fn native_placement_replay_after_handoff_preserves_original_committed_obligation
     native_placement_retirement(true, true);
 }
 
+#[test]
+fn native_unfinished_placement_repair_survives_primary_handoff() {
+    native_unfinished_placement_repair(true);
+}
+
+#[test]
+fn native_unfinished_placement_repair_progresses_with_same_primary() {
+    native_unfinished_placement_repair(false);
+}
+
+#[test]
+fn native_unfinished_placement_replay_keeps_retired_receipt_and_journal() {
+    use crate::DfsMetadataBackend;
+
+    let label = "native-placement-receipt-replay";
+    let mut case = NativePlacementFixture::with_nodes_and_initial_job(label, false, 1, 2, false);
+    let nodes = DfsTestRuntime::ordered_node_ids(label, 2);
+    let object = case.objects[0].clone();
+    let primary = case.primary.clone();
+    let original_id = {
+        let owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+        let history = owner
+            .metadata_backend()
+            .unwrap()
+            .object_write_intent_history(&object.object_id)
+            .unwrap();
+        let ids = history
+            .intents
+            .iter()
+            .filter(|intent| intent.target_version == object.version)
+            .map(|intent| intent.intent_id.clone())
+            .chain(
+                history
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.target_version == object.version)
+                    .map(|receipt| receipt.intent_id.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 1, "one actual original write identity");
+        ids.into_iter().next().unwrap()
+    };
+    let held = case
+        .runtime
+        .deny_background_replica_before_claim(&primary)
+        .unwrap();
+    let original = case.job.accepted_config.clone();
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    policy.required_node_ids = nodes;
+    let desired = placement_config_with_override(
+        &original,
+        &case.job.path,
+        DfsPlacementScope::Subtree,
+        Some(policy),
+    )
+    .unwrap();
+    let job = native_placement_job(
+        desired.clone(),
+        &case.job.path,
+        case.job.candidate_snapshot.clone(),
+        format!("receipt-{label}"),
+    );
+    assert!(case.control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .compare_and_put_placement_update(&original, &desired, &job)
+            .unwrap()
+    }));
+    let (resolved, replication, placement) =
+        reconciliation_placement_for_object(&desired, &job, &object).unwrap();
+    let operation = DfsNamespaceOperation::ReconcilePlacement {
+        job_id: job.job_id.clone(),
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        expected_version: object.version.clone(),
+        object_policy: resolved.policy.consistency,
+        replication_policy: replication,
+        desired_replica_node_ids: placement.plan.desired_replica_nodes,
+    };
+    case.service.refresh_control_plane_latest().unwrap();
+    case.service
+        .route_namespace_operation(primary.clone(), operation.clone())
+        .unwrap();
+    let shard = crate::DfsMetadataShardId::new("services");
+    let metadata_root =
+        crate::local_dfs_metadata_shard_path(case.runtime.data_dir(&primary), &shard);
+    let observe = |runtime: &DfsTestRuntime| {
+        let reader =
+            crate::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &metadata_root)
+                .unwrap();
+        let receipt = reader
+            .get_intent_receipt(&object.object_id, &original_id)
+            .unwrap()
+            .expect("the actual original terminal receipt");
+        let queue = crate::LocalDfsRepairQueueStore::new(
+            crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&primary)),
+        )
+        .view()
+        .unwrap();
+        (reader.journal_last_sequence(), receipt, queue)
+    };
+    let before = observe(&case.runtime);
+    assert!(
+        !before.2.records.is_empty(),
+        "the real missing repair target prevents the converged early return"
+    );
+    let replay = case
+        .service
+        .route_namespace_operation(primary.clone(), operation);
+    let after = observe(&case.runtime);
+    std::fs::write(
+        case.runtime
+            .data_dir(&primary)
+            .root()
+            .join("boundary-diagnostic-receipt-replay.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original_id": original_id, "replay": format!("{replay:?}"),
+            "before_head": before.0, "after_head": after.0,
+            "before_receipt": before.1, "after_receipt": after.1,
+            "before_queue_head": before.2.head_sequence,
+            "after_queue_head": after.2.head_sequence,
+            "before_queue": before.2.records, "after_queue": after.2.records,
+            "qualification": "Actual Main placement and durable missing-target queue; producer held before claim. No synthetic outcome or receipt. This checks settled metadata replay, not whether the held transfer completed."
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drop(held);
+    case.close();
+    replay.expect("same validated placement replay remains available");
+    assert_eq!(after.1, before.1, "settled receipt is not retained again");
+    assert_eq!(
+        after.0, before.0,
+        "no new metadata operation for the same retirement"
+    );
+    assert_eq!(
+        after.2.records, before.2.records,
+        "actual queue custody/backoff stays exact"
+    );
+    assert_eq!(after.2.head_sequence, before.2.head_sequence);
+}
+
+fn native_unfinished_placement_repair(handoff: bool) {
+    let label = if handoff {
+        "native-unfinished-placement-handoff"
+    } else {
+        "native-unfinished-placement-same-owner"
+    };
+    let mut case = NativePlacementFixture::with_nodes_and_initial_job(label, false, 1, 3, false);
+    let nodes = DfsTestRuntime::ordered_node_ids(label, 3);
+    let old_primary = case.primary.clone();
+    let promoted = if handoff {
+        nodes[2].clone()
+    } else {
+        old_primary.clone()
+    };
+    let replica = nodes[1].clone();
+    let object = case.objects[0].clone();
+    // Hold the actual old owner's content producer before claim. Metadata
+    // publication and the real handoff remain live; no receipt is supplied.
+    let held = case
+        .runtime
+        .deny_background_replica_before_claim(&old_primary)
+        .unwrap();
+    let original = case.job.accepted_config.clone();
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    policy.required_node_ids = vec![old_primary.clone(), replica.clone()];
+    let desired = placement_config_with_override(
+        &original,
+        &case.job.path,
+        DfsPlacementScope::Subtree,
+        Some(policy),
+    )
+    .unwrap();
+    let job = native_placement_job(
+        desired.clone(),
+        &case.job.path,
+        case.job.candidate_snapshot.clone(),
+        format!("unfinished-{label}"),
+    );
+    assert!(case.control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .compare_and_put_placement_update(&original, &desired, &job)
+            .unwrap()
+    }));
+    let (resolved, replication, placement) =
+        reconciliation_placement_for_object(&desired, &job, &object).unwrap();
+    let operation = DfsNamespaceOperation::ReconcilePlacement {
+        job_id: job.job_id.clone(),
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        expected_version: object.version.clone(),
+        object_policy: resolved.policy.consistency,
+        replication_policy: replication,
+        desired_replica_node_ids: placement.plan.desired_replica_nodes,
+    };
+    case.service.refresh_control_plane_latest().unwrap();
+    case.service
+        .route_namespace_operation(old_primary.clone(), operation.clone())
+        .expect("the actual original primary commits its placement obligation");
+    let intent_id = format!(
+        "placement:{}:{}:{}",
+        job.job_id, object.object_id, object.version
+    );
+    let original_record = {
+        let owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+        let backend = owner.metadata_backend().unwrap();
+        let record = backend
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap()
+            .expect("real committed placement intent");
+        assert_eq!(record.status, crate::DfsWriteIntentStatus::Committed);
+        assert!(
+            backend
+                .receipts_for_version(&object.object_id, &object.version)
+                .unwrap()
+                .iter()
+                .all(|receipt| receipt.replica_node_id != replica),
+            "the handoff must begin with a genuine missing target"
+        );
+        record
+    };
+    if handoff {
+        case.runtime
+            .reassign_metadata_shard(
+                &object.file_system_id,
+                "services",
+                promoted.clone(),
+                vec![old_primary.clone(), replica.clone()],
+            )
+            .unwrap();
+    }
+    drop(held);
+    case.service.refresh_control_plane_latest().unwrap();
+    let replay = case
+        .service
+        .route_namespace_operation(promoted.clone(), operation);
+    let after = {
+        let owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+        assert_eq!(owner.node_id(), &promoted);
+        owner
+            .metadata_backend()
+            .unwrap()
+            .get_intent(&object.object_id, &intent_id)
+            .unwrap()
+            .unwrap()
+    };
+    let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    let mut completed = false;
+    let mut maintenance = Vec::new();
+    while replay.is_ok() && Instant::now() < deadline {
+        // The native fixture exposes the registered Main's ordinary bounded
+        // maintenance call explicitly. Observational reads do not drive it.
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let remaining = remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
+        let observation = case.runtime.maintenance_tick(&promoted, remaining).unwrap();
+        maintenance.push(serde_json::json!({
+            "outcome": format!("{:?}", observation.outcome),
+            "queue_before": format!("{:?}", observation.queue_before),
+            "queue_after": format!("{:?}", observation.queue_after),
+            "omitted_kv_events": observation.omitted_kv_event_count,
+        }));
+        if observation.outcome.is_err() {
+            break;
+        }
+        let owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+        let receipts = owner
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&object.object_id, &object.version)
+            .unwrap();
+        if receipts.iter().any(|receipt| {
+            receipt.replica_node_id == replica && receipt.content_hash == object.content_hash
+        }) {
+            let target = case.runtime.client(&replica).unwrap();
+            let actual = target
+                .content()
+                .read_object_version(object.object_id.as_str(), object.version.as_str())
+                .unwrap();
+            assert_eq!(actual.1, vec![0; 4096]);
+            completed = true;
+            break;
+        }
+        drop(owner);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let calls = case.runtime.rpc_observations();
+    let selected: Vec<_> = calls
+        .iter()
+        .filter(|call| call.route.starts_with("/dfs/"))
+        .map(|call| {
+            serde_json::json!({
+                "source": call.source, "target": call.target, "call_id": call.call_id,
+                "route": call.route, "phase": format!("{:?}", call.phase),
+                "origin": format!("{:?}", call.origin), "outcome_error": call.outcome_error,
+                "intent": call.dfs_intent_id, "request": call.dfs_request_id,
+                "object": call.dfs_object_id, "version": call.dfs_version,
+            })
+        })
+        .collect();
+    std::fs::write(
+        case.runtime
+            .data_dir(&promoted)
+            .root()
+            .join("boundary-diagnostic-unfinished-placement.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original": original_record, "after": after, "replay": format!("{replay:?}"),
+            "old_primary": old_primary, "new_primary": promoted, "replica": replica, "handoff": handoff,
+            "completed": completed, "maintenance": maintenance,
+            "all_rpc_observation_count": calls.len(), "selected_dfs_rpc_observations": selected,
+            "qualification": "Actual fresh native fixture; selected DFS RPCs only. Full call count states omitted other routes. No supplied success, receipt or replacement authority."
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!(
+        "unfinished-placement-handoff original={original_record:?} replay={replay:?} after={after:?} completed={completed} maintenance={maintenance:?}"
+    );
+    case.close();
+    replay.expect("the new actual primary must resume the exact unfinished placement");
+    assert_eq!(
+        after, original_record,
+        "handoff cannot rewrite the committed placement identity or captured body"
+    );
+    assert!(completed, "the real missing target must become durable");
+}
+
 fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
     let label = if replay_after_handoff {
         "native-placement-replay-handoff"

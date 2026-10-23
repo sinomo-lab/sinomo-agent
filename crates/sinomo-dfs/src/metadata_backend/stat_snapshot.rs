@@ -32,25 +32,15 @@ impl LocalSobjMetadataBackend {
                 self.prefix_proof.clone(),
                 self.materialized_through_sequence,
             ),
-            DfsMetadataTablesSnapshot::Shared(tables) => {
-                let cache = self
-                    .read_snapshot_cache
-                    .lock()
-                    .map_err(|_| MetadataBackendError::Serde("stat read cache poisoned".into()))?;
-                let cache = cache
-                    .as_ref()
-                    .filter(|c| Arc::ptr_eq(&c.tables, &tables))
-                    .ok_or_else(|| {
-                        MetadataBackendError::Serde(
-                            "stat table/proof cache generation changed".into(),
-                        )
-                    })?;
-                (
-                    Some(tables),
-                    cache.prefix_proof.clone(),
-                    cache.materialized_through_sequence.unwrap_or(0),
-                )
-            }
+            DfsMetadataTablesSnapshot::Shared {
+                tables,
+                prefix_proof,
+                materialized_through_sequence,
+            } => (
+                Some(tables),
+                prefix_proof,
+                materialized_through_sequence.unwrap_or(0),
+            ),
         };
         let prefix = prefix
             .filter(|p| p.is_well_formed() && p.journal_sequence == sequence)

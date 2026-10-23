@@ -401,6 +401,13 @@ impl DfsMetadataAuthorityRuntime {
         self.state.replica_context_state(context)
     }
 
+    pub(crate) fn replica_context_lifecycle_state(
+        &self,
+        context: &DfsMetadataReplicaShardContext,
+    ) -> Result<((u64, u64), bool), DfsError> {
+        self.state.replica_context_lifecycle_state(context)
+    }
+
     pub fn current_complete_prefix(self: &Arc<Self>) -> Option<DfsAuthoritativePrefixProjection> {
         let retained = self.state.current_complete_prefix();
         if retained.is_none() {
@@ -899,11 +906,36 @@ impl DfsMetadataAuthorityRuntime {
         self: &Arc<Self>,
         #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<(), DfsError> {
+        self.ready_write_configuration_with_pending_observer(
+            #[cfg(test)]
+            pending_observer,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Return the very cut whose native floor passed readiness. Borrowing it
+    /// again after this wait would race a later publication/refresh transition.
+    /// This immutable configuration is read input, not publication authority.
+    pub(crate) async fn ready_write_configuration_projection_async(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
+        self.ready_write_configuration_with_pending_observer(
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn ready_write_configuration_with_pending_observer(
+        self: &Arc<Self>,
+        #[cfg(test)] pending_observer: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, DfsError> {
         let mut completion = self.refresh_completion.subscribe();
         let mut joined_owner = false;
         loop {
             let error = match self.read_write_configuration() {
-                Ok(_) => return Ok(()),
+                Ok(view) => return Ok(view),
                 Err(DfsWriteConfigurationReadError::Pending(error)) => error,
                 Err(DfsWriteConfigurationReadError::Unavailable(error)) => return Err(error),
             };
@@ -945,7 +977,7 @@ impl DfsMetadataAuthorityRuntime {
                 self.request_authoritative_refresh();
                 if !self.refresh_in_flight.load(Ordering::Acquire) {
                     // A promptly completed owner may publish before this load.
-                    return self.write_configuration_projection().map(|_| ());
+                    return self.write_configuration_projection();
                 }
             }
             if completion.changed().await.is_err() {
@@ -1639,15 +1671,26 @@ impl DfsMetadataAuthorityState {
         &self,
         context: &DfsMetadataReplicaShardContext,
     ) -> Result<(u64, bool), DfsError> {
+        self.replica_context_lifecycle_state(context)
+            .map(|((generation, _), matches)| (generation, matches))
+    }
+
+    fn replica_context_lifecycle_state(
+        &self,
+        context: &DfsMetadataReplicaShardContext,
+    ) -> Result<((u64, u64), bool), DfsError> {
         let projection = self.projection.lock().map_err(|_| DfsError::Network {
             message: "DFS metadata authority projection lock poisoned".to_string(),
         })?;
+        // The exact context and physical-store generation belong to the same
+        // observed cut. A provider/proof-only change need not replace a store.
+        let generations = (self.generation(), self.storage_generation());
         if projection.revision.is_none() {
-            return Ok((self.generation(), false));
+            return Ok((generations, false));
         }
         let matches =
             metadata_replica_context_matches_authority_entries(&projection.entries, context)?;
-        Ok((self.generation(), matches))
+        Ok((generations, matches))
     }
 
     pub fn retained_complete_prefix_for_generation(

@@ -357,6 +357,10 @@ pub struct DfsRuntimeHost {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutting_down: crate::DfsCancellationFlag,
     shutdown_notify: tokio::sync::Notify,
+    /// Per-mounted-host configuration input for native unit fixtures. This
+    /// changes what the real advertisement producers read, never their results.
+    #[cfg(test)]
+    fixture_local_zone: Mutex<Option<String>>,
 }
 
 impl DfsRuntimeHost {
@@ -375,6 +379,8 @@ impl DfsRuntimeHost {
             tasks: Mutex::new(Vec::new()),
             shutting_down: crate::DfsCancellationFlag::new(),
             shutdown_notify: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            fixture_local_zone: Mutex::new(None),
         }
     }
 
@@ -1813,14 +1819,30 @@ pub(crate) fn registered_dfs_runtime_peer_node_ids(
     control_plane: &dyn crate::DfsControlPlaneKvClient,
     state: &sinomo_core::ClusterBootstrapState,
 ) -> Result<Vec<NodeId>, DfsRuntimeError> {
-    let members = control_plane
+    let members = registered_dfs_runtime_members(control_plane)?;
+    let services = control_plane.range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)?;
+    dfs_runtime_peer_node_ids_from_entries(state, &members, &services)
+}
+
+/// sinomo:kv-configuration: Read registered membership through the actual native owner's bounded configuration client for service discovery.
+fn registered_dfs_runtime_members(
+    control_plane: &dyn crate::DfsControlPlaneKvClient,
+) -> Result<Vec<sinomo_core::ClusterMemberRecord>, DfsRuntimeError> {
+    control_plane
         .range_prefix("/cluster/members/")?
         .into_iter()
         .map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>())
-        .collect::<Result<Vec<_>, _>>()?;
-    let services = control_plane.range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)?;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn dfs_runtime_peer_node_ids_from_entries(
+    state: &sinomo_core::ClusterBootstrapState,
+    members: &[sinomo_core::ClusterMemberRecord],
+    services: &[KvEntry],
+) -> Result<Vec<NodeId>, DfsRuntimeError> {
     let mut peers = crate::cluster_service::dfs_provider_node_ids_from_current_entries(
-        state, &members, &services,
+        state, members, services,
     )?;
     if !peers.contains(&state.local_node_id) {
         peers.push(state.local_node_id.clone());
@@ -1927,14 +1949,16 @@ fn open_dfs_runtime_service_for_effect(
         detail: error.to_string(),
     })?;
     // Join configuration before any service/backend mutation or effect admission.
-    block_on_dfs_cluster_future(&provider_runtime, async {
+    let configuration = block_on_dfs_cluster_future(&provider_runtime, async {
         authority
-            .ensure_write_configuration_ready_async()
+            .ready_write_configuration_projection_async()
             .await
             .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
     })
     .map_err(|error| DfsRuntimeError::Parse {
         detail: error.to_string(),
+    })?.ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "native DFS service has no current certified metadata topology".into(),
     })?;
     let control_plane =
         daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&provider_runtime))
@@ -1944,16 +1968,15 @@ fn open_dfs_runtime_service_for_effect(
     // Use the existing owner client's native configuration projection. Opening
     // another KV-path reader here competes with the live Raft owner and cannot
     // substitute for that component's retained configuration.
-    let peer_node_ids = registered_dfs_runtime_peer_node_ids(control_plane.as_ref(), &state)?;
-    // Borrow one immutable native configuration view. Separately loading its
-    // generation and the decoded authority index can lose a coherent view to
-    // an unrelated committed delta between the two reads.
-    let configuration =
-        authority
-            .write_configuration_projection()?
-            .ok_or_else(|| DfsRuntimeError::Parse {
-                detail: "native DFS service has no current certified metadata topology".into(),
-            })?;
+    // Peer offers and topology come from the SAME floor-checked configuration
+    // returned by readiness. A later refresh cannot erase this read input;
+    // actual effects still reacquire and validate their current authority.
+    let members = registered_dfs_runtime_members(control_plane.as_ref())?;
+    let services = configuration.entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+        .ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "native DFS configuration has no complete service-offer scope".into(),
+        })?;
+    let peer_node_ids = dfs_runtime_peer_node_ids_from_entries(&state, &members, services)?;
     let file_system_id = effect
         .map(|scope| scope.file_system_id.clone())
         .unwrap_or_else(crate::sifs_file_system_id);
@@ -2334,7 +2357,17 @@ fn daemon_kv_events_cover_revision_range(
             }))
 }
 
-fn daemon_dfs_local_zone() -> Option<String> {
+fn daemon_dfs_local_zone(_data_dir: &SinomoDataDir) -> Option<String> {
+    #[cfg(test)]
+    if let Ok(Some(host)) = registered_dfs_runtime_host(_data_dir)
+        && let Some(zone) = host
+            .fixture_local_zone
+            .lock()
+            .expect("native fixture zone input")
+            .clone()
+    {
+        return Some(zone);
+    }
     std::env::var(SINOMO_DFS_ZONE_ENV)
         .ok()
         .map(|zone| zone.trim().to_string())

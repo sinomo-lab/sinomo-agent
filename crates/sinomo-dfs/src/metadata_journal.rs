@@ -372,7 +372,7 @@ fn metadata_journal_decoded_cache_hits() -> usize {
 }
 
 #[cfg(test)]
-fn reset_metadata_journal_exact_read_counters() {
+pub(crate) fn reset_metadata_journal_exact_read_counters() {
     METADATA_JOURNAL_EXACT_INDEX_LOOKUPS.set(0);
     METADATA_JOURNAL_EXACT_FRAME_DECODES.set(0);
     METADATA_JOURNAL_EXACT_SEGMENT_OPENS.set(0);
@@ -384,12 +384,12 @@ fn metadata_journal_exact_index_lookups() -> usize {
 }
 
 #[cfg(test)]
-fn metadata_journal_exact_frame_decodes() -> usize {
+pub(crate) fn metadata_journal_exact_frame_decodes() -> usize {
     METADATA_JOURNAL_EXACT_FRAME_DECODES.get()
 }
 
 #[cfg(test)]
-fn metadata_journal_exact_segment_opens() -> usize {
+pub(crate) fn metadata_journal_exact_segment_opens() -> usize {
     METADATA_JOURNAL_EXACT_SEGMENT_OPENS.get()
 }
 

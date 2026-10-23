@@ -1,4 +1,5 @@
 use super::*;
+use crate::{DfsMessageResponse, DfsNetworkMessage, DfsRoutedMessage};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonDfsDataPlaneHost {
@@ -121,13 +122,11 @@ where
         });
     }
     let mut metadata_authority_preflight =
-        warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
+        warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
             &cluster_paths,
             &peer_snapshot,
             runtime,
             peer_deadline,
-            #[cfg(test)]
-            None,
         )
         .await?;
     let file_system_id = expected_context.shard.file_system_id.clone();
@@ -264,10 +263,13 @@ where
                 )?;
             }
             metadata_authority_preflight =
-                warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                     &cluster_paths,
                     &peer_snapshot,
                     runtime,
+                    peer_deadline,
+                    #[cfg(test)]
+                    None,
                 )
                 .await?;
             let projection = metadata_authority_preflight
@@ -410,10 +412,13 @@ where
                         stale,
                     )?;
                     metadata_authority_preflight =
-                        warm_daemon_dfs_metadata_authority_for_peer_snapshot_async(
+                        warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
                             &cluster_paths,
                             &peer_snapshot,
                             runtime,
+                            peer_deadline,
+                            #[cfg(test)]
+                            None,
                         )
                         .await?;
                     continue;
@@ -837,13 +842,11 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             else {
                 return Ok(None);
             };
-            let preflight = warm_daemon_dfs_metadata_authority_for_peer_snapshot_before(
+            let preflight = warm_daemon_dfs_replica_authority_for_peer_snapshot_before(
                 &cluster_paths,
                 &peer_snapshot,
                 &runtime,
                 peer_deadline,
-                #[cfg(test)]
-                None,
             )
             .await
             .map_err(|source| DfsDataPlaneHostError::new(source.to_string()))?;
@@ -1172,6 +1175,75 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let namespace_event = daemon_dfs_visible_mutation_event(&command);
         Box::pin(async move {
             let _data_owner = data_owner?;
+            if attachment.is_none()
+                && let DfsNetworkMessage::MetadataJournalBatch(batch) =
+                    &command.routed_message.message
+                && batch.authority_probe.is_some()
+                && !batch.verify_prefix_only
+                && batch.prefix_probe.is_none()
+                && let Some(file_system_id) = batch.file_system_id.clone()
+            {
+                // The data-plane service has authenticated the routed source.
+                // A fallback authority probe is the same replica-ingress
+                // operation as its direct RPC, not a general filesystem
+                // request. Share its physical owner, admission, validation
+                // and materialization path. Promoted-primary prefix probes
+                // keep their separate handoff-marker protocol below.
+                let data_dir = Arc::new(SinomoDataDir::new(
+                    daemon_data_dir(&paths).map_err(daemon_dfs_data_plane_error)?,
+                ));
+                let context = self
+                    .retained_metadata_replica_shard_context(
+                        Arc::clone(&data_dir),
+                        file_system_id,
+                        batch.batch.shard_id.clone(),
+                    )
+                    .expect("daemon host implements retained replica context")
+                    .await?
+                    .ok_or_else(|| {
+                        DfsDataPlaneHostError::new(
+                            "authoritative metadata replica shard context is unavailable",
+                        )
+                    })?;
+                if command.routed_message.target_node_id != context.local_node_id {
+                    return Err(DfsDataPlaneHostError::new(
+                        "routed metadata authority probe targets another node",
+                    ));
+                }
+                let local_node_id = context.local_node_id.clone();
+                let DfsMessageCommand {
+                    request_id,
+                    routed_message,
+                } = command;
+                let DfsRoutedMessage {
+                    source_node_id,
+                    frame_id,
+                    message_id,
+                    message,
+                    ..
+                } = routed_message;
+                let DfsNetworkMessage::MetadataJournalBatch(batch) = message else {
+                    unreachable!("selected metadata journal command");
+                };
+                let response = self
+                    .apply_metadata_journal_batch(
+                        data_dir,
+                        source_node_id.clone(),
+                        batch,
+                        Some(context),
+                    )
+                    .await?;
+                return Ok(DfsDataPlaneResponse::value(DfsMessageResponse {
+                    request_id,
+                    outbound_messages: vec![DfsRoutedMessage {
+                        source_node_id: local_node_id,
+                        target_node_id: source_node_id,
+                        frame_id,
+                        message_id,
+                        message: DfsNetworkMessage::MetadataJournalBatchResponse(response),
+                    }],
+                }));
+            }
             let response = handle_daemon_dfs_message_with_encoded_size_async(
                 &paths,
                 command,

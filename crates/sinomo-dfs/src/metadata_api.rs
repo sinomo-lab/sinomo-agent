@@ -473,6 +473,26 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _operation_id: &str,
     ) -> Result<Option<std::sync::Arc<crate::metadata_records::DfsPreparedOperationPayload>>>;
 
+    /// Resolve immutable content bound to one exact durable prepare identity.
+    /// A resident body may outlive its current record or authority generation:
+    /// returning it proves neither current status nor permission to publish.
+    /// Callers needing those facts must use the ordinary current-state APIs.
+    fn prepared_operation_payload_for_digest(
+        &self,
+        digest: &DfsPreparedOperationDigest,
+    ) -> Result<Option<std::sync::Arc<DfsPreparedOperationPayload>>> {
+        let Some(record) = self.prepared_operation_record(&digest.operation_id)? else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.digest != *digest {
+            return Err(MetadataBackendError::Serde(
+                "immutable prepared body differs from the requested durable identity".into(),
+            ));
+        }
+        Ok(Some(record.payload))
+    }
+
     /// Read-only exact terminal evidence. No acknowledgement round or new
     /// publication marker is required for an already materialized commit.
     fn committed_prepared_operation(

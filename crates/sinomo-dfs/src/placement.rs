@@ -2785,6 +2785,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.coordinator
             .set_committed_repair_active(&intent_id, true);
         self.restore_pending_write_for_intent_if_missing(&intent_id, object_id)?;
+        if let Some(execution) = self.publication_execution.current() {
+            // A handoff replay keeps the original committed metadata, so it
+            // does not cross the new-commit enrollment callback. The current
+            // primary still needs its first local producer before handing
+            // derived work to the queue. Reuse that same enrollment: existing
+            // named/unknown custody and retry backoff are never replaced.
+            let now = dfs_now_unix_nanos();
+            let births = desired_replica_node_ids
+                .iter()
+                .filter(|target| {
+                    self.coordinator
+                        .repair_job_for_target(&intent_id, target)
+                        .is_some()
+                })
+                .map(|target| crate::DfsRepairAttemptRecord {
+                    intent_id: intent_id.clone(),
+                    object_id: object_id.clone(),
+                    version: expected_version.clone(),
+                    content_hash: content_hash.clone(),
+                    missing_replica_node_id: target.clone(),
+                    attempts: 0,
+                    in_flight: false,
+                    last_attempt_unix_nanos: 0,
+                    next_retry_unix_nanos: now,
+                    transfer_request_id: None,
+                    last_error: None,
+                    transfer_delivery_state: Some(
+                        sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                    ),
+                    completed_transfer_request_id: None,
+                    transfer_kind: Some(
+                        sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair,
+                    ),
+                })
+                .collect::<Vec<_>>();
+            crate::service_repair::enroll_prepared_repair_targets(
+                &sinomo_core::local::SinomoDataDir::new(execution.data_root()),
+                &self.repair_attempt_records,
+                &self.writes.pending_writes,
+                &births,
+            )?;
+        }
         if self.coordinator.capture_active_repair_jobs(&intent_id) {
             self.record_message_committed_work(DfsMessageCommittedWork {
                 repair_maintenance: true,

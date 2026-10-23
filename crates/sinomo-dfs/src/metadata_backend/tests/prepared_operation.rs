@@ -1,4 +1,7 @@
 //! Native PreparedV7 kernel regressions; author guards come from real hosted services.
+mod immutable_payload;
+mod checkpoint_cache;
+mod owned_namespace_plan;
 use super::*;
 use crate::DfsControlPlaneStore;
 use crate::test_support::{DfsTestRuntime, current_native_metadata_service};
