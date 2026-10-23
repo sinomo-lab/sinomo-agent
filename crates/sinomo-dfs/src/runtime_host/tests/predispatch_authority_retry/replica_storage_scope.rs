@@ -135,6 +135,25 @@ fn exercise_replica_storage_scope(
         assert_eq!(warmed.result, crate::DfsMetadataJournalBatchResult::Applied);
         assert_eq!(warmed.next_after_sequence, predecessor.next_after_sequence);
     }
+    // This control must test the first ingest while the receiver's unrelated
+    // writer configuration is paused. The normal source publisher is also
+    // allowed to send this prepare, so hold its real planning lane before the
+    // prepare exists. Its retained work resumes when the measured RPC returns.
+    let first_ingest_source_scope = DfsMessageExecutionScope::ExactShard {
+        file_system_id: context.shard.file_system_id.clone(),
+        shard_id: shard_id.clone(),
+    };
+    let first_ingest_source_owner = first_ingest.then(|| {
+        fixture.runtime.block_on(async {
+            tokio::time::timeout(
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                fixture.scheduler.admit(&first_ingest_source_scope),
+            )
+            .await
+            .expect("source planning lane drains before creating the first-ingest prepare")
+            .expect("actual source planning admission")
+        })
+    });
     let prepared = source
         .metadata_backend
         .as_mut()
@@ -408,6 +427,10 @@ fn exercise_replica_storage_scope(
             .map_err(|error| error.to_string())
     });
     let rpc_elapsed = started.elapsed();
+    let first_ingest_source_owned = first_ingest_source_owner
+        .as_ref()
+        .is_some_and(|owner| owner.is_exact());
+    drop(first_ingest_source_owner);
     let global_still_owned = scheduler.try_admit_global().is_none();
     drop(other_owner);
     let writer_still_pending = paused_configuration.as_ref().map(|paused| {
@@ -458,6 +481,7 @@ fn exercise_replica_storage_scope(
         "physical_root": data_dir.root(), "local_node": fixture.remote,
         "primary_publisher": primary_publisher, "pause_write_configuration": pause_write_configuration,
         "first_ingest": first_ingest,
+        "first_ingest_source_owned_at_rpc_return": first_ingest_source_owned,
         "held_configured_shard": (!pause_write_configuration).then_some(&other_shard),
         "requested_context": format!("{context:?}"),
         "before_generations": before, "after_generations": after,
@@ -514,6 +538,7 @@ fn exercise_replica_storage_scope(
     assert_eq!(response.verified_authority_probe_id, Some(confirmation));
     assert_eq!(response.next_after_sequence, prefix.journal_sequence);
     if first_ingest {
+        assert!(first_ingest_source_owned, "the source publisher stayed ordered behind the first ingest");
         assert_eq!(
             response.applied_entries, 1,
             "the new prepare was actually persisted"
