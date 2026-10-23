@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import time
@@ -105,11 +106,35 @@ def daemon_delta(before, after):
     return delta
 
 
+def collector_group_members(group):
+    members = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[2]) == group and fields[0] != "Z":
+                members.append({"pid": int(proc.name), "start_ticks": int(fields[19])})
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return members
+
+
+def completed_legacy_collector(process, record):
+    record["exit_code"] = process.wait()
+    record["remaining_group_members"] = collector_group_members(process.pid)
+    if record["remaining_group_members"]:
+        raise IncompleteObservation("legacy idle collector left owned descendants")
+    return process.returncode
+
+
 def measure(args):
     report = {"started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "project": args.project, "window_seconds": args.window, "nodes": {}, "samples": [],
               "qualification": "Stable live owned-container window only; physical cgroup bytes are distinct from logical/proc bytes. Exclusive owned DATA and supported Btrfs writeback required. Main/shadow snapshots and their exited collectors are inside the counter interval. No post-teardown accounting or whole-host acceptance claim."}
     code = 2
+    legacy = None
+    legacy_log = None
     try:
         with contextlib.ExitStack() as stack:
             owners = inspect(args.project, args.nodes)
@@ -123,6 +148,15 @@ def measure(args):
                 readers[node].validate(report["nodes"][node]["before"])
             for node, owner in owners.items():
                 report["nodes"][node]["daemon_before"] = daemon_snapshot(owner["id"])
+            if getattr(args, "legacy_idle", False):
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                legacy_log = args.output.with_suffix(".legacy.log").open("x")
+                environment = dict(os.environ, SINOMO_IDLE_OWNED_IO_CHILD="1")
+                legacy_command = ["bash", str(Path(__file__).with_name("measure-idle.sh")), str(args.window)]
+                legacy = subprocess.Popen(legacy_command, env=environment, stdout=legacy_log,
+                                          stderr=subprocess.STDOUT, start_new_session=True)
+                report["legacy_idle"] = {"command": legacy_command, "pid": legacy.pid,
+                                         "collector_drain_seconds": 10}
             deadline = time.monotonic() + args.window
             buffered = set()
             while True:
@@ -137,14 +171,24 @@ def measure(args):
                 report["samples"].append(cut)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    break
-                time.sleep(min(1, remaining))
+                    if legacy is None or legacy.poll() is not None:
+                        break
+                    if time.monotonic() >= deadline + 10:
+                        raise IncompleteObservation("legacy idle collector did not drain within ten seconds of the fixed window")
+                time.sleep(min(1, max(.05, remaining)))
+            if legacy is not None:
+                completed_legacy_collector(legacy, report["legacy_idle"])
+                legacy_log.close()
+                legacy_log = None
+
             for node, owner in owners.items():
                 report["nodes"][node]["daemon_after"] = daemon_snapshot(owner["id"])
             final_owners = inspect(args.project, args.nodes)
             if owners != final_owners:
                 raise IncompleteObservation("container ownership changed during the observation")
             failures = []
+            if legacy is not None and legacy.returncode != 0:
+                failures.append("legacy idle thresholds failed; see retained collector log")
             for node, reader in readers.items():
                 row = report["nodes"][node]
                 row["after"] = reader.sample()
@@ -162,6 +206,24 @@ def measure(args):
     except Exception as error:
         report.update(complete=False, error=repr(error))
     finally:
+        if legacy is not None and (legacy.poll() is None or collector_group_members(legacy.pid)):
+            # Cancel only the collector group created by this observation.
+            report["legacy_idle"]["cancelled_in_cleanup"] = True
+            for sig, grace in [(signal.SIGTERM, 10), (signal.SIGKILL, 2)]:
+                try:
+                    os.killpg(legacy.pid, sig)
+                except ProcessLookupError:
+                    pass
+                end = time.monotonic() + grace
+                while collector_group_members(legacy.pid) and time.monotonic() < end:
+                    time.sleep(.05)
+                if not collector_group_members(legacy.pid):
+                    break
+            legacy.wait(timeout=2)
+            report["legacy_idle"]["exit_code"] = legacy.returncode
+            report["legacy_idle"]["remaining_group_members"] = collector_group_members(legacy.pid)
+        if legacy_log is not None:
+            legacy_log.close()
         report["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         report["exit_code"] = code
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +243,8 @@ if __name__ == "__main__":
     parser.add_argument("--nodes", nargs="+", default=[f"node{i}" for i in range(1, 7)])
     parser.add_argument("--window", type=int, required=True)
     parser.add_argument("--max-read-bps", type=int)
+    parser.add_argument("--legacy-idle", action="store_true",
+                        help="enclose the unchanged legacy disk/network sampler and its collector exit")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.window <= 0 or args.window > 600 or len(set(args.nodes)) != len(args.nodes):

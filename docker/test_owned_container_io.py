@@ -4,6 +4,8 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+import subprocess
+import sys
 from unittest.mock import patch
 
 from owned_container_io import IncompleteObservation, OwnedCgroup, io_values
@@ -14,6 +16,22 @@ spec.loader.exec_module(window)
 
 
 class CounterTests(unittest.TestCase):
+    def test_real_collector_failure_is_retained_after_actual_exit(self):
+        process = subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"], start_new_session=True)
+        record = {}
+        self.assertEqual(window.completed_legacy_collector(process, record), 7)
+        self.assertEqual(record["exit_code"], 7)
+        self.assertEqual(record["remaining_group_members"], [])
+
+    def test_collector_exit_does_not_hide_remaining_owned_descendants(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        record = {}
+        with patch.object(window, "collector_group_members", return_value=[{"pid": 42, "start_ticks": 100}]):
+            with self.assertRaisesRegex(IncompleteObservation, "owned descendants"):
+                window.completed_legacy_collector(process, record)
+        self.assertEqual(record["exit_code"], 0)
+        self.assertEqual(record["remaining_group_members"], [{"pid": 42, "start_ticks": 100}])
+
     def setUp(self):
         self.reader = OwnedCgroup.__new__(OwnedCgroup)
         self.reader.path = Path("/sys/fs/cgroup/test-only-no-cgroup-created")

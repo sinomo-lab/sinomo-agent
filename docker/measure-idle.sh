@@ -6,6 +6,8 @@
 # orders of magnitude above that bounded burst allowance.
 #
 #   docker/measure-idle.sh [window_seconds]   (default 60)
+# Set SINOMO_GATE_OWNED_IO_ARTIFACTS to retain stable-container block I/O,
+# helper/writeback and collector-exit coverage alongside the unchanged gates.
 
 # These helpers target the dev cluster compose file regardless of the caller's
 # working directory (the root docker-compose.yml is the production node).
@@ -147,6 +149,18 @@ check_delta() {
   fi
   return 0
 }
+
+# Optional stable whole-container I/O coverage encloses this unchanged sampler,
+# including its endpoint collectors. The child flag prevents recursion only.
+if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ] && [ "${SINOMO_IDLE_OWNED_IO_CHILD:-0}" != "1" ]; then
+  mkdir -p "$SINOMO_GATE_OWNED_IO_ARTIFACTS"
+  owned_artifacts="$(mktemp -d "$SINOMO_GATE_OWNED_IO_ARTIFACTS/idle-XXXXXXXX")"
+  read -r -a owned_nodes <<< "$NODES"
+  exec python3 "$SINOMO_DOCKER_DIR/measure-owned-io.py" \
+    --project "$COMPOSE_PROJECT_NAME" --nodes "${owned_nodes[@]}" \
+    --window "$WINDOW" --max-read-bps "$MAX_READ_BLOCK_BPS" --legacy-idle \
+    --output "$owned_artifacts/io.json"
+fi
 
 declare -A daemon_id0 r0 w0 rc0 wc0
 declare -A rx0 tx0

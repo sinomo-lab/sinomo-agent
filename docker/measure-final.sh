@@ -20,6 +20,7 @@
 #   SINOMO_GATE_QUIESCE_WAIT    initial settle delay after readiness
 #   SINOMO_GATE_QUIESCE_WINDOW  zero-write window required after the settle deadline
 #   SINOMO_GATE_QUIESCE_TIMEOUT maximum seconds to find a full zero-write window
+#   SINOMO_GATE_OWNED_IO_ARTIFACTS opt into complete stable-container I/O evidence
 
 # These helpers target the dev cluster compose file regardless of the caller's
 # working directory (the root docker-compose.yml is the production node).
@@ -198,6 +199,31 @@ enforce_idle_write_stability() {
   local -A before=()
   while :; do
     attempt=$(( attempt + 1 ))
+    if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ]; then
+      mkdir -p "$SINOMO_GATE_OWNED_IO_ARTIFACTS"
+      local owned_artifacts owned_status
+      local -a owned_nodes
+      owned_artifacts="$(mktemp -d "$SINOMO_GATE_OWNED_IO_ARTIFACTS/settling-XXXXXXXX")"
+      read -r -a owned_nodes <<< "$MEASURE_NODES"
+      owned_status=0
+      python3 "$SINOMO_DOCKER_DIR/measure-owned-io.py" \
+        --project "$COMPOSE_PROJECT_NAME" --nodes "${owned_nodes[@]}" \
+        --window "$QUIESCE_WINDOW" --output "$owned_artifacts/io.json" || owned_status=$?
+      if [ "$owned_status" -eq 0 ]; then
+        echo "owned main/shadow/helper block writes stayed quiet for ${QUIESCE_WINDOW}s (attempt ${attempt})"
+        return
+      fi
+      if [ "$owned_status" -ne 1 ]; then
+        echo "owned I/O observation incomplete; preserving failed coverage, no reset/stitching"
+        exit "$owned_status"
+      fi
+      now="$(date +%s)"
+      if [ $(( now + QUIESCE_WINDOW )) -gt "$deadline" ]; then
+        break
+      fi
+      echo "retrying owned zero-write window before the original quiescence deadline"
+      continue
+    fi
     before=()
     for node in $MEASURE_NODES; do
       if ! before_snapshot="$(node_daemon_write_snapshot "$node")" || [ -z "$before_snapshot" ]; then
@@ -271,6 +297,12 @@ run_validation_cycle() {
   echo "=== cycle ${cycle}/${CYCLES}: bridge loss/recovery (${BRIDGE_RECOVERY_WAIT}s recovery budget) ==="
   docker/test-bridge-recovery.sh "$BRIDGE_RECOVERY_WAIT"
   wait_for_named_ready "cycle ${cycle}/${CYCLES} final"
+  if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ]; then
+    # Recovery is a new workload. Reuse the same bounded settling and idle
+    # checks; never splice its counters into the pre-recovery ownership window.
+    enforce_idle_write_stability "cycle ${cycle}/${CYCLES} post-recovery"
+    docker/measure-idle.sh "$IDLE_WINDOW"
+  fi
 }
 
 if [ "$REBUILD" != "0" ]; then
