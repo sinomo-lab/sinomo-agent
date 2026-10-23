@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 
+import disk_metrics
+
 
 class Collector(unittest.TestCase):
     @classmethod
@@ -59,6 +61,19 @@ class Collector(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertFalse(rows)
         self.assertEqual(self.raw.read_text(), "previous evidence\n")
+
+    def test_disk_observations_have_brackets_without_claiming_coverage(self):
+        r, rows = self.run_commands("SAMPLE 0 disk-fixture\nQUIT\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sample = rows[-1]
+        disk = sample["disk"]
+        self.assertEqual(disk["read_errors"], [])
+        self.assertLessEqual(sample["begin_ns"], disk["read_ns"][0])
+        self.assertLessEqual(disk["read_ns"][1], sample["end_ns"])
+        self.assertTrue(disk_metrics.parse_diskstats(disk["diskstats"]))
+        self.assertIn("writeback_bytes", disk_metrics.settling(disk))
+        self.assertFalse(disk["device_lifecycle_coverage"])
+        self.assertFalse(disk["sync_syscall_coverage"])
 
     def test_duplicate_or_skipped_command_sequence_fails(self):
         for command in ("SAMPLE 1 fixture-1\n", "SAMPLE 0 fixture-0\nSAMPLE 0 fixture-0\n"):

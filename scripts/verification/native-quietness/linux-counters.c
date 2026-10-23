@@ -371,6 +371,27 @@ static void mounts(void) {
     fputs("}\n", raw);
 }
 
+/* Keep raw block layers separate. Polling cannot certify device lifetimes,
+ * physical topology, fsync calls or completion of deferred writeback. */
+static void disk_snapshot(FILE *out) {
+    U begin = ns(CLOCK_MONOTONIC);
+    char *stats = read_file("/proc/diskstats", NULL);
+    int stats_error = stats ? 0 : errno;
+    char *vm = read_file("/proc/vmstat", NULL);
+    int vm_error = vm ? 0 : errno;
+    long page = sysconf(_SC_PAGESIZE);
+    U end = ns(CLOCK_MONOTONIC);
+    fprintf(out, ",\"disk\":{\"read_ns\":[%" PRIu64 ",%" PRIu64 "],\"page_size\":%ld,\"diskstats\":", begin, end, page);
+    if (stats) quote(out, stats, strlen(stats)); else fputs("null", out);
+    fputs(",\"vmstat\":", out);
+    if (vm) quote(out, vm, strlen(vm)); else fputs("null", out);
+    fputs(",\"read_errors\":[", out);
+    if (stats_error) fprintf(out, "{\"source\":\"/proc/diskstats\",\"errno\":%d}", stats_error);
+    if (vm_error) fprintf(out, "%s{\"source\":\"/proc/vmstat\",\"errno\":%d}", stats_error ? "," : "", vm_error);
+    fputs("],\"device_lifecycle_coverage\":false,\"sync_syscall_coverage\":false}", out);
+    free(stats); free(vm);
+}
+
 static void sample(U sequence, const char *nonce) {
     U begin = ns(CLOCK_MONOTONIC), cpu_begin = ns(CLOCK_PROCESS_CPUTIME_ID);
     errors = vanished = denied_ns = skipped = task_count = process_count = 0;
@@ -402,7 +423,9 @@ static void sample(U sequence, const char *nonce) {
     fprintf(out, ",\"boot_id\":"); quote(out, boot, strlen(boot));
     fprintf(out, ",\"begin_ns\":%" PRIu64 ",\"cpu_read_ns\":[%" PRIu64 ",%" PRIu64 "],\"cpu_fields\":[", begin, cpu_read_begin, cpu_read_end);
     for (int i = 0; i < 10; i++) fprintf(out, "%s%" PRIu64, i ? "," : "", ticks[i]);
-    fprintf(out, "],\"groups\":{");
+    fputc(']', out);
+    disk_snapshot(out);
+    fprintf(out, ",\"groups\":{");
     for (size_t i = 0; i < group_count; i++) {
         Group *g = &groups[i];
         fprintf(out, "%s\"%ju:%ju\":{\"netns\":%" PRIu64 ",\"read_ns\":[%" PRIu64 ",%" PRIu64 "],\"interfaces\":%s,\"interface_indices\":",

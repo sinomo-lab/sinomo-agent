@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Whole-native-host quietness protocol and conservative evidence evaluation.
+"""Optional whole-native-host diagnostics and conservative evidence evaluation.
 
 The Linux polling backend is deliberately coverage-incomplete. This controller
-cannot turn it into an acceptance PASS. Fixture tests exercise the same arithmetic
-and barriers, but fixture results are always labelled non-acceptance.
+cannot turn it into an acceptance PASS. These host observations are NOT rollout
+prerequisites. The mandatory Sinomo process-family policy is in daemon_scope.py.
 """
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ import secrets
 import subprocess
 import threading
 import time
+
+import disk_metrics
 
 SECOND = 1_000_000_000
 CPU_PERCENT = 10
@@ -265,13 +267,13 @@ class Reader:
 
 
 def run(config, output):
-    """Capture diagnostic native evidence; never accept an incomplete backend.
+    """Capture optional host evidence; its coverage gaps never gate rollout.
 
     config.nodes entries contain an argv command for an already-built, permitted
     collector and its expected SHA256/boot identity. No shell is invoked locally.
-    Raw task evidence stays at the collector's --raw path. Native acceptance must
-    wait for an authorized, complete lifecycle/drain provider; no config flag can
-    assert that provider into existence.
+    Raw task evidence stays at the collector's --raw path. A complete host
+    diagnostic would need lifecycle/drain evidence; no config flag supplies it.
+    Such host-global evidence is not required for Sinomo-only acceptance.
     """
     output.mkdir(parents=True, exist_ok=False)
     nodes = config["nodes"]
@@ -284,13 +286,15 @@ def run(config, output):
     previous = {}
     ready = {}
     result = {"schema": "sinomo.native-joint-quietness.v1", "scope": "EACH ENTIRE NATIVE HOST",
-              "limits": {"cpu_percent_of_one_core": CPU_PERCENT,
+              "rollout_gate": False, "optional_diagnostic": True,
+              "reference_limits": {"cpu_percent_of_one_core": CPU_PERCENT,
                          "combined_TX_RX_Bps_all_interfaces_including_loopback": NETWORK_BPS,
                          "continuous_ns": QUIET_NS, "absolute_search_ns": DEADLINE_NS,
                          "cadence_ns": CADENCE_NS},
               "started_ns": started, "absolute_deadline_ns": window.deadline,
-              "acceptance": False, "verdict": "BLOCKED", "hosts": names,
-              "blockers": [], "ready": ready, "collector_exit": {}}
+              "acceptance": False, "verdict": "DIAGNOSTIC", "coverage_verdict": "BLOCKED", "hosts": names,
+              "diagnostic_gaps": [],
+              "ready": ready, "collector_exit": {}}
     try:
         for n in nodes:
             readers[n["name"]] = Reader(n["command"], output / (n["name"] + ".stderr"))
@@ -301,7 +305,7 @@ def run(config, output):
             if r.get("collector_sha256") != n["collector_sha256"] or r.get("boot_id") != n["boot_id"]:
                 raise ValueError("collector build/host boot identity differs from preflight")
             ready[n["name"]] = r
-        result["blockers"].append("Linux public polling has no complete host namespace/interface/process lifecycle or persistent/orphan-namespace provider")
+        result["diagnostic_gaps"].append("Linux public polling has no complete host namespace/interface/process lifecycle or persistent/orphan-namespace provider")
         with (output / "controller.ndjson").open("x") as evidence:
             tick = time.monotonic_ns()
             sequence = 0
@@ -321,6 +325,13 @@ def run(config, output):
                             checks[name] = interval(sample, previous[name], ready[name]["hertz"])
                         except (ValueError, KeyError, TypeError) as e:
                             checks[name] = dict(counters_within=False, coverage_complete=False, error=str(e))
+                        # Disk observations remain available even when another
+                        # counter family is incomplete. Never substitute zero.
+                        try:
+                            checks[name]["disk"] = disk_metrics.interval(sample, previous[name])
+                        except (ValueError, KeyError, TypeError) as e:
+                            checks[name]["disk"] = dict(acceptance=False, coverage_complete=False,
+                                                       verdict="UNAVAILABLE", error=str(e))
                     previous[name] = sample
                 end = window.anchor is not None and min(sends.values()) - window.anchor >= QUIET_NS
                 status = window.observe(sequence, nonce, sends, replies, checks, end=end)
@@ -335,7 +346,7 @@ def run(config, output):
             result["samples"] = sequence
             result["barrier_errors"] = window.errors
     except (OSError, ValueError, KeyError, TypeError, TimeoutError, EOFError, queue.Empty) as e:
-        result["blockers"].append(f"collector/controller evidence unavailable: {type(e).__name__}: {e}")
+        result["diagnostic_gaps"].append(f"collector/controller evidence unavailable: {type(e).__name__}: {e}")
     finally:
         # Native drain is explicit evidence, not inferred from a successful exit.
         # This backend lacks an independent full-host reader across its own exit.
@@ -343,7 +354,7 @@ def run(config, output):
             reader.close()
             result["collector_exit"][name] = reader.process.returncode
             result.setdefault("collector_cleanup_errors", {})[name] = reader.cleanup_errors
-        result["blockers"].append("independent whole-host counter coverage through collector/transport drain is unavailable")
+        result["diagnostic_gaps"].append("independent whole-host counter coverage through collector/transport drain is unavailable")
         result["drain_coverage_complete"] = False
         result["finished_ns"] = time.monotonic_ns()
         (output / "receipt.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -458,7 +469,8 @@ def attribution(raw_path, expected_runtimes):
                          namespace_bytes_are_process_attribution=False))
     return dict(schema="sinomo.native-thread-attribution.v1", boot_id=ready["boot_id"],
                 hertz=ready["hertz"], acceptance=False, overhead_subtracted=False,
-                qualification="Stable-thread CPU attribution only. Birth/exit/exec gaps, kernel/IRQ/steal and denied identities are explicit. Host CPU remains the gate. Namespace bytes cannot identify a daemon's traffic.", rows=rows)
+                rollout_gate=False,
+                qualification="Stable-thread CPU attribution only. Birth/exit/exec gaps and denied identities are explicit. Host CPU is optional diagnostic context. Namespace bytes cannot identify a daemon's traffic.", rows=rows)
 
 
 def main():

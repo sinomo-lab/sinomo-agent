@@ -28,6 +28,17 @@ Keep artifacts under `target/` or `benchmark-results/`, outside commits.
 Record active history-retention rules and whether they match the workload path;
 an unrelated filesystem rule can still affect the selected implementation path.
 
+For real native rollout quietness, use process-family scope without
+whole-host limits. Gate Sinomo main/shadow daemons and their attributable
+children, helpers, detached/delegated work and writeback. Whole-host counters and
+their lifecycle/privileged-observer gaps are optional diagnostics, never rollout
+prerequisites. Use the process-family policy in
+[`native-quietness/README.md`](../../scripts/verification/native-quietness/README.md).
+Preserve the existing numeric thresholds and their distinct CPU/network and
+disk windows; do not substitute namespace bytes for process traffic or exempt
+Sinomo work by calling it observation overhead. Docker's maintained isolated
+container verification remains a separate scope.
+
 Stop only the task's Docker cluster before compiling. Use normal Cargo workers,
 unset `CARGO_BUILD_JOBS`, and run one compilation task at a time. Do not solve
 memory pressure by reducing Cargo workers. Use the existing Docker verification
