@@ -1,7 +1,7 @@
 use super::*;
 fn unsupported() -> DesktopError {
     DesktopError::Unsupported(format!(
-        "desktop capture/input backend is not implemented on {}",
+        "app-use OS integration is not implemented on {}",
         std::env::consts::OS
     ))
 }

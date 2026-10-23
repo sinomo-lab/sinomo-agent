@@ -1,8 +1,11 @@
 //! Opt-in interactive-desktop acceptance. Sends messages only to an owned test
 //! window, never raw keyboard/mouse input to the user's active application.
 #![cfg(target_os = "windows")]
-use sinomo_core::node::{LocalNodePermissionStore, LocalNodePermissions};
-use sinomo_device::desktop::*;
+use sinomo_actions::desktop::provider::DesktopProviderClient;
+use sinomo_runtime::device::desktop::*;
+use sinomo_runtime::node::{LocalNodePermissionStore, LocalNodePermissions};
+#[path = "support/app_use.rs"]
+mod support;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
@@ -76,6 +79,8 @@ fn background_dpi_unaware_window_maps_frame_coordinates() {
 
 fn background_window_acceptance(dpi_unaware: bool) {
     let root = sinomo_testdir::TestDir::new("desktop-windows-acceptance");
+    support::install(&root);
+    let provider = DesktopProviderClient::resolve(&root).unwrap();
     let store = LocalNodePermissionStore::new(&root);
     let mut grants = LocalNodePermissions::new();
     grants.set_remote_management_enabled(true);
@@ -171,7 +176,7 @@ fn background_window_acceptance(dpi_unaware: bool) {
         }
     }
     let _cleanup = Cleanup(Some(stop), Some(thread));
-    let info = enumerate_targets(&store, true).unwrap().into_iter().find(|info| matches!(info.target, DesktopTarget::Window { handle: found, .. } if found == handle)).unwrap();
+    let info = provider.targets(DesktopControlMode::Background).unwrap().into_iter().find(|info| matches!(info.target, DesktopTarget::Window { handle: found, .. } if found == handle)).unwrap();
     let target = info.target.clone();
     for operation in ["input", "capture"] {
         grants
@@ -179,21 +184,22 @@ fn background_window_acceptance(dpi_unaware: bool) {
             .unwrap();
     }
     store.save(&grants).unwrap();
-    let mut capture = DesktopCapture::start(
-        DesktopCaptureConfig {
+    let capture = provider
+        .capture(DesktopCaptureConfig {
             target: target.clone(),
             frames_per_second: 30,
             include_cursor: false,
-        },
-        store.clone(),
-    )
-    .unwrap();
+            lease_ms: 30_000,
+        })
+        .unwrap();
     let first = capture
         .next(0, Duration::from_secs(5))
         .unwrap()
         .expect("first compositor frame");
     first.validate().unwrap();
-    let mut input = DesktopInputSession::open(target.clone(), store.clone()).unwrap();
+    let mut input = provider
+        .open_input(target.clone(), DesktopControlMode::Background, 30_000)
+        .unwrap();
     input
         .send(&[
             DesktopInput::Move {
@@ -361,6 +367,14 @@ fn background_window_acceptance(dpi_unaware: bool) {
         capture.next(0, Duration::ZERO),
         Err(DesktopError::PermissionDenied(_))
     ));
-    capture.stop();
+    drop(capture);
     drop(input);
+    let report = Arc::try_unwrap(provider)
+        .ok()
+        .expect("all native handles released")
+        .unload();
+    assert!(
+        report.shutdown_ok && report.library_handle_released,
+        "{report:?}"
+    );
 }

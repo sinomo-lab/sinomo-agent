@@ -1,21 +1,28 @@
-//! Driver-free desktop devices. Pixels remain native video samples; this layer
-//! owns neither encoding nor transport. Every effect rechecks local consent.
-
-#[cfg(target_os = "windows")]
-#[path = "desktop/windows.rs"]
-mod platform;
-#[cfg(not(target_os = "windows"))]
-#[path = "desktop/unsupported.rs"]
-mod platform;
-
+//! Platform-neutral app-use contracts. Native OS integration lives in the
+//! independently loaded modules/desktop/app-use provider.
 use crate::NativeVideoSample;
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::LocalNodePermissionStore;
-use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+pub mod protocol;
+
+/// Background messages are preferred. Raw input is an explicit fallback on a
+/// monitor target and can affect the user's pointer, keyboard and foreground.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopControlMode {
+    #[default]
+    Background,
+    Raw,
+}
+impl DesktopControlMode {
+    pub fn validate_target(self, target: &DesktopTarget) -> DesktopResult<()> {
+        if target.is_window() != (self == Self::Background) {
+            return Err(DesktopError::Invalid("background mode requires a window; raw mode requires a monitor and explicit raw selection".into()));
+        }
+        Ok(())
+    }
+}
 
 pub const MAX_INPUT_EVENTS: usize = 256;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -93,26 +100,6 @@ pub struct DesktopCapabilities {
     pub gamepad: String,
     pub limitations: Vec<String>,
 }
-pub fn capabilities() -> DesktopCapabilities {
-    platform::capabilities()
-}
-
-pub fn enumerate_targets(
-    permissions: &LocalNodePermissionStore,
-    windows: bool,
-) -> DesktopResult<Vec<DesktopTargetInfo>> {
-    authorize_host(permissions)?;
-    platform::enumerate_targets(windows)
-}
-pub fn enumerate_child_windows(
-    permissions: &LocalNodePermissionStore,
-    parent: &DesktopTarget,
-) -> DesktopResult<Vec<DesktopTargetInfo>> {
-    authorize_host(permissions)?;
-    platform::validate_target(parent)?;
-    platform::enumerate_child_windows(parent)
-}
-
 pub fn authorize_host(store: &LocalNodePermissionStore) -> DesktopResult<()> {
     let permission = store
         .load()
@@ -156,7 +143,7 @@ pub enum MouseButton {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopInput {
-    /// Set-1 scan code for computer use; virtual-key code for app use.
+    /// Set-1 scan code for raw mode; virtual-key code for background mode.
     Key {
         code: u16,
         down: bool,
@@ -166,7 +153,7 @@ pub enum DesktopInput {
     Text {
         text: String,
     },
-    /// Physical virtual-desktop pixels for computer use; client pixels for app use.
+    /// Physical virtual-desktop pixels for raw mode; client pixels for background mode.
     Move {
         x: i32,
         y: i32,
@@ -295,8 +282,7 @@ fn validate_frame_point(x: f64, y: f64, source: [u32; 2]) -> DesktopResult<()> {
 /// model-side aspect-preserving resizing does not change these fractions. Keep
 /// geometry at the device boundary instead of asking the model to subtract
 /// screen origins, decoration sizes, or DPI offsets.
-#[cfg(any(target_os = "windows", test))]
-fn frame_point_to_client(
+pub fn frame_point_to_client(
     x: f64,
     y: f64,
     source: [u32; 2],
@@ -334,236 +320,6 @@ fn frame_point_to_client(
     }
 }
 
-/// A held-input lease. Dropping it releases only inputs injected by this owner.
-/// Cleanup is allowed after revocation so keys cannot remain stuck.
-struct InputState {
-    target: DesktopTarget,
-    permissions: LocalNodePermissionStore,
-    input: platform::Input,
-    keys: BTreeSet<(u16, bool)>,
-    buttons: BTreeSet<MouseButton>,
-    cancelled: Arc<AtomicBool>,
-    deadline: Instant,
-}
-impl InputState {
-    fn open(
-        target: DesktopTarget,
-        permissions: LocalNodePermissionStore,
-        cancelled: Arc<AtomicBool>,
-        deadline: Instant,
-    ) -> DesktopResult<Self> {
-        authorize(&permissions, &target, "input")?;
-        platform::validate_target(&target)?;
-        Ok(Self {
-            input: platform::Input::new(&target)?,
-            target,
-            permissions,
-            keys: BTreeSet::new(),
-            buttons: BTreeSet::new(),
-            cancelled,
-            deadline,
-        })
-    }
-    pub fn send(&mut self, events: &[DesktopInput]) -> DesktopResult<usize> {
-        validate_inputs(&self.target, events)?;
-        for (index, event) in events.iter().enumerate() {
-            if matches!(event, DesktopInput::ReleaseAll) {
-                self.release_all()?;
-                continue;
-            }
-            let active =
-                if self.cancelled.load(Ordering::Acquire) || Instant::now() >= self.deadline {
-                    Err(DesktopError::Closed("input lease ended".into()))
-                } else {
-                    Ok(())
-                };
-            if let Err(error) = active
-                .and_then(|_| authorize(&self.permissions, &self.target, "input"))
-                .and_then(|_| platform::validate_target(&self.target))
-                .and_then(|_| self.input.send(event))
-            {
-                let _ = self.release_all();
-                return Err(if index == 0 {
-                    error
-                } else {
-                    DesktopError::PartialInput {
-                        applied: index,
-                        detail: error.to_string(),
-                    }
-                });
-            }
-            match event {
-                DesktopInput::Key {
-                    code,
-                    extended,
-                    down,
-                } => {
-                    if *down {
-                        self.keys.insert((*code, *extended));
-                    } else {
-                        self.keys.remove(&(*code, *extended));
-                    }
-                }
-                DesktopInput::Button { button, down } => {
-                    if *down {
-                        self.buttons.insert(*button);
-                    } else {
-                        self.buttons.remove(button);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(events.len())
-    }
-    pub fn release_all(&mut self) -> DesktopResult<()> {
-        let mut failure = None;
-        // Monitor removal must not strand global held keys. A destroyed HWND
-        // has no global input state and must never receive cleanup via a new owner.
-        if !self.target.is_window() || platform::validate_target(&self.target).is_ok() {
-            for (code, extended) in self.keys.clone() {
-                match self.input.send(&DesktopInput::Key {
-                    code,
-                    extended,
-                    down: false,
-                }) {
-                    Ok(()) => {
-                        self.keys.remove(&(code, extended));
-                    }
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                    }
-                }
-            }
-            for button in self.buttons.clone() {
-                match self.input.send(&DesktopInput::Button {
-                    button,
-                    down: false,
-                }) {
-                    Ok(()) => {
-                        self.buttons.remove(&button);
-                    }
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                    }
-                }
-            }
-        }
-        self.input.release_gamepad();
-        failure.map_or(Ok(()), Err)
-    }
-}
-impl Drop for InputState {
-    fn drop(&mut self) {
-        let _ = self.release_all();
-    }
-}
-
-enum InputCommand {
-    Send(Vec<DesktopInput>, mpsc::SyncSender<DesktopResult<usize>>),
-    Stop,
-}
-/// Input is executed on an owning OS thread, including WinRT gamepad lifetime.
-/// Idle leases expire after 30 seconds; callers renew by sending input.
-pub struct DesktopInputSession {
-    commands: mpsc::Sender<InputCommand>,
-    worker: Option<JoinHandle<()>>,
-}
-impl DesktopInputSession {
-    pub fn open(
-        target: DesktopTarget,
-        permissions: LocalNodePermissionStore,
-    ) -> DesktopResult<Self> {
-        Self::open_with_lease(
-            target,
-            permissions,
-            Duration::from_secs(300),
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
-    pub fn open_with_lease(
-        target: DesktopTarget,
-        permissions: LocalNodePermissionStore,
-        duration: Duration,
-        cancelled: Arc<AtomicBool>,
-    ) -> DesktopResult<Self> {
-        authorize(&permissions, &target, "input")?;
-        let deadline = Instant::now() + duration.min(Duration::from_secs(300));
-        let (commands, receiver) = mpsc::channel();
-        let (ready, started) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("desktop-input".into())
-            .spawn(move || {
-                let _thread = match platform::initialize_input_thread() {
-                    Ok(thread) => thread,
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
-                };
-                let mut state = match InputState::open(target, permissions, cancelled, deadline) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                        return;
-                    }
-                };
-                let _ = ready.send(Ok(()));
-                let mut last_input = Instant::now();
-                loop {
-                    match receiver.recv_timeout(Duration::from_millis(100)) {
-                        Ok(InputCommand::Send(events, reply)) => {
-                            let result = state.send(&events);
-                            last_input = Instant::now();
-                            let _ = reply.send(result);
-                        }
-                        Ok(InputCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    if last_input.elapsed() >= Duration::from_secs(30)
-                        || Instant::now() >= state.deadline
-                        || state.cancelled.load(Ordering::Acquire)
-                        || authorize(&state.permissions, &state.target, "input").is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .map_err(|e| DesktopError::Platform(e.to_string()))?;
-        let session = Self {
-            commands,
-            worker: Some(worker),
-        };
-        started
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|e| DesktopError::Platform(format!("input startup: {e}")))??;
-        Ok(session)
-    }
-    pub fn send(&mut self, events: &[DesktopInput]) -> DesktopResult<usize> {
-        let (reply, response) = mpsc::sync_channel(1);
-        self.commands
-            .send(InputCommand::Send(events.to_vec(), reply))
-            .map_err(|_| DesktopError::Closed("input lease ended".into()))?;
-        response
-            .recv()
-            .map_err(|_| DesktopError::Closed("input worker ended".into()))?
-    }
-    pub fn release_all(&mut self) {
-        let _ = self.send(&[DesktopInput::ReleaseAll]);
-    }
-    pub fn stop(&mut self) {
-        let _ = self.commands.send(InputCommand::Stop);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-impl Drop for DesktopInputSession {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopCaptureConfig {
@@ -572,6 +328,11 @@ pub struct DesktopCaptureConfig {
     pub frames_per_second: u32,
     #[serde(default = "default_cursor")]
     pub include_cursor: bool,
+    #[serde(default = "default_capture_lease_ms")]
+    pub lease_ms: u64,
+}
+fn default_capture_lease_ms() -> u64 {
+    300_000
 }
 fn default_fps() -> u32 {
     30
@@ -580,131 +341,34 @@ fn default_cursor() -> bool {
     true
 }
 
-#[derive(Default)]
-struct CaptureState {
-    sample: Option<NativeVideoSample>,
-    error: Option<DesktopError>,
-    closed: bool,
-}
-#[derive(Default)]
-pub(super) struct CaptureMailbox {
-    state: Mutex<CaptureState>,
-    changed: Condvar,
-}
-impl CaptureMailbox {
-    pub(super) fn publish(&self, sample: NativeVideoSample) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).sample = Some(sample);
-        self.changed.notify_all();
-    }
-    fn close(&self, error: Option<DesktopError>) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.sample = None;
-        state.error = error;
-        state.closed = true;
-        self.changed.notify_all();
-    }
-}
-
-/// Continuous compositor capture with a single latest-frame slot. Consumers
-/// select their own cadence. No encoding, polling screenshots, or unbounded queue.
-pub struct DesktopCapture {
-    target: DesktopTarget,
-    permissions: LocalNodePermissionStore,
-    mailbox: Arc<CaptureMailbox>,
-    stop: Option<mpsc::Sender<()>>,
-    worker: Option<JoinHandle<()>>,
-}
-impl DesktopCapture {
-    pub fn start(
-        config: DesktopCaptureConfig,
-        permissions: LocalNodePermissionStore,
-    ) -> DesktopResult<Self> {
-        if !(1..=120).contains(&config.frames_per_second) {
-            return Err(DesktopError::Invalid("capture fps must be 1..120".into()));
-        }
-        authorize(&permissions, &config.target, "capture")?;
-        platform::validate_target(&config.target)?;
-        let mailbox = Arc::new(CaptureMailbox::default());
-        let output = mailbox.clone();
-        let authority = permissions.clone();
-        let target = config.target.clone();
-        let (stop, stopping) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let worker = std::thread::Builder::new()
-            .name("desktop-capture".into())
-            .spawn(move || {
-                let result = platform::capture(config, authority, &output, stopping, ready_tx);
-                output.close(result.err());
-            })
-            .map_err(|e| DesktopError::Platform(e.to_string()))?;
-        let mut capture = Self {
-            target,
-            permissions,
-            mailbox,
-            stop: Some(stop),
-            worker: Some(worker),
-        };
-        match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => Ok(capture),
-            Ok(Err(error)) => {
-                capture.stop();
-                Err(error)
-            }
-            Err(error) => {
-                capture.stop();
-                Err(DesktopError::Platform(format!("capture startup: {error}")))
-            }
-        }
-    }
-    pub fn next(
+/// Continuous native samples consumed by the shared media encoder.
+pub trait DesktopFrameSource: Send {
+    fn next(
         &self,
         after_sequence: u64,
         timeout: Duration,
-    ) -> DesktopResult<Option<NativeVideoSample>> {
-        authorize(&self.permissions, &self.target, "capture")?;
-        let state = self.mailbox.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (state, _) = self
-            .mailbox
-            .changed
-            .wait_timeout_while(state, timeout.min(Duration::from_secs(5)), |s| {
-                !s.closed
-                    && s.sample
-                        .as_ref()
-                        .is_none_or(|sample| sample.sequence <= after_sequence)
-            })
-            .unwrap_or_else(|e| e.into_inner());
-        // Do not return a cached frame across permission revocation.
-        authorize(&self.permissions, &self.target, "capture")?;
-        if let Some(error) = &state.error {
-            return Err(error.clone());
-        }
-        if state.closed {
-            return Err(DesktopError::Closed("capture stopped".into()));
-        }
-        Ok(state
-            .sample
-            .as_ref()
-            .filter(|s| s.sequence > after_sequence)
-            .cloned())
-    }
-    pub fn stop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-impl Drop for DesktopCapture {
-    fn drop(&mut self) {
-        self.stop();
-    }
+    ) -> DesktopResult<Option<NativeVideoSample>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn background_is_default_and_raw_cannot_be_implicit() {
+        assert_eq!(
+            DesktopControlMode::default(),
+            DesktopControlMode::Background
+        );
+        let monitor = DesktopTarget::Monitor {
+            device_name: "test".into(),
+        };
+        assert!(
+            DesktopControlMode::Background
+                .validate_target(&monitor)
+                .is_err()
+        );
+        assert!(DesktopControlMode::Raw.validate_target(&monitor).is_ok());
+    }
     #[test]
     fn frame_coordinates_map_chrome_and_nonzero_origins_without_encoded_size() {
         // Whole-window image point (200, 200), client begins at (2, 45).
@@ -796,41 +460,5 @@ mod tests {
         );
         assert!(validate_inputs(&target, &[DesktopInput::RelativeMove { dx: 1, dy: 1 }]).is_err());
         assert!(validate_inputs(&target, &[DesktopInput::Move { x: 32768, y: 0 }]).is_err());
-    }
-    #[test]
-    fn mailbox_keeps_only_the_latest_frame() {
-        let mailbox = CaptureMailbox::default();
-        for sequence in 1..100 {
-            mailbox.publish(NativeVideoSample {
-                sequence,
-                format: crate::NativeVideoSampleFormat::Gray8,
-                width: 1,
-                height: 1,
-                timestamp_ns: sequence,
-                duration_ns: 1,
-                captured_at_unix_ms: 1,
-                data: Arc::from([1]),
-                planes: Arc::from([crate::NativeVideoPlane {
-                    offset: 0,
-                    len: 1,
-                    width: 1,
-                    height: 1,
-                    stride: 1,
-                }]),
-            });
-        }
-        assert_eq!(
-            mailbox
-                .state
-                .lock()
-                .unwrap()
-                .sample
-                .as_ref()
-                .unwrap()
-                .sequence,
-            99
-        );
-        mailbox.close(None);
-        assert!(mailbox.state.lock().unwrap().sample.is_none());
     }
 }

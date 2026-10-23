@@ -31,11 +31,7 @@ pub(crate) async fn open_desktop_video_source(
     encoding: sinomo_lm::RealtimeVideoInputConfig,
 ) -> Result<sinomo_video::stream::RemoteVideoSource, CliError> {
     use sinomo_actions::desktop::{DesktopModule, DesktopStreamRequest, MEDIA_CATEGORY};
-    let kind = if app {
-        DesktopModule::AppUse
-    } else {
-        DesktopModule::ComputerUse
-    };
+    let kind = DesktopModule::AppUse;
     let client = media_daemon_client(data_dir, node_id).await?;
     let request = DesktopStreamRequest {
         session_id,

@@ -1,11 +1,11 @@
-//! Continuous video over Sinomo's streaming object-RPC media path. Both desktop
-//! modules use this framing and the same encoder as RealtimeSession.
+//! Continuous video over Sinomo's streaming object-RPC media path. Both App Use
+//! control modes use this framing and the same encoder as RealtimeSession.
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     RealtimeEncodedVideoFrameInput, RealtimeVideoFrameFormat, RealtimeVideoFrameInput,
     RealtimeVideoInputConfig, RealtimeVideoPixelFormat,
 };
-use sinomo_runtime::device::desktop::DesktopCapture;
+use sinomo_runtime::device::desktop::DesktopFrameSource;
 use sinomo_runtime::device::{NativeVideoSample, NativeVideoSampleFormat};
 use sinomo_runtime::network::ObjectRpcBodySource;
 use std::io;
@@ -108,7 +108,7 @@ fn record(metadata: &VideoFrameMetadata, image: &[u8]) -> Result<Vec<u8>, String
 /// The source owns capture and stops when the reader drops, the component is
 /// cancelled, local consent is revoked, or the explicit duration expires.
 pub fn desktop_capture_body(
-    capture: DesktopCapture,
+    capture: impl DesktopFrameSource + 'static,
     encoding: RealtimeVideoInputConfig,
     duration: Duration,
     cancelled: Arc<AtomicBool>,
@@ -119,7 +119,6 @@ pub fn desktop_capture_body(
     let worker = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + duration;
         let mut sequence = 0;
-        let mut pending = None;
         let mut next_encode = Instant::now();
         let encode_interval = encoding.model_frame_interval().unwrap_or(Duration::ZERO);
         let result = (|| -> Result<(), String> {
@@ -127,25 +126,25 @@ pub fn desktop_capture_body(
                 && !cancelled.load(Ordering::Acquire)
                 && !sender.is_closed()
             {
-                let timeout = if pending.is_some() && sender.capacity() > 0 {
-                    next_encode
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(100))
-                } else {
-                    Duration::from_millis(100)
-                };
-                if let Some(sample) = capture.next(sequence, timeout).map_err(|e| e.to_string())? {
-                    sequence = sample.sequence;
-                    pending = Some(sample);
-                }
-                // Skip encoding if the consumer is behind, while capture keeps
-                // replacing its latest slot. There is never a growing backlog.
-                if sender.capacity() == 0 || Instant::now() < next_encode {
+                // Native capture keeps its own latest-frame slot. Pull only
+                // when we can encode/send: a provider boundary may copy a full
+                // raw frame, so polling it while backpressured wastes bandwidth.
+                if sender.capacity() == 0 {
+                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
-                let Some(sample) = pending.take() else {
+                let wait = next_encode.saturating_duration_since(Instant::now());
+                if !wait.is_zero() {
+                    std::thread::sleep(wait.min(Duration::from_millis(100)));
+                    continue;
+                }
+                let Some(sample) = capture
+                    .next(sequence, Duration::from_millis(100))
+                    .map_err(|e| e.to_string())?
+                else {
                     continue;
                 };
+                sequence = sample.sequence;
                 let (metadata, encoded) = encode_sample(&sample, &encoding)?;
                 next_encode = Instant::now() + encode_interval;
                 match sender.try_send(record(&metadata, &encoded.image)?) {
@@ -338,6 +337,61 @@ impl Drop for RemoteVideoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn backpressure_does_not_fetch_unconsumed_native_frames() {
+        use std::sync::atomic::AtomicUsize;
+        struct Source(Arc<AtomicUsize>);
+        impl DesktopFrameSource for Source {
+            fn next(
+                &self,
+                _: u64,
+                _: Duration,
+            ) -> sinomo_runtime::device::desktop::DesktopResult<Option<NativeVideoSample>>
+            {
+                let sequence = self.0.fetch_add(1, Ordering::AcqRel) as u64 + 1;
+                Ok(Some(NativeVideoSample {
+                    sequence,
+                    format: NativeVideoSampleFormat::Bgra8,
+                    width: 1,
+                    height: 1,
+                    timestamp_ns: sequence,
+                    duration_ns: 1,
+                    captured_at_unix_ms: 1,
+                    data: Arc::from([0, 0, 0, 255]),
+                    planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+                        offset: 0,
+                        len: 4,
+                        width: 1,
+                        height: 1,
+                        stride: 4,
+                    }]),
+                }))
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (body, worker) = desktop_capture_body(
+            Source(reads.clone()),
+            RealtimeVideoInputConfig {
+                frame_format: RealtimeVideoFrameFormat::Png,
+                max_frame_rate_hz: None,
+                ..Default::default()
+            },
+            Duration::from_secs(2),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let until = tokio::time::Instant::now() + Duration::from_secs(1);
+        while reads.load(Ordering::Acquire) == 0 {
+            assert!(tokio::time::Instant::now() < until);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert_eq!(reads.load(Ordering::Acquire), 1);
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     #[tokio::test]
     async fn bgra_video_uses_the_shared_encoder_and_keeps_capture_metadata() {
         let sample = NativeVideoSample {

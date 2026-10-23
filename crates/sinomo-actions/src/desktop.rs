@@ -1,5 +1,5 @@
-//! Computer Use and App Use are independently enabled lifecycle units. They
-//! share device contracts and media plumbing, not input authority or sessions.
+//! Unified App Use host logic: one tool/skill with background and explicit raw
+//! modes. Native OS effects are provided by the independently loaded OS module.
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{CapabilityName, ModuleCapabilities, TrustRing};
 use sinomo_runtime::device::desktop::*;
@@ -11,15 +11,15 @@ use sinomo_runtime::service::{
     ServiceRegistryBuilder, ServiceRoute, ServiceSigner,
 };
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+pub mod provider;
+use provider::{DesktopProviderClient, NativeDesktopInput};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
-pub const COMPUTER_CONTROL_ROUTE: &str = "/computer-use/control";
-pub const COMPUTER_CAPTURE_ROUTE: &str = "/computer-use/capture";
 pub const APP_CONTROL_ROUTE: &str = "/app-use/control";
 pub const APP_CAPTURE_ROUTE: &str = "/app-use/capture";
 pub const MEDIA_CATEGORY: &str = "media";
@@ -28,80 +28,41 @@ const MAX_LEASE_MS: u64 = 300_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DesktopModule {
-    ComputerUse,
     AppUse,
 }
 impl DesktopModule {
     pub fn legacy_id(self) -> &'static str {
-        match self {
-            Self::ComputerUse => "module.computer-use",
-            Self::AppUse => "module.app-use",
-        }
+        "module.app-use"
     }
     pub fn name(self) -> &'static str {
-        match self {
-            Self::ComputerUse => "computer-use",
-            Self::AppUse => "app-use",
-        }
+        "app-use"
     }
     fn display_name(self) -> &'static str {
-        match self {
-            Self::ComputerUse => "Computer Use",
-            Self::AppUse => "App Use",
-        }
+        "App Use"
     }
     pub fn control_route(self) -> &'static str {
-        match self {
-            Self::ComputerUse => COMPUTER_CONTROL_ROUTE,
-            Self::AppUse => APP_CONTROL_ROUTE,
-        }
+        APP_CONTROL_ROUTE
     }
     pub fn capture_route(self) -> &'static str {
-        match self {
-            Self::ComputerUse => COMPUTER_CAPTURE_ROUTE,
-            Self::AppUse => APP_CAPTURE_ROUTE,
-        }
+        APP_CAPTURE_ROUTE
     }
     fn routes(self) -> &'static [&'static str] {
-        match self {
-            Self::ComputerUse => &[COMPUTER_CONTROL_ROUTE, COMPUTER_CAPTURE_ROUTE],
-            Self::AppUse => &[APP_CONTROL_ROUTE, APP_CAPTURE_ROUTE],
-        }
+        &[APP_CONTROL_ROUTE, APP_CAPTURE_ROUTE]
     }
     fn operation(self) -> &'static str {
-        match self {
-            Self::ComputerUse => "computer.control",
-            Self::AppUse => "app.control",
-        }
+        "app.control"
     }
     fn interface(self) -> &'static str {
-        match self {
-            Self::ComputerUse => "sinomo.computer-use",
-            Self::AppUse => "sinomo.app-use",
-        }
+        "sinomo.app-use"
     }
     fn event_kind(self) -> &'static str {
-        match self {
-            Self::ComputerUse => "computer.use.operation",
-            Self::AppUse => "app.use.operation",
-        }
+        "app.use.operation"
     }
     fn skill(self) -> &'static str {
-        match self {
-            Self::ComputerUse => include_str!("../skills/computer-use/SKILL.md"),
-            Self::AppUse => include_str!("../skills/app-use/SKILL.md"),
-        }
-    }
-    fn check_target(self, target: &DesktopTarget) -> DesktopResult<()> {
-        if target.is_window() != (self == Self::AppUse) {
-            return Err(DesktopError::Invalid(
-                "target belongs to the other desktop module".into(),
-            ));
-        }
-        Ok(())
+        include_str!("../skills/app-use/SKILL.md")
     }
     pub fn module_id(self) -> ModuleId {
-        ModuleId::from_legacy_named(self.legacy_id()).expect("desktop module id")
+        ModuleId::from_legacy_named(self.legacy_id()).expect("app-use module id")
     }
     pub fn enabled(self, root: &Path) -> Result<bool, String> {
         native_rust_module_enabled(root, &self.module_id(), true).map_err(|e| e.to_string())
@@ -112,12 +73,17 @@ impl DesktopModule {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopControlRequest {
     Capabilities,
-    Targets,
+    Targets {
+        #[serde(default)]
+        mode: DesktopControlMode,
+    },
     Children {
         target: DesktopTarget,
     },
     Open {
         target: DesktopTarget,
+        #[serde(default)]
+        mode: DesktopControlMode,
         #[serde(default)]
         input: bool,
         #[serde(default)]
@@ -188,8 +154,9 @@ fn default_cursor() -> bool {
 
 struct Session {
     owner: String,
+    mode: DesktopControlMode,
     target: DesktopTarget,
-    input: Option<Arc<Mutex<DesktopInputSession>>>,
+    input: Option<Arc<Mutex<NativeDesktopInput>>>,
     capture: bool,
     capture_active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -205,12 +172,25 @@ impl Drop for Session {
 }
 #[derive(Default)]
 struct Runtime {
+    root: PathBuf,
+    provider: Mutex<Option<Arc<DesktopProviderClient>>>,
     sessions: Mutex<BTreeMap<String, Session>>,
     workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     closed: AtomicBool,
     changed: tokio::sync::Notify,
 }
 impl Runtime {
+    fn provider(&self) -> DesktopResult<Arc<DesktopProviderClient>> {
+        let mut provider = self.provider.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(provider) = provider.as_ref() {
+            provider.check_current()?;
+            return Ok(provider.clone());
+        }
+        let loaded = DesktopProviderClient::resolve(&self.root)?;
+        *provider = Some(loaded.clone());
+        self.changed.notify_one();
+        Ok(loaded)
+    }
     fn stop(&self) {
         self.closed.store(true, Ordering::Release);
         for session in self
@@ -243,28 +223,22 @@ impl Runtime {
         }
         match request {
             DesktopControlRequest::Capabilities => Ok(DesktopControlResponse::Capabilities {
-                capabilities: capabilities(),
+                capabilities: self.provider()?.capabilities()?,
             }),
-            DesktopControlRequest::Targets => Ok(DesktopControlResponse::Targets {
-                targets: enumerate_targets(&permissions, kind == DesktopModule::AppUse)?,
+            DesktopControlRequest::Targets { mode } => Ok(DesktopControlResponse::Targets {
+                targets: self.provider()?.targets(mode)?,
             }),
-            DesktopControlRequest::Children { target } => {
-                if kind != DesktopModule::AppUse {
-                    return Err(DesktopError::Invalid(
-                        "child windows belong to App Use".into(),
-                    ));
-                }
-                Ok(DesktopControlResponse::Targets {
-                    targets: enumerate_child_windows(&permissions, &target)?,
-                })
-            }
+            DesktopControlRequest::Children { target } => Ok(DesktopControlResponse::Targets {
+                targets: self.provider()?.children(target)?,
+            }),
             DesktopControlRequest::Open {
                 target,
+                mode,
                 input,
                 capture,
                 lease_ms,
             } => {
-                kind.check_target(&target)?;
+                mode.validate_target(&target)?;
                 if !(1_000..=MAX_LEASE_MS).contains(&lease_ms) || (!input && !capture) {
                     return Err(DesktopError::Invalid(
                         "open requires input and/or capture, with lease_ms in 1000..300000".into(),
@@ -275,11 +249,10 @@ impl Runtime {
                 }
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let input = if input {
-                    Some(Arc::new(Mutex::new(DesktopInputSession::open_with_lease(
+                    Some(Arc::new(Mutex::new(self.provider()?.open_input(
                         target.clone(),
-                        permissions,
-                        Duration::from_millis(lease_ms),
-                        cancelled.clone(),
+                        mode,
+                        lease_ms,
                     )?)))
                 } else {
                     None
@@ -300,7 +273,9 @@ impl Runtime {
                 if input.is_some()
                     && sessions.values().any(|session| {
                         session.input.is_some()
-                            && (kind == DesktopModule::ComputerUse || session.target == target)
+                            && (mode == DesktopControlMode::Raw
+                                && session.mode == DesktopControlMode::Raw
+                                || session.target == target)
                     })
                 {
                     return Err(DesktopError::Invalid(
@@ -313,6 +288,7 @@ impl Runtime {
                     session_id.clone(),
                     Session {
                         owner,
+                        mode,
                         target,
                         input,
                         capture,
@@ -335,13 +311,18 @@ impl Runtime {
                 })
             }
             DesktopControlRequest::Input { session_id, events } => {
-                let input = {
+                let (input, mode) = {
                     let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
                     let session = owned_session(&sessions, &session_id, &owner)?;
                     validate_inputs(&session.target, &events)?;
-                    session.input.clone().ok_or_else(|| {
-                        DesktopError::PermissionDenied("session was not opened for input".into())
-                    })?
+                    (
+                        session.input.clone().ok_or_else(|| {
+                            DesktopError::PermissionDenied(
+                                "session was not opened for input".into(),
+                            )
+                        })?,
+                        session.mode,
+                    )
                 };
                 let events = input
                     .lock()
@@ -349,7 +330,7 @@ impl Runtime {
                     .send(&events)?;
                 Ok(DesktopControlResponse::InputApplied {
                     events,
-                    delivery: if kind == DesktopModule::AppUse {
+                    delivery: if mode == DesktopControlMode::Background {
                         "queued window messages; application handling is best effort"
                     } else {
                         "OS input injection accepted"
@@ -447,7 +428,7 @@ impl Service for DesktopService {
                     .await?;
                 let action = match &command {
                     DesktopControlRequest::Capabilities => "capabilities",
-                    DesktopControlRequest::Targets => "targets",
+                    DesktopControlRequest::Targets { .. } => "targets",
                     DesktopControlRequest::Children { .. } => "children",
                     DesktopControlRequest::Open { .. } => "open",
                     DesktopControlRequest::Input { .. } => "input",
@@ -508,15 +489,16 @@ impl Service for DesktopService {
                     target,
                     frames_per_second: capture_request.frames_per_second,
                     include_cursor: capture_request.include_cursor,
+                    lease_ms: duration.as_millis().min(MAX_LEASE_MS as u128) as u64,
                 };
                 if self.state.closed.load(Ordering::Acquire) {
                     return Err(service_error("module is unloading"));
                 }
-                let capture =
-                    tokio::task::spawn_blocking(move || DesktopCapture::start(config, permissions))
-                        .await
-                        .map_err(service_error)?
-                        .map_err(service_error)?;
+                let native = self.state.provider().map_err(service_error)?;
+                let capture = tokio::task::spawn_blocking(move || native.capture(config))
+                    .await
+                    .map_err(service_error)?
+                    .map_err(service_error)?;
                 let (body, worker) = sinomo_video::stream::desktop_capture_body(
                     capture,
                     capture_request.encoding,
@@ -601,28 +583,28 @@ fn service_route(kind: DesktopModule, route: &'static str) -> ServiceRoute {
     })
 }
 
-fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
+fn control_request_schema(_kind: DesktopModule) -> serde_json::Value {
     use serde_json::{Value, json};
     fn object(properties: Value, required: &[&str]) -> Value {
         json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
     }
     let integer = json!({"type":"integer"});
-    let target = match kind {
-        DesktopModule::ComputerUse => object(
-            json!({"kind":{"type":"string","enum":["monitor"]},"device_name":{"type":"string","description":"Exact enumerated device_name"}}),
-            &["kind", "device_name"],
-        ),
-        DesktopModule::AppUse => object(
-            json!({"kind":{"type":"string","enum":["window"]},"handle":integer,"process_id":integer,"thread_id":integer,"process_started":integer}),
-            &[
-                "kind",
-                "handle",
-                "process_id",
-                "thread_id",
-                "process_started",
-            ],
-        ),
-    };
+    let monitor = object(
+        json!({"kind":{"type":"string","enum":["monitor"]},"device_name":{"type":"string","description":"Exact device_name from targets with mode raw"}}),
+        &["kind", "device_name"],
+    );
+    let window = object(
+        json!({"kind":{"type":"string","enum":["window"]},"handle":integer,"process_id":integer,"thread_id":integer,"process_started":integer}),
+        &[
+            "kind",
+            "handle",
+            "process_id",
+            "thread_id",
+            "process_started",
+        ],
+    );
+    let target = json!({"oneOf":[window,monitor]});
+    let mode = json!({"type":"string","enum":["background","raw"],"default":"background","description":"Prefer background window messages. Select raw explicitly only when background input is unsuitable; raw requires a monitor and affects user input/focus. No automatic fallback."});
     let mut events = vec![
         object(
             json!({"kind":{"type":"string","enum":["move"]},"x":integer,"y":integer}),
@@ -637,7 +619,7 @@ fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
             &["kind", "text"],
         ),
         object(
-            json!({"kind":{"type":"string","enum":["key"]},"code":{"type":"integer","minimum":1,"maximum":255,"description":if kind==DesktopModule::AppUse{"Windows virtual-key code"}else{"Set-1 scan code"}},"down":{"type":"boolean"},"extended":{"type":"boolean"}}),
+            json!({"kind":{"type":"string","enum":["key"]},"code":{"type":"integer","minimum":1,"maximum":255,"description":"Windows virtual-key code in background mode; Set-1 scan code in raw mode"},"down":{"type":"boolean"},"extended":{"type":"boolean"}}),
             &["kind", "code", "down"],
         ),
         object(
@@ -649,7 +631,7 @@ fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
             &["kind"],
         ),
     ];
-    if kind == DesktopModule::AppUse {
+    {
         let fraction = json!({"type":"number","minimum":0,"maximum":1,"description":"Fraction of the entire image: 0 is left/top, 1 is right/bottom. No pixel, screen-origin, client or DPI conversion."});
         let source_size = json!({"type":"integer","minimum":1,"description":"Copy source_width/source_height from the current video frame metadata, before encoding. Stale sizes are rejected."});
         events.push(object(
@@ -657,7 +639,7 @@ fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
             &["kind", "x", "y", "source_width", "source_height"],
         ));
     }
-    if kind == DesktopModule::ComputerUse {
+    {
         events.push(object(
             json!({"kind":{"type":"string","enum":["relative_move"]},"dx":integer,"dy":integer}),
             &["kind", "dx", "dy"],
@@ -668,11 +650,15 @@ fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
     }
     let mut actions = vec![
         object(
-            json!({"action":{"type":"string","enum":["capabilities","targets"]}}),
+            json!({"action":{"type":"string","enum":["targets"]},"mode":mode}),
             &["action"],
         ),
         object(
-            json!({"action":{"type":"string","enum":["open"]},"target":target,"input":{"type":"boolean"},"capture":{"type":"boolean"},"lease_ms":{"type":"integer","minimum":1000,"maximum":300000}}),
+            json!({"action":{"type":"string","enum":["capabilities"]}}),
+            &["action"],
+        ),
+        object(
+            json!({"action":{"type":"string","enum":["open"]},"target":target,"mode":mode,"input":{"type":"boolean"},"capture":{"type":"boolean"},"lease_ms":{"type":"integer","minimum":1000,"maximum":300000}}),
             &["action", "target"],
         ),
         object(
@@ -684,13 +670,13 @@ fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
             &["action", "session_id"],
         ),
     ];
-    if kind == DesktopModule::AppUse {
+    {
         actions.push(object(
-            json!({"action":{"type":"string","enum":["children"]},"target":target}),
+            json!({"action":{"type":"string","enum":["children"]},"target":window}),
             &["action", "target"],
         ));
     }
-    json!({"oneOf":actions,"description":"Desktop control request. For app video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels for app use, virtual-desktop pixels for computer use. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
+    json!({"oneOf":actions,"description":"Unified App Use control request. Background window messages are preferred; raw desktop input requires an explicit raw session. For background video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels in background mode, virtual-desktop pixels in raw mode. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
 }
 
 pub fn module_registration(kind: DesktopModule) -> ModuleRegistration {
@@ -759,7 +745,10 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
         let runtime = context.runtime().ok_or_else(|| {
             ComponentError::component(&caller.component_id, "desktop module requires runtime")
         })?;
-        let state = Arc::new(Runtime::default());
+        let state = Arc::new(Runtime {
+            root: context.data_dir_root(),
+            ..Runtime::default()
+        });
         let events = context.event_client(&caller)?;
         scope.set_services(
             ServiceRegistryBuilder::default()
@@ -774,13 +763,26 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
         let reaper = state.clone();
         scope.own_task("desktop-session-expiry", runtime.spawn(async move {
             loop {
-                let deadline = reaper.sessions.lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| s.expires).min();
+                let mut deadline = reaper.sessions.lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| s.expires).min();
+                if reaper.provider.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                    let check = Instant::now() + Duration::from_millis(500);
+                    deadline = Some(deadline.map_or(check, |expires| expires.min(check)));
+                }
                 let wait = async { if let Some(deadline) = deadline { tokio::time::sleep_until(deadline.into()).await; } else { std::future::pending::<()>().await; } };
                 tokio::select! { _ = shutdown.changed() => break, _ = reaper.changed.notified() => {}, _ = wait => {} }
                 let state = reaper.clone();
                 let cleanup = tokio::task::spawn_blocking(move || {
                     let mut sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
                     sessions.retain(|_, session| session.expires > Instant::now());
+                    let mut provider = state.provider.lock().unwrap_or_else(|e| e.into_inner());
+                    if provider.as_ref().is_some_and(|provider| provider.check_current().is_err()) {
+                        sessions.clear();
+                        provider.take();
+                    } else if sessions.is_empty() && provider.as_ref().is_some_and(|provider| Arc::strong_count(provider) == 1) {
+                        // No idle polling or loaded DLL once the last operation
+                        // and session release their provider references.
+                        provider.take();
+                    }
                 });
                 let mut workers = reaper.workers.lock().unwrap_or_else(|e| e.into_inner());
                 workers.retain(|worker| !worker.is_finished());
@@ -817,6 +819,11 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
                         return Err("desktop capture teardown is still draining".into());
                     }
                 }
+                state
+                    .provider
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
                 Ok(())
             }
         });
@@ -828,10 +835,51 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_os_provider_has_no_linked_fallback() {
+        let root = sinomo_testdir::TestDir::new("app-use-missing-provider");
+        let permissions = LocalNodePermissionStore::new(&root);
+        let mut grants = sinomo_runtime::node::LocalNodePermissions::new();
+        grants.set_remote_management_enabled(true);
+        permissions.save(&grants).unwrap();
+        let runtime = Runtime {
+            root: root.to_path_buf(),
+            ..Runtime::default()
+        };
+        assert!(matches!(
+            runtime.control(
+                DesktopModule::AppUse,
+                permissions,
+                "owner".into(),
+                DesktopControlRequest::Targets {
+                    mode: DesktopControlMode::Background
+                }
+            ),
+            Err(DesktopError::Unsupported(_))
+        ));
+        assert!(runtime.provider.lock().unwrap().is_none());
+    }
 
     #[test]
+    fn omitted_mode_stays_background_and_old_computer_tool_is_absent() {
+        let request: DesktopControlRequest = serde_json::from_value(serde_json::json!({"action":"open","target":{"kind":"monitor","device_name":"test"},"input":true})).unwrap();
+        let DesktopControlRequest::Open { mode, target, .. } = request else {
+            panic!("open");
+        };
+        assert_eq!(mode, DesktopControlMode::Background);
+        assert!(mode.validate_target(&target).is_err());
+        let registration = module_registration(DesktopModule::AppUse);
+        assert_eq!(registration.surfaces.object_rpc_routes.len(), 1);
+        assert_eq!(
+            registration.surfaces.object_rpc_routes[0].route,
+            APP_CONTROL_ROUTE
+        );
+        assert_eq!(registration.surfaces.declarative_resources[0].id, "app-use");
+    }
+    #[test]
     fn desktop_control_tools_publish_typed_event_schemas() {
-        for kind in [DesktopModule::AppUse, DesktopModule::ComputerUse] {
+        {
+            let kind = DesktopModule::AppUse;
             let registration = module_registration(kind);
             let schema = registration.surfaces.object_rpc_routes[0]
                 .request_schema
@@ -880,21 +928,20 @@ mod tests {
                 events
                     .iter()
                     .any(|event| event["properties"]["kind"]["enum"][0] == "gamepad"),
-                kind == DesktopModule::ComputerUse
+                kind == DesktopModule::AppUse
             );
         }
     }
     #[test]
-    fn both_modules_finalize_without_route_collisions_and_have_independent_skills() {
+    fn unified_module_finalizes_with_one_skill_and_both_input_modes() {
         let catalog = ComponentCatalog::builder()
-            .register_module(module_registration(DesktopModule::ComputerUse))
-            .unwrap()
             .register_module(module_registration(DesktopModule::AppUse))
             .unwrap()
             .build()
             .unwrap();
         drop(catalog);
-        for kind in [DesktopModule::ComputerUse, DesktopModule::AppUse] {
+        {
+            let kind = DesktopModule::AppUse;
             component_factory(kind).unwrap();
             assert_eq!(
                 module_registration(kind)
@@ -910,13 +957,15 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("desktop-module-consent");
         let permissions = LocalNodePermissionStore::new(&root);
         let state = Runtime::default();
-        let kind = DesktopModule::ComputerUse;
+        let kind = DesktopModule::AppUse;
         assert!(matches!(
             state.control(
                 kind,
                 permissions.clone(),
                 "caller".into(),
-                DesktopControlRequest::Targets
+                DesktopControlRequest::Targets {
+                    mode: DesktopControlMode::Background
+                }
             ),
             Err(DesktopError::PermissionDenied(_))
         ));
@@ -933,10 +982,10 @@ mod tests {
         ));
     }
     #[test]
-    fn app_module_cannot_request_desktop_effects() {
+    fn background_mode_rejects_monitor_targets() {
         assert!(
-            DesktopModule::AppUse
-                .check_target(&DesktopTarget::Monitor {
+            DesktopControlMode::Background
+                .validate_target(&DesktopTarget::Monitor {
                     device_name: "display".into()
                 })
                 .is_err()
@@ -961,14 +1010,13 @@ mod tests {
         let context =
             ComponentContext::new(data_dir.clone()).with_runtime(tokio::runtime::Handle::current());
         let mut reconciler = ComponentReconciler::new(context, ServiceRegistry::default());
-        let factories: Vec<Arc<dyn ComponentFactory>> =
-            [DesktopModule::ComputerUse, DesktopModule::AppUse]
-                .into_iter()
-                .map(|kind| Arc::new(component_factory(kind).unwrap()) as Arc<dyn ComponentFactory>)
-                .collect();
-        assert_eq!(reconciler.reconcile(&factories).unwrap().active.len(), 2);
+        let factories: Vec<Arc<dyn ComponentFactory>> = [DesktopModule::AppUse]
+            .into_iter()
+            .map(|kind| Arc::new(component_factory(kind).unwrap()) as Arc<dyn ComponentFactory>)
+            .collect();
+        assert_eq!(reconciler.reconcile(&factories).unwrap().active.len(), 1);
         let snapshot = reconciler.service_registry().active_snapshot();
-        assert_eq!(snapshot.registry().route_count(), 4);
+        assert_eq!(snapshot.registry().route_count(), 2);
         let response = Arc::new(Mutex::new(None));
         snapshot
             .registry()
@@ -984,9 +1032,11 @@ mod tests {
                     Box::new(Sink(response.clone())),
                 ),
                 ObjectRpcRequest::encode_body(
-                    COMPUTER_CONTROL_ROUTE,
-                    "computer-use",
-                    &DesktopControlRequest::Targets,
+                    APP_CONTROL_ROUTE,
+                    "app-use",
+                    &DesktopControlRequest::Targets {
+                        mode: DesktopControlMode::Background,
+                    },
                 )
                 .unwrap(),
             )
@@ -1018,7 +1068,7 @@ mod tests {
             .shutdown_and_wait(Duration::from_secs(3))
             .await
             .unwrap();
-        assert_eq!(reconciler.reconcile(&factories).unwrap().active.len(), 2);
+        assert_eq!(reconciler.reconcile(&factories).unwrap().active.len(), 1);
         reconciler
             .shutdown_and_wait(Duration::from_secs(3))
             .await
@@ -1040,11 +1090,12 @@ mod tests {
         let state = Runtime::default();
         let response = state
             .control(
-                DesktopModule::ComputerUse,
+                DesktopModule::AppUse,
                 permissions.clone(),
                 "owner".into(),
                 DesktopControlRequest::Open {
                     target,
+                    mode: DesktopControlMode::Raw,
                     input: false,
                     capture: true,
                     lease_ms: 1000,
@@ -1057,7 +1108,7 @@ mod tests {
         assert!(
             state
                 .control(
-                    DesktopModule::ComputerUse,
+                    DesktopModule::AppUse,
                     permissions.clone(),
                     "other".into(),
                     DesktopControlRequest::Close {
@@ -1073,7 +1124,7 @@ mod tests {
         }
         state
             .control(
-                DesktopModule::ComputerUse,
+                DesktopModule::AppUse,
                 permissions,
                 "owner".into(),
                 DesktopControlRequest::Close { session_id },

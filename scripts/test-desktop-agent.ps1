@@ -3,6 +3,7 @@ param(
     [ValidateSet('responses','realtime')][string]$AgentRuntime = 'responses',
     [string]$Case,
     [string]$Binary,
+    [string]$AppUseModule,
     [string]$Credentials,
     [string]$RunDirectory,
     [ValidateRange(128,4096)][int]$CaptureMaxDimension = 1440,
@@ -108,6 +109,8 @@ if ($Watchdog) {
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (!$Binary) { $Binary = Join-Path $repo 'target/debug/sinomo.exe' }
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
+if (!$AppUseModule) { $AppUseModule = Join-Path (Split-Path -Parent $Binary) 'sinomo_app_use_module.dll' }
+$AppUseModule = (Resolve-Path -LiteralPath $AppUseModule).Path
 if (!$Credentials) { $Credentials = Join-Path $env:USERPROFILE '.sinomo/configs/lm/credentials/codex.json' }
 $Credentials = (Resolve-Path -LiteralPath $Credentials).Path
 $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source
@@ -138,6 +141,7 @@ try {
     if ($Case) { $arguments += $Case } else { $arguments += @('--tag','agent-desktop') }
     $arguments += @('--provider','codex','--model',$Model,'--live','--json',
         '--param',('agent-runtime='+$AgentRuntime),
+        '--param',('app-use-module='+$AppUseModule),
         '--param',('capture-max-dimension='+$CaptureMaxDimension),
         '--param',('artifacts-dir='+$RunDirectory),'--param',('desktop-name='+$desktopName),
         '--param',('ffmpeg='+$ffmpeg),'--param',('ffprobe='+$ffprobe))
@@ -145,11 +149,12 @@ try {
     if ($CoordinateGrid) { $arguments += @('--param','coordinate-grid=true') }
     if ($UseInteractiveDesktop) { $arguments += @('--param','interactive-fixture=true') }
     $sourceFiles = @(& git -C $repo diff --name-only) + @(& git -C $repo ls-files --others --exclude-standard)
+    $deletedSources = @(& git -C $repo diff --name-only --diff-filter=D)
     $hashes = @($sourceFiles | Sort-Object -Unique | ForEach-Object {
         $candidate = Join-Path $repo $_
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { @{path=$_;sha256=(Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash} }
     })
-    @{head=(& git -C $repo rev-parse HEAD);modified_sources=$hashes;model=$Model;agent_runtime=$AgentRuntime;binary=$Binary;binary_sha256=(Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash} |
+    @{head=(& git -C $repo rev-parse HEAD);modified_sources=$hashes;deleted_sources=$deletedSources;model=$Model;agent_runtime=$AgentRuntime;binary=$Binary;binary_sha256=(Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash;app_use_module=$AppUseModule;app_use_module_sha256=(Get-FileHash -LiteralPath $AppUseModule -Algorithm SHA256).Hash} |
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $RunDirectory 'source.json')
     [uint32]$childId=0
     $childHandle = [DesktopHarness]::Start($Binary,$arguments,$desktopName,$repo,(Join-Path $RunDirectory 'report.json'),(Join-Path $RunDirectory 'runtime.log'),[ref]$childId)

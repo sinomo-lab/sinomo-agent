@@ -1,6 +1,8 @@
 //! Exercise the real component/device/media boundary without external model
 //! credentials or input to any user-owned application.
 #![cfg(target_os = "windows")]
+#[path = "support/app_use.rs"]
+mod support;
 use sinomo_actions::desktop::*;
 use sinomo_runtime::device::desktop::*;
 use sinomo_runtime::module::*;
@@ -129,6 +131,7 @@ async fn invoke<T: serde::Serialize>(
 #[ignore = "requires an interactive Windows desktop; creates an owned background window"]
 async fn app_component_streams_live_video_over_the_shared_rpc_media_path() {
     let root = sinomo_testdir::TestDir::new("desktop-component-media");
+    support::install(&root);
     let data_dir = Arc::new(sinomo_runtime::local::SinomoDataDir::new(&root));
     let store = LocalNodePermissionStore::new(&root);
     let mut grants = LocalNodePermissions::new();
@@ -148,7 +151,9 @@ async fn app_component_streams_live_video_over_the_shared_rpc_media_path() {
         &data_dir,
         APP_CONTROL_ROUTE,
         "app-use",
-        &DesktopControlRequest::Targets,
+        &DesktopControlRequest::Targets {
+            mode: DesktopControlMode::Background,
+        },
     )
     .await
     .into_materialized_value_response(1024 * 1024)
@@ -171,6 +176,7 @@ async fn app_component_streams_live_video_over_the_shared_rpc_media_path() {
         "app-use",
         &DesktopControlRequest::Open {
             target,
+            mode: DesktopControlMode::Background,
             input: false,
             capture: true,
             lease_ms: 30_000,

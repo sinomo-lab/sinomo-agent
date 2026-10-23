@@ -176,7 +176,7 @@ tighten their checks by hand.
 Build the opt-in fixture host, then run the real agent against owned test windows:
 
 ```powershell
-cargo build -p sinomo --features desktop-e2e
+cargo build -p sinomo -p sinomo-app-use-module --features sinomo/desktop-e2e
 .\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop
 # Run just one case:
 .\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop -Case agent.desktop.app-drag-resize
@@ -186,6 +186,12 @@ cargo build -p sinomo --features desktop-e2e
 .\scripts\test-desktop-agent.ps1 -AgentRuntime realtime -Model gpt-realtime-2 -UseInteractiveDesktop -Case agent.desktop.app-drag-resize -CaptureMaxDimension 768 -CoordinateGrid
 ```
 
+The launcher loads `sinomo_app_use_module.dll` beside the test binary;
+`-AppUseModule` selects another explicitly built artifact. Its hash is recorded
+and the normal native installer activates it only in the fresh test data directory.
+No OS implementation is linked into the fixture host. Background and raw cases
+use the same control tool with an explicit session mode.
+
 The launcher requires `ffmpeg` and `ffprobe` on PATH and an existing Sinomo Codex
 credential. `-Credentials` can select another stored credential file. It reads
 the token without copying it into the result bundle, checks expiry before each
@@ -194,7 +200,7 @@ expired or rejected credentials. The requested model is sent unchanged; absence
 from a provider's menu does not trigger model substitution.
 
 Each case creates a fresh data directory, local resource grants, a component
-host with only its desktop module, and a real `AgentSessionRuntime`. The normal
+host with the unified App Use service, its installed native OS artifact, and a real `AgentSessionRuntime`. The normal
 module tool projection and service dispatch handle actual model tool calls.
 Local object-RPC uses production body framing and ownership through the network
 test-support adapter. No daemon, cluster, operator workspace or distributed
@@ -222,7 +228,7 @@ encoding and model-side resizing do not require the agent to scale pixel
 coordinates. Resize and subsequent actions use separate observe/act steps.
 The Windows device integration test covers physical and normalized input in
 both per-monitor-aware and DPI-unaware windows without foreground or pointer
-changes (`cargo test -p sinomo-device --test desktop_windows -- --ignored --test-threads=1`).
+changes (`cargo test -p sinomo-actions --test app_use_native_windows -- --ignored --test-threads=1`).
 `-CoordinateGrid` enables content-independent coordinate rulers in the shared
 encoder after resizing, without changing the viewport. The recording and model
 receive the same annotated frames. This is an optional grounding aid, not control

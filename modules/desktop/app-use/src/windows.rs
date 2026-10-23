@@ -1,5 +1,5 @@
 use super::*;
-use crate::{NativeVideoPlane, NativeVideoSampleFormat};
+use sinomo_device::{NativeVideoPlane, NativeVideoSampleFormat};
 use std::ffi::c_void;
 use std::mem::size_of;
 use windows::Foundation::{EventHandler, TypedEventHandler};
@@ -728,7 +728,11 @@ pub fn capture(
     let mut next_frame = Instant::now();
     let mut pending_frame = false;
     let mut sequence = 0;
+    let deadline = Instant::now() + Duration::from_millis(config.lease_ms.min(300_000));
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
         match stop.try_recv() {
             Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}

@@ -9584,6 +9584,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-app-use-module"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-core",
+ "sinomo-device",
+ "sinomo-module-api",
+ "windows",
+]
+
+[[package]]
 name = "sinomo-audio"
 version = "0.1.0"
 dependencies = [
@@ -9831,13 +9842,13 @@ dependencies = [
  "cpal",
  "nokhwa",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sinomo-core",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "tokio",
  "v4l",
- "windows",
 ]
 
 [[package]]

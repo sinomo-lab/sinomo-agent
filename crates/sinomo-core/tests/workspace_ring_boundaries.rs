@@ -532,6 +532,31 @@ fn evolution_is_an_external_module_not_a_host_dependency() {
 }
 
 #[test]
+fn app_use_os_integration_is_an_external_leaf() {
+    let packages = read_workspace_packages();
+    let provider = packages
+        .get("sinomo-app-use-module")
+        .expect("native App Use OS provider");
+    assert!(is_native_module_package(provider));
+    for package in packages
+        .values()
+        .filter(|package| !is_native_module_package(package))
+    {
+        assert!(
+            !package.dependencies.contains(&provider.name),
+            "{} must load the OS provider through the native ABI",
+            package.name
+        );
+    }
+    let device = packages.get("sinomo-device").unwrap();
+    let manifest = fs::read_to_string(&device.manifest_path).unwrap();
+    assert!(
+        !manifest.contains("Graphics_Capture") && !manifest.contains("UI_Input_Preview_Injection"),
+        "desktop OS bindings belong in the native provider"
+    );
+}
+
+#[test]
 fn external_component_fixture_is_not_a_core_workspace_dependency() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

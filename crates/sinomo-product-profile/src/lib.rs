@@ -311,7 +311,8 @@ pub fn base_component_catalog(
         )
     {
         use sinomo_actions::desktop::{self, DesktopModule};
-        for kind in [DesktopModule::ComputerUse, DesktopModule::AppUse] {
+        {
+            let kind = DesktopModule::AppUse;
             let enabled = kind.enabled(&data_dir.root()).unwrap_or(false);
             let registration = desktop::module_registration(kind);
             builder = if enabled {
@@ -486,7 +487,8 @@ mod tests {
             ProductComponentProfile::embedded(false),
         ] {
             let catalog = base_component_catalog(&root, profile).unwrap();
-            for kind in [DesktopModule::ComputerUse, DesktopModule::AppUse] {
+            {
+                let kind = DesktopModule::AppUse;
                 assert!(catalog.factory(kind.module_id().as_str()).is_some());
             }
         }
@@ -495,28 +497,24 @@ mod tests {
             ProductComponentProfile::mobile_embedded(false),
         ] {
             let catalog = base_component_catalog(&root, profile).unwrap();
-            for kind in [DesktopModule::ComputerUse, DesktopModule::AppUse] {
+            {
+                let kind = DesktopModule::AppUse;
                 assert!(catalog.modules().get(&kind.module_id()).is_none());
             }
         }
         sinomo_runtime::module::set_native_rust_module_enabled(
             &root.root(),
-            &DesktopModule::ComputerUse.module_id(),
+            &DesktopModule::AppUse.module_id(),
             false,
             "test",
-            "independent disable",
+            "unified app-use disable",
         )
         .unwrap();
         let catalog = base_component_catalog(&root, ProductComponentProfile::main(false)).unwrap();
         assert!(
             catalog
-                .factory(DesktopModule::ComputerUse.module_id().as_str())
-                .is_none()
-        );
-        assert!(
-            catalog
                 .factory(DesktopModule::AppUse.module_id().as_str())
-                .is_some()
+                .is_none()
         );
         assert!(
             !sinomo_runtime::node::LocalNodePermissionStore::new(root.root())
@@ -537,8 +535,6 @@ mod tests {
         let catalog =
             base_component_catalog(&data_dir, ProductComponentProfile::main(true)).unwrap();
         let without = catalog
-            .without_module(&DesktopModule::ComputerUse.module_id())
-            .unwrap()
             .without_module(&DesktopModule::AppUse.module_id())
             .unwrap();
         let with_layout =

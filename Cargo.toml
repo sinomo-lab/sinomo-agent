@@ -170,6 +170,7 @@ sinomo-module = { path = "crates/sinomo-module" }
 sinomo-cli-registry = { path = "crates/sinomo-cli-registry" }
 sinomo-api = { path = "crates/sinomo-api" }
 sinomo-module-api = { path = "crates/sinomo-module-api" }
+sinomo-device = { path = "crates/sinomo-device" }
 sinomo-core = { path = "crates/sinomo-core", default-features = false }
 sinomo-config = { path = "crates/sinomo-config" }
 sinomo-testdir = { path = "crates/sinomo-testdir" }

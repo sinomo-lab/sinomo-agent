@@ -1370,7 +1370,8 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let projection = sinomo_agent::product_module_tool_projection(&data_dir).unwrap();
         let bindings = projection.project_bindings();
-        for route in [COMPUTER_CONTROL_ROUTE, APP_CONTROL_ROUTE] {
+        {
+            let route = APP_CONTROL_ROUTE;
             assert_eq!(
                 bindings
                     .iter()
@@ -1379,12 +1380,14 @@ mod tests {
                 1
             );
         }
-        assert!(!bindings.iter().any(|binding| {
-            [COMPUTER_CAPTURE_ROUTE, APP_CAPTURE_ROUTE].contains(&binding.route.as_str())
-        }));
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| { [APP_CAPTURE_ROUTE].contains(&binding.route.as_str()) })
+        );
         sinomo_runtime::module::set_native_rust_module_enabled(
             &data_dir.root(),
-            &DesktopModule::ComputerUse.module_id(),
+            &DesktopModule::AppUse.module_id(),
             false,
             "test",
             "tool withdrawal",
@@ -1395,12 +1398,6 @@ mod tests {
             !projection
                 .project_bindings()
                 .iter()
-                .any(|binding| binding.route == COMPUTER_CONTROL_ROUTE)
-        );
-        assert!(
-            projection
-                .project_bindings()
-                .iter()
                 .any(|binding| binding.route == APP_CONTROL_ROUTE)
         );
         assert!(
@@ -1408,7 +1405,7 @@ mod tests {
                 .registrations
                 .iter()
                 .flat_map(|r| &r.surfaces.declarative_resources)
-                .any(|skill| skill.id == "computer-use")
+                .any(|skill| skill.id == "app-use")
         );
     }
 

@@ -192,13 +192,41 @@ fn run_live(
     {
         return Err("fixture did not establish the required foreground ownership".into());
     }
-    let kind = if case.raw() {
-        DesktopModule::ComputerUse
+    let kind = DesktopModule::AppUse;
+    let mode = if case.raw() {
+        DesktopControlMode::Raw
     } else {
-        DesktopModule::AppUse
+        DesktopControlMode::Background
     };
-    let target_info = sinomo_runtime::device::desktop::enumerate_targets(&permissions, !case.raw())
-        .map_err(|e| e.to_string())?
+    let artifact = PathBuf::from(
+        ctx.required_parameter("app-use-module")
+            .map_err(|e| e.to_string())?,
+    );
+    sinomo_runtime::module::install_native_dylib_module_from_file(
+        &data.root(),
+        &artifact,
+        sinomo_runtime::module::NativeDylibModuleInstallRequest {
+            expected_module_id: Some(
+                sinomo_runtime::module::ModuleId::from_legacy_named(
+                    sinomo_runtime::device::desktop::protocol::APP_USE_OS_MODULE_ID,
+                )
+                .unwrap(),
+            ),
+            artifact_id: None,
+            expected_interface_version: Some("sinomo.app-use.os.v1".into()),
+            cache_key: Some(sinomo_runtime::device::desktop::protocol::APP_USE_OS_CACHE_KEY.into()),
+            library_name: None,
+            source: "desktop-e2e verified local artifact".into(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let targets = {
+        let provider =
+            sinomo_actions::desktop::provider::DesktopProviderClient::resolve(&data.root())
+                .map_err(|e| e.to_string())?;
+        provider.targets(mode).map_err(|e| e.to_string())?
+    };
+    let target_info = targets
         .into_iter()
         .find(|item| match &item.target {
             DesktopTarget::Window { handle, .. } => *handle == window.handle,
@@ -217,6 +245,7 @@ fn run_live(
     }
     permissions.save(&grants).map_err(|e| e.to_string())?;
     let allowed = target_info.target.clone();
+    let allowed_bounds = target_info.bounds;
     let fixture_handle = window.handle;
     let raw = case.raw();
     let expected_desktop = desktop.to_string();
@@ -232,10 +261,15 @@ fn run_live(
             let command: DesktopControlRequest =
                 request.decode_body().map_err(|e| e.to_string())?;
             match command {
-                DesktopControlRequest::Targets=>return Err("fixture discovery is scoped to the assigned target; use the supplied target identity and current video dimensions".into()),
+                DesktopControlRequest::Targets{..}=>return Err("fixture discovery is scoped to the assigned target; use the supplied target identity and current video dimensions".into()),
                 DesktopControlRequest::Open{target,..}|DesktopControlRequest::Children{target} if target!=allowed=>return Err("target is outside the owned test resource".into()),
                 DesktopControlRequest::Input{events,..}=>{
                     if raw&&unsafe{windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize as u64}!=fixture_handle{return Err("raw input stopped because the owned fixture lost foreground".into());}
+                    if raw && events.iter().any(|event| match event {
+                        DesktopInput::Move { x, y } => *x < allowed_bounds[0] || *x >= allowed_bounds[2] || *y < allowed_bounds[1] || *y >= allowed_bounds[3],
+                        DesktopInput::RelativeMove { .. } => true,
+                        _ => false,
+                    }) { return Err("raw test motion must stay inside the owned fixture; relative motion is not part of these cases".into()); }
                     if events.iter().any(|event|matches!(event,DesktopInput::Key{code,..} if [0x5b,0x5c,0x5d].contains(code)||(raw&&*code==0x38))){return Err("system hotkeys are outside the test task".into());}
                 }
                 _=>{}
@@ -265,6 +299,7 @@ fn run_live(
         kind.name(),
         &DesktopControlRequest::Open {
             target: target_info.target.clone(),
+            mode,
             input: false,
             capture: true,
             lease_ms: 300_000,
@@ -399,6 +434,7 @@ fn run_live(
         }
         task.push_str(" Do not copy example coordinates from the skill. Capture is already streaming to you: open input=true, capture=false with lease_ms=180000, then use only input and close. Keep speech brief and perform the task with native function calls.");
     }
+    task.push_str(&format!(" Use mode={} in the open request for this case. This is an explicit test of that input mode.", if raw { "raw" } else { "background" }));
     let system = format!(
         "You are an actual Sinomo agent performing a bounded acceptance task in an owned Windows test window with isolated runtime state. Use only the offered module control tool; do not delegate or invent other tools. A fresh video frame is supplied before each model request. Coordinate metadata accompanies it. The test window belongs to this task. Use the exact target below when opening an input=true, capture=false, lease_ms=180000 session. All observation recording is already running independently. Do not open a second capture. Query capabilities if useful. Global target discovery is intentionally denied; use the assigned target. The window origin stays fixed if it resizes, and current video metadata supplies the updated dimensions. Use one tool invocation at a time, but batch related input events. Always pair button/key down and up. For background app input send move before clicks, use VK_RETURN 13 for Enter; computer use uses scan-code 28 for Enter. Only claim completion after observing the resulting state.\nTARGET INFO:\n{}\nMODULE SKILL:\n{}",
         serde_json::to_string(&target_info).unwrap(),
