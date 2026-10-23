@@ -136,32 +136,8 @@ impl LocalSobjMetadataBackend {
         if self.materialized_through_sequence < persisted_through_sequence {
             self.refresh_after_metadata_write_lock()?;
         }
-        let mut validation_tables = self.tables.clone();
-        for entry in batch
-            .entries
-            .iter()
-            .filter(|entry| entry.sequence > self.materialized_through_sequence)
-        {
-            let op = match &entry.mutation {
-                DfsMetadataMutation::PrepareOperationV7 { record, .. } => {
-                    DfsMetadataTableOp::PutPreparedOperationV7 {
-                        record: record.clone(),
-                    }
-                }
-                DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } => {
-                    DfsMetadataTableOp::CommitPreparedOperationV7 {
-                        digest: digest.clone(),
-                        committed_entry: Box::new(
-                            crate::DfsPreparedOperationCommitReference::from_journal_entry(&entry)?,
-                        ),
-                    }
-                }
-            };
-            validation_tables.apply_checked(op)?;
-        }
         if let Some(operation) = expected_operation {
             let crate::DfsMetadataAuthorityOperation::PreparedOperation {
-                operation_id,
                 file_system_id,
                 shard_id,
                 owner_epoch,
@@ -177,16 +153,14 @@ impl LocalSobjMetadataBackend {
                     "authority operation is outside the validated current source cut".into(),
                 ));
             }
-            let record = validation_tables.prepared_operations_v7.get(operation_id).ok_or_else(|| {
-                MetadataBackendError::Serde(
-                    "authority operation has no complete original body in the validated current cut".into(),
-                )
-            })?;
-            namespace_authority_proof = Some(
-                crate::metadata_api::validated_metadata_authority_operation_digest(
-                    record, operation,
-                )?,
-            );
+        }
+        let suffix_start = batch
+            .entries
+            .partition_point(|entry| entry.sequence <= self.materialized_through_sequence);
+        if let Some(proof) = self
+            .validate_replica_journal_suffix(&batch.entries[suffix_start..], expected_operation)?
+        {
+            namespace_authority_proof = Some(proof);
         }
         self.next_sequence = self.next_sequence.max(durable_next_sequence);
         let target_sequence = batch.next_after_sequence;
@@ -454,6 +428,33 @@ impl LocalSobjMetadataBackend {
             trace_started.elapsed().as_millis(),
         ));
         Ok(report)
+    }
+
+    /// Validate the incoming cut through the same checked transitions as replay,
+    /// then restore every touched row and index before durable ingestion. Copying
+    /// the entire resident table here kept shard admission occupied by unrelated
+    /// history, even for a one-record ACK. The existing replay rollback preserves
+    /// the same all-or-nothing validation without that whole-table copy.
+    pub(super) fn validate_replica_journal_suffix(
+        &mut self,
+        entries: &[DfsMetadataJournalEntry],
+        expected_operation: Option<&crate::DfsMetadataAuthorityOperation>,
+    ) -> Result<Option<crate::DfsPreparedOperationDigest>> {
+        // The planner restores already-applied rows itself on a malformed later
+        // entry. A successful plan still grants no materialization/publication.
+        let planned = self.plan_written_journal_entries_table_ops(entries)?;
+        let proof = expected_operation.map(|operation| {
+            let crate::DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. } = operation;
+            let record = self.tables.prepared_operations_v7.get(operation_id).ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "authority operation has no complete original body in the validated current cut".into(),
+                )
+            })?;
+            crate::metadata_api::validated_metadata_authority_operation_digest(record, operation)
+        }).transpose();
+        // Restore on both proof success and failure, before returning either.
+        planned.rollback.rollback(&mut self.tables);
+        proof
     }
 
     pub(crate) fn materialize_pending_replica_journal(&mut self) -> Result<usize> {
