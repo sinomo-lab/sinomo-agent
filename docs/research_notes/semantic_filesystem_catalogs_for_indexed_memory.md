@@ -1,6 +1,5 @@
 # Semantic Filesystem Catalogs for Indexed Memory
 
-Research date: 2026-07-18
 
 This is a supporting research note. The
 [memory architecture](../memory-architecture.md),

@@ -1,7 +1,6 @@
 # Agent Session Activity and Unified Channels
 
 Status: Active implementation plan (phases 1–5 implemented; follow-ups open)
-Last reviewed: 2026-10-13
 
 This plan makes the agent session the owner of everything an agent does
 (reasoning, tool calls, async work) and makes a chat a channel with one agent.

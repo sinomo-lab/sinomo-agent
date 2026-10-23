@@ -7,6 +7,16 @@ description: Design, change, or diagnose Sinomo networking, KV/Raft, membership,
 
 Work from the repository root. Select the affected contract before changing its
 implementation; plans and old experiment reports are not the current protocol.
+Architecture supplies purpose, ownership and required behavior. Obtain exact
+ACK rules, state transitions and lock ordering from source/tests and dedicated
+protocol references; use [sinomo-documentation](../sinomo-documentation/SKILL.md)
+when recording a change instead of appending its mechanics to architecture.
+
+For repeated DFS failures, use the [DFS debugging skill](../sinomo-dfs-debugging/SKILL.md)
+to trace runtime ownership and wait dependencies, and the
+[DFS validation skill](../sinomo-dfs-validation/SKILL.md) for fixture, retained-state
+and failure-matrix work. They provide concrete diagnosis procedures and do not
+replace the required protocol behavior.
 
 ## Locate the contract
 
@@ -35,12 +45,19 @@ restart paths; a success response alone does not identify the commit boundary.
 - Cluster KV holds compact control records and fences. DFS paths, journals,
   intents, receipts, namespace transactions, and bytes stay in DFS-owned stores.
 - Content receipt threshold `W` is distinct from metadata publication authority.
-  Healthy DFS publication requires the configured full-shard proof; degraded
-  publication needs the defined recovery quorum and operation-bound Raft permit.
+  Current DFS publication requires the complete configured metadata participant
+  proof. Missing participants leave it pending/unavailable; there is no ordinary
+  per-operation Raft permit, KV floor or watermark fallback. The error name
+  `MetadataRecoveryQuorumUnavailable` does not imply majority admission.
+  This is a known implementation mismatch with the user's original outage/W/N
+  requirement, not a product constraint to preserve indefinitely. Restore that
+  behavior with a safe protocol; do not merely lower a count, revive a removed
+  permit path, or redefine the requirement to match this implementation.
 - A committed shard reconfiguration is not activation. Retiring-primary freeze,
   exact prefix evidence, both assignment majorities, and both primary
-  acknowledgements govern handoff. Read the detailed handoff contract before
-  changing any acknowledgement threshold or rebind shortcut.
+  acknowledgements govern the reviewed implementation's handoff. Trace its
+  sender/receiver and tests before changing a threshold or rebind shortcut;
+  these mechanisms must still satisfy the original outage requirement.
 - Replica ingest is a narrow permit, not author authority. Validate the complete
   journal/snapshot payload, including embedded records, before partial mutation.
   A later sequence number alone is not proof of the correct history.

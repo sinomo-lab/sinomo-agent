@@ -943,9 +943,8 @@ convergence and reruns every-node DFS invariants, cluster doctor, and routed
 status. Mount cleanup is attempted even when `SINOMO_TEST_KEEP=1` or
 `SINOMO_TEST_REUSE=1` leaves the cluster running.
 
-The image pins upstream revision
-`ededbeb2b44929972898afb87474b0937f78a877` and applies the reviewed
-`sinomo-linux-portability-v1` contract. That contract replaces active upstream
+The image pins its upstream source in the Docker build definition and applies
+the `sinomo-linux-portability-v1` contract. That contract replaces active upstream
 TAP TODO directives with explicit expectations:
 
 - directory ownership changes may preserve or clear set-id bits, while uid and

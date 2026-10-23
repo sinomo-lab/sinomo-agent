@@ -65,6 +65,16 @@ is an accepted requirement.
 Avoid committing generated output from `target/`, `dist/`, toolchain `work/` or
 `out/` directories, `_apalache-out/`, or `benchmark-results/`.
 
+Most bug fixes restore the existing design and need no architecture edit. Follow
+[documentation boundaries](docs/README.md#document-status-rules): no development
+logs in docs, and preserve valid text outside the requested correction.
+
+For extended autonomous work or cross-boundary changes, use the
+[change-scope workflow](.agents/skills/sinomo-change-scope/SKILL.md). Review the
+actual diff against captured requirements and disclose additional improvements
+and contract changes separately. A useful extra change needs a visible reason;
+a passing test suite is not evidence that it was requested.
+
 ## Validate in Proportion to Risk
 
 Start with the smallest relevant check, then broaden. A typical Rust change
@@ -102,6 +112,7 @@ Finish every contribution with:
 
 ```sh
 python3 scripts/docs/check_links.py
+python3 scripts/docs/check_content.py
 git diff --check
 git status --short --branch
 ```

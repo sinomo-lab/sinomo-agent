@@ -2,7 +2,7 @@
 
 Status: active. Phase 0 and the Phase 1 Markdown/text first slice are
 implemented; the rest of Phase 1, all scale hardening, and Phases 2 through 6
-remain. Last reviewed 2026-10-13.
+remain.
 
 Implemented (`crates/sinomo-memory/src/indexed/`, exercised by
 `crates/sinomo-memory/tests/indexed_file_memory.rs`):
@@ -81,9 +81,8 @@ The implementation is complete when:
 
 ## Starting Baseline
 
-This section records the record-first prototype as it stood when the plan
-started (July 2026). It remains a useful correctness and provenance reference.
-Since then the agent has stopped using it, and the indexed-file slice supplies
+This section describes the record-first prototype for comparison with the
+indexed-file design. The agent no longer uses the prototype; the indexed-file slice supplies
 the roots, versions, anchors, tombstones, partitions, evidence bundles, and
 overlays listed as missing below.
 

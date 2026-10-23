@@ -10,11 +10,12 @@ The integration consists of:
 
 ## Setup
 
-Use Python 3.12 because tau3-bench requires Python `>=3.12,<3.14` and its telephony converter uses the standard-library `audioop` module.
+Use Python 3.12 because tau3-bench requires Python `>=3.12,<3.14` and its telephony converter uses the standard-library `audioop` module. After cloning, obtain `required_tau3_revision` from the offline plan described below before checkout and dependency installation.
 
 ```bash
 git clone https://github.com/sierra-research/tau2-bench.git /tmp/tau3-bench
-git -C /tmp/tau3-bench checkout f0927a4b9cdfa7b374269efaa29ff7fdac90d8fc
+: "${TAU3_REVISION:?Set required_tau3_revision from the offline plan}"
+git -C /tmp/tau3-bench checkout "$TAU3_REVISION"
 cd /tmp/tau3-bench
 uv sync --python 3.12 --extra voice
 ```

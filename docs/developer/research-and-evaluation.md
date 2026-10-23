@@ -51,8 +51,8 @@ never be cited as proof that a feature exists.
 
 ## Current Research and Evaluation Surfaces
 
-Status last reviewed: 2026-07-19. Inspect the referenced code and tests at the
-exact commit used by an experiment.
+Inspect the referenced code and tests from the exact source used by an
+experiment; record that source identity in its result artifacts.
 
 | Surface | Implemented foundation | Existing evidence | Important limitation |
 |---|---|---|---|

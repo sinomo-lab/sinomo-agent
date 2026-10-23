@@ -89,3 +89,8 @@ only host-side mocks. Run the trust-ring gate for changed manifests, facades,
 features or imports, plus the [validation matrix](../../../docs/developer/testing.md)
 for the domain behavior. Updating an installed artifact uses the
 [rollout workflow](../sinomo-rollout/SKILL.md).
+
+Update architecture only when ownership, dependency or lifecycle guarantees
+change. Registration methods, cleanup ordering and validation results belong
+near their source/tests or in the relevant guide/artifact; use
+[sinomo-documentation](../sinomo-documentation/SKILL.md) to choose the destination.

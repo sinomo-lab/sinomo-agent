@@ -109,8 +109,8 @@ their inventories.
 
 ## Plans and Research Notes
 
-- [Plans](plans/README.md) contain active roadmaps and selected completed or
-  historical records that retain useful reasoning.
+- [Plans](plans/README.md) contain active roadmaps and design reasoning, not
+  development logs.
 - [Research notes](research_notes/README.md) contain literature reviews and
   design evidence.
 
@@ -120,11 +120,28 @@ project decision only when adopted by architecture or a reviewed implementation.
 
 ## Document Status Rules
 
+No development logs belong in docs, regardless of relevance or importance.
+Explain the system, requirements, reasoning and reusable procedures directly;
+do not recount what a patch changed, when work was completed or which run passed.
+This applies to plans and skills as well as architecture and guides.
+
+Development-history dates, dated report filenames, specific Git commit references
+and agent conversation/session provenance are prohibited markers. Removing those
+markers while retaining the change narrative does not make it documentation.
+Keep raw evidence in task artifacts outside docs. Preserve meaningful facts such
+as conference/publication years and protocol versions.
+
+Most bug fixes need no architecture edit. Remove out-of-place material without
+rewriting valid surrounding text. See the
+[documentation skill](../.agents/skills/sinomo-documentation/SKILL.md) for examples.
+Run `python3 scripts/docs/check_content.py` alongside the link checker; its
+recognizable-marker checks do not replace reviewing the prose for dev logs.
+
 | Document class | Purpose |
 |---|---|
 | User guide | A task supported by the current public interface |
 | Developer guide | Setup, navigation, extension, validation, evaluation, and reproducibility workflows |
-| Architecture | Stable intent, ownership, invariants, and major flows |
+| Architecture | Stable intent, ownership, invariants, design constraints, and major flows |
 | Reference/specification | Exact format, schema, protocol, model, or harness behavior |
 | Plan | Future work, sequencing, status, or retained implementation rationale |
 | Research note | Literature and design evidence that has not necessarily been adopted |
@@ -134,7 +151,7 @@ When updating documentation:
 - use current public commands and verify their help;
 - label targets and partial implementations instead of presenting them as
   guarantees;
-- keep implementation logs out of architecture pages;
+- keep implementation logs out of documentation;
 - update plan status when implementation lands;
 - link to the owner rather than duplicating a contract;
 - preserve relative links and run local link/anchor validation;

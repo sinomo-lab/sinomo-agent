@@ -2,7 +2,7 @@
 
 This document is the detailed implementation record for `sinomo-sandbox`. Current implementation status, remaining gaps, and detailed design notes belong here.
 
-Status (reviewed 2026-10-13): much of this record predates later structural
+Status: much of this record predates later structural
 changes. [architecture.md](architecture.md) is normative where they differ.
 
 - The WASIX engine moved into the external native module `module.sandbox.wasix`

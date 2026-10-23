@@ -6,8 +6,8 @@ The verifier is
 [`toolchains/build-tools/verify-posixtestsuite-wasix.sh`](../toolchains/build-tools/verify-posixtestsuite-wasix.sh).
 Detailed verifier output belongs under
 `target/sinomo-posixtestsuite-results/` and should not be committed. The
-results below were last refreshed in May 2026, before the WASIX engine moved
-into the `modules/sandbox/wasix` native module.
+results below cover the backend before extraction into the
+`modules/sandbox/wasix` native module; module acceptance needs a fresh verifier run.
 
 ## Status Key
 

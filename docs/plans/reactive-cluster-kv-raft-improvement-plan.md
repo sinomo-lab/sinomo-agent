@@ -1,10 +1,8 @@
 # Reactive Cluster KV/Raft Improvement Plan
 
-Status: recommended first implementation slice completed 2026-07-19; the
-generic maintenance design was removed in favor of action-owned convergence on
-2026-07-20. Bounded group commit and shared follower replication landed on
-2026-09-19. Remaining P1-P3 follow-up work is identified below. Last reviewed
-2026-10-13.
+Status: the first slice, action-owned convergence, bounded group commit and
+shared follower replication are implemented. Remaining follow-up work is
+identified below.
 
 ## Context
 
@@ -327,8 +325,7 @@ state a small independent invariant.
 
 ### Runtime and cluster evidence
 
-The completed first slice and the 2026-07-20 action-ownership correction are
-accepted only with:
+The first slice and action-owned convergence require:
 
 - focused tests proving local reads remain available without quorum while
   authoritative reads fail;
@@ -346,32 +343,29 @@ accepted only with:
   failed authoritative operations, quorum restoration, catch-up, and eventual
   convergence.
 
-## Completed First Implementation Slice
+## First Implementation Slice
 
-Initial slice completed 2026-07-19; action-ownership correction completed
-2026-07-20:
+The slice requires:
 
-1. Added the consistency contract to docs and route/type names.
-2. Implemented the authoritative-read barrier and migrated the initial critical
-   callers.
-3. Closed the semantic-no-effect fast path so write success always has quorum or
-   durable prior-commit evidence.
-4. Added request IDs, bounded committed-request retention, and outcome records
-   for KV transactions.
-5. Made convergence action-owned: exact commit fanout persists its own peer
+1. A consistency contract expressed in docs and route/type names.
+2. An authoritative-read barrier for correctness-sensitive callers.
+3. Write success backed by quorum or durable prior-commit evidence, including
+   semantic-no-effect writes.
+4. Request IDs, bounded committed-request retention, and outcome records for
+   KV transactions.
+5. Action-owned convergence: exact commit fanout persists its own peer
    progress, configuration operations reconcile their own lifecycle, storage
    mutations own compaction, recovery signals target the affected peer, and
-   changed member/endpoint sources own publication. Removed the generic
-   maintenance task and observational wake points.
-6. Converted Raft config changes into explicit lifecycle operations with
-   catch-up and terminal evidence plus restart reconciliation.
+   changed member/endpoint sources own publication. There is no generic
+   maintenance task or observational wake point.
+6. Raft config changes expressed as explicit lifecycle operations with catch-up
+   and terminal evidence plus restart reconciliation.
 
 The small `raft_kv` contract refinement covers steps 2-3. Runtime and cluster
 tests cover the action-ownership boundaries in step 5 instead of expanding the
-Raft protocol model. The focused
-formal run reached the deliberately broken no-quorum/no-effect witness in 5000
-of 5000 traces, and the five-step Apalache check of the corrected relation found
-no violation; exact commands and tool versions are recorded in the
+Raft protocol model. Require coverage of the deliberately broken
+no-quorum/no-effect witness and bounded verification of the corrected relation;
+commands and toolchain configuration are described in the
 [formal verification guide](../formal/cluster-verification.md).
 
 This slice preserves Sinomo's passive design while addressing the most important

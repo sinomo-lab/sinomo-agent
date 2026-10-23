@@ -1,7 +1,6 @@
 # Agent Session Placement and Workspace Projection
 
 Status: Active implementation plan
-Last reviewed: 2026-10-13
 
 The durable ownership model is now represented in `sinomo-agent`:
 

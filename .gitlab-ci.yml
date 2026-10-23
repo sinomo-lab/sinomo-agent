@@ -29,6 +29,16 @@ default:
       - .cache/cargo/registry/cache/
       - .cache/cargo/git/db/
 
+build:documentation:
+  stage: build
+  image: python:3.12-slim
+  cache: []
+  script:
+    - python3 -m unittest discover -s scripts/docs -p 'test_*.py'
+    - python3 scripts/docs/check_links.py
+    - python3 scripts/docs/check_links.py AGENTS.md .agents/skills skills
+    - python3 scripts/docs/check_content.py
+
 build:dfs-kv-boundary:
   stage: build
   timeout: 1h

@@ -5,6 +5,21 @@
 - Read `docs/architecture.md` before non-trivial work; its boundaries are load-bearing.
 - Check `git status` first. Preserve unrelated changes and never commit generated artifacts (`target/`, toolchain `work/` or `out/`, or `benchmark-results/`).
 
+## Change scope
+
+- Keep requirements distinct from the implementation plan. Classify edits as
+  requested work, necessary support, additional improvements or external work.
+  Preserve valid wording/behavior unless there is a stated reason to change it.
+- Additional improvements can be useful. Make their value and impact explicit
+  and independently reviewable; do not hide them in a larger required change.
+  Surface changes to intent or contracts before depending on them, honoring
+  decisions already made instead of repeatedly asking for routine approval.
+- For extended autonomous work, refactors and cross-boundary fixes, use
+  [sinomo-change-scope](.agents/skills/sinomo-change-scope/SKILL.md): capture the
+  starting state and requirements, then check the actual diff before handoff.
+  Missing or stale scope accounting is not a completed review. The check enforces
+  disclosure, not semantic correctness or authorization.
+
 ## Architecture invariants
 
 - Every crate declares a trust ring in `Cargo.toml`; enforcement lives in `crates/sinomo-core/tests/workspace_ring_boundaries.rs`.
@@ -23,6 +38,35 @@
 - Use workspace dependencies (`dependency.workspace = true`) instead of crate-local version pins.
 - State paths are owned by `sinomo_local::SinomoDataDir` (`SINOMO_DATA_DIR`, default `~/.sinomo`). Without `--repo`, `sinomo evolve propose` targets its managed source checkout, not the operator checkout.
 - Prefer integration tests for cross-crate networking, KV, DFS, and sandbox behavior. Use real verifier scripts for WASIX/toolchain behavior.
+
+## Documentation boundaries
+
+- No development logs in documentation, regardless of relevance or importance.
+  This includes undated change narration, implementation milestones and run results.
+  Docs explain the system, requirements, reasoning and reusable procedures directly.
+- Development-history dates, dated report filenames, concrete Git commit
+  references and agent conversation/session histories are prohibited indicators
+  of that broader problem; removing those markers alone does not fix a dev log.
+  State the relevant requirement, mechanism or procedure directly. These rules
+  also apply to plans, research notes, examples and skill documentation.
+  Preserve meaningful facts such as conference/publication years and protocol
+  version identifiers; they are not development-log provenance.
+- Architecture docs state stable intent, ownership, invariants, design constraints
+  and major flows. Most bug fixes do not change them.
+- Do not append ACK sequences, lock ordering, state-field updates, retry branches,
+  schema versions, implementation inventories, commit IDs or validation results
+  to architecture pages. Exact behavior belongs beside its source/tests or in an
+  existing dedicated protocol/reference document when readers need that contract.
+- Developer/user guides explain reusable tasks, not the current debugging session.
+  Keep run output and handoffs in task artifacts; preserve history through Git.
+- A current implementation restriction does not supersede a stated requirement.
+  Keep implementation gaps/status outside the architectural contract.
+- When editing docs, apply
+  [sinomo-documentation](.agents/skills/sinomo-documentation/SKILL.md).
+  Consolidate the owning section instead of adding a paragraph for each fix.
+- Run `python3 scripts/docs/check_content.py` and the link checker for doc changes.
+  The content check rejects recognizable development-log markers, commit citations
+  and agent-session provenance; review narration the mechanical check cannot infer.
 
 ## Common checks
 

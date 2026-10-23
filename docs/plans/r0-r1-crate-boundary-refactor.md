@@ -1,7 +1,7 @@
 # R0/R1 Crate Boundary Refactor Plan
 
-Status: completed and retained as an implementation record. Last reviewed
-2026-07-09.
+Status: completed. This document explains the boundary design and migration
+sequence; current rules are linked below.
 
 The facade migration flag is enabled and the workspace boundary test enforces
 the resulting dependency graph. Stage descriptions below record the sequencing

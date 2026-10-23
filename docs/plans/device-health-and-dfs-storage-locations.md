@@ -3,7 +3,7 @@
 Status: partially implemented. DFS storage-health sampling, the aggregate node
 advertisement, and host resource evidence have landed; general node health,
 additional content locations, storage management, and the app surfaces remain
-proposed. Last reviewed 2026-10-13.
+proposed.
 
 This plan adds cached node and device health observation plus safe management of
 additional node-local DFS content locations. It extends the current
@@ -69,8 +69,7 @@ not the multi-location content-store abstraction.
 
 ## Implementation Status
 
-Landed with network-aware DFS placement and mobile resource evidence
-(2026-08):
+Implemented network-aware DFS placement and mobile resource evidence:
 
 - `sinomo-api` defines the DFS observation vocabulary: `DfsHealthState`
   (`Healthy`, `Degraded`, `Critical`, `Unknown`) and a separate

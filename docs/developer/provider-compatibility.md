@@ -1,10 +1,7 @@
 # Language-model provider compatibility
 
 This reference covers Sinomo's model providers, configuration, wire protocols,
-tools, and compatibility boundaries. The general provider review dates to
-2026-09-18; Codex tools, DeepSeek, Gemini, Grok, and Kimi were updated on
-2026-09-26, and GPT-6 and Claude 5.5 support on 2026-09-30. Provider-specific
-source revisions and dates appear below. Hosted media interfaces retain their
+tools, and compatibility boundaries. Hosted media interfaces retain their
 existing APIs.
 
 - [Provider coverage](#provider-coverage)
@@ -30,7 +27,7 @@ existing APIs.
 | Gemini | Paginated Models API, filtered to `generateContent` models; default `gemini-3.8-flash` | Native function calls/results, thought signatures, function IDs and thinking controls. Thought text stays separate from answer text; output usage includes thought tokens. |
 | Grok | Authenticated Models API; default `grok-4.7` | Responses, encrypted reasoning replay, native function calls, and model-specific reasoning effort. |
 | Kimi | Authenticated Models API; default `kimi-k3`; K2.7 Code, K2.6, and K2.5 suggestions | Chat Completions, full assistant-message replay, native tools, K3 effort/output limits, and K2 thinking controls. |
-| DeepSeek | Authenticated Models API; default `deepseek-flash`; V4 Pro remains available | [Messages transport and harness-compatible editor](#deepseek), updated against harness `477b4f4205`. Explicit Chat Completions endpoints retain their previous wire contract. Signed thinking and native tool turns are preserved. |
+| DeepSeek | Authenticated Models API; default `deepseek-flash`; V4 Pro remains available | [Messages transport and harness-compatible editor](#deepseek). Explicit Chat Completions endpoints retain their previous wire contract. Signed thinking and native tool turns are preserved. |
 | NVIDIA | Authenticated `/models`; default Nemotron 3 Super retained | Shared Chat Completions codec carries native tools and results. Third-party IDs use their actual organization prefix. Vendor options reach the request. |
 | GitHub Copilot | Account catalog retained; direct default `gpt-6.1-sol` | GPT-5.5, GPT-5.6 and GPT-6 use Responses. Both API dialects retain tools and continuation state. The CLI forwards configured reasoning effort. |
 | Ollama / LM Studio | Existing installed/local model discovery and defaults retained | Both Responses paths preserve native calls and continuation state. |
@@ -99,9 +96,7 @@ drops the HTTP response and fails rather than completing.
 
 ## Codex
 
-The direct `codex` provider is aligned with the local Codex checkout at
-`2e5fea64e` for model metadata (2026-09-30), with tool contracts compared
-against `e72da2b53` on 2026-09-26. Its source contracts are:
+The direct `codex` provider uses these upstream source contracts:
 
 - `codex-rs/models-manager/models.json`: model capabilities and visibility.
 - `codex-rs/protocol/src/openai_models.rs` and its `reasoning_effort.rs` module:
@@ -189,7 +184,7 @@ surface and executor checks still apply. After a receipt leaves the retained
 context, the model can search again. This is client-owned function-tool
 discovery, not the hosted Responses `tool_search` protocol.
 
-The September tool comparison preserves these runtime distinctions:
+The tool integration preserves these runtime distinctions:
 
 | Codex tool surface | Sinomo behavior |
 | --- | --- |
@@ -210,10 +205,9 @@ remain available through their Sinomo interfaces.
 
 ## DeepSeek
 
-Compared against the local `deepseek-harness` checkout at `477b4f4205`
-(2026-09-24), particularly its `llm-deepseek` serializer/transport and
-`tool-str-replace-editor` implementation. Reference:
-[DeepSeek Harness source](https://github.com/deepseek-ai/deepseek-harness/tree/477b4f4205/packages/llm/llm-deepseek).
+Reference: the `llm-deepseek` serializer/transport and
+`tool-str-replace-editor` implementation in the
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
 ### Transport selection
 
@@ -279,8 +273,7 @@ This integration does not advertise the harness's persistent `bash`, PTC
 
 ## Gemini, Grok, and Kimi configuration
 
-Updated from official documentation on 2026-09-26. These are direct API-key
-providers; subscription or coding-agent OAuth credentials are separate services.
+These are direct API-key providers; subscription or coding-agent OAuth credentials are separate services.
 
 | Provider | Default model | API root | API-key environment variables |
 | --- | --- | --- | --- |

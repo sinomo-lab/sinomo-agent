@@ -190,9 +190,8 @@ allowed to come online without catch-up, then accept a later committed entry
 without the earlier prefix. The Rust in-process cluster catches up a node when
 `set_node_online(..., true)` is called, so the spec now models that behavior.
 
-The focused reactive-contract evidence recorded on 2026-07-19 against
-implementation source revision `1cf40a35962bac388a533353ab74e99fa7f002c6`
-used Quint 0.32.0 and Apalache 0.56.1:
+Run the focused reactive-contract checks with the pinned Quint and Apalache
+toolchain:
 
 ```bash
 QUINT_CASE_FILTER=raft-kv QUINT_COVERAGE_MAX_SAMPLES=5000 \
@@ -202,10 +201,9 @@ QUINT_CASE_FILTER=raft-kv QUINT_VERIFY_MAX_STEPS=5 \
   bash scripts/formal/check-quint.sh verify-fast
 ```
 
-Coverage found no refined-safety violation and reached
-`witnessBrokenNoQuorumNoEffectCounterexample` in 5000 of 5000 traces. The
-five-step Apalache check of the refined `step` relation found no violation and
-completed in 175694 ms.
+Require refined safety and the
+`witnessBrokenNoQuorumNoEffectCounterexample` sensitivity witness. Record actual
+coverage, bounds and elapsed time in the run artifacts.
 
 Companion Rust evidence covers the mechanics intentionally excluded from this
 Quint slice: local-read availability without quorum, authoritative-read
@@ -985,10 +983,7 @@ The `dfs_authority_routing_safety.safety` invariant combines these properties:
 This maps to routed namespace response settlement
 (`validate_routed_namespace_authority_redirect`), refreshed dispatch-shard
 corroboration (`refreshed_primary_after_authority_redirect`), and
-`lookup_sifs_path_distributed_synced`. The former
-`sifs_routed_*_authority_redirect` integration tests were removed in the
-October 2026 publication consolidation (merge `c8c8ab71`). The remaining
-redirect regression is
+`lookup_sifs_path_distributed_synced`. The current focused redirect regression is
 `native_stale_authority_redirect_keeps_original_identity_after_lost_reply`;
 no current focused test covers grouped-shard corroboration or the live-hit
 fallback. The foreign affected
@@ -1092,13 +1087,12 @@ a `PutPreparedOperationV7` table operation installs a prepared record
 (`put_prepared_operation_indexed`), releases them when a record leaves
 `Prepared` or is evicted, removes the prior state before exact-id replacement,
 and rebuilds the derived maps after snapshot loading and preapplied table
-rollback. `PutPreparedOperationV7` replaced the earlier `PutNamespacePrepare`
-mutation when metadata publication collapsed onto
-`PrepareOperationV7`/`CommitPreparedOperationV7` (merge `c8c8ab71`). The
-tables still carry a test-only history-scan oracle
+rollback. Metadata publication uses
+`PrepareOperationV7`/`CommitPreparedOperationV7`. The
+tables carry a test-only history-scan oracle
 (`namespace_prepare_footprint_indexes_match_history`) and admission counter,
 but the focused reference-equivalence and snapshot-then-log-replay reopen
-regressions that used them were removed in that merge, so this index
+regressions are absent, so this index
 currently has no Rust differential test.
 
 The `dfs_metadata_journal_tail_recovery_safety.safety` invariant isolates
@@ -1277,8 +1271,7 @@ covers a retired-source tombstone losing to the live path-selected row after a
 move and mkdir-all. The earlier backend helpers
 (`apply_namespace_transaction`, `write_transaction_object_shard_indexes`,
 `put_cross_shard_tombstone`) and their target-failure and tombstone-failure
-regressions were removed in the October 2026 publication consolidation (merge
-`c8c8ab71`), so those failure cuts currently have no focused Rust test.
+regressions are absent, so those failure cuts currently have no focused Rust test.
 
 The model deliberately tracks a nuance of the former implementation: if the
 target shard transaction succeeded but the object-shard index write failed,
@@ -1357,8 +1350,7 @@ and the regression tests
 `repair_command_accepts_newer_authority_shard_when_receiver_view_is_stale`, and
 `repair_command_rejects_unknown_object_from_non_primary_metadata_source`. The
 former stored-intent regression
-(`repair_command_accepts_metadata_primary_for_stored_intent`) was removed in
-merge `c8c8ab71`, so the stored-intent metadata-primary branch currently has
+(`repair_command_accepts_metadata_primary_for_stored_intent`) is absent, so the stored-intent metadata-primary branch currently has
 no focused Rust test. The model does not cover the later content-hash check,
 conflicting pending-write check, or lost-authority retry suppression after a
 repair response.
@@ -1837,8 +1829,7 @@ covers exact replay and id-reuse rejection, and
 completed replay across a primary restart. Startup and maintenance recovery
 runs through `recover_pending_namespace_requests_bounded`, but the former
 interrupted-`Pending` regression
-(`durable_pending_namespace_request_recovers_automatically_after_restart`) was
-removed in merge `c8c8ab71` and has no current replacement.
+(`durable_pending_namespace_request_recovers_automatically_after_restart`) has no current replacement.
 
 The `dfs_repair_content_validation_safety.safety` invariant combines these properties:
 
@@ -1874,7 +1865,7 @@ The pre-existing receipt-validation portion maps to
 `NetworkedDfsService::ensure_repair_response_matches_pending`, and
 `NetworkedDfsService::handle_fetch_blob_response`. The current-location
 updates were mapped to `NetworkedDfsService::mark_repaired_location`, which
-was removed in merge `c8c8ab71`; that property has no re-established Rust
+is absent; that property has no current Rust
 mapping. The model includes the implementation nuance that a restored repair
 response may be accepted without a tracked in-flight request when a matching
 repair job still exists. It also
@@ -2332,12 +2323,9 @@ The exact-prefix authority-acknowledgement slice uses
 separates re-reading the named operation from equality of the receiver's
 complete resulting prefix. A divergent predecessor reaches the same sequence
 but rejects without persisting the authority floor, remains eligible for an
-authoritative snapshot, and may acknowledge only after exact repair. A fixed-
-seed 5,000-trace run reached the four healthy ACK, divergent rejection,
-snapshot-repair, and repaired-ACK witnesses, and the depth-4 Apalache check
-passed in about 5.2 seconds. Two stale-catch-up witnesses (snapshot request
-and floor preservation) were registered later, on 2026-09-28; the run has not
-been re-recorded with all six.
+authoritative snapshot, and may acknowledge only after exact repair. Coverage
+must include healthy ACK, divergent rejection, snapshot repair, repaired ACK,
+and the two stale-catch-up witnesses (snapshot request and floor preservation).
 The handoff probe backend-selection slice uses
 `QUINT_DFS_METADATA_HANDOFF_PROBE_BACKEND_VERIFY_MAX_STEPS`, defaulting to 4.
 It retains the bounded old-path counterexample where a stale pre-opened routed

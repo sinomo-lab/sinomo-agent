@@ -1,6 +1,5 @@
 # Indexed File Memory Literature
 
-Research date: 2026-07-05
 
 Status: historical design input. The indexed-file direction was adopted by the
 [memory architecture](../memory-architecture.md); the first local

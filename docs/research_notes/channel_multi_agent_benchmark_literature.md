@@ -11,7 +11,6 @@ It asks which existing benchmarks can inform evaluation of a channel-style
 multi-agent system, what each benchmark actually measures, and where the
 literature leaves gaps.
 
-Research date: 2026-06-30.
 
 ## High-level findings
 

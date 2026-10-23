@@ -1,6 +1,6 @@
 # Network verification suite
 
-Status: first local harness slice implemented on 2026-09-23; broader coverage
+Status: first local harness slice implemented; broader coverage
 below remains a backlog. No CI work is included.
 
 Implemented: existing-harness case listing/preview/selection, strict prebuilt

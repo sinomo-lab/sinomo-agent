@@ -1,7 +1,6 @@
 # DFS Policy and Authority Hardening
 
 Status: remaining follow-up work under the current DFS authority contract.
-Last reviewed 2026-10-13.
 
 The current DFS architecture supports local-owned, replicated-eventual, and
 replicated-confirmed workflows with deterministic candidate selection and

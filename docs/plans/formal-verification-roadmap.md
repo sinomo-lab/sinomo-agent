@@ -1,6 +1,6 @@
 # Formal Verification Roadmap
 
-Status: active backlog. Last reviewed 2026-10-13.
+Status: active backlog.
 
 This plan tracks the next bounded verification slices. Current models,
 properties, and execution instructions live in the
@@ -12,7 +12,7 @@ large state machine.
 
 ## KV and Raft
 
-Completed 2026-07-10: the per-node three-voter protocol slice now covers vote
+The per-node three-voter protocol slice now covers vote
 freshness and vote-once, quorum election, AppendEntries backtracking and
 divergent-suffix repair, acknowledgement-backed commit, leader completeness,
 state-machine replay, higher-term stepdown, and durable term/vote/log restart.
@@ -25,11 +25,10 @@ state-machine replay, higher-term stepdown, and durable term/vote/log restart.
 
 ## Network
 
-Retired 2026-07-22: the route-cache slice (completed 2026-07-10) and the
-object-RPC body direct-delivery slice (completed 2026-07-15), together with the
+The retired route-cache and object-RPC body direct-delivery slices, together with the
 route-planning, delivery-retry, attempt-budget, timed delivery-retry, and
 tunnel-backpressure models, refined the delivery executor and carriers that
-were removed with the legacy transport stack (commit `0c98c19e`). They were
+belonged to the removed legacy transport stack. They were
 deleted rather than kept as misleading evidence. The remaining network specs
 are the base network, endpoint selection, and timed transport models; current
 routing behavior is covered by Rust tests in `sinomo-network`.
@@ -63,13 +62,13 @@ routing behavior is covered by Rust tests in `sinomo-network`.
 
 ## DFS
 
-Updated 2026-07-21: the namespace-command replay slice now captures durable
+The namespace-command replay slice now captures durable
 `Pending`/`Completed` admission keyed by requester and request id, immutable
 full-command identity, exact terminal-result replay across process restart,
 changed-payload rejection, fail-safe interrupted-pending handling, and the
 requester-local cancellation boundary.
 
-Completed 2026-07-10: the canonical POSIX synchronization slices now cover
+The canonical POSIX synchronization slices now cover
 whole-file shared/exclusive advisory locks, exact epoch-fenced lock tokens,
 healthy-session lease renewal, partitioned-session expiry, close/crash cleanup,
 file `fsync`, `fdatasync`, directory `fsync`,
@@ -80,7 +79,7 @@ prefix, and proceeds. Deterministic traces cover clean terminal states for both
 outcomes. Cross-shard retry exhaustion now finalizes forward instead of
 stranding durable jobs with path reservations held.
 
-Completed 2026-07-14: a bounded target-hardening slice compares the reference
+A bounded target-hardening slice compares the reference
 namespace planner's whole-table clone plus operation replay with an in-place
 preapplied planner for one parent/child move and one child/parent recursive
 delete. It proves identical prepared plans and successful terminal tables, and
@@ -90,7 +89,7 @@ reference path. Wider transactions remain follow-up proof; the immediately
 following slice closes the same-instance recovery obligation for this failure
 cut.
 
-Completed 2026-07-14: a bounded metadata journal-tail recovery slice separates
+A bounded metadata journal-tail recovery slice separates
 the durable two-entry journal prefix from the materialized and live-table
 prefixes. It proves that table-batch failure rolls preapplied tables back while
 retaining the durable tail, that the next begin-write detects the gap without
@@ -100,7 +99,7 @@ recovery materialize the identical durable replay projection. Torn records,
 replay failure, concurrent writers, and unbounded journal histories remain
 separate proof work.
 
-Completed 2026-07-14: a companion crash/reopen stale-head slice proves that a
+A companion crash/reopen stale-head slice proves that a
 persisted next-sequence hint behind both the durable segment tail and
 materialized proof cannot authorize sequence reuse. Reopen first promotes the
 allocator and persisted head to at least one beyond the maximum durable proof,
@@ -108,7 +107,7 @@ then admits the next append at `N + 1`. Torn records, proof disagreement,
 integer exhaustion, concurrent writers, and unbounded histories remain outside
 this bounded slice.
 
-Completed 2026-07-15: a bounded packed-blob index append refinement compares
+A bounded packed-blob index append refinement compares
 the existing per-record length/body writes with one contiguous batch write over
 the identical two-record byte stream. It checks every crash cut across both
 four-byte length fields and symbolic two-byte bodies. Replay and tail truncation
@@ -119,7 +118,7 @@ claim one kernel syscall. Variable record lengths, allocation failure,
 concurrent appenders, filesystem ordering, and concrete Rust byte-conformance
 tests remain refinement obligations.
 
-Revised 2026-07-16: the namespace-transaction body-transport slice proves
+The namespace-transaction body-transport slice proves
 that one same-shard transaction travels through the single authenticated
 object-RPC call contract with a semantic attachment, independent of its
 encoded byte count. The model contains no control-head limit, size threshold,
@@ -132,7 +131,7 @@ Concrete SOBJ conformance and the remote-primary cluster probe remain Rust and
 live-gate obligations; transfer flow control and backend crash recovery stay
 owned by their existing proof slices.
 
-Completed 2026-07-14: a bounded directory-tombstone overlay refinement compares
+A bounded directory-tombstone overlay refinement compares
 the reference full-table clone/replay emptiness check with sparse direct-child
 path ownership. Both replay three transaction slots in tombstone-then-live
 planner order, evict the prior object placement and current target-slot owner,
@@ -144,7 +143,7 @@ two candidate directories, and compacted-marker cuts. The optimized cost
 projection scans only candidate initial children and excludes unrelated
 metadata. Canonical-path/dentry-key conformance remains Rust follow-up work.
 
-Completed 2026-07-14: a bounded active namespace-prepare footprint-index
+A bounded active namespace-prepare footprint-index
 refinement compares the reference retained-history overlap scan with sparse,
 filesystem-qualified object and normalized-path ownership. It proves identical
 accept/object-conflict/path-conflict decisions, including exact same-operation
@@ -159,13 +158,11 @@ width footprint sets and persistence-failure cuts remain follow-up proof work.
 The corresponding Rust fast path derives filesystem-scoped, set-valued
 object/path owners from every prepared-operation record, including structured
 snapshot and table-log replay, and rebuilds them after preapplied rollback.
-The record was `PutNamespacePrepare` when this landed; since the V7
-publication consolidation (merge `c8c8ab71`, 2026-10-12) it is
-`PutPreparedOperationV7`. That merge removed the focused reference-equivalence
-and reopen regressions, so Rust differential coverage must be restored (DFS
+The current record is `PutPreparedOperationV7`. Focused reference-equivalence
+and reopen regressions are absent, so Rust differential coverage must be restored (DFS
 item 9 below).
 
-Completed 2026-07-14: a bounded mkdir transaction-identity slice preserves the
+A bounded mkdir transaction-identity slice preserves the
 same stable directory object and path across create, cross-shard move with a
 selected source tombstone, and newer-version resurrection. It retains the
 original prepare record to witness the legacy kind-plus-object/path id
@@ -175,7 +172,7 @@ and proves an exact same-generation retry keeps the id and payload while adding
 no second mutation. Arbitrary rename trees, history compaction, persistence
 cuts, authority changes, and local-first operations remain outside this slice.
 
-Completed 2026-07-14: a bounded coordinator intent-index refinement compares
+A bounded coordinator intent-index refinement compares
 historical scans with sparse awaiting-object and active-or-committed target
 indexes across start, commit, abort, and failed-start rollback. It proves exact
 lookup and validation-result equivalence, uniqueness, committed duplicate-claim
@@ -187,25 +184,21 @@ lookup equivalence and closing one intent while the other remains open. Replica
 policy, receipt, and repair-job transitions remain outside this algorithm-only
 slice.
 
-Completed 2026-07-14: a bounded coordinator receipt-bucket refinement compares
+A bounded coordinator receipt-bucket refinement compares
 the flat historical `(intent, replica)` receipt map with per-intent replica
 buckets. It proves exact receipt content, durable node/count and ordered-result
 equivalence, duplicate overwrite idempotency, cross-intent isolation, retained
 closed-intent restore, and no mutation on rejected record or restore. Policy,
 commit, repair-job, persistence, and local-first transitions remain separate.
 
-Completed 2026-07-15: the repair content-validation slice now models
+The repair content-validation slice now models
 work-conserving stage fan-out with a fixed cap of two. N2 and N3 may be active
 concurrently, every response remains authorized by its target-specific request
 identity, and N3 may complete out of order while N2 remains in flight. An N2
 failure and retry affect only N2 and neither cancel nor restart N3. Publication
 snapshots the receipts satisfying `W` and the committed target hash/version;
 an already-issued desired-replica request may complete afterward and extend
-durable placement without rewriting that snapshot or target. The fixed-seed
-5,000-trace run reached the bounded fan-out, out-of-order success, isolated
-failure, isolated retry, and late completion witnesses in 3,340, 1,663, 1,677,
-1,677, and 1,660 traces respectively, with no violation in 6,066 ms at 824
-traces/s. The depth-6 Apalache check found no violation in 150,166 ms. The Rust
+durable placement without rewriting that snapshot or target. The Rust
 mapping now uses a fixed cap of two for full-body stage and repair transfers,
 validates ordered target-specific outcomes before per-target inflight/retry
 bookkeeping, and has sync/async three-target overlap plus isolated-failure
@@ -215,7 +208,7 @@ responses are still merged after the bounded batch joins, and inline/patch
 transfers remain sequential; those liveness/performance refinements and local-
 first behavior are outside this completed safety slice.
 
-Completed 2026-07-15: a companion quorum-aware fan-out slice separates the
+A companion quorum-aware fan-out slice separates the
 effective repair mode retained by the metadata primary from the caller's outer
 wait policy. Background mode reserves only the exact missing `W` stage slots,
 publishes its response at `W`, and starts `N-W` repair afterward. Foreground
@@ -226,15 +219,10 @@ the response-construction boundary over durable staged replicas with its own
 cap of two, not as a durability acknowledgement. A rejected promotion returns
 to the outbox and is explicitly covered through resend. At `N`, repair jobs,
 stage/repair inflight state, retry and attempt records, and the retained pending
-write are all empty; promotion may remain queued independently. The fixed-seed
-5,000-trace run reached the thirteen registered witnesses in 1,232, 1,232,
-1,232, 2,528, 1,269, 1,259, 2,528, 1,232, 1,232, 1,269, 1,240, 1,240, and 5,000
-traces, with no violation in 4,252 ms at 1,176 traces/s. A generic 5,000-trace,
-20-step run also passed in 3,890 ms at 1,285 traces/s, and the depth-6 Apalache
-check found no violation in 36,968 ms. Unbounded replica sets, transport
+write are all empty; promotion may remain queued independently. Unbounded replica sets, transport
 fairness, and wall-clock performance remain outside this bounded safety slice.
 
-Completed 2026-07-15: a dedicated detached-promotion outbox slice refines the
+A dedicated detached-promotion outbox slice refines the
 post-response policy across multiple writes and daemon cache generations. A
 drain attempts each identity once under a cap of two, keeps failed identities
 retryable behind unattempted ready work, and accepts only an exact `Committed`
@@ -245,16 +233,12 @@ bookkeeping replaces the older version for one target/filesystem/object key.
 The strengthened slice also makes promotion recovery independent of unrelated
 maintenance failure, retains the authority observer across no-read topology
 changes, and cools failed retries while newly queued healthy work remains
-dispatchable. The fixed-seed 5,000-trace run reached all eighteen registered
-witnesses in 623, 646, 646, 597, 597, 597, 615, 615, 616, 616, 616, 663, 663,
-663, 633, 633, 633, and 607 traces, with no violation in 3,245 ms at 1,541
-traces/s. A nondeterministic 5,000-trace, 20-step run passed in 3,698 ms at
-1,352 traces/s, and the depth-8 Apalache check found no violation. Retry
+dispatchable. Retry
 cooling is an abstract delay transition; transport fairness, recovery-worker
 liveness, unbounded queues, and wall-clock timing remain outside this bounded
 slice.
 
-Completed 2026-07-14: a bounded metadata membership-handoff union-sync slice
+A bounded metadata membership-handoff union-sync slice
 captures the observed ordinary-fallback wedge. A partial `{retained primary,
 desired replica}` quorum is rejected as a retiring-epoch watermark and loses
 its fresh ACK state, while a retiring-only quorum is still too small to
@@ -268,7 +252,7 @@ for membership-handoff purpose while showing that ordinary metadata sync over
 those same sets remains eligible. Activation requires the exact retiring union
 and its full-shard certificate. Transport fairness remains separate liveness.
 
-Completed 2026-07-14: a companion maintenance-trigger slice proves that, with
+A companion maintenance-trigger slice proves that, with
 ordinary maintenance work absent, a pending handoff contributes to the prompt
 detector exactly on its local retiring primary. Nonlocal handoffs do not spur a
 local coordinator, phantom triggers are excluded, the retiring write fence is
@@ -276,7 +260,7 @@ monotonic, and a blocked attempt returns to pending, is reprobed and retriggered
 then completes on its ready second attempt before the long periodic tick.
 Wall-clock bounds and fair repeated delivery remain outside the slice.
 
-Completed 2026-07-14: a completed-handoff lane-rebind slice proves that durable
+A completed-handoff lane-rebind slice proves that durable
 activation does not implicitly bind fresh or independently opened service
 handles. Bootstrap may bind a fresh lane only from an exact active assignment,
 successor epoch, completion proof, and a current prefix that is marker-equal or
@@ -284,27 +268,27 @@ a proven contiguous extension after legitimate post-activation appends. Wrong,
 still-pending, or sequence-height-matching divergent evidence stays fenced;
 fresh reopen and bootstrap from the contiguous successor remain admissible.
 
-Completed 2026-07-14: an exact-prefix authority-acknowledgement slice proves
+An exact-prefix authority-acknowledgement slice proves
 that re-reading a named prepared operation at its expected sequence is not
 enough to persist an authority floor. The receiver's complete resulting prefix
 must equal the primary's prepared sequence and fingerprint. A divergent
 receiver rejects without a floor, consumes an exact authoritative snapshot,
 and may then acknowledge the repaired prefix.
 
-Completed 2026-07-14: a purpose-separated handoff-probe slice captures the live
+A purpose-separated handoff-probe slice captures the live
 stale-lane retry wedge. Ordinary replication can update the canonical direct
 backend while a pre-opened routed lane remains stale; ordinary handoff probes
 therefore attest through a freshly refreshed direct durable view. Promoted-
 primary probes retain their routed/current-marker path. The durable refresh is
 cold synchronization and recovery work, not a mutation-hot-path operation.
 
-Completed 2026-07-14: the Docker acceptance path now waits for two consecutive
+The Docker acceptance path now waits for two consecutive
 live shard-layout observations with five replicas on each default root,
 services, and users lane and three distinct primaries before correctness and
 performance probes begin. A convergence timeout fails closed with the last
 probe evidence instead of benchmarking a pending, write-frozen handoff.
 
-Completed 2026-07-14: a proof-bound primary-rotation slice composes the retiring
+A proof-bound primary-rotation slice composes the retiring
 write fence and exact-union synchronization with promoted-replica activation.
 The member ring is unchanged, mixed membership movement is rejected, and the
 promoted replica persists a handoff/head/fingerprint marker before its ACK can
@@ -313,7 +297,7 @@ lost-response paths bind only the exact promoted generation, stale lanes never
 write, and completed inactive markers can be replaced by a later reverse
 rotation. Direct KV-only primary transfer remains fail-closed.
 
-Completed 2026-07-15: a cursor-assisted primary-handoff preflight slice captures
+A cursor-assisted primary-handoff preflight slice captures
 the placement liveness failure where a post-expansion write advances the live
 head beyond the last certified KV watermark. On the healthy retiring primary,
 a durable sender cursor covering the observed head may begin a pending handoff,
@@ -323,7 +307,7 @@ probe and remains repairable, and activation still requires exact fresh
 acknowledgements from the complete unchanged member ring. Replica failover is
 unchanged and cannot use this preflight relaxation.
 
-Completed 2026-07-14: a retiring-lane replica-ingest slice separates author
+A retiring-lane replica-ingest slice separates author
 authority from replica maintenance after primary rotation. The activated old
 primary remains unable to author, while an exact current-successor contiguous
 journal batch or authoritative snapshot may advance its replica prefix without
@@ -371,7 +355,7 @@ snapshot mutation APIs remain author-fenced.
    the combined model beyond target hardening. Then deepen directory, by-id
    lookup, open-handle rename/unlink, byte-range locks, application wait-cycle
    detection, and aborted-move reservation release.
-8. **Local-first DFS extension.** Completed 2026-07-10 as separate
+8. **Local-first DFS extension.** Modeled as separate
    target-hardening slices rather than weakening the canonical model. The
    regular-file slice covers local write/truncate/fsync, crash recovery,
    immutable sealing, fresh/stale reconciliation planning, apply/converge/
@@ -386,13 +370,13 @@ snapshot mutation APIs remain author-fenced.
    sealing. A shared stuttering projection requires local work to leave
    authority/journal/object/namespace counters unchanged and accepts a crossing
    publication only with supplied abstract quorum/current-authority/epoch/plan/
-   durability evidence. Added 2026-07-11: a separate one-shard publication
+   durability evidence. A separate one-shard publication
    gateway derives that compact evidence from a typed permit binding quorum,
    authority, symbolic content receipts, metadata prepare, epoch, configuration,
    predecessor head, successor index, payload, and one atomic effect/result
    envelope. Its journal lifecycle covers append, commit, pre/post-commit crash,
    recovery materialization, exact retry, changed-payload rejection, and stale
-   head/epoch fencing. Added later 2026-07-11: direct file and namespace
+   head/epoch fencing. Direct file and namespace
    composition modules now expose terminal branch actions only when paired with
    the gateway commit in the same transition. They align journal/data revisions,
    bind two exact one-sync file manifests and seven named finite namespace
@@ -408,10 +392,9 @@ snapshot mutation APIs remain author-fenced.
    dependency graphs, cross-shard branches, hardlinks and symlinks, branch
    gossip, and explicit service-produced merge candidates before Rust
    implementation claims conformance.
-9. **Restore Rust conformance after V7 consolidation.** Merge `c8c8ab71`
-   (2026-10-12) moved metadata publication onto
-   `PrepareOperationV7`/`CommitPreparedOperationV7` and removed regressions
-   the guide cited as Rust evidence. Re-establish focused tests for routed
+9. **Restore Rust conformance after V7 consolidation.** Metadata publication uses
+   `PrepareOperationV7`/`CommitPreparedOperationV7`; focused regressions
+   for several model properties are absent. Re-establish focused tests for routed
    authority-redirect corroboration and live-hit fallback, the
    namespace-prepare footprint index against its history-scan oracle, the
    sharded-namespace target-failure and source-tombstone-failure cuts,

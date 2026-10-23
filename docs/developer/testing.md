@@ -34,6 +34,13 @@ failure, and keep the contribution scoped.
 
 ## Crate and Integration Tests
 
+For a broad DFS refactor or a failing suite, use the
+[DFS validation workflow](../../.agents/skills/sinomo-dfs-validation/SKILL.md).
+It covers native fixture prerequisites, required-feature targets, retained DATA,
+causal failure inventories and build-artifact reuse. The
+[distributed development guide](distributed-development.md) separates release
+gates from independent feature work.
+
 Representative distributed test targets are:
 
 ```sh
@@ -267,10 +274,11 @@ immutable result artifact; do not commit an unreviewed output dump.
 
 ## Current CI Boundary
 
-The GitLab pipeline runs only on `main`. It runs the DFS/KV boundary lint and
+The GitLab pipeline runs only on `main`. It checks documentation links and
+standalone-content rules, tests those checks, runs the DFS/KV boundary lint and
 builds locked release CLI artifacts for configured Linux and Windows targets
 plus a Linux x86_64 desktop bundle. It does not currently run merge-request
-formatting, Clippy, unit tests, the trust-ring test, formal checks, real-cluster
+formatting, Clippy, product unit tests, the trust-ring test, formal checks, real-cluster
 tests, or benchmarks.
 
 Contributors must therefore report local validation explicitly. A future CI
@@ -291,4 +299,4 @@ architecture requires.
 | Provider or agent protocol | Scripted-provider tests or scenarios; opt-in live smoke only when required |
 | Performance optimization | Correctness gates plus before/after benchmark on a recorded environment; DFS/cluster work uses the performance analysis skill's standard tables |
 | User command | Parser/help tests, domain tests, and updated user guide |
-| Documentation only | `python3 scripts/docs/check_links.py` and `git diff --check` |
+| Documentation only | `python3 scripts/docs/check_links.py`, `python3 scripts/docs/check_content.py` and `git diff --check` |

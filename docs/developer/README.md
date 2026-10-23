@@ -17,6 +17,8 @@ subsystem specifications.
 | Integrate explicit file retention, content preservation, and restore | [DFS file history](dfs-file-history.md) |
 | Add resumable storage upgrades with old readers and current writers | [Durable storage migrations](storage-migrations.md) |
 | Choose unit, integration, formal, cluster, sandbox, and benchmark checks | [Testing and validation](testing.md) |
+| Keep feature work moving while a distributed subsystem is unstable | [Distributed development](distributed-development.md) |
+| Avoid requirement drift and unnecessary DFS state | [DFS development lessons](dfs-development-lessons.md) |
 | Understand research surfaces, evidence classes, and claim boundaries | [Research and evaluation](research-and-evaluation.md) |
 | Record a reproducible formal, cluster, benchmark, model, or agent experiment | [Experimental reproducibility](experimental-reproducibility.md) |
 | Prepare a reviewable change | [Contributing](../../CONTRIBUTING.md) |
@@ -98,8 +100,8 @@ A completed feature normally updates more than Rust:
 - exact encoding changes update the relevant reference and fixtures;
 - formal refinements update model classification and Rust conformance evidence;
 - unfinished work stays in a plan with an honest status;
-- experiments record inputs, configuration, commit, and limitations.
+- experiments record inputs, configuration, commit, and limitations in run artifacts.
 
 The [documentation index](../README.md) defines the navigation paths. Avoid
 turning architecture pages into implementation journals; link to specialist
-evidence instead.
+evidence instead. Follow the [documentation boundaries](../README.md#document-status-rules).

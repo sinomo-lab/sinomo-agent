@@ -2,7 +2,7 @@
 
 This guide describes the package build and install system for the Sinomo sandbox. The goal is an Arch-inspired package workflow for `wasm32-wasix`, with a real package manager inside the sandbox and automated source rebuilds for suitable official Arch packages.
 
-Status (reviewed 2026-10-13): proposed. The `sinomo sandbox package` commands,
+Status: proposed. The `sinomo sandbox package` commands,
 the `/services/sandbox/packages` repository layout, the bootstrap installer, and
 the build worker below do not exist yet. Implemented pieces are the upstream
 makepkg package recipe (`toolchains/build-tools/build-makepkg-wasix.sh`) and its

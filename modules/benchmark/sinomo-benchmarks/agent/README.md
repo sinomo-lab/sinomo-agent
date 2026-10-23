@@ -36,22 +36,16 @@ limits, result schema, and containment contract.
 
 ### Acquire the dataset explicitly
 
-The runner never downloads data implicitly. Acquire the exact cleaned dataset
-revision into a gitignored location:
+The runner never downloads data implicitly. Plan mode reports the exact dataset
+URL, byte count and digest expected by the harness. Set the URL from that plan
+and acquire the dataset into a gitignored location:
 
 ```bash
+: "${LONGMEMEVAL_DATASET_URL:?Set the dataset URL reported by plan mode}"
 mkdir -p benchmark-results/datasets
 curl --location --fail --show-error \
   --output benchmark-results/datasets/longmemeval_s_cleaned.json \
-  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json
-```
-
-The pinned artifact is:
-
-```text
-revision  98d7416c24c778c2fee6e6f3006e7a073259d48f
-bytes     277383467
-sha256    d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442
+  "$LONGMEMEVAL_DATASET_URL"
 ```
 
 The run command verifies both byte count and digest before creating a benchmark

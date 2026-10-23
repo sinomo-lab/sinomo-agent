@@ -2,7 +2,7 @@
 
 This directory contains the initial SWE-bench support for Sinomo's coding agent harness.
 
-The checked-in `verified_10.json` suite selects 10 representative tasks from SWE-bench Verified. It keeps 10 distinct repositories, covers Django, SymPy, Sphinx, scientific Python, testing/linting, and HTTP-client behavior, and mirrors the Verified difficulty distribution at this size with 4 easy tasks, 5 medium tasks, and 1 harder task. The cases were selected on 2026-06-04 from the official `princeton-nlp/SWE-bench_Verified` test split with moderate patch and test sizes where possible, so the suite stays useful for repeated provider and harness iteration rather than only final leaderboard evaluation.
+The checked-in `verified_10.json` suite selects 10 representative tasks from SWE-bench Verified. It keeps 10 distinct repositories, covers Django, SymPy, Sphinx, scientific Python, testing/linting, and HTTP-client behavior, and mirrors the Verified difficulty distribution at this size with 4 easy tasks, 5 medium tasks, and 1 harder task. The cases are selected from the official `princeton-nlp/SWE-bench_Verified` test split with moderate patch and test sizes where possible, so the suite stays useful for repeated provider and harness iteration rather than only final leaderboard evaluation.
 
 ## Setup
 
