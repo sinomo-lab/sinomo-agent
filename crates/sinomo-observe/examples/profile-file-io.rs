@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir(&output)?;
     std::fs::create_dir(output.join("local-smoke"))?;
     sinomo_observe::init_observe_runtime(ObserveRuntimeConfig {
+        live_log_writing: false,
         process_role: "local-smoke".into(),
         node_id: Some("local-smoke".into()),
         filter: "warn".into(),

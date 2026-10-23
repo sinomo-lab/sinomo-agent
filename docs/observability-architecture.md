@@ -64,8 +64,10 @@ Each daemon initializes the observe runtime at startup:
 - `metrics` is the low-overhead counter, gauge, and histogram API.
 - `tracing-subscriber` installs a reloadable filter, controlled at runtime by
   `/observe/control`.
-- Recent trace events are retained in a bounded in-memory ring so a live node can
-  be inspected without a separate collector.
+- Recent log and trace events are retained in bounded in-memory buffers so a
+  live node can be inspected without a separate collector. Routine info, debug
+  and trace events do not write to formatted stdout/stderr or app log files by
+  default; enabled warnings and errors still use those existing sinks.
 
 The default filter is intentionally modest. Hot paths should emit `trace!` or
 `debug!` events only behind the normal tracing level checks, and expensive field
@@ -80,7 +82,9 @@ updates remain authoritative after startup.
 `sinomo test run` initializes this explicit trace mode on stderr, preserving
 its machine-readable `--json` stdout while retaining the client-side
 `content_ms` and `send_ms` records. Long-lived daemons retain their supervised
-observe runtime and normal log sink.
+observe runtime and the default warnings/errors-only formatted sinks. The
+explicit one-shot stderr trace mode opts into writing for that diagnostic
+process; it does not enable routine text writing in the daemons.
 
 ## Cluster Interface
 
@@ -91,7 +95,8 @@ Observation is exposed as ordinary object RPC:
 - `/observe/metrics` reads live runtime metrics plus registered snapshot
   exporters.
 - `/observe/traces` reads the bounded trace ring.
-- `/observe/control` reads or updates the active tracing filter.
+- `/observe/control` reads or updates the active tracing filter and the
+  process-local opt-in live log writing mode.
 - `/observe/profile/cpu` starts, inspects, or stops one bounded node-local CPU
   profile and reports its pprof artifact path. Sampling requires Linux x86-64
   or AArch64 and a build with the `sinomo-observe/cpu-profiler` feature; other
@@ -161,6 +166,51 @@ observe filter determines which runtime events are collected; viewing logs never
 changes that filter. Runtime retention is bounded by 4,096 records and 4 MiB and
 resets on process restart. Each record is bounded to 16 KiB with explicit
 truncation metadata. This is recent diagnostic history, not an audit archive.
+
+Formatted sink retention is independent of collection. The global Observe filter,
+structured fields, span/capture context, trace sequences/cursors, capacities and
+eviction/drop/truncation accounting continue to apply. Main, shadow and graphical
+processes use the same default: enabled warnings/errors are formatted to their
+existing outputs; routine enabled records stay in memory. Panic diagnostics and
+explicit operational/domain/audit journals are unchanged. A process crash loses
+unexported memory history; no power-loss durability is promised for text exports.
+
+Export recent history explicitly through the existing bounded APIs, for example:
+
+```sh
+sinomo observe logs --target NODE --limit 1000 --json > logs.json
+sinomo observe traces --target NODE --after-sequence 0 --json > traces.json
+```
+
+Retain the full response, including process identity, sequence/cursor and
+loss/truncation fields. An export is a bounded snapshot, not proof of complete
+history. `--all` retains the existing per-node results and errors.
+
+Opt into subsequent routine text output for a live process through the existing
+authenticated admin control route:
+
+```sh
+sinomo observe control --target NODE --live-log-writing --json
+sinomo observe control --target NODE --no-live-log-writing --json
+```
+
+The response must explicitly acknowledge `live_log_writing: true` or `false`.
+An absent field means unsupported, uninitialized, or owned sinks not installed,
+not confirmed disabled; new
+clients reject absent or mismatched acknowledgments from older peers. A partial
+`--all` update fails and identifies unconfirmed nodes; successfully updated nodes
+retain their acknowledged setting. There is no cluster-wide transaction.
+
+Live writing is process-local and independent of capture leases and filter
+reset. Send capture lifecycle and live-writing changes as separate requests.
+Changing the sink mode never changes the collection filter or emits a backlog.
+Disabling stops newly admitted routine formatted events; already executing
+synchronous writes and filesystem writeback still drain and remain attributable.
+There is no deferred routine-log flush on disable or shutdown. For explicit
+startup diagnostics, `SINOMO_OBSERVE_LIVE_LOG_WRITING=1` (`true`, `yes`, `on` also
+accepted) enables the same mode. Otherwise a new process starts disabled.
+Export, live writing, warnings/errors and their delayed I/O remain part of the
+applicable observation window; none is subtracted from quietness measurements.
 
 `/observe/logs` merges that buffer with the retained operational JSONL journals.
 The disk tail reads at most 2 MiB on a blocking worker, uses the journal's shared
