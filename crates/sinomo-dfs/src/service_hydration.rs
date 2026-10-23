@@ -476,7 +476,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // shell to its owner. Keep its complete coherent catalog at
                 // every handback boundary, even before job/object replay.
                 let catalog = std::mem::take(&mut self.metadata.filesystems);
+                // These are live protocol owners, not a metadata projection.
+                // In particular an outstanding Fetch may still own the only
+                // genuine pre-dispatch facts for its later N-W repair. Keep
+                // them even when this rebuild yields before restoring intents.
+                let pending_writes = std::mem::take(&mut self.writes.pending_writes);
                 self.reset_reconstructable_metadata_projection();
+                self.writes.pending_writes = pending_writes;
                 self.metadata.filesystems = catalog;
                 self.restore_durable_intent_counter_floor()?;
                 if !self.rebuild_cross_shard_namespace_locks_until_cancelled(should_cancel)? {
@@ -920,16 +926,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // write commit-ready, immediately before finalizing it.
                     self.add_transient_object_metadata(object)?;
                 }
-                self.writes.pending_writes.insert(
-                    intent_record.intent_id.clone(),
-                    PendingNetworkedWrite::new(
-                        intent_record.object_id.clone(),
-                        intent_record.target_version.clone(),
-                        content_hash,
-                        size_hint.unwrap_or(0),
-                    )
-                    .with_foreground_replica_repair(false),
-                );
+                if let Some(pending) = self.writes.pending_writes.get(&intent_record.intent_id) {
+                    if pending.object_id != intent_record.object_id
+                        || pending.version != intent_record.target_version
+                        || pending.content_hash != content_hash
+                    {
+                        return Err(DfsError::Metadata {
+                            message: "hydrated intent differs from its live pending write".into(),
+                        });
+                    }
+                } else {
+                    self.writes.pending_writes.insert(
+                        intent_record.intent_id.clone(),
+                        PendingNetworkedWrite::new(
+                            intent_record.object_id.clone(),
+                            intent_record.target_version.clone(),
+                            content_hash,
+                            size_hint.unwrap_or(0),
+                        )
+                        .with_foreground_replica_repair(false),
+                    );
+                }
                 if matches!(
                     intent_record.status,
                     DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending

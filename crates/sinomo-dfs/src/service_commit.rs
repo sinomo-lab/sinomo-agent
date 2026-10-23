@@ -549,9 +549,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // owns the exact N-W repair plan. get_intent restores that recorded
         // plan, while the repair executor checks the current head and authority
         // before effects. Committed visibility alone never retires missing N.
-        if self.writes.pending_writes.contains_key(intent_id) {
+        if self.writes.pending_writes.contains_key(intent_id)
+            && self.coordinator.intent(intent_id).is_some()
+            && self.metadata.object(object_id).is_some()
+        {
             return Ok(None);
         }
+        // A metadata rebuild can retain the actual transfer while dropping a
+        // pre-visibility create's transient anchor. Restore that anchor from
+        // its real stored intent before consuming the original Fetch response.
         let Some(record) = (match self.metadata_backend.as_ref() {
             Some(backend) => backend.get_intent(object_id, intent_id)?,
             None => None,
@@ -695,16 +701,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .pending_write_size_hint(&record.object_id, &record.target_version, &content_hash)?
             .or(local_manifest_size)
             .unwrap_or(0);
-        self.writes.pending_writes.insert(
-            intent_id.to_string(),
-            PendingNetworkedWrite::new(
-                record.object_id,
-                record.target_version,
-                content_hash,
-                size_bytes,
-            )
-            .with_foreground_replica_repair(false),
-        );
+        if let Some(pending) = self.writes.pending_writes.get(intent_id) {
+            if pending.object_id != record.object_id
+                || pending.version != record.target_version
+                || pending.content_hash != content_hash
+            {
+                return Err(DfsError::Metadata {
+                    message: "restored intent differs from its live pending write".into(),
+                });
+            }
+            // Rebuilding a coordinator projection cannot replace the actual
+            // request, delivery classification or foreground/background mode.
+        } else {
+            self.writes.pending_writes.insert(
+                intent_id.to_string(),
+                PendingNetworkedWrite::new(
+                    record.object_id,
+                    record.target_version,
+                    content_hash,
+                    size_bytes,
+                )
+                .with_foreground_replica_repair(false),
+            );
+        }
         Ok(())
     }
 
