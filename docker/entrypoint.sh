@@ -32,6 +32,20 @@ set -uo pipefail   # NOTE: not -e; cross-segment join failures are expected and 
 BOOTSTRAP_BIN=/usr/local/bin/sinomo
 DATA=/data
 SRC=/sinomo-src
+# The owned-I/O diagnostic retains every entrypoint, shadow and inherited
+# helper byte in this container's DATA volume. Docker's external json-file
+# logger would otherwise persist their output outside its I/O cgroup. Keep
+# ordinary Docker console behavior unless the isolated verifier selects this
+# mode; do not tee, filter, buffer until later, or discard either stream.
+case "${SINOMO_TEST_OWNED_LOG_FILES:-0}" in
+  1)
+    mkdir -p "$DATA/daemon" || exit 1
+    exec >>"$DATA/daemon/entrypoint-shadow.stdout.log" \
+      2>>"$DATA/daemon/entrypoint-shadow.stderr.log" || exit 1
+    ;;
+  0) ;;
+  *) echo "invalid SINOMO_TEST_OWNED_LOG_FILES; expected 0 or 1" >&2; exit 2 ;;
+esac
 ROLE="${ROLE:-joiner}"
 CLUSTER_NAME="${CLUSTER_NAME:-dev-cluster}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"

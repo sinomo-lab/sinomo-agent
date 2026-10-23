@@ -4542,6 +4542,12 @@ capture_failure_context() {
       > "$ARTIFACTS/$node.daemon.stderr.log" 2>/dev/null || true
     compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/main.stdout.log \
       > "$ARTIFACTS/$node.daemon.stdout.log" 2>/dev/null || true
+    # Optional owned-I/O mode retains shadow/entrypoint/helpers inside DATA
+    # instead of delegating persistence to Docker's external log driver.
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/entrypoint-shadow.stdout.log \
+      > "$ARTIFACTS/$node.entrypoint-shadow.stdout.log" 2>/dev/null || true
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/entrypoint-shadow.stderr.log \
+      > "$ARTIFACTS/$node.entrypoint-shadow.stderr.log" 2>/dev/null || true
     compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster connectivity \
       > "$ARTIFACTS/$node.cluster-connectivity.txt" 2>&1 || true
     # Local cluster-KV view: snapshot revision + invitation/shard keys, the

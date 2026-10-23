@@ -1151,6 +1151,48 @@ deltas for the sampled window.
 When launched by `docker/measure-final.sh`, these values inherit the top-level
 gate wait and window settings.
 
+For a bounded, read-only **diagnostic** that also covers exited helpers and
+delayed inode writeback in the live owned container cgroups:
+
+```sh
+python3 docker/measure-owned-io.py --project sinomo-dfs-test \
+  --window 135 --output target/owned-io/unique-window.json
+```
+
+This command does not start containers or replace the maintained functional,
+CPU/network, or final verification workflow. It requires the existing six-node
+2 GiB/no-swap limits and a source-sealed, exclusively owned disposable DATA
+cohort. Qualify the host's cgroup writeback/filesystem support before using its
+physical counters; the validated Linux/Btrfs control uses ordinary buffered
+and detached writers, their actual exits, and subsequent exact-file flushes.
+Concurrent foreign writers to the same inode are outside that qualification.
+Select `SINOMO_TEST_OWNED_LOG_FILES=1` in each service's per-run Compose
+environment before creating the disposable project. The entrypoint then
+appends unchanged entrypoint/shadow/inherited-helper stdout and stderr to
+`/data/daemon/entrypoint-shadow.{stdout,stderr}.log`; the main keeps its existing
+files. Failure capture includes these streams. Preserve all four complete
+files from stopped containers when retaining evidence. The reader rejects
+main/shadow output pipes, including Docker's external log-driver sink, rather
+than declaring that unmeasured persistence zero. This mode changes neither
+filters nor buffer/export timing, and is not a daemon or host setting change.
+
+The reader pins the live container/init/cgroup incarnation, retains main/shadow
+PID/start/executable and `/proc` I/O checks, and records physical-device
+incarnations and counters plus dirty/writeback gauges. All in-container snapshot
+collectors finish before the final cgroup read. Missing counters, owner changes,
+device changes, resets, or resource-limit events produce incomplete coverage
+(exit 2); writes or unsettled dirty/writeback produce failure (exit 1).
+Only a complete quiet window exits 0. Physical block bytes, process I/O bytes,
+and logical file bytes remain distinct; no observation cost is subtracted.
+The output file must be new and retains the endpoints and bounded samples.
+
+The observation ends before final container teardown. Losing its owner during
+the window invalidates it; losing a retired cgroup after the selected workflow
+does not retroactively invalidate a completed stable window. Recovery requires
+a fresh observation of the new incarnation, never stitching counters across
+restarts. `python3 docker/test_owned_container_io.py` exercises rejection rules;
+it does not substitute for real helper/writeback controls or application gates.
+
 ## Notes
 
 - Within a segment, nodes discover each other via LAN multicast + direct TCP; across
