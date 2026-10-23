@@ -18,6 +18,7 @@ mod local_responses;
 mod nvidia;
 mod openai;
 mod realtime_audio;
+mod realtime_model;
 #[cfg(feature = "webrtc-media")]
 pub mod realtime_webrtc;
 mod responses_tools;
@@ -26,6 +27,7 @@ mod scripted;
 #[cfg(feature = "test-cases")]
 mod test_cases;
 mod vendor_api;
+mod video_grounding;
 
 pub use anthropic::{ANTHROPIC_DEFAULT_MODEL, AnthropicConfig, AnthropicProvider};
 pub use claude::{
@@ -92,6 +94,9 @@ pub use realtime_audio::{
     openai_response_cancel_payload, openai_session_update_payload, openai_tool_result_payload,
     parse_realtime_audio_event, realtime_audio_event_from_value, realtime_call_session_payload,
     realtime_sideband_ws_url,
+};
+pub use realtime_model::{
+    RealtimeModelProvider, RealtimeModelVideoObservation, RealtimeModelVideoSource,
 };
 #[cfg(feature = "scripted-provider")]
 pub use scripted::{

@@ -35,12 +35,30 @@ routing, minimized windows and higher-integrity apps may ignore them. Verify
 behavior through video. Do not silently switch to desktop injection. Relative
 hardware mouse motion and gamepad injection are not window-message capabilities.
 
-Capture includes window chrome while mouse input addresses the client area.
-Scale image coordinates by the frame's source/encoded dimensions, add the
-window `bounds` origin, then subtract `client_bounds` origin. These rectangles
-use physical screen pixels. Re-enumerate after move/resize; if capture dimensions
-do not match current bounds, wait for a fresh frame before acting. Windows may
-translate posted coordinates into a DPI-unaware target's logical coordinates.
+For visual grounding, prefer `move_in_frame` over pixel `move`. Its `x` and `y`
+are fractions from 0 to 1 of the **entire image**, including window chrome:
+0 is the left/top edge and 1 the right/bottom edge. Choose the control center
+by its relative position; do not subtract chrome or screen origins. Include
+`source_width` and `source_height` copied from the current video metadata
+(dimensions before encoding). The device maps these fractions into client
+coordinates and handles the target window's DPI. Fractions survive video
+downscaling; no model-side pixel scaling is needed. Chrome/outside-client points
+and source dimensions that disagree with the current window are rejected.
+For models that struggle to estimate positions, request
+`"encoding":{"coordinate_grid":true}` (alongside the encoding's `frame_format`)
+on the media stream. The shared encoder draws a generic grid at every 0.1;
+top labels give x fractions and left labels give y fractions. Interpolate the
+control center between those lines. This opt-in overlay preserves the viewport
+and is included in both recorded and model-visible frames.
+
+Perform a resize in its own input batch. Observe a fresh frame and use its new
+source dimensions for subsequent input. Likewise inspect the result after each
+meaningful action before continuing: queued messages alone do not prove a hit.
+For legacy pixel `move`, scale image pixels by source/encoded dimensions, add
+the current window `bounds` origin and subtract `client_bounds` origin. Those
+rectangles and legacy input pixels are physical; the backend converts them to
+the target's message coordinates. Do not use a top-level frame's coordinates
+with an input lease on a child window.
 
 Close with `{"action":"close","session_id":ID}` even after a failure. Input
 leases release held events after 30 seconds idle; session leases expire at their

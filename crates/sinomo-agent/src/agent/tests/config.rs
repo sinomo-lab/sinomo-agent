@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn native_tools_mode_executes_native_call_and_accepts_plain_answer() {
+    let model = EventfulModel::new([
+        (
+            "",
+            vec![LanguageModelStreamEvent::ToolCallCompleted {
+                call_id: Some("realtime_call_1".into()),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"Cargo.toml"}),
+            }],
+        ),
+        ("Done.", Vec::new()),
+    ]);
+    let definition = AgentDefinition::main().with_output_format(AgentOutputFormat::NativeTools);
+    let wire: sinomo_runtime::api::app::agent::AgentDefinition =
+        serde_json::from_value(serde_json::to_value(&definition).unwrap()).unwrap();
+    let definition: AgentDefinition =
+        serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap();
+    assert_eq!(definition.output_format, AgentOutputFormat::NativeTools);
+    let config = AgentConfig::new("fake", "fake").with_agent_definition(definition);
+    let agent = Agent::new(model, "fake", "fake")
+        .with_config(config)
+        .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
+    let run = agent.run(&agent_input("read the file")).unwrap();
+    assert_eq!(run.tool_results.len(), 1);
+    assert_eq!(run.tool_results[0].status, AgentToolStatus::Succeeded);
+    assert_eq!(
+        run.tool_results[0].call.call_id.as_deref(),
+        Some("realtime_call_1")
+    );
+    assert_eq!(run.final_decision.text, "Done.");
+    assert_eq!(run.model_metrics.native_tool_call_count, 1);
+    assert_eq!(run.model_metrics.repair_attempt_count, 0);
+}
+
+#[test]
 fn text_output_agent_definition_returns_plain_final_answer() {
     let mut input = agent_input("status");
     input.tool_specs = Vec::new();

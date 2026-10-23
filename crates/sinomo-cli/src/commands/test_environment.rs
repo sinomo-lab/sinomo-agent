@@ -237,6 +237,7 @@ impl LiveFrames {
     }
 }
 pub struct VideoRecording {
+    pub started: Instant,
     pub frames: Arc<LiveFrames>,
     stop: Arc<AtomicBool>,
     pump: tokio::task::JoinHandle<()>,
@@ -253,6 +254,7 @@ impl VideoRecording {
         use std::io::Write;
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
+        let started = Instant::now();
         let encoder_log =
             std::fs::File::create(directory.join("encoder.log")).map_err(|e| e.to_string())?;
         let timeline = std::fs::File::create(directory.join("video-frames.jsonl"))
@@ -303,7 +305,6 @@ impl VideoRecording {
         let encoder_stop = stop.clone();
         let encoder = std::thread::spawn(move || {
             let mut log = timeline;
-            let started = Instant::now();
             let mut count = 0u64;
             let result = (|| -> Result<(), String> {
                 encoder_frames.latest(Duration::from_secs(10))?;
@@ -339,6 +340,7 @@ impl VideoRecording {
             )
         });
         Ok(Self {
+            started,
             frames,
             stop,
             pump,
@@ -355,6 +357,403 @@ impl VideoRecording {
             .map_err(|_| "encoder worker panicked")?;
         self.pump.abort();
         result
+    }
+}
+
+pub struct RealtimeCaseEvidence {
+    directory: PathBuf,
+    started: Instant,
+    log: Mutex<std::fs::File>,
+    audio: Mutex<(std::fs::File, u64)>,
+    failure: Mutex<Option<String>>,
+}
+impl RealtimeCaseEvidence {
+    fn observe(&self, event: &serde_json::Value) {
+        use std::io::Write;
+        let result = (|| -> Result<(), String> {
+            let mut safe = event.clone();
+            if event["type"] == "response.output_audio.delta"
+                && let Some(encoded) = event["delta"].as_str()
+            {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|e| e.to_string())?;
+                let mut audio = self.audio.lock().unwrap();
+                let target = (self.started.elapsed().as_secs_f64() * 24_000.0) as u64 * 2;
+                if target > audio.1 {
+                    let padding = (target - audio.1) as usize;
+                    audio
+                        .0
+                        .write_all(&vec![0; padding])
+                        .map_err(|e| e.to_string())?;
+                    audio.1 = target;
+                }
+                audio.0.write_all(&decoded).map_err(|e| e.to_string())?;
+                audio.1 += decoded.len() as u64;
+                safe["delta"] = serde_json::json!({"pcm_bytes":decoded.len()});
+            }
+            redact_realtime_event(&mut safe);
+            writeln!(
+                self.log.lock().unwrap(),
+                "{}",
+                serde_json::json!({"elapsed_ms":self.started.elapsed().as_millis(),"event":safe})
+            )
+            .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            *self.failure.lock().unwrap() = Some(error);
+        }
+    }
+    pub fn audio_tail(&self) -> Duration {
+        Duration::from_secs_f64(self.audio.lock().unwrap().1 as f64 / 48_000.0)
+            .saturating_sub(self.started.elapsed())
+    }
+    pub fn mux(&self, ffmpeg: &Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        if let Some(error) = self.failure.lock().unwrap().clone() {
+            return Err(error);
+        }
+        let mut audio = self.audio.lock().unwrap();
+        audio.0.flush().map_err(|e| e.to_string())?;
+        if audio.1 == 0 {
+            return Ok(());
+        }
+        let duration = self.started.elapsed().as_secs_f64().to_string();
+        let log =
+            std::fs::File::create(self.directory.join("mux.log")).map_err(|e| e.to_string())?;
+        let mut child = std::process::Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(self.directory.join("recording.mp4"))
+            .args(["-f", "s16le", "-ar", "24000", "-ac", "1", "-i"])
+            .arg(self.directory.join("realtime-output.pcm"))
+            .args([
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-af",
+                "apad",
+                "-movflags",
+                "+faststart",
+            ])
+            .args(["-t", duration.as_str()])
+            .arg(self.directory.join("recording-with-audio.mp4"))
+            .creation_flags(0x08000000)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("recording mux timed out; inspect mux.log".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if !status.success() {
+            return Err("recording audio mux failed; inspect mux.log".into());
+        }
+        Ok(())
+    }
+}
+fn redact_realtime_event(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "access_token" | "refresh_token" | "api_key" | "client_secret"
+                ) {
+                    *value = serde_json::Value::String("[redacted]".into());
+                } else {
+                    redact_realtime_event(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_realtime_event),
+        serde_json::Value::String(text) if text.starts_with("data:") => {
+            *value = serde_json::Value::String("[media retained separately]".into())
+        }
+        _ => {}
+    }
+}
+struct RealtimeFixtureSource {
+    frames: Arc<LiveFrames>,
+    transport: Arc<FixtureTransport>,
+    directory: PathBuf,
+    model: String,
+    sequence: AtomicUsize,
+    evidence: Arc<RealtimeCaseEvidence>,
+    desktop_origin: Option<[i32; 2]>,
+}
+impl RealtimeModelVideoSource for RealtimeFixtureSource {
+    fn observe(
+        &self,
+        before_response: bool,
+    ) -> Result<Option<RealtimeModelVideoObservation>, String> {
+        if let Some(error) = self.evidence.failure.lock().unwrap().clone() {
+            return Err(error);
+        }
+        let after = if before_response {
+            self.transport
+                .last_effect_unix_ms
+                .load(Ordering::Acquire)
+                .saturating_add(150)
+        } else {
+            0
+        };
+        let (metadata, frame) = self.frames.after(
+            after,
+            if before_response {
+                Duration::from_secs(5)
+            } else {
+                Duration::ZERO
+            },
+        )?;
+        let index = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let path = self
+            .directory
+            .join("observations")
+            .join(format!("video-{index:06}.jpg"));
+        std::fs::write(&path, &frame.image).map_err(|e| e.to_string())?;
+        write_json(
+            &path.with_extension("json"),
+            &serde_json::json!({"model":self.model,"source":metadata,"before_response":before_response,"observation_after_unix_ms":after,"image_blake3":blake3::hash(&frame.image).to_hex().to_string()}),
+        )?;
+        let coordinates = if let Some(origin) = self.desktop_origin {
+            format!(
+                "Convert an image pixel (x,y) to desktop input with input_x=round(x*{})+({}), input_y=round(y*{})+({}).",
+                f64::from(metadata.source_width) / f64::from(metadata.width),
+                origin[0],
+                f64::from(metadata.source_height) / f64::from(metadata.height),
+                origin[1],
+            )
+        } else {
+            format!(
+                "Use move_in_frame for app input. Locate control centers as fractions of the entire visible image (x=0 left, x=1 right, y=0 top, y=1 bottom). Do not subtract the title bar or convert to client pixels. For this frame supply source_width={} and source_height={}. The device performs coordinate conversion. After resizing, use fresh dimensions from a new frame. Observe each action's result before continuing.",
+                metadata.source_width, metadata.source_height,
+            )
+        };
+        let coordinates = if metadata.coordinate_grid {
+            format!(
+                "{coordinates} The image has coordinate rulers: labels along the TOP are x fractions and labels along the LEFT are y fractions. Thin grid lines mark every 0.1. Read those labels and interpolate the control center between the lines; do not estimate a different image size."
+            )
+        } else {
+            coordinates
+        };
+        Ok(Some(RealtimeModelVideoObservation {
+            frame,
+            context: Some(format!(
+                "{coordinates} Current frame: {}",
+                serde_json::to_string(&metadata).unwrap()
+            )),
+        }))
+    }
+}
+pub struct VisualRealtime {
+    pub provider: Arc<RealtimeModelProvider>,
+    pub evidence: Arc<RealtimeCaseEvidence>,
+    credentials: OpenAiResponsesCodexClient,
+    pub auth_failed: Arc<AtomicBool>,
+    directory: PathBuf,
+    sequence: AtomicUsize,
+}
+impl VisualRealtime {
+    fn new(
+        model: &str,
+        credentials: &Path,
+        frames: Arc<LiveFrames>,
+        transport: Arc<FixtureTransport>,
+        directory: &Path,
+        started: Instant,
+        desktop_origin: Option<[i32; 2]>,
+    ) -> Result<Self, String> {
+        let credentials = OpenAiResponsesCodexClient::new(OpenAiResponsesCodexConfig {
+            credentials_path: Some(credentials.into()),
+            default_model: model.into(),
+            allow_credential_refresh: false,
+            ..Default::default()
+        });
+        credential_preflight(&credentials)?;
+        let mut config = RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, model)
+            .with_video_input(RealtimeVideoInputConfig {
+                max_frame_rate_hz: Some(2),
+                detail: RealtimeVideoFrameDetail::High,
+                ..Default::default()
+            });
+        credentials
+            .authorize_realtime_session(&mut config)
+            .map_err(|e| format!("AUTH_STOP: {e}"))?;
+        config.connect_timeout_ms = Some(15_000);
+        config.receive_timeout_ms = Some(45_000);
+        std::fs::create_dir_all(directory.join("observations")).map_err(|e| e.to_string())?;
+        let evidence = Arc::new(RealtimeCaseEvidence {
+            directory: directory.into(),
+            started,
+            log: Mutex::new(
+                std::fs::File::create(directory.join("realtime-events.jsonl"))
+                    .map_err(|e| e.to_string())?,
+            ),
+            audio: Mutex::new((
+                std::fs::File::create(directory.join("realtime-output.pcm"))
+                    .map_err(|e| e.to_string())?,
+                0,
+            )),
+            failure: Mutex::new(None),
+        });
+        let source = Arc::new(RealtimeFixtureSource {
+            frames,
+            transport,
+            directory: directory.into(),
+            model: model.into(),
+            sequence: AtomicUsize::new(0),
+            evidence: evidence.clone(),
+            desktop_origin,
+        });
+        let observed = evidence.clone();
+        let provider = RealtimeModelProvider::new(config)
+            .map_err(|e| e.to_string())?
+            .with_video_source(source)
+            .with_observer(move |event| observed.observe(event));
+        Ok(Self {
+            provider: Arc::new(provider),
+            evidence,
+            credentials,
+            auth_failed: Arc::new(AtomicBool::new(false)),
+            directory: directory.into(),
+            sequence: AtomicUsize::new(0),
+        })
+    }
+}
+pub enum DesktopVisualModel {
+    Responses(VisualCodex),
+    Realtime(VisualRealtime),
+}
+impl DesktopVisualModel {
+    pub fn new(
+        realtime: bool,
+        model: &str,
+        credentials: &Path,
+        recording: &VideoRecording,
+        transport: Arc<FixtureTransport>,
+        directory: &Path,
+        desktop_origin: Option<[i32; 2]>,
+    ) -> Result<Self, String> {
+        if realtime {
+            VisualRealtime::new(
+                model,
+                credentials,
+                recording.frames.clone(),
+                transport,
+                directory,
+                recording.started,
+                desktop_origin,
+            )
+            .map(Self::Realtime)
+        } else {
+            VisualCodex::new(
+                model,
+                credentials,
+                recording.frames.clone(),
+                transport,
+                directory,
+            )
+            .map(Self::Responses)
+        }
+    }
+    pub fn auth_failed(&self) -> Arc<AtomicBool> {
+        match self {
+            Self::Responses(p) => p.auth_failed.clone(),
+            Self::Realtime(p) => p.auth_failed.clone(),
+        }
+    }
+    pub fn realtime_handles(
+        &self,
+    ) -> Option<(Arc<RealtimeModelProvider>, Arc<RealtimeCaseEvidence>)> {
+        match self {
+            Self::Realtime(p) => Some((p.provider.clone(), p.evidence.clone())),
+            _ => None,
+        }
+    }
+}
+impl LanguageModelProvider for DesktopVisualModel {
+    fn info(&self) -> LanguageModelProviderInfo {
+        match self {
+            Self::Responses(p) => LanguageModelProvider::info(p),
+            Self::Realtime(p) => LanguageModelProvider::info(p.provider.as_ref()),
+        }
+    }
+    fn complete(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        LanguageModelProvider::complete_streaming_events_with_cancellation(
+            self,
+            request,
+            &LanguageModelCancellation::default(),
+            &mut |_| {},
+        )
+    }
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation: &LanguageModelCancellation,
+        event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        match self {
+            Self::Responses(p) => {
+                LanguageModelProvider::complete_streaming_events_with_cancellation(
+                    p,
+                    request,
+                    cancellation,
+                    event,
+                )
+            }
+            Self::Realtime(p) => {
+                if let Err(detail) = credential_preflight(&p.credentials) {
+                    p.auth_failed.store(true, Ordering::Release);
+                    return Err(LanguageModelError::AuthenticationRequired {
+                        provider: "codex".into(),
+                        detail,
+                    });
+                }
+                let index = p.sequence.fetch_add(1, Ordering::Relaxed);
+                write_json(
+                    &p.directory
+                        .join("observations")
+                        .join(format!("{index:03}.request.json")),
+                    request,
+                )
+                .map_err(|detail| {
+                    LanguageModelError::ProviderInvocationFailed {
+                        provider: "codex".into(),
+                        model: request.model.clone(),
+                        detail,
+                    }
+                })?;
+                eprintln!("realtime agent model turn {index}: {}", request.model);
+                let result = LanguageModelProvider::complete_streaming_events_with_cancellation(
+                    p.provider.as_ref(),
+                    request,
+                    cancellation,
+                    event,
+                );
+                if matches!(
+                    result,
+                    Err(LanguageModelError::AuthenticationRequired { .. })
+                ) {
+                    p.auth_failed.store(true, Ordering::Release);
+                }
+                result
+            }
+        }
     }
 }
 impl Drop for VideoRecording {
@@ -568,6 +967,7 @@ mod tests {
                 source_width: 1,
                 source_height: 1,
                 format: RealtimeVideoFrameFormat::Jpeg,
+                coordinate_grid: false,
             },
             RealtimeEncodedVideoFrameInput::new(
                 Vec::<u8>::new(),

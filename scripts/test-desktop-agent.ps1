@@ -1,9 +1,12 @@
 param(
     [string]$Model = 'gpt-6.1-sol',
+    [ValidateSet('responses','realtime')][string]$AgentRuntime = 'responses',
     [string]$Case,
     [string]$Binary,
     [string]$Credentials,
     [string]$RunDirectory,
+    [ValidateRange(128,4096)][int]$CaptureMaxDimension = 1440,
+    [switch]$CoordinateGrid,
     [int]$TimeoutSeconds = 900,
     [switch]$FixtureOnly,
     [switch]$UseInteractiveDesktop,
@@ -134,16 +137,19 @@ try {
     $arguments = @('test','run')
     if ($Case) { $arguments += $Case } else { $arguments += @('--tag','agent-desktop') }
     $arguments += @('--provider','codex','--model',$Model,'--live','--json',
+        '--param',('agent-runtime='+$AgentRuntime),
+        '--param',('capture-max-dimension='+$CaptureMaxDimension),
         '--param',('artifacts-dir='+$RunDirectory),'--param',('desktop-name='+$desktopName),
         '--param',('ffmpeg='+$ffmpeg),'--param',('ffprobe='+$ffprobe))
     if ($FixtureOnly) { $arguments += @('--param','fixture-only=true') }
+    if ($CoordinateGrid) { $arguments += @('--param','coordinate-grid=true') }
     if ($UseInteractiveDesktop) { $arguments += @('--param','interactive-fixture=true') }
     $sourceFiles = @(& git -C $repo diff --name-only) + @(& git -C $repo ls-files --others --exclude-standard)
     $hashes = @($sourceFiles | Sort-Object -Unique | ForEach-Object {
         $candidate = Join-Path $repo $_
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { @{path=$_;sha256=(Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash} }
     })
-    @{head=(& git -C $repo rev-parse HEAD);modified_sources=$hashes;model=$Model;binary=$Binary;binary_sha256=(Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash} |
+    @{head=(& git -C $repo rev-parse HEAD);modified_sources=$hashes;model=$Model;agent_runtime=$AgentRuntime;binary=$Binary;binary_sha256=(Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash} |
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $RunDirectory 'source.json')
     [uint32]$childId=0
     $childHandle = [DesktopHarness]::Start($Binary,$arguments,$desktopName,$repo,(Join-Path $RunDirectory 'report.json'),(Join-Path $RunDirectory 'runtime.log'),[ref]$childId)
@@ -168,7 +174,7 @@ try {
     }
     [uint32]$nativeExit=1
     [DesktopHarness]::GetExitCodeProcess($childHandle,[ref]$nativeExit) | Out-Null
-    $exitCode=[int]$nativeExit
+    $exitCode=if ($nativeExit -gt [int]::MaxValue) { 1 } else { [int]$nativeExit }
 } finally {
     if ($childHandle -ne [IntPtr]::Zero) {
         if ([DesktopHarness]::WaitForSingleObject($childHandle,0) -eq 258) { Stop-OwnedChild $owner }

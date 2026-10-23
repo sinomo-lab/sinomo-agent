@@ -1767,6 +1767,10 @@ pub struct ModuleObjectRpcRoute {
     pub concurrency_limit: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Optional JSON schema for model-facing request payload projection. The
+    /// service still owns decoding, validation and authorization of each call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1806,11 +1810,17 @@ impl ModuleObjectRpcRoute {
             exact_member_identity: false,
             concurrency_limit: None,
             timeout_ms: None,
+            request_schema: None,
         }
     }
 
     pub fn with_request_body_mode(mut self, mode: NativeModuleBodyMode) -> Self {
         self.request_body_mode = mode;
+        self
+    }
+
+    pub fn with_request_schema(mut self, schema: serde_json::Value) -> Self {
+        self.request_schema = Some(schema);
         self
     }
 
@@ -1851,6 +1861,16 @@ impl ModuleObjectRpcRoute {
 
     pub fn validate(&self) -> Result<(), ModuleSurfaceError> {
         validate_module_object_rpc_route_path(&self.route)?;
+        if self
+            .request_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.is_object() && !schema.is_boolean())
+        {
+            return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+                route: self.route.clone(),
+                detail: "request_schema must be a JSON schema object or boolean".into(),
+            });
+        }
         validate_module_surface_token(
             &self.route,
             &self.category,

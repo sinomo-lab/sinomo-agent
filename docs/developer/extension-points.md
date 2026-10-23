@@ -129,6 +129,18 @@ lets a caller distinguish committed, rejected, unknown, and timed-out outcomes.
 
 ## Agent Tools
 
+Linked module control routes can publish a JSON payload schema through
+`ModuleObjectRpcRoute::with_request_schema`. The generic agent-tool projection
+places it under the tool's required `input` property. Keep request schemas with
+the service owner so every model receives the same contract. This metadata is
+descriptive; the service remains responsible for decoding, validation and
+authority checks. Routes without schemas retain their existing generic payload.
+
+`AgentOutputFormat::NativeTools` exposes the normal authorized tool projection
+while accepting a plain-text final answer. Use it with native function-calling
+models such as Realtime; `Text` remains tool-free and `JsonDecision` retains its
+existing decision envelope.
+
 Implement `AgentTool::descriptor` and `AgentTool::execute`, then register the
 tool with `AgentToolRegistry`. The descriptor is user/model-visible contract;
 execution is still subject to runtime policy and workspace boundaries.

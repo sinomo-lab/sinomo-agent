@@ -180,6 +180,10 @@ cargo build -p sinomo --features desktop-e2e
 .\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop
 # Run just one case:
 .\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop -Case agent.desktop.app-drag-resize
+# Persistent Realtime session, live capture and native function calls:
+.\scripts\test-desktop-agent.ps1 -AgentRuntime realtime -Model gpt-realtime-2 -UseInteractiveDesktop
+# Exercise app grounding with video deliberately smaller than the source UI:
+.\scripts\test-desktop-agent.ps1 -AgentRuntime realtime -Model gpt-realtime-2 -UseInteractiveDesktop -Case agent.desktop.app-drag-resize -CaptureMaxDimension 768 -CoordinateGrid
 ```
 
 The launcher requires `ffmpeg` and `ffprobe` on PATH and an existing Sinomo Codex
@@ -197,11 +201,36 @@ test-support adapter. No daemon, cluster, operator workspace or distributed
 settings are required or changed. This exercises the local agent-to-device
 path; it does not establish cross-node routing behavior.
 
-The agent receives native image inputs sampled from the continuous, shared
-Sinomo media stream. Each new observation waits for a frame captured after the
-preceding tool completion. This is a visual tool loop with a recorded video,
-not evidence of a realtime provider's native video API. The separate
-`sinomo voice call --computer-stream/--app-stream` path supplies such consumers.
+Both modes observe the continuous shared Sinomo media stream and wait for a
+post-action frame before requesting the next model response. Responses mode
+sends a native image with each request. Realtime mode uses one persistent
+`RealtimeModelProvider` connection behind the same `AgentSessionRuntime`, with
+`native_tools` output format. The agent executor still owns tool policy,
+execution, cancellation, traces and stored sessions. Frames continue at 2 Hz
+while the Realtime response is generated; the independent capture and video
+recording remain active throughout tool execution. This is JPEG frame input
+over WebSocket, not a native WebRTC video track.
+
+Realtime tool calls are dispatched only after a successful terminal
+`response.done`. Results are sent back once with their original provider call
+IDs, and failed connections are not silently reconnected or replayed. Typed
+module request schemas and per-frame geometry are included in the model context.
+App input uses `move_in_frame`: normalized fractions of the full window image
+plus the frame's source dimensions. The device converts them to client/message
+coordinates, accounts for DPI, and rejects stale sizes after a resize. Video
+encoding and model-side resizing do not require the agent to scale pixel
+coordinates. Resize and subsequent actions use separate observe/act steps.
+The Windows device integration test covers physical and normalized input in
+both per-monitor-aware and DPI-unaware windows without foreground or pointer
+changes (`cargo test -p sinomo-device --test desktop_windows -- --ignored --test-threads=1`).
+`-CoordinateGrid` enables content-independent coordinate rulers in the shared
+encoder after resizing, without changing the viewport. The recording and model
+receive the same annotated frames. This is an optional grounding aid, not control
+detection or fixture-specific target coordinates; it defaults off.
+Realtime runs additionally retain redacted server events,
+usage, returned PCM speech and `recording-with-audio.mp4`; the latter aligns
+speech to receipt/playback time on the screen recording timeline. Recording
+finalization has a bounded encoder deadline.
 
 | Case | Independent acceptance condition |
 |---|---|
@@ -233,6 +262,32 @@ hashes. MP4 recording uses FFmpeg only as an artifact sink after Sinomo's shared
 encoder and media transport; repeated latest frames preserve recording time
 and are declared in its metadata. Failed runs are retained, and reusing an
 existing run directory is rejected.
+
+## Live Realtime Visual Probe
+
+The small ignored test below uses the stored Codex credential with
+`gpt-realtime-2`. It sends four synthetic JPEG frames through the shared encoder
+and production Realtime WebSocket session, asks for two short spoken responses,
+and independently checks random codes, colors, shapes, positions and frame order.
+It captures neither the desktop nor the microphone, and starts no cluster.
+
+```powershell
+$env:SINOMO_CODEX_CREDENTIALS_FILE = Join-Path $env:USERPROFILE '.sinomo/configs/lm/credentials/codex.json'
+$env:SINOMO_REALTIME_VIDEO_ARTIFACTS = Join-Path $PWD ('benchmark-results/realtime-video-' + [Guid]::NewGuid().ToString('N'))
+cargo test -p sinomo-lm --test codex_realtime_video_e2e -- --ignored --nocapture
+```
+
+Use a fresh artifact directory each time. The test disables credential refresh,
+checks expiry before connecting, and verifies the credential file is unchanged.
+Artifacts include exact encoded frames, returned PCM WAV audio, redacted server
+events, terminal response status/usage, expected answers and an independent
+verdict. A visual recognition error fails the strict test even when transport
+and API processing succeed; retain that evidence.
+
+This verifies sequential image input to a Realtime model, not a native WebRTC
+video track. Successful subscription-token authentication establishes observed
+access only. The server's token usage and before/after shared account counters
+do not establish an undocumented subscription billing rule.
 
 ## Formal Verification
 

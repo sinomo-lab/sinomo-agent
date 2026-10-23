@@ -663,6 +663,7 @@ mod tests {
             exact_member_identity: true,
             concurrency_limit: Some(3),
             timeout_ms: Some(60_000),
+            request_schema: None,
         }
         .descriptor()
         .expect("valid descriptor");

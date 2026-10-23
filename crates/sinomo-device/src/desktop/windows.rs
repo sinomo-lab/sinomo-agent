@@ -6,6 +6,7 @@ use windows::Foundation::{EventHandler, TypedEventHandler};
 use windows::Gaming::Input::{Gamepad, GamepadButtons};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    IDirect3D11CaptureFramePoolStatics2, IGraphicsCaptureSessionStatics,
 };
 use windows::Graphics::DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat};
 use windows::UI::Input::Preview::Injection::{InjectedInputGamepadInfo, InputInjector};
@@ -135,7 +136,7 @@ pub(super) fn initialize_input_thread() -> DesktopResult<InputThread> {
 
 pub fn capabilities() -> DesktopCapabilities {
     let _apartment = Apartment::new();
-    DesktopCapabilities { platform: "windows".into(), capture: GraphicsCaptureSession::IsSupported().unwrap_or(false), keyboard_mouse: true, background_window_input: true,
+    DesktopCapabilities { platform: "windows".into(), capture: capture_supported().unwrap_or(false), keyboard_mouse: true, background_window_input: true,
         gamepad: "conditional: Windows InputInjector requires inputInjectionBrokered; availability is checked on first gamepad input".into(),
         limitations: vec!["Input is subject to UIPI, interactive-session and secure-desktop boundaries.".into(), "Window messages are best effort: raw-input/DirectInput apps, focus checks and held modifier polling may ignore them.".into(), "Occluded windows can be captured; minimized, protected or suspended windows may stop producing frames. Capture never restores or focuses a window.".into()] }
 }
@@ -388,6 +389,9 @@ impl Input {
             DesktopInput::RelativeMove { dx, dy } => {
                 send_input(&[mouse_input(*dx, *dy, 0, MOUSEEVENTF_MOVE)])
             }
+            DesktopInput::MoveInFrame { .. } => Err(DesktopError::Unsupported(
+                "frame-relative input requires an app window".into(),
+            )),
             DesktopInput::Button { button, down } => {
                 let (flags, data) = match (button, down) {
                     (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
@@ -518,6 +522,9 @@ impl Input {
                 Ok(())
             }
             DesktopInput::Move { x, y } => {
+                // This worker posts physical pixels from a per-monitor-aware
+                // context. Windows translates these mouse messages for a
+                // DPI-unaware receiver; pre-scaling would translate twice.
                 post(
                     WM_MOUSEMOVE,
                     self.window_mouse_flags() as usize,
@@ -525,6 +532,40 @@ impl Input {
                 )?;
                 self.position = (*x, *y);
                 Ok(())
+            }
+            DesktopInput::MoveInFrame {
+                x,
+                y,
+                source_width,
+                source_height,
+            } => {
+                let mut bounds = RECT::default();
+                let mut client = RECT::default();
+                let mut origin = POINT::default();
+                unsafe {
+                    DwmGetWindowAttribute(
+                        window,
+                        DWMWA_EXTENDED_FRAME_BOUNDS,
+                        &mut bounds as *mut _ as *mut c_void,
+                        size_of::<RECT>() as u32,
+                    )
+                    .map_err(error)?;
+                    GetClientRect(window, &mut client).map_err(error)?;
+                    ClientToScreen(window, &mut origin).ok().map_err(error)?;
+                }
+                let (x, y) = frame_point_to_client(
+                    *x,
+                    *y,
+                    [*source_width, *source_height],
+                    [bounds.left, bounds.top, bounds.right, bounds.bottom],
+                    [
+                        origin.x,
+                        origin.y,
+                        origin.x + client.right - client.left,
+                        origin.y + client.bottom - client.top,
+                    ],
+                )?;
+                self.window_input(window, thread_id, &DesktopInput::Move { x, y })
             }
             DesktopInput::Button { button, down } => {
                 let (flag, pressed, released, xbutton) = match button {
@@ -599,6 +640,7 @@ impl Drop for Input {
 fn packed_position(x: i32, y: i32) -> isize {
     ((x as u16 as u32) | ((y as u16 as u32) << 16)) as isize
 }
+
 fn key_input(code: u16, down: bool, extended: bool, unicode: bool) -> INPUT {
     let mut flags = if unicode {
         KEYEVENTF_UNICODE
@@ -739,6 +781,43 @@ struct Capture {
     item: GraphicsCaptureItem,
     include_cursor: bool,
 }
+
+// The generated static methods keep process-global factory pointers. WGC can
+// invalidate those when the last WinRT apartment shuts down, crashing the next
+// capture in a small host. Acquire scoped factories so they are released before
+// our apartment, rather than retaining COM state across module lifetimes.
+fn capture_supported() -> windows::core::Result<bool> {
+    let factory = factory::<GraphicsCaptureSession, IGraphicsCaptureSessionStatics>()?;
+    let mut supported = false;
+    unsafe {
+        (factory.vtable().IsSupported)(factory.as_raw(), &mut supported).ok()?;
+    }
+    Ok(supported)
+}
+
+fn create_frame_pool(
+    device: &IDirect3DDevice,
+    size: windows::Graphics::SizeInt32,
+) -> windows::core::Result<Direct3D11CaptureFramePool> {
+    let factory = factory::<Direct3D11CaptureFramePool, IDirect3D11CaptureFramePoolStatics2>()?;
+    let mut pool = std::ptr::null_mut();
+    unsafe {
+        (factory.vtable().CreateFreeThreaded)(
+            factory.as_raw(),
+            device.as_raw(),
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+            &mut pool,
+        )
+        .ok()?;
+        if pool.is_null() {
+            Err(windows::core::Error::empty())
+        } else {
+            Ok(Direct3D11CaptureFramePool::from_raw(pool))
+        }
+    }
+}
 struct CapturedFrame(windows::Graphics::Capture::Direct3D11CaptureFrame);
 impl std::ops::Deref for CapturedFrame {
     type Target = windows::Graphics::Capture::Direct3D11CaptureFrame;
@@ -753,7 +832,7 @@ impl Drop for CapturedFrame {
 }
 impl Capture {
     fn new(config: &DesktopCaptureConfig) -> DesktopResult<Self> {
-        if !GraphicsCaptureSession::IsSupported().map_err(error)? {
+        if !capture_supported().map_err(error)? {
             return Err(DesktopError::Unsupported(
                 "Windows Graphics Capture is unavailable".into(),
             ));
@@ -793,13 +872,7 @@ impl Capture {
             .map_err(error)?;
         let size = item.Size().map_err(error)?;
         validate_size(size.Width, size.Height)?;
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &winrt_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
-            size,
-        )
-        .map_err(error)?;
+        let pool = create_frame_pool(&winrt_device, size).map_err(error)?;
         let session = pool.CreateCaptureSession(&item).map_err(error)?;
         session
             .SetIsCursorCaptureEnabled(config.include_cursor)
@@ -940,13 +1013,7 @@ impl Capture {
         // the compositor for a complete initial frame at the new size. Reuse
         // the D3D device/context, retain the native PTS origin, and never focus
         // or repaint the target application.
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &self.winrt_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
-            size,
-        )
-        .map_err(error)?;
+        let pool = create_frame_pool(&self.winrt_device, size).map_err(error)?;
         let session = pool.CreateCaptureSession(&self.item).map_err(error)?;
         session
             .SetIsCursorCaptureEnabled(self.include_cursor)

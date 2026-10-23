@@ -88,6 +88,16 @@ fn run(ctx: &mut SinomoTestContext, case: Case) -> SinomoTestResult {
     };
     write_json(&directory.join("case-result.json"),&serde_json::json!({"case":case.id(),"model":model,"provider":"codex","result":summary,"environment":if ctx.parameter("interactive-fixture")==Some("true"){"owned windows on interactive desktop; isolated data and real agent/component runtimes"}else{"isolated Win32 desktop; real agent/component runtimes"},"transport":"local object-RPC production body ownership and framing"})).map_err(SinomoTestError::failed)?;
     for (file, mime, label) in [
+        (
+            "recording-with-audio.mp4",
+            "video/mp4",
+            "Live Realtime agent screen and returned speech",
+        ),
+        (
+            "realtime-events.jsonl",
+            "application/x-ndjson",
+            "Realtime session, tool and usage events",
+        ),
         ("recording.mp4", "video/mp4", "Live agent screen recording"),
         ("agent-run.json", "application/json", "Real agent execution"),
         (
@@ -267,6 +277,14 @@ fn run_live(
     else {
         return Err("capture lease failed".into());
     };
+    let max_dimension: u32 = ctx
+        .parameter("capture-max-dimension")
+        .unwrap_or("1440")
+        .parse()
+        .map_err(|_| "capture-max-dimension must be an integer")?;
+    if !(128..=4096).contains(&max_dimension) {
+        return Err("capture-max-dimension must be 128..4096".into());
+    }
     let stream = environment.runtime.block_on(environment.transport.invoke(
         kind.capture_route(),
         MEDIA_CATEGORY,
@@ -275,8 +293,9 @@ fn run_live(
             frames_per_second: 20,
             include_cursor: case.raw(),
             encoding: RealtimeVideoInputConfig {
-                max_dimension: Some(1440),
+                max_dimension: Some(max_dimension),
                 max_frame_rate_hz: Some(10),
+                coordinate_grid: ctx.parameter("coordinate-grid") == Some("true"),
                 ..Default::default()
             },
         },
@@ -314,14 +333,31 @@ fn run_live(
         )
         .with_diagnostics(serde_json::json!({"fixture_ready":true,"model_invoked":false})));
     }
-    let visual = VisualCodex::new(
+    let realtime = match ctx.parameter("agent-runtime") {
+        Some("realtime") => true,
+        Some("responses") | None => false,
+        _ => return Err("unknown agent-runtime; use responses or realtime".into()),
+    };
+    ctx.record(
+        "agent_runtime",
+        if realtime {
+            "AgentSessionRuntime + persistent RealtimeModelProvider"
+        } else {
+            "AgentSessionRuntime + Responses"
+        },
+    );
+    let desktop_origin = raw.then_some([target_info.bounds[0], target_info.bounds[1]]);
+    let visual = DesktopVisualModel::new(
+        realtime,
         model,
         credentials,
-        recording.frames.clone(),
+        &recording,
         environment.transport.clone(),
         directory,
+        desktop_origin,
     )?;
-    let auth_failed = visual.auth_failed.clone();
+    let realtime_handles = visual.realtime_handles();
+    let auth_failed = visual.auth_failed();
     let tools = environment.tools(&data);
     let mut config = AgentConfig::new("codex", model)
         .with_workspace_root(directory)
@@ -332,6 +368,12 @@ fn run_live(
         .with_module_tool_projection(environment.projection.clone());
     config.visible_toolsets = vec!["module".into(), kind.name().into()];
     config.max_output_tokens = Some(4096);
+    if realtime {
+        config.definition.output_format = AgentOutputFormat::NativeTools;
+        config = config
+            .with_max_tool_calls_per_step(8)
+            .with_max_model_repair_attempts(0);
+    }
     let agent = Agent::new(visual, "codex", model)
         .with_config(config)
         .with_tool_registry(tools)
@@ -345,12 +387,18 @@ fn run_live(
         environment.node_id.clone(),
         InteractionSurface::new("desktop-e2e", InteractionSurfaceKind::CommandLine),
     );
-    let task=match case{
+    let mut task=match case{
         Case::AppForm|Case::ComputerForm=>format!("Fill the visible input with {code}, submit it using Enter or the Submit button, make Counter exactly 3, and turn the OFF button ON. Use the provided desktop control tool. Verify the final screen, release all held inputs and close your input session."),
         Case::AppDragResize=>format!("Click EXPAND to resize the window, then use the updated visual frame to drag the yellow token into the green DROP HERE area. Scroll upward three wheel ticks so Scroll ticks reads 3. Type {code} into the input and submit. Verify the final screen and close your input session."),
         Case::GamepadCapability=>"Open an input session and attempt one neutral native gamepad state (all buttons, axes and triggers zero). If the OS rejects the restricted capability, report that honestly and do not substitute keyboard input. Close your session. This is a capability probe, not a game-play claim.".into(),
         Case::GamepadState=>"Use native gamepad injection to hold A (Windows GamepadButtons mask 4), left_x=0.65, left_y=-0.4, right_trigger=0.75, all other axes/triggers zero. Wait for the next visual observation and verify Gamepad pattern reads true. Then send a separate completely neutral gamepad state, verify Returned neutral reads true, and close your input session. Never send the held and neutral states in the same batch. If Windows reports the native capability unsupported, report that honestly without substituting keyboard input.".into(),
     };
+    if realtime {
+        if !raw {
+            task.push_str(" Ground app clicks and drags with move_in_frame using fractions of the entire image and its source dimensions. Separate resizing from subsequent actions and observe the new frame first. After each meaningful action, inspect the result and correct a miss before continuing.");
+        }
+        task.push_str(" Do not copy example coordinates from the skill. Capture is already streaming to you: open input=true, capture=false with lease_ms=180000, then use only input and close. Keep speech brief and perform the task with native function calls.");
+    }
     let system = format!(
         "You are an actual Sinomo agent performing a bounded acceptance task in an owned Windows test window with isolated runtime state. Use only the offered module control tool; do not delegate or invent other tools. A fresh video frame is supplied before each model request. Coordinate metadata accompanies it. The test window belongs to this task. Use the exact target below when opening an input=true, capture=false, lease_ms=180000 session. All observation recording is already running independently. Do not open a second capture. Query capabilities if useful. Global target discovery is intentionally denied; use the assigned target. The window origin stays fixed if it resizes, and current video metadata supplies the updated dimensions. Use one tool invocation at a time, but batch related input events. Always pair button/key down and up. For background app input send move before clicks, use VK_RETURN 13 for Enter; computer use uses scan-code 28 for Enter. Only claim completion after observing the resulting state.\nTARGET INFO:\n{}\nMODULE SKILL:\n{}",
         serde_json::to_string(&target_info).unwrap(),
@@ -406,7 +454,14 @@ fn run_live(
             &serde_json::json!({"error":result.as_ref().err()}),
         )?;
     }
-    std::thread::sleep(Duration::from_secs(1));
+    if let Some((provider, _)) = &realtime_handles {
+        provider.close()?;
+    }
+    let tail = realtime_handles
+        .as_ref()
+        .map(|(_, e)| e.audio_tail())
+        .unwrap_or_default();
+    std::thread::sleep(Duration::from_secs(1).max(tail));
     let actual = window.state();
     let pointer = window.pointer()?;
     let foreground = window.foreground();
@@ -426,6 +481,9 @@ fn run_live(
     ));
     environment.close()?;
     let video = recording_result?;
+    if let Some((_, evidence)) = &realtime_handles {
+        evidence.mux(&ffmpeg)?;
+    }
     let probe = std::process::Command::new(ffprobe)
         .args([
             "-v",

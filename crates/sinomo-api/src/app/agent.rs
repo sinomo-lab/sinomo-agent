@@ -451,6 +451,7 @@ pub enum AgentOutputFormat {
     #[default]
     JsonDecision,
     Text,
+    NativeTools,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

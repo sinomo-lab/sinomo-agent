@@ -601,6 +601,98 @@ fn service_route(kind: DesktopModule, route: &'static str) -> ServiceRoute {
     })
 }
 
+fn control_request_schema(kind: DesktopModule) -> serde_json::Value {
+    use serde_json::{Value, json};
+    fn object(properties: Value, required: &[&str]) -> Value {
+        json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+    }
+    let integer = json!({"type":"integer"});
+    let target = match kind {
+        DesktopModule::ComputerUse => object(
+            json!({"kind":{"type":"string","enum":["monitor"]},"device_name":{"type":"string","description":"Exact enumerated device_name"}}),
+            &["kind", "device_name"],
+        ),
+        DesktopModule::AppUse => object(
+            json!({"kind":{"type":"string","enum":["window"]},"handle":integer,"process_id":integer,"thread_id":integer,"process_started":integer}),
+            &[
+                "kind",
+                "handle",
+                "process_id",
+                "thread_id",
+                "process_started",
+            ],
+        ),
+    };
+    let mut events = vec![
+        object(
+            json!({"kind":{"type":"string","enum":["move"]},"x":integer,"y":integer}),
+            &["kind", "x", "y"],
+        ),
+        object(
+            json!({"kind":{"type":"string","enum":["button"]},"button":{"type":"string","enum":["left","right","middle","x1","x2"]},"down":{"type":"boolean"}}),
+            &["kind", "button", "down"],
+        ),
+        object(
+            json!({"kind":{"type":"string","enum":["text"]},"text":{"type":"string","maxLength":4096}}),
+            &["kind", "text"],
+        ),
+        object(
+            json!({"kind":{"type":"string","enum":["key"]},"code":{"type":"integer","minimum":1,"maximum":255,"description":if kind==DesktopModule::AppUse{"Windows virtual-key code"}else{"Set-1 scan code"}},"down":{"type":"boolean"},"extended":{"type":"boolean"}}),
+            &["kind", "code", "down"],
+        ),
+        object(
+            json!({"kind":{"type":"string","enum":["wheel"]},"delta":{"type":"integer","minimum":-32768,"maximum":32767,"description":"120 units per wheel tick; positive scrolls up"},"horizontal":{"type":"boolean"}}),
+            &["kind", "delta"],
+        ),
+        object(
+            json!({"kind":{"type":"string","enum":["release_all"]}}),
+            &["kind"],
+        ),
+    ];
+    if kind == DesktopModule::AppUse {
+        let fraction = json!({"type":"number","minimum":0,"maximum":1,"description":"Fraction of the entire image: 0 is left/top, 1 is right/bottom. No pixel, screen-origin, client or DPI conversion."});
+        let source_size = json!({"type":"integer","minimum":1,"description":"Copy source_width/source_height from the current video frame metadata, before encoding. Stale sizes are rejected."});
+        events.push(object(
+            json!({"kind":{"type":"string","enum":["move_in_frame"]},"x":fraction,"y":fraction,"source_width":source_size,"source_height":source_size}),
+            &["kind", "x", "y", "source_width", "source_height"],
+        ));
+    }
+    if kind == DesktopModule::ComputerUse {
+        events.push(object(
+            json!({"kind":{"type":"string","enum":["relative_move"]},"dx":integer,"dy":integer}),
+            &["kind", "dx", "dy"],
+        ));
+        let axis = json!({"type":"number","minimum":-1,"maximum":1});
+        let trigger = json!({"type":"number","minimum":0,"maximum":1});
+        events.push(object(json!({"kind":{"type":"string","enum":["gamepad"]},"buttons":{"type":"integer","minimum":0,"description":"Windows GamepadButtons bitmask"},"left_x":axis,"left_y":axis,"right_x":axis,"right_y":axis,"left_trigger":trigger,"right_trigger":trigger}),&["kind","buttons","left_x","left_y","right_x","right_y","left_trigger","right_trigger"]));
+    }
+    let mut actions = vec![
+        object(
+            json!({"action":{"type":"string","enum":["capabilities","targets"]}}),
+            &["action"],
+        ),
+        object(
+            json!({"action":{"type":"string","enum":["open"]},"target":target,"input":{"type":"boolean"},"capture":{"type":"boolean"},"lease_ms":{"type":"integer","minimum":1000,"maximum":300000}}),
+            &["action", "target"],
+        ),
+        object(
+            json!({"action":{"type":"string","enum":["input"]},"session_id":{"type":"string","description":"Exact ID from the opened input session"},"events":{"type":"array","minItems":1,"maxItems":256,"items":{"oneOf":events}}}),
+            &["action", "session_id", "events"],
+        ),
+        object(
+            json!({"action":{"type":"string","enum":["close"]},"session_id":{"type":"string"}}),
+            &["action", "session_id"],
+        ),
+    ];
+    if kind == DesktopModule::AppUse {
+        actions.push(object(
+            json!({"action":{"type":"string","enum":["children"]},"target":target}),
+            &["action", "target"],
+        ));
+    }
+    json!({"oneOf":actions,"description":"Desktop control request. For app video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels for app use, virtual-desktop pixels for computer use. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
+}
+
 pub fn module_registration(kind: DesktopModule) -> ModuleRegistration {
     let mut registration = ModuleRegistration::native_rust(
         kind.module_id(),
@@ -620,12 +712,15 @@ pub fn module_registration(kind: DesktopModule) -> ModuleRegistration {
     // Only control is an ordinary JSON agent tool. The capture operation is a
     // media service offer; generic JSON tool adapters cannot consume live bodies.
     registration.surfaces = ModuleSurfaces::default()
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            kind.control_route(),
-            kind.name(),
-            kind.operation(),
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
+        .with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                kind.control_route(),
+                kind.name(),
+                kind.operation(),
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .with_request_schema(control_request_schema(kind)),
+        )
         .with_declarative_resource(
             ModuleDeclarativeResourceExport::skill(
                 kind.name(),
@@ -733,6 +828,62 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_control_tools_publish_typed_event_schemas() {
+        for kind in [DesktopModule::AppUse, DesktopModule::ComputerUse] {
+            let registration = module_registration(kind);
+            let schema = registration.surfaces.object_rpc_routes[0]
+                .request_schema
+                .as_ref()
+                .unwrap();
+            let actions = schema["oneOf"].as_array().unwrap();
+            let input = actions
+                .iter()
+                .find(|action| action["properties"]["action"]["enum"][0] == "input")
+                .unwrap();
+            let events = input["properties"]["events"]["items"]["oneOf"]
+                .as_array()
+                .unwrap();
+            let button = events
+                .iter()
+                .find(|event| event["properties"]["kind"]["enum"][0] == "button")
+                .unwrap();
+            assert_eq!(button["properties"]["button"]["type"], "string");
+            assert!(
+                button["properties"]["button"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("left"))
+            );
+            let key = events
+                .iter()
+                .find(|event| event["properties"]["kind"]["enum"][0] == "key")
+                .unwrap();
+            assert_eq!(key["properties"]["code"]["minimum"], 1);
+            let frame_move = events
+                .iter()
+                .find(|event| event["properties"]["kind"]["enum"][0] == "move_in_frame");
+            assert_eq!(frame_move.is_some(), kind == DesktopModule::AppUse);
+            if let Some(event) = frame_move {
+                assert_eq!(event["properties"]["x"]["maximum"], 1);
+                assert!(
+                    event["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!("source_width"))
+                );
+                let input: DesktopInput = serde_json::from_value(serde_json::json!({"kind":"move_in_frame","x":0.5,"y":0.5,"source_width":912,"source_height":681})).unwrap();
+                assert!(matches!(input, DesktopInput::MoveInFrame { .. }));
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| event["properties"]["kind"]["enum"][0] == "gamepad"),
+                kind == DesktopModule::ComputerUse
+            );
+        }
+    }
     #[test]
     fn both_modules_finalize_without_route_collisions_and_have_independent_skills() {
         let catalog = ComponentCatalog::builder()

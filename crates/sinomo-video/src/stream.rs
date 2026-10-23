@@ -35,6 +35,8 @@ pub struct VideoFrameMetadata {
     pub source_width: u32,
     pub source_height: u32,
     pub format: RealtimeVideoFrameFormat,
+    #[serde(default)]
+    pub coordinate_grid: bool,
 }
 
 /// BGRA desktop textures go directly into the existing media encoder. Other
@@ -86,6 +88,7 @@ pub fn encode_sample(
         source_width: sample.width,
         source_height: sample.height,
         format: encoded.format,
+        coordinate_grid: config.coordinate_grid,
     };
     Ok((metadata, encoded))
 }
@@ -387,6 +390,7 @@ mod tests {
             source_width: 2,
             source_height: 1,
             format: RealtimeVideoFrameFormat::Png,
+            coordinate_grid: true,
         };
         let bytes = record(&metadata, &[1, 2, 3]).unwrap();
         let mut reader = bytes.as_slice();

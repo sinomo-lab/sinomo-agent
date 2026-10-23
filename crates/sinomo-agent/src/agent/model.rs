@@ -599,7 +599,7 @@ pub(super) fn parse_agent_model_decision(
                 }
             })
         }
-        AgentOutputFormat::Text => {
+        AgentOutputFormat::Text | AgentOutputFormat::NativeTools => {
             parse_agent_loop_response(output_format, &response.content).map(|decision| {
                 ParsedAgentModelDecision {
                     decision,

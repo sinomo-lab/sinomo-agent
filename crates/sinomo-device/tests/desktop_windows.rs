@@ -65,6 +65,16 @@ unsafe extern "system" fn wndproc(window: HWND, message: u32, wp: WPARAM, lp: LP
 #[test]
 #[ignore = "requires an interactive Windows desktop; creates one no-activate test window"]
 fn background_window_messages_and_continuous_capture_preserve_user_input() {
+    background_window_acceptance(false);
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; creates one no-activate DPI-unaware window"]
+fn background_dpi_unaware_window_maps_frame_coordinates() {
+    background_window_acceptance(true);
+}
+
+fn background_window_acceptance(dpi_unaware: bool) {
     let root = sinomo_testdir::TestDir::new("desktop-windows-acceptance");
     let store = LocalNodePermissionStore::new(&root);
     let mut grants = LocalNodePermissions::new();
@@ -80,7 +90,11 @@ fn background_window_messages_and_continuous_capture_preserve_user_input() {
         GetCursorPos(&mut before_cursor).unwrap();
     }
     let thread = std::thread::spawn(move || unsafe {
-        let old_dpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let old_dpi = SetThreadDpiAwarenessContext(if dpi_unaware {
+            DPI_AWARENESS_CONTEXT_UNAWARE
+        } else {
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        });
         let class = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             lpszClassName: w!("SinomoDesktopAcceptance"),
@@ -112,7 +126,24 @@ fn background_window_messages_and_continuous_capture_preserve_user_input() {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
-        ready.send(window.0 as usize as u64).unwrap();
+        // Derive the physical point from the application's own logical space,
+        // independently of the backend which must invert this conversion.
+        let mut origin = POINT::default();
+        let mut point = POINT { x: 31, y: 29 };
+        ClientToScreen(window, &mut origin).ok().unwrap();
+        ClientToScreen(window, &mut point).ok().unwrap();
+        LogicalToPhysicalPointForPerMonitorDPI(Some(window), &mut origin)
+            .ok()
+            .unwrap();
+        LogicalToPhysicalPointForPerMonitorDPI(Some(window), &mut point)
+            .ok()
+            .unwrap();
+        ready
+            .send((
+                window.0 as usize as u64,
+                [point.x - origin.x, point.y - origin.y],
+            ))
+            .unwrap();
         let mut message = MSG::default();
         while stopping.try_recv().is_err() {
             let _ = InvalidateRect(Some(window), None, false);
@@ -127,7 +158,7 @@ fn background_window_messages_and_continuous_capture_preserve_user_input() {
         UnregisterClassW(class.lpszClassName, None).unwrap();
         SetThreadDpiAwarenessContext(old_dpi);
     });
-    let handle = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (handle, physical) = receive.recv_timeout(Duration::from_secs(3)).unwrap();
     // Always stop the fixture even if a validation below panics.
     struct Cleanup(
         Option<mpsc::Sender<()>>,
@@ -140,7 +171,8 @@ fn background_window_messages_and_continuous_capture_preserve_user_input() {
         }
     }
     let _cleanup = Cleanup(Some(stop), Some(thread));
-    let target = enumerate_targets(&store, true).unwrap().into_iter().find(|info| matches!(info.target, DesktopTarget::Window { handle: found, .. } if found == handle)).unwrap().target;
+    let info = enumerate_targets(&store, true).unwrap().into_iter().find(|info| matches!(info.target, DesktopTarget::Window { handle: found, .. } if found == handle)).unwrap();
+    let target = info.target.clone();
     for operation in ["input", "capture"] {
         grants
             .expose_resource_operation(target.resource_id(), operation)
@@ -164,7 +196,10 @@ fn background_window_messages_and_continuous_capture_preserve_user_input() {
     let mut input = DesktopInputSession::open(target.clone(), store.clone()).unwrap();
     input
         .send(&[
-            DesktopInput::Move { x: 31, y: 29 },
+            DesktopInput::Move {
+                x: physical[0],
+                y: physical[1],
+            },
             DesktopInput::Button {
                 button: MouseButton::Left,
                 down: true,
@@ -200,13 +235,78 @@ fn background_window_messages_and_continuous_capture_preserve_user_input() {
         log.lock()
             .unwrap()
             .iter()
-            .any(|m| m.0 == WM_LBUTTONDOWN && m.2 as u32 == (31 | (29 << 16)))
+            .any(|m| m.0 == WM_LBUTTONDOWN && m.2 as u32 == (31 | (29 << 16))),
+        "physical={physical:?}, messages={:?}",
+        log.lock().unwrap()
     );
     assert!(
         log.lock()
             .unwrap()
             .iter()
             .any(|m| m.0 == WM_KEYUP && m.2 as u32 & 0xc0000000 == 0xc0000000)
+    );
+    let client = info.client_bounds.unwrap();
+    let normalized = DesktopInput::MoveInFrame {
+        x: f64::from(client[0] + physical[0] - info.bounds[0]) / f64::from(first.width - 1),
+        y: f64::from(client[1] + physical[1] - info.bounds[1]) / f64::from(first.height - 1),
+        source_width: first.width,
+        source_height: first.height,
+    };
+    log.lock().unwrap().clear();
+    input
+        .send(&[
+            normalized,
+            DesktopInput::Button {
+                button: MouseButton::Left,
+                down: true,
+            },
+            DesktopInput::Button {
+                button: MouseButton::Left,
+                down: false,
+            },
+            DesktopInput::Wheel {
+                delta: 120,
+                horizontal: false,
+            },
+            DesktopInput::Text { text: "Z".into() },
+        ])
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !log.lock().unwrap().iter().any(|m| m.0 == WM_CHAR) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.0 == WM_LBUTTONDOWN && m.2 as u32 == (31 | (29 << 16))),
+        "normalized point must reach the same logical client pixel, including DPI virtualization"
+    );
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.0 == WM_MOUSEWHEEL && (m.1 >> 16) == 120)
+    );
+    assert!(matches!(
+        input.send(&[
+            DesktopInput::MoveInFrame {
+                x: 0.5,
+                y: 0.5,
+                source_width: first.width + 100,
+                source_height: first.height
+            },
+            DesktopInput::Text { text: "!".into() },
+        ]),
+        Err(DesktopError::TargetUnavailable(_))
+    ));
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.0 == WM_CHAR && m.1 == '!' as usize),
+        "stale geometry must stop the batch before text input"
     );
     let mut sequence = first.sequence;
     let changed = loop {

@@ -171,6 +171,14 @@ pub enum DesktopInput {
         x: i32,
         y: i32,
     },
+    /// App use: fractions [0,1] of the entire captured window (including chrome).
+    /// Source dimensions, before encoding, guard against a stale resized frame.
+    MoveInFrame {
+        x: f64,
+        y: f64,
+        source_width: u32,
+        source_height: u32,
+    },
     RelativeMove {
         dx: i32,
         dy: i32,
@@ -204,6 +212,19 @@ pub fn validate_inputs(target: &DesktopTarget, events: &[DesktopInput]) -> Deskt
     }
     for event in events {
         match event {
+            DesktopInput::MoveInFrame {
+                x,
+                y,
+                source_width,
+                source_height,
+            } => {
+                if !target.is_window() {
+                    return Err(DesktopError::Unsupported(
+                        "frame-relative input requires an app window".into(),
+                    ));
+                }
+                validate_frame_point(*x, *y, [*source_width, *source_height])?;
+            }
             DesktopInput::Key { code, .. } if *code == 0 || *code > 255 => {
                 return Err(DesktopError::Invalid("key code must be 1..255".into()));
             }
@@ -254,6 +275,63 @@ pub fn validate_inputs(target: &DesktopTarget, events: &[DesktopInput]) -> Deskt
         }
     }
     Ok(())
+}
+
+fn validate_frame_point(x: f64, y: f64, source: [u32; 2]) -> DesktopResult<()> {
+    if !(0.0..=1.0).contains(&x)
+        || !(0.0..=1.0).contains(&y)
+        || source.contains(&0)
+        || u64::from(source[0]) * u64::from(source[1]) > (MAX_FRAME_BYTES / 4) as u64
+    {
+        return Err(DesktopError::Invalid(
+            "frame coordinates must be finite fractions in [0,1] with valid source dimensions"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Map fractions of a full-window image to physical client pixels. Encoding or
+/// model-side aspect-preserving resizing does not change these fractions. Keep
+/// geometry at the device boundary instead of asking the model to subtract
+/// screen origins, decoration sizes, or DPI offsets.
+#[cfg(any(target_os = "windows", test))]
+fn frame_point_to_client(
+    x: f64,
+    y: f64,
+    source: [u32; 2],
+    bounds: [i32; 4],
+    client: [i32; 4],
+) -> DesktopResult<(i32, i32)> {
+    validate_frame_point(x, y, source)?;
+    let width = i64::from(bounds[2]) - i64::from(bounds[0]);
+    let height = i64::from(bounds[3]) - i64::from(bounds[1]);
+    if width != i64::from(source[0]) || height != i64::from(source[1]) {
+        return Err(DesktopError::TargetUnavailable(format!(
+            "window geometry changed: frame {}x{}, current {width}x{height}; observe a fresh frame before input",
+            source[0], source[1]
+        )));
+    }
+    let screen_x = i64::from(bounds[0]) + (x * f64::from(source[0] - 1)).round() as i64;
+    let screen_y = i64::from(bounds[1]) + (y * f64::from(source[1] - 1)).round() as i64;
+    if screen_x < i64::from(client[0])
+        || screen_x >= i64::from(client[2])
+        || screen_y < i64::from(client[1])
+        || screen_y >= i64::from(client[3])
+    {
+        return Err(DesktopError::Invalid(
+            "frame point is outside the window client area; app input cannot click window chrome"
+                .into(),
+        ));
+    }
+    let x = i16::try_from(screen_x - i64::from(client[0]));
+    let y = i16::try_from(screen_y - i64::from(client[1]));
+    match (x, y) {
+        (Ok(x), Ok(y)) => Ok((i32::from(x), i32::from(y))),
+        _ => Err(DesktopError::Invalid(
+            "app client coordinates must fit signed 16 bits".into(),
+        )),
+    }
 }
 
 /// A held-input lease. Dropping it releases only inputs injected by this owner.
@@ -627,6 +705,73 @@ impl Drop for DesktopCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_coordinates_map_chrome_and_nonzero_origins_without_encoded_size() {
+        // Whole-window image point (200, 200), client begins at (2, 45).
+        for (left, top) in [(229, 110), (-1800, -400)] {
+            assert_eq!(
+                frame_point_to_client(
+                    200.0 / 911.0,
+                    200.0 / 680.0,
+                    [912, 681],
+                    [left, top, left + 912, top + 681],
+                    [left + 2, top + 45, left + 910, top + 679],
+                )
+                .unwrap(),
+                (198, 155)
+            );
+        }
+        // The same fractions work when source pixels are twice as dense, even
+        // if shared media later encodes that source at a smaller resolution.
+        assert_eq!(
+            frame_point_to_client(
+                0.5,
+                0.5,
+                [1801, 1201],
+                [0, 0, 1801, 1201],
+                [4, 90, 1797, 1197]
+            )
+            .unwrap(),
+            (896, 510)
+        );
+    }
+
+    #[test]
+    fn frame_coordinates_reject_stale_geometry_chrome_and_invalid_values() {
+        let map =
+            |x, y, size| frame_point_to_client(x, y, size, [0, 0, 912, 681], [2, 45, 910, 679]);
+        assert!(matches!(
+            map(0.5, 0.5, [1132, 781]),
+            Err(DesktopError::TargetUnavailable(_))
+        ));
+        for (x, y, size) in [
+            (0.5, 0.01, [912, 681]),
+            (1.0, 0.5, [912, 681]),
+            (f64::NAN, 0.5, [912, 681]),
+            (0.5, f64::INFINITY, [912, 681]),
+            (-0.1, 0.5, [912, 681]),
+            (0.5, 1.01, [912, 681]),
+            (0.5, 0.5, [0, 681]),
+            (0.5, 0.5, [u32::MAX, u32::MAX]),
+        ] {
+            assert!(map(x, y, size).is_err());
+        }
+        let event = DesktopInput::MoveInFrame {
+            x: 0.5,
+            y: 0.5,
+            source_width: 912,
+            source_height: 681,
+        };
+        assert!(matches!(
+            validate_inputs(
+                &DesktopTarget::Monitor {
+                    device_name: "test".into()
+                },
+                &[event]
+            ),
+            Err(DesktopError::Unsupported(_))
+        ));
+    }
     #[test]
     fn input_validation_rejects_partial_invalid_batches_and_hardware_app_events() {
         let target = DesktopTarget::Window {
