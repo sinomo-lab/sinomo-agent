@@ -1427,6 +1427,11 @@ pub struct DfsMetadataPrefixProbe {
     /// durably installs the matching local freeze marker.
     #[serde(deserialize_with = "required_optional")]
     pub primary_handoff_id: Option<String>,
+    /// Versioned exact repair custody accompanies every current primary
+    /// rotation. Old peers reject this unknown field; new peers reject a
+    /// rotation without it. Ordinary prefix probes retain their wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_custody: Option<crate::DfsRepairHandoffPage>,
 }
 
 /// Fresh request identity bound to the complete captured current source cut.

@@ -81,10 +81,48 @@ impl LocalSobjMetadataBackend {
             journal_sequence,
             state_fingerprint,
             rebind_prefix_proof: prefix_proof.clone(),
+            repair_custody: existing
+                .as_ref()
+                .filter(|freeze| freeze.handoff_id == handoff_id)
+                .and_then(|freeze| freeze.repair_custody.clone()),
         };
         write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
         self.instance_authority_epoch = None;
         Ok(freeze)
+    }
+
+    pub(super) fn bind_repair_handoff_cut(
+        &mut self,
+        cut: &crate::DfsRepairHandoffCut,
+    ) -> Result<()> {
+        let _lock = self.begin_metadata_write_allow_frozen()?;
+        let mut freeze = self.membership_handoff_write_freeze()?.ok_or_else(|| {
+            MetadataBackendError::Serde(
+                "repair custody has no actual pending metadata freeze".into(),
+            )
+        })?;
+        let fence = cut.handoff.retiring_primary_fence.as_ref().ok_or_else(|| {
+            MetadataBackendError::Serde("repair custody has no retiring prefix".into())
+        })?;
+        if freeze.handoff_id != cut.handoff.handoff_id
+            || freeze.retiring_epoch != cut.handoff.retiring_shard.epoch
+            || freeze.activated_epoch.is_some()
+            || freeze.journal_sequence != fence.journal_sequence
+            || freeze.state_fingerprint != fence.state_fingerprint
+            || freeze
+                .repair_custody
+                .as_ref()
+                .is_some_and(|existing| existing != cut)
+        {
+            return Err(MetadataBackendError::Serde(
+                "repair custody differs from the immutable pending freeze".into(),
+            ));
+        }
+        if freeze.repair_custody.is_none() {
+            freeze.repair_custody = Some(cut.clone());
+            write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
+        }
+        Ok(())
     }
 
     pub(super) fn mark_membership_handoff_write_freeze_activated_unlocked(
@@ -213,6 +251,21 @@ impl LocalSobjMetadataBackend {
                 checked_prefix.journal_sequence,
                 rebound_prefix_proof.journal_sequence,
             )));
+        }
+        if let Some(cut) = self
+            .membership_handoff_write_freeze()?
+            .and_then(|freeze| freeze.repair_custody)
+        {
+            if cut.handoff.handoff_id != handoff_id || cut.handoff.desired_shard != *active_shard {
+                return Err(MetadataBackendError::Serde(
+                    "activated repair custody differs from the exact successor assignment".into(),
+                ));
+            }
+            if !crate::repair_handoff::install_next_page(&self.root, &cut)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            {
+                return Ok(false);
+            }
         }
         let previous_instance_authority_epoch =
             self.instance_authority_epoch.replace(active_shard.epoch);

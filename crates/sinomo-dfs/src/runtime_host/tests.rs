@@ -1988,6 +1988,7 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
                 journal_sequence: 0,
                 state_fingerprint: "blake3:prefix-probe-state".to_string(),
                 primary_handoff_id: None,
+                repair_custody: None,
             }),
             authority_probe: None,
             durable_replication: None,

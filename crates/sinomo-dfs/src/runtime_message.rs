@@ -24,8 +24,9 @@ pub(crate) const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 pub(crate) fn checkpoint_detached_replica_delivery(
     data_dir: &sinomo_core::local::SinomoDataDir,
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
-) -> Result<Option<crate::DfsRepairAttemptRecord>, crate::DfsError> {
+) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
     use crate::node_transport::DfsBackgroundReplicaDeliveryEvent;
+    use crate::node_transport::DfsBackgroundReplicaDispatch;
     use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
     use sinomo_core::network::NetworkDeliveryState;
     let store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
@@ -53,19 +54,34 @@ pub(crate) fn checkpoint_detached_replica_delivery(
                         .into(),
                 });
             };
+            let shard =
+                command
+                    .authority_shard
+                    .as_ref()
+                    .ok_or_else(|| crate::DfsError::Metadata {
+                        message: "native background repair has no original authority shard".into(),
+                    })?;
+            if crate::read_local_dfs_metadata_shard_write_freeze(
+                data_dir,
+                &crate::DfsMetadataShardId::new(&shard.shard_id),
+            )?
+            .is_some_and(|freeze| freeze.activated_epoch != Some(shard.epoch))
+            {
+                return Ok(DfsBackgroundReplicaDispatch::Fenced);
+            }
             let (records, _) = store.observe_transfer_targets(
                 &command.intent_id,
                 std::slice::from_ref(&message.target_node_id),
             )?;
             let Some(record) = records.into_iter().next() else {
-                return Ok(None);
+                return Ok(DfsBackgroundReplicaDispatch::Observed(None));
             };
             if !matches(&message, &record) {
                 return Err(crate::DfsError::Distributed {
                     message: "detached repair differs from its named durable custody".into(),
                 });
             }
-            Ok(Some(record))
+            Ok(DfsBackgroundReplicaDispatch::Observed(Some(record)))
         }
         DfsBackgroundReplicaDeliveryEvent::Failed {
             message,
@@ -102,7 +118,7 @@ pub(crate) fn checkpoint_detached_replica_delivery(
             desired.next_retry_unix_nanos =
                 now.saturating_add(crate::transfer::repair_retry_delay_nanos_for_ticks(ticks));
             store.checkpoint_transfer_record(&before, &desired)?;
-            Ok(None)
+            Ok(DfsBackgroundReplicaDispatch::Observed(None))
         }
     }
 }
@@ -1047,6 +1063,41 @@ pub(crate) fn dfs_detached_send_runtime_for_identity(
     Ok(Arc::clone(runtimes.entry(key).or_insert_with(|| {
         Arc::new(DfsDetachedSendRuntime::new())
     })))
+}
+
+/// Resolve only the already registered Main carrier. A caller's transport can
+/// have a private outbox; it cannot stand in for this actual native owner.
+pub(crate) fn registered_repair_handoff_drain_gate(
+    owner: &crate::runtime_host::DfsDataOwnerLock,
+    node: &NodeId,
+) -> Result<Arc<Mutex<()>>, crate::DfsError> {
+    let error = || crate::DfsError::Metadata {
+        message: "repair handoff has no unique live Main carrier owner".into(),
+    };
+    let data_dir = sinomo_core::local::SinomoDataDir::new(owner.physical_data_root());
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir))
+        .map_err(|_| error())?;
+    if state.local_node_id != *node {
+        return Err(error());
+    }
+    let registry = DFS_DETACHED_SEND_RUNTIMES
+        .get()
+        .ok_or_else(error)?
+        .lock()
+        .map_err(|_| error())?;
+    let mut candidates = registry.iter().filter(|(key, _)| {
+        key.cluster_id == state.cluster_id.to_string()
+            && key.local_node_id == node.to_string()
+            && key
+                .data_root
+                .canonicalize()
+                .is_ok_and(|root| root == owner.physical_data_root())
+    });
+    let (_, runtime) = candidates.next().ok_or_else(error)?;
+    if candidates.next().is_some() {
+        return Err(error());
+    }
+    Ok(runtime.state.repair_handoff_drain_gate())
 }
 
 #[derive(Debug)]

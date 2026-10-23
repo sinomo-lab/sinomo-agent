@@ -444,6 +444,51 @@ eligible for prompt rediscovery and retry. Missing desired replicas catch up
 through normal replica maintenance after activation; missing retiring-only
 replicas remain fenced by the committed successor epoch when they return.
 
+An ordinary primary rotation also transfers the retiring Main's original durable
+repair state. The source takes the existing native shard admission and tries the
+registered Main carrier's shared drain exclusion. A busy carrier leaves the
+same handoff pending; the source does not wait while holding admission needed
+by its response handler. A client's private transport outbox cannot establish
+this exclusion. After the existing metadata freeze, the source captures an
+immutable, disk-backed queue cut for the exact physical shard. Original intent,
+object, version, hash, target, transfer kind, request/completion identity,
+delivery uncertainty, attempts and retry state remain unchanged. Unknown
+delivery is never converted into DefinitelyNotSent.
+
+Version 1 custody pages travel through the existing authenticated metadata
+prefix exchange, under its 512-record and 4 MiB page limits and original absolute
+handoff deadline. Page order, chain digest, total record count and the exact
+pending handoff bind the transfer. Each page acknowledgment follows durable
+staging at the promoted replica; joint-prefix activation requires every page.
+Staging does not enroll an active producer under the retiring assignment. The
+successor's normal proof-checked rebind installs one bounded page through its
+existing queue/log/fsync path and checkpoints that installation. Its writer
+remains frozen until the complete cut is installed. A crash between queue fsync
+and the installation cursor replays exact rows; conflicting existing custody
+fails closed, and an acknowledged replay cannot overwrite a later claim.
+
+The custody cut is retained in the successor's existing freeze marker using an
+explicit versioned envelope. Current readers retain support for older completed
+metadata-only markers without inventing their missing historical repair state.
+Older binaries cannot decode a custody-bearing marker as a metadata-only
+freeze. New primary-rotation prefix probes carry the versioned custody field;
+older receivers reject that field, and current receivers reject ordinary
+rotations which omit it. Both handoff endpoints therefore need this contract;
+ordinary prefix probes and the separately certified storage-import custody
+protocol keep their existing meanings. No metadata journal, content or local
+repair-queue format is replaced.
+
+Source and successor retain the original transfer evidence across cancellation
+and restart. A missing source before complete transfer, an incomplete page set,
+unsupported version, changed cut or conflicting producer leaves work unavailable
+or pending under the existing fences. Having the complete repair state does not
+make unavailable content available: a W=1 source outage can still prevent the
+missing copy from being produced. The retired source cannot resume effects from
+its retained queue merely because it originally owned the transfer. Existing
+metadata discovery observes assignment activation; actual custody-install
+checkpoints request the existing bounded recovery. Ordinary proof updates and
+observational reads do not create another recovery scan.
+
 DFS component maintenance discovery includes a pending handoff only on its
 retiring primary. This allows a handoff committed immediately after one
 maintenance pass to request the prompt maintenance cadence instead of idling

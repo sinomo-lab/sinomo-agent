@@ -60,6 +60,7 @@ enum MetadataQuorumSyncPurpose {
 struct MetadataPrimaryHandoffProbe {
     handoff_id: String,
     promoted_node_id: NodeId,
+    repair_custody: Option<crate::DfsRepairHandoffPage>,
 }
 
 /// One full-snapshot repair attempt for an exact target in one sync invocation.
@@ -137,6 +138,15 @@ impl MetadataCheckpointSnapshotAttempt {
 }
 
 impl MetadataQuorumSyncPurpose {
+    fn primary_handoff_for(&self, node_id: &NodeId) -> Option<&MetadataPrimaryHandoffProbe> {
+        match self {
+            Self::MembershipHandoff {
+                primary_handoff: Some(probe),
+                ..
+            } if &probe.promoted_node_id == node_id => Some(probe),
+            _ => None,
+        }
+    }
     fn primary_handoff_id_for(&self, node_id: &NodeId) -> Option<&str> {
         match self {
             Self::MembershipHandoff {
@@ -212,6 +222,7 @@ pub const fn dfs_metadata_replica_quorum_size(replica_count: usize) -> usize {
 #[cfg(test)]
 thread_local! {
     static BEFORE_REBIND_WRITER_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_HANDOFF_EFFECT_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
@@ -744,6 +755,101 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .operation_deadline()
             .filter(|existing| *existing < requested_deadline)
             .unwrap_or(requested_deadline);
+        // Reuse actual native admission so every prior producer has published
+        // its queue checkpoint before capture. Never wait for the detached
+        // carrier while holding admission its response handler may require.
+        let rotates_primary =
+            requested_retiring.primary_node_id != requested_handoff.desired_shard.primary_node_id;
+        // Storage import already has its separately certified source/queue
+        // conversion contract. Only ordinary role rotation uses these pages.
+        let transfers_repair_custody = rotates_primary
+            && matches!(
+                requested_handoff.cause,
+                crate::DfsMetadataShardHandoffCause::Membership
+            );
+        #[cfg(test)]
+        if let Some(before) = BEFORE_HANDOFF_EFFECT_ADMISSION.with(|hook| hook.borrow_mut().take())
+        {
+            before();
+        }
+        let _execution = if transfers_repair_custody {
+            match self.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+                file_system_id: requested_retiring.file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new(&requested_retiring.shard_id),
+                owner_epoch: requested_retiring.epoch,
+                operation_id: requested_handoff.handoff_id.clone(),
+            }) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    // Main may finish this exact proposal while a caller
+                    // queues for effect admission. Reuse the existing fresh
+                    // pending/assignment read solely to decline old work;
+                    // this grants no effect or successful completion claim.
+                    if let Some(control) = self.control_plane.as_mut()
+                        && let Ok((active, pending)) = DfsControlPlaneStore::new(control.as_mut())
+                            .retiring_metadata_shard_handoff_view_before(
+                                &requested_retiring.file_system_id,
+                                &requested_retiring.shard_id,
+                                deadline,
+                            )
+                        && active.as_ref() == Some(&requested_handoff.desired_shard)
+                        && pending.is_none()
+                    {
+                        return Ok(false);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let drain_gate = if transfers_repair_custody {
+            let backend = self
+                .metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "repair handoff has no original physical metadata backend".into(),
+                })?;
+            let shard_id = DfsMetadataShardId::new(&requested_retiring.shard_id);
+            let scope =
+                backend.publication_owner_scope(&requested_retiring.file_system_id, &shard_id)?;
+            let execution =
+                self.publication_execution
+                    .current()
+                    .ok_or_else(|| DfsError::Metadata {
+                        message: "repair handoff requires actual native mutation admission".into(),
+                    })?;
+            if !execution.admits(&scope, &requested_retiring.file_system_id, &shard_id) {
+                return Err(DfsError::Metadata {
+                    message: "repair handoff admission belongs to another physical scope".into(),
+                });
+            }
+            let owner = crate::runtime_host::publication_runtime_owner(scope.root())
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "repair handoff lost its actual DATA owner".into(),
+                })?;
+            Some(
+                crate::runtime_message::registered_repair_handoff_drain_gate(
+                    &owner,
+                    &self.node_id,
+                )?,
+            )
+        } else {
+            None
+        };
+        let _drain = match drain_gate.as_ref().map(|gate| gate.try_lock()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(std::sync::TryLockError::WouldBlock)) => return Ok(false),
+            Some(Err(std::sync::TryLockError::Poisoned(_))) => {
+                return Err(DfsError::Metadata {
+                    message: "repair handoff carrier drain exclusion is poisoned".into(),
+                });
+            }
+            None => None,
+        };
         let trace_operation = if crate::service_trace::dfs_perf_trace_enabled() {
             format!(
                 "handoff:{}:{}:{}:{}",
@@ -906,27 +1012,75 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             state_fingerprint: state_fingerprint.clone(),
             checkpoint_snapshot: None,
         };
-        let primary_handoff = (handoff.desired_shard.primary_node_id != retiring.primary_node_id)
-            .then(|| MetadataPrimaryHandoffProbe {
-                handoff_id: handoff.handoff_id.clone(),
-                promoted_node_id: handoff.desired_shard.primary_node_id.clone(),
-            });
+        let export = if transfers_repair_custody {
+            let store = self
+                .owned_repair_queue_store()?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "primary handoff requires its original native repair queue owner"
+                        .into(),
+                })?;
+            if drain_gate.is_none() {
+                return Err(DfsError::Metadata {
+                    message: "primary handoff has no native carrier drain owner".into(),
+                });
+            }
+            let backend = self
+                .metadata_backend
+                .as_deref()
+                .expect("handoff backend checked");
+            let scope = backend.publication_owner_scope(&retiring.file_system_id, &shard_id)?;
+            Some(crate::repair_handoff::RepairHandoffExport::capture(
+                scope.root(),
+                &handoff,
+                &store,
+                |record| {
+                    Ok(backend
+                        .get_object_on_shard(&shard_id, &record.object_id)?
+                        .is_some_and(|object| object.file_system_id == retiring.file_system_id))
+                },
+                deadline,
+            )?)
+        } else {
+            None
+        };
         timing.mark("handoff-prefix-proofs-started");
-        let certificate = self.sync_metadata_shard_to_quorum_with_required_intersection(
-            &target,
-            &BTreeSet::new(),
-            MetadataQuorumSyncPurpose::MembershipHandoff {
-                primary_handoff,
-                retiring_shard: retiring.clone(),
-                desired_shard: handoff.desired_shard.clone(),
-            },
-            deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| DfsError::Network {
-                    message: "metadata handoff authority read exhausted the caller deadline".into(),
-                })?,
-        )?;
+        let mut last_certificate = None;
+        for ordinal in 0..export.as_ref().map_or(1, |export| export.cut.page_count) {
+            let primary_handoff = if rotates_primary {
+                Some(MetadataPrimaryHandoffProbe {
+                    handoff_id: handoff.handoff_id.clone(),
+                    promoted_node_id: handoff.desired_shard.primary_node_id.clone(),
+                    repair_custody: export
+                        .as_ref()
+                        .map(|export| export.page(ordinal))
+                        .transpose()?,
+                })
+            } else {
+                None
+            };
+            last_certificate = Some(
+                self.sync_metadata_shard_to_quorum_with_required_intersection(
+                    &target,
+                    &BTreeSet::new(),
+                    MetadataQuorumSyncPurpose::MembershipHandoff {
+                        primary_handoff,
+                        retiring_shard: retiring.clone(),
+                        desired_shard: handoff.desired_shard.clone(),
+                    },
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or_else(|| DfsError::Network {
+                            message:
+                                "metadata handoff authority read exhausted the caller deadline"
+                                    .into(),
+                        })?,
+                )?,
+            );
+        }
+        let certificate = last_certificate.ok_or_else(|| DfsError::Metadata {
+            message: "handoff omitted its complete bounded custody cut".into(),
+        })?;
         timing.mark("handoff-prefix-proofs-returned");
         let acknowledged_node_ids = certificate
             .acknowledged_node_ids
@@ -2144,6 +2298,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             journal_sequence: target.journal_sequence,
             state_fingerprint: target.state_fingerprint.clone(),
             primary_handoff_id: None,
+            repair_custody: None,
         };
         let probe = crate::DfsMetadataJournalFrameBatch {
             shard_id: target.shard_id.clone(),
@@ -2172,10 +2327,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.next_request_id()
             );
             let required_authority_confirmation_id = purpose
+                .primary_handoff_for(target_node_id)
+                .map(|handoff| {
+                    handoff.repair_custody.as_ref().map_or_else(
+                        || Ok(handoff.handoff_id.clone()),
+                        |page| page.confirmation(),
+                    )
+                })
+                .transpose()?;
+            let mut node_prefix_probe = prefix_probe.clone();
+            node_prefix_probe.primary_handoff_id = purpose
                 .primary_handoff_id_for(target_node_id)
                 .map(str::to_string);
-            let mut node_prefix_probe = prefix_probe.clone();
-            node_prefix_probe.primary_handoff_id = required_authority_confirmation_id.clone();
+            node_prefix_probe.repair_custody = purpose
+                .primary_handoff_for(target_node_id)
+                .and_then(|handoff| handoff.repair_custody.clone());
             candidates.push((
                 target_node_id.clone(),
                 DfsMetadataJournalBatchCommand {
@@ -3076,6 +3242,86 @@ fn record_metadata_sync_prefix_probe_events(
 mod tests {
     use super::*;
     use crate::*;
+
+    #[test]
+    fn native_completed_handoff_is_not_reclaimed_after_effect_admission_changes() {
+        use std::sync::{Arc, Mutex};
+        let peer =
+            NodeId::from_legacy_named("native-handoff-completed-before-admission-peer").unwrap();
+        let fixture =
+            configured_normal_sync_fixture("native-handoff-completed-before-admission", vec![peer]);
+        let NormalSyncFixture {
+            mut service,
+            runtime,
+            shard,
+            control_plane_probe,
+            ..
+        } = fixture;
+        let runtime = Arc::new(runtime);
+        let control = runtime.shared_control_plane().unwrap();
+        let promoted = shard.replica_node_ids[0].clone();
+        // Stop only the existing real publication boundary, before publishing
+        // the proposal. The other actual Main remains free to win on release.
+        let fence = service
+            .metadata_shard_fence_guard(&shard.file_system_id, &shard.shard_id)
+            .unwrap();
+        let handoff = control
+            .with_client(|kv| {
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .request_metadata_shard_primary_handoff(&shard, &promoted)
+            })
+            .unwrap()
+            .unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&observed);
+        let actual = Arc::clone(&runtime);
+        let original = handoff.clone();
+        let source = shard.primary_node_id.clone();
+        let control_for_hook = control.clone();
+        BEFORE_HANDOFF_EFFECT_ADMISSION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                drop(fence);
+                let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                actual.request_repair_reconciliation(&source).unwrap();
+                loop {
+                    if let Some(completed) = actual
+                        .observe_completed_native_handoff(&control_for_hook, &original, deadline)
+                        .unwrap()
+                    {
+                        *captured.lock().unwrap() = Some(completed);
+                        break;
+                    }
+                    let remaining = deadline.checked_duration_since(Instant::now()).expect(
+                        "normal Main completes the original handoff within its existing budget",
+                    );
+                    actual
+                        .maintenance_tick(
+                            &source,
+                            remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                        )
+                        .unwrap();
+                }
+            }))
+        });
+        let result = service.reconcile_pending_metadata_shard_membership_handoffs(
+            std::slice::from_ref(&shard),
+            DEFAULT_DFS_POSIX_SYNC_TIMEOUT,
+        );
+        let completed = observed.lock().unwrap().clone();
+        std::fs::write(runtime.data_dir(&shard.primary_node_id).root().join("boundary-diagnostic-handoff-admission-winner.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"original":handoff,"actual_completed":completed,"caller_result":format!("{result:?}"),
+                "qualification":"Actual registered Main and exact original completion proof; hook schedules existing bounded work and supplies no authority or result."})).unwrap()).unwrap();
+        assert_eq!(completed.as_ref(), Some(&handoff.desired_shard));
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "the losing actor has no pending handoff to execute"
+        );
+        drop(service);
+        drop(control_plane_probe);
+        drop(control);
+        Arc::try_unwrap(runtime).ok().unwrap().close().unwrap();
+    }
 
     struct NormalSyncFixture {
         // Drop the live client/metadata lease before the owning runtime.

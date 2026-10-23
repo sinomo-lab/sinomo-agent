@@ -741,6 +741,9 @@ pub struct DfsNodeDetachedSendState {
 }
 
 impl DfsNodeDetachedSendState {
+    pub(crate) fn repair_handoff_drain_gate(&self) -> Arc<std::sync::Mutex<()>> {
+        Arc::clone(&self.drain_gate)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -1143,6 +1146,13 @@ pub(crate) enum DfsBackgroundReplicaDeliveryEvent {
     },
 }
 
+pub(crate) enum DfsBackgroundReplicaDispatch {
+    Observed(Option<crate::DfsRepairAttemptRecord>),
+    /// The existing durable source freeze has retired this queued carrier.
+    /// Its original named queue record is retained for handoff/recovery.
+    Fenced,
+}
+
 /// Backend-free peer-sending capability with the shared detached outbox and
 /// checkpointed, owned repair attachments. Hosts publish the worker only after
 /// releasing admission; replies return through an admitted validation handler.
@@ -1162,7 +1172,7 @@ pub struct DfsNodeDetachedSendWorker {
         Arc<
             dyn Fn(
                     DfsBackgroundReplicaDeliveryEvent,
-                ) -> Result<Option<crate::DfsRepairAttemptRecord>, DfsError>
+                ) -> Result<DfsBackgroundReplicaDispatch, DfsError>
                 + Send
                 + Sync,
         >,
@@ -1275,9 +1285,7 @@ impl DfsNodeDetachedSendWorker {
 
     pub(crate) fn set_background_delivery_handler<F>(&mut self, handler: F)
     where
-        F: Fn(
-                DfsBackgroundReplicaDeliveryEvent,
-            ) -> Result<Option<crate::DfsRepairAttemptRecord>, DfsError>
+        F: Fn(DfsBackgroundReplicaDeliveryEvent) -> Result<DfsBackgroundReplicaDispatch, DfsError>
             + Send
             + Sync
             + 'static,
@@ -1304,6 +1312,12 @@ impl DfsNodeDetachedSendWorker {
     }
 
     fn drain_background_replica_calls(&mut self) -> Result<(), DfsError> {
+        // Share the existing outbox drain exclusion with handoff capture.
+        // Its owner uses try_lock and never waits with reply admission held.
+        let drain_gate = Arc::clone(&self.transport.detached_send_state.drain_gate);
+        let _drain = drain_gate.lock().map_err(|_| DfsError::Network {
+            message: "background repair drain exclusion is poisoned".into(),
+        })?;
         let mut prepared = self
             .prepared_replica_calls
             .lock()
@@ -1338,17 +1352,20 @@ impl DfsNodeDetachedSendWorker {
         let observed = requests
             .iter()
             .map(|request| {
-                delivery_handler.as_ref().map_or(Ok(None), |handler| {
-                    if request.producer_delivery.get().is_none() {
-                        return Err(DfsError::Distributed {
-                            message: "background repair has no exact producer delivery basis"
-                                .into(),
-                        });
-                    }
-                    handler(DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
-                        message: request.request.call.message.clone(),
-                    })
-                })
+                delivery_handler.as_ref().map_or(
+                    Ok(DfsBackgroundReplicaDispatch::Observed(None)),
+                    |handler| {
+                        if request.producer_delivery.get().is_none() {
+                            return Err(DfsError::Distributed {
+                                message: "background repair has no exact producer delivery basis"
+                                    .into(),
+                            });
+                        }
+                        handler(DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
+                            message: request.request.call.message.clone(),
+                        })
+                    },
+                )
             })
             .collect::<Result<Vec<_>, DfsError>>();
         let observed = match observed {
@@ -1363,6 +1380,14 @@ impl DfsNodeDetachedSendWorker {
                 return Err(error);
             }
         };
+        let (requests, observed): (Vec<_>, Vec<_>) = requests
+            .into_iter()
+            .zip(observed)
+            .filter_map(|(request, observation)| match observation {
+                DfsBackgroundReplicaDispatch::Observed(record) => Some((request, record)),
+                DfsBackgroundReplicaDispatch::Fenced => None,
+            })
+            .unzip();
         let expected = requests
             .iter()
             .zip(observed)

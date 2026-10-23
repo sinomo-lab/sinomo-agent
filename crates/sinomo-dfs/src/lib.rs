@@ -146,7 +146,9 @@ mod posix_path;
 mod protocol;
 mod renewable_lease;
 mod repair;
+mod repair_handoff;
 mod repair_queue_store;
+pub use repair_handoff::{DfsRepairHandoffCut, DfsRepairHandoffPage};
 mod response_delivery;
 pub use response_delivery::DfsRoutedResponseDelivery;
 #[cfg(any(test, feature = "test-support"))]

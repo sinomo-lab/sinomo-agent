@@ -253,6 +253,9 @@ pub fn storage_file_identity(file: &File) -> std::io::Result<(u64, u64)> {
 }
 
 impl DfsDataOwnerLock {
+    pub(crate) fn physical_data_root(&self) -> &Path {
+        &self.physical_data_root
+    }
     /// Identity of the actual retained OS owner lock, used by source-owner
     /// capabilities. It grants no filesystem or cluster authorization.
     pub fn storage_owner_file_identity(&self) -> std::io::Result<(u64, u64)> {
@@ -1957,7 +1960,8 @@ fn open_dfs_runtime_service_for_effect(
     })
     .map_err(|error| DfsRuntimeError::Parse {
         detail: error.to_string(),
-    })?.ok_or_else(|| DfsRuntimeError::Parse {
+    })?
+    .ok_or_else(|| DfsRuntimeError::Parse {
         detail: "native DFS service has no current certified metadata topology".into(),
     })?;
     let control_plane =
@@ -1972,7 +1976,8 @@ fn open_dfs_runtime_service_for_effect(
     // returned by readiness. A later refresh cannot erase this read input;
     // actual effects still reacquire and validate their current authority.
     let members = registered_dfs_runtime_members(control_plane.as_ref())?;
-    let services = configuration.entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+    let services = configuration
+        .entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
         .ok_or_else(|| DfsRuntimeError::Parse {
             detail: "native DFS configuration has no complete service-offer scope".into(),
         })?;
