@@ -461,7 +461,18 @@ pub fn update_cluster_node_role_with_host(
     now: OffsetDateTime,
     host: &mut (impl ClusterMemberMutationHost + ?Sized),
 ) -> Result<ClusterNodeRoleUpdate, NetworkError> {
-    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state)?;
+    let _observation = tracing::trace_span!(target: "sinomo.perf", "cluster.role.update",
+        local_node_id = %state.local_node_id, target_node_id = %node_id,
+        requested_role = ?role)
+    .entered();
+    tracing::trace!(target: "sinomo.perf", phase = "authoritative-snapshot", outcome = "started",
+        "cluster role update boundary");
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state).inspect_err(|error| {
+        tracing::trace!(target: "sinomo.perf", phase = "authoritative-snapshot", outcome = "error",
+            %error, "cluster role update boundary");
+    })?;
+    tracing::trace!(target: "sinomo.perf", phase = "authoritative-snapshot", outcome = "completed",
+        "cluster role update boundary");
     let store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;
     let member_key = cluster_member_key(&node_id);
     let Some(member_entry) = store.get(&member_key).cloned() else {
@@ -483,8 +494,17 @@ pub fn update_cluster_node_role_with_host(
     }
     apply_cluster_node_role(&mut member, role.clone(), now);
     let txn = cluster_member_update_txn_from_store(&store, member_entry, &member)?;
-    let result =
-        host.commit_cluster_kv_txn_with_quorum(paths, &mut state, KvTxnRequest::generated(txn))?;
+    let request = KvTxnRequest::generated(txn);
+    tracing::trace!(target: "sinomo.perf", phase = "commit", outcome = "started",
+        request_id = %request.request_id, "cluster role update boundary");
+    let result = host
+        .commit_cluster_kv_txn_with_quorum(paths, &mut state, request)
+        .inspect_err(|error| {
+            tracing::trace!(target: "sinomo.perf", phase = "commit", outcome = "error",
+            %error, "cluster role update boundary");
+        })?;
+    tracing::trace!(target: "sinomo.perf", phase = "commit", outcome = "returned",
+        "cluster role update boundary");
     require_cluster_kv_txn_succeeded(result, "updating cluster node role")?;
     update_local_cluster_node_role_if_present(paths, &node_id, role.clone(), now)?;
     Ok(ClusterNodeRoleUpdate {

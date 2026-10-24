@@ -859,7 +859,14 @@ where
     F: Future<Output = Result<PeerStream, NetworkError>>,
     G: Fn() -> u64,
 {
-    let open = async move {
+    // Observation only: these fields identify the exact attempted relationship,
+    // not a retained carrier, admission permit, or delivery acknowledgement.
+    let observation = tracing::trace_span!(target: "sinomo.perf", "network.carrier.open",
+        stage = "network.carrier.open", scope = %scope, local_node_id = %local_node_id,
+        peer_node_id = %peer_node_id, route_compatibility_generation, directory_generation,
+        affinity = ?destination_process_affinity, protection = ?protection);
+    let mut phase = "pool-lookup";
+    let open = async {
         let key = PoolKey::new(
             scope,
             route_compatibility_generation,
@@ -909,6 +916,7 @@ where
             }
         }
 
+        phase = "connect-registry";
         let connect_lock = {
             let mut locks = lock_routed_stream_connect_locks();
             if let Some(newer_generation) = newer_route_compatibility_generation(&locks, &key) {
@@ -936,7 +944,11 @@ where
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
             )
         };
+        phase = "connect-owner-wait";
+        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
         let connect_guard = connect_lock.lock().await;
+        phase = "connect-owner-acquired";
+        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
         let observed_generation = current_route_compatibility_generation();
         if observed_generation != key.route_compatibility_generation {
             return Err(stale_route_compatibility_error(
@@ -957,7 +969,10 @@ where
         let client = match existing {
             Some(client) => client,
             None => {
+                phase = "carrier-establish";
+                tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
                 let carrier = establish.await?;
+                phase = "carrier-validate";
                 if registered_routed_stream_incoming_token(&key.local_node_id)
                     != key.local_dispatcher
                 {
@@ -1029,6 +1044,8 @@ where
             }
         };
         drop(connect_guard);
+        phase = "connect-owner-released";
+        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
         match client.open() {
             Ok(stream) => Ok(stream),
             Err(error) => {
@@ -1044,14 +1061,25 @@ where
         }
     };
 
-    match tokio::time::timeout(timeout, open).await {
+    match tokio::time::timeout(
+        timeout,
+        tracing::Instrument::instrument(open, observation.clone()),
+    )
+    .await
+    {
         Ok(result) => result,
-        Err(_) => Err(NetworkError::timeout(
-            "open pooled routed carrier",
-            crate::NetworkTimeoutPhase::Connect,
-            timeout,
-            crate::NetworkDeliveryState::DefinitelyNotSent,
-        )),
+        Err(_) => {
+            // The timed-out future (including any connect guard) is already
+            // dropped. A waiter never becomes an owner merely by timing out.
+            tracing::trace!(target: "sinomo.perf", parent: &observation,
+                phase, outcome = "timeout", "routed carrier open boundary");
+            Err(NetworkError::timeout(
+                "open pooled routed carrier",
+                crate::NetworkTimeoutPhase::Connect,
+                timeout,
+                crate::NetworkDeliveryState::DefinitelyNotSent,
+            ))
+        }
     }
 }
 
@@ -1706,6 +1734,166 @@ mod tests {
         .expect("a later carrier open must not inherit the stalled lock")
         .expect("a later carrier open should recover");
         drop(recovery);
+        drop(server_carrier);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct CarrierOpenTrace {
+        spans: Arc<Mutex<BTreeMap<u64, BTreeMap<String, String>>>>,
+        rows: Arc<Mutex<Vec<(u64, BTreeMap<String, String>)>>>,
+        next_span: Arc<std::sync::atomic::AtomicU64>,
+        omitted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct CarrierTraceFields(BTreeMap<String, String>);
+    impl tracing::field::Visit for CarrierTraceFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+    impl tracing::Subscriber for CarrierOpenTrace {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "sinomo.perf"
+        }
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let id = 1 + self
+                .next_span
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut fields = CarrierTraceFields::default();
+            attrs.record(&mut fields);
+            let mut spans = self.spans.lock().unwrap();
+            if spans.len() < 64 {
+                spans.insert(id, fields.0);
+            } else {
+                self.omitted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            tracing::span::Id::from_u64(id)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = CarrierTraceFields::default();
+            event.record(&mut fields);
+            if fields.0.get("message").map(String::as_str) != Some("routed carrier open boundary") {
+                return;
+            }
+            let id = event
+                .parent()
+                .expect("explicit attempted relationship span")
+                .into_u64();
+            let mut rows = self.rows.lock().unwrap();
+            if rows.len() < 64 {
+                rows.push((id, fields.0));
+            } else {
+                self.omitted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn pooled_carrier_trace_distinguishes_waiter_from_owner_without_retaining_admission() {
+        // Keep an unobserved dispatcher registered as well: another test's
+        // first callsite use must not cache away this thread's capture.
+        let _unobserved = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let trace = CarrierOpenTrace::default();
+        let _capture = tracing::subscriber::set_default(trace.clone());
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let (carrier, server_carrier) = carrier_pair();
+        let local = carrier.local_node_id.clone();
+        let peer = carrier.peer_node_id.clone();
+        let mut owner = Box::pin(open_test_pooled_routed_stream(
+            scope.clone(),
+            generation,
+            17,
+            RouteConstraints::default(),
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(5),
+            std::future::pending::<Result<PeerStream, NetworkError>>(),
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let result = open_test_pooled_routed_stream(
+            scope.clone(),
+            generation,
+            17,
+            RouteConstraints::default(),
+            local.clone(),
+            peer.clone(),
+            Duration::from_millis(20),
+            async { panic!("the waiter cannot establish while the actual owner holds admission") },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(NetworkError::Timeout {
+                delivery_state: crate::NetworkDeliveryState::DefinitelyNotSent,
+                ..
+            })
+        ));
+        {
+            let rows = trace.rows.lock().unwrap();
+            let owner_id = rows
+                .iter()
+                .find(|(_, f)| f.get("phase").map(String::as_str) == Some("carrier-establish"))
+                .unwrap()
+                .0;
+            let waiter_id = rows
+                .iter()
+                .find(|(_, f)| {
+                    f.get("phase").map(String::as_str) == Some("connect-owner-wait")
+                        && f.get("outcome").map(String::as_str) == Some("timeout")
+                })
+                .unwrap()
+                .0;
+            assert_ne!(owner_id, waiter_id);
+            let spans = trace.spans.lock().unwrap();
+            for id in [owner_id, waiter_id] {
+                assert_eq!(spans[&id]["scope"], scope);
+                assert_eq!(spans[&id]["local_node_id"], local.to_string());
+                assert_eq!(spans[&id]["peer_node_id"], peer.to_string());
+                assert_eq!(spans[&id]["directory_generation"], "17");
+                assert_eq!(
+                    spans[&id]["route_compatibility_generation"],
+                    generation.to_string()
+                );
+            }
+        }
+        // The captured rows remain alive. Cancelling only the real owner must
+        // nevertheless release admission and permit actual carrier creation.
+        drop(owner);
+        let stream = open_test_pooled_routed_stream(
+            scope.clone(),
+            generation,
+            17,
+            RouteConstraints::default(),
+            local,
+            peer,
+            Duration::from_millis(200),
+            async { Ok(carrier) },
+        )
+        .await
+        .expect("diagnostic state must not retain the cancelled owner's lock");
+        assert_eq!(trace.omitted.load(std::sync::atomic::Ordering::Relaxed), 0);
+        println!(
+            "carrier_open_capture={{spans:{:?}, events:{:?}, omitted:0}}",
+            trace.spans.lock().unwrap(),
+            trace.rows.lock().unwrap()
+        );
+        drop(stream);
         drop(server_carrier);
         assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
     }

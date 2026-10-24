@@ -3100,6 +3100,9 @@ impl MultiHopRoutedConnector {
         );
         let deadline = tokio::time::Instant::now() + options.timeout;
         let path_count = paths.len();
+        tracing::trace!(target: "sinomo.perf", local_node_id = %self.local_node_id,
+            peer_node_id = %destination_node_id, ?destination_process_affinity,
+            path_count, phase = "planned", "routed candidate boundary");
         let mut attempts = 0_usize;
         let mut failures = Vec::new();
         for (path_index, path) in paths.iter().enumerate() {
@@ -3119,6 +3122,11 @@ impl MultiHopRoutedConnector {
             }
             let direct_edge_established = Arc::new(AtomicBool::new(false));
             let established = Arc::clone(&direct_edge_established);
+            tracing::trace!(target: "sinomo.perf", local_node_id = %self.local_node_id,
+                peer_node_id = %destination_node_id, path_index, path_count,
+                path = ?path.nodes, endpoint_id = %first_hop.endpoint.endpoint_id,
+                address = %first_hop.endpoint.address, budget_us = attempt_timeout.as_micros() as u64,
+                phase = "direct-connect", "routed candidate boundary");
             let attempt = async {
                 let link = self
                     .link_provider
@@ -3134,11 +3142,15 @@ impl MultiHopRoutedConnector {
                 {
                     return Err(PathAttemptError::DirectEdge(NetworkError::AuthDenied));
                 }
+                tracing::trace!(target: "sinomo.perf", path_index,
+                    phase = "authenticated-link-open", "routed candidate boundary");
                 let stream = link
                     .open_stream()
                     .await
                     .map_err(PathAttemptError::DirectEdge)?;
                 established.store(true, Ordering::Release);
+                tracing::trace!(target: "sinomo.perf", path_index,
+                    phase = "routed-session-acceptance", "routed candidate boundary");
                 initiate_routed_session(
                     stream,
                     directory,
@@ -3151,7 +3163,11 @@ impl MultiHopRoutedConnector {
                 .map_err(PathAttemptError::RoutedSession)
             };
             match tokio::time::timeout(attempt_timeout, attempt).await {
-                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Ok(stream)) => {
+                    tracing::trace!(target: "sinomo.perf", path_index,
+                        phase = "established", "routed candidate boundary");
+                    return Ok(stream);
+                }
                 Ok(Err(PathAttemptError::DirectEdge(error))) => {
                     report_routed_edge_failure(
                         Some(self.failure_sink.as_ref()),
