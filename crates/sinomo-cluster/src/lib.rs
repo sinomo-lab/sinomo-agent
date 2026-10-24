@@ -81,6 +81,7 @@ pub use connectivity_publish::{
     ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
     ClusterNetworkRecordExpiryHost, cluster_connectivity_publish_record_matches,
     cluster_network_publish_interval_for_node, expire_cluster_network_records_with_host,
+    publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host,
     sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
     sync_cluster_connectivity_records_to_quorum_async_with_state_and_host,

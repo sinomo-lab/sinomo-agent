@@ -2687,11 +2687,8 @@ impl ClusterNetworkMaintenance {
             })
             .and_then(|retained| {
                 let records = retained.records.as_ref()?;
-                let current =
-                    sinomo_core::network::read_local_cluster_connectivity_records_for_source(
-                        paths,
-                        &state.local_node_id,
-                    )
+                let current = local_connectivity_snapshot
+                    .persisted_records_for_source(&state.local_node_id)
                     .ok()?;
                 (current.as_slice() == records.as_slice()).then(|| Arc::clone(records))
             });
@@ -3006,7 +3003,7 @@ impl ClusterNetworkMaintenance {
             paths,
             source_node_id,
             state,
-            records,
+            records: _,
             input_generation,
             local_connectivity_snapshot,
         } = pending;
@@ -3032,45 +3029,22 @@ impl ClusterNetworkMaintenance {
             self.record_connectivity_topology_superseded();
             return true;
         }
-        let read_paths = paths.clone();
-        let read_source_node_id = source_node_id.clone();
-        let current_records = match runtime
-            .spawn_blocking(move || {
-                sinomo_core::network::read_local_cluster_connectivity_records_for_source(
-                    &read_paths,
-                    &read_source_node_id,
-                )
-            })
-            .await
-        {
-            Ok(Ok(records)) => records,
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    "sinomo daemon cached connectivity read failed for {source_node_id}: {error}"
-                );
-                self.record_connectivity_publish_failure();
-                return false;
-            }
+        let prepare_paths = paths.clone();
+        let prepare_source = source_node_id.clone();
+        let prepare_state = current_state.clone();
+        let prepared = match runtime.spawn_blocking(move || {
+            sinomo_core::network::__connectivity_store::prepare_local_cluster_connectivity_publication_if_snapshot(
+                &prepare_paths, &prepare_state, &prepare_source, &local_connectivity_snapshot,
+            )
+        }).await {
+            Ok(result) => result,
             Err(error) => {
-                tracing::warn!(
-                    "sinomo daemon cached connectivity read task failed for {source_node_id}: {error}"
-                );
+                tracing::warn!("sinomo daemon connectivity publication preparation task failed: {error}");
                 self.record_connectivity_publish_failure();
                 return false;
             }
         };
-        let records = records
-            .filter(|retained| retained.as_slice() == current_records.as_slice())
-            .unwrap_or_else(|| Arc::new(current_records));
-        let (records, committed_snapshot) = match sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_source_set_if_snapshot_async(
-            &runtime,
-            &paths,
-            &current_state,
-            &source_node_id,
-            records.as_slice(),
-            &local_connectivity_snapshot,
-        )
-        .await
+        let (records, committed_snapshot) = match prepared
         {
             Ok(sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Committed {
                 records,
@@ -3119,11 +3093,10 @@ impl ClusterNetworkMaintenance {
             "connectivity publish",
             CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT,
             deadline,
-            sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+            sinomo_core::cluster::publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host(
                 &runtime,
                 &paths,
                 &source_node_id,
-                records.as_ref().clone(),
                 current_state,
                 &mut publish_host,
             ),
@@ -3257,10 +3230,7 @@ impl ClusterNetworkMaintenance {
                 .map(|current_snapshot| {
                     current_snapshot != retained.local_connectivity_snapshot
                         || retained.records.as_ref().is_none_or(|records| {
-                            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
-                                &retained.paths,
-                                &retained.source_node_id,
-                            )
+                            current_snapshot.persisted_records_for_source(&retained.source_node_id)
                             .map(|current| current.as_slice() != records.as_slice())
                             .unwrap_or(true)
                         })
@@ -3432,11 +3402,10 @@ impl ClusterNetworkMaintenance {
             "connectivity publish",
             CLUSTER_NETWORK_PENDING_CONNECTIVITY_PUBLISH_TIMEOUT,
             deadline,
-            sinomo_core::cluster::sync_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+            sinomo_core::cluster::publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host(
                 &runtime,
                 &paths,
                 &source_node_id,
-                persisted_records.as_ref().clone(),
                 current_state.clone(),
                 &mut publish_host,
             ),
@@ -11812,6 +11781,129 @@ mod tests {
         assert!(!maintenance.connectivity_force_probe);
         assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
         assert!(maintenance.connectivity_publish_retry_at.is_some());
+    }
+
+    #[test]
+    fn connectivity_publication_does_not_turn_read_time_expiry_into_a_new_source_generation() {
+        let runtime = daemon_cluster_test_runtime();
+        let (root, paths, mut state) = seeded_single_node_cluster_for_publish_cache_test(
+            "connectivity_expiry_is_not_observation",
+        );
+        let now = OffsetDateTime::now_utc();
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(
+            &state.local_node_id,
+            "127.0.0.1:32154".to_string(),
+            10,
+        );
+        state.members[0].endpoints.push(endpoint.clone());
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+        // A persisted old observation, as after an idle interval or restart.
+        // It is already unusable for routing; these bytes never prove liveness.
+        let record = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            None,
+            None,
+            now - time::Duration::seconds(2),
+            1,
+        );
+        let bytes = sinomo_core::network::SinomoObjectCodec::default()
+            .encode(&vec![record.clone()])
+            .unwrap();
+        sinomo_core::storage::durable_file::write_file_atomic(
+            &paths.connectivity_local,
+            &bytes,
+            sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
+                "connectivity",
+                "test-expired-source",
+            )
+            .sync_all(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("boundary-diagnostic-original-expired-source.sobj"),
+            &bytes,
+        )
+        .unwrap();
+        let key = cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        let (before, _) = commit_cluster_kv_txn_with_quorum_response(
+            &paths,
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::put_serde(&key, &record, None).unwrap()],
+                failure: Vec::new(),
+            },
+        )
+        .expect("seed the actual expired advisory KV record");
+        assert!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&paths)
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_publish_claimed: true,
+                connectivity_publish: Some(ClusterConnectivityPendingPublish {
+                    paths: paths.clone(),
+                    source_node_id: state.local_node_id.clone(),
+                    state: state.clone(),
+                    records: None,
+                    input_generation: maintenance.connectivity_input_generation,
+                    local_connectivity_snapshot: snapshot.clone(),
+                }),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+        assert!(
+            maintenance.retained_connectivity_publish.is_none(),
+            "unchanged actual source publication completes"
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).ok(),
+            Some(bytes),
+            "reading an expired view must not author a different durable source set"
+        );
+        assert_eq!(sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap(), snapshot);
+        let after = sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&paths).unwrap();
+        assert_eq!(
+            after.revision, before.revision,
+            "expiry-only publication must not append a quorum mutation"
+        );
+        assert_eq!(after.get(&key), before.get(&key));
+        assert!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id
+            )
+            .unwrap()
+            .is_empty(),
+            "expired observations remain unusable"
+        );
+        assert!(
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(&paths)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

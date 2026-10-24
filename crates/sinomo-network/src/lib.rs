@@ -75,6 +75,7 @@ pub mod __connectivity_store {
         commit_local_cluster_connectivity_source_set_if_snapshot,
         commit_local_cluster_connectivity_source_set_if_snapshot_async,
         local_cluster_connectivity_content_generation,
+        prepare_local_cluster_connectivity_publication_if_snapshot,
         record_daemon_owned_local_cluster_endpoint_command_connectivity,
         subscribe_local_cluster_connectivity_routing_generation,
     };

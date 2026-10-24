@@ -20,7 +20,6 @@ use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::read_local_cluster_connectivity_records_for_source;
 use sinomo_network::write_local_cluster_connectivity_record_set;
 use sinomo_network::{CLUSTER_NETWORK_PUBLISH_INTERVAL, cluster_network_publish_interval_for_role};
 use sinomo_network::{
@@ -149,7 +148,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
         // A probe can complete while an earlier publication batch is being
         // appended. Re-read on every pass so the operation cannot finish with
         // cluster KV reflecting the older set.
-        let records = read_local_cluster_connectivity_records_for_source(paths, source_node_id)?;
+        let records = read_persisted_connectivity_records_for_source(paths, source_node_id)?;
         let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
             snapshot.as_ref(),
             source_node_id,
@@ -217,7 +216,7 @@ where
         // Re-read after every quorum round. If a newer local observation landed
         // while the previous transaction was in flight, immediately plan a
         // corrective transaction instead of returning on the stale response.
-        let records = read_local_cluster_connectivity_records_for_source(paths, source_node_id)?;
+        let records = read_persisted_connectivity_records_for_source(paths, source_node_id)?;
         let local_snapshot = match latest.as_ref() {
             Some(_) => None,
             None => Some(read_cluster_kv_current_or_empty_snapshot_arc_for_source(
@@ -320,6 +319,36 @@ where
     .await
 }
 
+/// Publish the source generation already committed by its observation owner.
+/// This entry point does not merge a TTL-filtered read view back into storage.
+pub async fn publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    state: ClusterBootstrapState,
+    host: &mut H,
+) -> Result<Option<KvSnapshot>, H::Error>
+where
+    H: ClusterConnectivityPublishAsyncHost,
+{
+    publish_current_cluster_connectivity_records_to_quorum_async_inner(
+        runtime,
+        paths,
+        source_node_id,
+        Some(state),
+        host,
+    )
+    .await
+}
+
+fn read_persisted_connectivity_records_for_source(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+    sinomo_network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(paths)?
+        .persisted_records_for_source(source_node_id)
+}
+
 async fn sync_cluster_connectivity_records_to_quorum_async_inner<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -351,6 +380,26 @@ where
         })?
         .map_err(H::Error::from)?;
 
+    publish_current_cluster_connectivity_records_to_quorum_async_inner(
+        runtime,
+        paths,
+        source_node_id,
+        initial_state,
+        host,
+    )
+    .await
+}
+
+async fn publish_current_cluster_connectivity_records_to_quorum_async_inner<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    initial_state: Option<ClusterBootstrapState>,
+    host: &mut H,
+) -> Result<Option<KvSnapshot>, H::Error>
+where
+    H: ClusterConnectivityPublishAsyncHost,
+{
     let mut state = initial_state;
     let mut latest: Option<KvSnapshot> = None;
     let mut previous_ops: Option<Vec<KvOp>> = None;
@@ -359,10 +408,7 @@ where
         let read_source_node_id = source_node_id.clone();
         let records = runtime
             .spawn_blocking(move || {
-                read_local_cluster_connectivity_records_for_source(
-                    &read_paths,
-                    &read_source_node_id,
-                )
+                read_persisted_connectivity_records_for_source(&read_paths, &read_source_node_id)
             })
             .await
             .map_err(|source| {

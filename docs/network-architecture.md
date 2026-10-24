@@ -135,6 +135,16 @@ change a node's status. Probe owners and routed-session executors submit
 observations through an explicit sink. The tracker validates ownership,
 deduplicates updates, expires stale facts, and publishes a new snapshot.
 
+The live routing view and the stored source generation are distinct. A periodic
+publication pass forwards the generation already committed by the observation
+owner; TTL expiry in a read view does not itself authorize a new source-set
+mutation or a quorum deletion. Expired stored observations remain unusable for
+routing and are not renewed by publication. Actual source updates, explicit
+clears, and topology revocations still reconcile through the existing
+cross-process snapshot fence and writer. Publication retries re-read stored
+source data, so a newer source generation wins without replacing its evidence
+with a clock-filtered omission.
+
 Routed edge feedback preserves a typed distinction between transport failure and
 identity mismatch. A refused connection, timeout, or expired handshake during
 restart remains eligible for transport recovery; it must not be persisted as a

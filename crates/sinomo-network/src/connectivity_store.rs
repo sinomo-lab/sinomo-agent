@@ -809,6 +809,27 @@ impl PartialEq for LocalClusterConnectivityStoreSnapshot {
 
 impl Eq for LocalClusterConnectivityStoreSnapshot {}
 
+impl LocalClusterConnectivityStoreSnapshot {
+    /// Exact stored source data for publication, including expired observations.
+    /// This is not a routing/liveness view; ordinary readers still filter TTLs.
+    #[doc(hidden)]
+    pub fn persisted_records_for_source(
+        &self,
+        source_node_id: &NodeId,
+    ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+        let mut records = Vec::new();
+        for record in self
+            .persisted_records
+            .iter()
+            .filter(|record| record.source_node_id == *source_node_id)
+        {
+            crate::object::try_reserve_vec(&mut records, 1, "capture stored connectivity source")?;
+            records.push(record.clone());
+        }
+        Ok(records)
+    }
+}
+
 /// Captures the exact persisted base that a later source-set commit may
 /// replace. The read and cache reconciliation share the cross-process
 /// mutation lock with all supported writers.
@@ -833,6 +854,64 @@ pub fn capture_local_cluster_connectivity_store_snapshot(
         persisted_records: Arc::new(persisted_records),
         observation_generations: Arc::new(observation_watermarks.generations),
     })
+}
+
+/// Prepare publication of a generation already owned by the local store.
+/// Reading a TTL-filtered routing view cannot author a new source omission.
+/// A genuine topology revocation still uses the existing fenced writer; a
+/// concurrent source change remains Superseded, including an explicit clear.
+#[doc(hidden)]
+pub fn prepare_local_cluster_connectivity_publication_if_snapshot(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    let actual = capture_local_cluster_connectivity_store_snapshot(paths)?;
+    let records = actual.persisted_records_for_source(source_node_id)?;
+    if &actual != expected_snapshot {
+        return Ok(LocalClusterConnectivitySourceSetCommit::Superseded {
+            records,
+            snapshot: actual,
+        });
+    }
+    let topology = LocalConnectivityTopology::from_state(state);
+    if actual
+        .persisted_records
+        .iter()
+        .all(|record| topology.record_matches_topology(record))
+    {
+        return Ok(LocalClusterConnectivitySourceSetCommit::Committed {
+            records,
+            snapshot: actual,
+            content_changed: false,
+        });
+    }
+    // Do not add a second mutation path. The existing writer rechecks the
+    // physical source fence and prunes revoked/rebound endpoints atomically.
+    match commit_local_cluster_connectivity_source_set_if_snapshot(
+        paths,
+        state,
+        source_node_id,
+        &records,
+        &actual,
+    )? {
+        LocalClusterConnectivitySourceSetCommit::Committed {
+            snapshot,
+            content_changed,
+            ..
+        } => Ok(LocalClusterConnectivitySourceSetCommit::Committed {
+            records: snapshot.persisted_records_for_source(source_node_id)?,
+            snapshot,
+            content_changed,
+        }),
+        LocalClusterConnectivitySourceSetCommit::Superseded { snapshot, .. } => {
+            Ok(LocalClusterConnectivitySourceSetCommit::Superseded {
+                records: snapshot.persisted_records_for_source(source_node_id)?,
+                snapshot,
+            })
+        }
+    }
 }
 
 /// Atomically verifies `expected_snapshot`, prunes records against `state`,
@@ -1265,11 +1344,14 @@ impl LocalConnectivityTopology {
     }
 
     fn record_is_usable(&self, record: &ClusterConnectivityRecord, now: OffsetDateTime) -> bool {
+        cluster_network_record_live(record.expires_at, now) && self.record_matches_topology(record)
+    }
+
+    fn record_matches_topology(&self, record: &ClusterConnectivityRecord) -> bool {
         if self
             .cluster_id
             .as_ref()
             .is_some_and(|cluster_id| record.cluster_id != *cluster_id)
-            || !cluster_network_record_live(record.expires_at, now)
             || !self.authorized_nodes.contains(&record.source_node_id)
             || !self.authorized_nodes.contains(&record.target_node_id)
         {
@@ -1948,6 +2030,85 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
         (root, paths, state, local, endpoint, now)
+    }
+
+    #[test]
+    fn publication_preparation_preserves_newer_source_and_prunes_revoked_topology() {
+        let (_root, paths, mut state, local, endpoint_a, now) =
+            connectivity_generation_fixture("publication_topology_and_source_fence");
+        let mut endpoint_b = endpoint_a.clone();
+        endpoint_b.endpoint_id = ClusterEndpointId::derived("publication-second-endpoint", b"b");
+        endpoint_b.address = "target:21354".to_string();
+        state.members[1].endpoints.push(endpoint_b.clone());
+        let a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let b = cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(&paths, &local, &[a.clone(), b]).unwrap();
+        let old = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let fresh = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("new actual observation".into()),
+            now + time::Duration::seconds(1),
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[fresh.clone()]).unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let superseded = prepare_local_cluster_connectivity_publication_if_snapshot(
+            &paths, &state, &local, &old,
+        )
+        .unwrap();
+        assert!(
+            matches!(superseded, LocalClusterConnectivitySourceSetCommit::Superseded { ref records, .. }
+            if records.iter().any(|r| r == &fresh)),
+            "actual newer source wins: {superseded:?}"
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            before,
+            "stale publication must not mutate the winner"
+        );
+        let current = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        state.members[1]
+            .endpoints
+            .retain(|endpoint| endpoint.endpoint_id != endpoint_b.endpoint_id);
+        let pruned = prepare_local_cluster_connectivity_publication_if_snapshot(
+            &paths, &state, &local, &current,
+        )
+        .unwrap();
+        assert!(
+            matches!(pruned, LocalClusterConnectivitySourceSetCommit::Committed { ref records, content_changed: true, .. }
+            if records == &vec![fresh.clone()]),
+            "revoked endpoint is actually pruned: {pruned:?}"
+        );
+        invalidate_local_cluster_connectivity_cache(&paths).unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local).unwrap(),
+            vec![fresh]
+        );
     }
 
     #[test]
