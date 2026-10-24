@@ -7721,9 +7721,12 @@ mod native_selected_data_tests {
                 queue.compact_if_needed(DfsRepairQueueCompactionOptions::force()).unwrap();
                 queue.reload_from_disk_on_next_access();
                 let before_repeat = queue.view().unwrap();
+                assert_eq!(queue.imported_history_query_for_test(&producer, &id).unwrap(), Some(recorded.clone()),
+                    "cold snapshot replay must retain every delivery and the exact genuine Terminal response");
                 let calls_before_repeat = fixture.runtime.rpc_observations().len();
                 let response = query(fixture, assignment, successor);
                 assert_terminal(&response, fixture);
+                assert_eq!(&response, recorded.terminal().unwrap());
                 assert_eq!(queue.view().unwrap(), before_repeat);
                 assert!(!fixture.runtime.rpc_observations().iter().skip(calls_before_repeat).any(|call| call.source == fixture.promoted
                     && call.target == fixture.holder && call.route == DFS_DATA_READ_ROUTE));
