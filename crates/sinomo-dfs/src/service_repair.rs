@@ -6122,9 +6122,14 @@ mod received_repair_content_tests {
             let catalog = content_root.join("inline-bindings/current.sobj");
             let before = std::fs::read(&catalog).unwrap();
             let mut service = NetworkedDfsService::new(crate::test_runtime::DfsTestRuntime::local_transport(material.original.target_node_id.clone()), content);
+            // Construction intentionally installs SIFS. Rejection must preserve
+            // that actual baseline, not require an empty filesystem cache.
+            let metadata_before = service.metadata.clone();
             let error = service.handle_selected_original_repair(material.original.source_node_id.clone(), DfsSelectedOriginalRepairCommand { version: 1, material: material.clone(), bytes: b"complete original attachment".to_vec() }).unwrap_err();
             assert!(error.to_string().contains(if format == 4 { "actual native backend" } else { "explicit native fixture" }), "{error}");
-            assert!(service.metadata.objects.is_empty() && service.metadata.filesystems.is_empty());
+            assert_eq!(service.metadata.objects, metadata_before.objects);
+            assert_eq!(service.metadata.filesystems, metadata_before.filesystems);
+            assert_eq!(service.metadata.objects_by_path, metadata_before.objects_by_path);
             assert_eq!(std::fs::read(&catalog).unwrap(), before);
             assert!(service.content.read_object_version(material.original.command.object_id.as_str(), material.original.command.version.as_str()).is_err());
             if format == 4 { assert!(service.content.original_repair_test_snapshot(&material).unwrap().is_none()); }
