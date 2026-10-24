@@ -1513,10 +1513,45 @@ pub(crate) fn open_daemon_dfs_message_service_lane_with_content(
     cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
     let metadata_backend = if resident_metadata_scope.is_none() {
-        Some(sinomo_dfs::open_cluster_aware_dfs_metadata_backend(
-            data_dir,
-            cluster_paths,
-        )?)
+        let metadata_root = sinomo_dfs::default_dfs_metadata_shards_root(data_dir);
+        let selected = publication_runtime_owner(&metadata_root)
+            .map_err(|error| sinomo_dfs::DfsError::Metadata {
+                message: error.to_string(),
+            })?
+            .map(|owner| owner.selected_original_data_layout())
+            .transpose()
+            .map_err(|error| sinomo_dfs::DfsError::Metadata {
+                message: error.to_string(),
+            })?
+            .flatten();
+        Some(if let Some(layout) = selected {
+            // An empty native projection must not create an ordinary root
+            // beneath an explicitly selected physical layout. The existing
+            // maintenance owner retries on its normal topology/wake path.
+            // This context selects a reader, never an assignment or authority.
+            let projection = authoritative_prefix.as_ref().ok_or_else(|| {
+                sinomo_dfs::DfsError::Metadata {
+                    message: "selected native metadata lane awaits certified topology".into(),
+                }
+            })?;
+            let shards = daemon_dfs_metadata_shards_from_authority_projection(
+                projection,
+                &sinomo_dfs::sifs_file_system_id(),
+            )?;
+            if shards.is_empty() {
+                return Err(sinomo_dfs::DfsError::Metadata {
+                    message: "selected native metadata lane awaits certified topology".into(),
+                });
+            }
+            Box::new(sinomo_dfs::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
+                metadata_root, shards, local_node_id, layout,
+            )?) as Box<dyn sinomo_dfs::DfsMetadataBackend>
+        } else {
+            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(
+                &metadata_root,
+            )?;
+            sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?
+        })
     } else {
         None
     };
