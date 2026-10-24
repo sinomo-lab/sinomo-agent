@@ -354,8 +354,9 @@ pub fn upsert_daemon_member(
     }
 }
 
-/// Remove only retired TCP listener advertisements when their local owner has
-/// supplied listener observations. Non-listener merging belongs to the caller.
+/// Retire TCP listener advertisements, including their mDNS echoes, only when
+/// the local owner supplied current static/observed listeners. A discovery hint
+/// alone cannot authorize retirement. Other transports/sources remain intact.
 pub(crate) fn remove_superseded_daemon_listeners(
     existing: &mut Vec<ClusterEndpointRecord>,
     observed: &[ClusterEndpointRecord],
@@ -364,7 +365,17 @@ pub(crate) fn remove_superseded_daemon_listeners(
         .iter()
         .any(daemon_tcp_endpoint_is_listener_advertisement)
     {
-        existing.retain(|endpoint| !daemon_tcp_endpoint_is_listener_advertisement(endpoint));
+        existing.retain(|endpoint| {
+            !matches!(
+                endpoint.transport,
+                ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp
+            ) || !matches!(
+                endpoint.source,
+                ClusterEndpointSource::Static
+                    | ClusterEndpointSource::Observed
+                    | ClusterEndpointSource::Mdns
+            )
+        });
     }
 }
 

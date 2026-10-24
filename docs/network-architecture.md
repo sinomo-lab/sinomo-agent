@@ -199,6 +199,13 @@ Local observations may supplement route choice for their source node. They do
 not authorize an absent member, extend an expired remote observation, or
 override a newer non-empty authoritative projection.
 
+When a local owner replaces its complete TCP listener observations, retirement
+also removes mDNS copies of those retired listeners. Otherwise an old discovered
+IP can survive a restart and later name a different node. Only current local
+static/observed listener input triggers this replacement; an mDNS hint alone
+does not. The same retirement rule applies when overlaying older KV records,
+while other transports and independently published routes remain intact.
+
 ## Routing Contract
 
 The routing layer is the sole owner of transitive reachability. It turns paths
