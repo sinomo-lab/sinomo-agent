@@ -204,7 +204,8 @@ admitted configuration instead of rereading every participant's member and
 capability-policy records.
 
 Ordinary daemon writes take one published configuration view for filesystem
-policy, content advertisements and filesystem provider records. The existing
+policy, content advertisements, filesystem provider records and cluster
+membership. The existing
 authority runtime owns that view, its committed subscriptions and its single
 refresh owner. Cold bootstrap, gap recovery and migration inventories read each
 DFS configuration prefix through the cluster's complete-prefix authoritative
@@ -218,6 +219,15 @@ watermark before publishing. The complete advertised zone map remains part of
 durable operation identity, including when the policy requires zero distinct
 zones. Provider/content configuration changes advance authority fencing while
 the physical metadata-store generation stays unchanged.
+
+The strict content-target inventory joins authorized membership in the retained
+Raft configuration's cluster, compatible cluster-visible DFS transfer providers
+and explicit content acceptance from that same complete view. Missing provider
+records never supply a legacy/local fallback for this inventory. Provider health
+is operational evidence: an offline member or unavailable compatible provider
+may remain a desired target without supplying a writable target, holder or
+receipt. This inventory does not change the existing write planner, publication
+authority or replication counts by itself.
 
 Warm write view access never fetches prefixes, hydrates KV or opens another
 configuration watcher. Its narrow native floor check borrows the exact resident

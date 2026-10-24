@@ -4011,8 +4011,8 @@ fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapsh
     );
     assert_eq!(
         take_daemon_dfs_test_authoritative_prefix_call_count(&cluster_paths),
-        3,
-        "cold authority warmup must prove all three bounded configuration scopes on a 2 MiB worker"
+        crate::write_configuration_projection::DFS_WRITE_CONFIGURATION_PREFIXES.len(),
+        "cold authority warmup must prove all four bounded configuration scopes on a 2 MiB worker"
     );
 
     let client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime.handle());

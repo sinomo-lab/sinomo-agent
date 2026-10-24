@@ -1205,6 +1205,13 @@ impl DfsMetadataAuthorityRuntime {
             let providers = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[2])
                 .await?;
+            #[cfg(test)]
+            if let Some(observer) = native_read_observer {
+                observer(DFS_WRITE_CONFIGURATION_PREFIXES[3]);
+            }
+            let members = host
+                .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[3])
+                .await?;
             let after = host.write_configuration_floor()?;
             if before.value.is_none()
                 || before.value != after.value
@@ -1229,7 +1236,7 @@ impl DfsMetadataAuthorityRuntime {
                 });
             }
             configuration
-                .install_bootstrap(token, [filesystem, content, providers], after)
+                .install_bootstrap(token, [filesystem, content, providers, members], after)
                 .map_err(DfsError::from)?;
             authority_changed |= if let Some(published) = configuration.snapshot() {
                 match self

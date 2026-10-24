@@ -1148,11 +1148,14 @@ impl NativeShardTraceCapture {
 struct NativeConfigurationCutObservationV1 {
     owner_label: String,
     owner_ordinal: String,
-    requested_scope_prefixes: [&'static str; 3],
+    requested_scope_prefixes:
+        [&'static str; crate::write_configuration_projection::DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
     revision: String,
     accepted_authority_generation: String,
-    scopes: [Vec<sinomo_core::kv::KvEntry>; 3],
-    authority: [sinomo_core::kv::KvAuthorityProof; 3],
+    scopes: [Vec<sinomo_core::kv::KvEntry>;
+        crate::write_configuration_projection::DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
+    authority: [sinomo_core::kv::KvAuthorityProof;
+        crate::write_configuration_projection::DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
     retained_projection_floor: sinomo_core::kv::KvLocalRead<Option<sinomo_core::kv::KvEntry>>,
     // SAME normal accepted immutable view consumed at this actual guard's
     // final recheck. Correlation is observational and grants no authority.
