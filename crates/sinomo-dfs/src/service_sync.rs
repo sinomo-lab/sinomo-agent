@@ -4960,7 +4960,8 @@ mod native_selected_data_tests {
             "fixture_prepared_b_bytes":false,
             "retiring_assignment_rejected":false,
             "native_b_associated":false,
-            "native_b_reopen_duplicate_matched":false
+            "native_b_reopen_duplicate_matched":false,
+            "dispatch_observation_qualification":"held_promoted pre-claim guard remains installed; no unguarded scheduler coverage"
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let owner = fixture.shard.primary_node_id.clone();
@@ -5086,16 +5087,31 @@ mod native_selected_data_tests {
                 original_digest,
                 installed.material.birth.root.original_command_digest
             );
-            assert!(
-                fixture
-                    .runtime
-                    .client(&promoted)
-                    .unwrap()
-                    .content()
-                    .read_object_version(command.object_id.as_str(), command.version.as_str())
-                    .is_err(),
-                "actual metadata installation must leave B without the exact content version"
-            );
+            let missing_manifest = fixture
+                .runtime
+                .data_dir(&promoted)
+                .dfs_dir()
+                .join("content/objects")
+                .join(command.object_id.as_str())
+                .join(command.version.as_str())
+                .join("manifest.sobj");
+            let captured_absence = fixture
+                .runtime
+                .client(&promoted)
+                .unwrap()
+                .content()
+                .read_manifest(command.object_id.as_str(), command.version.as_str())
+                .expect_err("actual metadata installation leaves this exact B manifest absent");
+            match &captured_absence {
+                ContentStoreError::Io { path, source } => {
+                    assert_eq!(path, &missing_manifest);
+                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                other => panic!(
+                    "corruption/unsupported storage is not a missing-payload control: {other:?}"
+                ),
+            }
+            let expected_missing = DfsError::from(captured_absence);
 
             let mut successor = fixture.runtime.metadata_primary_service(path).unwrap();
             let association_scope = DfsPreparedOperationScope {
@@ -5119,10 +5135,20 @@ mod native_selected_data_tests {
                 Instant::now() <= missing_deadline,
                 "missing-payload call keeps the existing 5s operation bound"
             );
-            assert!(
-                matches!(missing, DfsError::ContentStore { .. }),
-                "a native authority/startup error cannot masquerade as missing payload: {missing:?}"
-            );
+            match (missing, expected_missing) {
+                (
+                    DfsError::ContentStore { message: actual },
+                    DfsError::ContentStore { message: expected },
+                ) => {
+                    assert_eq!(
+                        actual, expected,
+                        "association must return the exact captured B manifest absence"
+                    );
+                }
+                (actual, expected) => panic!(
+                    "native authority/corruption failure is not the captured absence: actual={actual:?}, expected={expected:?}"
+                ),
+            }
             assert_eq!(queue.view().unwrap(), before_missing);
             assert!(
                 queue
@@ -5340,6 +5366,10 @@ mod native_selected_data_tests {
                     .is_none()
             );
             assert_eq!(queue.view().unwrap(), before_duplicate);
+            // Guarded absence only: held_promoted remains installed. The
+            // native lookup/attempt rejections above independently prove that
+            // association DATA grants no dispatch permit; this is not an
+            // unguarded native scheduling/executor liveness control.
             assert_eq!(b_capture.omitted_count(), 0);
             assert!(
                 b_capture
@@ -5406,13 +5436,24 @@ mod native_selected_data_tests {
             );
             let reopen_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
             let mut current = fixture.runtime.metadata_primary_service(path).unwrap();
+            let reopen_admission = current
+                .acquire_prepared_execution(&association_scope)
+                .unwrap();
+            let before_reopen_duplicate = reopened.view().unwrap();
             assert_eq!(
                 current
                     .associate_installed_repair_executor_disabled(&assignment, &owner, &request,)
                     .unwrap(),
                 Some(association)
             );
+            assert_eq!(
+                reopened.view().unwrap(),
+                before_reopen_duplicate,
+                "native reopen duplicate must not append or rewrite queue DATA"
+            );
             assert!(Instant::now() <= reopen_deadline);
+            drop(reopen_admission);
+            // The same held_promoted guard also qualifies this observation.
             assert_eq!(fixture.runtime.observation_dropped_count(), 0);
             assert!(
                 !fixture
@@ -5435,7 +5476,7 @@ mod native_selected_data_tests {
         let report = serde_json::json!({
             "native_assertions_passed":outcome.is_ok(), "initial_original":&fixture.birth,
             "facts":facts,
-            "qualification":"Native disabled-association DATA control. B bytes are fixture-prepared through the actual local writer, not transferred. A->B retiring-role rejection is not a second reconfiguration trace. No successor dispatch, receiver Terminal/dedup, causal application, root retirement, C1 or availability proof."
+            "qualification":"Native disabled-association DATA control. B bytes are fixture-prepared through the actual local writer, not transferred. A->B retiring-role rejection is not a second reconfiguration trace. Absence of B dispatch is observed with held_promoted installed; native lookup/attempt rejections do not claim unguarded scheduler coverage. No successor dispatch, receiver Terminal/dedup, causal application, root retirement, C1 or availability proof."
         });
         if let Err(error) = std::fs::write(
             fixture
