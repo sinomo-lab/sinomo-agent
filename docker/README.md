@@ -166,6 +166,29 @@ recovery exits require a recorded, node-specific, single-use intent; OOM is
 never excused by such an intent. Failed resource evidence must be debugged at
 the existing limits, not retried with larger containers.
 
+For a qualification run, `SINOMO_TEST_DEFER_PPROF_PRESENTATION=1` defers optional
+host Go `pprof -top` and flamegraph presentation. The setting is inherited by
+nested restart harnesses and shared by write/idle profile collection. Debugging,
+tracing, CPU sampling, raw profile and CPU-manifest exports, identities, coverage
+checks, collector drain, and resource thresholds are unchanged. Timeline summaries
+and required collectors remain in their existing phase. Each available profile
+gets `pprof-presentation.json` with raw/provenance hashes and explicit `deferred`
+status, without claiming HTML/top outputs. Missing or mismatched raw evidence is
+`unavailable`, never a successful deferral or complete capture. The default,
+without this setting, retains inline presentation.
+
+Offline presentation may begin only after all measured legs and collector/export
+work finish, the original verdicts and counters are sealed, owned containers are
+stopped, and owned helper/session/group/scope and fixture cleanup is verified.
+Use preserved host files only, recheck the deferred receipt's input hashes, and
+acquire the normal maintenance guard for a separate bounded measured phase; no
+qualification workload may overlap. Use the existing renderer and, when requested,
+`go tool pprof -top -nodecount=20`, writing to a fresh postprocessing directory.
+Retain render failures, timeouts, resource events and actual drain independently.
+Postprocessing never rewrites the sealed measurement verdict, resets counters or
+subtracts overhead. Deferred presentation is not a rendering pass, and a later
+successful render cannot turn failed measured quietness into acceptance.
+
 This resets and removes the selected disposable project's volumes. `KEEP=1`
 is spelled `SINOMO_TEST_KEEP=1` and retains it at teardown only;
 `SINOMO_TEST_REUSE=1` skips initial reset and retains existing state. The lane

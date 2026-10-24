@@ -4474,6 +4474,31 @@ render_formation_observation_artifacts() {
     done < <(find "$node_dir/network-timeline-artifacts" -type f -name timeline.json -print0)
   done
 
+  if [ "${SINOMO_TEST_DEFER_PPROF_PRESENTATION:-0}" = 1 ]; then
+    # Raw captures/CPU manifests and all collection above stay in this phase.
+    # Nested restart harnesses inherit the same explicit per-run setting.
+    while IFS= read -r -d '' profile; do
+      profile_dir="$(dirname "$profile")"
+      python3 "$flamegraph_renderer" "$profile" --defer-presentation \
+        --manifest "$profile_dir/manifest.json" --provenance "${BASH_SOURCE[0]}" \
+        -o "$profile_dir/pprof-presentation.json" \
+        > "$profile_dir/pprof-presentation.stdout.log" \
+        2> "$profile_dir/pprof-presentation.stderr.log" || true
+    done < <(find "$observe_dir" -type f -name cpu.pprof.pb -print0)
+    # Missing current captures remain unavailable, not a successful deferral.
+    for node in $NODES; do
+      profile_dir="$observe_dir/$node/profile-artifact"
+      if [ ! -f "$profile_dir/cpu.pprof.pb" ]; then
+        mkdir -p "$profile_dir"
+        python3 "$flamegraph_renderer" "$profile_dir/cpu.pprof.pb" --defer-presentation \
+          --manifest "$profile_dir/manifest.json" --provenance "${BASH_SOURCE[0]}" \
+          -o "$profile_dir/pprof-presentation.json" \
+          > "$profile_dir/pprof-presentation.stdout.log" \
+          2> "$profile_dir/pprof-presentation.stderr.log" || true
+      fi
+    done
+    return 0
+  fi
   [ -x "$flamegraph_renderer" ] || return 0
   while IFS= read -r -d '' profile; do
     profile_dir="$(dirname "$profile")"

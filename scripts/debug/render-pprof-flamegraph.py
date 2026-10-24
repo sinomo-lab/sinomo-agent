@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -31,6 +33,64 @@ LOG_TAIL_BYTES = 16 * 1024
 
 class RenderError(RuntimeError):
     """A user-facing profile rendering failure."""
+
+
+def record_deferred_presentation(profile: Path, manifest: Path, output: Path,
+                                 provenance=(), include_top: bool = False) -> dict:
+    """Seal raw inputs only. This neither starts Go nor schedules later work."""
+    errors = []
+    inputs = {}
+    manifest_bytes = None
+    for name, path in [("profile", profile), ("manifest", manifest), ("recorder", Path(__file__)),
+                       *[(f"provenance-{i}", p) for i, p in enumerate(provenance)]]:
+        path = path.resolve()
+        try:
+            size = path.stat().st_size
+            if not path.is_file() or not 0 < size <= MAX_INPUT_BYTES:
+                raise RenderError(f"invalid or oversized raw input: {path}")
+            with path.open("rb") as stream:
+                data = stream.read(MAX_INPUT_BYTES + 1)
+            if len(data) != size:
+                raise RenderError(f"raw input changed while sealing: {path}")
+            digest = hashlib.sha256(data).hexdigest()
+            if name == "manifest":
+                manifest_bytes = data
+            inputs[name] = {"path": str(path), "bytes": size, "sha256": digest}
+        except (OSError, RenderError) as error:
+            errors.append(str(error))
+            inputs[name] = {"path": str(path), "unavailable": str(error)}
+    capture = None
+    if "sha256" in inputs["manifest"]:
+        try:
+            captured = json.loads(manifest_bytes)
+            capture = captured["response"]
+            if (not isinstance(capture, dict) or capture.get("state") != "complete" or not capture.get("capture_id")
+                    or not captured.get("process_id")
+                    or capture.get("artifact_bytes") != inputs["profile"].get("bytes")):
+                raise RenderError("CPU manifest does not describe a complete matching raw profile")
+        except (OSError, ValueError, KeyError, TypeError, RenderError) as error:
+            errors.append(str(error))
+    record = {
+        "schema": "sinomo.pprof-presentation.v1",
+        "status": "unavailable" if errors else "deferred",
+        "inputs": inputs,
+        "capture": capture,
+        "requested_outputs": ["top", "flamegraph"] if include_top else ["flamegraph"],
+        "presentation_outputs": {},
+        "errors": errors,
+        "boundary": "Offline presentation only after measured verdict/counters are sealed and "
+                    "owned containers, collectors, helpers and scopes have actually drained. "
+                    "A separate guarded postprocessing result cannot change the measured verdict.",
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x") as stream:
+        json.dump(record, stream, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    if errors:
+        raise RenderError("deferred presentation has unavailable raw evidence: " + "; ".join(errors))
+    return record
 
 
 def _go_binary() -> str:
@@ -320,7 +380,12 @@ def run_self_test() -> None:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("profile", nargs="?", type=Path, help="raw cpu.pprof.pb artifact")
-    parser.add_argument("-o", "--output", type=Path, help="output flamegraph HTML path")
+    parser.add_argument("-o", "--output", type=Path, help="output HTML, or deferred receipt path")
+    parser.add_argument("--defer-presentation", action="store_true",
+                        help="record raw hashes and deferred status without starting Go")
+    parser.add_argument("--manifest", type=Path, help="preserved CPU manifest for deferral")
+    parser.add_argument("--provenance", action="append", type=Path, default=[])
+    parser.add_argument("--include-top", action="store_true")
     parser.add_argument(
         "--self-test",
         action="store_true",
@@ -328,10 +393,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.self_test:
-        if args.profile is not None or args.output is not None:
+        if (args.profile is not None or args.output is not None or args.defer_presentation
+                or args.manifest or args.provenance or args.include_top):
             parser.error("--self-test does not accept a profile or output path")
     elif args.profile is None or args.output is None:
         parser.error("profile and --output are required unless --self-test is used")
+    if args.defer_presentation and args.manifest is None:
+        parser.error("--defer-presentation requires --manifest")
+    if not args.defer_presentation and (args.manifest or args.provenance or args.include_top):
+        parser.error("manifest/provenance/include-top are only for deferred presentation")
     return args
 
 
@@ -340,6 +410,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.self_test:
             run_self_test()
+        elif args.defer_presentation:
+            record_deferred_presentation(args.profile, args.manifest, args.output,
+                                         args.provenance, args.include_top)
+            print(f"presentation deferred; raw evidence sealed in {args.output}")
         else:
             written = render_profile(args.profile, args.output)
             print(f"rendered {args.output} ({written} bytes)")
