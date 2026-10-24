@@ -31,6 +31,63 @@ impl AppliedOriginalRepair {
     }
 }
 
+/// Prohibition-only preflight for the disabled DATA join. Inputs are not an
+/// authority certificate, a complete residency proof, W/N admission or a
+/// serialization boundary between a policy change and a content-root write.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn associate_disabled_imported_executor_with_hard_prohibitions(
+    executor: &NodeId,
+    object: &DfsObjectMetadata,
+    immutable_policy: &DfsReplicationPolicy,
+    retained_configuration: impl FnOnce() -> Result<Option<DfsFileSystemConfig>, DfsError>,
+    retain: impl FnOnce() -> Result<
+        crate::repair_queue_store::ImportedRepairExecutorAssociation,
+        DfsError,
+    >,
+) -> Result<crate::repair_queue_store::ImportedRepairExecutorAssociation, DfsError> {
+    // A later path override cannot erase an immutable intent prohibition. Do
+    // this before even borrowing current configuration or opening B content.
+    if immutable_policy.forbidden_node_ids.contains(executor) {
+        return Err(DfsError::InvalidReplicationPolicy {
+            message: "immutable Repair intent forbids disabled executor retention on this node"
+                .into(),
+        });
+    }
+    let config = retained_configuration()?.ok_or_else(|| DfsError::Metadata {
+        message: "disabled executor retention has no retained exact-filesystem policy".into(),
+    })?;
+    // The exact-key accessor decodes the value; it does not validate this
+    // embedded identity. Never resolve another filesystem's rule over this path.
+    if config.file_system_id != object.file_system_id {
+        return Err(DfsError::Metadata {
+            message: "disabled executor retention policy names another filesystem".into(),
+        });
+    }
+    let resolved = crate::placement::resolve_placement_policy(
+        &config,
+        &object.path,
+        object.policy.clone(),
+        immutable_policy.desired_replicas,
+    )?;
+    if resolved.policy.forbidden_node_ids.contains(executor) {
+        return Err(DfsError::InvalidReplicationPolicy {
+            message: "current path policy forbids disabled executor retention on this node".into(),
+        });
+    }
+    if (object.policy == sinomo_core::DfsObjectPolicy::LocalOwned
+        || resolved.policy.consistency == sinomo_core::DfsObjectPolicy::LocalOwned)
+        && &object.owner_node_id != executor
+    {
+        return Err(DfsError::InvalidReplicationPolicy {
+            message: "local-owned content cannot be retained by a different disabled executor"
+                .into(),
+        });
+    }
+    // Required nodes, counts and zones are deliberately not evaluated as an
+    // allowlist or an N-target plan. This is an extra effect-body hold only.
+    retain()
+}
+
 /// Observe the actual producer maps without changing transfer custody.
 fn pending_repair_transfer_observation<'a>(
     pending: &'a PendingNetworkedWrite,
@@ -487,15 +544,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return Err(invalid());
         }
-        // Resolve B content from the actual retained DATA owner, not an
-        // arbitrary service content handle or the imported A physical root.
-        let data_dir = sinomo_core::local::SinomoDataDir::new(owner.physical_data_root());
-        let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-        let association = queue.associate_imported_executor_disabled(
-            &imported,
+        let association = associate_disabled_imported_executor_with_hard_prohibitions(
             &self.node_id,
-            assignment,
-            &content,
+            &object,
+            &intent.policy,
+            || {
+                // Retained-only: no get/range fallback, KV read or hydration.
+                let Some(control) = self.control_plane.as_deref() else {
+                    return Ok(None);
+                };
+                let Some(configuration) = control.write_configuration_projection()? else {
+                    return Ok(None);
+                };
+                configuration
+                    .file_system_config(&object.file_system_id)
+                    .map_err(DfsError::from)
+            },
+            || {
+                // Resolve B content from the actual retained DATA owner only
+                // after both immutable and current explicit hard checks.
+                let data_dir = sinomo_core::local::SinomoDataDir::new(owner.physical_data_root());
+                let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+                queue.associate_imported_executor_disabled(
+                    &imported,
+                    &self.node_id,
+                    assignment,
+                    &content,
+                )
+            },
         )?;
         layout.check_owner(&owner)?;
         if self

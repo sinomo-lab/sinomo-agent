@@ -4085,6 +4085,276 @@ pub(crate) mod tests {
                 .unwrap()
         }
 
+        fn hard_policy_inputs(
+            f: &Fixture,
+        ) -> (
+            crate::DfsObjectMetadata,
+            crate::DfsReplicationPolicy,
+            crate::DfsFileSystemConfig,
+        ) {
+            let crate::DfsNetworkMessage::RepairReplica(command) = &f.original.message else {
+                panic!("Repair fixture");
+            };
+            let object = crate::DfsObjectMetadata {
+                object_id: command.object_id.clone(),
+                file_system_id: command.file_system_id.clone(),
+                path: "/hard-policy/object.bin".into(),
+                kind: crate::DfsObjectKind::File,
+                tombstone_provenance: None,
+                owner_node_id: f.original.source_node_id.clone(),
+                current_locations: vec![f.original.source_node_id.clone()],
+                content_hash: Some(command.content_hash.clone()),
+                content_size_bytes: Some(f.imported.material.birth.attachment.total_size_bytes),
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: command.version.clone(),
+                policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            };
+            // These policy/configuration VALUES are local preflight inputs,
+            // not native committed authority or rewritten imported intent DATA.
+            let policy = crate::DfsReplicationPolicy::new(1, 2)
+                .unwrap()
+                .with_placement_constraints(
+                    vec![
+                        f.original.source_node_id.clone(),
+                        f.original.target_node_id.clone(),
+                    ],
+                    Vec::new(),
+                    0,
+                    BTreeMap::new(),
+                )
+                .unwrap();
+            let config = crate::DfsFileSystemConfig::from(&crate::DfsFileSystem::sifs(
+                f.original.source_node_id.clone(),
+            ));
+            (object, policy, config)
+        }
+
+        fn assert_hard_policy_rejection_did_not_capture(f: &Fixture, before: &DfsRepairQueueView) {
+            let crate::DfsNetworkMessage::RepairReplica(command) = &f.original.message else {
+                panic!("Repair fixture");
+            };
+            assert_eq!(&f.queue.view().unwrap(), before);
+            assert!(
+                f.content
+                    .retained_repair_for_slot(
+                        &f.original.source_node_id.to_string(),
+                        &f.original.target_node_id.to_string(),
+                        &command.intent_id,
+                    )
+                    .unwrap()
+                    .is_none(),
+                "a rejected preflight must not append B effect-root retention"
+            );
+            assert!(
+                f.queue
+                    .imported_executor_association(&f.original.source_node_id, &command.request_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                f.queue
+                    .installed_original_handoff_data(
+                        &f.original.source_node_id,
+                        &command.request_id
+                    )
+                    .unwrap()
+                    .unwrap(),
+                f.imported
+            );
+            assert_eq!(
+                f.source_queue
+                    .original_repair(&f.original)
+                    .unwrap()
+                    .unwrap(),
+                f.imported.material.birth
+            );
+        }
+
+        #[test]
+        fn imported_executor_immutable_forbid_precedes_configuration_and_actual_root_capture() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-immutable-forbidden");
+            let f = fixture(root.path());
+            let (object, mut policy, _config) = hard_policy_inputs(&f);
+            policy
+                .forbidden_node_ids
+                .push(f.assignment.primary_node_id.clone());
+            policy.validate().unwrap();
+            let unchanged = policy.clone();
+            let before = f.queue.view().unwrap();
+            let result =
+                crate::service_repair::associate_disabled_imported_executor_with_hard_prohibitions(
+                    &f.assignment.primary_node_id,
+                    &object,
+                    &policy,
+                    || panic!("immutable forbid must win before current configuration is read"),
+                    || {
+                        f.queue.associate_imported_executor_disabled(
+                            &f.imported,
+                            &f.assignment.primary_node_id,
+                            &f.assignment,
+                            &f.content,
+                        )
+                    },
+                );
+            assert!(
+                matches!(result, Err(DfsError::InvalidReplicationPolicy { message }) if message.contains("immutable Repair intent forbids"))
+            );
+            assert_eq!(policy, unchanged);
+            assert_hard_policy_rejection_did_not_capture(&f, &before);
+        }
+
+        #[test]
+        fn imported_executor_required_ac_n2_and_unrelated_self_only_rule_still_allow_b_hold() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-required-not-allowlist");
+            let f = fixture(root.path());
+            let (object, policy, mut config) = hard_policy_inputs(&f);
+            assert!(
+                !policy
+                    .required_node_ids
+                    .contains(&f.assignment.primary_node_id)
+            );
+            let unchanged = policy.clone();
+            let mut unrelated = crate::DfsSubtreePolicy::new(
+                "/hard-policy",
+                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                1,
+                2,
+            );
+            unrelated.scope = crate::DfsPlacementScope::SelfOnly;
+            unrelated
+                .forbidden_node_ids
+                .push(f.assignment.primary_node_id.clone());
+            config.subtree_policies.push(unrelated);
+            let association =
+                crate::service_repair::associate_disabled_imported_executor_with_hard_prohibitions(
+                    &f.assignment.primary_node_id,
+                    &object,
+                    &policy,
+                    || Ok(Some(config)),
+                    || {
+                        f.queue.associate_imported_executor_disabled(
+                            &f.imported,
+                            &f.assignment.primary_node_id,
+                            &f.assignment,
+                            &f.content,
+                        )
+                    },
+                )
+                .unwrap();
+            f.content
+                .inspect_repair_payload_root(association.local_root())
+                .unwrap();
+            assert_eq!(
+                association.local_root().subject,
+                f.imported.material.birth.root.subject
+            );
+            assert_ne!(
+                association.local_root().store_incarnation,
+                f.imported.material.birth.root.store_incarnation
+            );
+            assert_eq!(policy, unchanged);
+            assert_eq!(policy.desired_replicas, 2);
+        }
+
+        #[test]
+        fn imported_executor_current_path_forbid_and_local_ownership_reject_before_capture() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-current-hard-prohibitions");
+            for case in [
+                "inherited-forbid",
+                "durable-local-owner",
+                "managed-local-owner",
+            ] {
+                let f = fixture(&root.join(case));
+                let (mut object, policy, mut config) = hard_policy_inputs(&f);
+                match case {
+                    "inherited-forbid" => {
+                        let mut rule = crate::DfsSubtreePolicy::new(
+                            "/hard-policy",
+                            sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                            1,
+                            2,
+                        );
+                        rule.forbidden_node_ids
+                            .push(f.assignment.primary_node_id.clone());
+                        config.subtree_policies.push(rule);
+                    }
+                    "durable-local-owner" => {
+                        object.policy = sinomo_core::DfsObjectPolicy::LocalOwned
+                    }
+                    _ => config.subtree_policies.push(crate::DfsSubtreePolicy::new(
+                        &object.path,
+                        sinomo_core::DfsObjectPolicy::LocalOwned,
+                        1,
+                        1,
+                    )),
+                }
+                let before = f.queue.view().unwrap();
+                let result =
+                    crate::service_repair::associate_disabled_imported_executor_with_hard_prohibitions(
+                        &f.assignment.primary_node_id,
+                        &object,
+                        &policy,
+                        || Ok(Some(config)),
+                        || {
+                            f.queue.associate_imported_executor_disabled(
+                                &f.imported,
+                                &f.assignment.primary_node_id,
+                                &f.assignment,
+                                &f.content,
+                            )
+                        },
+                    );
+                assert!(
+                    matches!(result, Err(DfsError::InvalidReplicationPolicy { message })
+                    if if case == "inherited-forbid" { message.contains("current path policy forbids") }
+                        else { message.contains("local-owned content") }),
+                    "{case}"
+                );
+                assert_hard_policy_rejection_did_not_capture(&f, &before);
+            }
+        }
+
+        #[test]
+        fn imported_executor_absent_or_foreign_filesystem_policy_never_falls_back_to_capture() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-policy-context-unavailable");
+            for foreign in [false, true] {
+                let f = fixture(&root.join(if foreign { "foreign" } else { "missing" }));
+                let (object, policy, mut config) = hard_policy_inputs(&f);
+                config.file_system_id =
+                    crate::DfsFileSystemId::from_legacy_named("other-hard-policy-filesystem")
+                        .unwrap();
+                let before = f.queue.view().unwrap();
+                let result =
+                    crate::service_repair::associate_disabled_imported_executor_with_hard_prohibitions(
+                        &f.assignment.primary_node_id,
+                        &object,
+                        &policy,
+                        || Ok(foreign.then_some(config)),
+                        || {
+                            f.queue.associate_imported_executor_disabled(
+                                &f.imported,
+                                &f.assignment.primary_node_id,
+                                &f.assignment,
+                                &f.content,
+                            )
+                        },
+                    );
+                assert!(matches!(result, Err(DfsError::Metadata { message })
+                    if if foreign { message.contains("another filesystem") }
+                        else { message.contains("no retained exact-filesystem policy") }));
+                assert_hard_policy_rejection_did_not_capture(&f, &before);
+            }
+        }
+
         #[test]
         fn imported_executor_retains_actual_b_content_without_enabling_native_execution() {
             let root = sinomo_testdir::TestDir::new("imported-executor-disabled");
