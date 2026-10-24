@@ -3657,6 +3657,70 @@ mod provider_lifecycle_tests {
     }
 
     #[test]
+    fn native_cold_client_continuation_resumes_negative_pending_but_not_errors() {
+        use sinomo_dfs::runtime_host::DfsRuntimeError;
+        let (native, nodes) = placement_work::native_tests::native_migration_cluster(
+            "native-cold-client-preparation-control", 1,
+        );
+        let node = &nodes[0];
+        let root = sinomo_dfs::default_dfs_metadata_shards_root(native.data_dir(node))
+            .join("root").canonicalize().unwrap();
+        let open = |deny_first: bool| {
+            let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let mut actual_opens = 0;
+            let result = placement_work::native_tests::continue_native_source_step(&root, deadline, || {
+                let actual = native.client_with_startup_deadline_once(
+                    node, tokio::time::Instant::from_std(deadline),
+                );
+                let result = actual.and_then(|client| {
+                    actual_opens += 1;
+                    if actual_opens != 1 {
+                        return Ok(client);
+                    }
+                    // Negative-only consumer-boundary control after a genuine
+                    // open. Drop that shell before yielding; no successful
+                    // provider result, authority or receipt is fabricated.
+                    drop(client);
+                    if deny_first {
+                        Err(DfsRuntimeError::StoragePreparationPending {
+                            root: root.clone(), processed_records: 0,
+                        })
+                    } else {
+                        Err(DfsRuntimeError::Parse {
+                            detail: "controlled native preparation failure".into(),
+                        })
+                    }
+                });
+                result.map_err(|value| match value {
+                    DfsRuntimeError::StoragePreparationPending { root, processed_records } =>
+                        MetadataBackendError::StoragePreparationPending { root, processed_records },
+                    other => error(other),
+                })
+            });
+            (result, actual_opens)
+        };
+        let (positive, pending_opens) = open(true);
+        let positive = match positive {
+            Ok(mut client) => client.posix_stat("/")
+                .map(|stat| stat.file_system_id).map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let (terminal, terminal_opens) = open(false);
+        let terminal_error = terminal.err().map(|error| error.to_string());
+        std::fs::write(native.data_dir(node).root().join("boundary-diagnostic-client-preparation-control.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "positive": positive, "pending_actual_opens": pending_opens,
+                "terminal_error": terminal_error, "terminal_actual_opens": terminal_opens,
+                "qualification": "Negative-only consumer-boundary injection after genuine registered native opens. Complements actual source-writer-release and typed-error controls; does not reproduce historical provider contention."
+            })).unwrap()).unwrap();
+        native.close().unwrap();
+        assert_eq!(positive.unwrap(), sinomo_dfs::sifs_file_system_id());
+        assert_eq!(pending_opens, 2, "Pending must reopen through the actual native owner");
+        assert!(terminal_error.unwrap().contains("controlled native preparation failure"));
+        assert_eq!(terminal_opens, 1, "an unrelated error must not turn into another open");
+    }
+
+    #[test]
     fn native_legacy3_users_receiver_checkpoint_after_missed_peer_stage() {
         native_legacy3_users_receiver_checkpoint_case(true);
     }
