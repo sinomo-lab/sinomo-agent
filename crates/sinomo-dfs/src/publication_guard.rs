@@ -458,6 +458,7 @@ pub(crate) struct NativeContentOnlyRepairAdmission {
     projection_generation: u64,
     authority_generation: u64,
     content_identity: crate::content_store::ReceivedRepairFixtureIdentity,
+    immutable_policy: crate::DfsReplicationPolicy,
 }
 
 impl NativeContentOnlyRepairAdmission {
@@ -466,7 +467,7 @@ impl NativeContentOnlyRepairAdmission {
         self.provider.validate_content_only_repair_owner(&self.execution, &self.owner)?;
         let content_identity = self.provider.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
         if content_identity != self.content_identity { return Err(crate::DfsError::Metadata { message: "native content-only Repair physical content expectation changed".into() }); }
-        let (shard, filesystem, projection_generation) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver)?;
+        let (shard, filesystem, projection_generation) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver, &self.immutable_policy)?;
         if shard != self.shard || filesystem != self.filesystem || projection_generation != self.projection_generation
             || self.provider.authority.generation() != self.authority_generation {
             return Err(crate::DfsError::Metadata { message: "native content-only Repair configuration advanced".into() });
@@ -490,6 +491,14 @@ impl NativeContentOnlyRepairAdmission {
     pub(crate) fn check_content_store(&self, store: &crate::LocalContentStore) -> std::result::Result<(), crate::ContentStoreError> {
         self.content_identity.check_original_store_identity(store)
     }
+
+    pub(crate) fn check_intent(&self, intent: Option<&crate::DfsWriteIntentRecord>) -> std::result::Result<(), crate::DfsError> {
+        let current = crate::service_repair::checked_selected_original_intent(&self.material, &self.receiver, intent)?;
+        if current.policy != self.immutable_policy {
+            return Err(crate::DfsError::Metadata { message: "selected original Repair immutable intent policy changed".into() });
+        }
+        Ok(())
+    }
 }
 
 impl DfsPublicationExecutionProvider {
@@ -512,8 +521,9 @@ impl DfsPublicationExecutionProvider {
         Ok(())
     }
 
-    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, u64), crate::DfsError> {
+    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, immutable_policy: &crate::DfsReplicationPolicy) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, u64), crate::DfsError> {
         material.validate()?;
+        crate::service_repair::ensure_repair_content_not_forbidden(receiver, immutable_policy, "selected receiver")?;
         let command = &material.original.command;
         let error = || crate::DfsError::Metadata { message: "content-only Repair has no exact current nonauthoring native configuration".into() };
         // This is the existing observed-consensus-floor check, with no new KV
@@ -522,6 +532,7 @@ impl DfsPublicationExecutionProvider {
         let key = crate::file_system_config_key(&command.file_system_id);
         let filesystem = view.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key))
             .ok_or_else(error)?.decode::<crate::DfsFileSystemConfig>()?;
+        crate::service_repair::ensure_repair_content_hard_prohibitions(receiver, object, immutable_policy, &filesystem, "selected receiver")?;
         let shards = view.entries(&crate::metadata_shards_prefix(&command.file_system_id)).ok_or_else(error)?
             .iter().map(|entry| entry.decode::<crate::DfsMetadataShardConfig>()).collect::<std::result::Result<Vec<_>, _>>()?;
         let shard = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &shards, &object.path)?
@@ -544,12 +555,14 @@ impl DfsPublicationExecutionProvider {
         Ok((shard, filesystem, generation))
     }
 
-    pub(crate) fn admit_content_only_original_repair(self: &Arc<Self>, execution: Arc<DfsPublicationExecutionOwners>, owner: DfsPublicationOwnerScope, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId) -> std::result::Result<NativeContentOnlyRepairAdmission, crate::DfsError> {
+    pub(crate) fn admit_content_only_original_repair(self: &Arc<Self>, execution: Arc<DfsPublicationExecutionOwners>, owner: DfsPublicationOwnerScope, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, intent: &crate::DfsWriteIntentRecord) -> std::result::Result<NativeContentOnlyRepairAdmission, crate::DfsError> {
+        let intent = crate::service_repair::checked_selected_original_intent(material, receiver, Some(intent))?;
+        crate::service_repair::ensure_repair_content_not_forbidden(receiver, &intent.policy, "selected receiver")?;
         self.validate_content_only_repair_owner(&execution, &owner)?;
         let authority_generation = self.authority.generation();
         let content_identity = self.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
-        let (shard, filesystem, projection_generation) = self.content_only_repair_configuration(material, object, receiver)?;
-        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), projection_generation, authority_generation, content_identity };
+        let (shard, filesystem, projection_generation) = self.content_only_repair_configuration(material, object, receiver, &intent.policy)?;
+        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), projection_generation, authority_generation, content_identity, immutable_policy: intent.policy.clone() };
         admission.revalidate(material)?;
         Ok(admission)
     }

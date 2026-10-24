@@ -66,6 +66,97 @@ impl AppliedOriginalRepair {
 /// Prohibition-only preflight for the disabled DATA join. Inputs are not an
 /// authority certificate, a complete residency proof, W/N admission or a
 /// serialization boundary between a policy change and a content-root write.
+pub(crate) fn ensure_repair_content_not_forbidden(
+    executor: &NodeId,
+    immutable_policy: &DfsReplicationPolicy,
+    actor: &'static str,
+) -> Result<(), DfsError> {
+    if immutable_policy.forbidden_node_ids.contains(executor) {
+        return Err(DfsError::InvalidReplicationPolicy {
+            message: format!("immutable Repair intent forbids {actor} retention on this node"),
+        });
+    }
+    Ok(())
+}
+
+/// Pure hard prohibitions shared by disabled custody and the selected native
+/// receiver. A desired/required set is not an exclusive retainer allowlist.
+/// `actor` changes diagnostics only, never policy or authority.
+pub(crate) fn ensure_repair_content_hard_prohibitions(
+    executor: &NodeId,
+    object: &DfsObjectMetadata,
+    immutable_policy: &DfsReplicationPolicy,
+    config: &DfsFileSystemConfig,
+    actor: &'static str,
+) -> Result<(), DfsError> {
+    ensure_repair_content_not_forbidden(executor, immutable_policy, actor)?;
+    if config.file_system_id != object.file_system_id {
+        return Err(DfsError::Metadata {
+            message: format!("{actor} retention policy names another filesystem"),
+        });
+    }
+    let resolved = crate::placement::resolve_placement_policy(
+        config, &object.path, object.policy.clone(), immutable_policy.desired_replicas,
+    )?;
+    if resolved.policy.forbidden_node_ids.contains(executor) {
+        return Err(DfsError::InvalidReplicationPolicy {
+            message: format!("current path policy forbids {actor} retention on this node"),
+        });
+    }
+    if (object.policy == sinomo_core::DfsObjectPolicy::LocalOwned
+        || resolved.policy.consistency == sinomo_core::DfsObjectPolicy::LocalOwned)
+        && &object.owner_node_id != executor
+    {
+        return Err(DfsError::InvalidReplicationPolicy {
+            message: format!("local-owned content cannot be retained by a different {actor}"),
+        });
+    }
+    Ok(())
+}
+
+/// Exact current background Repair intent. The returned record is DATA from
+/// this caller's existing indexed backend read, never an authority capability.
+pub(crate) fn checked_selected_original_intent<'a>(
+    material: &DfsOriginalRepairMaterial,
+    receiver: &NodeId,
+    intent: Option<&'a DfsWriteIntentRecord>,
+) -> Result<&'a DfsWriteIntentRecord, DfsError> {
+    let intent = intent.ok_or_else(|| DfsError::Metadata {
+        message: "selected original Repair has no exact current native intent".into(),
+    })?;
+    let command = &material.original.command;
+    if intent.intent_id != command.intent_id
+        || intent.file_system_id != command.file_system_id
+        || intent.object_id != command.object_id
+        || intent.base_version != command.expected_base_version
+        || intent.target_version != command.version
+        || intent.content_hash.as_deref() != Some(command.content_hash.as_str())
+        || !intent.publication.is_current()
+        || intent.status != DfsWriteIntentStatus::Committed
+        || !intent.desired_replica_node_ids.contains(receiver)
+    {
+        return Err(DfsError::Metadata {
+            message: "selected original Repair current intent tuple, publication or target differs".into(),
+        });
+    }
+    // Current canonical metadata or a path override cannot erase an immutable
+    // LocalOwned restriction recorded in either original provenance body.
+    for (source, metadata) in [
+        ("original command", command.object_metadata.as_ref()),
+        ("actual intent", intent.object_metadata.as_ref()),
+    ] {
+        if let Some(metadata) = metadata {
+            if metadata.file_system_id != command.file_system_id || metadata.object_id != command.object_id {
+                return Err(DfsError::Metadata { message: format!("selected original Repair {source} metadata scope differs") });
+            }
+            if metadata.policy == sinomo_core::DfsObjectPolicy::LocalOwned && &metadata.owner_node_id != receiver {
+                return Err(DfsError::InvalidReplicationPolicy { message: format!("immutable {source} local-owned content cannot be retained by another selected receiver") });
+            }
+        }
+    }
+    Ok(intent)
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn associate_disabled_imported_executor_with_hard_prohibitions(
     executor: &NodeId,
@@ -79,42 +170,13 @@ pub(crate) fn associate_disabled_imported_executor_with_hard_prohibitions(
 ) -> Result<crate::repair_queue_store::ImportedRepairExecutorAssociation, DfsError> {
     // A later path override cannot erase an immutable intent prohibition. Do
     // this before even borrowing current configuration or opening B content.
-    if immutable_policy.forbidden_node_ids.contains(executor) {
-        return Err(DfsError::InvalidReplicationPolicy {
-            message: "immutable Repair intent forbids disabled executor retention on this node"
-                .into(),
-        });
-    }
+    ensure_repair_content_not_forbidden(executor, immutable_policy, "disabled executor")?;
     let config = retained_configuration()?.ok_or_else(|| DfsError::Metadata {
         message: "disabled executor retention has no retained exact-filesystem policy".into(),
     })?;
     // The exact-key accessor decodes the value; it does not validate this
     // embedded identity. Never resolve another filesystem's rule over this path.
-    if config.file_system_id != object.file_system_id {
-        return Err(DfsError::Metadata {
-            message: "disabled executor retention policy names another filesystem".into(),
-        });
-    }
-    let resolved = crate::placement::resolve_placement_policy(
-        &config,
-        &object.path,
-        object.policy.clone(),
-        immutable_policy.desired_replicas,
-    )?;
-    if resolved.policy.forbidden_node_ids.contains(executor) {
-        return Err(DfsError::InvalidReplicationPolicy {
-            message: "current path policy forbids disabled executor retention on this node".into(),
-        });
-    }
-    if (object.policy == sinomo_core::DfsObjectPolicy::LocalOwned
-        || resolved.policy.consistency == sinomo_core::DfsObjectPolicy::LocalOwned)
-        && &object.owner_node_id != executor
-    {
-        return Err(DfsError::InvalidReplicationPolicy {
-            message: "local-owned content cannot be retained by a different disabled executor"
-                .into(),
-        });
-    }
+    ensure_repair_content_hard_prohibitions(executor, object, immutable_policy, &config, "disabled executor")?;
     // Required nodes, counts and zones are deliberately not evaluated as an
     // allowlist or an N-target plan. This is an extra effect-body hold only.
     retain()
@@ -1702,11 +1764,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let backend = self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair requires its actual native backend".into() })?;
         let object = backend.get_object(&command.object_id)?.ok_or_else(|| DfsError::UnknownObject { object_id: command.object_id.clone() })?;
         ensure_selected_original_exact_current_content(&object.version, object.content_hash.as_deref(), command)?;
+        let intent = backend.get_intent(&command.object_id, &command.intent_id)?;
+        let intent = checked_selected_original_intent(material, &self.node_id, intent.as_ref())?;
         let stamp = command.authority_shard.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair original has no authority stamp".into() })?;
         let owner = backend.publication_owner_scope(&command.file_system_id, &DfsMetadataShardId::new(stamp.shard_id.clone()))?;
         let execution = self.publication_execution.current().ok_or_else(|| DfsError::Metadata { message: "selected Repair has no actual native mutation admission".into() })?;
         let provider = self.publication_provider.current().ok_or_else(|| DfsError::Metadata { message: "selected Repair has no current native publication provider".into() })?;
-        let admission = provider.admit_content_only_original_repair(execution, owner, material, &object, &self.node_id)?;
+        let admission = provider.admit_content_only_original_repair(execution, owner, material, &object, &self.node_id, intent)?;
         // These existing checks are read-only. In particular, the ordinary
         // potentially authoring object/helper and metadata-cache path are NOT
         // called anywhere in this selected branch.
@@ -1724,6 +1788,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let object = self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair lost its actual native backend".into() })?
             .get_object(&command.object_id)?.ok_or_else(|| DfsError::UnknownObject { object_id: command.object_id.clone() })?;
         ensure_selected_original_exact_current_content(&object.version, object.content_hash.as_deref(), command)?;
+        let current_intent = self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair lost its actual native backend".into() })?
+            .get_intent(&command.object_id, &command.intent_id)?;
+        admission.check_intent(current_intent.as_ref())?;
         // Explicitly local cache only. Never call add_file_system,
         // add_object_metadata, put_metadata_receipt, or a V7 publication helper.
         if !self.metadata.filesystems.contains_key(&object.file_system_id) {
@@ -6081,6 +6148,197 @@ mod received_repair_content_tests {
         DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY, cluster_capability_policy_key,
         cluster_member_key,
     };
+
+    // Real file-backed original/body inputs; policy and intent VALUES below
+    // exercise pure validation, not a native committed authority certificate.
+    fn selected_hard_policy_inputs(root: &std::path::Path) -> (
+        crate::repair_queue_store::LocalDfsRepairQueueStore,
+        DfsOriginalRepairMaterial, DfsObjectMetadata, DfsWriteIntentRecord, DfsFileSystemConfig,
+    ) {
+        selected_hard_policy_inputs_with_original_policy(root, DfsObjectPolicy::ReplicatedEventual)
+    }
+
+    fn selected_hard_policy_inputs_with_original_policy(root: &std::path::Path, original_policy: DfsObjectPolicy) -> (
+        crate::repair_queue_store::LocalDfsRepairQueueStore,
+        DfsOriginalRepairMaterial, DfsObjectMetadata, DfsWriteIntentRecord, DfsFileSystemConfig,
+    ) {
+        let source_root = root.join("source");
+        let (queue, _layout) = crate::repair_queue_store::LocalDfsRepairQueueStore::new_selected_original_fixture(&source_root).unwrap();
+        let incarnation = queue.custody_incarnation().unwrap();
+        let content = LocalContentStore::new(source_root.join("content")).unwrap();
+        let producer = NodeId::from_legacy_named("custody-producer").unwrap();
+        let target = NodeId::from_legacy_named("custody-receiver").unwrap();
+        let object_id = DfsObjectId::from_legacy_named("custody-object").unwrap();
+        let version = DfsVersion::from_legacy_named("custody-version").unwrap();
+        let manifest = content.put_object_version(object_id.as_str(), version.as_str(), b"complete original attachment").unwrap();
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(), file_system_id: crate::sifs_file_system_id(),
+            path: "/hard-policy/object.bin".into(), kind: DfsObjectKind::File, tombstone_provenance: None,
+            owner_node_id: producer.clone(), current_locations: vec![producer.clone()],
+            content_hash: Some(manifest.content_hash.clone()), content_size_bytes: Some(manifest.size_bytes),
+            link_target_object_id: None, mode: 0o644, uid: 0, gid: 0,
+            accessed_at_unix_nanos: 0, modified_at_unix_nanos: 0, created_at_unix_nanos: 0, changed_at_unix_nanos: 0,
+            version: version.clone(), policy: original_policy,
+            created_by_event_id: None, last_modified_by_event_id: None,
+        };
+        // Fix the complete head BEFORE the first content root/enrollment.
+        // No existing original body/digest or uncertain effect is rewritten.
+        let message = DfsRoutedMessage { source_node_id: producer.clone(), target_node_id: target.clone(), frame_id: 11, message_id: 12,
+            message: DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                request_id: "original-request".into(), background_repair: true, intent_id: "original-intent".into(),
+                file_system_id: object.file_system_id.clone(), object_id: object_id.clone(), expected_base_version: None,
+                version: version.clone(), content_hash: manifest.content_hash.clone(), bytes: Vec::new(), object_metadata: Some(object.clone()),
+                authority_shard: Some(DfsMetadataShardConfig { file_system_id: object.file_system_id.clone(), shard_id: "root".into(), primary_node_id: producer,
+                    replica_node_ids: vec![target], epoch: 7, assignment: DfsMetadataShardAssignment::Root, default_policy: DfsObjectPolicy::ReplicatedEventual }),
+            }) };
+        let descriptor = DfsRpcAttachmentDescriptor { total_size_bytes: manifest.size_bytes, content_hash: Some(manifest.content_hash.clone()) };
+        let retained = content.capture_repair_payload(
+            crate::repair_queue_store::repair_subject(&incarnation, &message).unwrap(),
+            crate::repair_queue_store::original_repair_digest(&message, &descriptor).unwrap(),
+            object_id.as_str(), version.as_str(), &manifest.content_hash, manifest.size_bytes,
+        ).unwrap();
+        queue.enroll_original_repair(&message, &descriptor, &retained).unwrap();
+        let material = queue.original_repair(&message).unwrap().unwrap().original_wire_material().unwrap();
+        let command = &material.original.command;
+        let policy = DfsReplicationPolicy::new(1, 2).unwrap().with_placement_constraints(
+            vec![material.original.source_node_id.clone(), material.original.target_node_id.clone()], Vec::new(), 0, BTreeMap::new(),
+        ).unwrap();
+        let intent = DfsWriteIntentRecord {
+            publication: DfsWritePublication::Current, intent_id: command.intent_id.clone(), file_system_id: command.file_system_id.clone(),
+            object_id: command.object_id.clone(), base_version: command.expected_base_version.clone(), target_version: command.version.clone(),
+            coordinator_node_id: material.original.source_node_id.clone(), operation_id: None, operation_order_token: None,
+            owner_epoch: command.authority_shard.as_ref().unwrap().epoch,
+            desired_replica_node_ids: vec![material.original.source_node_id.clone(), material.original.target_node_id.clone()],
+            policy, status: DfsWriteIntentStatus::Committed, content_hash: Some(command.content_hash.clone()), object_metadata: Some(object.clone()),
+            touch_parent_on_create: false, create_predecessor_object_id: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH, updated_at: None,
+        };
+        let config = DfsFileSystemConfig::from(&DfsFileSystem::sifs(material.original.source_node_id.clone()));
+        (queue, material, object, intent, config)
+    }
+
+    #[test]
+    fn repair_hard_policy_required_peers_and_self_only_rule_are_not_exclusive() {
+        let root = sinomo_testdir::TestDir::new("repair-hard-policy-allowed-retainer");
+        let (queue, material, object, intent, mut config) = selected_hard_policy_inputs(root.path());
+        let other = NodeId::from_legacy_named("another-policy-retainer").unwrap();
+        let mut unrelated = crate::DfsSubtreePolicy::new("/hard-policy", DfsObjectPolicy::LocalOwned, 1, 1);
+        unrelated.scope = crate::DfsPlacementScope::SelfOnly;
+        unrelated.forbidden_node_ids.push(other.clone());
+        config.subtree_policies.push(unrelated);
+        let before = (queue.view().unwrap(), intent.clone(), config.clone(), material.clone());
+        ensure_repair_content_hard_prohibitions(&other, &object, &intent.policy, &config, "selected receiver").unwrap();
+        ensure_repair_content_hard_prohibitions(&material.original.target_node_id, &object, &intent.policy, &config, "selected receiver").unwrap();
+        assert_eq!(queue.view().unwrap(), before.0);
+        assert_eq!(intent, before.1);
+        assert_eq!(config, before.2);
+        assert_eq!(material, before.3);
+    }
+
+    #[test]
+    fn repair_hard_policy_rejects_original_current_and_local_owned_prohibitions() {
+        let root = sinomo_testdir::TestDir::new("repair-hard-policy-denied-retainer");
+        let (queue, material, object, intent, config) = selected_hard_policy_inputs(root.path());
+        let receiver = &material.original.target_node_id;
+        for arm in ["immutable", "current", "object-local", "path-local", "foreign-fs"] {
+            let mut object = object.clone(); let mut policy = intent.policy.clone(); let mut config = config.clone();
+            let reason = match arm {
+                "immutable" => {
+                    policy = DfsReplicationPolicy::new(1, 2).unwrap().with_placement_constraints(
+                        vec![material.original.source_node_id.clone()], vec![receiver.clone()], 0, BTreeMap::new(),
+                    ).unwrap();
+                    "immutable Repair intent forbids"
+                }
+                "current" => {
+                    let mut rule = crate::DfsSubtreePolicy::new("/hard-policy", DfsObjectPolicy::ReplicatedEventual, 1, 2);
+                    rule.forbidden_node_ids.push(receiver.clone()); config.subtree_policies.push(rule);
+                    "current path policy forbids"
+                }
+                "object-local" => { object.policy = DfsObjectPolicy::LocalOwned; "local-owned content" }
+                "path-local" => {
+                    config.subtree_policies.push(crate::DfsSubtreePolicy::new("/hard-policy", DfsObjectPolicy::LocalOwned, 1, 1));
+                    "local-owned content"
+                }
+                "foreign-fs" => { config.file_system_id = DfsFileSystemId::from_legacy_named("other-policy-filesystem").unwrap(); "another filesystem" }
+                _ => unreachable!(),
+            };
+            let before = queue.view().unwrap();
+            let error = ensure_repair_content_hard_prohibitions(receiver, &object, &policy, &config, "selected receiver").unwrap_err();
+            assert!(error.to_string().contains(reason), "{arm}: {error}");
+            assert_eq!(queue.view().unwrap(), before);
+            assert_eq!(queue.original_repair(&material.original.routed()).unwrap().unwrap().original_wire_material().unwrap(), material);
+        }
+        let mut owned = object.clone(); owned.policy = DfsObjectPolicy::LocalOwned; owned.owner_node_id = receiver.clone();
+        ensure_repair_content_hard_prohibitions(receiver, &owned, &intent.policy, &config, "selected receiver").unwrap();
+    }
+
+    #[test]
+    fn selected_original_intent_requires_exact_current_committed_target_tuple() {
+        let root = sinomo_testdir::TestDir::new("selected-repair-exact-intent");
+        let (queue, material, _object, intent, _config) = selected_hard_policy_inputs(root.path());
+        let receiver = &material.original.target_node_id;
+        assert_eq!(checked_selected_original_intent(&material, receiver, Some(&intent)).unwrap(), &intent);
+        assert!(checked_selected_original_intent(&material, receiver, None).is_err());
+        for arm in ["intent", "filesystem", "object", "base", "version", "hash", "missing-hash", "retained", "staging", "target", "metadata-fs", "metadata-object"] {
+            let mut changed = intent.clone();
+            match arm {
+                "intent" => changed.intent_id.push_str("-other"),
+                "filesystem" => changed.file_system_id = DfsFileSystemId::from_legacy_named("other-intent-fs").unwrap(),
+                "object" => changed.object_id = DfsObjectId::from_legacy_named("other-intent-object").unwrap(),
+                "base" => changed.base_version = Some(DfsVersion::from_legacy_named("other-intent-base").unwrap()),
+                "version" => changed.target_version = DfsVersion::from_legacy_named("other-intent-version").unwrap(),
+                "hash" => changed.content_hash = Some(crate::content_hash(b"other intent bytes")),
+                "missing-hash" => changed.content_hash = None,
+                "retained" => changed.publication = DfsWritePublication::RetainedRepair,
+                "staging" => changed.status = DfsWriteIntentStatus::Staging,
+                "target" => changed.desired_replica_node_ids.retain(|node| node != receiver),
+                "metadata-fs" => changed.object_metadata.as_mut().unwrap().file_system_id = DfsFileSystemId::from_legacy_named("foreign-provenance-fs").unwrap(),
+                "metadata-object" => changed.object_metadata.as_mut().unwrap().object_id = DfsObjectId::from_legacy_named("foreign-provenance-object").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(checked_selected_original_intent(&material, receiver, Some(&changed)).is_err(), "{arm}");
+        }
+        assert_eq!(queue.original_repair(&material.original.routed()).unwrap().unwrap().original_wire_material().unwrap(), material);
+    }
+
+    #[test]
+    fn selected_original_preserves_local_owned_provenance_despite_current_replication_policy() {
+        let root = sinomo_testdir::TestDir::new("selected-repair-immutable-local-owned");
+        for arm in ["original-command", "actual-intent"] {
+            let case = root.join(arm); std::fs::create_dir_all(&case).unwrap();
+            let (queue, material, mut current, mut intent, config) = selected_hard_policy_inputs_with_original_policy(&case,
+                if arm == "original-command" { DfsObjectPolicy::LocalOwned } else { DfsObjectPolicy::ReplicatedEventual });
+            let receiver = &material.original.target_node_id;
+            let original = queue.original_repair(&material.original.routed()).unwrap().unwrap();
+            material.validate().unwrap();
+            current.policy = DfsObjectPolicy::ReplicatedEventual;
+            if arm == "original-command" { intent.object_metadata = Some(current.clone()); }
+            else { intent.object_metadata.as_mut().unwrap().policy = DfsObjectPolicy::LocalOwned; }
+            // Current policy alone would admit C. Neither immutable body may
+            // lose its LocalOwned owner restriction through that later view.
+            ensure_repair_content_hard_prohibitions(receiver, &current, &intent.policy, &config, "selected receiver").unwrap();
+            let error = checked_selected_original_intent(&material, receiver, Some(&intent)).unwrap_err();
+            assert!(error.to_string().contains(if arm == "original-command" { "immutable original command local-owned" } else { "immutable actual intent local-owned" }), "{error}");
+            assert_eq!(queue.original_repair(&material.original.routed()).unwrap(), Some(original));
+        }
+        let allowed_case = root.join("local-owner-is-receiver"); std::fs::create_dir_all(&allowed_case).unwrap();
+        let (_queue, material, _current, mut intent, _config) = selected_hard_policy_inputs(&allowed_case);
+        let receiver = &material.original.target_node_id;
+        intent.object_metadata.as_mut().unwrap().policy = DfsObjectPolicy::LocalOwned;
+        intent.object_metadata.as_mut().unwrap().owner_node_id = receiver.clone();
+        checked_selected_original_intent(&material, receiver, Some(&intent)).unwrap();
+    }
+
+    #[test]
+    fn selected_original_intent_keeps_write_coordinator_and_epoch_distinct_from_repair_authority() {
+        let root = sinomo_testdir::TestDir::new("selected-repair-intent-prior-coordinator");
+        let (_queue, material, _object, mut intent, _config) = selected_hard_policy_inputs(root.path());
+        intent.coordinator_node_id = NodeId::from_legacy_named("prior-write-coordinator").unwrap();
+        intent.owner_epoch = intent.owner_epoch.checked_sub(1).unwrap();
+        checked_selected_original_intent(&material, &material.original.target_node_id, Some(&intent)).unwrap();
+        // Native admission still separately requires the actual current A
+        // primary/epoch and C owner. These values grant no such permission.
+    }
 
     #[test]
     fn selected_original_rejects_older_target_even_when_current_hash_matches() {
