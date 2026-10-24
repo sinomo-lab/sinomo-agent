@@ -929,6 +929,30 @@ mod tests {
     }
 
     #[test]
+    fn contended_capture_accounts_for_dropped_event_without_blocking_producer() {
+        let _serial = serial_capture_test();
+        ensure_capture_stopped();
+        start_network_timeline_capture(2).expect("bounded capture");
+        {
+            let storage = CAPTURE.get().expect("actual capture storage");
+            let held = storage.lock().expect("hold actual recorder boundary");
+            let count = held.as_ref().unwrap().events.len();
+            let dropped = CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed);
+            record_network_timeline_event_now(test_event(20));
+            assert_eq!(
+                held.as_ref().unwrap().events.len(),
+                count,
+                "a contended recorder must not fabricate stored evidence"
+            );
+            assert!(
+                CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed) > dropped,
+                "the nonblocking omission must be accounted"
+            );
+        }
+        stop_network_timeline_capture().expect("release capture");
+    }
+
+    #[test]
     fn disabled_recording_does_not_initialize_or_mutate_capture() {
         let _serial = serial_capture_test();
         ensure_capture_stopped();

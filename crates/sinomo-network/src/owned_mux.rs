@@ -2570,6 +2570,57 @@ mod tests {
 
     #[tokio::test]
     async fn owned_mux_timeline_disabled_and_overflow_do_not_change_delivery_or_cancellation() {
+        const CASE: &str = "owned_mux::tests::owned_mux_timeline_disabled_and_overflow_do_not_change_delivery_or_cancellation";
+        const CHILD: &str = "SINOMO_NETWORK_TIMELINE_ISOLATED_CASE";
+        if std::env::var(CHILD).as_deref() != Ok(CASE) {
+            // The timeline is process-global and deliberately drops events on
+            // recorder contention. The capture-control mutex excludes other
+            // capture owners, not ordinary network producers in sibling tests.
+            // Exact ring counts require an owned process; keep all original
+            // delivery/cancellation assertions and normal test workers there.
+            let evidence = sinomo_testdir::TestDir::new("network-timeline-owned-process");
+            let result =
+                std::process::Command::new(std::env::current_exe().expect("libtest executable"))
+                    .args(["--exact", CASE, "--nocapture"])
+                    .env(CHILD, CASE)
+                    .output()
+                    .expect("run isolated timeline fixture");
+            std::fs::write(
+                evidence.join("boundary-diagnostic-timeline-child.stdout"),
+                &result.stdout,
+            )
+            .expect("retain child output");
+            std::fs::write(
+                evidence.join("boundary-diagnostic-timeline-child.stderr"),
+                &result.stderr,
+            )
+            .expect("retain child error output");
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success(),
+                "isolated timeline fixture failed: {}; raw evidence: {}",
+                result.status,
+                evidence.display()
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("test {CASE} ... ok")),
+                "the exact child test must actually execute; evidence: {}",
+                evidence.display()
+            );
+            assert_eq!(
+                stdout
+                    .lines()
+                    .filter(
+                        |line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    )
+                    .count(),
+                1,
+                "zero selection or an ignored child is not a pass"
+            );
+            return;
+        }
         let _serial = crate::timeline::network_timeline_test_capture_guard();
         let _ = crate::timeline::stop_network_timeline_capture();
         let connection = 0x4d55_5803;
