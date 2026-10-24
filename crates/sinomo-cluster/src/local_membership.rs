@@ -315,13 +315,7 @@ pub fn upsert_daemon_member(
         .find(|member| member.node_id == replacement.node_id)
     {
         let mut next_endpoints = member.endpoints.clone();
-        if endpoints
-            .iter()
-            .any(daemon_tcp_endpoint_is_listener_advertisement)
-        {
-            next_endpoints
-                .retain(|endpoint| !daemon_tcp_endpoint_is_listener_advertisement(endpoint));
-        }
+        remove_superseded_daemon_listeners(&mut next_endpoints, &endpoints);
         for endpoint in endpoints {
             next_endpoints.retain(|candidate| candidate.endpoint_id != endpoint.endpoint_id);
             next_endpoints.push(endpoint);
@@ -357,6 +351,20 @@ pub fn upsert_daemon_member(
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         state.members.push(member);
         true
+    }
+}
+
+/// Remove only retired TCP listener advertisements when their local owner has
+/// supplied listener observations. Non-listener merging belongs to the caller.
+pub(crate) fn remove_superseded_daemon_listeners(
+    existing: &mut Vec<ClusterEndpointRecord>,
+    observed: &[ClusterEndpointRecord],
+) {
+    if observed
+        .iter()
+        .any(daemon_tcp_endpoint_is_listener_advertisement)
+    {
+        existing.retain(|endpoint| !daemon_tcp_endpoint_is_listener_advertisement(endpoint));
     }
 }
 

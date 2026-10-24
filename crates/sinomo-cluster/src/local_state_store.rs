@@ -9,7 +9,7 @@ use crate::kv_local_store::{
 use crate::kv_read_model::read_cluster_members_from_kv;
 use crate::local_membership::{
     locally_learned_remote_route_endpoints, merge_cluster_join_registration,
-    preserve_locally_learned_remote_route_endpoints,
+    preserve_locally_learned_remote_route_endpoints, remove_superseded_daemon_listeners,
 };
 use crate::member_store::merge_member_record;
 use fs2::FileExt;
@@ -243,14 +243,22 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         state.members = kv_members;
         preserve_locally_learned_remote_route_endpoints(&mut state, local_remote_route_endpoints);
         for local_member in local_process_members {
-            if let Some(mut kv_member) = state
+            if let Some(kv_member) = state
                 .members
                 .iter()
                 .find(|member| member.node_id == local_member.node_id)
                 .cloned()
             {
                 let mut local_member = local_member;
-                for endpoint in kv_member.endpoints.drain(..) {
+                // The local owner already replaced its listener advertisements.
+                // Reuse that same merge when overlaying an older KV projection,
+                // so a later caller cannot persist retired local addresses again.
+                let mut published_endpoints = kv_member.endpoints;
+                remove_superseded_daemon_listeners(
+                    &mut published_endpoints,
+                    &local_member.endpoints,
+                );
+                for endpoint in published_endpoints {
                     upsert_member_endpoint(&mut local_member, endpoint);
                 }
                 cleanup_member_endpoint_duplicates(&mut local_member);
@@ -801,6 +809,144 @@ mod tests {
             .members
             .sort_by(|left, right| left.node_id.cmp(&right.node_id));
         node_id
+    }
+
+    fn observed_listener(node: &NodeId, address: &str) -> sinomo_base::ClusterEndpointRecord {
+        sinomo_base::ClusterEndpointRecord {
+            endpoint_id: sinomo_base::Id::from_legacy_named(format!("listener_{node}_{address}"))
+                .expect("listener identity"),
+            node_id: node.clone(),
+            transport: sinomo_base::ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: sinomo_base::ClusterEndpointSource::Observed,
+            privacy: sinomo_base::ClusterEndpointPrivacy::Lan,
+            priority: 25,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn local_listener_replacement_survives_stale_kv_member_overlay_and_persistence() {
+        let root = sinomo_testdir::TestDir::new("local-listener-stale-overlay");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let mut local = test_state("local_listener_stale_overlay");
+        let remote = add_learner(&mut local, "local_listener_remote");
+        let old = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        let current = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+        let remote_endpoint = observed_listener(&remote, "10.0.0.3:21353");
+        let mut published = local.clone();
+        published
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == local.local_node_id)
+            .expect("local member")
+            .endpoints = vec![old.clone()];
+        published
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == remote)
+            .expect("remote member")
+            .endpoints = vec![remote_endpoint.clone()];
+        write_cluster_state(&paths, &published).expect("bootstrap projection");
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &published)
+            .expect("seed the deliberately stale observational KV fixture");
+        local
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == local.local_node_id)
+            .expect("local member")
+            .endpoints = vec![current.clone()];
+        write_cluster_state(&paths, &local).expect("publish current local listener observation");
+        let merged = read_cluster_state(&paths).expect("read merged routing view");
+        let member = merged
+            .members
+            .iter()
+            .find(|m| m.node_id == local.local_node_id)
+            .unwrap();
+        assert_eq!(
+            member.endpoints,
+            vec![current.clone()],
+            "an old KV advertisement must not resurrect a retired local listener"
+        );
+        assert!(
+            merged
+                .members
+                .iter()
+                .find(|m| m.node_id == remote)
+                .unwrap()
+                .endpoints
+                .contains(&remote_endpoint),
+            "remote routing endpoints remain available"
+        );
+        write_cluster_state(&paths, &merged).expect("persist a caller's derived projection");
+        let reread = read_cluster_state(&paths).expect("read after persistence");
+        assert_eq!(
+            reread
+                .members
+                .iter()
+                .find(|m| m.node_id == local.local_node_id)
+                .unwrap()
+                .endpoints,
+            vec![current]
+        );
+        assert_eq!(reread.cluster_id, local.cluster_id);
+        assert_eq!(reread.local_node_id, local.local_node_id);
+        assert_eq!(reread.term, local.term);
+    }
+
+    #[test]
+    fn local_listener_overlay_retains_non_listener_published_routes() {
+        let root = sinomo_testdir::TestDir::new("local-listener-published-relay");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let mut local = test_state("local_listener_published_relay");
+        let listener = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+        let mut relay = observed_listener(&local.local_node_id, "relay-placeholder");
+        relay.address = "https://relay.invalid/node".to_string();
+        relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+        relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+        relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+        let mut published = local.clone();
+        published.members[0].endpoints.push(relay.clone());
+        write_cluster_state(&paths, &local).expect("bootstrap projection");
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &published)
+            .expect("seed published relay metadata without dialing it");
+        local.members[0].endpoints.push(listener.clone());
+        write_cluster_state(&paths, &local).expect("current local listener observation");
+        let view = read_cluster_state(&paths).expect("merged routing view");
+        let endpoints = &view
+            .members
+            .iter()
+            .find(|m| m.node_id == local.local_node_id)
+            .unwrap()
+            .endpoints;
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.contains(&listener));
+        assert!(endpoints.contains(&relay));
+    }
+
+    #[test]
+    fn local_member_without_listener_observation_keeps_published_endpoint() {
+        let root = sinomo_testdir::TestDir::new("local-listener-no-observation");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let local = test_state("local_listener_no_observation");
+        let endpoint = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        let mut published = local.clone();
+        published.members[0].endpoints.push(endpoint.clone());
+        write_cluster_state(&paths, &local).expect("bootstrap projection");
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &published)
+            .expect("seed the published observational KV fixture");
+        let read = read_cluster_state(&paths).expect("read routing view without local observation");
+        assert!(
+            read.members
+                .iter()
+                .find(|m| m.node_id == local.local_node_id)
+                .unwrap()
+                .endpoints
+                .contains(&endpoint)
+        );
     }
 
     #[test]
