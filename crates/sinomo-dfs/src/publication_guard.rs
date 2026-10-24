@@ -444,6 +444,91 @@ pub(crate) enum NativeRepairEffectManifest {
     ReceiverContentAndLocalCacheOnly,
 }
 
+/// One authenticated history REQUEST under the actual retained native owner.
+/// It grants no mutation execution and is never deserialized or stored idle.
+pub(crate) struct VerifiedOriginalRepairHistoryRead {
+    data_owner: Arc<DfsDataOwnerLock>,
+    authority: Arc<crate::DfsMetadataAuthorityRuntime>,
+    request: crate::DfsOriginalRepairHistoryRequest,
+    authority_generation: u64,
+    storage_generation: u64,
+    projection_generation: u64,
+    filesystem: crate::DfsFileSystemConfig,
+    content_identity: crate::content_store::ReceivedRepairFixtureIdentity,
+}
+
+impl VerifiedOriginalRepairHistoryRead {
+    pub(crate) fn capture(data_owner: Arc<DfsDataOwnerLock>, authority: Arc<crate::DfsMetadataAuthorityRuntime>,
+        requester: &sinomo_core::node::NodeId, receiver: &sinomo_core::node::NodeId,
+        request: &crate::DfsOriginalRepairHistoryRequest) -> std::result::Result<Self, crate::DfsError> {
+        request.validate()?;
+        if requester != &request.carrier.source || receiver != &request.carrier.target {
+            return Err(crate::DfsError::Metadata { message: "history request differs from authenticated native identities".into() });
+        }
+        let content_identity = data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
+        let (filesystem, projection_generation) = Self::configuration(&authority, request)?;
+        let proof = Self { data_owner, authority_generation: authority.generation(), storage_generation: authority.storage_generation(),
+            authority, request: request.clone(), projection_generation, filesystem, content_identity };
+        proof.revalidate(request)?;
+        Ok(proof)
+    }
+
+    fn configuration(authority: &Arc<crate::DfsMetadataAuthorityRuntime>, request: &crate::DfsOriginalRepairHistoryRequest)
+        -> std::result::Result<(crate::DfsFileSystemConfig, u64), crate::DfsError> {
+        Self::configuration_for_material(authority, &request.original_material, &request.current_assignment,
+            &request.carrier.source, &request.carrier.target)
+    }
+
+    fn configuration_for_material(authority: &Arc<crate::DfsMetadataAuthorityRuntime>, material: &crate::DfsOriginalRepairMaterial,
+        assignment: &crate::DfsMetadataShardConfig, requester: &sinomo_core::node::NodeId, receiver: &sinomo_core::node::NodeId)
+        -> std::result::Result<(crate::DfsFileSystemConfig, u64), crate::DfsError> {
+        let invalid = || crate::DfsError::Metadata { message: "history query has no exact current native read configuration".into() };
+        material.validate()?;
+        let command = &material.original.command;
+        if requester != &assignment.primary_node_id || requester == &material.original.source_node_id
+            || receiver != &material.original.target_node_id || !assignment.replica_node_ids.contains(receiver)
+        { return Err(invalid()); }
+        let head = command.object_metadata.as_ref().ok_or_else(invalid)?;
+        let view = authority.write_configuration_projection()?.ok_or_else(invalid)?;
+        let key = crate::file_system_config_key(&command.file_system_id);
+        let filesystem = view.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key))
+            .ok_or_else(invalid)?.decode::<crate::DfsFileSystemConfig>()?;
+        let shards = view.entries(&crate::metadata_shards_prefix(&command.file_system_id)).ok_or_else(invalid)?
+            .iter().map(|entry| entry.decode::<crate::DfsMetadataShardConfig>()).collect::<std::result::Result<Vec<_>, _>>()?;
+        let selected = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &shards, &head.path)?.ok_or_else(invalid)?;
+        if filesystem.file_system_id != command.file_system_id || head.file_system_id != command.file_system_id
+            || head.object_id != command.object_id || &selected != assignment
+            || &selected.primary_node_id != requester || !selected.replica_node_ids.contains(receiver)
+        { return Err(invalid()); }
+        let generation = authority.with_current_publication_configuration(&command.file_system_id, |generation, current_shards, current_fs| {
+            (current_fs.as_ref() == Some(&filesystem)
+                && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &current_shards, &head.path)
+                    .is_ok_and(|current| current.as_ref() == Some(&selected))).then_some(generation)
+        })?.flatten().ok_or_else(invalid)?;
+        Ok((filesystem, generation))
+    }
+
+    pub(crate) fn revalidate(&self, request: &crate::DfsOriginalRepairHistoryRequest) -> std::result::Result<(), crate::DfsError> {
+        let invalid = || crate::DfsError::Metadata { message: "history query native read/physical scope changed".into() };
+        if request != &self.request || self.authority.generation() != self.authority_generation
+            || self.authority.storage_generation() != self.storage_generation
+            || self.data_owner.selected_original_data_layout().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?.is_none()
+            || self.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })? != self.content_identity
+        { return Err(invalid()); }
+        self.content_identity.check_original_physical_identity()?;
+        let (filesystem, generation) = Self::configuration(&self.authority, request)?;
+        if filesystem != self.filesystem || generation != self.projection_generation { return Err(invalid()); }
+        Ok(())
+    }
+
+    pub(crate) fn check_content_store(&self, store: &crate::LocalContentStore) -> std::result::Result<(), crate::ContentStoreError> {
+        self.content_identity.check_original_store_identity(store)
+    }
+    pub(crate) fn check_content_owner(&self, store: &crate::LocalContentStore, incarnation: &str) -> std::result::Result<(), crate::ContentStoreError> {
+        self.content_identity.check_original_store(store, incarnation)
+    }
+}
+
 /// No serde/constructor outside this actual native owner. It holds the real
 /// mutation permit and provider only for the admitted synchronous operation.
 pub(crate) struct NativeContentOnlyRepairAdmission {
@@ -542,6 +627,16 @@ impl NativeContentOnlyRepairAdmission {
 }
 
 impl DfsPublicationExecutionProvider {
+    pub(crate) fn validate_original_history_installer(
+        &self, execution: &DfsPublicationExecutionOwners, scope: &DfsPublicationOwnerScope,
+        material: &crate::DfsOriginalRepairMaterial, assignment: &crate::DfsMetadataShardConfig,
+        requester: &sinomo_core::node::NodeId, receiver: &sinomo_core::node::NodeId,
+    ) -> std::result::Result<(), crate::DfsError> {
+        self.validate_content_only_repair_owner(execution, scope)?;
+        let _ = VerifiedOriginalRepairHistoryRead::configuration_for_material(&self.authority, material, assignment, requester, receiver)?;
+        Ok(())
+    }
+
     fn validate_content_only_repair_owner(&self, execution: &DfsPublicationExecutionOwners, owner: &DfsPublicationOwnerScope) -> std::result::Result<(), crate::DfsError> {
         let layout = self.data_owner.selected_original_data_layout().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
             .ok_or_else(|| crate::DfsError::Metadata { message: "selected content-only Repair has no checked actual native fixture owner".into() })?;

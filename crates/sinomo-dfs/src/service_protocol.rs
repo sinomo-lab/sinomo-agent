@@ -202,6 +202,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_message_label = dfs_network_message_trace_label(&message);
 
         match message {
+            DfsNetworkMessage::OriginalRepairHistoryRequest(_) | DfsNetworkMessage::OriginalRepairHistoryResponse(_) => {
+                return Err(DfsError::Metadata { message: "history messages require their exact native direct-call owner".into() });
+            }
             DfsNetworkMessage::StageBlob(command) => {
                 events.push(self.handle_stage_blob(source_node_id, command)?);
             }

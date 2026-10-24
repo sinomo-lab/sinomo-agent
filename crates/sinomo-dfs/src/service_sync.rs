@@ -5065,7 +5065,32 @@ mod native_selected_data_tests {
         receiver_foundation: bool,
         probe_wrong_source: bool,
     ) -> GenuineNativeOriginal {
+        genuine_native_original_with_receiver_modes(
+            name, forbid_promoted, receiver_foundation, probe_wrong_source, false,
+        )
+    }
+
+    fn genuine_native_original_with_receiver_cut(
+        name: &str,
+        forbid_promoted: bool,
+        receiver_foundation: bool,
+        prepared_only: bool,
+    ) -> GenuineNativeOriginal {
+        genuine_native_original_with_receiver_modes(
+            name, forbid_promoted, receiver_foundation, false, prepared_only,
+        )
+    }
+
+    fn genuine_native_original_with_receiver_modes(
+        name: &str,
+        forbid_promoted: bool,
+        receiver_foundation: bool,
+        probe_wrong_source: bool,
+        prepared_only: bool,
+    ) -> GenuineNativeOriginal {
         assert!(!probe_wrong_source || receiver_foundation);
+        assert!(!prepared_only || receiver_foundation);
+        assert!(!(probe_wrong_source && prepared_only), "native fixture modes are independent controls");
         let path = "/services/selected-original-data.bin";
         let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
         let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
@@ -5149,6 +5174,28 @@ mod native_selected_data_tests {
         )) as Box<dyn Send>);
         drop(context);
         let held_promoted = Some(Box::new(runtime.deny_background_replica_before_claim(&promoted).unwrap()) as Box<dyn Send>);
+        // The pending-history arm uses the EXISTING actual receiver cut after
+        // Prepared. It cannot fabricate a response, effect or Terminal.
+        let held_receiver = prepared_only.then(|| {
+            assert!(receiver_foundation);
+            let receiver = runtime.client(&holder).unwrap();
+            let content = receiver.content().clone();
+            drop(receiver);
+            let context = runtime.component_context(&holder).unwrap();
+            let window = Arc::clone(&claim_window);
+            crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(context.data_dir(), Arc::new(move |point, command, _| {
+                if matches!(point, crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. })
+                    && command.is_some_and(|command| matches!(&command.routed_message.message, DfsNetworkMessage::SelectedOriginalRepair(_))) {
+                    window.store(false, std::sync::atomic::Ordering::Release);
+                    content.arm_original_repair_after_prepared_test_cut()?;
+                }
+                Ok(())
+            }))
+        });
+        let held = match held_receiver {
+            Some(receiver) => Some(Box::new((held, receiver)) as Box<dyn Send>),
+            None => held,
+        };
         let capture = runtime.capture_checkpointed_background_repairs(&owner, 8).unwrap();
         let mut paused_dispatch = NativeRepairProbeDispatchGate(
             probe_wrong_source.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
@@ -5286,7 +5333,8 @@ mod native_selected_data_tests {
                             && queue.records_for_targets(&command.intent_id, std::slice::from_ref(&holder)).unwrap()
                                 .iter().any(|row| row.transfer_request_id.as_deref() == Some(command.request_id.as_str())
                                     && !row.in_flight && row.last_error.is_some()
-                                    && row.transfer_delivery_state == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied))
+                                    && (row.transfer_delivery_state == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+                                        || (prepared_only && row.transfer_delivery_state != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent))))
                     })
                 });
                 if let Some(birth) = found {
@@ -5301,7 +5349,25 @@ mod native_selected_data_tests {
                         // original validator, without persisting any observation.
                         checked.validate(&birth.root.subject.queue_incarnation).is_ok()
                     });
-                    if exact_lost_reply { break birth; }
+                    if prepared_only {
+                        let material = birth.original_wire_material().unwrap();
+                        if let Some(prepared) = runtime.client(&holder).unwrap().content().original_repair_test_snapshot(&material).unwrap() {
+                            assert!(prepared.bound_id.is_none() && prepared.terminal_id.is_none() && prepared.response.is_none());
+                            assert_eq!(prepared.bytes, vec![0x5a;4096]);
+                            assert!(!exact_lost_reply);
+                            let command = &material.original.command;
+                            let returned_cut = runtime.rpc_observations().iter().any(|call| call.source == owner && call.target == holder
+                                && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE && call.origin == RpcOrigin::RegisteredHost
+                                && call.phase == RpcPhase::EndedWithoutResponse
+                                && call.dfs_request_id.as_deref() == Some(command.request_id.as_str())
+                                && call.dfs_intent_id.as_deref() == Some(command.intent_id.as_str())
+                                && call.dfs_file_system_id.as_ref() == Some(&command.file_system_id)
+                                && call.dfs_object_id.as_ref() == Some(&command.object_id)
+                                && call.dfs_version.as_ref() == Some(&command.version)
+                                && call.outcome_error.as_deref().is_some_and(|error| error.contains("injected receiver cut after Prepared before content binding")));
+                            if returned_cut { break birth; }
+                        }
+                    } else if exact_lost_reply { break birth; }
                 }
                 let remaining = deadline.checked_duration_since(Instant::now());
                 if remaining.is_none() {
@@ -5340,7 +5406,11 @@ mod native_selected_data_tests {
         // content or an inferred A-side receipt. The existing arm loses reply.
         for node in [&owner, &holder] {
             let reader = runtime.client(node).unwrap();
-            assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
+            if prepared_only && node == &holder {
+                assert!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).is_err(), "Prepared body is not a live binding");
+            } else {
+                assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
+            }
         }
         let empty_successor = runtime.client(&promoted).unwrap();
         assert!(matches!(empty_successor.content().read_manifest(stat.object_id.as_str(), stat.version.as_str()),
@@ -7339,6 +7409,522 @@ mod native_selected_data_tests {
                 && call.target == fixture.promoted && call.route == route
                 && call.origin == RpcOrigin::ExplicitFixtureRpc && call.phase == RpcPhase::Completed));
         });
+    }
+
+
+    mod imported_history_query_tests {
+        use super::*;
+
+        fn with_query_fixture(
+            name: &str, prospective_receiver: bool,
+            check: impl FnOnce(&mut GenuineNativeOriginal, &DfsMetadataShardConfig,
+                &mut NetworkedDfsService<crate::DfsNodeTransport>, &LocalDfsRepairQueueStore),
+        ) {
+            with_query_fixture_cut(name, prospective_receiver, false, check);
+        }
+
+        fn with_query_fixture_cut(
+            name: &str, prospective_receiver: bool, prepared_only: bool,
+            check: impl FnOnce(&mut GenuineNativeOriginal, &DfsMetadataShardConfig,
+                &mut NetworkedDfsService<crate::DfsNodeTransport>, &LocalDfsRepairQueueStore),
+        ) {
+            let path = "/services/selected-original-data.bin";
+            let mut fixture = genuine_native_original_with_receiver_cut(name, false, prospective_receiver, prepared_only);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let owner = fixture.shard.primary_node_id.clone();
+                let request = fixture.birth.root.subject.request_id.clone();
+                let mut source = fixture.runtime.metadata_primary_service(path).unwrap();
+                let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
+                let control = fixture.runtime.shared_control_plane().unwrap();
+                let proposed = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                    .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
+                fixture.runtime.select_genuine_original_before_handoff(&owner, &request, &proposed).unwrap();
+                drop(fence);
+                let handoff_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+                let produced = source.reconcile_pending_metadata_shard_membership_handoffs(
+                    &fixture.runtime.metadata_shards().unwrap(), handoff_deadline.saturating_duration_since(Instant::now()));
+                drop(source);
+                assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, handoff_deadline).unwrap(),
+                    Some(proposed.desired_shard.clone()), "actual native handoff: {produced:?}");
+                let layout = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
+                let shard_id = DfsMetadataShardId::new(&fixture.shard.shard_id);
+                loop {
+                    let marker = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                        fixture.runtime.data_dir(&fixture.promoted), &shard_id, Some(&layout)).unwrap();
+                    if marker.is_some_and(|marker| marker.activated_epoch == Some(proposed.desired_shard.epoch)) { break; }
+                    let remaining = handoff_deadline.checked_duration_since(Instant::now()).expect("unchanged 45s native handoff budget");
+                    fixture.runtime.maintenance_tick(&fixture.promoted, remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)).unwrap();
+                }
+                assert!(Instant::now() <= handoff_deadline);
+                let queue = layout.queue().unwrap();
+                let imported = queue.installed_original_handoff_data(&owner, &request).unwrap().unwrap();
+                assert_eq!(imported.material.birth.original, fixture.birth.original);
+                assert_eq!(imported.material.birth.root, fixture.birth.root);
+                assert_eq!(imported.material.birth.attachment, fixture.birth.attachment);
+                assert_eq!(imported.material.cut.handoff.handoff_id, proposed.handoff_id);
+                assert_eq!(imported.material.cut.handoff.desired_shard, proposed.desired_shard);
+                assert!(queue.imported_executor_association(&owner, &request).unwrap().is_none());
+                let command = &imported.material.birth.original_wire_material().unwrap().original.command;
+                let absent = fixture.runtime.client(&fixture.promoted).unwrap().content()
+                    .read_manifest(command.object_id.as_str(), command.version.as_str()).unwrap_err();
+                assert!(matches!(absent, ContentStoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+                let mut successor = fixture.runtime.metadata_primary_service(path).unwrap();
+                assert!(successor.publication_execution.current().is_none(), "query owns separate native phases");
+                check(&mut fixture, &proposed.desired_shard, &mut successor, &queue);
+                drop(successor);
+            }));
+            crate::service_repair::HISTORY_QUERY_AFTER_ATTEMPT.with(|slot| { slot.borrow_mut().take(); });
+            crate::service_repair::HISTORY_QUERY_AFTER_OBSERVATION.with(|slot| { slot.borrow_mut().take(); });
+            drop(fixture.held.take());
+            drop(fixture.held_promoted.take());
+            let closed = fixture.runtime.close();
+            if let Err(error) = outcome {
+                if let Err(close_error) = closed { eprintln!("native history cleanup also failed: {close_error}"); }
+                std::panic::resume_unwind(error);
+            }
+            closed.expect("normal native history-query fixture drains");
+        }
+
+        fn query(fixture: &GenuineNativeOriginal, assignment: &DfsMetadataShardConfig,
+            successor: &mut NetworkedDfsService<crate::DfsNodeTransport>) -> DfsOriginalRepairHistoryResponse {
+            let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let previous = successor.set_transport_operation_deadline(Some(deadline));
+            let returned = successor.query_installed_original_history(assignment, &fixture.shard.primary_node_id,
+                &fixture.birth.root.subject.request_id);
+            assert_eq!(successor.transport.operation_deadline(), Some(deadline));
+            assert!(Instant::now() <= deadline, "query does not renew its existing caller clock");
+            successor.set_transport_operation_deadline(previous);
+            returned.unwrap()
+        }
+
+        fn assert_terminal(response: &DfsOriginalRepairHistoryResponse, fixture: &GenuineNativeOriginal) {
+            let command = &fixture.birth.original_wire_material().unwrap().original.command;
+            let DfsOriginalRepairHistoryResult::HistoricalTerminal { exact_original_response, .. } = &response.result else {
+                panic!("genuine C Terminal was not returned as history: {response:?}");
+            };
+            assert_eq!(exact_original_response, &DfsRepairReplicaResponse {
+                request_id: command.request_id.clone(), intent_id: command.intent_id.clone(), file_system_id: command.file_system_id.clone(),
+                object_id: command.object_id.clone(), version: command.version.clone(), replica_node_id: fixture.holder.clone(),
+                result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() },
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_without_b_payload() {
+            with_query_fixture("native-imported-history-no-b-bytes", true, |fixture, assignment, successor, queue| {
+                let producer = fixture.shard.primary_node_id.clone();
+                let id = fixture.birth.root.subject.request_id.clone();
+                let material = fixture.birth.original_wire_material().unwrap();
+                let command = &material.original.command;
+                let before_rows = queue.view().unwrap().records;
+                let before_import = queue.installed_original_handoff_data(&producer, &id).unwrap();
+                let source_queue = fixture.runtime.selected_original_data_layout(&producer).unwrap().queue().unwrap();
+                let before_origin = source_queue.original_repair(&fixture.birth.original).unwrap();
+                let before_receipts = successor.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap();
+                let before_head = successor.metadata_backend().unwrap().get_object(&command.object_id).unwrap();
+                let before_c = fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap();
+                let rpc_before = fixture.runtime.rpc_observations().len();
+                let response = query(fixture, assignment, successor);
+                assert_terminal(&response, fixture);
+                let saved = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                assert_eq!(saved.request().original_material, material);
+                assert_eq!(saved.response(), Some(&response));
+                assert!(saved.request().query_ref.attempt_sequence > saved.request().import_ref.imported_at_sequence);
+                assert!(queue.view().unwrap().head_sequence > saved.request().query_ref.attempt_sequence);
+                assert_eq!(queue.view().unwrap().records, before_rows);
+                assert_eq!(queue.installed_original_handoff_data(&producer, &id).unwrap(), before_import);
+                assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), before_origin);
+                assert!(queue.imported_executor_association(&producer, &id).unwrap().is_none());
+                assert!(queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+                assert_eq!(successor.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap(), before_receipts);
+                assert_eq!(successor.metadata_backend().unwrap().get_object(&command.object_id).unwrap(), before_head);
+                assert_eq!(fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap(), before_c);
+                assert!(matches!(successor.content().read_manifest(command.object_id.as_str(), command.version.as_str()),
+                    Err(ContentStoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound));
+                let calls = fixture.runtime.rpc_observations();
+                assert!(calls.iter().skip(rpc_before).any(|call| call.source == fixture.promoted && call.target == fixture.holder
+                    && call.route == DFS_DATA_READ_ROUTE && call.phase == RpcPhase::Completed));
+                assert!(!calls.iter().skip(rpc_before).any(|call| call.source == fixture.promoted && call.target == fixture.holder
+                    && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE));
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_missing_history_stays_pending() {
+            with_query_fixture_cut("native-imported-history-prepared-only", true, true, |fixture, assignment, successor, queue| {
+                let material = fixture.birth.original_wire_material().unwrap();
+                let before = fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap().unwrap();
+                assert!(before.bound_id.is_none() && before.terminal_id.is_none() && before.response.is_none());
+                let response = query(fixture, assignment, successor);
+                assert!(matches!(response.result, DfsOriginalRepairHistoryResult::Pending { reason: DfsOriginalRepairHistoryPending::MissingTerminal }));
+                let producer = fixture.shard.primary_node_id.clone();
+                let id = fixture.birth.root.subject.request_id.clone();
+                let pending = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                assert!(pending.terminal().is_none());
+                let before_repeat = queue.view().unwrap();
+                assert_eq!(query(fixture, assignment, successor), response);
+                assert_eq!(queue.view().unwrap(), before_repeat, "same Pending observation cannot churn its attempt/result records");
+                assert_eq!(fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap(), Some(before));
+            });
+            // This receiver has genuine ordinary content but no prospective
+            // original-history representation. Matching bytes cannot upgrade it.
+            with_query_fixture("native-imported-history-default-no-history", false, |fixture, assignment, successor, queue| {
+                let material = fixture.birth.original_wire_material().unwrap();
+                let command = &material.original.command;
+                let c = fixture.runtime.client(&fixture.holder).unwrap();
+                assert_eq!(c.content().read_object_version(command.object_id.as_str(), command.version.as_str()).unwrap().1, vec![0x5a;4096]);
+                let rows = queue.view().unwrap().records;
+                let result = successor.query_installed_original_history(assignment, &fixture.shard.primary_node_id, &command.request_id);
+                assert!(result.is_err(), "default content cannot mint a history capability: {result:?}");
+                let saved = queue.imported_history_query_for_test(&fixture.shard.primary_node_id, &command.request_id).unwrap().unwrap();
+                assert!(saved.terminal().is_none());
+                assert_eq!(queue.view().unwrap().records, rows);
+                assert!(queue.imported_executor_association(&fixture.shard.primary_node_id, &command.request_id).unwrap().is_none());
+                assert_eq!(c.content().read_object_version(command.object_id.as_str(), command.version.as_str()).unwrap().1, vec![0x5a;4096]);
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_binds_origin_attempt_and_reply() {
+            with_query_fixture("native-imported-history-exact-correlation", true, |fixture, assignment, successor, queue| {
+                crate::service_repair::HISTORY_QUERY_AFTER_ATTEMPT.with(|slot| *slot.borrow_mut() = Some(Box::new(||
+                    Err(DfsError::Cancelled { operation: "history certificate initial-observation control" }))));
+                assert!(matches!(successor.query_installed_original_history(assignment, &fixture.shard.primary_node_id,
+                    &fixture.birth.root.subject.request_id), Err(DfsError::Cancelled { .. })));
+                let pending = queue.imported_history_query_for_test(&fixture.shard.primary_node_id, &fixture.birth.root.subject.request_id).unwrap().unwrap();
+                let genuine_return = successor.transport.request_original_repair_history_direct(&fixture.holder,
+                    &pending.request().routed(), Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).unwrap().into_routed();
+                let before_initial = queue.view().unwrap();
+                for fault in ["nonempty-seal", "nonempty-incarnation"] {
+                    let mut wrong = genuine_return.clone();
+                    let DfsNetworkMessage::OriginalRepairHistoryResponse(reply) = &mut wrong.message else { unreachable!() };
+                    let DfsOriginalRepairHistoryResult::HistoricalTerminal { certificate, .. } = &mut reply.result else { unreachable!() };
+                    if fault == "nonempty-seal" { certificate.prepared_seal.push_str("changed"); }
+                    else { certificate.store_incarnation.push_str("changed"); }
+                    assert!(reply.validate_for_request(pending.request()).is_err(), "{fault}");
+                    assert!(queue.observe_imported_history_result(&pending, wrong,
+                        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).is_err(), "initial {fault}");
+                    assert_eq!(queue.view().unwrap(), before_initial);
+                }
+                let response = query(fixture, assignment, successor);
+                assert_terminal(&response, fixture);
+                let saved = queue.imported_history_query_for_test(&fixture.shard.primary_node_id, &fixture.birth.root.subject.request_id).unwrap().unwrap();
+                let carrier = saved.request().routed();
+                let command = DfsMessageCommand { request_id: format!("dfs_message_{}", carrier.frame_id), routed_message: carrier };
+                let genuine = DfsMessageResponse { request_id: command.request_id.clone(), outbound_messages: vec![saved.returned_for_test().unwrap().clone()] };
+                let material = fixture.birth.original_wire_material().unwrap();
+                let unrelated = successor.next_dfs_routed_message(&fixture.promoted, DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                    request_id: "unrelated-native-core-read".into(), object_id: material.original.command.object_id.clone(),
+                    version: Some(material.original.command.version.clone()), content_hash: Some(material.original.command.content_hash.clone()),
+                    content_size_bytes: Some(4096), range_offset: None, range_max_bytes: None,
+                }));
+                successor.transport.test_enqueue_protocol_message(unrelated);
+                let queued_before = successor.transport.pending_incoming_count().unwrap();
+                assert!(queued_before.is_some_and(|count| count > 0));
+                successor.transport.request_original_repair_history_direct(&fixture.holder, &saved.request().routed(),
+                    Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).unwrap();
+                assert_eq!(successor.transport.pending_incoming_count().unwrap(), queued_before,
+                    "the real direct native call cannot drain an unrelated Core protocol request");
+                let queue_before = queue.view().unwrap();
+                // These negative DTO probes use a return already produced by
+                // the real native C call above; none supplies positive history.
+                for malformed in ["outer", "empty", "multiple", "family", "source", "query", "origin", "nonempty-seal", "nonempty-incarnation"] {
+                    let mut value = genuine.clone();
+                    match malformed {
+                        "outer" => value.request_id.push_str("-wrong"),
+                        "empty" => value.outbound_messages.clear(),
+                        "multiple" => value.outbound_messages.push(value.outbound_messages[0].clone()),
+                        "family" => value.outbound_messages[0].message = fixture.birth.original.message.clone(),
+                        "source" => value.outbound_messages[0].source_node_id = fixture.shard.primary_node_id.clone(),
+                        "query" | "origin" | "nonempty-seal" | "nonempty-incarnation" => {
+                            let DfsNetworkMessage::OriginalRepairHistoryResponse(reply) = &mut value.outbound_messages[0].message else { unreachable!() };
+                            if malformed == "query" { reply.query_ref.attempt_sequence += 1; }
+                            else if malformed == "origin" { reply.original_command_digest.push_str("wrong"); }
+                            else {
+                                let DfsOriginalRepairHistoryResult::HistoricalTerminal { certificate, .. } = &mut reply.result else { unreachable!() };
+                                if malformed == "nonempty-seal" { certificate.prepared_seal.push_str("changed"); }
+                                else { certificate.store_incarnation.push_str("changed"); }
+                                assert!(queue.observe_imported_history_result(&saved, value.outbound_messages[0].clone(),
+                                    Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).is_err(), "duplicate {malformed}");
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(crate::node_transport::validate_original_history_rpc_return(&command, value).is_err(), "{malformed}");
+                }
+                let mut changed = saved.request().clone(); changed.original_material.subject.queue_incarnation.push_str("-changed");
+                assert!(changed.validate().is_err());
+                assert_eq!(queue.view().unwrap(), queue_before);
+                let counters = (successor.next_frame_id, successor.next_message_id);
+                let repeat = query(fixture, assignment, successor);
+                assert_eq!(repeat, response);
+                assert_eq!((successor.next_frame_id, successor.next_message_id), counters);
+                assert_eq!(queue.view().unwrap(), queue_before);
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_reopen_and_certification_cuts() {
+            with_query_fixture("native-imported-history-reopen-cuts", true, |fixture, assignment, successor, queue| {
+                let producer = fixture.shard.primary_node_id.clone();
+                let id = fixture.birth.root.subject.request_id.clone();
+                crate::service_repair::HISTORY_QUERY_AFTER_ATTEMPT.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                    Err(DfsError::Cancelled { operation: "native history cut after synchronized attempt before send" })
+                })));
+                let rpc_before = fixture.runtime.rpc_observations().len();
+                assert!(matches!(successor.query_installed_original_history(assignment, &producer, &id), Err(DfsError::Cancelled { .. })));
+                let pending = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                assert!(pending.response().is_none());
+                assert!(!fixture.runtime.rpc_observations().iter().skip(rpc_before).any(|call| call.source == fixture.promoted
+                    && call.target == fixture.holder && call.route == DFS_DATA_READ_ROUTE));
+                queue.compact_if_needed(DfsRepairQueueCompactionOptions::force()).unwrap();
+                queue.reload_from_disk_on_next_access();
+                assert_eq!(queue.imported_history_query_for_test(&producer, &id).unwrap(), Some(pending.clone()));
+                let c_before = fixture.runtime.client(&fixture.holder).unwrap().content()
+                    .original_repair_test_snapshot(&pending.request().original_material).unwrap();
+                fixture.runtime.stop_node(&fixture.holder).unwrap();
+                fixture.runtime.reopen_node(fixture.holder.clone()).unwrap();
+                assert_eq!(fixture.runtime.client(&fixture.holder).unwrap().content()
+                    .original_repair_test_snapshot(&pending.request().original_material).unwrap(), c_before);
+                // Actual authenticated C dispatch enters its existing writer
+                // recovery and fails the real catalog certification barrier.
+                // The fixture forces uncertainty; this is not an OS crash.
+                let receiver = fixture.runtime.client(&fixture.holder).unwrap();
+                let content = receiver.content().clone();
+                drop(receiver);
+                let context = fixture.runtime.component_context(&fixture.holder).unwrap();
+                let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = Arc::clone(&once);
+                let certification_cut = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(context.data_dir(), Arc::new(move |point, command, _| {
+                    if matches!(point, crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. })
+                        && command.is_some_and(|command| matches!(&command.routed_message.message, DfsNetworkMessage::OriginalRepairHistoryRequest(_)))
+                        && !observed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        content.arm_original_history_certification_failure_for_test()?;
+                    }
+                    Ok(())
+                }));
+                drop(context);
+                let uncertified = successor.query_installed_original_history(assignment, &producer, &id);
+                drop(certification_cut);
+                assert!(once.load(std::sync::atomic::Ordering::Acquire), "actual C query ingress reached the certification cut");
+                let uncertified_error = uncertified.expect_err("a readable Terminal cannot escape failed certification");
+                assert!(uncertified_error.to_string().contains("injected catalog recertification failure"),
+                    "the actual owning writer barrier, not earlier scope refusal, must reject: {uncertified_error}");
+                assert!(queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap().terminal().is_none());
+                crate::service_repair::HISTORY_QUERY_AFTER_OBSERVATION.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {
+                    Err(DfsError::Cancelled { operation: "native history cut after synchronized result before caller completion" })
+                })));
+                assert!(matches!(successor.query_installed_original_history(assignment, &producer, &id), Err(DfsError::Cancelled { .. })));
+                let recorded = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                assert_eq!(recorded.request(), pending.request());
+                assert!(recorded.terminal().is_some());
+                queue.compact_if_needed(DfsRepairQueueCompactionOptions::force()).unwrap();
+                queue.reload_from_disk_on_next_access();
+                let before_repeat = queue.view().unwrap();
+                let calls_before_repeat = fixture.runtime.rpc_observations().len();
+                let response = query(fixture, assignment, successor);
+                assert_terminal(&response, fixture);
+                assert_eq!(queue.view().unwrap(), before_repeat);
+                assert!(!fixture.runtime.rpc_observations().iter().skip(calls_before_repeat).any(|call| call.source == fixture.promoted
+                    && call.target == fixture.holder && call.route == DFS_DATA_READ_ROUTE));
+                let mut stale = assignment.clone(); stale.epoch += 1;
+                assert!(successor.query_installed_original_history(&stale, &producer, &id).is_err());
+                assert_eq!(queue.view().unwrap(), before_repeat);
+            });
+        }
+
+
+        type HistoryGate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+        fn release_history_gate(gate: &HistoryGate) {
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        }
+
+        // Reuse the real per-root hook. Every matched invocation waits; only
+        // the arrival notification is one-shot. No response or authority is supplied.
+        fn history_native_gate(fixture: &GenuineNativeOriginal, after_execute: bool, deadline: Instant)
+            -> (Box<dyn Send>, std::sync::mpsc::Receiver<()>, HistoryGate) {
+            let material = fixture.birth.original_wire_material().unwrap();
+            let source = fixture.promoted.clone();
+            let receiver = fixture.holder.clone();
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let held = Arc::clone(&gate);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let signal = Mutex::new(Some(tx));
+            let context = fixture.runtime.component_context(&fixture.holder).unwrap();
+            let hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(context.data_dir(), Arc::new(move |point, command, _| {
+                let reached = if after_execute {
+                    matches!(point, crate::runtime_host::DaemonDfsPreDispatchTestPoint::AfterExecute)
+                } else {
+                    matches!(point, crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. })
+                };
+                if reached && command.is_some_and(|command| command.routed_message.source_node_id == source
+                    && command.routed_message.target_node_id == receiver
+                    && matches!(&command.routed_message.message, DfsNetworkMessage::OriginalRepairHistoryRequest(request)
+                        if request.original_material == material)) {
+                    if let Some(signal) = signal.lock().unwrap().take() { let _ = signal.send(()); }
+                    let ready = held.0.lock().unwrap();
+                    let (ready, _) = held.1.wait_timeout_while(ready, deadline.saturating_duration_since(Instant::now()), |ready| !*ready).unwrap();
+                    if !*ready { return Err(DfsError::Cancelled { operation: "native history negative gate exhausted original caller deadline" }); }
+                }
+                Ok(())
+            }));
+            (Box::new(hook), rx, gate)
+        }
+
+        #[test]
+        fn native_imported_history_query_rejects_physical_replacement_after_capture() {
+            with_query_fixture("native-history-physical-after-capture", true, |fixture, assignment, successor, queue| {
+                let material = fixture.birth.original_wire_material().unwrap();
+                let receiver = fixture.runtime.client(&fixture.holder).unwrap();
+                let content = receiver.content().clone();
+                let before = content.original_repair_test_snapshot(&material).unwrap();
+                drop(receiver);
+                let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                let previous = successor.set_transport_operation_deadline(Some(deadline));
+                let (hook, reached, gate) = history_native_gate(fixture, false, deadline);
+                let producer = fixture.shard.primary_node_id.clone();
+                let id = fixture.birth.root.subject.request_id.clone();
+                std::thread::scope(|scope| {
+                    let mut caller = Some(scope.spawn(|| successor.query_installed_original_history(assignment, &producer, &id)));
+                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        reached.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("real C captured its exact native read context");
+                        content.with_original_history_replaced_root_for_test(|| {
+                            release_history_gate(&gate);
+                            let result = caller.take().unwrap().join().expect("owned native history caller drained");
+                            let error = result.expect_err("matching files in another physical root cannot use C's captured owner");
+                            assert!(error.to_string().contains("physically replaced"), "the owner check, not timeout/unrelated refusal, must reject: {error}");
+                            assert!(Instant::now() <= deadline, "no renewed physical-fault caller budget");
+                        }).unwrap();
+                    }));
+                    release_history_gate(&gate);
+                    if let Some(caller) = caller.take() { let _ = caller.join(); }
+                    drop(hook);
+                    if let Err(error) = checked { std::panic::resume_unwind(error); }
+                });
+                successor.set_transport_operation_deadline(previous);
+                let pending = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                assert!(pending.response().is_none());
+                assert_eq!(content.original_repair_test_snapshot(&material).unwrap(), before,
+                    "restoration reuses the original physical root and genuine retained history");
+                assert_eq!(content.read_object_version(material.original.command.object_id.as_str(), material.original.command.version.as_str()).unwrap().1, vec![0x5a;4096]);
+                let response = query(fixture, assignment, successor);
+                assert_terminal(&response, fixture);
+                assert_eq!(queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap().request(), pending.request());
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_retiring_b_cannot_observe_inflight_return() {
+            with_query_fixture("native-history-inflight-b-retirement", true, |fixture, assignment, successor, queue| {
+                let producer = fixture.shard.primary_node_id.clone();
+                let id = fixture.birth.root.subject.request_id.clone();
+                let source_queue = fixture.runtime.selected_original_data_layout(&producer).unwrap().queue().unwrap();
+                let original_before = source_queue.original_repair(&fixture.birth.original).unwrap();
+                let layout_b = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
+                let shard_id = DfsMetadataShardId::new(&assignment.shard_id);
+                let control = fixture.runtime.shared_control_plane().unwrap();
+                let configs = fixture.runtime.metadata_shards().unwrap();
+                let mut retiring = fixture.runtime.metadata_primary_service("/services/selected-original-data.bin").unwrap();
+                let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                let previous = successor.set_transport_operation_deadline(Some(deadline));
+                let (hook, reached, gate) = history_native_gate(fixture, true, deadline);
+                std::thread::scope(|scope| {
+                    let mut caller = Some(scope.spawn(|| successor.query_installed_original_history(assignment, &producer, &id)));
+                    let mut retirement = None;
+                    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        reached.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("real C history result reached the native post-execution edge");
+                        // Explicit ordinary metadata retirement, not automatic
+                        // failback and not a new selected-original protocol.
+                        let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                            .request_metadata_shard_primary_handoff(assignment, &producer)).unwrap().unwrap();
+                        let retirement_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+                        retirement = Some(scope.spawn(move || retiring.reconcile_pending_metadata_shard_membership_handoffs(
+                            &configs, retirement_deadline.saturating_duration_since(Instant::now()))));
+                        loop {
+                            let marker = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                                fixture.runtime.data_dir(&fixture.promoted), &shard_id, Some(&layout_b)).unwrap();
+                            if marker.is_some_and(|marker| marker.handoff_id == pending.handoff_id && marker.retiring_epoch == assignment.epoch) { break; }
+                            assert!(Instant::now() < deadline, "the actual B phase must be released before RPC wait so its native retirement can freeze");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        release_history_gate(&gate);
+                        let result = caller.take().unwrap().join().expect("owned in-flight query caller drained");
+                        let error = result.expect_err("B retirement fences durable observation of an already prepared C result");
+                        assert!(Instant::now() <= deadline, "retirement must reject under the same original 5s call, not a timeout");
+                        let current_b_rejection = matches!(&error, DfsError::StaleOwnerEpoch { local_node_id, .. } if local_node_id == &fixture.promoted)
+                            || matches!(&error, DfsError::Metadata { message } if message == "history query has no exact current native B owner/import"
+                                || message == "publication configuration is not current" || message.contains("publication configuration advanced"));
+                        assert!(current_b_rejection, "the NEW B phase, not a C/network/timeout refusal, must fence observation: {error}");
+                        assert!(fixture.runtime.rpc_observations().iter().any(|call| call.source == fixture.promoted
+                            && call.target == fixture.holder && call.route == DFS_DATA_READ_ROUTE
+                            && call.phase == RpcPhase::Completed && call.outcome_error.is_none()),
+                            "the actual native C RPC returned before the B observation was refused");
+                        assert!(queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap().response().is_none());
+                    }));
+                    // Gates and both actual children drain on every verdict.
+                    release_history_gate(&gate);
+                    if let Some(caller) = caller.take() { let _ = caller.join(); }
+                    let retirement_panic = retirement.take().and_then(|retirement| match retirement.join() {
+                        Ok(result) => { eprintln!("HISTORY_NATIVE_RETIREMENT_OUTCOME {result:?}; query asserts the actual retiring fence, not full activation"); None }
+                        Err(error) => Some(error),
+                    });
+                    drop(hook);
+                    if let Some(error) = retirement_panic {
+                        if checked.is_ok() { std::panic::resume_unwind(error); }
+                        eprintln!("native retirement child also panicked; retaining the original query assertion");
+                    }
+                    if let Err(error) = checked { std::panic::resume_unwind(error); }
+                });
+                successor.set_transport_operation_deadline(previous);
+                assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), original_before);
+                assert!(queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_preserves_later_withdrawal() {
+            with_query_fixture("native-imported-history-known-withdrawal", true, |fixture, assignment, successor, queue| {
+                let material = fixture.birth.original_wire_material().unwrap();
+                let command = &material.original.command;
+                // The real lost C reply left C absent from canonical
+                // receipts. Withdraw the actually present A holder instead;
+                // do not fabricate C application merely to seed this control.
+                let producer = fixture.shard.primary_node_id.clone();
+                let initial_head = successor.metadata_backend().unwrap().get_object(&command.object_id).unwrap().unwrap();
+                let initial_receipts = successor.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap();
+                assert!(initial_head.current_locations.contains(&producer));
+                assert!(initial_receipts.iter().any(|receipt| receipt.replica_node_id == producer));
+                assert!(initial_receipts.iter().all(|receipt| receipt.replica_node_id != fixture.holder));
+                let source_queue = fixture.runtime.selected_original_data_layout(&producer).unwrap().queue().unwrap();
+                let origin_before = source_queue.original_repair(&fixture.birth.original).unwrap();
+                let c_before = fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap();
+                // Ordinary authoritative withdrawal, not a query/cache effect.
+                successor.mark_remote_read_location_missing(&command.object_id, &command.version,
+                    &Some(command.content_hash.clone()), &producer).unwrap();
+                let head = successor.metadata_backend().unwrap().get_object(&command.object_id).unwrap().unwrap();
+                assert!(!head.current_locations.contains(&producer));
+                assert!(!head.current_locations.contains(&fixture.holder));
+                let receipts = successor.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap();
+                assert!(receipts.iter().all(|receipt| receipt.replica_node_id != producer && receipt.replica_node_id != fixture.holder));
+                let rows = queue.view().unwrap().records;
+                let response = query(fixture, assignment, successor);
+                assert_terminal(&response, fixture);
+                assert_eq!(successor.metadata_backend().unwrap().get_object(&command.object_id).unwrap(), Some(head.clone()));
+                assert_eq!(successor.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap(), receipts);
+                assert_eq!(queue.view().unwrap().records, rows);
+                fixture.runtime.stop_node(&fixture.holder).unwrap();
+                fixture.runtime.reopen_node(fixture.holder.clone()).unwrap();
+                assert_eq!(query(fixture, assignment, successor), response);
+                assert_eq!(successor.metadata_backend().unwrap().get_object(&command.object_id).unwrap(), Some(head));
+                assert!(queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+                assert!(queue.imported_executor_association(&fixture.shard.primary_node_id, &command.request_id).unwrap().is_none());
+                assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), origin_before);
+                assert_eq!(fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap(), c_before);
+                assert_eq!(successor.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap(), receipts);
+            });
+        }
     }
 
 }

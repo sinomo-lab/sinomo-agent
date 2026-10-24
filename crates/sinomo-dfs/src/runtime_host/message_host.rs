@@ -3019,6 +3019,22 @@ pub(super) fn prepare_daemon_dfs_verified_blob_fetch(
     Ok(verified)
 }
 
+fn prepare_daemon_dfs_verified_original_history_query(
+    data_dir: &SinomoDataDir, peer: &DaemonDfsMessagePeerSnapshot,
+    command: &DfsMessageCommand, preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+) -> Result<Option<crate::publication_guard::VerifiedOriginalRepairHistoryRead>, sinomo_dfs::DfsError> {
+    let sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &command.routed_message.message else { return Ok(None); };
+    let invalid = || sinomo_dfs::DfsError::Metadata { message: "history query requires its actual current native read preflight".into() };
+    if command.routed_message != request.routed() || command.routed_message.target_node_id != peer.local_node_id { return Err(invalid()); }
+    let preflight = preflight.ok_or_else(invalid)?;
+    if preflight.authority.generation() != preflight.generation { return Err(invalid()); }
+    let owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir)).map_err(|error| sinomo_dfs::DfsError::Metadata { message: error.to_string() })?;
+    let verified = crate::publication_guard::VerifiedOriginalRepairHistoryRead::capture(owner, Arc::clone(&preflight.authority),
+        &command.routed_message.source_node_id, &peer.local_node_id, request)?;
+    if preflight.authority.generation() != preflight.generation { return Err(invalid()); }
+    Ok(Some(verified))
+}
+
 pub(crate) fn process_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -3116,6 +3132,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
+    let verified_history = prepare_daemon_dfs_verified_original_history_query(data_dir, peer_snapshot, &command, metadata_authority_preflight.as_ref())?;
     // Daemon startup owns data-directory initialization. Repeating its six
     // create_dir_all calls here turns every routed DFS message into layout I/O.
     let cache_key = data_dir.root();
@@ -3193,7 +3210,9 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     #[cfg(any(test, feature = "test-support"))]
     let observed_command = execution_test_hook.as_ref().map(|_| command.clone());
     #[cfg(test)]
-    struct CreatePrepareTestHookCleanup;
+    struct CreatePrepareTestHookCleanup {
+        original_repair_faults: Option<crate::content_store::OriginalRepairTestFaultCleanup>,
+    }
     #[cfg(test)]
     impl Drop for CreatePrepareTestHookCleanup {
         fn drop(&mut self) {
@@ -3203,23 +3222,37 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             crate::publication_guard::AFTER_PREPARED_AUTHORIZATION.with(|hook| {
                 hook.borrow_mut().take();
             });
+            drop(self.original_repair_faults.take());
         }
     }
     // A fixture may arm the existing one-shot on this actual Main worker.
     // Clear it on the SAME worker on every return and unwind, including errors.
     #[cfg(test)]
-    let _create_prepare_cleanup = execution_test_hook
+    let mut _create_prepare_cleanup = execution_test_hook
         .as_ref()
-        .map(|_| CreatePrepareTestHookCleanup);
+        .map(|_| CreatePrepareTestHookCleanup { original_repair_faults: None });
     #[cfg(any(test, feature = "test-support"))]
     if let Some(hook) = execution_test_hook.as_ref() {
-        hook(
-            DaemonDfsPreDispatchTestPoint::BeforeExecute {
-                admission_held: mutation_admission.is_some(),
-            },
-            observed_command.as_ref(),
-            metadata_authority_preflight.as_ref(),
-        )?;
+        let before_execute = || hook(
+            DaemonDfsPreDispatchTestPoint::BeforeExecute { admission_held: mutation_admission.is_some() },
+            observed_command.as_ref(), metadata_authority_preflight.as_ref(),
+        );
+        #[cfg(test)]
+        if matches!(&command.routed_message.message,
+            crate::DfsNetworkMessage::SelectedOriginalRepair(_) | crate::DfsNetworkMessage::OriginalRepairHistoryRequest(_)) {
+            // The existing generic cleanup already exists before this fallible
+            // join. Missing/failed actual owner capture returns BEFORE the hook;
+            // no retained content handle can substitute for this native owner.
+            let cleanup = run_original_repair_test_hook_with_cleanup(
+                daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
+                    .map_err(|error| crate::DfsError::Metadata { message: error.to_string() }),
+                before_execute,
+            )?;
+            _create_prepare_cleanup.as_mut().expect("the installed test hook owns its generic cleanup")
+                .original_repair_faults = Some(cleanup);
+        } else { before_execute()?; }
+        #[cfg(not(test))]
+        before_execute()?;
     }
     if verified_fetch.is_some() {
         let preflight = metadata_authority_preflight.as_ref().ok_or_else(|| {
@@ -3290,6 +3323,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
         preingested_blob,
         execution_scope,
         verified_fetch,
+        verified_history,
         publication_scope
             .as_ref()
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
@@ -3754,6 +3788,12 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     encoded_value_bytes: Option<u64>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsDataPlaneResponse, DaemonError> {
+    if matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryResponse(_)) {
+        return Err(DaemonError::Network { address: "DFS history query".into(), detail: "unsolicited historical response has no direct-call owner".into() });
+    }
+    if attachment.is_some() && matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryRequest(_)) {
+        return Err(DaemonError::Network { address: "DFS history query".into(), detail: "history query cannot carry a semantic attachment".into() });
+    }
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
     let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
@@ -3821,7 +3861,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         });
     }
     let uses_content_read_lane = daemon_dfs_message_uses_content_read_lane(&command);
-    let mut metadata_authority_preflight = if !uses_content_read_lane {
+    let mut metadata_authority_preflight = if !uses_content_read_lane
+        || matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryRequest(_)) {
         // Complete or join authority I/O before even the shared content-store
         // lookup below can take the process-wide DFS cache mutex. Attachment
         // ingest may perform durable local I/O, but it never owns authority.

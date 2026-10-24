@@ -127,6 +127,137 @@ impl BoundOriginalRepairContent {
 }
 
 impl LocalContentStore {
+    #[cfg(test)]
+    pub(crate) fn arm_original_repair_after_prepared_test_cut(&self) -> Result<()> {
+        self.requires_original_repair_fixture()?;
+        arm_original_repair_test_fault(&self.root, InlineFault::ReceiverAfterPrepared)
+    }
+
+    /// One native negative fixture swaps in a byte-exact physical copy while
+    /// the actual content mutation owner excludes ordinary content writers.
+    /// The copy is never admitted. Both roots are retained for failed evidence.
+    #[cfg(test)]
+    pub(crate) fn with_original_history_replaced_root_for_test<R>(&self, check: impl FnOnce() -> R) -> Result<R> {
+        self.requires_original_repair_fixture()?;
+        let _owner = self.content_mutation_guard()?;
+        let _reservation = self.lock_content_reservations_for_write()?;
+        let parent = self.root.parent().ok_or_else(|| inline_error("history fixture has no parent"))?;
+        let copy = parent.join("history-replacement-copy");
+        let parked = parent.join("history-original-physical-root");
+        let rejected = parent.join("history-rejected-physical-copy");
+        for path in [&copy, &parked, &rejected] {
+            if fs::symlink_metadata(path).is_ok() { return Err(inline_error("history replacement fixture path is occupied")); }
+        }
+        fn copy_exact(source: &Path, target: &Path) -> Result<()> {
+            fs::create_dir(target).map_err(|source| ContentStoreError::Io { path: target.to_owned(), source })?;
+            for entry in fs::read_dir(source).map_err(|error| ContentStoreError::Io { path: source.to_owned(), source: error })? {
+                let entry = entry.map_err(inline_error)?;
+                let original = entry.path();
+                let output = target.join(entry.file_name());
+                let metadata = fs::symlink_metadata(&original).map_err(inline_error)?;
+                if metadata.file_type().is_symlink() { return Err(inline_error("history copy cannot follow a symlink")); }
+                if metadata.is_dir() { copy_exact(&original, &output)?; }
+                else if metadata.is_file() {
+                    fs::copy(&original, &output).map_err(inline_error)?;
+                    if fs::read(&original).map_err(inline_error)? != fs::read(&output).map_err(inline_error)? {
+                        return Err(inline_error("history physical copy differs from the actual owner"));
+                    }
+                } else { return Err(inline_error("history physical copy has a nonregular entry")); }
+            }
+            Ok(())
+        }
+        copy_exact(&self.root, &copy)?;
+        struct Restore { root: PathBuf, parked: PathBuf, rejected: PathBuf, restored: bool }
+        impl Restore {
+            fn restore(&mut self) -> Result<()> {
+                if self.restored { return Ok(()); }
+                if self.root.exists() { fs::rename(&self.root, &self.rejected).map_err(inline_error)?; }
+                fs::rename(&self.parked, &self.root).map_err(inline_error)?;
+                self.restored = true;
+                Ok(())
+            }
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) { if let Err(error) = self.restore() { eprintln!("history fixture physical restoration failed: {error}"); } }
+        }
+        fs::rename(&self.root, &parked).map_err(inline_error)?;
+        let mut restore = Restore { root: self.root.clone(), parked, rejected, restored: false };
+        fs::rename(&copy, &self.root).map_err(inline_error)?;
+        let result = check();
+        restore.restore()?;
+        Ok(result)
+    }
+
+    /// The owning Prepared codec, reused by history validators. This returns a
+    /// deterministic DATA seal, never receiver acceptance or durability.
+    pub(crate) fn original_repair_prepared_seal(
+        material: &DfsOriginalRepairMaterial, receiver: &sinomo_core::node::NodeId,
+        incarnation: &str, prepared_id: u64,
+    ) -> Result<String> {
+        material.validate().map_err(inline_error)?;
+        OriginalRepairPrepared {
+            key: OriginalRepairKey::of(material), material: material.clone(),
+            receiver: receiver.to_string(), store_incarnation: incarnation.to_owned(),
+            logical_id: prepared_id, seal: String::new(),
+        }.seal()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_original_history_certification_failure_for_test(&self) -> Result<()> {
+        self.requires_original_repair_fixture()?;
+        arm_original_repair_test_fault(&self.root, InlineFault::CatalogCertification)?;
+        let _owner = self.content_mutation_guard()?;
+        let _reservation = self.lock_content_reservations_for_write()?;
+        // Explicit fixture forcing of the existing writer-recertification
+        // branch; it is not evidence of an actual OS crash or unsynced ACK.
+        self.inline_store.owner.state.lock().map_err(|_| inline_error("history state poisoned"))?.uncertain = true;
+        Ok(())
+    }
+
+    /// Certify retained accepted history through the actual existing writer.
+    /// This may sync/recover an unacknowledged tail; it never runs an effect or
+    /// synthesizes a missing phase from current content/receipt/cache state.
+    pub(crate) fn certified_original_repair_terminal(
+        &self,
+        request: &crate::DfsOriginalRepairHistoryRequest,
+        verified: &crate::publication_guard::VerifiedOriginalRepairHistoryRead,
+    ) -> Result<crate::DfsOriginalRepairHistoryResult> {
+        verified.revalidate(request).map_err(inline_error)?;
+        verified.check_content_store(self)?;
+        self.requires_original_repair_fixture()?;
+        let result = {
+            let _owner = self.content_mutation_guard()?;
+            let reservation = self.lock_content_reservations_for_write()?;
+            verified.check_content_owner(self, &reservation.sentinel.store_incarnation)?;
+            let mut state = self.inline_store.owner.state.lock().map_err(|_| inline_error("history state poisoned"))?;
+            ensure_writer(&self.root, &reservation.sentinel.store_incarnation, &mut state)?;
+            let key = OriginalRepairKey::of(&request.original_material);
+            match state.view.original_repairs.get(&key) {
+                Some(prepared) if prepared.material != request.original_material => return Err(inline_error("history query changed the original accepted material")),
+                _ => {}
+            }
+            if let Some(terminal) = state.view.original_terminals.get(&key) {
+                validate_terminal(&state.view, terminal, &reservation.sentinel.store_incarnation)?;
+                crate::DfsOriginalRepairHistoryResult::HistoricalTerminal {
+                    certificate: crate::DfsOriginalRepairHistoryCertificate {
+                        store_incarnation: terminal.store_incarnation.clone(), prepared_id: terminal.prepared_id,
+                        prepared_seal: terminal.prepared_seal.clone(), bound_id: terminal.bound_id,
+                        terminal_id: terminal.logical_id,
+                        response_digest: crate::repair_queue_store::repair_result_digest(&terminal.response).map_err(inline_error)?,
+                        provenance: terminal.provenance.clone(),
+                    },
+                    exact_original_response: terminal.response.clone(),
+                }
+            } else {
+                crate::DfsOriginalRepairHistoryResult::Pending { reason: crate::DfsOriginalRepairHistoryPending::MissingTerminal }
+            }
+        };
+        // Configuration/projection callbacks are never called with the content
+        // mutation/reservation/state locks held.
+        verified.revalidate(request).map_err(inline_error)?;
+        Ok(result)
+    }
+
     pub(crate) fn requires_original_repair_fixture(&self) -> Result<()> {
         if self.inline_store.owner.expected_format != ORIGINAL_REPAIR_FIXTURE_VERSION {
             return Err(inline_error(
@@ -447,6 +578,106 @@ impl LocalContentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_repair_test_fault_lifetime_clears_early_errors_and_unwind_only() {
+        let root = sinomo_testdir::TestDir::new("original-repair-worker-fault-lifetime");
+        let (store, identity) = LocalContentStore::new_original_repair_fixture(root.join("content")).unwrap();
+        let (other, other_identity) = LocalContentStore::new_original_repair_fixture(root.join("other")).unwrap();
+        let assert_empty = || {
+            assert!(INLINE_FAULT.with(|slot| slot.borrow().is_none()));
+            assert!(ORIGINAL_REPAIR_TEST_FAULT.with(|slot| slot.borrow().is_none()));
+        };
+        assert_empty();
+        for missing in [true, false] {
+            let invoked = std::cell::Cell::new(false);
+            let lookup = if missing { Ok(None) } else { Err(crate::DfsError::Metadata { message: "actual native owner lookup refused fixture DATA".into() }) };
+            let refused = crate::runtime_host::run_original_repair_test_hook_with_cleanup(lookup, || {
+                invoked.set(true);
+                // The retained private4 store is valid and WOULD arm, so only
+                // the mandatory native capture can prevent this callback.
+                store.arm_original_repair_after_prepared_test_cut()?;
+                Ok(())
+            });
+            let error = match refused { Ok(_) => panic!("missing/refused native owner cannot reach the hook"), Err(error) => error };
+            assert!(!invoked.get());
+            if missing { assert!(error.to_string().contains("requires its actual native DATA owner")); }
+            else { assert!(error.to_string().contains("actual native owner lookup refused fixture DATA")); }
+            assert_empty();
+        }
+        for catalog in [false, true] {
+            for unwind in [false, true] {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let _cleanup = identity.original_repair_test_fault_cleanup().unwrap();
+                    if catalog { store.arm_original_history_certification_failure_for_test()?; }
+                    else { store.arm_original_repair_after_prepared_test_cut()?; }
+                    // No injection point is consumed: model the earlier
+                    // owner/admission/preparation error or unwind explicitly.
+                    if unwind { panic!("earlier worker preparation unwound"); }
+                    Err(inline_error("earlier worker preparation returned error"))
+                }));
+                if unwind { assert!(outcome.is_err()); }
+                else { assert!(outcome.unwrap().unwrap_err().to_string().contains("earlier worker preparation returned error")); }
+                assert_empty();
+            }
+        }
+        // A real subsequent writer recertifies successfully. Cleanup removed
+        // only the injection; it did not reset the deliberately uncertain state.
+        let object = crate::DfsObjectId::from_legacy_named("fault-lifetime-object").unwrap();
+        let version = crate::DfsVersion::from_legacy_named("fault-lifetime-version").unwrap();
+        store.put_object_version(object.as_str(), version.as_str(), b"next real owner write").unwrap();
+
+        let other_cleanup = other_identity.original_repair_test_fault_cleanup().unwrap();
+        other.arm_original_repair_after_prepared_test_cut().unwrap();
+        drop(identity.original_repair_test_fault_cleanup());
+        assert!(INLINE_FAULT.with(|slot| slot.borrow().as_ref().is_some_and(|(path, point)| path == &other.root && *point == InlineFault::ReceiverAfterPrepared)));
+        drop(other_cleanup);
+        assert_empty();
+
+        let cleanup = identity.original_repair_test_fault_cleanup();
+        store.arm_original_repair_after_prepared_test_cut().unwrap();
+        INLINE_FAULT.with(|slot| *slot.borrow_mut() = Some((store.root.clone(), InlineFault::LostAppendCompletion)));
+        drop(cleanup);
+        assert!(take_inline_fault(&store.root, InlineFault::LostAppendCompletion), "another ordinary fault cannot be cleared by stale lifetime provenance");
+        assert_empty();
+
+        let cleanup = identity.original_repair_test_fault_cleanup();
+        store.arm_original_repair_after_prepared_test_cut().unwrap();
+        store.with_original_history_replaced_root_for_test(|| {
+            assert!(identity.check_original_physical_identity().is_err());
+            drop(cleanup);
+            assert_empty(); // Cleanup needs no recovery/open of the now-refused root.
+        }).unwrap();
+        identity.check_original_store_identity(&store).unwrap();
+
+        for point in [InlineFault::CatalogCertification, InlineFault::LostAppendCompletion] {
+            INLINE_FAULT.with(|slot| *slot.borrow_mut() = Some((store.root.clone(), point)));
+            let cleanup = identity.original_repair_test_fault_cleanup();
+            assert!(store.arm_original_repair_after_prepared_test_cut().is_err(), "cannot overwrite an ordinary preexisting fault");
+            drop(cleanup);
+            assert!(INLINE_FAULT.with(|slot| slot.borrow().as_ref().is_some_and(|(path, armed)| path == &store.root && *armed == point)));
+            assert!(take_inline_fault(&store.root, point));
+            assert_empty();
+        }
+        // An ordinary same-point replacement BEFORE consumption must also
+        // discard obsolete ownership; root/point equality alone is not enough.
+        let cleanup = identity.original_repair_test_fault_cleanup();
+        store.arm_original_repair_after_prepared_test_cut().unwrap();
+        store.arm_received_repair_after_prepared_test_cut();
+        drop(cleanup);
+        assert!(take_inline_fault(&store.root, InlineFault::ReceiverAfterPrepared));
+        assert_empty();
+        // Consumption releases the lifetime tag immediately. A later ordinary
+        // fault at the same root/point must survive this invocation's cleanup.
+        let cleanup = identity.original_repair_test_fault_cleanup();
+        store.arm_original_repair_after_prepared_test_cut().unwrap();
+        assert!(store.received_repair_after_prepared_test_cut().unwrap_err().to_string()
+            .contains("injected receiver cut after Prepared before content binding"));
+        store.arm_received_repair_after_prepared_test_cut();
+        drop(cleanup);
+        assert!(take_inline_fault(&store.root, InlineFault::ReceiverAfterPrepared));
+        assert_empty();
+    }
 
     #[test]
     fn original_owner_identity_rejects_other_admitted_private4_writer() {

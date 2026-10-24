@@ -21,6 +21,9 @@ use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod history;
+pub(crate) use history::ImportedRepairHistoryQuery;
+
 const DFS_REPAIR_QUEUE_LOG_MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_DFS_REPAIR_QUEUE_COMPACTION_LOG_BYTES: u64 = 4 * 1024 * 1024;
 const SELECTED_ORIGINAL_FIXTURE_MARKER: &str = "selected-original-data-fixture-v2.sobj";
@@ -208,6 +211,20 @@ pub enum RepairCustodyChange {
         subject: crate::content_store::RepairPayloadSubject,
         observed_digest: String,
     },
+    BeginImportedHistoryQuery {
+        import_ref: crate::DfsImportedRepairHistoryRef,
+        assignment: crate::DfsMetadataShardConfig,
+        carrier: crate::DfsOriginalRepairHistoryCarrier,
+    },
+    ObserveImportedHistoryQueryDelivery {
+        query_ref: crate::DfsOriginalRepairHistoryQueryRef,
+        carrier: crate::DfsOriginalRepairHistoryCarrier,
+        delivery: Option<sinomo_core::network::NetworkDeliveryState>,
+    },
+    ObserveImportedHistoryQueryResult {
+        query_ref: crate::DfsOriginalRepairHistoryQueryRef,
+        returned: crate::DfsRoutedMessage,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,6 +236,8 @@ struct RepairCustodySnapshot {
     imported_original_data: Vec<ImportedRepairOriginalData>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     imported_executor_associations: Vec<ImportedRepairExecutorAssociation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    imported_history_queries: Vec<history::ImportedRepairHistorySnapshot>,
 }
 
 /// Exact captured material. This contains no executor or root-release permit.
@@ -307,6 +326,11 @@ struct RepairCustodyIndex {
     births: BTreeMap<crate::content_store::RepairPayloadSubject, RepairOriginalBirth>,
     imported_original_data: BTreeMap<(String, String), ImportedRepairOriginalData>,
     imported_executor_associations: BTreeMap<(String, String), ImportedRepairExecutorAssociation>,
+    imported_history_queries: BTreeMap<crate::DfsOriginalRepairHistoryQueryRef, ImportedRepairHistoryQuery>,
+    imported_history_slots: BTreeMap<(String, String), crate::DfsOriginalRepairHistoryQueryRef>,
+    // Derived from retained imports/query phases, never another sequence
+    // allocator or persisted ledger. None reserves an actual import frame.
+    history_sequences: BTreeMap<u64, Option<crate::DfsOriginalRepairHistoryQueryRef>>,
     // Conflict index only. Never consulted as runnable/native original work.
     associated_slots: BTreeMap<DfsRepairQueueKey, (String, String)>,
     slots: BTreeMap<DfsRepairQueueKey, crate::content_store::RepairPayloadSubject>,
@@ -370,7 +394,7 @@ pub(crate) fn original_repair_digest(
     Ok(hash.finalize().to_hex().to_string())
 }
 
-fn repair_result_digest(response: &crate::DfsRepairReplicaResponse) -> Result<String, DfsError> {
+pub(crate) fn repair_result_digest(response: &crate::DfsRepairReplicaResponse) -> Result<String, DfsError> {
     let bytes = sinomo_object_serde::to_bytes(response, 1, LengthMode::U32)
         .map_err(|error| custody_error(&format!("encode original Repair result: {error}")))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
@@ -552,7 +576,8 @@ impl RepairCustodyIndex {
         };
         if !selected_reader
             && (!snapshot.imported_original_data.is_empty()
-                || !snapshot.imported_executor_associations.is_empty())
+                || !snapshot.imported_executor_associations.is_empty()
+                || !snapshot.imported_history_queries.is_empty())
         {
             return Err(custody_error("default queue reader rejects selected original DATA"));
         }
@@ -600,9 +625,12 @@ impl RepairCustodyIndex {
         }
         for imported in snapshot.imported_original_data {
             result.validate_import(&imported.material, &imported.installer_queue_incarnation)?;
-            if imported.installed_at_sequence == 0 || imported.installed_at_sequence > floor {
+            if imported.installed_at_sequence == 0 || imported.installed_at_sequence > floor
+                || result.history_sequences.contains_key(&imported.installed_at_sequence)
+                || result.imported_original_data.contains_key(&imported.material.wire_key()) {
                 return Err(custody_error("original DATA installation exceeds its local snapshot prefix"));
             }
+            result.history_sequences.insert(imported.installed_at_sequence, None);
             if result.imported_original_data.insert(imported.material.wire_key(), imported).is_some() {
                 return Err(custody_error("duplicate imported original DATA in snapshot"));
             }
@@ -634,6 +662,9 @@ impl RepairCustodyIndex {
                 ));
             }
         }
+        for query in snapshot.imported_history_queries {
+            result.restore_history_query(query, floor)?;
+        }
         Ok(result)
     }
 
@@ -647,6 +678,7 @@ impl RepairCustodyIndex {
                 .values()
                 .cloned()
                 .collect(),
+            imported_history_queries: self.imported_history_queries.values().map(ImportedRepairHistoryQuery::snapshot).collect(),
         })
     }
 
@@ -723,6 +755,9 @@ impl RepairCustodyIndex {
 
     fn validate_change(&self, change: &RepairCustodyChange) -> Result<(), DfsError> {
         match change {
+            RepairCustodyChange::BeginImportedHistoryQuery { .. }
+            | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
+            | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. } => self.validate_history_change(change)?,
             RepairCustodyChange::AssociateImportedExecutor { binding } => {
                 self.validate_executor_binding(binding)?;
             }
@@ -947,6 +982,9 @@ impl RepairCustodyIndex {
     ) -> Result<(), DfsError> {
         self.validate_change(change)?;
         match change {
+            RepairCustodyChange::BeginImportedHistoryQuery { .. }
+            | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
+            | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. } => self.apply_history_change(change, sequence)?,
             RepairCustodyChange::AssociateImportedExecutor { binding } => {
                 if sequence <= binding.imported_at_sequence {
                     return Err(custody_error(
@@ -968,11 +1006,17 @@ impl RepairCustodyIndex {
                     });
             }
             RepairCustodyChange::ImportOriginalData { material, installer_queue_incarnation } => {
-                self.imported_original_data.entry(material.wire_key()).or_insert_with(|| ImportedRepairOriginalData {
-                    material: *material.clone(),
-                    installer_queue_incarnation: installer_queue_incarnation.clone(),
-                    installed_at_sequence: sequence,
-                });
+                let key = material.wire_key();
+                if !self.imported_original_data.contains_key(&key) {
+                    if self.history_sequences.contains_key(&sequence) {
+                        return Err(custody_error("original DATA import reuses a retained query/import frame"));
+                    }
+                    self.history_sequences.insert(sequence, None);
+                    self.imported_original_data.insert(key, ImportedRepairOriginalData {
+                        material: *material.clone(), installer_queue_incarnation: installer_queue_incarnation.clone(),
+                        installed_at_sequence: sequence,
+                    });
+                }
             }
             RepairCustodyChange::Initialize { incarnation } => {
                 self.incarnation = incarnation.clone()
@@ -1695,6 +1739,9 @@ impl DfsRepairQueueState {
                 change,
                 RepairCustodyChange::ImportOriginalData { .. }
                     | RepairCustodyChange::AssociateImportedExecutor { .. }
+                    | RepairCustodyChange::BeginImportedHistoryQuery { .. }
+                    | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
+                    | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. }
             ) && self.selected_fixture.is_none()
             {
                 return Err(custody_error("selected original DATA requires its admitted physical fixture"));
@@ -3739,10 +3786,14 @@ fn replay_repair_queue_log(
             && batch.operations.iter().any(|operation| matches!(operation,
                 DfsRepairQueueOperation::RepairCustody { change } if matches!(change.as_ref(),
                     RepairCustodyChange::ImportOriginalData { .. }
-                        | RepairCustodyChange::AssociateImportedExecutor { .. })))
+                        | RepairCustodyChange::AssociateImportedExecutor { .. }
+                    | RepairCustodyChange::BeginImportedHistoryQuery { .. }
+                    | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
+                    | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. })))
         {
             return Err(custody_error("default queue replay rejects selected original DATA"));
         }
+        if selected_reader { history::validate_history_frame(&batch.operations)?; }
         if batch.sequence <= snapshot_floor {
             if custody.incarnation.is_empty()
                 && batch.operations.iter().any(|operation| {
@@ -3764,6 +3815,17 @@ fn replay_repair_queue_log(
                     batch.sequence
                 ),
             });
+        }
+        if selected_reader {
+            for operation in &batch.operations {
+                if let DfsRepairQueueOperation::RepairCustody { change } = operation
+                    && matches!(change.as_ref(), RepairCustodyChange::BeginImportedHistoryQuery { .. }
+                        | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
+                        | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. }) {
+                    custody.validate_change(change)?;
+                    custody.validate_history_sequence(change, batch.sequence)?;
+                }
+            }
         }
         custody.validate_scheduling_changes(&batch.operations)?;
         custody.validate_enrollment_records(records, &batch.operations)?;

@@ -19,6 +19,130 @@ use crate::transfer::{
 };
 use crate::*;
 
+#[cfg(test)]
+thread_local! {
+    // Negative cuts on this explicit caller only. Neither supplies a reply or
+    // retained history, and no worker/timer is installed.
+    pub(crate) static HISTORY_QUERY_AFTER_ATTEMPT: std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(), DfsError>>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static HISTORY_QUERY_AFTER_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> Result<(), DfsError>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NetworkedDfsService<crate::DfsNodeTransport> {
+    /// Explicit one-item selected history query. No executor association or B
+    /// bytes are required; historical values never enter Repair completion.
+    pub(crate) fn query_installed_original_history(
+        &mut self, assignment: &DfsMetadataShardConfig, producer: &NodeId, request_id: &str,
+    ) -> Result<DfsOriginalRepairHistoryResponse, DfsError> {
+        use std::time::Instant;
+        let captured = Instant::now();
+        let deadline = self.transport.operation_deadline().map_or(captured + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            |caller| caller.min(captured + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT));
+        // This API owns two distinct phases. It cannot release an admission
+        // borrowed from an enclosing Main mutation/callback.
+        if self.publication_execution.current().is_some() {
+            return Err(DfsError::Metadata { message: "history query cannot borrow an enclosing mutation phase".into() });
+        }
+        let query = self.with_imported_history_phase(assignment, producer, request_id, deadline, |service, queue, imported| {
+            queue.begin_imported_history_query(imported, assignment, deadline, || {
+                history_query_deadline(deadline)?;
+                let carrier = DfsOriginalRepairHistoryCarrier { source: service.node_id.clone(),
+                    target: imported.material.birth.original.target_node_id.clone(), frame_id: service.next_frame_id, message_id: service.next_message_id };
+                service.next_frame_id = service.next_frame_id.checked_add(1).ok_or_else(|| DfsError::Metadata { message: "history frame identity exhausted".into() })?;
+                service.next_message_id = service.next_message_id.checked_add(1).ok_or_else(|| DfsError::Metadata { message: "history message identity exhausted".into() })?;
+                Ok(carrier)
+            })
+        })?;
+        history_query_deadline(deadline)?;
+        if let Some(response) = query.terminal() { return Ok(response.clone()); }
+        #[cfg(test)]
+        HISTORY_QUERY_AFTER_ATTEMPT.with(|slot| {
+            let cut = slot.borrow_mut().take();
+            if let Some(cut) = cut { cut()?; }
+            Ok::<(), DfsError>(())
+        })?;
+        // All B mutation, queue writer and shard-fence owners from the first
+        // phase have been dropped before this actual one-call RPC.
+        let request = query.request();
+        let returned = self.transport.request_original_repair_history_direct(
+            &request.carrier.target, &request.routed(), deadline,
+        );
+        match returned {
+            Err(error) => {
+                let delivery = error.delivery_state();
+                // Failure facts concern only this query. If current B is gone
+                // the already-synced attempt remains conservatively unknown.
+                let _ = self.with_imported_history_phase(assignment, producer, request_id, deadline, |_, queue, _| {
+                    queue.observe_imported_history_delivery(&query, delivery, deadline)
+                });
+                Err(DfsError::from_network(error))
+            }
+            Ok(returned) => {
+                history_query_deadline(deadline)?;
+                let routed = returned.into_routed();
+                let observed = self.with_imported_history_phase(assignment, producer, request_id, deadline, |_, queue, _| {
+                    history_query_deadline(deadline)?;
+                    queue.observe_imported_history_result(&query, routed, deadline)
+                })?;
+                #[cfg(test)]
+                HISTORY_QUERY_AFTER_OBSERVATION.with(|slot| {
+                    let cut = slot.borrow_mut().take();
+            if let Some(cut) = cut { cut()?; }
+                    Ok::<(), DfsError>(())
+                })?;
+                history_query_deadline(deadline)?;
+                let result = observed.response().ok_or_else(|| DfsError::Metadata { message: "history observation has no exact result".into() })?;
+                Ok(result.clone())
+            }
+        }
+    }
+
+    fn with_imported_history_phase<R>(
+        &mut self, assignment: &DfsMetadataShardConfig, producer: &NodeId, request_id: &str,
+        deadline: std::time::Instant,
+        operation: impl FnOnce(&mut Self, &crate::LocalDfsRepairQueueStore, &crate::repair_queue_store::ImportedRepairOriginalData) -> Result<R, DfsError>,
+    ) -> Result<R, DfsError> {
+        history_query_deadline(deadline)?;
+        let invalid = || DfsError::Metadata { message: "history query has no exact current native B owner/import".into() };
+        if assignment.primary_node_id != self.node_id || producer == &self.node_id || self.publication_execution.current().is_some() { return Err(invalid()); }
+        let shard = DfsMetadataShardId::new(&assignment.shard_id);
+        let backend = self.metadata_backend.as_ref().ok_or_else(invalid)?;
+        let layout = backend.selected_original_data_layout(&assignment.file_system_id, &shard)?.ok_or_else(invalid)?;
+        let scope = backend.publication_owner_scope(&assignment.file_system_id, &shard)?;
+        let owner = crate::runtime_host::publication_runtime_owner(scope.root()).map_err(|error| DfsError::Metadata { message: error.to_string() })?.ok_or_else(invalid)?;
+        layout.check_owner(&owner)?;
+        let queue = layout.queue()?;
+        let imported = queue.installed_original_handoff_data(producer, request_id)?.ok_or_else(invalid)?;
+        if imported.material.cut.handoff.desired_shard != *assignment { return Err(invalid()); }
+        let _admission = self.acquire_prepared_execution(&DfsPreparedOperationScope { file_system_id: assignment.file_system_id.clone(),
+            shard_id: shard.clone(), owner_epoch: assignment.epoch, operation_id: request_id.to_owned() })?.ok_or_else(invalid)?;
+        history_query_deadline(deadline)?;
+        let execution = self.publication_execution.current().ok_or_else(invalid)?;
+        let provider = self.publication_provider.current().ok_or_else(invalid)?;
+        let material = imported.material.birth.original_wire_material()?;
+        provider.validate_original_history_installer(&execution, &scope, &material, assignment,
+            &self.node_id, &imported.material.birth.original.target_node_id)?;
+        let _fence = crate::publication_guard::shard_fence_guard(&scope);
+        let backend = self.metadata_backend.as_ref().ok_or_else(invalid)?;
+        let freeze = backend.metadata_shard_write_freeze(&shard)?.ok_or_else(invalid)?;
+        if freeze.activated_epoch != Some(assignment.epoch) || freeze.repair_custody.as_ref() != Some(&imported.material.cut)
+            || backend.metadata_shard_authoritative_writes_frozen(&shard)? { return Err(invalid()); }
+        history_query_deadline(deadline)?;
+        let result = operation(self, &queue, &imported)?;
+        provider.validate_original_history_installer(&execution, &scope, &material, assignment,
+            &self.node_id, &imported.material.birth.original.target_node_id)?;
+        layout.check_owner(&owner)?;
+        history_query_deadline(deadline)?;
+        Ok(result)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn history_query_deadline(deadline: std::time::Instant) -> Result<(), DfsError> {
+    if std::time::Instant::now() >= deadline { return Err(DfsError::Metadata { message: "original history query caller deadline expired".into() }); }
+    Ok(())
+}
+
 /// Only the actual selected native receiver can construct this outcome after
 /// its fixed content/cache branch succeeds. It is not a serialized capability.
 pub(crate) struct NativeOriginalRepairOutcome {

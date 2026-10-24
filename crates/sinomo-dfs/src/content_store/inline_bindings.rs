@@ -600,8 +600,59 @@ enum InlineFault {
 #[cfg(test)]
 thread_local! { static INLINE_FAULT: RefCell<Option<(PathBuf, InlineFault)>> = const { RefCell::new(None) }; }
 #[cfg(test)]
+thread_local! {
+    // Lifetime provenance only, not another injection point. Ordinary users
+    // of INLINE_FAULT are not owned or cleared by this native fixture guard.
+    static ORIGINAL_REPAIR_TEST_FAULT: RefCell<Option<(PathBuf, InlineFault)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct OriginalRepairTestFaultCleanup {
+    root: PathBuf,
+    _same_worker: std::marker::PhantomData<Rc<()>>,
+}
+#[cfg(test)]
+impl OriginalRepairTestFaultCleanup {
+    fn new(root: PathBuf) -> Self {
+        Self { root, _same_worker: std::marker::PhantomData }
+    }
+}
+#[cfg(test)]
+impl Drop for OriginalRepairTestFaultCleanup {
+    fn drop(&mut self) {
+        let owned = ORIGINAL_REPAIR_TEST_FAULT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(root, _)| root == &self.root) { slot.take() } else { None }
+        });
+        if let Some(owned) = owned {
+            INLINE_FAULT.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.as_ref() == Some(&owned) { slot.take(); }
+            });
+        }
+    }
+}
+#[cfg(test)]
+fn arm_original_repair_test_fault(root: &Path, point: InlineFault) -> Result<()> {
+    if !matches!(point, InlineFault::ReceiverAfterPrepared | InlineFault::CatalogCertification) {
+        return Err(inline_error("unsupported original Repair fixture fault"));
+    }
+    INLINE_FAULT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() { return Err(inline_error("original Repair test fault cannot replace an existing fault")); }
+        ORIGINAL_REPAIR_TEST_FAULT.with(|owned| {
+            let mut owned = owned.borrow_mut();
+            if owned.is_some() { return Err(inline_error("original Repair test fault still has a lifetime owner")); }
+            let fault = (root.to_owned(), point);
+            *owned = Some(fault.clone());
+            *slot = Some(fault);
+            Ok(())
+        })
+    })
+}
+#[cfg(test)]
 fn take_inline_fault(root: &Path, point: InlineFault) -> bool {
-    INLINE_FAULT.with(|fault| {
+    let taken = INLINE_FAULT.with(|fault| {
         let mut fault = fault.borrow_mut();
         if fault
             .as_ref()
@@ -612,7 +663,14 @@ fn take_inline_fault(root: &Path, point: InlineFault) -> bool {
         } else {
             false
         }
-    })
+    });
+    if taken {
+        ORIGINAL_REPAIR_TEST_FAULT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(path, armed)| path == root && *armed == point) { slot.take(); }
+        });
+    }
+    taken
 }
 fn publish_catalog(root: &Path, catalog: &InlineCatalog) -> Result<()> {
     let bytes = encode_catalog(catalog)?;

@@ -135,6 +135,12 @@ pub(crate) struct ReceivedRepairFixtureIdentity {
 }
 
 impl ReceivedRepairFixtureIdentity {
+    #[cfg(test)]
+    pub(crate) fn original_repair_test_fault_cleanup(&self) -> Option<OriginalRepairTestFaultCleanup> {
+        (self.format == ORIGINAL_REPAIR_FIXTURE_VERSION)
+            .then(|| OriginalRepairTestFaultCleanup::new(self.root.clone()))
+    }
+
     pub(crate) fn is_at_root(&self, root: &Path) -> bool { self.root == root }
     pub(crate) fn check_original_physical_identity(&self) -> Result<()> {
         if self.format != ORIGINAL_REPAIR_FIXTURE_VERSION { return Err(inline_error("expected original Repair identity is not private4")); }
@@ -892,6 +898,9 @@ impl LocalContentStore {
     }
 
     pub(crate) fn arm_received_repair_after_prepared_test_cut(&self) {
+        // This ordinary setter replaces the existing slot. Even an identical
+        // root/point is a new unowned injection, not the former managed arm.
+        ORIGINAL_REPAIR_TEST_FAULT.with(|owned| { owned.borrow_mut().take(); });
         INLINE_FAULT.with(|fault| {
             *fault.borrow_mut() = Some((self.root.clone(), InlineFault::ReceiverAfterPrepared))
         });

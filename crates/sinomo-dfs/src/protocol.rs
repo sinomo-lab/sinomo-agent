@@ -1652,6 +1652,164 @@ pub struct DfsSelectedOriginalRepairCommand {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// Exact installed DATA reference. This is correlation, never authority or a
+/// claim that the history holder certified the installer's queue.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsImportedRepairHistoryRef {
+    pub(crate) queue_incarnation: String,
+    pub(crate) imported_at_sequence: u64,
+    pub(crate) captured_birth_digest: String,
+    pub(crate) original_command_digest: String,
+    pub(crate) cut: crate::DfsRepairHandoffCut,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairHistoryQueryRef {
+    pub(crate) queue_incarnation: String,
+    pub(crate) attempt_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairHistoryCarrier {
+    pub(crate) source: NodeId,
+    pub(crate) target: NodeId,
+    pub(crate) frame_id: u64,
+    pub(crate) message_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairHistoryRequest {
+    pub(crate) version: u32,
+    pub(crate) query_ref: DfsOriginalRepairHistoryQueryRef,
+    pub(crate) import_ref: DfsImportedRepairHistoryRef,
+    pub(crate) original_material: DfsOriginalRepairMaterial,
+    pub(crate) current_assignment: DfsMetadataShardConfig,
+    pub(crate) carrier: DfsOriginalRepairHistoryCarrier,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairHistoryCertificate {
+    pub(crate) store_incarnation: String,
+    pub(crate) prepared_id: u64,
+    pub(crate) prepared_seal: String,
+    pub(crate) bound_id: u64,
+    pub(crate) terminal_id: u64,
+    pub(crate) response_digest: String,
+    pub(crate) provenance: crate::publication_guard::NativeContentOnlyRepairProvenance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub enum DfsOriginalRepairHistoryPending {
+    MissingTerminal,
+    UnsupportedHistory,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub enum DfsOriginalRepairHistoryRejection {
+    InvalidScope,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub enum DfsOriginalRepairHistoryResult {
+    HistoricalTerminal {
+        certificate: DfsOriginalRepairHistoryCertificate,
+        exact_original_response: DfsRepairReplicaResponse,
+    },
+    Pending { reason: DfsOriginalRepairHistoryPending },
+    RejectedQuery { reason: DfsOriginalRepairHistoryRejection },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairHistoryResponse {
+    pub(crate) version: u32,
+    pub(crate) query_ref: DfsOriginalRepairHistoryQueryRef,
+    pub(crate) import_ref: DfsImportedRepairHistoryRef,
+    pub(crate) original_command_digest: String,
+    pub(crate) query_carrier: DfsOriginalRepairHistoryCarrier,
+    pub(crate) result: DfsOriginalRepairHistoryResult,
+}
+
+impl DfsImportedRepairHistoryRef {
+    pub(crate) fn validate_original_carrier(&self, original: &DfsOriginalRepairMaterial,
+        assignment: &DfsMetadataShardConfig, carrier: &DfsOriginalRepairHistoryCarrier) -> Result<(), crate::DfsError> {
+        let invalid = || crate::DfsError::Metadata { message: "original history query does not bind its exact installed origin/carrier".into() };
+        original.validate()?;
+        self.cut.validate_selected_original_data()?;
+        let selected = self.cut.selected_original_data.as_ref().ok_or_else(invalid)?;
+        if self.imported_at_sequence == 0 || self.queue_incarnation.is_empty()
+            || self.queue_incarnation == original.subject.queue_incarnation
+            || self.original_command_digest != original.command_digest
+            || self.captured_birth_digest != selected.captured_birth_digest
+            || selected.source_queue_incarnation != original.subject.queue_incarnation
+            || selected.producer != original.original.source_node_id
+            || selected.request_id != original.original.command.request_id
+            || selected.original_digest != original.command_digest
+            || assignment != &self.cut.handoff.desired_shard
+            || carrier.source != assignment.primary_node_id
+            || carrier.source == original.original.source_node_id
+            || carrier.target != original.original.target_node_id
+            || !assignment.replica_node_ids.contains(&carrier.target)
+            || assignment.file_system_id != original.original.command.file_system_id
+        { return Err(invalid()); }
+        Ok(())
+    }
+}
+
+impl DfsOriginalRepairHistoryRequest {
+    pub(crate) fn validate(&self) -> Result<(), crate::DfsError> {
+        self.import_ref.validate_original_carrier(&self.original_material, &self.current_assignment, &self.carrier)?;
+        if self.version != 1 || self.query_ref.attempt_sequence <= self.import_ref.imported_at_sequence
+            || self.query_ref.queue_incarnation != self.import_ref.queue_incarnation {
+            return Err(crate::DfsError::Metadata { message: "history query has no exact actual queue append reference".into() });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn routed(&self) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: self.carrier.source.clone(), target_node_id: self.carrier.target.clone(),
+            frame_id: self.carrier.frame_id, message_id: self.carrier.message_id,
+            message: DfsNetworkMessage::OriginalRepairHistoryRequest(self.clone()),
+        }
+    }
+}
+
+impl DfsOriginalRepairHistoryResponse {
+    pub(crate) fn validate_for_request(&self, request: &DfsOriginalRepairHistoryRequest) -> Result<(), crate::DfsError> {
+        request.validate()?;
+        let invalid = || crate::DfsError::Metadata { message: "historical Repair result does not match the exact query/origin".into() };
+        if self.version != 1 || self.query_ref != request.query_ref || self.import_ref != request.import_ref
+            || self.original_command_digest != request.original_material.command_digest || self.query_carrier != request.carrier
+        { return Err(invalid()); }
+        if let DfsOriginalRepairHistoryResult::HistoricalTerminal { certificate, exact_original_response: response } = &self.result {
+            let original = &request.original_material;
+            let command = &original.original.command;
+            if certificate.store_incarnation.is_empty() || certificate.prepared_id == 0
+                || certificate.prepared_id >= certificate.bound_id || certificate.bound_id >= certificate.terminal_id
+                || certificate.prepared_seal != crate::LocalContentStore::original_repair_prepared_seal(
+                    original, &original.original.target_node_id, &certificate.store_incarnation, certificate.prepared_id)?
+                || certificate.response_digest != crate::repair_queue_store::repair_result_digest(response)?
+                || certificate.provenance.receiver != original.original.target_node_id
+                || command.authority_shard.as_ref() != Some(&certificate.provenance.admitted_shard)
+                || response.request_id != command.request_id || response.intent_id != command.intent_id
+                || response.file_system_id != command.file_system_id || response.object_id != command.object_id
+                || response.version != command.version || response.replica_node_id != original.original.target_node_id
+                || !matches!(&response.result, DfsBlobTransferResult::Committed { content_hash } if content_hash == &command.content_hash)
+            { return Err(invalid()); }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataJournalBatchResult {
@@ -1724,6 +1882,8 @@ pub enum DfsNetworkMessage {
     ContentRootCatalogPageResponse(DfsContentRootCatalogPage),
     // Append new variants so existing ordinal-based codecs keep V1 indices.
     SelectedOriginalRepair(DfsSelectedOriginalRepairCommand),
+    OriginalRepairHistoryRequest(DfsOriginalRepairHistoryRequest),
+    OriginalRepairHistoryResponse(DfsOriginalRepairHistoryResponse),
 }
 
 impl DfsMetadataJournalBatchResult {
