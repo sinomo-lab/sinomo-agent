@@ -2577,6 +2577,11 @@ mod tests {
 
     #[test]
     fn active_timeline_can_annotate_forwarded_streamed_value_metadata() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "route::tests::active_timeline_can_annotate_forwarded_streamed_value_metadata",
+        ) {
+            return;
+        }
         let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
         if crate::network_timeline_capture_is_active() {
             let _ = crate::stop_network_timeline_capture();
@@ -2603,6 +2608,11 @@ mod tests {
 
     #[test]
     fn active_timeline_still_samples_mutable_calls() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "route::tests::active_timeline_still_samples_mutable_calls",
+        ) {
+            return;
+        }
         let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
         if crate::network_timeline_capture_is_active() {
             let _ = crate::stop_network_timeline_capture();
