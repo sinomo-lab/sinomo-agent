@@ -3982,6 +3982,9 @@ pub(crate) mod tests {
         // handoff/configuration VALUES test local DATA persistence only; this
         // helper does not impersonate native cluster authority or execution.
         fn fixture(root: &Path) -> Fixture {
+            // Create the case-owned parent for nested policy arms. The
+            // selected-store physical identity checks remain unchanged.
+            fs::create_dir_all(root).unwrap();
             let (source_queue, source_content, original, attachment, retained, source_identity) =
                 selected_original_fixture(&root.join("source"));
             source_queue
