@@ -49,6 +49,37 @@ use crate::{
 };
 
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
+
+/// Pure correlation validation returns DATA, not an authenticated capability.
+/// Only the actual native RPC owner wraps its successful output.
+pub(crate) fn validate_original_history_rpc_return(command: &DfsMessageCommand, response: DfsMessageResponse) -> Result<DfsRoutedMessage, NetworkError> {
+    let invalid = |detail: &str| NetworkError::Serialization { detail: detail.to_owned() };
+    let DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &command.routed_message.message else {
+        return Err(invalid("history return has no exact request family"));
+    };
+    request.validate().map_err(|error| invalid(&error.to_string()))?;
+    if command.routed_message != request.routed() { return Err(invalid("history request carrier differs")); }
+    if response.request_id != command.request_id || response.outbound_messages.len() != 1 {
+        return Err(invalid("history RPC must return exactly one response for its outer request"));
+    }
+    let returned = response.outbound_messages.into_iter().next().ok_or_else(|| invalid("history response missing"))?;
+    if returned.source_node_id != request.carrier.target || returned.target_node_id != request.carrier.source {
+        return Err(invalid("history return route differs from its actual query"));
+    }
+    let DfsNetworkMessage::OriginalRepairHistoryResponse(response) = &returned.message else {
+        return Err(invalid("history RPC returned an unrelated message family"));
+    };
+    response.validate_for_request(request).map_err(|error| invalid(&error.to_string()))?;
+    Ok(returned)
+}
+
+/// Only the native one-call decoder can construct this non-effect return.
+pub(crate) struct VerifiedOriginalRepairHistoryReturn {
+    returned: DfsRoutedMessage,
+}
+impl VerifiedOriginalRepairHistoryReturn {
+    pub(crate) fn into_routed(self) -> DfsRoutedMessage { self.returned }
+}
 /// Refinement of `PromotionFanoutCap` in `replica_quorum_fanout.qnt`.
 const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
 /// Process-local terminal promotion identities suppress redundant hydration
@@ -2311,6 +2342,41 @@ impl DfsNodeTransport {
                 ),
             })?;
         Ok(page)
+    }
+
+    /// One explicit RPC owns its entire return. This path never touches the
+    /// generic incoming queue, detached outbox, retry helper or frame counter.
+    pub(crate) fn request_original_repair_history_direct(
+        &self, target: &NodeId, carrier: &DfsRoutedMessage, deadline: Instant,
+    ) -> Result<VerifiedOriginalRepairHistoryReturn, NetworkError> {
+        let invalid = |detail: &str| NetworkError::Serialization { detail: detail.to_owned() };
+        let DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &carrier.message else {
+            return Err(invalid("direct history call requires its exact typed query"));
+        };
+        request.validate().map_err(|error| invalid(&error.to_string()))?;
+        if carrier != &request.routed() || carrier.source_node_id != self.local_node_id
+            || &carrier.target_node_id != target || target == &self.local_node_id
+            || !self.known_remote_nodes.contains(target)
+        { return Err(invalid("direct history call changed its actual native carrier")); }
+        let peer = self.peer_transport.as_ref().ok_or_else(|| invalid("history query requires an actual native peer transport"))?;
+        let command = DfsMessageCommand { request_id: format!("dfs_message_{}", carrier.frame_id), routed_message: carrier.clone() };
+        let call = dfs_message_rpc_call(&command)?;
+        let deadline = self.operation_deadline.map_or(deadline, |earlier| earlier.min(deadline));
+        let options = Self::clamp_send_options_to_operation_deadline(
+            DfsObjectRpcSendOptions::new(self.connect_timeout).with_observe_connectivity(false),
+            Some(deadline), "query retained original Repair history",
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_attempt = crate::native_shard_trace::begin_rpc_attempt(target, &command);
+        let returned = peer.call_object_rpc(target, call, options)
+            .and_then(|result| value_response_from_rpc_result(result)
+                .and_then(|response| decode_dfs_message_rpc_response(&response).map_err(|error| DfsPeerTransportError::new(error.to_string()))));
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(attempt) = native_attempt.as_mut() { attempt.returned(&returned); }
+        let response = returned.map_err(|error| dfs_peer_transport_network_error("query retained original Repair history".into(), error))?;
+        if Instant::now() >= deadline { return Err(invalid("history query returned after its original caller deadline")); }
+        let returned = validate_original_history_rpc_return(&command, response)?;
+        Ok(VerifiedOriginalRepairHistoryReturn { returned })
     }
 
     #[cfg(test)]
@@ -8214,6 +8280,33 @@ fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) 
 }
 
 impl NetworkedDfsService<DfsNodeTransport> {
+    /// Purpose-specific read processing, with no generic inbox/flush/followup
+    /// calls. The actual native host supplies this one-call capability.
+    pub(crate) fn process_verified_original_history_report(
+        &mut self, command: DfsMessageCommand,
+        verified: crate::publication_guard::VerifiedOriginalRepairHistoryRead,
+    ) -> DfsMessageProcessReport {
+        let outcome = (|| {
+            let DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &command.routed_message.message else {
+                return Err(DfsError::Metadata { message: "history read proof used for another family".into() });
+            };
+            if command.routed_message != request.routed() || request.carrier.target != self.node_id {
+                return Err(DfsError::Metadata { message: "history request carrier is not the local verified invocation".into() });
+            }
+            verified.revalidate(request)?;
+            let result = self.content.certified_original_repair_terminal(request, &verified)?;
+            verified.revalidate(request)?;
+            let response = crate::DfsOriginalRepairHistoryResponse { version: 1, query_ref: request.query_ref.clone(),
+                import_ref: request.import_ref.clone(), original_command_digest: request.original_material.command_digest.clone(),
+                query_carrier: request.carrier.clone(), result };
+            response.validate_for_request(request)?;
+            let routed = self.next_dfs_routed_message(&request.carrier.source, DfsNetworkMessage::OriginalRepairHistoryResponse(response));
+            Ok(DfsMessageProcessResult { response: DfsMessageResponse { request_id: command.request_id, outbound_messages: vec![routed] },
+                attachment: None, events: Vec::new() })
+        })();
+        DfsMessageProcessReport { outcome, committed_work: Default::default(), committed_repair_records: Vec::new() }
+    }
+
     pub(crate) fn set_background_replica_dispatch(&mut self, enabled: bool) {
         let Some(served) = self.transport.served_message.as_deref_mut() else {
             return;

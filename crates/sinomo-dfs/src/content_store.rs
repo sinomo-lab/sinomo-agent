@@ -25,6 +25,8 @@ use fs2::FileExt;
 pub use inline_bindings::{ContentStoreStagingRow, ContentStoreStagingWriter};
 use inline_bindings::{InlineReservationState, InlineStoreLease, InlineVersionState};
 pub(crate) use inline_bindings::{BoundOriginalRepairContent, ReceivedRepairFixtureIdentity};
+#[cfg(test)]
+pub(crate) use inline_bindings::OriginalRepairTestFaultCleanup;
 pub use readers::{BlobRangeReader, BlobReader, ObjectVersionReader};
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};

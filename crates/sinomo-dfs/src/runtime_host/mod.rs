@@ -520,6 +520,24 @@ impl DfsDataOwnerLock {
     }
 }
 
+/// The existing native test hook may arm only after mandatory actual-owner
+/// cleanup capture. The local !Send guard also covers callback error/unwind.
+#[cfg(test)]
+pub(crate) fn run_original_repair_test_hook_with_cleanup(
+    owner_lookup: Result<Option<Arc<DfsDataOwnerLock>>, crate::DfsError>,
+    before_execute: impl FnOnce() -> Result<(), crate::DfsError>,
+) -> Result<crate::content_store::OriginalRepairTestFaultCleanup, crate::DfsError> {
+    let owner = owner_lookup?.ok_or_else(|| crate::DfsError::Metadata {
+        message: "original Repair test hook requires its actual native DATA owner".into(),
+    })?;
+    let identity = owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
+    let cleanup = identity.original_repair_test_fault_cleanup().ok_or_else(|| crate::DfsError::Metadata {
+        message: "original Repair test hook requires its private4 cleanup identity".into(),
+    })?;
+    before_execute()?;
+    Ok(cleanup)
+}
+
 impl Drop for DfsDataOwnerLock {
     fn drop(&mut self) {
         let _ = self.file.unlock();

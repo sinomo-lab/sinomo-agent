@@ -1039,6 +1039,7 @@ impl DfsRuntimeMessageCacheEntry {
 
 pub(crate) fn dfs_runtime_message_uses_content_read_lane(command: &DfsMessageCommand) -> bool {
     match &command.routed_message.message {
+        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => true,
         DfsNetworkMessage::ReadRequest(request) => {
             request.version.is_some() && request.content_hash.is_some()
         }
@@ -1287,6 +1288,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
     preingested_blob: Option<crate::ContentStoreQuarantinedBlob>,
     execution_scope: &crate::DfsMessageExecutionScope,
     verified_fetch: Option<crate::service_fetch_transfer::VerifiedDfsBlobFetch>,
+    verified_history: Option<crate::publication_guard::VerifiedOriginalRepairHistoryRead>,
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
@@ -1300,6 +1302,13 @@ where
         DfsNetworkMessage::FetchBlobResponse(_)
     );
     let is_verified_fetch = verified_fetch.is_some();
+    let is_verified_history = verified_history.is_some();
+    if matches!(&command.routed_message.message, DfsNetworkMessage::OriginalRepairHistoryRequest(_)) != is_verified_history
+        || matches!(&command.routed_message.message, DfsNetworkMessage::OriginalRepairHistoryResponse(_))
+        || (is_verified_history && verified_fetch.is_some())
+        || (is_verified_history && (completed_phase.is_some() || publication_owners.is_some()
+            || publication_provider.is_some()))
+    { return Err(crate::DfsError::Metadata { message: "history request/context has no exact verified per-call owner".into() }); }
     let is_read_only = is_verified_fetch || crate::dfs_message_is_read_only_request(&command);
     let lane_lock_wait_started = std::time::Instant::now();
     let mut service_lane = service_lane_handle
@@ -1308,7 +1317,12 @@ where
             message: "DFS runtime message lane lock poisoned".to_string(),
         })?;
     let lane_lock_wait = lane_lock_wait_started.elapsed();
-    if is_verified_fetch
+    if is_verified_history && (service_lane.service.remote_namespace_phase.is_some()
+        || service_lane.service.publication_execution.current().is_some()
+        || service_lane.service.publication_provider.current().is_some()) {
+        return Err(crate::DfsError::Metadata { message: "history read cannot consume a preexisting mutation/remote phase".into() });
+    }
+    if (is_verified_fetch || is_verified_history)
         && (service_lane.resident_metadata_scope.is_some()
             || preingested_blob.is_some()
             || !service_lane
@@ -1365,13 +1379,15 @@ where
     service_lane
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
-    let mut process_report = match verified_fetch {
-        Some(verified) => service_lane
+    let mut process_report = match (verified_fetch, verified_history) {
+        (None, Some(verified)) => service_lane.service.process_verified_original_history_report(command, verified),
+        (Some(verified), None) => service_lane
             .service
             .process_verified_blob_fetch_report(command, verified),
-        None => service_lane
+        (None, None) => service_lane
             .service
             .process_message_command_report_with_preingested_blob(command, preingested_blob),
+        (Some(_), Some(_)) => unreachable!("mutually exclusive verified request families"),
     };
     if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {
         match &process_report.outcome {
@@ -1384,6 +1400,9 @@ where
                 response = ?response, error = %error,
                 "normal Main decoded repair reply execution failed"),
         }
+    }
+    if is_verified_history && service_lane.service.remote_namespace_phase.is_some() {
+        return Err(crate::DfsError::Metadata { message: "history handler cannot consume a remote namespace phase".into() });
     }
     let remote_namespace_phase = service_lane
         .service

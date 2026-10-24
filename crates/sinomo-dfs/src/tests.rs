@@ -293,6 +293,8 @@ fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
         DfsNetworkMessage::CommitVersionResponse(_) => "commit-version-response".to_string(),
         DfsNetworkMessage::RepairReplica(_) => "repair-replica".to_string(),
         DfsNetworkMessage::SelectedOriginalRepair(_) => "selected-original-repair".to_string(),
+        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => "original-repair-history-request".to_string(),
+        DfsNetworkMessage::OriginalRepairHistoryResponse(_) => "original-repair-history-response".to_string(),
         DfsNetworkMessage::RepairReplicaResponse(_) => "repair-replica-response".to_string(),
         DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch".to_string(),
         DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
