@@ -333,6 +333,16 @@ impl LocalSobjMetadataBackend {
                 return Err(error);
             }
         }
+        #[cfg(test)]
+        if let Some(deadline) = selected_install_deadline {
+            let hook = SELECTED_INSTALL_AFTER_MARKER_SYNC.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.as_ref().is_some_and(|(root, expected, _)| root == &self.root && expected == handoff_id) {
+                    slot.take().map(|(_, _, hook)| hook)
+                } else { None }
+            });
+            if let Some(hook) = hook { hook(deadline); }
+        }
         if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             self.instance_authority_epoch = previous_instance_authority_epoch;
             return Err(MetadataBackendError::Rejected {

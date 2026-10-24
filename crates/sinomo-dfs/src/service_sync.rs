@@ -5133,6 +5133,164 @@ mod native_selected_data_tests {
     }
 
     #[test]
+    fn native_selected_install_expiry_after_marker_sync_retains_data_and_cold_rebinds() {
+        let path = "/services/selected-original-data.bin";
+        let mut fixture = genuine_native_original("native-selected-install-marker-expiry");
+        let mut facts = serde_json::json!({
+            "actual_marker_hook_reached": false, "expired_instance_remains_fenced": false,
+            "exact_import_cursor_marker_retained": false, "fresh_cold_rebind_completed": false,
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = fixture.shard.primary_node_id.clone();
+            let promoted = fixture.promoted.clone();
+            let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
+            let layout = fixture.runtime.selected_original_data_layout(&promoted).unwrap();
+            let request = fixture.birth.root.subject.request_id.clone();
+            let mut source = fixture.runtime.metadata_primary_service(path).unwrap();
+            let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
+            let control = fixture.runtime.shared_control_plane().unwrap();
+            let proposed = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&fixture.shard, &promoted)).unwrap().unwrap();
+            fixture.runtime.select_genuine_original_before_handoff(&owner, &request, &proposed).unwrap();
+            drop(fence);
+            let handoff_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            let produced = source.reconcile_pending_metadata_shard_membership_handoffs(
+                &fixture.runtime.metadata_shards().unwrap(), handoff_deadline.saturating_duration_since(Instant::now()));
+            drop(source);
+            assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, handoff_deadline).unwrap(),
+                Some(proposed.desired_shard.clone()), "genuine source handoff result: {produced:?}");
+            loop {
+                let marker = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                    fixture.runtime.data_dir(&promoted), &shard, Some(&layout)).unwrap();
+                if marker.is_some_and(|marker| marker.activated_epoch == Some(proposed.desired_shard.epoch)) { break; }
+                let remaining = handoff_deadline.checked_duration_since(Instant::now())
+                    .expect("initial selected installation keeps the original 45s budget");
+                fixture.runtime.maintenance_tick(&promoted, remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)).unwrap();
+            }
+            assert!(Instant::now() <= handoff_deadline);
+            let active = fixture.runtime.metadata_shards().unwrap().into_iter()
+                .find(|current| current.file_system_id == fixture.shard.file_system_id
+                    && current.shard_id == fixture.shard.shard_id).unwrap();
+            assert_eq!(active, proposed.desired_shard);
+            let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .get_metadata_shard_membership_handoff(&active.file_system_id, &active.shard_id)).unwrap();
+            assert!(pending.is_none());
+            let proof = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .get_metadata_shard_membership_handoff_proof(&active.file_system_id, &active.shard_id)).unwrap().unwrap();
+            assert_eq!(proof.handoff_id, proposed.handoff_id);
+            assert_eq!(proof.desired_shard, active);
+
+            // Real native B admission excludes competing same-shard work while
+            // a separate cold handle exercises the actual file-backed writer.
+            let native = fixture.runtime.metadata_primary_service(path).unwrap();
+            let admission = native.acquire_prepared_execution(&DfsPreparedOperationScope {
+                file_system_id: active.file_system_id.clone(), shard_id: shard.clone(),
+                owner_epoch: active.epoch, operation_id: request.clone(),
+            }).unwrap();
+            let scope = native.metadata_backend().unwrap().publication_owner_scope(&active.file_system_id, &shard).unwrap();
+            assert!(native.publication_execution.current().is_some_and(|execution|
+                execution.admits(&scope, &active.file_system_id, &shard)));
+            let root = crate::local_dfs_metadata_shard_path(fixture.runtime.data_dir(&promoted), &shard);
+            assert_eq!(scope.root(), root.as_path());
+            let queue = layout.queue().unwrap();
+            let imported = queue.installed_original_handoff_data(&owner, &request).unwrap().unwrap();
+            assert_eq!(imported.material.birth.original, fixture.birth.original);
+            assert_eq!(imported.material.birth.attachment, fixture.birth.attachment);
+            assert_eq!(imported.material.birth.root, fixture.birth.root);
+            let before_queue = queue.view().unwrap();
+            let before_marker = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                fixture.runtime.data_dir(&promoted), &shard, Some(&layout)).unwrap().unwrap();
+            assert_eq!(before_marker.repair_custody.as_ref(), Some(&imported.material.cut));
+            let cursor_path = root.join("journal/repair-handoffs-v1")
+                .join(format!("{}-received", blake3::hash(proposed.handoff_id.as_bytes()).to_hex()))
+                .join("received.sobj");
+            let before_cursor = std::fs::read(&cursor_path).unwrap();
+            let source_queue = fixture.runtime.selected_original_data_layout(&owner).unwrap().queue().unwrap();
+            let source_before = source_queue.original_repair(&fixture.birth.original).unwrap().unwrap();
+            let mut cold = LocalSobjMetadataBackend::open_for_inspection_with_layout(
+                shard.clone(), root.clone(), Some((active.file_system_id.clone(), Arc::clone(&layout)))).unwrap();
+            assert!(cold.metadata_shard_instance_writes_frozen(&shard).unwrap());
+            let prefix = DfsMetadataBackend::metadata_prefix_proof(&cold, &shard).unwrap().unwrap();
+
+            struct ClearSelectedInstallHook;
+            impl Drop for ClearSelectedInstallHook {
+                fn drop(&mut self) {
+                    crate::metadata_backend::SELECTED_INSTALL_AFTER_MARKER_SYNC.with(|slot| { slot.borrow_mut().take(); });
+                }
+            }
+            let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = std::rc::Rc::clone(&reached);
+            crate::metadata_backend::SELECTED_INSTALL_AFTER_MARKER_SYNC.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some((root.clone(), proposed.handoff_id.clone(), Box::new(move |deadline| {
+                    observed.set(true);
+                    // The native owner already captured its real 5s cap. Delay
+                    // this physical boundary; never supply a shorter deadline.
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
+                })));
+            });
+            let clear_hook = ClearSelectedInstallHook;
+            let expired = rebind_completed_metadata_shard_membership_handoff(
+                &mut cold, &promoted, &active, None, Some(&proof));
+            facts["expiry_result"] = serde_json::json!(format!("{expired:?}"));
+            facts["actual_marker_hook_reached"] = serde_json::json!(reached.get());
+            assert!(reached.get(), "the actual synchronized selected marker boundary must execute");
+            assert!(matches!(&expired, Err(DfsError::MetadataRejection {
+                code: DfsMetadataRejectionCode::Other, message,
+            }) if message.contains("expired after marker sync")), "{expired:?}");
+            assert!(cold.metadata_shard_instance_writes_frozen(&shard).unwrap(),
+                "a durable activated marker cannot make the rejected cold instance ready");
+            facts["expired_instance_remains_fenced"] = serde_json::json!(true);
+            assert_eq!(DfsMetadataBackend::metadata_prefix_proof(&cold, &shard).unwrap(), Some(prefix));
+            assert_eq!(queue.view().unwrap(), before_queue);
+            assert_eq!(queue.installed_original_handoff_data(&owner, &request).unwrap(), Some(imported.clone()));
+            assert_eq!(std::fs::read(&cursor_path).unwrap(), before_cursor);
+            assert_eq!(crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                fixture.runtime.data_dir(&promoted), &shard, Some(&layout)).unwrap(), Some(before_marker.clone()));
+            facts["exact_import_cursor_marker_retained"] = serde_json::json!(true);
+            drop(clear_hook);
+            drop(cold);
+
+            // Fresh handle; same physical owner, actual control proof and
+            // immutable imported A birth. No new original/cursor is allocated.
+            let mut reopened = LocalSobjMetadataBackend::open_for_inspection_with_layout(
+                shard.clone(), root, Some((active.file_system_id.clone(), Arc::clone(&layout)))).unwrap();
+            assert!(reopened.metadata_shard_instance_writes_frozen(&shard).unwrap());
+            let rebind_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            assert!(rebind_completed_metadata_shard_membership_handoff(
+                &mut reopened, &promoted, &active, None, Some(&proof)).unwrap());
+            assert!(Instant::now() <= rebind_deadline, "fresh rebind keeps the existing 5s operation bound");
+            assert!(!reopened.metadata_shard_instance_writes_frozen(&shard).unwrap());
+            assert_eq!(queue.view().unwrap(), before_queue);
+            assert_eq!(queue.installed_original_handoff_data(&owner, &request).unwrap(), Some(imported));
+            assert_eq!(std::fs::read(cursor_path).unwrap(), before_cursor);
+            assert_eq!(reopened.metadata_shard_write_freeze(&shard).unwrap(), Some(before_marker));
+            assert!(queue.validate_original_repair_dispatch(&fixture.birth.original).is_err());
+            assert!(queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+            assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), Some(source_before));
+            facts["fresh_cold_rebind_completed"] = serde_json::json!(true);
+            drop(reopened);
+            drop(admission);
+            drop(native);
+        }));
+        let report = serde_json::json!({
+            "assertions_passed": outcome.is_ok(), "initial_original": &fixture.birth, "facts": facts,
+            "qualification": "Native-created selected DATA plus file-backed cold-instance rebind. No first-install crash, process loss, post-replay expiry, successor execution or abrupt-loss proof."
+        });
+        if let Err(error) = std::fs::write(fixture.runtime.data_dir(&fixture.promoted).root()
+            .join("native-selected-install-marker-expiry.json"), serde_json::to_vec_pretty(&report).unwrap())
+        { eprintln!("native selected install-expiry report write failed: {error}"); }
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("native selected install-expiry cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("normal selected install-expiry fixture drain");
+    }
+
+    #[test]
     fn native_selected_imported_executor_requires_b_payload_and_retains_disabled_origin() {
         native_selected_imported_executor_control(false);
     }
