@@ -3321,6 +3321,31 @@ impl DfsTestRuntime {
         )
         .map_err(|e| e.to_string())
     }
+    /// One ordinary client-open attempt with the caller's startup deadline and
+    /// typed Pending result intact. No admission is retained on a yielded open;
+    /// recovery callers can use their existing exact-root continuation path.
+    pub fn client_with_startup_deadline_once(
+        &self,
+        node: &NodeId,
+        deadline: tokio::time::Instant,
+    ) -> Result<NetworkedDfsService<DfsNodeTransport>, crate::runtime_host::DfsRuntimeError> {
+        use crate::runtime_host::DfsRuntimeError;
+        if self.nodes[node].reconciler.is_none() {
+            return Err(DfsRuntimeError::Parse { detail: "DFS case node is stopped".into() });
+        }
+        self.wait_startup_completion_with_budget(Some(deadline), None)
+            .map_err(|detail| DfsRuntimeError::Parse { detail })?;
+        let client = crate::runtime_host::open_dfs_runtime_service(
+            self.data_dir(node), Some(executor().handle()),
+        )?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DfsRuntimeError::Parse {
+                detail: "native client preparation completed after its original startup deadline".into(),
+            });
+        }
+        Ok(client)
+    }
+
     pub fn pause_replica_materialization(
         &self,
         node: &NodeId,

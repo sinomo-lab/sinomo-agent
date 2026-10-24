@@ -4332,7 +4332,34 @@ mod provider_lifecycle_tests {
             original_record,
             "second cold reopen preserves the exact original native record"
         );
-        let mut client = native.client(&source_primary).unwrap();
+        // A concurrent real Main preparation turn may yield Pending0 even after
+        // startup completion. Reuse the existing exact-root continuation and
+        // original client budget; do not retry other roots, progress or errors.
+        let client_deadline = std::time::Instant::now()
+            + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let client_root = sinomo_dfs::default_dfs_metadata_shards_root(
+            native.data_dir(&source_primary),
+        ).join("root");
+        let mut client = placement_work::native_tests::continue_native_source_step(
+            &client_root,
+            client_deadline,
+            || match native.client_with_startup_deadline_once(
+                &source_primary, tokio::time::Instant::from_std(client_deadline),
+            ) {
+                Ok(client) => Ok(client),
+                Err(sinomo_dfs::runtime_host::DfsRuntimeError::StoragePreparationPending {
+                    root, processed_records,
+                }) => {
+                    sinomo_dfs::test_support::record_metadata_operation_boundary(
+                        &native.data_dir(&source_primary).root(),
+                        "users-cold-client-preparation-yield",
+                        || serde_json::json!({"source":root,"processed_records":processed_records}),
+                    );
+                    Err(MetadataBackendError::StoragePreparationPending { root, processed_records })
+                }
+                Err(other) => Err(error(other)),
+            },
+        ).unwrap();
         assert_eq!(client.posix_read_file_distributed(path).unwrap(), after);
         for ((_, _, source_bytes, floors, ..), (_, retained)) in
             modeled.iter().zip(&retained_sources)
