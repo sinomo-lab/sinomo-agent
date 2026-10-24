@@ -1564,7 +1564,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
-            if publication.is_current() && expected_base_version.is_none() {
+            if options.publication.is_current() && expected_base_version.is_none() {
                 options.creation
             } else {
                 DfsWriteCreation::Upsert
@@ -2344,7 +2344,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
-            if publication.is_current() && expected_base_version.is_none() {
+            if options.publication.is_current() && expected_base_version.is_none() {
                 options.creation
             } else {
                 DfsWriteCreation::Upsert
