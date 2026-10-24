@@ -229,6 +229,108 @@ thread_local! {
 static AFTER_SELECTED_HANDOFF_EXPORT: std::sync::Mutex<Option<std::sync::Arc<SelectedSourceExportPause>>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static BEFORE_FIRST_SELECTED_CAPTURE: std::sync::Mutex<Option<std::sync::Arc<SelectedPreCaptureStop>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SelectedPreCaptureObservation {
+    root: std::path::PathBuf,
+    handoff: DfsMetadataShardMembershipHandoff,
+    freeze: crate::DfsMetadataShardWriteFreeze,
+    queue_sequence: u64,
+    birth: crate::repair_queue_store::RepairOriginalBirth,
+}
+
+#[cfg(test)]
+struct SelectedPreCaptureStop {
+    layout: std::sync::Arc<crate::DfsSelectedOriginalDataLayout>,
+    root: std::path::PathBuf,
+    handoff_id: String,
+    request_id: String,
+    observed: std::sync::mpsc::SyncSender<SelectedPreCaptureObservation>,
+    matched_invocations: std::sync::atomic::AtomicUsize,
+}
+
+/// A negative cut, never a successful handoff or a blocking owner lifetime.
+/// No Drop removal: failure cleanup must keep stopping matched owners until
+/// the actual old DATA owner is gone, rather than unpausing them during close.
+#[cfg(test)]
+struct SelectedPreCaptureRegistration(std::sync::Arc<SelectedPreCaptureStop>);
+
+#[cfg(test)]
+impl SelectedPreCaptureRegistration {
+    fn install(stop: SelectedPreCaptureStop) -> Self {
+        let mut registered = BEFORE_FIRST_SELECTED_CAPTURE.lock().unwrap();
+        assert!(registered.is_none(), "an existing pre-capture fault cannot be overwritten");
+        let stop = std::sync::Arc::new(stop);
+        *registered = Some(std::sync::Arc::clone(&stop));
+        Self(stop)
+    }
+
+    fn remove_after_owner_stop(&self, owner: &std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>) {
+        assert!(owner.upgrade().is_none(), "pre-capture fault stays active until the old native owner is gone");
+        let mut registered = BEFORE_FIRST_SELECTED_CAPTURE.lock().unwrap();
+        assert!(registered.as_ref().is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.0)),
+            "only this exact pre-capture registration can be removed");
+        registered.take();
+    }
+}
+
+#[cfg(test)]
+fn stop_selected_before_capture_for_test(
+    root: &Path,
+    layout: &std::sync::Arc<crate::DfsSelectedOriginalDataLayout>,
+    backend: &dyn DfsMetadataBackend,
+    handoff: &DfsMetadataShardMembershipHandoff,
+    request_id: &str,
+    queue_sequence: u64,
+    birth: &crate::repair_queue_store::RepairOriginalBirth,
+    deadline: Instant,
+) -> Result<(), DfsError> {
+    let stop = {
+        let registered = BEFORE_FIRST_SELECTED_CAPTURE.lock().unwrap();
+        registered.as_ref().filter(|stop| stop.root == root
+            && stop.handoff_id == handoff.handoff_id && stop.request_id == request_id
+            && std::sync::Arc::ptr_eq(&stop.layout, layout)).cloned()
+    };
+    let Some(stop) = stop else { return Ok(()); };
+    let invocation = stop.matched_invocations.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let invalid = |message: &str| DfsError::Metadata { message: message.into() };
+    layout.check()?;
+    let shard = DfsMetadataShardId::new(&handoff.retiring_shard.shard_id);
+    let freeze = backend.metadata_shard_write_freeze(&shard)?
+        .ok_or_else(|| invalid("pre-capture fault has no actual source freeze"))?;
+    let fence = handoff.retiring_primary_fence.as_ref()
+        .ok_or_else(|| invalid("pre-capture fault has no authenticated retiring fence"))?;
+    let export = root.join("journal/repair-handoffs-v1")
+        .join(format!("{}-source", blake3::hash(handoff.handoff_id.as_bytes()).to_hex()));
+    match std::fs::symlink_metadata(&export) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(invalid("pre-capture fault cannot certify absence of its exact export directory")),
+    }
+    if freeze.handoff_id != handoff.handoff_id
+        || freeze.retiring_epoch != handoff.retiring_shard.epoch
+        || freeze.activated_epoch.is_some() || freeze.repair_custody.is_some()
+        || freeze.journal_sequence != fence.journal_sequence
+        || freeze.state_fingerprint != fence.state_fingerprint
+        || birth.root.subject.request_id != request_id
+        || birth.original.source_node_id != handoff.retiring_shard.primary_node_id
+        || Instant::now() >= deadline
+    {
+        return Err(invalid("pre-capture fault differs from its exact original/freeze/deadline"));
+    }
+    if invocation == 0 {
+        stop.observed.try_send(SelectedPreCaptureObservation {
+            root: root.to_path_buf(), handoff: handoff.clone(), freeze,
+            queue_sequence, birth: birth.clone(),
+        }).map_err(|_| invalid("pre-capture observation owner unavailable"))?;
+    }
+    // Every matched invocation returns here while registered, including a
+    // different native source owner. No page or success response is supplied.
+    Err(DfsError::Cancelled { operation: "test stop after selected freeze before first capture" })
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct SelectedSourceExportObservation {
     root: std::path::PathBuf,
@@ -1162,7 +1264,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 layout.check_owner(&owner)?;
                 store.validate_selected_original_fixture(layout.queue_layout())?;
                 if let Some(request) = layout.selected_request(&handoff)? {
-                    let (_, birth) = store.selected_original_handoff_data(&self.node_id, &request)?;
+                    let (_selected_sequence, birth) = store.selected_original_handoff_data(&self.node_id, &request)?;
                     let crate::DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
                         return Err(DfsError::Metadata { message: "selected source has no genuine Repair".into() });
                     };
@@ -1172,6 +1274,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     {
                         return Err(DfsError::Metadata { message: "selected original is outside the exact frozen source shard".into() });
                     }
+                    #[cfg(test)]
+                    stop_selected_before_capture_for_test(scope.root(), &layout, backend, &handoff,
+                        &request, _selected_sequence, &birth, deadline)?;
                 }
                 let export = crate::repair_handoff::RepairHandoffExport::capture_native_layout(
                     scope.root(), &layout, &handoff, belongs, deadline,
@@ -5130,6 +5235,193 @@ mod native_selected_data_tests {
             std::panic::resume_unwind(error);
         }
         closed.expect("normal native DATA fixture drain");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_selected_freeze_before_first_capture_reopens_the_same_original_selection() {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = "/services/selected-original-data.bin";
+        let mut fixture = genuine_native_original("native-selected-freeze-before-capture");
+        let owner_node = fixture.shard.primary_node_id.clone();
+        let layout = fixture.runtime.selected_original_data_layout(&owner_node).unwrap();
+        let queue = layout.queue().unwrap();
+        let (old_owner, physical_root, owner_file_identity) = {
+            let context = fixture.runtime.component_context(&owner_node).unwrap();
+            let owner = crate::runtime_host::retain_component_data_owner(&context).unwrap();
+            (Arc::downgrade(&owner), owner.physical_data_root().to_path_buf(), owner.storage_owner_file_identity().unwrap())
+        };
+        let original_directory = std::fs::symlink_metadata(&physical_root).unwrap();
+        assert!(original_directory.is_dir() && !original_directory.file_type().is_symlink());
+        let directory_identity = (original_directory.dev(), original_directory.ino());
+        let mut registration: Option<SelectedPreCaptureRegistration> = None;
+        let mut facts = serde_json::json!({
+            "pre_capture_observed": false, "old_owner_stopped_without_export": false,
+            "same_physical_owner_reopened": false, "first_real_capture_and_import": false,
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
+            let request = fixture.birth.root.subject.request_id.clone();
+            let mut source = fixture.runtime.metadata_primary_service(path).unwrap();
+            let source_scope = source.metadata_backend().unwrap()
+                .publication_owner_scope(&fixture.shard.file_system_id, &shard).unwrap();
+            let source_root = source_scope.root().to_path_buf();
+            let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
+            let control = fixture.runtime.shared_control_plane().unwrap();
+            let proposed = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
+            fixture.runtime.select_genuine_original_before_handoff(&owner_node, &request, &proposed).unwrap();
+            let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+            registration = Some(SelectedPreCaptureRegistration::install(SelectedPreCaptureStop {
+                layout: Arc::clone(&layout), root: source_root.clone(),
+                handoff_id: proposed.handoff_id.clone(), request_id: request.clone(), observed: observed_tx,
+                matched_invocations: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            let configs = fixture.runtime.metadata_shards().unwrap();
+            let phase_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            drop(fence);
+            let observed = std::thread::scope(|scope| {
+                let producer = scope.spawn(move || source.reconcile_pending_metadata_shard_membership_handoffs(
+                    &configs, phase_deadline.saturating_duration_since(Instant::now())));
+                let capture_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                let observation = observed_rx.recv_timeout(capture_deadline.saturating_duration_since(Instant::now()));
+                // This source cut returns an error rather than blocking an
+                // owner through stop. Join even if observation failed.
+                let produced = producer.join().expect("interrupted native source joined before stop");
+                facts["source_result"] = serde_json::json!(format!("{produced:?}"));
+                let observed = observation.expect("actual native source reached freeze before first capture");
+                assert!(Instant::now() <= capture_deadline, "pre-capture observation/join keeps the existing 5s budget");
+                observed
+            });
+            assert_eq!(observed.root, source_root);
+            assert_eq!(observed.handoff.handoff_id, proposed.handoff_id);
+            assert_eq!(layout.selected_request(&observed.handoff).unwrap(), Some(request.clone()));
+            assert_eq!(observed.birth.original, fixture.birth.original);
+            assert_eq!(observed.birth.attachment, fixture.birth.attachment);
+            assert_eq!(observed.birth.root, fixture.birth.root);
+            assert!(observed.freeze.activated_epoch.is_none() && observed.freeze.repair_custody.is_none());
+            let expected_birth_bytes = crate::metadata_io::encode_sobj(&observed.birth).unwrap();
+            facts["pre_capture_observed"] = serde_json::json!(true);
+            facts["observed_original"] = serde_json::to_value(&observed.birth).unwrap();
+            let export_directory = source_root.join("journal/repair-handoffs-v1")
+                .join(format!("{}-source", blake3::hash(proposed.handoff_id.as_bytes()).to_hex()));
+            assert_eq!(std::fs::symlink_metadata(&export_directory).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+            let freeze_path = source_root.join("journal/membership-handoff-write-freeze.sobj");
+            let freeze_bytes = std::fs::read(&freeze_path).unwrap();
+            let default_read = crate::read_local_dfs_metadata_shard_write_freeze(fixture.runtime.data_dir(&owner_node), &shard)
+                .expect_err("a selected physical root cannot opt a default observer into its pre-cut freeze");
+            assert!(matches!(&default_read, DfsError::MetadataRejection {
+                code: DfsMetadataRejectionCode::Other, message,
+            } if message.contains("default reader rejects selected original physical layout")), "{default_read:?}");
+            assert_eq!(std::fs::read(&freeze_path).unwrap(), freeze_bytes);
+            let (active, pending) = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .retiring_metadata_shard_handoff_view_before(&fixture.shard.file_system_id, &fixture.shard.shard_id, phase_deadline)).unwrap();
+            assert_eq!(active.as_ref(), Some(&fixture.shard));
+            assert_eq!(pending.as_ref(), Some(&observed.handoff));
+            let mut different = observed.handoff.clone();
+            different.handoff_id.push_str("-not-the-selected-handoff");
+            assert!(layout.selected_request(&different).is_err());
+            assert!(layout.select_original(&owner_node, &request, &proposed).is_err(),
+                "even the old caller cannot reselect behind a pending freeze");
+
+            // Keep the fault registered through actual scope/owner shutdown.
+            // Layout/queue handles own no OS DATA owner; the Weak must expire.
+            fixture.runtime.stop_node(&owner_node).unwrap();
+            assert!(old_owner.upgrade().is_none(), "the original native DATA owner actually drained");
+            assert_eq!(std::fs::symlink_metadata(&export_directory).unwrap_err().kind(), std::io::ErrorKind::NotFound,
+                "no native owner captured while the stop cut remained registered");
+            assert_eq!(std::fs::read(&freeze_path).unwrap(), freeze_bytes);
+            assert_eq!(crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                fixture.runtime.data_dir(&owner_node), &shard, Some(&layout)).unwrap(), Some(observed.freeze.clone()));
+            facts["old_owner_stopped_without_export"] = serde_json::json!(true);
+            let stop = registration.take().unwrap();
+            facts["matched_pre_capture_invocations"] = serde_json::json!(stop.0.matched_invocations.load(std::sync::atomic::Ordering::Acquire));
+            stop.remove_after_owner_stop(&old_owner);
+            drop(stop);
+            // Force the SAME admitted queue handle through its actual disk
+            // replay on native reopen; never create a competing queue owner.
+            queue.reload_from_disk_on_next_access();
+            let reopen_deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            fixture.runtime.reopen_node_with_startup_deadline(owner_node.clone(), reopen_deadline).unwrap();
+            assert!(tokio::time::Instant::now() <= reopen_deadline, "native reopen keeps the existing 5s startup budget");
+            let reopened_layout = fixture.runtime.selected_original_data_layout(&owner_node).unwrap();
+            assert!(Arc::ptr_eq(&layout, &reopened_layout), "the external fixture expectation survives; it is not decoded from a marker");
+            assert_eq!(reopened_layout.selected_request(&observed.handoff).unwrap(), Some(request.clone()));
+            {
+                let context = fixture.runtime.component_context(&owner_node).unwrap();
+                let new_owner = crate::runtime_host::retain_component_data_owner(&context).unwrap();
+                assert!(!std::sync::Weak::ptr_eq(&old_owner, &Arc::downgrade(&new_owner)));
+                assert_eq!(new_owner.physical_data_root(), physical_root.as_path());
+                assert_eq!(new_owner.storage_owner_file_identity().unwrap(), owner_file_identity);
+                assert!(Arc::ptr_eq(&new_owner.selected_original_data_layout().unwrap().unwrap(), &layout));
+            }
+            let reopened_directory = std::fs::symlink_metadata(&physical_root).unwrap();
+            assert!(reopened_directory.is_dir() && !reopened_directory.file_type().is_symlink());
+            assert_eq!((reopened_directory.dev(), reopened_directory.ino()), directory_identity);
+            let reopened_birth = reopened_layout.queue().unwrap().original_repair(&fixture.birth.original).unwrap().unwrap();
+            assert_eq!(crate::metadata_io::encode_sobj(&reopened_birth).unwrap(), expected_birth_bytes,
+                "actual cold queue replay preserves the complete original and uncertain history");
+            facts["same_physical_owner_reopened"] = serde_json::json!(true);
+            assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, phase_deadline).unwrap(),
+                Some(proposed.desired_shard.clone()), "normal native startup must resume the same selected handoff");
+            assert!(Instant::now() <= phase_deadline, "stop/reopen does not renew the original 45s handoff deadline");
+            let cut: DfsRepairHandoffCut = crate::metadata_io::read_sobj_optional(&export_directory.join("cut.sobj")).unwrap().unwrap();
+            cut.validate_selected_original_data().unwrap();
+            assert_eq!(cut.handoff, observed.handoff);
+            assert!(cut.queue_sequence >= observed.queue_sequence);
+            let mut source_rows = Vec::new();
+            for ordinal in 0..cut.page_count {
+                let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(
+                    &export_directory.join(format!("{ordinal}.sobj"))).unwrap().unwrap();
+                page.validate_selected_original_data().unwrap();
+                assert_eq!(page.cut, cut);
+                assert_eq!(page.ordinal, ordinal);
+                if ordinal == 0 {
+                    assert_eq!(crate::metadata_io::encode_sobj(page.selected_original_data.as_deref().unwrap()).unwrap(), expected_birth_bytes);
+                }
+                source_rows.extend(page.records);
+            }
+            assert_eq!(source_rows.len() as u64, cut.record_count);
+            let promoted_layout = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
+            let promoted_queue = promoted_layout.queue().unwrap();
+            let installed = loop {
+                if let Some(installed) = promoted_queue.installed_original_handoff_data(&owner_node, &request).unwrap() { break installed; }
+                let remaining = phase_deadline.checked_duration_since(Instant::now())
+                    .expect("first actual selected import keeps the original handoff budget");
+                fixture.runtime.maintenance_tick(&fixture.promoted,
+                    remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)).unwrap();
+            };
+            assert!(Instant::now() <= phase_deadline);
+            assert_eq!(installed.material.cut, cut);
+            assert_eq!(crate::metadata_io::encode_sobj(&installed.material.birth).unwrap(), expected_birth_bytes);
+            let imported_rows = promoted_queue.view().unwrap().records;
+            assert!(source_rows.iter().all(|row| imported_rows.contains(row)));
+            assert!(promoted_queue.validate_original_repair_dispatch(&fixture.birth.original).is_err());
+            assert!(promoted_queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+            facts["first_real_capture_and_import"] = serde_json::json!(true);
+            assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+        }));
+        let report = serde_json::json!({
+            "assertions_passed": outcome.is_ok(), "initial_original": &fixture.birth, "facts": facts,
+            "qualification": "Controlled post-freeze interruption and native component/OS-owner restart with externally retained selected layout. No abrupt process loss, missing-selection recovery, serving floor or successor execution proof."
+        });
+        if let Err(error) = std::fs::write(fixture.runtime.data_dir(&owner_node).root()
+            .join("native-selected-freeze-before-capture.json"), serde_json::to_vec_pretty(&report).unwrap())
+        { eprintln!("native selected pre-capture report write failed: {error}"); }
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        // On failed owner drain, retain the exact negative registration rather
+        // than silently allowing a surviving source to capture during cleanup.
+        if let Some(stop) = registration.take() {
+            if closed.is_ok() && old_owner.upgrade().is_none() { stop.remove_after_owner_stop(&old_owner); }
+            else { eprintln!("pre-capture fault retained because old DATA owner did not drain"); }
+        }
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("native pre-capture restart cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("normal native pre-capture restart fixture drain");
     }
 
     #[test]
