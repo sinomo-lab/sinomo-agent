@@ -6,6 +6,8 @@ from pathlib import Path
 import unittest
 import subprocess
 import sys
+import os
+import tempfile
 from unittest.mock import patch
 
 from owned_container_io import IncompleteObservation, OwnedCgroup, io_values
@@ -134,6 +136,75 @@ class CounterTests(unittest.TestCase):
         after["roles"]["shadow"]["sinks"]["stdout"][2] = "12"
         with self.assertRaisesRegex(IncompleteObservation, "identity changed"):
             window.daemon_delta(before, after)
+
+
+class MobileWindowDispatchTests(unittest.TestCase):
+    def run_window(self, adapter_status, owned=True):
+        source = Path(__file__).with_name("test-mobile-idle.sh").read_text()
+        functions = source.split("node_write_bytes() {", 1)[1].split("declare -a TARGET_SERVICES=()", 1)[0]
+        functions = "node_write_bytes() {" + functions
+        with tempfile.TemporaryDirectory(prefix="mobile-window-control-") as root:
+            environment = dict(os.environ, CONTROL_ROOT=root,
+                               CONTROL_ADAPTER_STATUS=str(adapter_status),
+                               SINOMO_DOCKER_DIR=str(Path(__file__).parent.resolve()),
+                               COMPOSE_PROJECT_NAME="owned-window-control",
+                               MEASURE_NODES="node4 node5 node6", QUIESCE_WAIT="10",
+                               QUIESCE_WINDOW="135")
+            if owned:
+                environment["SINOMO_GATE_OWNED_IO_ARTIFACTS"] = root + "/evidence"
+            else:
+                environment.pop("SINOMO_GATE_OWNED_IO_ARTIFACTS", None)
+            controls = r"""
+sleep() { printf 'sleep %s\n' "$*" >> "$CONTROL_ROOT/calls"; }
+python3() {
+  printf 'adapter\n' >> "$CONTROL_ROOT/calls"
+  printf '%s\n' "$@" > "$CONTROL_ROOT/adapter-args"
+  return "$CONTROL_ADAPTER_STATUS"
+}
+node_write_bytes() {
+  printf 'legacy %s\n' "$1" >> "$CONTROL_ROOT/calls"
+  printf '17\n'
+}
+enforce_idle_write_stability "battery-constrained role transition"
+printf 'continued\n' >> "$CONTROL_ROOT/calls"
+"""
+            result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + functions + controls],
+                                    env=environment, text=True, capture_output=True)
+            calls = Path(root, "calls").read_text().splitlines()
+            args_file = Path(root, "adapter-args")
+            args = args_file.read_text().splitlines() if args_file.exists() else []
+            stages = list(Path(root).glob("evidence/mobile-stability-*/stage.txt"))
+            stage_text = [p.read_text().strip() for p in stages]
+            return result, calls, args, stage_text
+
+    def test_owned_mobile_window_preserves_one_stabilization_and_exact_window(self):
+        result, calls, args, stages = self.run_window(0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["sleep 10", "adapter", "continued"])
+        self.assertEqual(args[0], str(Path(__file__).with_name("measure-owned-io.py").resolve()))
+        self.assertEqual(args[1:9], ["--project", "owned-window-control", "--nodes",
+                                   "node4", "node5", "node6", "--window", "135"])
+        self.assertEqual(args[9], "--output")
+        self.assertTrue(args[10].endswith("/io.json"))
+        self.assertEqual(stages, ["battery-constrained role transition"])
+
+    def test_owned_mobile_writes_and_missing_coverage_both_stop_without_fallback(self):
+        for status in (1, 2):
+            with self.subTest(status=status):
+                result, calls, args, stages = self.run_window(status)
+                self.assertEqual(result.returncode, status)
+                self.assertEqual(calls, ["sleep 10", "adapter"])
+                self.assertEqual(stages, ["battery-constrained role transition"])
+                self.assertIn("no retry or deadline reset", result.stdout)
+
+    def test_nonowned_mobile_window_keeps_original_single_proc_window(self):
+        result, calls, args, stages = self.run_window(0, owned=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["sleep 10", "legacy node4", "legacy node5", "legacy node6",
+                                 "sleep 135", "legacy node4", "legacy node5", "legacy node6",
+                                 "continued"])
+        self.assertEqual(args, [])
+        self.assertEqual(stages, [])
 
 
 if __name__ == "__main__":

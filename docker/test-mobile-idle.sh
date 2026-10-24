@@ -90,6 +90,28 @@ enforce_idle_write_stability() {
   echo "=== enforce zero daemon block writes after ${label} + ${QUIESCE_WAIT}s stabilization deadline ==="
   sleep "$QUIESCE_WAIT"
 
+  if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ]; then
+    # Reuse the same stable live-owner window as the ordinary settling gate.
+    # It retains exact main/shadow zero-write checks and additionally covers
+    # exited helpers, output sinks and delayed writeback without resetting time.
+    mkdir -p "$SINOMO_GATE_OWNED_IO_ARTIFACTS"
+    local owned_artifacts owned_status
+    local -a owned_nodes
+    owned_artifacts="$(mktemp -d "$SINOMO_GATE_OWNED_IO_ARTIFACTS/mobile-stability-XXXXXXXX")"
+    printf '%s\n' "$label" > "$owned_artifacts/stage.txt"
+    read -r -a owned_nodes <<< "$MEASURE_NODES"
+    owned_status=0
+    python3 "$SINOMO_DOCKER_DIR/measure-owned-io.py" \
+      --project "$COMPOSE_PROJECT_NAME" --nodes "${owned_nodes[@]}" \
+      --window "$QUIESCE_WINDOW" --output "$owned_artifacts/io.json" || owned_status=$?
+    if [ "$owned_status" -ne 0 ]; then
+      echo "owned mobile/role-restoration write observation failed or was incomplete; no retry or deadline reset"
+      exit "$owned_status"
+    fi
+    echo "owned main/shadow/helper block writes stayed quiet for ${QUIESCE_WINDOW}s"
+    return
+  fi
+
   local -A before=()
   for node in $MEASURE_NODES; do
     if ! before_value="$(node_write_bytes "$node")" || [ -z "$before_value" ]; then
