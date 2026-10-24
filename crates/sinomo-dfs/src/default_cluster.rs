@@ -624,7 +624,15 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     let backend = handle.checkout()?;
                     return genesis::native_genesis_committed(&backend, &current);
                 }
-                let backend = open_local_metadata_shard_backend(&self.data_dir, shard_id)?;
+                let backend = match self.publication_owners.selected_original_data_layout()? {
+                    Some(layout) => crate::LocalSobjMetadataBackend::new_with_selected_layout(
+                        current.file_system_id.clone(),
+                        shard_id.clone(),
+                        crate::local_dfs_metadata_shard_path(&self.data_dir, &shard_id),
+                        layout,
+                    )?,
+                    None => open_local_metadata_shard_backend(&self.data_dir, shard_id)?,
+                };
                 return genesis::native_genesis_committed(&backend, &current);
             }
             let watermark = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())

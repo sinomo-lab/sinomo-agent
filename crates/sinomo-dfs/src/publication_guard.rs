@@ -427,6 +427,18 @@ pub struct DfsPublicationExecutionOwners {
     _data_owner: Arc<DfsDataOwnerLock>,
 }
 impl DfsPublicationExecutionOwners {
+    /// Representation context from the retained physical owner only. This
+    /// does not grant genesis, publication or successor execution authority.
+    pub(crate) fn selected_original_data_layout(
+        &self,
+    ) -> Result<Option<Arc<crate::DfsSelectedOriginalDataLayout>>> {
+        self._data_owner.selected_original_data_layout().map_err(|error| {
+            MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: error.to_string(),
+            }
+        })
+    }
     pub(crate) fn data_root(&self) -> &Path {
         &self.data_root
     }

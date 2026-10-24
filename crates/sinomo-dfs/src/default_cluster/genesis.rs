@@ -45,6 +45,21 @@ pub(super) fn native_genesis_committed(
 }
 
 impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
+    fn open_owned_bootstrap_metadata(
+        &self,
+        shards: Vec<DfsMetadataShardConfig>,
+    ) -> Result<crate::LocalShardedMetadataBackend, DfsError> {
+        let root = default_dfs_metadata_shards_root(&self.data_dir);
+        Ok(match self.publication_owners.selected_original_data_layout()? {
+            Some(layout) => crate::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
+                root, shards, &self.local_node_id, layout,
+            )?,
+            None => open_local_sharded_metadata_backend_for_replica_repair(
+                root, shards, &self.local_node_id,
+            )?,
+        })
+    }
+
     pub(super) async fn prepare_native_genesis(
         &mut self,
         file_system: &DfsFileSystem,
@@ -76,11 +91,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
         if missing.is_empty() {
             return Ok(());
         }
-        let mut backend = open_local_sharded_metadata_backend_for_replica_repair(
-            default_dfs_metadata_shards_root(&self.data_dir),
-            shards.to_vec(),
-            &self.local_node_id,
-        )?;
+        let mut backend = self.open_owned_bootstrap_metadata(shards.to_vec())?;
         for shard in missing {
             let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
             let physical = backend.shard_backend_mut(&shard_id)?;
@@ -213,11 +224,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             service.with_resident_sharded_metadata_backend_lazy(resident.checkout_global()?)?
         } else {
             service.with_metadata_backend_lazy(
-                open_local_sharded_metadata_backend_for_replica_repair(
-                    default_dfs_metadata_shards_root(&self.data_dir),
-                    shards.clone(),
-                    &self.local_node_id,
-                )?,
+                self.open_owned_bootstrap_metadata(shards.clone())?,
             )?
         };
         service = service.with_boxed_control_plane(
