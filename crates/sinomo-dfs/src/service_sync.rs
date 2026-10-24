@@ -4685,6 +4685,13 @@ mod native_selected_data_tests {
     }
 
     fn genuine_native_original(name: &str) -> GenuineNativeOriginal {
+        genuine_native_original_with_forbidden_promoted(name, false)
+    }
+
+    fn genuine_native_original_with_forbidden_promoted(
+        name: &str,
+        forbid_promoted: bool,
+    ) -> GenuineNativeOriginal {
         let path = "/services/selected-original-data.bin";
         let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
         let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
@@ -4702,6 +4709,9 @@ mod native_selected_data_tests {
         assert!(shard.replica_node_ids.contains(&promoted) && shard.replica_node_ids.contains(&holder));
         let mut policy = DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
         policy.required_node_ids = vec![owner.clone(), holder.clone()];
+        if forbid_promoted {
+            policy.forbidden_node_ids.push(promoted.clone());
+        }
         runtime.apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, policy).unwrap();
         // Candidates are hints. Resolve the actual managed constraints so the
         // seed really places the exact bytes on A/C, leaving promoted B empty.
@@ -4713,6 +4723,7 @@ mod native_selected_data_tests {
         assert_eq!(planned_policy.min_commit_replicas, 1);
         assert_eq!(planned_policy.desired_replicas, 2);
         assert_eq!(planned_policy.required_node_ids.iter().cloned().collect::<BTreeSet<_>>(), required);
+        assert_eq!(planned_policy.forbidden_node_ids.contains(&promoted), forbid_promoted);
         drop(policy_reader);
         let mut writer = runtime.client(&owner).unwrap();
         assert!(writer.transport.delegates_local_namespace_authority());
@@ -4998,9 +5009,25 @@ mod native_selected_data_tests {
 
     #[test]
     fn native_selected_imported_executor_requires_b_payload_and_retains_disabled_origin() {
+        native_selected_imported_executor_control(false);
+    }
+
+    #[test]
+    fn native_selected_imported_executor_rejects_immutable_forbidden_b_before_retention() {
+        native_selected_imported_executor_control(true);
+    }
+
+    fn native_selected_imported_executor_control(forbid_promoted: bool) {
         let path = "/services/selected-original-data.bin";
-        let mut fixture = genuine_native_original("native-selected-disabled-executor");
+        let name = if forbid_promoted {
+            "native-selected-forbidden-disabled-executor"
+        } else {
+            "native-selected-disabled-executor"
+        };
+        let mut fixture = genuine_native_original_with_forbidden_promoted(name, forbid_promoted);
         let mut facts = serde_json::json!({
+            "immutable_forbidden_b_requested":forbid_promoted,
+            "immutable_forbidden_b_rejected_before_retention":false,
             "missing_b_payload_rejected":false,
             "unrelated_main_work_completed":false,
             "fixture_prepared_b_bytes":false,
@@ -5174,6 +5201,49 @@ mod native_selected_data_tests {
                 .acquire_prepared_execution(&association_scope)
                 .unwrap();
             let before_missing = queue.view().unwrap();
+            if forbid_promoted {
+                // This prohibition was supplied to the real A write before
+                // its original Repair existed, then transferred unchanged.
+                // Do not manufacture prohibited B bytes to exercise the guard.
+                let intent = successor
+                    .metadata_backend()
+                    .unwrap()
+                    .get_intent_on_shard(&shard_id, &command.object_id, &command.intent_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
+                assert!(intent.policy.forbidden_node_ids.contains(&promoted));
+                let error = successor
+                    .associate_installed_repair_executor_disabled(&assignment, &owner, &request)
+                    .expect_err("immutable intent forbids B before any content-root retention");
+                match error {
+                    DfsError::InvalidReplicationPolicy { message } => assert_eq!(
+                        message,
+                        "immutable Repair intent forbids disabled executor retention on this node"
+                    ),
+                    other => panic!("native authority or payload error is not the policy rejection: {other:?}"),
+                }
+                assert!(Instant::now() <= missing_deadline);
+                assert_eq!(queue.view().unwrap(), before_missing);
+                assert!(queue.imported_executor_association(&owner, &request).unwrap().is_none());
+                assert_eq!(
+                    queue.installed_original_handoff_data(&owner, &request).unwrap().unwrap(),
+                    installed
+                );
+                assert_eq!(
+                    source_queue.original_repair(&fixture.birth.original).unwrap().unwrap(),
+                    source_before
+                );
+                assert_eq!(
+                    crate::repair_queue_store::original_repair_digest(
+                        &fixture.birth.original, &fixture.birth.attachment,
+                    ).unwrap(),
+                    original_digest
+                );
+                assert!(!missing_manifest.exists());
+                facts["immutable_forbidden_b_rejected_before_retention"] = serde_json::json!(true);
+                return;
+            }
             let missing = successor
                 .associate_installed_repair_executor_disabled(&assignment, &owner, &request)
                 .expect_err("a native B executor still needs its exact local payload");
@@ -5522,7 +5592,11 @@ mod native_selected_data_tests {
         let report = serde_json::json!({
             "native_assertions_passed":outcome.is_ok(), "initial_original":&fixture.birth,
             "facts":facts,
-            "qualification":"Native disabled-association DATA control. B bytes are fixture-prepared through the actual local writer, not transferred. A->B retiring-role rejection is not a second reconfiguration trace. Absence of B dispatch is observed with held_promoted installed; native lookup/attempt rejections do not claim unguarded scheduler coverage. No successor dispatch, receiver Terminal/dedup, causal application, root retirement, C1 or availability proof."
+            "qualification":if forbid_promoted {
+                "Native immutable-prohibition rejection only. The original A write committed the forbidden-B policy before its genuine Repair existed. After authenticated DATA installation/current B admission, the exact policy rejection precedes absent B content; no B bytes were prepared. No association, successor dispatch, receiver Terminal/dedup, causal application, root retirement, C1 or availability proof."
+            } else {
+                "Native disabled-association DATA control. B bytes are fixture-prepared through the actual local writer, not transferred. A->B retiring-role rejection is not a second reconfiguration trace. Absence of B dispatch is observed with held_promoted installed; native lookup/attempt rejections do not claim unguarded scheduler coverage. No successor dispatch, receiver Terminal/dedup, causal application, root retirement, C1 or availability proof."
+            }
         });
         if let Err(error) = std::fs::write(
             fixture
