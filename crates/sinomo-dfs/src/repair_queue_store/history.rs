@@ -20,8 +20,34 @@ pub(super) struct ImportedRepairHistorySnapshot {
     assignment: crate::DfsMetadataShardConfig,
     carrier: DfsOriginalRepairHistoryCarrier,
     query_ref: DfsOriginalRepairHistoryQueryRef,
-    delivery: Vec<(u64, Option<sinomo_core::network::NetworkDeliveryState>)>,
-    observed: Option<(u64, DfsRoutedMessage)>,
+    delivery: Vec<ImportedRepairHistoryDeliverySnapshot>,
+    observed: Option<ImportedRepairHistoryObservationSnapshot>,
+}
+
+// SOBJ tuples are homogeneous lists. Persist the sequence and its differently
+// typed value as named object fields, retaining the live tuple representation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportedRepairHistoryDeliverySnapshot {
+    sequence: u64,
+    #[serde(deserialize_with = "deserialize_history_delivery")]
+    delivery: Option<sinomo_core::network::NetworkDeliveryState>,
+}
+
+fn deserialize_history_delivery<'de, D>(
+    deserializer: D,
+) -> Result<Option<sinomo_core::network::NetworkDeliveryState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportedRepairHistoryObservationSnapshot {
+    sequence: u64,
+    returned: DfsRoutedMessage,
 }
 
 impl ImportedRepairHistoryQuery {
@@ -37,8 +63,22 @@ impl ImportedRepairHistoryQuery {
             assignment: self.request.current_assignment.clone(),
             carrier: self.request.carrier.clone(),
             query_ref: self.request.query_ref.clone(),
-            delivery: self.delivery.clone(),
-            observed: self.observed.clone(),
+            delivery: self
+                .delivery
+                .iter()
+                .map(
+                    |(sequence, delivery)| ImportedRepairHistoryDeliverySnapshot {
+                        sequence: *sequence,
+                        delivery: *delivery,
+                    },
+                )
+                .collect(),
+            observed: self.observed.as_ref().map(|(sequence, returned)| {
+                ImportedRepairHistoryObservationSnapshot {
+                    sequence: *sequence,
+                    returned: returned.clone(),
+                }
+            }),
         }
     }
     pub(crate) fn request(&self) -> &DfsOriginalRepairHistoryRequest {
@@ -355,8 +395,14 @@ impl RepairCustodyIndex {
         }
         let query = ImportedRepairHistoryQuery {
             request,
-            delivery: snapshot.delivery,
-            observed: snapshot.observed,
+            delivery: snapshot
+                .delivery
+                .into_iter()
+                .map(|entry| (entry.sequence, entry.delivery))
+                .collect(),
+            observed: snapshot
+                .observed
+                .map(|entry| (entry.sequence, entry.returned)),
         };
         let request = &query.request;
         let imported = self.history_import(&request.import_ref)?;
@@ -755,9 +801,77 @@ mod tests {
         let first = begin(&queue, &a);
         let second = begin(&queue, &b);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Empty delivery and absent observation were already encodable. Keep
+        // that attempt-only shape and its exact prefix across cold replay.
+        let attempt_view = queue.view().unwrap();
+        let attempt_snapshot = queue.lock_state().unwrap().custody.snapshot();
+        assert!(
+            attempt_snapshot
+                .as_ref()
+                .unwrap()
+                .imported_history_queries
+                .iter()
+                .all(|query| query.delivery.is_empty() && query.observed.is_none())
+        );
+        // Compare the exact former snapshot DTO only in its encodable empty
+        // state. This is current-codec byte/decode compatibility, not old-binary
+        // interoperability or a claim that nonempty tuple states were valid.
+        #[derive(Serialize)]
+        struct FormerAttemptOnlySnapshot<'a> {
+            import_ref: &'a DfsImportedRepairHistoryRef,
+            assignment: &'a crate::DfsMetadataShardConfig,
+            carrier: &'a DfsOriginalRepairHistoryCarrier,
+            query_ref: &'a DfsOriginalRepairHistoryQueryRef,
+            delivery: Vec<(u64, Option<sinomo_core::network::NetworkDeliveryState>)>,
+            observed: Option<(u64, DfsRoutedMessage)>,
+        }
+        for query in &attempt_snapshot.as_ref().unwrap().imported_history_queries {
+            let former = FormerAttemptOnlySnapshot {
+                import_ref: &query.import_ref,
+                assignment: &query.assignment,
+                carrier: &query.carrier,
+                query_ref: &query.query_ref,
+                delivery: Vec::new(),
+                observed: None,
+            };
+            let former_bytes = encode_sobj(&former).unwrap();
+            assert_eq!(encode_sobj(query).unwrap(), former_bytes);
+            assert_eq!(
+                sinomo_object_serde::from_bytes::<ImportedRepairHistorySnapshot>(&former_bytes)
+                    .unwrap(),
+                *query
+            );
+        }
+        #[derive(Serialize)]
+        struct MissingDelivery {
+            sequence: u64,
+        }
+        let missing_delivery = encode_sobj(&MissingDelivery { sequence: 1 }).unwrap();
+        assert!(
+            sinomo_object_serde::from_bytes::<ImportedRepairHistoryDeliverySnapshot>(
+                &missing_delivery
+            )
+            .is_err(),
+            "an omitted delivery field cannot become a retained explicit None"
+        );
         queue
-            .observe_imported_history_delivery(&first, None, deadline)
+            .compact_if_needed(crate::DfsRepairQueueCompactionOptions::force())
             .unwrap();
+        queue.reload_from_disk_on_next_access();
+        assert_eq!(queue.view().unwrap(), attempt_view);
+        assert_eq!(
+            queue.lock_state().unwrap().custody.snapshot(),
+            attempt_snapshot
+        );
+        for delivery in [
+            None,
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent),
+            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+        ] {
+            queue
+                .observe_imported_history_delivery(&first, delivery, deadline)
+                .unwrap();
+        }
         let first = queue
             .observe_imported_history_result(&first, pending_return(first.request()), deadline)
             .unwrap();
@@ -769,9 +883,53 @@ mod tests {
             .unwrap();
         assert_ne!(first.request().query_ref, second.request().query_ref);
         assert_ne!(a.material.wire_key(), b.material.wire_key());
+        assert_eq!(
+            first
+                .delivery
+                .iter()
+                .map(|(_, delivery)| *delivery)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent),
+                Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+            ]
+        );
+        assert!(first.response().is_some());
+        let pending_view = queue.view().unwrap();
+        let pending_snapshot = queue.lock_state().unwrap().custody.snapshot();
+        let pending_sequences = queue
+            .lock_state()
+            .unwrap()
+            .custody
+            .history_sequences
+            .clone();
         queue
             .compact_if_needed(crate::DfsRepairQueueCompactionOptions::force())
             .unwrap();
+        queue.reload_from_disk_on_next_access();
+        assert_eq!(queue.view().unwrap(), pending_view);
+        assert_eq!(
+            queue.lock_state().unwrap().custody.snapshot(),
+            pending_snapshot
+        );
+        assert_eq!(
+            queue.lock_state().unwrap().custody.history_sequences,
+            pending_sequences
+        );
+        for expected in [&first, &second] {
+            let original = &expected.request().original_material.original;
+            assert_eq!(
+                queue
+                    .imported_history_query_for_test(
+                        &original.source_node_id,
+                        &original.command.request_id
+                    )
+                    .unwrap()
+                    .as_ref(),
+                Some(expected)
+            );
+        }
         let persisted = read_repair_queue_snapshot(identity.snapshot_path()).unwrap();
         let floor = persisted.applied_through_sequence;
         let mut snapshot = persisted.custody.unwrap();
@@ -834,21 +992,24 @@ mod tests {
             let mut invalid = second_snapshot.clone();
             match fault {
                 "same-query-result-delivery" => {
-                    invalid.observed.as_mut().unwrap().0 = invalid.delivery[0].0
+                    invalid.observed.as_mut().unwrap().sequence = invalid.delivery[0].sequence
                 }
-                "cross-query-delivery" => invalid.delivery[0].0 = first_snapshot.delivery[0].0,
+                "cross-query-delivery" => {
+                    invalid.delivery[0].sequence = first_snapshot.delivery[0].sequence
+                }
                 "cross-query-result" => {
-                    invalid.observed.as_mut().unwrap().0 =
-                        first_snapshot.observed.as_ref().unwrap().0
+                    invalid.observed.as_mut().unwrap().sequence =
+                        first_snapshot.observed.as_ref().unwrap().sequence
                 }
                 "cross-query-attempt" => {
-                    invalid.query_ref.attempt_sequence = first_snapshot.observed.as_ref().unwrap().0
+                    invalid.query_ref.attempt_sequence =
+                        first_snapshot.observed.as_ref().unwrap().sequence
                 }
                 _ => unreachable!(),
             }
-            if let Some((_, returned)) = invalid.observed.as_mut() {
+            if let Some(observed) = invalid.observed.as_mut() {
                 let crate::DfsNetworkMessage::OriginalRepairHistoryResponse(response) =
-                    &mut returned.message
+                    &mut observed.returned.message
                 else {
                     unreachable!()
                 };
@@ -873,9 +1034,9 @@ mod tests {
         let imports_sequences = imports_index.history_sequences.clone();
         let mut at_other_import = first_snapshot.clone();
         at_other_import.query_ref.attempt_sequence = b.installed_at_sequence;
-        if let Some((_, returned)) = at_other_import.observed.as_mut() {
+        if let Some(observed) = at_other_import.observed.as_mut() {
             let crate::DfsNetworkMessage::OriginalRepairHistoryResponse(response) =
-                &mut returned.message
+                &mut observed.returned.message
             else {
                 unreachable!()
             };
@@ -903,8 +1064,8 @@ mod tests {
         for sequence in [
             1,
             second.request().query_ref.attempt_sequence,
-            second_snapshot.delivery[0].0,
-            first_snapshot.observed.as_ref().unwrap().0,
+            second_snapshot.delivery[0].sequence,
+            first_snapshot.observed.as_ref().unwrap().sequence,
         ] {
             for change in [
                 RepairCustodyChange::ObserveImportedHistoryQueryDelivery {
@@ -933,7 +1094,7 @@ mod tests {
         // A newer Pending disposition replaces the retained observation, not
         // the physical queue head. Compaction reconstructs only retained claims;
         // future frame allocation/replay still starts strictly above its floor.
-        let old_sequence = first_snapshot.observed.as_ref().unwrap().0;
+        let old_sequence = first_snapshot.observed.as_ref().unwrap().sequence;
         let mut newer = pending_return(first.request());
         let crate::DfsNetworkMessage::OriginalRepairHistoryResponse(response) = &mut newer.message
         else {
