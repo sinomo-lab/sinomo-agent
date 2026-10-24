@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_runtime::{FaultAction, FaultRule, RpcOrigin, RpcPhase};
+use std::time::Duration;
 
 #[test]
 fn native_fresh_background_write_keeps_n_three_with_two_content_receipts_and_heals() {
