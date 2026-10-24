@@ -5124,4 +5124,298 @@ mod native_selected_data_tests {
         native_selected_receiver_clock_control(true);
     }
 
+    /// Capture only the native receiver's authoritative metadata and selected
+    /// custody files. Diagnostic clocks/wakes are permitted; none can stand for
+    /// a new journal entry, prefix ACK, installed original or execution grant.
+    fn selected_rejection_files(fixture: &GenuineNativeOriginal) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(path: &Path, result: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => panic!("inspect selected rejection path {}: {error}", path.display()),
+            };
+            assert!(!metadata.file_type().is_symlink(), "fixture path cannot alias another owner");
+            if metadata.is_file() {
+                result.push((path.to_path_buf(), std::fs::read(path).unwrap()));
+            } else {
+                assert!(metadata.is_dir());
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(&entry.unwrap().path(), result);
+                }
+            }
+        }
+        let data = fixture.runtime.data_dir(&fixture.promoted);
+        let root = crate::local_dfs_metadata_shard_path(data, &DfsMetadataShardId::new(&fixture.shard.shard_id));
+        let snapshot = crate::default_dfs_repair_attempt_snapshot_path(data);
+        let mut files = Vec::new();
+        for path in [
+            root.join("journal"),
+            root.join("records/tables"),
+            root.join("coordination/metadata-prefix-ack-floors"),
+            snapshot.with_file_name("repair-attempts.active.slog"),
+            snapshot,
+        ] {
+            visit(&path, &mut files);
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    fn assert_selected_probe_rejected(
+        response: &DfsMetadataJournalBatchResponse,
+        command: &DfsMetadataJournalBatchCommand,
+        expected_code: DfsMetadataRejectionCode,
+        reason_fragment: &str,
+    ) {
+        assert_eq!(response.request_id, command.request_id);
+        assert_eq!(response.shard_id, command.batch.shard_id);
+        assert_eq!(response.next_after_sequence, command.batch.next_after_sequence);
+        assert_eq!(response.applied_entries, 0);
+        assert!(!response.verified_prefix_only);
+        assert!(response.verified_authority_probe_id.is_none());
+        assert!(matches!(&response.result,
+            DfsMetadataJournalBatchResult::Rejected { code, reason }
+                if *code == expected_code && reason.contains(reason_fragment)), "{response:?}");
+    }
+
+    fn selected_rejection_file_evidence(files: &[(std::path::PathBuf, Vec<u8>)]) -> serde_json::Value {
+        serde_json::json!(files.iter().map(|(path, bytes)| serde_json::json!({
+            "path": path, "bytes": bytes.len(), "blake3": blake3::hash(bytes).to_hex().to_string(),
+        })).collect::<Vec<_>>())
+    }
+
+    /// A's normal native protocol owns the freeze and first selected export.
+    /// Only its registered delivery is paused; explicit negative RPCs traverse
+    /// the actual authenticated Main endpoint and cannot supply successful ACKs.
+    fn with_native_selected_rejection_probe(
+        name: &str,
+        check: impl FnOnce(&GenuineNativeOriginal, &DfsMetadataJournalBatchCommand, &mut Vec<serde_json::Value>),
+    ) {
+        let mut fixture = genuine_native_original(name);
+        let mut observations = Vec::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = fixture.shard.primary_node_id.clone();
+            let mut source = fixture.runtime.metadata_primary_service("/services/selected-original-data.bin").unwrap();
+            let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
+            let control = fixture.runtime.shared_control_plane().unwrap();
+            let proposed = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
+            fixture.runtime.select_genuine_original_before_handoff(&owner, &fixture.birth.root.subject.request_id, &proposed).unwrap();
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            fixture.runtime.install_fault(FaultRule {
+                source: Some(owner.clone()), target: Some(fixture.promoted.clone()),
+                route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
+                origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 16,
+                action: FaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
+            });
+            let configs = fixture.runtime.metadata_shards().unwrap();
+            let phase_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            drop(fence);
+            std::thread::scope(|scope| {
+                let producer = scope.spawn(move || source.reconcile_pending_metadata_shard_membership_handoffs(
+                    &configs, DEFAULT_DFS_POSIX_SYNC_TIMEOUT));
+                let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
+                    let source_directory = crate::local_dfs_metadata_shard_path(fixture.runtime.data_dir(&owner), &shard)
+                        .join("journal/repair-handoffs-v1")
+                        .join(format!("{}-source", blake3::hash(proposed.handoff_id.as_bytes()).to_hex()));
+                    let capture_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                    let cut: DfsRepairHandoffCut = loop {
+                        let captured = crate::metadata_io::read_sobj_optional(&source_directory.join("cut.sobj")).unwrap();
+                        assert!(Instant::now() <= capture_deadline, "actual source export uses unchanged 5s setup budget");
+                        if let Some(cut) = captured { break cut; }
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    cut.validate_selected_original_data().unwrap();
+                    let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&source_directory.join("0.sobj")).unwrap().unwrap();
+                    page.validate_selected_original_data().unwrap();
+                    assert_eq!(page.cut, cut);
+                    let sealed = page.selected_original_data.as_ref().expect("genuine selected original");
+                    assert_eq!(sealed.original, fixture.birth.original);
+                    assert_eq!(sealed.attachment, fixture.birth.attachment);
+                    assert_eq!(sealed.root, fixture.birth.root);
+                    let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                        .get_metadata_shard_membership_handoff(&fixture.shard.file_system_id, &fixture.shard.shard_id)).unwrap().unwrap();
+                    assert_eq!(pending, cut.handoff);
+                    let data = Arc::new(fixture.runtime.data_dir(&fixture.promoted).clone());
+                    let handle = fixture.runtime.runtime_handle();
+                    let host = crate::runtime_host::DaemonDfsDataPlaneHost::new_on_runtime(
+                        crate::runtime_host::DfsRuntimePaths::for_host_role(&data, sinomo_module::ComponentHostRole::Embedded), &handle);
+                    let context_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                    loop {
+                        let context = handle.block_on(host.retained_metadata_replica_shard_context(
+                            Arc::clone(&data), fixture.shard.file_system_id.clone(), shard.clone()).unwrap()).unwrap();
+                        assert!(Instant::now() <= context_deadline, "actual B context reaches the pending fence within its unchanged 5s budget");
+                        if context.is_some_and(|context| context.pending_membership_handoff.as_ref() == Some(&pending)) { break; }
+                    }
+                    let fence = pending.retiring_primary_fence.as_ref().unwrap();
+                    // Probe/carrier IDs are independent of the immutable Repair
+                    // identity inside page zero; no original request is reborn.
+                    let command = DfsMetadataJournalBatchCommand {
+                        request_id: format!("selected-negative-probe-{}", proposed.handoff_id),
+                        source_node_id: Some(owner.clone()), file_system_id: Some(fixture.shard.file_system_id.clone()),
+                        authority_epoch: Some(fixture.shard.epoch), verify_prefix_only: true,
+                        authority_probe: None, durable_replication: None,
+                        prefix_probe: Some(DfsMetadataPrefixProbe {
+                            barrier_id: format!("selected-negative-barrier-{}", proposed.handoff_id),
+                            file_system_id: Some(fixture.shard.file_system_id.clone()), authority_epoch: Some(fixture.shard.epoch),
+                            shard_id: shard.clone(), journal_sequence: fence.journal_sequence,
+                            state_fingerprint: fence.state_fingerprint.clone(), primary_handoff_id: Some(proposed.handoff_id.clone()),
+                            repair_custody: Some(page),
+                        }),
+                        batch: DfsMetadataJournalFrameBatch { shard_id: shard, journal_frames: Vec::new(), next_after_sequence: fence.journal_sequence },
+                    };
+                    let source_queue = fixture.runtime.selected_original_data_layout(&owner).unwrap().queue().unwrap();
+                    let original_before = source_queue.original_repair(&fixture.birth.original).unwrap().unwrap();
+                    check(&fixture, &command, &mut observations);
+                    assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), Some(original_before),
+                        "negative probes cannot recreate, replace or settle the source original");
+                    let queue = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap().queue().unwrap();
+                    assert!(queue.installed_original_handoff_data(&owner, &fixture.birth.root.subject.request_id).unwrap().is_none());
+                    assert!(queue.validate_original_repair_dispatch(&fixture.birth.original).is_err());
+                    assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+                }));
+                // Always release and join the real producer before propagating
+                // a failed negative assertion or closing the native fixture.
+                fixture.runtime.clear_faults();
+                gate.add_permits(16);
+                let produced = producer.join().expect("native source handoff child drained");
+                if let Err(error) = checks { std::panic::resume_unwind(error); }
+                if let Err(error) = produced {
+                    assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, phase_deadline).unwrap(),
+                        Some(proposed.desired_shard.clone()), "normal handoff after negative-only gate release: {error}");
+                }
+            });
+        }));
+        let report = serde_json::json!({
+            "assertions_passed": outcome.is_ok(), "initial_original": &fixture.birth,
+            "observations": observations,
+            "qualification": "Actual authenticated native input rejection only; no successor execution, Terminal, root retirement or abrupt-loss acceptance."
+        });
+        if let Err(error) = std::fs::write(fixture.runtime.data_dir(&fixture.promoted).root()
+            .join("native-selected-input-rejections.json"), serde_json::to_vec_pretty(&report).unwrap())
+        { eprintln!("native selected rejection report write failed: {error}"); }
+        fixture.runtime.clear_faults();
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("native selected rejection cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("native selected rejection fixture drains normally");
+    }
+
+    #[test]
+    fn native_selected_ingress_rejects_wrong_source_prefix_and_scope_without_mutation() {
+        with_native_selected_rejection_probe("native-selected-invalid-ingress", |fixture, genuine, observations| {
+            let owner = &fixture.shard.primary_node_id;
+            for arm in ["authenticated-source", "prefix", "filesystem-scope", "epoch"] {
+                let mut command = genuine.clone();
+                command.request_id.push_str(arm);
+                let caller = if arm == "authenticated-source" { &fixture.holder } else { owner };
+                let (code, reason) = match arm {
+                    "authenticated-source" => (DfsMetadataRejectionCode::Other, "authenticated metadata journal caller"),
+                    "prefix" => {
+                        let fingerprint = &mut command.prefix_probe.as_mut().unwrap().state_fingerprint;
+                        let first = fingerprint.chars().next().unwrap();
+                        fingerprint.replace_range(..first.len_utf8(), if first == '0' { "1" } else { "0" });
+                        // The real pending-handoff fence rejects this before
+                        // the later stored-prefix comparison can run.
+                        (DfsMetadataRejectionCode::Other, "not bound to the exact fenced role rotation")
+                    }
+                    "filesystem-scope" => {
+                        command.prefix_probe.as_mut().unwrap().file_system_id = None;
+                        (DfsMetadataRejectionCode::Other, "prefix probe authority does not match")
+                    }
+                    "epoch" => {
+                        command.prefix_probe.as_mut().unwrap().authority_epoch = Some(fixture.shard.epoch.checked_add(1).unwrap());
+                        (DfsMetadataRejectionCode::Other, "prefix probe authority does not match")
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(command.prefix_probe.as_ref().unwrap().repair_custody,
+                    genuine.prefix_probe.as_ref().unwrap().repair_custody, "only the hostile outer claim changes");
+                let before = selected_rejection_files(fixture);
+                let prior_observations = fixture.runtime.rpc_observations().len();
+                let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+                    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, &command).unwrap();
+                let response = fixture.runtime.rpc_request(caller, &fixture.promoted, request,
+                    sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).unwrap_or_else(|error| {
+                        observations.push(serde_json::json!({"arm": arm, "command": command, "transport_error": error}));
+                        panic!("{arm} requires an actual decoded rejection, not a transport failure: {error}");
+                    });
+                let response: DfsMetadataJournalBatchResponse = response.decode_body().unwrap_or_else(|error| {
+                    observations.push(serde_json::json!({"arm": arm, "command": command, "decode_error": error.to_string()}));
+                    panic!("{arm} requires the native metadata response codec: {error}");
+                });
+                let after = selected_rejection_files(fixture);
+                observations.push(serde_json::json!({"arm": arm, "command": command, "response": response,
+                    "before_files": selected_rejection_file_evidence(&before),
+                    "after_files": selected_rejection_file_evidence(&after)}));
+                assert_selected_probe_rejected(&response, &command, code, reason);
+                assert!(after == before,
+                    "{arm} must not freeze, stage, install, write a prefix ACK or change journal/queue DATA");
+                assert!(fixture.runtime.rpc_observations().iter().skip(prior_observations).any(|call| call.source == *caller
+                    && call.target == fixture.promoted && call.route == DFS_METADATA_JOURNAL_BATCH_ROUTE
+                    && call.origin == RpcOrigin::ExplicitFixtureRpc && call.phase == RpcPhase::Completed));
+            }
+        });
+    }
+
+    #[test]
+    fn native_selected_routed_input_without_receiver_budget_rejects_before_effects() {
+        with_native_selected_rejection_probe("native-selected-unbudgeted-routed", |fixture, genuine, observations| {
+            let owner = &fixture.shard.primary_node_id;
+            let layout = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
+            let before_clocks = layout.receiver_clocks().unwrap();
+            let mut caller = fixture.runtime.client(owner).unwrap();
+            let routed_message = caller.next_dfs_routed_message(&fixture.promoted,
+                DfsNetworkMessage::MetadataJournalBatch(genuine.clone()));
+            drop(caller);
+            let command = DfsMessageCommand {
+                request_id: format!("selected-routed-envelope-{}", genuine.request_id), routed_message,
+            };
+            let call = crate::dfs_message_rpc_call(&command).unwrap();
+            let route = call.request.route.clone();
+            assert_eq!(route, DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE);
+            assert_ne!(route, DFS_METADATA_JOURNAL_BATCH_ROUTE);
+            let before = selected_rejection_files(fixture);
+            let prior_observations = fixture.runtime.rpc_observations().len();
+            let response = fixture.runtime.rpc_call(owner, &fixture.promoted, call,
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT).unwrap_or_else(|error| {
+                    observations.push(serde_json::json!({"arm": "routed-no-local-clock", "command": command, "transport_error": error}));
+                    panic!("unbudgeted routed input requires a decoded rejection, not a transport failure: {error}");
+                });
+            let response = crate::decode_dfs_message_rpc_response(&response).unwrap_or_else(|error| {
+                observations.push(serde_json::json!({"arm": "routed-no-local-clock", "command": command, "decode_error": error.to_string()}));
+                panic!("routed input requires the native message response codec: {error}");
+            });
+            let after = selected_rejection_files(fixture);
+            observations.push(serde_json::json!({"arm": "routed-no-local-clock", "command": command, "response": response,
+                "before_files": selected_rejection_file_evidence(&before),
+                "after_files": selected_rejection_file_evidence(&after)}));
+            assert_eq!(response.request_id, command.request_id);
+            let replies: Vec<_> = response.outbound_messages.iter().filter_map(|routed| {
+                if let DfsNetworkMessage::MetadataJournalBatchResponse(reply) = &routed.message
+                    && reply.request_id == genuine.request_id
+                {
+                    assert_eq!(routed.source_node_id, fixture.promoted);
+                    assert_eq!(&routed.target_node_id, owner);
+                    Some(reply)
+                } else { None }
+            }).collect();
+            assert_eq!(replies.len(), 1, "actual routed handler returns exactly this original probe rejection");
+            assert_selected_probe_rejected(replies[0], genuine, DfsMetadataRejectionCode::Other,
+                "selected receiver processing budget unavailable/expired");
+            assert_eq!(layout.receiver_clocks().unwrap(), before_clocks,
+                "the routed fallback cannot mint the direct receiver's local processing clock");
+            assert!(after == before,
+                "unbudgeted selected input cannot persist custody, metadata or an ACK");
+            assert!(fixture.runtime.rpc_observations().iter().skip(prior_observations).any(|call| call.source == *owner
+                && call.target == fixture.promoted && call.route == route
+                && call.origin == RpcOrigin::ExplicitFixtureRpc && call.phase == RpcPhase::Completed));
+        });
+    }
+
 }
