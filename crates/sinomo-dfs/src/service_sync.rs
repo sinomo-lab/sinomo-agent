@@ -5044,7 +5044,28 @@ mod native_selected_data_tests {
         genuine_native_original_with_receiver_foundation(name, forbid_promoted, false)
     }
 
-    fn genuine_native_original_with_receiver_foundation(name: &str, forbid_promoted: bool, receiver_foundation: bool) -> GenuineNativeOriginal {
+    fn genuine_native_original_with_receiver_foundation(
+        name: &str,
+        forbid_promoted: bool,
+        receiver_foundation: bool,
+    ) -> GenuineNativeOriginal {
+        genuine_native_original_with_receiver_source_probe(
+            name,
+            forbid_promoted,
+            receiver_foundation,
+            false,
+        )
+    }
+
+    // The optional probe is one test-only negative at the SAME first genuine
+    // A call. Existing fixtures retain their exact captured-reply-loss arm.
+    fn genuine_native_original_with_receiver_source_probe(
+        name: &str,
+        forbid_promoted: bool,
+        receiver_foundation: bool,
+        probe_wrong_source: bool,
+    ) -> GenuineNativeOriginal {
+        assert!(!probe_wrong_source || receiver_foundation);
         let path = "/services/selected-original-data.bin";
         let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
         let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
@@ -5129,11 +5150,20 @@ mod native_selected_data_tests {
         drop(context);
         let held_promoted = Some(Box::new(runtime.deny_background_replica_before_claim(&promoted).unwrap()) as Box<dyn Send>);
         let capture = runtime.capture_checkpointed_background_repairs(&owner, 8).unwrap();
+        let mut paused_dispatch = NativeRepairProbeDispatchGate(
+            probe_wrong_source.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
+        );
         runtime.install_fault(FaultRule {
             source: Some(owner.clone()), target: Some(holder.clone()),
             route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()), call_id: None,
             origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
-            action: FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id: None, captured: Arc::clone(&replies) },
+            action: match &paused_dispatch.0 {
+                Some(gate) => FaultAction::PauseBeforeDispatch(Arc::clone(gate)),
+                None => FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
+                    intent_id: None,
+                    captured: Arc::clone(&replies),
+                },
+            },
         });
         let mut writer = runtime.client(&owner).unwrap();
         assert!(writer.transport.delegates_local_namespace_authority());
@@ -5174,50 +5204,125 @@ mod native_selected_data_tests {
         let selected_layout = runtime.selected_original_data_layout(&owner).unwrap();
         let queue = selected_layout.queue().unwrap();
         let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-        let birth = loop {
-            let found = capture.records().iter().find_map(|captured| {
-                queue.original_repair(&captured.message).unwrap().filter(|birth| {
-                    let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else { return false; };
-                    birth.closed_at_sequence.is_none() && !birth.attempts.is_empty()
-                        && queue.records_for_targets(&command.intent_id, std::slice::from_ref(&holder)).unwrap()
-                            .iter().any(|row| row.transfer_request_id.as_deref() == Some(command.request_id.as_str())
-                                && !row.in_flight && row.last_error.is_some()
-                                && row.transfer_delivery_state == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied))
-                })
-            });
-            if let Some(birth) = found {
-                let exact_lost_reply = replies.lock().unwrap().iter().any(|routed| {
-                    let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
-                    if routed.source_node_id != holder || routed.target_node_id != owner
-                        || !matches!(response.result, DfsBlobTransferResult::Durable { .. } | DfsBlobTransferResult::Committed { .. })
-                    { return false; }
-                    let mut checked = birth.clone();
-                    checked.observed.push(response.clone());
-                    // Validate this candidate reply with the existing full
-                    // original validator, without persisting any observation.
-                    checked.validate(&birth.root.subject.queue_incarnation).is_ok()
-                });
-                if exact_lost_reply { break birth; }
-            }
-            let remaining = deadline.checked_duration_since(Instant::now());
-            if remaining.is_none() {
-                let diagnostic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    retain_genuine_original_timeout_diagnostic(
-                        &runtime, &owner, &holder, selected_layout.queue_layout().snapshot_path(),
-                        &capture, &replies,
-                    )
-                }));
-                // Diagnostic failure must not replace the original panic or
-                // bypass the runtime's normal unwinding/fixture preservation.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if !matches!(diagnostic, Ok(Ok(()))) {
-                        eprintln!("SELECTED_GENUINE_TIMEOUT_DIAGNOSTIC_UNAVAILABLE {diagnostic:?}");
+        let birth = if probe_wrong_source {
+            let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (birth, carrier, paused_call_id) = loop {
+                    let found = capture.records().iter().find_map(|captured| {
+                        let birth = queue.original_repair(&captured.message).unwrap()?;
+                        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message
+                        else {
+                            return None;
+                        };
+                        if birth.closed_at_sequence.is_some()
+                            || birth.attempts.is_empty()
+                            || command.object_id != stat.object_id
+                            || command.version != stat.version
+                            || captured.message.source_node_id != owner
+                            || captured.message.target_node_id != holder
+                        {
+                            return None;
+                        }
+                        let call = runtime.rpc_observations().into_iter().find(|call| {
+                            call.source == owner
+                                && call.target == holder
+                                && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                                && call.origin == RpcOrigin::RegisteredHost
+                                && call.phase == RpcPhase::BeforeDispatch
+                                && call.dfs_request_id.as_deref()
+                                    == Some(command.request_id.as_str())
+                                && call.dfs_frame_id == Some(captured.message.frame_id)
+                        });
+                        call.map(|call| (birth, captured.message.clone(), call.call_id))
+                    });
+                    assert!(
+                        Instant::now() <= deadline,
+                        "first genuine A call must pause within the unchanged 5s phase budget"
+                    );
+                    if let Some(found) = found {
+                        break found;
                     }
-                }));
+                    let remaining = deadline.checked_duration_since(Instant::now()).unwrap();
+                    runtime.maintenance_tick(&owner, remaining).unwrap();
+                };
+                // Stop subsequent producer claims. Releasing the already-owned
+                // call below does not consult this gate or mint another attempt.
+                claim_window.store(false, std::sync::atomic::Ordering::Release);
+                probe_selected_original_authenticated_source(
+                    &runtime,
+                    &owner,
+                    &promoted,
+                    &holder,
+                    &birth,
+                    &carrier,
+                    paused_call_id,
+                    deadline,
+                    &mut paused_dispatch,
+                );
+                birth
+            }));
+            paused_dispatch.release();
+            match checks {
+                Ok(birth) => birth,
+                Err(error) => {
+                    claim_window.store(false, std::sync::atomic::Ordering::Release);
+                    runtime.clear_faults();
+                    drop(capture);
+                    drop(held);
+                    drop(held_promoted);
+                    if let Err(close_error) = runtime.close() {
+                        eprintln!(
+                            "native receiver source-probe cleanup also failed: {close_error}"
+                        );
+                    }
+                    std::panic::resume_unwind(error);
+                }
             }
-            let remaining = remaining.expect("actual lost reply reaches original queue within unchanged 5s budget");
-            let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
-            eprintln!("SELECTED_GENUINE_LOST_REPLY_TICK {:?}", tick.outcome);
+        } else {
+            loop {
+                let found = capture.records().iter().find_map(|captured| {
+                    queue.original_repair(&captured.message).unwrap().filter(|birth| {
+                        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else { return false; };
+                        birth.closed_at_sequence.is_none() && !birth.attempts.is_empty()
+                            && queue.records_for_targets(&command.intent_id, std::slice::from_ref(&holder)).unwrap()
+                                .iter().any(|row| row.transfer_request_id.as_deref() == Some(command.request_id.as_str())
+                                    && !row.in_flight && row.last_error.is_some()
+                                    && row.transfer_delivery_state == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied))
+                    })
+                });
+                if let Some(birth) = found {
+                    let exact_lost_reply = replies.lock().unwrap().iter().any(|routed| {
+                        let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
+                        if routed.source_node_id != holder || routed.target_node_id != owner
+                            || !matches!(response.result, DfsBlobTransferResult::Durable { .. } | DfsBlobTransferResult::Committed { .. })
+                        { return false; }
+                        let mut checked = birth.clone();
+                        checked.observed.push(response.clone());
+                        // Validate this candidate reply with the existing full
+                        // original validator, without persisting any observation.
+                        checked.validate(&birth.root.subject.queue_incarnation).is_ok()
+                    });
+                    if exact_lost_reply { break birth; }
+                }
+                let remaining = deadline.checked_duration_since(Instant::now());
+                if remaining.is_none() {
+                    let diagnostic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        retain_genuine_original_timeout_diagnostic(
+                            &runtime, &owner, &holder, selected_layout.queue_layout().snapshot_path(),
+                            &capture, &replies,
+                        )
+                    }));
+                    // Diagnostic failure must not replace the original panic or
+                    // bypass the runtime's normal unwinding/fixture preservation.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if !matches!(diagnostic, Ok(Ok(()))) {
+                            eprintln!("SELECTED_GENUINE_TIMEOUT_DIAGNOSTIC_UNAVAILABLE {diagnostic:?}");
+                        }
+                    }));
+                }
+                let remaining = remaining.expect("actual lost reply reaches original queue within unchanged 5s budget");
+                let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
+                eprintln!("SELECTED_GENUINE_LOST_REPLY_TICK {:?}", tick.outcome);
+            }
         };
         claim_window.store(false, std::sync::atomic::Ordering::Release);
         runtime.clear_faults();
@@ -5231,8 +5336,8 @@ mod native_selected_data_tests {
         assert_eq!(birth.root.subject.request_id, command.request_id);
         assert_eq!(birth.root.original_command_digest,
             crate::repair_queue_store::original_repair_digest(&birth.original, &birth.attachment).unwrap());
-        // C's bytes are now proved after its actual positive response was lost,
-        // not supplied by setup or inferred from an A-side receipt or timeout.
+        // C's bytes follow its actual Repair effect, never fixture-supplied
+        // content or an inferred A-side receipt. The existing arm loses reply.
         for node in [&owner, &holder] {
             let reader = runtime.client(node).unwrap();
             assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
@@ -5242,7 +5347,281 @@ mod native_selected_data_tests {
             Err(crate::ContentStoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound),
             "the genuine source/copy cut leaves B without the exact version");
         drop(empty_successor);
-        GenuineNativeOriginal { runtime, shard, promoted, holder, birth, held, held_promoted }
+        GenuineNativeOriginal {
+            runtime,
+            shard,
+            promoted,
+            holder,
+            birth,
+            held,
+            held_promoted,
+        }
+    }
+
+    struct NativeRepairProbeDispatchGate(Option<Arc<tokio::sync::Semaphore>>);
+    impl NativeRepairProbeDispatchGate {
+        fn release(&mut self) {
+            if let Some(gate) = self.0.take() {
+                gate.add_permits(1);
+            }
+        }
+    }
+    impl Drop for NativeRepairProbeDispatchGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn native_repair_receiver_content_files(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, files: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "receiver fixture must retain its actual physical files"
+            );
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), files);
+                }
+            } else {
+                assert!(metadata.is_file());
+                files.push((
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    std::fs::read(path).unwrap(),
+                ));
+            }
+        }
+        let mut files = Vec::new();
+        visit(root, root, &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    fn probe_selected_original_authenticated_source(
+        runtime: &DfsTestRuntime,
+        owner: &NodeId,
+        wrong_source: &NodeId,
+        holder: &NodeId,
+        birth: &crate::repair_queue_store::RepairOriginalBirth,
+        carrier: &DfsRoutedMessage,
+        paused_call_id: u64,
+        deadline: Instant,
+        paused_dispatch: &mut NativeRepairProbeDispatchGate,
+    ) {
+        let material = birth.original_wire_material().unwrap();
+        assert_eq!(material.original.routed(), birth.original);
+        let command = &material.original.command;
+        assert_eq!(&carrier.source_node_id, owner);
+        assert_eq!(&carrier.target_node_id, holder);
+        let queue = runtime
+            .selected_original_data_layout(owner)
+            .unwrap()
+            .queue()
+            .unwrap();
+        let source = runtime.client(owner).unwrap();
+        let receiver = runtime.client(holder).unwrap();
+        let reader = source
+            .content()
+            .open_retained_repair_payload(&birth.root)
+            .unwrap();
+        let selected = DfsRoutedCall::with_attachment(
+            carrier.clone(),
+            DfsOutboundAttachment::from_reader(
+                reader,
+                birth.attachment.total_size_bytes,
+                birth.attachment.content_hash.as_deref().unwrap(),
+            ),
+        )
+        .with_original_repair(material.clone())
+        .unwrap();
+        let (expected, call) = crate::dfs_routed_call_rpc_call(selected).unwrap();
+        assert_eq!(expected.routed_message, *carrier);
+        let queue_before = queue.view().unwrap();
+        let birth_before = queue.original_repair(carrier).unwrap().unwrap();
+        assert_eq!(&birth_before, birth);
+        let content_root = runtime.data_dir(holder).dfs_dir().join("content");
+        let files_before = native_repair_receiver_content_files(&content_root);
+        let last_call = runtime
+            .rpc_observations()
+            .iter()
+            .map(|call| call.call_id)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("same 5s probe budget");
+        // The envelope still names A. Only the real authenticated native
+        // carrier is B; no claimed origin/head/body/digest is reconstructed.
+        let error = match runtime.rpc_result(wrong_source, holder, call, remaining) {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "wrong authenticated source must fail service admission without a domain reply"
+            ),
+        };
+        let expected_error = format!(
+            "authenticated DFS message caller {wrong_source} does not match claimed source {owner} for route {DFS_DATA_REPAIR_REPLICA_ROUTE}"
+        );
+        assert!(
+            error.contains(&expected_error),
+            "requires the actual authentication rejection, not an arbitrary transport error: {error}"
+        );
+        assert!(
+            Instant::now() <= deadline,
+            "wrong-source rejection must finish within its original 5s phase budget"
+        );
+        // Compare raw files FIRST. The phase snapshot helper below recertifies
+        // its writer and is deliberately not used as a non-recovery observer.
+        assert_eq!(
+            native_repair_receiver_content_files(&content_root),
+            files_before
+        );
+        assert_eq!(
+            queue.view().unwrap(),
+            queue_before,
+            "this bounded fixture requires an unchanged A queue cut; unrelated writer progress would fail this condition, not establish a B-authentication defect"
+        );
+        assert_eq!(
+            queue.original_repair(carrier).unwrap(),
+            Some(birth_before.clone())
+        );
+        assert_eq!(birth_before.original_wire_material().unwrap(), material);
+        assert_eq!(birth_before.root, birth.root);
+        assert!(
+            receiver
+                .content()
+                .original_repair_test_snapshot(&material)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(receiver.content().read_manifest(command.object_id.as_str(), command.version.as_str()),
+            Err(ContentStoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound)
+        );
+        let probe_calls = runtime
+            .rpc_observations()
+            .into_iter()
+            .filter(|call| {
+                call.call_id > last_call
+                    && call.source == *wrong_source
+                    && call.target == *holder
+                    && call.origin == RpcOrigin::ExplicitFixtureRpc
+                    && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && call.phase == RpcPhase::EndedWithoutResponse
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(probe_calls.len(), 1);
+        assert!(
+            probe_calls[0]
+                .outcome_error
+                .as_ref()
+                .is_some_and(|error| error.contains(&expected_error))
+        );
+        assert!(
+            matches!(probe_calls[0].signer.as_ref(), Some(sinomo_core::service::ServiceSigner::Remote { node_id, .. }) if node_id == wrong_source.as_str())
+        );
+        assert!(
+            !runtime
+                .rpc_observations()
+                .iter()
+                .any(|call| call.call_id == paused_call_id
+                    && matches!(call.phase, RpcPhase::AfterDispatch | RpcPhase::Completed)),
+            "the genuine A call must remain paused throughout the negative probe"
+        );
+        drop(source);
+        paused_dispatch.release();
+        let terminal = loop {
+            assert!(
+                Instant::now() <= deadline,
+                "same 5s phase budget covers release and genuine A Terminal"
+            );
+            let snapshot = receiver
+                .content()
+                .original_repair_test_snapshot(&material)
+                .unwrap();
+            let completed = runtime.rpc_observations().iter().any(|call| {
+                call.call_id == paused_call_id
+                    && call.source == *owner
+                    && call.target == *holder
+                    && call.origin == RpcOrigin::RegisteredHost
+                    && call.phase == RpcPhase::Completed
+                    && call.outcome_error.is_none()
+            });
+            assert!(
+                Instant::now() <= deadline,
+                "late completion cannot satisfy the original phase budget"
+            );
+            if let Some(snapshot) =
+                snapshot.filter(|snapshot| snapshot.terminal_id.is_some() && completed)
+            {
+                break snapshot;
+            }
+            let remaining = deadline.checked_duration_since(Instant::now()).unwrap();
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        };
+        assert_eq!(terminal.material, material);
+        assert_eq!(terminal.bytes, vec![0x5a; 4096]);
+        assert!(terminal.prepared_id < terminal.bound_id.unwrap());
+        assert!(terminal.bound_id.unwrap() < terminal.terminal_id.unwrap());
+        assert_eq!(
+            terminal.response,
+            Some(DfsRepairReplicaResponse {
+                request_id: command.request_id.clone(),
+                intent_id: command.intent_id.clone(),
+                file_system_id: command.file_system_id.clone(),
+                object_id: command.object_id.clone(),
+                version: command.version.clone(),
+                replica_node_id: holder.clone(),
+                result: DfsBlobTransferResult::Committed {
+                    content_hash: command.content_hash.clone()
+                },
+            })
+        );
+        assert_eq!(
+            receiver
+                .content()
+                .read_object_version(command.object_id.as_str(), command.version.as_str())
+                .unwrap()
+                .1,
+            terminal.bytes
+        );
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        assert!(
+            Instant::now() <= deadline,
+            "exact Terminal/body checks retain the unchanged 5s phase budget"
+        );
+        let report = serde_json::json!({
+            "qualification": "Actual authenticated B rejection before any C original phase, followed by the SAME previously paused genuine A call and native content-only Terminal. No successor execution, historical delivery, receiver dedup, causal application or abrupt-process proof.",
+            "original": birth_before, "actual_carrier": carrier, "paused_call_id": paused_call_id,
+            "wrong_source": wrong_source, "native_rejection": error, "rejection_calls": probe_calls.iter().map(|call| format!("{call:?}")).collect::<Vec<_>>(),
+            "receiver_content_root": content_root,
+            "raw_content_before_and_after_rejection": selected_rejection_file_evidence(&files_before),
+            "queue_head_before_and_after_rejection": queue_before.head_sequence,
+            "terminal": { "material": terminal.material, "prepared_id": terminal.prepared_id,
+                "bound_id": terminal.bound_id, "terminal_id": terminal.terminal_id, "response": terminal.response,
+                "store_incarnation": terminal.store_incarnation },
+        });
+        std::fs::write(
+            runtime
+                .data_dir(holder)
+                .root()
+                .join("native-original-authenticated-source.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn native_original_repair_rejects_wrong_authenticated_source_before_genuine_primary_effect() {
+        let mut fixture = genuine_native_original_with_receiver_source_probe(
+            "native-original-repair-wrong-source",
+            false,
+            true,
+            true,
+        );
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        fixture.runtime.close().unwrap();
     }
 
     #[test]
