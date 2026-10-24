@@ -1576,6 +1576,144 @@ fn metadata_only_effect_preserves_actual_recorded_data_generation_and_w() {
 }
 
 #[test]
+fn metadata_only_successor_repair_uses_recorded_content_generation() {
+    let (runtime, mut service, config) = native_case("v7-metadata-successor-repair", 3);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let original = actual_w2_object(&mut service, &config, "/services/repair-before-rename");
+    let original_version = service
+        .metadata_backend()
+        .unwrap()
+        .get_version(&original.object_id, &original.version)
+        .unwrap()
+        .unwrap();
+    let plan = original_version.content_durability.clone().unwrap();
+    let original_intent = service
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&original.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|intent| {
+            intent.status == DfsWriteIntentStatus::Committed
+                && intent.target_version == original.version
+        })
+        .expect("actual committed native write");
+    let renamed = service
+        .posix_rename(&original.path, "/services/repair-after-rename")
+        .unwrap();
+    let current = service
+        .metadata_backend()
+        .unwrap()
+        .get_object(&renamed.object_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.version, original.version);
+    assert_eq!(current.content_hash, original.content_hash);
+    let version = service
+        .metadata_backend()
+        .unwrap()
+        .get_version(&current.object_id, &current.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.content_durability, Some(plan.clone()));
+    assert_ne!(current.version, plan.source_version);
+
+    // This is the actual persistence path used by placement repair after a
+    // metadata-only rename. It creates no new byte generation or supplied ACK.
+    let mut repair = crate::intent::distributed_intent_from_record(&original_intent);
+    repair.intent_id = format!(
+        "placement:metadata-successor:{}:{}",
+        current.object_id, current.version
+    );
+    repair.base_version = Some(current.version.clone());
+    repair.target_version = current.version.clone();
+    repair.operation_id = None;
+    repair.operation_order_token = None;
+    service
+        .put_metadata_intent_and_receipts(&repair, current.content_hash.as_ref().unwrap(), &[])
+        .expect(
+            "repair of the actual metadata head retains the original data-generation W evidence",
+        );
+    let recorded = service
+        .metadata_backend()
+        .unwrap()
+        .get_intent(&current.object_id, &repair.intent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::intent::distributed_intent_from_record(&recorded),
+        repair
+    );
+    assert_eq!(recorded.object_metadata.as_ref(), Some(&current));
+    let after = entries(&service, &shard);
+    service
+        .put_metadata_intent_and_receipts(&repair, current.content_hash.as_ref().unwrap(), &[])
+        .unwrap();
+    assert_eq!(
+        entries(&service, &shard),
+        after,
+        "exact repair replay has no new journal effect"
+    );
+
+    for wrong_target in [true, false] {
+        let mut forged = repair.clone();
+        forged.intent_id.push_str(if wrong_target {
+            ":wrong-target"
+        } else {
+            ":wrong-base"
+        });
+        if wrong_target {
+            forged.target_version = DfsVersion::generate();
+        } else {
+            forged.base_version = Some(DfsVersion::generate());
+        }
+        assert!(
+            service
+                .put_metadata_intent_and_receipts(
+                    &forged,
+                    current.content_hash.as_ref().unwrap(),
+                    &[]
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&current.object_id, &forged.intent_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(entries(&service, &shard), after);
+    }
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_version(&current.object_id, &current.version)
+            .unwrap()
+            .unwrap()
+            .content_durability,
+        Some(plan.clone())
+    );
+    assert!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&current.object_id, &plan.source_version)
+            .unwrap()
+            .len()
+            >= plan.policy.min_commit_replicas
+    );
+    assert_eq!(
+        service.posix_read_file(&current.path).unwrap(),
+        vec![0x4d; 4096]
+    );
+    drop(service);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_kernel_trace_observes_actual_hidden_prepare_and_visible_commit() {
     let (runtime, mut service, config) = native_case("v7-native-raw-trace", 3);
     let original = directory(&mut service, "/services/v7-native-trace-directory");
