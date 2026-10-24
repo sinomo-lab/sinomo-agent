@@ -225,6 +225,128 @@ thread_local! {
     static BEFORE_HANDOFF_EFFECT_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+static AFTER_SELECTED_HANDOFF_EXPORT: std::sync::Mutex<Option<std::sync::Arc<SelectedSourceExportPause>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SelectedSourceExportObservation {
+    root: std::path::PathBuf,
+    cut: crate::DfsRepairHandoffCut,
+    page: crate::DfsRepairHandoffPage,
+    freeze: crate::DfsMetadataShardWriteFreeze,
+}
+
+#[cfg(test)]
+struct SelectedSourceExportPause {
+    layout: std::sync::Arc<crate::DfsSelectedOriginalDataLayout>,
+    root: std::path::PathBuf,
+    handoff_id: String,
+    deadline: Instant,
+    observed: std::sync::mpsc::SyncSender<SelectedSourceExportObservation>,
+    observation_sent: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+struct SelectedSourceExportRegistration(std::sync::Arc<SelectedSourceExportPause>);
+
+#[cfg(test)]
+impl SelectedSourceExportRegistration {
+    fn install(pause: SelectedSourceExportPause) -> Self {
+        let mut registered = AFTER_SELECTED_HANDOFF_EXPORT.lock().unwrap();
+        assert!(registered.is_none(), "an existing source gate cannot be overwritten");
+        let pause = std::sync::Arc::new(pause);
+        *registered = Some(std::sync::Arc::clone(&pause));
+        Self(pause)
+    }
+
+    fn release(&self) {
+        *self.0.released.lock().unwrap() = true;
+        self.0.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for SelectedSourceExportRegistration {
+    fn drop(&mut self) {
+        self.release();
+        let mut registered = AFTER_SELECTED_HANDOFF_EXPORT.lock().unwrap();
+        if registered.as_ref().is_some_and(|pause| std::sync::Arc::ptr_eq(pause, &self.0)) {
+            registered.take();
+        }
+    }
+}
+
+/// Observe one genuine frozen source export before its first network attempt.
+/// This test-only gate holds the existing source admission/drain lifetime; it
+/// neither certifies another owner nor writes a marker, ACK or replacement cut.
+#[cfg(test)]
+fn pause_selected_source_export_for_test(
+    root: &Path,
+    layout: &std::sync::Arc<crate::DfsSelectedOriginalDataLayout>,
+    backend: &dyn DfsMetadataBackend,
+    export: &crate::repair_handoff::RepairHandoffExport,
+    source_deadline: Instant,
+) -> Result<(), DfsError> {
+    let pause = {
+        let registered = AFTER_SELECTED_HANDOFF_EXPORT.lock().unwrap();
+        registered.as_ref().filter(|pause| export.cut.version == 2 && {
+            pause.root == root && pause.handoff_id == export.cut.handoff.handoff_id
+                && std::sync::Arc::ptr_eq(&pause.layout, layout)
+        }).cloned()
+    };
+    let Some(pause) = pause else { return Ok(()); };
+    let invalid = |message: &str| DfsError::Metadata { message: message.into() };
+    let deadline = source_deadline.min(pause.deadline);
+    layout.check()?;
+    export.cut.validate_selected_original_data()?;
+    let page = export.page(0)?;
+    let shard = DfsMetadataShardId::new(&export.cut.handoff.retiring_shard.shard_id);
+    let freeze = backend.metadata_shard_write_freeze(&shard)?
+        .ok_or_else(|| invalid("selected source pause has no actual durable freeze"))?;
+    let fence = export.cut.handoff.retiring_primary_fence.as_ref()
+        .ok_or_else(|| invalid("selected source pause has no authenticated retiring fence"))?;
+    if page.cut != export.cut || page.ordinal != 0
+        || freeze.handoff_id != export.cut.handoff.handoff_id
+        || freeze.retiring_epoch != export.cut.handoff.retiring_shard.epoch
+        || freeze.activated_epoch.is_some()
+        || freeze.journal_sequence != fence.journal_sequence
+        || freeze.state_fingerprint != fence.state_fingerprint
+        || freeze.repair_custody.as_ref().is_some_and(|cut| cut != &export.cut)
+    {
+        return Err(invalid("selected source pause differs from its exact frozen cut"));
+    }
+    // The source cut already binds the actual native fence. Do not introduce a
+    // source marker mutation merely to observe a boundary before first send.
+    if Instant::now() >= deadline {
+        return Err(invalid("selected source pause reached its original handoff deadline before observation"));
+    }
+    if !pause.observation_sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        pause.observed.try_send(SelectedSourceExportObservation {
+            root: root.to_path_buf(), cut: export.cut.clone(), page, freeze,
+        }).map_err(|_| invalid("selected source pause observation owner unavailable"))?;
+    }
+    // Keep the registration until explicit release. A later actual owner that
+    // reaches this exact cut after another attempt times out cannot bypass it.
+    // Each invocation retains its own original native deadline.
+    let mut released = pause.released.lock().unwrap();
+    while !*released {
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| invalid("selected source pause reached its original handoff deadline"))?;
+        let (current, _) = pause.changed.wait_timeout(released, remaining).unwrap();
+        released = current;
+    }
+    drop(released);
+    if Instant::now() >= deadline {
+        return Err(invalid("selected source pause released after its original handoff deadline"));
+    }
+    layout.check()?;
+    Ok(())
+}
+
 pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
     backend: &mut dyn DfsMetadataBackend,
     local_node_id: &NodeId,
@@ -1051,9 +1173,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return Err(DfsError::Metadata { message: "selected original is outside the exact frozen source shard".into() });
                     }
                 }
-                crate::repair_handoff::RepairHandoffExport::capture_native_layout(
+                let export = crate::repair_handoff::RepairHandoffExport::capture_native_layout(
                     scope.root(), &layout, &handoff, belongs, deadline,
-                )?
+                )?;
+                #[cfg(test)]
+                pause_selected_source_export_for_test(scope.root(), &layout, backend, &export, deadline)?;
+                export
             } else {
                 crate::repair_handoff::RepairHandoffExport::capture(
                     scope.root(), &handoff, &store, belongs, deadline,
@@ -5636,8 +5761,9 @@ mod native_selected_data_tests {
         result.sort_by(|a,b| a.0.cmp(&b.0)); result
     }
 
-    /// The real A protocol creates the frozen export. A negative transport gate
-    /// holds its delivery while the actual B host's entry clock is exercised.
+    /// The real A protocol creates the frozen export. Before-poll expiry pauses
+    /// that source before its first send; the after-processing control retains
+    /// its decoded receiver pause. Neither gate supplies a successful reply.
     /// Supplying an argument to the host method is not transport authentication;
     /// the separate positive control exercises that wire boundary.
     fn native_selected_receiver_clock_control(after_processing: bool) {
@@ -5653,17 +5779,28 @@ mod native_selected_data_tests {
             fixture.runtime.select_genuine_original_before_handoff(&owner, &fixture.birth.root.subject.request_id, &proposed).unwrap();
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
             let paused_pages = Arc::new(Mutex::new(Vec::new()));
-            fixture.runtime.install_fault(FaultRule {
-                source: Some(owner.clone()), target: Some(fixture.promoted.clone()),
-                route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
-                origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 16,
-                action: FaultAction::PauseSelectedOriginalCustody {
-                    handoff_id: proposed.handoff_id.clone(), gate: Arc::clone(&gate),
-                    captured: Arc::clone(&paused_pages),
-                },
-            });
+            if after_processing {
+                fixture.runtime.install_fault(FaultRule {
+                    source: Some(owner.clone()), target: Some(fixture.promoted.clone()),
+                    route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
+                    origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 16,
+                    action: FaultAction::PauseSelectedOriginalCustody {
+                        handoff_id: proposed.handoff_id.clone(), gate: Arc::clone(&gate),
+                        captured: Arc::clone(&paused_pages),
+                    },
+                });
+            }
             let configs = fixture.runtime.metadata_shards().unwrap();
             let phase_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            let (source_observed, source_observation) = std::sync::mpsc::sync_channel(1);
+            let source_pause = (!after_processing).then(|| SelectedSourceExportRegistration::install(SelectedSourceExportPause {
+                layout: fixture.runtime.selected_original_data_layout(&owner).unwrap(),
+                root: crate::local_dfs_metadata_shard_path(fixture.runtime.data_dir(&owner),
+                    &DfsMetadataShardId::new(&fixture.shard.shard_id)),
+                handoff_id: proposed.handoff_id.clone(), deadline: phase_deadline,
+                observed: source_observed, observation_sent: std::sync::atomic::AtomicBool::new(false),
+                released: std::sync::Mutex::new(false), changed: std::sync::Condvar::new(),
+            }));
             drop(fence);
             std::thread::scope(|scope| {
                 let producer = scope.spawn(move || source.reconcile_pending_metadata_shard_membership_handoffs(
@@ -5684,23 +5821,38 @@ mod native_selected_data_tests {
                     let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&source_directory.join("0.sobj")).unwrap().unwrap();
                     page.validate_selected_original_data().unwrap();
                     assert_eq!(page.cut, cut);
-                    loop {
-                        let paused = paused_pages.lock().unwrap();
-                        assert!(Instant::now() <= capture_deadline,
-                            "exact decoded selected page must pause within the existing 5s setup budget");
-                        assert!(paused.len() <= 16);
-                        if !paused.is_empty() {
-                            assert!(paused.iter().all(|command| command.prefix_probe.as_ref()
-                                .and_then(|probe| probe.repair_custody.as_ref())
-                                .is_some_and(|actual| actual.cut == cut)));
-                            assert!(paused.iter().any(|command| command.prefix_probe.as_ref()
-                                .and_then(|probe| probe.repair_custody.as_ref())
-                                .is_some_and(|actual| actual == &page)),
-                                "the paused decoded command must include this exact source page");
-                            break;
+                    if after_processing {
+                        loop {
+                            let paused = paused_pages.lock().unwrap();
+                            assert!(Instant::now() <= capture_deadline,
+                                "exact decoded selected page must pause within the existing 5s setup budget");
+                            assert!(paused.len() <= 16);
+                            if !paused.is_empty() {
+                                assert!(paused.iter().all(|command| command.prefix_probe.as_ref()
+                                    .and_then(|probe| probe.repair_custody.as_ref())
+                                    .is_some_and(|actual| actual.cut == cut)));
+                                assert!(paused.iter().any(|command| command.prefix_probe.as_ref()
+                                    .and_then(|probe| probe.repair_custody.as_ref())
+                                    .is_some_and(|actual| actual == &page)),
+                                    "the paused decoded command must include this exact source page");
+                                break;
+                            }
+                            drop(paused);
+                            std::thread::sleep(Duration::from_millis(10));
                         }
-                        drop(paused);
-                        std::thread::sleep(Duration::from_millis(10));
+                    } else {
+                        let remaining = capture_deadline.checked_duration_since(Instant::now())
+                            .expect("source export observation remains in the existing 5s capture budget");
+                        let observed = source_observation.recv_timeout(remaining)
+                            .expect("actual source reached the exact selected export before first send");
+                        assert!(Instant::now() <= capture_deadline,
+                            "source export observation cannot arrive after its original capture deadline");
+                        assert_eq!(observed.root, crate::local_dfs_metadata_shard_path(
+                            fixture.runtime.data_dir(&owner), &shard));
+                        assert_eq!(observed.cut, cut);
+                        assert_eq!(observed.page, page);
+                        assert_eq!(observed.freeze.handoff_id, proposed.handoff_id);
+                        assert!(observed.freeze.activated_epoch.is_none());
                     }
                     let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
                         .get_metadata_shard_membership_handoff(&fixture.shard.file_system_id, &fixture.shard.shard_id)).unwrap().unwrap();
@@ -5785,13 +5937,16 @@ mod native_selected_data_tests {
                     assert!(layout.queue().unwrap().installed_original_handoff_data(&owner, &fixture.birth.root.subject.request_id).unwrap().is_none(),
                         "staged DATA or a late rejected response never installs queue custody");
                 }));
+                // Release the source-stage pause even when a receiver
+                // assertion fails, then join before propagating that verdict.
+                if let Some(pause) = &source_pause { pause.release(); }
                 fixture.runtime.clear_faults();
                 gate.add_permits(16);
                 let produced = producer.join().expect("real source handoff child drained");
                 if let Err(error) = checks { std::panic::resume_unwind(error); }
-                if let Err(error) = produced {
+                if !after_processing || produced.is_err() {
                     assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, phase_deadline).unwrap(),
-                        Some(proposed.desired_shard.clone()), "real handoff after releasing only the negative gate: {error}");
+                        Some(proposed.desired_shard.clone()), "real handoff after releasing only the negative gate: {produced:?}");
                 }
             });
         }));
@@ -5881,12 +6036,19 @@ mod native_selected_data_tests {
     /// the actual authenticated Main endpoint and cannot supply successful ACKs.
     fn with_native_selected_rejection_probe(
         name: &str,
-        check: impl FnOnce(&GenuineNativeOriginal, &DfsMetadataJournalBatchCommand, &mut Vec<serde_json::Value>),
+        prepare_routed_carrier: bool,
+        check: impl FnOnce(&GenuineNativeOriginal, &DfsMetadataJournalBatchCommand,
+            Option<&mut NetworkedDfsService<crate::DfsNodeTransport>>, &mut Vec<serde_json::Value>),
     ) {
         let mut fixture = genuine_native_original(name);
         let mut observations = Vec::new();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let owner = fixture.shard.primary_node_id.clone();
+            // A normal client requires completed startup. Acquire it before
+            // this fixture deliberately parks that same A handoff, then use
+            // it only to allocate the routed probe's carrier envelope.
+            let mut carrier_allocator = prepare_routed_carrier
+                .then(|| fixture.runtime.client(&owner).unwrap());
             let mut source = fixture.runtime.metadata_primary_service("/services/selected-original-data.bin").unwrap();
             let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
             let control = fixture.runtime.shared_control_plane().unwrap();
@@ -5981,7 +6143,7 @@ mod native_selected_data_tests {
                     };
                     let source_queue = fixture.runtime.selected_original_data_layout(&owner).unwrap().queue().unwrap();
                     let original_before = source_queue.original_repair(&fixture.birth.original).unwrap().unwrap();
-                    check(&fixture, &command, &mut observations);
+                    check(&fixture, &command, carrier_allocator.as_mut(), &mut observations);
                     assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), Some(original_before),
                         "negative probes cannot recreate, replace or settle the source original");
                     let queue = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap().queue().unwrap();
@@ -6000,6 +6162,7 @@ mod native_selected_data_tests {
                         Some(proposed.desired_shard.clone()), "normal handoff after negative-only gate release: {error}");
                 }
             });
+            drop(carrier_allocator);
         }));
         let report = serde_json::json!({
             "assertions_passed": outcome.is_ok(), "initial_original": &fixture.birth,
@@ -6022,7 +6185,7 @@ mod native_selected_data_tests {
 
     #[test]
     fn native_selected_ingress_rejects_wrong_source_prefix_and_scope_without_mutation() {
-        with_native_selected_rejection_probe("native-selected-invalid-ingress", |fixture, genuine, observations| {
+        with_native_selected_rejection_probe("native-selected-invalid-ingress", false, |fixture, genuine, _carrier, observations| {
             let owner = &fixture.shard.primary_node_id;
             for arm in ["authenticated-source", "prefix", "filesystem-scope", "epoch"] {
                 let mut command = genuine.clone();
@@ -6079,14 +6242,13 @@ mod native_selected_data_tests {
 
     #[test]
     fn native_selected_routed_input_without_receiver_budget_rejects_before_effects() {
-        with_native_selected_rejection_probe("native-selected-unbudgeted-routed", |fixture, genuine, observations| {
+        with_native_selected_rejection_probe("native-selected-unbudgeted-routed", true, |fixture, genuine, carrier, observations| {
             let owner = &fixture.shard.primary_node_id;
             let layout = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
             let before_clocks = layout.receiver_clocks().unwrap();
-            let mut caller = fixture.runtime.client(owner).unwrap();
+            let caller = carrier.expect("normal A carrier allocator was obtained before the pending handoff");
             let routed_message = caller.next_dfs_routed_message(&fixture.promoted,
                 DfsNetworkMessage::MetadataJournalBatch(genuine.clone()));
-            drop(caller);
             let command = DfsMessageCommand {
                 request_id: format!("selected-routed-envelope-{}", genuine.request_id), routed_message,
             };
