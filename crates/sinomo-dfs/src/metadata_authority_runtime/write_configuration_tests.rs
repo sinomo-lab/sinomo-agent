@@ -2039,29 +2039,9 @@ async fn retained_control_client_revalidates_a_ready_generation_changed_during_f
     );
 }
 
-// These use the actual projection owner/reads/deltas and production capture
-// finisher. They mint no content admission or Terminal; native controls own
-// the physical-owner and end-to-end receiver boundary.
-fn original_repair_fixture_capture_generation(
-    runtime: &Arc<DfsMetadataAuthorityRuntime>,
-    filesystem: &crate::DfsFileSystemConfig,
-) -> u64 {
-    runtime
-        .with_current_publication_configuration(
-            &filesystem.file_system_id,
-            |generation, shards, current| {
-                assert!(
-                    shards.is_empty(),
-                    "this runtime fixture has no shard records"
-                );
-                assert_eq!(current.as_ref(), Some(filesystem));
-                generation
-            },
-        )
-        .unwrap()
-        .unwrap()
-}
-
+// These use the actual projection owner/reads/deltas and owned snapshot API.
+// They mint no content admission or Terminal; native controls retain ownership
+// of the physical and end-to-end receiver boundary.
 fn original_repair_fixture_filesystem_put(
     host: &NativeProjectionHost,
     runtime: &Arc<DfsMetadataAuthorityRuntime>,
@@ -2102,57 +2082,56 @@ async fn original_repair_contiguous_same_value_filesystem_delta_keeps_native_ori
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let before = runtime.write_configuration_projection().unwrap().unwrap();
     let mut entry = host.inputs.lock().unwrap().scopes[0][0].clone();
     let filesystem: crate::DfsFileSystemConfig = entry.decode().unwrap();
-    let captured_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
+    let before = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
+    assert_eq!(before.filesystem.as_ref(), Some(&filesystem));
+    assert!(before.shards.is_empty());
     let authority_generation = runtime.generation();
     let storage_generation = runtime.storage_generation();
     let reads = host.read_count();
-    crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &before,
-        captured_generation,
-    )
-    .unwrap();
     let original_value = entry.value.clone();
     entry.modify_revision = KvRevision(11);
     entry.version = KvVersion(2);
     let observation = original_repair_fixture_filesystem_put(&host, &runtime, entry, 11);
     assert!(observation.accepted && !observation.authority_changed);
-    let current = runtime.write_configuration_projection().unwrap().unwrap();
-    assert_eq!(current.revision(), KvRevision(11));
-    assert!(!Arc::ptr_eq(&current, &before));
+    let current = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
+    assert_eq!(current.view.revision(), KvRevision(11));
+    assert!(!Arc::ptr_eq(&current.view, &before.view));
     assert_eq!(
         current
+            .view
             .entries(&crate::file_system_config_key(&filesystem.file_system_id))
             .unwrap()[0]
             .value,
         original_value
     );
-    assert!(current.has_same_native_proof_origin(&before));
+    assert!(current.view.has_same_native_proof_origin(&before.view));
     assert!(
-        !before.has_same_native_proof_origin(&current),
-        "the relation also rejects revision regression"
+        !before.view.has_same_native_proof_origin(&current.view),
+        "native origin relation also rejects revision regression"
     );
-    let current_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
-    assert!(current_generation > captured_generation);
+    assert_eq!(current.filesystem.as_ref(), Some(&filesystem));
+    assert_eq!(current.shards, before.shards);
+    assert!(current.projection_generation > before.projection_generation);
+    assert_eq!(
+        current.projection_generation,
+        runtime.projection_generation()
+    );
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(current.view.revision())
+    );
     assert_eq!(runtime.generation(), authority_generation);
     assert_eq!(runtime.storage_generation(), storage_generation);
-    crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &current,
-        current_generation,
-    )
-    .unwrap();
-    assert!(
-        crate::publication_guard::validate_original_repair_configuration_capture(
-            &runtime,
-            &before,
-            captured_generation
-        )
-        .is_err(),
-        "old capture identity is not stable merely because proof origin is retained"
+    assert_eq!(
+        before.view.revision(),
+        KvRevision(10),
+        "the earlier owned snapshot remains immutable"
     );
     assert_eq!(
         host.read_count(),
@@ -2168,10 +2147,11 @@ async fn original_repair_required_revision_rebootstrap_changes_origin_with_equal
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let before = runtime.write_configuration_projection().unwrap().unwrap();
     let filesystem: crate::DfsFileSystemConfig =
         host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let captured_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
+    let before = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
     let authority_generation = runtime.generation();
     let storage_generation = runtime.storage_generation();
     let reads = host.read_count();
@@ -2192,12 +2172,9 @@ async fn original_repair_required_revision_rebootstrap_changes_origin_with_equal
             .is_none()
     );
     assert!(
-        crate::publication_guard::validate_original_repair_configuration_capture(
-            &runtime,
-            &before,
-            captured_generation
-        )
-        .is_err()
+        runtime
+            .current_original_repair_configuration(&filesystem.file_system_id)
+            .is_err()
     );
     assert_eq!(
         runtime.generation(),
@@ -2206,25 +2183,23 @@ async fn original_repair_required_revision_rebootstrap_changes_origin_with_equal
     );
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
-    let current = runtime.write_configuration_projection().unwrap().unwrap();
+    let current = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
     assert_eq!(
-        current.scopes, before.scopes,
+        current.view.scopes, before.view.scopes,
         "all final semantic configuration data is exactly equal"
     );
-    assert_eq!(current.revision(), KvRevision(11));
+    assert_eq!(current.filesystem, before.filesystem);
+    assert_eq!(current.shards, before.shards);
+    assert_eq!(current.view.revision(), KvRevision(11));
     assert!(
-        !current.has_same_native_proof_origin(&before),
-        "fresh native reads at a strictly required revision are a different origin"
+        !current.view.has_same_native_proof_origin(&before.view),
+        "strictly newer required native reads are a different origin"
     );
+    assert!(current.projection_generation > before.projection_generation);
     assert_eq!(runtime.generation(), authority_generation);
     assert_eq!(runtime.storage_generation(), storage_generation);
-    let current_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
-    crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &current,
-        current_generation,
-    )
-    .unwrap();
     assert_eq!(
         host.read_count(),
         reads + DFS_WRITE_CONFIGURATION_PREFIXES.len()
@@ -2238,19 +2213,22 @@ async fn original_repair_capture_rejects_withdrawal_during_its_final_floor_read(
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let before = runtime.write_configuration_projection().unwrap().unwrap();
+    let filesystem: crate::DfsFileSystemConfig =
+        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
+    let before = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
     let authority_generation = runtime.generation();
-    let projection_generation = runtime.projection_generation();
     let weak = Arc::downgrade(&runtime);
     *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
         weak.upgrade()
             .unwrap()
             .require_authoritative_revision(KvRevision(11));
     }));
-    // Establish the actual API window: it cloned this Arc BEFORE consulting
-    // the floor, whose observer withdraws publication but returns equal input.
+    // Preserve the old-ID control's observed ordinary API window: an Arc can
+    // be cloned before a floor callback withdraws the actual publication.
     let returned_old = runtime.write_configuration_projection().unwrap().unwrap();
-    assert!(Arc::ptr_eq(&returned_old, &before));
+    assert!(Arc::ptr_eq(&returned_old, &before.view));
     assert!(
         runtime
             .write_configuration
@@ -2259,7 +2237,7 @@ async fn original_repair_capture_rejects_withdrawal_during_its_final_floor_read(
             .snapshot()
             .is_none()
     );
-    assert!(runtime.projection_generation() > projection_generation);
+    assert!(runtime.projection_generation() > before.projection_generation);
     assert_eq!(runtime.generation(), authority_generation);
     {
         let mut inputs = host.inputs.lock().unwrap();
@@ -2269,32 +2247,25 @@ async fn original_repair_capture_rejects_withdrawal_during_its_final_floor_read(
         inputs.floor.applied_index = 111;
     }
     host.run_next().await;
-    let current = runtime.write_configuration_projection().unwrap().unwrap();
-    let filesystem: crate::DfsFileSystemConfig =
-        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let captured_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
-    crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &current,
-        captured_generation,
-    )
-    .unwrap();
+    let current = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
     let weak = Arc::downgrade(&runtime);
     *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
         weak.upgrade()
             .unwrap()
             .require_authoritative_revision(KvRevision(12));
     }));
-    // Invoke the REAL production finisher, rather than repeating its pointer
-    // or generation comparisons in a test-local acceptance predicate.
-    let error = crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &current,
-        captured_generation,
-    )
-    .unwrap_err();
+    // The retained case ID now exercises the real single-floor snapshot API.
+    // It must reject current None rather than lend its earlier checked Arc.
+    let error = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .err()
+        .expect("withdrawn current publication must reject owned capture");
     assert!(
-        error.to_string().contains("changed during current capture"),
+        error
+            .to_string()
+            .contains("withdrawn or replaced during capture"),
         "{error}"
     );
     assert!(
@@ -2305,7 +2276,7 @@ async fn original_repair_capture_rejects_withdrawal_during_its_final_floor_read(
             .snapshot()
             .is_none()
     );
-    assert!(runtime.projection_generation() > captured_generation);
+    assert!(runtime.projection_generation() > current.projection_generation);
     assert_eq!(runtime.generation(), authority_generation);
     assert_eq!(
         host.read_count(),
@@ -2321,9 +2292,11 @@ async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let before = runtime.write_configuration_projection().unwrap().unwrap();
     let original_entry = host.inputs.lock().unwrap().scopes[0][0].clone();
     let original: crate::DfsFileSystemConfig = original_entry.decode().unwrap();
+    let before = runtime
+        .current_original_repair_configuration(&original.file_system_id)
+        .unwrap();
     let authority_generation = runtime.generation();
     let storage_generation = runtime.storage_generation();
     assert!(
@@ -2350,10 +2323,13 @@ async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
     entry.modify_revision = KvRevision(12);
     entry.version = KvVersion(3);
     assert!(original_repair_fixture_filesystem_put(&host, &runtime, entry, 12).authority_changed);
-    let current = runtime.write_configuration_projection().unwrap().unwrap();
-    let current_generation = original_repair_fixture_capture_generation(&runtime, &original);
+    let current = runtime
+        .current_original_repair_configuration(&original.file_system_id)
+        .unwrap();
+    assert_eq!(current.filesystem.as_ref(), Some(&original));
+    assert_eq!(current.shards, before.shards);
     assert!(
-        current.has_same_native_proof_origin(&before),
+        current.view.has_same_native_proof_origin(&before.view),
         "contiguous native origin alone is deliberately not permission"
     );
     assert!(runtime.generation() > changed_generation);
@@ -2369,12 +2345,10 @@ async fn original_repair_contiguous_policy_aba_keeps_the_authority_fence() {
             runtime.generation()
         )
     );
-    crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &current,
-        current_generation,
-    )
-    .unwrap();
+    assert_eq!(
+        current.projection_generation,
+        runtime.projection_generation()
+    );
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(host.read_count(), DFS_WRITE_CONFIGURATION_PREFIXES.len());
     assert_eq!(host.queued_count(), 0);
@@ -2386,31 +2360,33 @@ async fn original_repair_equal_revision_discontinuity_keeps_the_authority_fence(
     let runtime = attach(&host);
     runtime.request_authoritative_refresh();
     host.run_next().await;
-    let before = runtime.write_configuration_projection().unwrap().unwrap();
     let filesystem: crate::DfsFileSystemConfig =
         host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
-    let captured_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
+    let before = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
     let authority_generation = runtime.generation();
     let storage_generation = runtime.storage_generation();
     let gap = runtime.observe_discontinuity(KvRevision(10));
     assert!(gap.proof_withdrawn && gap.authority_changed);
     assert!(runtime.generation() > authority_generation);
     assert!(
-        crate::publication_guard::validate_original_repair_configuration_capture(
-            &runtime,
-            &before,
-            captured_generation
-        )
-        .is_err()
+        runtime
+            .current_original_repair_configuration(&filesystem.file_system_id)
+            .is_err()
     );
     assert_eq!(host.queued_count(), 1);
     host.run_next().await;
-    let current = runtime.write_configuration_projection().unwrap().unwrap();
-    assert_eq!(current.scopes, before.scopes);
-    assert_eq!(current.revision(), before.revision());
-    // These fixture ReadIndex/floor values are identical at the same revision;
-    // the existing discontinuity authority fence must still reject the old cut.
-    assert!(current.has_same_native_proof_origin(&before));
+    let current = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
+    assert_eq!(current.view.scopes, before.view.scopes);
+    assert_eq!(current.view.revision(), before.view.revision());
+    assert_eq!(current.filesystem, before.filesystem);
+    assert_eq!(current.shards, before.shards);
+    // Same-revision native fixture fields can be equal after rebootstrap; the
+    // independently retained discontinuity authority fence is still required.
+    assert!(current.view.has_same_native_proof_origin(&before.view));
     assert!(
         !crate::runtime_host::test_retained_authority_admission_is_ready(
             &runtime,
@@ -2423,17 +2399,89 @@ async fn original_repair_equal_revision_discontinuity_keeps_the_authority_fence(
             runtime.generation()
         )
     );
-    let current_generation = original_repair_fixture_capture_generation(&runtime, &filesystem);
-    crate::publication_guard::validate_original_repair_configuration_capture(
-        &runtime,
-        &current,
-        current_generation,
-    )
-    .unwrap();
+    assert_eq!(
+        current.projection_generation,
+        runtime.projection_generation()
+    );
     assert_eq!(runtime.storage_generation(), storage_generation);
     assert_eq!(
         host.read_count(),
         2 * DFS_WRITE_CONFIGURATION_PREFIXES.len()
     );
+    assert_eq!(host.queued_count(), 0);
+}
+
+#[tokio::test]
+async fn original_repair_atomic_capture_uses_contiguous_current_view_during_floor_read() {
+    let host = NativeProjectionHost::new(true);
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let filesystem: crate::DfsFileSystemConfig =
+        host.inputs.lock().unwrap().scopes[0][0].decode().unwrap();
+    let before = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
+    let authority_generation = runtime.generation();
+    let storage_generation = runtime.storage_generation();
+    let reads = host.read_count();
+    let spawned = host.spawned.load(Ordering::Acquire);
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::clone(&published);
+    let weak_runtime = Arc::downgrade(&runtime);
+    let weak_host = Arc::downgrade(&host);
+    *host.floor_observer.lock().unwrap() = Some(Box::new(move || {
+        let runtime = weak_runtime.upgrade().unwrap();
+        let host = weak_host.upgrade().unwrap();
+        let mut entry = host.inputs.lock().unwrap().scopes[0][0].clone();
+        entry.modify_revision = KvRevision(11);
+        entry.version = KvVersion(2);
+        let delta = original_repair_fixture_filesystem_put(&host, &runtime, entry, 11);
+        assert!(delta.accepted && !delta.authority_changed);
+        *observed.lock().unwrap() = runtime.write_configuration.lock().unwrap().snapshot();
+    }));
+    // This calls the real API once. Its initial floor read executes the actual
+    // committed delta, after the older checked Arc was cloned but before the
+    // configuration -> projection owned capture. No retry or new read is used.
+    let current = runtime
+        .current_original_repair_configuration(&filesystem.file_system_id)
+        .unwrap();
+    let published = published
+        .lock()
+        .unwrap()
+        .take()
+        .expect("actual delta published its current Arc");
+    assert!(Arc::ptr_eq(&current.view, &published));
+    assert!(!Arc::ptr_eq(&current.view, &before.view));
+    assert_eq!(current.view.revision(), KvRevision(11));
+    assert_eq!(
+        current
+            .view
+            .entries(&crate::file_system_config_key(&filesystem.file_system_id))
+            .unwrap()[0]
+            .modify_revision,
+        KvRevision(11)
+    );
+    assert!(current.view.has_same_native_proof_origin(&before.view));
+    assert_eq!(current.filesystem.as_ref(), Some(&filesystem));
+    assert_eq!(current.shards, before.shards);
+    assert!(current.projection_generation > before.projection_generation);
+    assert_eq!(
+        current.projection_generation,
+        runtime.projection_generation()
+    );
+    assert_eq!(
+        runtime.state.current_complete_prefix_revision(),
+        Some(current.view.revision())
+    );
+    assert_eq!(runtime.generation(), authority_generation);
+    assert_eq!(runtime.storage_generation(), storage_generation);
+    assert!(host.floor_observer.lock().unwrap().is_none());
+    assert_eq!(
+        host.read_count(),
+        reads,
+        "floor-read progress uses the already-proven native bundle"
+    );
+    assert_eq!(host.spawned.load(Ordering::Acquire), spawned);
     assert_eq!(host.queued_count(), 0);
 }
