@@ -1,6 +1,52 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-24 R19
+## Current development checkpoint — 2026-10-24 R23
+
+Local code commit `37e6129604834e77aabbba56beb81abd9b784d39` has qualified
+source `14cb88d94479b813a318694127d21939a488a4a60ee259b0bae080919ff9615d`
+(4,903 inputs) and own sealed executable
+`30e6e0c816e5da49487e9ba008a9d4a324070eceac2b72a8d8bb04a346bc9ee8`.
+Fresh typecheck and libtest generation passed. Across disjoint I49/I52 execution,
+127 unique controls yielded **126 PASS / 1 FAIL / 0 incomplete / 0 unrun**.
+I49's separate preservation checkpoint failed on a process-exit race; that failure
+remains retained. The reviewed operation-local correction passed ten controls;
+I52 then executed only its 125 unrun cases with every preservation checkpoint passing.
+
+The fresh-create native W=2/N=3 control passed actual B/C content and receipt
+checks, retained N=3 and A's deficit, and healed A normally. It used healthy
+metadata participants and denied A's content transfer. Original reply loss was
+completed through the same operation/body/options and actual normal Main response;
+read-only reconciliation was not changed. This is bounded fresh-create evidence,
+not abrupt node loss, general overwrites or metadata quorum.
+
+The only failed Rust control is the prospective receiver Terminal positive.
+Unchanged I53 tracing captured default-layout inspection rejecting the actual
+private-format-4 content owner before RPC dispatch. Original birth/attempt and
+in-flight evidence remain intact. A focused owner-qualified inspection and
+whole-call attachment forwarding correction is under review; it has no execution
+acceptance yet. Historical Terminal delivery and foreign B execution remain disabled.
+
+Current-source full DFS/KV lint passed all 11 UI controls and all three library
+analyses. Standard tables, exact receipts and coverage limits are in
+`data/operations/dfs-availability-20261023/R23-REPORT.md`. I48 build receipt05931c3a,
+I52 runtime5d1224d1, I50 boundaryfc7cd7cf and I53 failed diagnostic1e6490b8 are sealed.
+All local merges were conflict-free; generated evidence remains uncommitted.
+
+The original R67 positive successor continuation remains failed on preserved
+40394f47/17295eb6. C1 admission, checked B execution/result correlation, causal
+application/withdrawal, root retirement, majority metadata history/fencing,
+full W/N degraded operation, abrupt process/partition/reconnect and Sinomo-only
+CPU/disk/network quietness remain open. Missing per-node metrics stay unavailable.
+
+Local reviewed commits and tested merges between isolated DFS subtasks are the
+integration boundaries. Launches use only the DFS-local lock and own16GiB/no-swap
+limits with actual source/artifact/runtime checks and cleanup. There is no peer
+capacity/source-release/handback workflow. dev/debug owns Docker and main owns
+rollout; this lane operates neither, pushes nowhere and remains nonblocking.
+
+## Historical checkpoints
+
+### Preserved R19 checkpoint
 
 Local merge `3e61778bea4c372ee4d36f01c115cc13873c190f` contains the private,
 prospective A-origin receiver foundation. Source
@@ -69,7 +115,6 @@ There is no peer capacity/source-release/handback workflow. `dev/debug` owns its
 Docker cluster and `main` owns real rollout; this lane operates neither, remains
 nonblocking, and does not merge into either lane, push or deploy.
 
-## Historical checkpoints
 
 The following entries preserve earlier source-specific findings. Their pending
 reservations, source grants and unrun statements describe those checkpoints,
