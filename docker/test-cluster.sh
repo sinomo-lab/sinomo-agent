@@ -4714,8 +4714,13 @@ if [ "${SINOMO_TEST_BUILD:-1}" = 1 ]; then
 fi
 
 compose config --format json > "$ARTIFACTS/compose-effective.json" || exit 1
+RESOURCE_PREFLIGHT_ARGS=()
+if [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
+  RESOURCE_PREFLIGHT_ARGS+=(--reuse-project "$PROJECT")
+fi
 python3 "$SINOMO_DOCKER_DIR/runtime_resources.py" preflight \
-  --config "$ARTIFACTS/compose-effective.json" --artifacts "$ARTIFACTS" || exit 1
+  --config "$ARTIFACTS/compose-effective.json" --artifacts "$ARTIFACTS" \
+  "${RESOURCE_PREFLIGHT_ARGS[@]}" || exit 1
 export SINOMO_TEST_RESOURCE_INTENTS="$ARTIFACTS/runtime-resource-intents.jsonl"
 trap 'FAILED_SCENARIOS="${FAILED_SCENARIOS:+$FAILED_SCENARIOS }runtime-resources"; exit 1' USR1
 
