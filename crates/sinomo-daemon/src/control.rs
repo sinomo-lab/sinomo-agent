@@ -4209,6 +4209,13 @@ mod tests {
             .with_trace_context_if_missing();
         let signed =
             sign_daemon_rpc_request_from_data_dir(&peer_data_dir, &request).expect("signed rpc");
+        // Match the real Main entrypoint before constructing components. This
+        // transport fixture must not race a cold raw Raft open against the
+        // resident owner initialized by its own component host.
+        assert!(
+            initialize_local_cluster_raft_resident(&target_daemon_paths)
+                .expect("normal Main resident startup")
+        );
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
