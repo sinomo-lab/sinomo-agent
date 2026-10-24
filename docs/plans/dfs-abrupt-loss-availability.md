@@ -1,6 +1,41 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-24 R28
+## Current development checkpoint — 2026-10-24 R29
+
+Local merge `dc2c96e991ce0d834006432b033e66c237eada5f` integrates the private
+historical-query branch `708cad79`. Source `6de91a23` has 4,904 inputs; its own
+sealed executable is `9edf0efb`. Fresh check/build/seal passed. The focused panel
+actually executed **27 controls: 25 PASS and 2 FAIL**, with no incomplete or unrun
+case within that panel. The other 123 inventory IDs are unrun on R29. The current
+full DFS/KV boundary gate passed all 11 UI controls and three library analyses.
+Earlier results do not transfer to this source.
+
+The query obtains exact retained original history from native C and journals a
+B observation through the existing queue writer, without B payload, a new Repair
+effect, receipt application, closure or root release. Six native query cases
+passed. The local duplicate-prefix control and native restart/certification case
+failed during queue compaction: persisted heterogeneous tuples cannot be encoded
+by SOBJ's homogeneous sequence serializer. A named-field snapshot correction is
+being prepared in isolation; the failed source and all raw evidence are retained.
+
+The one actual merge conflict was in `service_sync.rs`, where two fixture modes
+met. Separate auth-probe and Prepared-only wrappers preserve their existing
+semantics and reject combined use. Root's auth branch and atomic capture stayed
+byte-identical; the query additions were retained. All owned process/group/scope/
+root lifetimes and unconditional fixture archives were verified after cleanup.
+
+Exact standard tables and receipts: `R29-REPORT.md` and `R29-RESULT.json` under
+`data/operations/dfs-availability-20261023/`; build I72 `fcc0eddf`, focused I73
+`d01767f7`, boundary I75 `f180a523`. No generated evidence is committed.
+Historical Terminal is not current-holder/application authority. Snapshot replay,
+checked B effects, causal withdrawal, C1, root retirement, metadata quorum and real
+abrupt-process/partition/reconnect/Sinomo-only quietness remain open. This remains
+independent nonblocking development, with only the DFS-local lock and no Docker,
+production activation, push or merge into dev/debug or main.
+
+## Historical checkpoints
+
+### Preserved R28 checkpoint
 
 Local code merge `e700d3bd4b071ebbb7e1072afb8c89fad0f6a98c` has source
 `38bced0d25ad1cede26adc01a4bbb505f7082a70ab8c5f810b2c43fc39df7d3c`
@@ -52,8 +87,6 @@ Sinomo-only quietness acceptance remain open.
 This remains independent, nonblocking development: DFS-local serialization and
 own16GiB/no-swap limits, no peer permission/handback workflow, Docker operation,
 production activation, push or merge into dev/debug or main.
-
-## Historical checkpoints
 
 ### Preserved R25 checkpoint
 
