@@ -1,6 +1,61 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-24 R25
+## Current development checkpoint — 2026-10-24 R28
+
+Local code merge `e700d3bd4b071ebbb7e1072afb8c89fad0f6a98c` has source
+`38bced0d25ad1cede26adc01a4bbb505f7082a70ab8c5f810b2c43fc39df7d3c`
+(4,903 inputs) and sealed own executable
+`8f6f19dac5697b29da64c2b7438e8e2f4c7c4cf8cbfde339b73c7706398f86c2`.
+Fresh check/build/seal passed. Disjoint focused and remaining panels executed
+**140 unique controls once: 140 PASS, zero failed, incomplete or unrun**.
+The full current-source boundary gate passed its own lint library, all 11 UI
+controls, and DFS/history/attachments analyses. All owned lifetimes and fixture
+archives were verified after normal cleanup.
+
+The original receiver now tolerates continuous observational configuration
+progress while retaining the same native proof origin, authority and physical
+fences. Its floor read occurs outside locks; the current view and metadata cache
+are copied together under the existing configuration→projection order. No retry,
+new counter, metadata participant reduction or persisted floor was added. Six
+runtime controls cover update-during-read, withdrawal, rebootstrap, policy ABA
+and discontinuity. The actual native Terminal case passed while projection25→26
+and revision71→72 advanced with unchanged authority18 and native proof origin.
+It preserved original identity/body and reached Prepared→Bound→Terminal before
+lost reply, compaction and native-owner reopen. This is not OS-process proof.
+
+The native authenticated-source negative also passed: B could not execute an A
+envelope, C files/A queue stayed unchanged, then the same paused genuine A call
+completed. Other selected DATA, policy, legacy and fresh W=2/N=3 controls passed.
+Fresh placement still has all metadata participants available, preserves desired
+N=3/A deficit and heals A; general overwrite and abrupt-loss availability remain
+unverified. Full-participant metadata checks are unchanged.
+
+R26/I63 and R27/I66 failures remain preserved. The new successful trace demonstrates
+the corrected continuous-progress path; it does not identify those older runs'
+unrecorded delta/proof origins. Original R67 positive successor continuation,
+request/body and committed intent remain retained and unresolved.
+
+Exact evidence is in `data/operations/dfs-availability-20261023/R28-REPORT.md`
+and `R28-COMBINED-RESULT.json`: build I68 `6b5d09c1`, focused I69 `f1770881`,
+remaining I70 `e1f93ba0`, full boundary I71 `d8ff22a9`. Standard tables preserve
+unavailable measurements. All actual local merges were conflict-free; generated
+evidence is uncommitted.
+
+The next isolated candidate queries retained exact historical results using
+existing queue/content/native owners, without B payload, Repair execution,
+receipt application or root release. It is not yet integrated or executed.
+Source review is correcting precise snapshot/certificate and fixture-lifetime
+issues before compilation. Checked B effects/application, C1, root retirement,
+majority metadata history/fencing, real abrupt-loss/partition/reconnect and
+Sinomo-only quietness acceptance remain open.
+
+This remains independent, nonblocking development: DFS-local serialization and
+own16GiB/no-swap limits, no peer permission/handback workflow, Docker operation,
+production activation, push or merge into dev/debug or main.
+
+## Historical checkpoints
+
+### Preserved R25 checkpoint
 
 Local code commit `2d78a291` has source
 `e350c2e0fd4c29508095a6ca21b16dfd0b0f1bba846d8ac36ae5505db35759fe`
@@ -53,7 +108,6 @@ only the DFS-local lock and own16GiB/no-swap limits with exact qualification and
 cleanup. No debugger synchronization, Docker operation, push, production/main
 rollout or merge into another lane occurs; this development remains nonblocking.
 
-## Historical checkpoints
 
 ### Preserved R23 checkpoint
 
