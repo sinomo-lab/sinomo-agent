@@ -4703,13 +4703,24 @@ mod native_selected_data_tests {
         let mut policy = DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
         policy.required_node_ids = vec![owner.clone(), holder.clone()];
         runtime.apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, policy).unwrap();
+        // Candidates are hints. Resolve the actual managed constraints so the
+        // seed really places the exact bytes on A/C, leaving promoted B empty.
+        let mut policy_reader = runtime.metadata_primary_service(path).unwrap();
+        let planned_policy = policy_reader.managed_write_replication_policy_for_path(
+            path, sinomo_core::DfsObjectPolicy::ReplicatedEventual, 2,
+        ).unwrap();
+        let required = BTreeSet::from([owner.clone(), holder.clone()]);
+        assert_eq!(planned_policy.min_commit_replicas, 1);
+        assert_eq!(planned_policy.desired_replicas, 2);
+        assert_eq!(planned_policy.required_node_ids.iter().cloned().collect::<BTreeSet<_>>(), required);
+        drop(policy_reader);
         let mut writer = runtime.client(&owner).unwrap();
         assert!(writer.transport.delegates_local_namespace_authority());
         let seed_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         let previous = writer.set_transport_operation_deadline(Some(seed_deadline));
         let bytes = vec![0x5a; 4096];
         let stat = writer.posix_write_file(path, &bytes, DfsWriteOptions {
-            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+            policy: planned_policy,
             replica_candidates: vec![owner.clone(), holder.clone()],
             wait_for_commit: true, foreground_replica_repair: true,
         }).unwrap();
@@ -4718,6 +4729,8 @@ mod native_selected_data_tests {
         assert_eq!(writer.transport.operation_deadline(), Some(seed_deadline));
         assert_eq!(synced.target.version, stat.version);
         assert_eq!(synced.content_evidence.required_receipts, 2);
+        eprintln!("SELECTED_NATIVE_SEED_RECEIPTS {:?}", synced.content_evidence.receipt_node_ids);
+        assert_eq!(synced.content_evidence.receipt_node_ids.iter().cloned().collect::<BTreeSet<_>>(), required);
         writer.set_transport_operation_deadline(previous);
         drop(writer);
         for node in [&owner, &holder] {
