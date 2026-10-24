@@ -69,8 +69,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
         Self::Error,
     > {
         Box::pin(async move {
-            sinomo_daemon::start_cluster_kv_authoritative_watch_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::start_cluster_kv_authoritative_watch_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 prefix,
                 timeout,
                 self.runtime,
@@ -88,8 +89,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
     ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::KvLocalRead<Option<KvEntry>>, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::fetch_cluster_kv_local_entry_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::fetch_cluster_kv_local_entry_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 key,
                 timeout,
                 self.runtime,
@@ -107,8 +109,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
     ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::ClusterKvWatchDrainResponse, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::drain_cluster_kv_watch_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::drain_cluster_kv_watch_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 request,
                 timeout,
                 self.runtime,
@@ -126,8 +129,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
     ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::ClusterKvWatchCancelResponse, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::cancel_cluster_kv_watch_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::cancel_cluster_kv_watch_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 request,
                 timeout,
                 self.runtime,
