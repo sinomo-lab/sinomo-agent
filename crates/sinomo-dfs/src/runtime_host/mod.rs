@@ -359,7 +359,7 @@ impl DfsDataOwnerLock {
         self.original_repair_fixture.as_ref().map(|fixture| fixture.targets.lock().map(|targets| targets.contains(target)).map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture target mutex poisoned".into() })).transpose().map(|selected| selected.unwrap_or(false))
     }
 
-    fn open_native_content(&self) -> Result<LocalContentStore, DfsRuntimeError> {
+    pub(crate) fn open_native_content(&self) -> Result<LocalContentStore, DfsRuntimeError> {
         match &self.original_repair_fixture {
             #[cfg(any(test, feature = "test-support"))]
             Some(fixture) => fixture.open(self),

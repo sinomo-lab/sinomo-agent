@@ -212,7 +212,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             &self.data_dir,
             &runtime,
         );
-        let content = crate::LocalContentStore::new(self.data_dir.dfs_dir().join("content"))?;
+        let content = self.publication_owners.open_native_content()?;
         let service = crate::NetworkedDfsService::new(transport, content);
         let mut service = if let Some(backend) = self.genesis_backend.take() {
             service.with_metadata_backend_lazy(backend)?

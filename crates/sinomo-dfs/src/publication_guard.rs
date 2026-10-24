@@ -570,6 +570,16 @@ impl DfsPublicationExecutionOwners {
     pub(crate) fn data_root(&self) -> &Path {
         &self.data_root
     }
+    /// Open through the same physical owner retained by this admission.
+    /// Representation admission does not grant metadata publication authority.
+    pub(crate) fn open_native_content(&self) -> Result<crate::LocalContentStore> {
+        self._data_owner.open_native_content().map_err(|error| {
+            MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: error.to_string(),
+            }
+        })
+    }
     pub(crate) fn from_runtime(
         data_root: PathBuf,
         scope: DfsMessageExecutionScope,
