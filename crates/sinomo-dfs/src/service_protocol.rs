@@ -225,6 +225,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::RepairReplica(command) => {
                 events.push(self.handle_repair_replica(source_node_id, command)?);
             }
+            DfsNetworkMessage::SelectedOriginalRepair(command) => {
+                events.push(self.handle_selected_original_repair(source_node_id, command)?);
+            }
             DfsNetworkMessage::RepairReplicaResponse(response) => {
                 events.push(self.handle_repair_replica_response(source_node_id, response)?);
             }

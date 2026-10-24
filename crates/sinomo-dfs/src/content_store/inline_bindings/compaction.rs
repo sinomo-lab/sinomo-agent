@@ -40,6 +40,9 @@ enum CanonicalKey {
     ReceivedPrepared(received_repair::ReceivedRepairKey),
     ReceivedBound(received_repair::ReceivedRepairKey),
     DeletedBlob(String),
+    OriginalPrepared(original_repair::OriginalRepairKey),
+    OriginalBound(original_repair::OriginalRepairKey),
+    OriginalTerminal(original_repair::OriginalRepairKey),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -148,6 +151,9 @@ fn canonical_record_count(view: &InlineBindingView) -> u64 {
         .saturating_add(view.repair_payloads.len() as u64)
         .saturating_add(view.received_repairs.len() as u64)
         .saturating_add(view.received_bindings.len() as u64)
+        .saturating_add(view.original_repairs.len() as u64)
+        .saturating_add(view.original_bindings.len() as u64)
+        .saturating_add(view.original_terminals.len() as u64)
         .saturating_add(view.deleted_blobs.len() as u64)
 }
 /// Each step seeks after the last exact key instead of rescanning an ordinal
@@ -234,6 +240,9 @@ fn canonical_next<'a>(
         Some(
             CanonicalKey::ReceivedPrepared(_)
                 | CanonicalKey::ReceivedBound(_)
+                | CanonicalKey::OriginalPrepared(_)
+                | CanonicalKey::OriginalBound(_)
+                | CanonicalKey::OriginalTerminal(_)
                 | CanonicalKey::DeletedBlob(_)
         )
     ) {
@@ -257,7 +266,7 @@ fn canonical_next<'a>(
     }
     if !matches!(
         after,
-        Some(CanonicalKey::ReceivedBound(_) | CanonicalKey::DeletedBlob(_))
+        Some(CanonicalKey::ReceivedBound(_) | CanonicalKey::OriginalPrepared(_) | CanonicalKey::OriginalBound(_) | CanonicalKey::OriginalTerminal(_) | CanonicalKey::DeletedBlob(_))
     ) {
         let entry = match after {
             Some(CanonicalKey::ReceivedPrepared(key)) => view
@@ -274,7 +283,7 @@ fn canonical_next<'a>(
             ));
         }
     }
-    if !matches!(after, Some(CanonicalKey::DeletedBlob(_))) {
+    if !matches!(after, Some(CanonicalKey::OriginalPrepared(_) | CanonicalKey::OriginalBound(_) | CanonicalKey::OriginalTerminal(_) | CanonicalKey::DeletedBlob(_))) {
         let entry = match after {
             Some(CanonicalKey::ReceivedBound(key)) => view
                 .received_bindings
@@ -290,20 +299,28 @@ fn canonical_next<'a>(
             ));
         }
     }
-    let hash = match after {
-        Some(CanonicalKey::DeletedBlob(hash)) => view
-            .deleted_blobs
-            .range::<str, _>((Excluded(hash.as_str()), Unbounded))
-            .next(),
-        _ => view.deleted_blobs.first(),
-    }?;
-    Some((
-        CanonicalKey::DeletedBlob(hash.clone()),
-        InlineOperation::RemoveBlob {
-            content_hash: hash.clone(),
-        },
-        None,
-    ))
+    if !matches!(after, Some(CanonicalKey::OriginalPrepared(_) | CanonicalKey::OriginalBound(_) | CanonicalKey::OriginalTerminal(_))) {
+        let hash = match after {
+            Some(CanonicalKey::DeletedBlob(hash)) => view.deleted_blobs.range::<str, _>((Excluded(hash.as_str()), Unbounded)).next(),
+            _ => view.deleted_blobs.first(),
+        };
+        if let Some(hash) = hash {
+            return Some((CanonicalKey::DeletedBlob(hash.clone()), InlineOperation::RemoveBlob { content_hash: hash.clone() }, None));
+        }
+    }
+    if !matches!(after, Some(CanonicalKey::OriginalBound(_) | CanonicalKey::OriginalTerminal(_))) {
+        let entry = match after { Some(CanonicalKey::OriginalPrepared(key)) => view.original_repairs.range((Excluded(key), Unbounded)).next(), _ => view.original_repairs.first_key_value() };
+        if let Some((key, prepared)) = entry { return Some((CanonicalKey::OriginalPrepared(key.clone()), InlineOperation::RestoreOriginalRepairPrepared(prepared.clone()), None)); }
+    }
+    if !matches!(after, Some(CanonicalKey::OriginalTerminal(_))) {
+        let entry = match after { Some(CanonicalKey::OriginalBound(key)) => view.original_bindings.range((Excluded(key), Unbounded)).next(), _ => view.original_bindings.first_key_value() };
+        if let Some((key, bound)) = entry { return Some((CanonicalKey::OriginalBound(key.clone()), InlineOperation::RestoreOriginalRepairBound(bound.clone()), None)); }
+    }
+    {
+        let entry = match after { Some(CanonicalKey::OriginalTerminal(key)) => view.original_terminals.range((Excluded(key), Unbounded)).next(), _ => view.original_terminals.first_key_value() };
+        if let Some((key, terminal)) = entry { return Some((CanonicalKey::OriginalTerminal(key.clone()), InlineOperation::RestoreOriginalRepairTerminal(terminal.clone()), None)); }
+    }
+    None
 }
 fn next_record<'a>(
     plan: &CompactionPlan,
@@ -1016,11 +1033,34 @@ impl LocalContentStore {
 }
 
 #[cfg(test)]
+impl LocalContentStore {
+    /// Fixture-only physical forcing through the real compaction driver.
+    /// It grants no content/namespace/receiver authority and changes no limit.
+    pub(crate) fn compact_original_repair_fixture_for_test(&self) -> Result<()> {
+        self.requires_original_repair_fixture()?;
+        let _owner = self.content_mutation_guard()?;
+        if read_plan(&self.root)?.is_some() || MigrationJobStore::new(job_path(&self.root)).read().map_err(inline_error)?.is_some() {
+            return Err(inline_error("fixture compaction cannot replace existing migration progress"));
+        }
+        let initial = self.inline_sentinel_unlocked()?.ok_or_else(|| inline_error("fixture has no marker"))?;
+        let before = read_catalog_for_format(&self.root, &initial.store_incarnation, ORIGINAL_REPAIR_FIXTURE_VERSION)?.generation;
+        tests::force_plan(self);
+        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        for _ in 0..64 {
+            self.advance_inline_compaction(false, true)?;
+            if std::time::Instant::now() >= deadline { return Err(inline_error("bounded fixture compaction deadline expired")); }
+            if read_catalog_for_format(&self.root, &initial.store_incarnation, ORIGINAL_REPAIR_FIXTURE_VERSION)?.generation > before { return Ok(()); }
+        }
+        Err(inline_error("bounded fixture compaction did not publish"))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::tests::active_store;
     use super::*;
 
-    fn force_plan(store: &LocalContentStore) {
+    pub(super) fn force_plan(store: &LocalContentStore) {
         let _owner = store.content_mutation_guard().unwrap();
         let sentinel = store.inline_sentinel_unlocked().unwrap().unwrap();
         let mut state = store.inline_store.owner.state.lock().unwrap();

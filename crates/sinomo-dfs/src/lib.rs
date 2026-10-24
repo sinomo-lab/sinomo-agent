@@ -753,6 +753,7 @@ pub use protocol::{
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof,
     DfsMessageCommand, DfsMessageResponse, DfsMetadataAuthorityOperation,
+    DfsOriginalRepairHead, DfsOriginalRepairMaterial, DfsSelectedOriginalRepairCommand,
     DfsMetadataAuthorityProbe, DfsMetadataDurableReplication, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalFrameBatch,
     DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,

@@ -666,6 +666,10 @@ impl Carrier {
                             repair.version,
                             repair.request_id,
                         )),
+                        crate::DfsNetworkMessage::SelectedOriginalRepair(selected) => {
+                            let repair = selected.material.original.command;
+                            Some((command.routed_message.frame_id, repair.intent_id, repair.file_system_id, repair.object_id, repair.version, repair.request_id))
+                        }
                         crate::DfsNetworkMessage::RepairRetainedBlob(repair) => Some((
                             command.routed_message.frame_id,
                             repair.intent_id,
@@ -2922,6 +2926,20 @@ impl DfsTestRuntime {
         }
         native.selected_original_fixture = Some(crate::runtime_host::DfsSelectedOriginalDataFixture::default());
         Ok(())
+    }
+
+    pub(crate) fn select_original_repair_fixture_before_start(&mut self, node: &NodeId) -> Result<(), String> {
+        let native = self.nodes.get_mut(node).ok_or("unknown original Repair fixture node")?;
+        if native.reconciler.is_some() || native.mounted_context.is_some() || native.selected_original_fixture.is_some() {
+            return Err("original Repair representation must be supplied once before native mounting".into());
+        }
+        native.selected_original_fixture = Some(crate::runtime_host::DfsSelectedOriginalDataFixture::with_original_repair());
+        Ok(())
+    }
+
+    pub(crate) fn select_original_repair_wire_target(&self, source: &NodeId, target: NodeId) -> Result<(), String> {
+        self.nodes[source].selected_original_fixture.as_ref().ok_or("original Repair fixture was not admitted before start")?
+            .select_original_repair_target(target).map_err(|error| error.to_string())
     }
 
     pub(crate) fn selected_original_data_layout(&self, node: &NodeId) -> Result<Arc<crate::DfsSelectedOriginalDataLayout>, String> {

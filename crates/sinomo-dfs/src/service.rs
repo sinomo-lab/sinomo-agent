@@ -1183,6 +1183,9 @@ impl Service for DfsDataPlaneService {
                             &request_attachment,
                             "DFS request",
                         )?;
+                        if let crate::DfsNetworkMessage::SelectedOriginalRepair(command) = &head.command.routed_message.message {
+                            crate::body_rpc::validate_selected_original_repair_attachment(command, &head.attachment)?;
+                        }
                         if matches!(
                             &head.command.routed_message.message,
                             crate::DfsNetworkMessage::StageBlob(_)

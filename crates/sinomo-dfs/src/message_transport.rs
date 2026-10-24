@@ -31,6 +31,9 @@ pub struct DfsOutboundAttachment {
 pub struct DfsRoutedCall {
     pub message: DfsRoutedMessage,
     pub attachment: Option<DfsOutboundAttachment>,
+    /// Prospective wire representation only. `message` remains the actual
+    /// ordinary carrier used by original-attempt and delivery correlation.
+    pub original_repair: Option<crate::DfsOriginalRepairMaterial>,
 }
 
 impl DfsRoutedCall {
@@ -38,6 +41,7 @@ impl DfsRoutedCall {
         Self {
             message,
             attachment: None,
+            original_repair: None,
         }
     }
 
@@ -45,8 +49,38 @@ impl DfsRoutedCall {
         Self {
             message,
             attachment: Some(attachment),
+            original_repair: None,
         }
     }
+
+    pub(crate) fn with_original_repair(mut self, material: crate::DfsOriginalRepairMaterial) -> Result<Self, crate::DfsError> {
+        material.validate()?;
+        if !material.matches_carrier(&self.message)
+            || self.attachment.as_ref().map(|body| &body.descriptor) != Some(&material.attachment)
+        {
+            return Err(crate::DfsError::Metadata { message: "selected Repair carrier/body differs from actual original".into() });
+        }
+        self.original_repair = Some(material);
+        Ok(self)
+    }
+}
+
+pub(crate) fn selected_original_repair_wire_message(
+    mut message: DfsRoutedMessage,
+    material: Option<crate::DfsOriginalRepairMaterial>,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    if let Some(material) = material {
+        material.validate().map_err(|error| NetworkError::Serialization { detail: error.to_string() })?;
+        if !material.matches_carrier(&message) {
+            return Err(NetworkError::Serialization { detail: "selected Repair representation changed original carrier".into() });
+        }
+        message.message = crate::DfsNetworkMessage::SelectedOriginalRepair(crate::DfsSelectedOriginalRepairCommand {
+            version: 1,
+            material,
+            bytes: Vec::new(),
+        });
+    }
+    Ok(message)
 }
 
 /// Preserve the same normal message route while moving a native snapshot's
@@ -592,7 +626,9 @@ pub fn materialize_dfs_routed_call_sync(
     let DfsRoutedCall {
         message,
         attachment,
+        original_repair,
     } = call;
+    let message = selected_original_repair_wire_message(message, original_repair)?;
     let Some(attachment) = attachment else {
         return Ok(message);
     };
@@ -607,7 +643,9 @@ pub(crate) async fn materialize_dfs_routed_call(
     let DfsRoutedCall {
         message,
         attachment,
+        original_repair,
     } = call;
+    let message = selected_original_repair_wire_message(message, original_repair)?;
     let Some(attachment) = attachment else {
         return Ok(message);
     };

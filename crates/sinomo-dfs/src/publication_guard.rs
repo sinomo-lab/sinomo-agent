@@ -426,6 +426,132 @@ pub struct DfsPublicationExecutionOwners {
     admission: Mutex<Option<DfsMutationAdmission>>,
     _data_owner: Arc<DfsDataOwnerLock>,
 }
+
+/// Recorded provenance for the structurally nonauthoring receiver branch.
+/// Deserializing it recreates DATA, never this operation's native capability.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeContentOnlyRepairProvenance {
+    pub(crate) receiver: sinomo_core::node::NodeId,
+    pub(crate) admitted_shard: crate::DfsMetadataShardConfig,
+    pub(crate) effect: NativeRepairEffectManifest,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub(crate) enum NativeRepairEffectManifest {
+    ReceiverContentAndLocalCacheOnly,
+}
+
+/// No serde/constructor outside this actual native owner. It holds the real
+/// mutation permit and provider only for the admitted synchronous operation.
+pub(crate) struct NativeContentOnlyRepairAdmission {
+    provider: Arc<DfsPublicationExecutionProvider>,
+    execution: Arc<DfsPublicationExecutionOwners>,
+    owner: DfsPublicationOwnerScope,
+    material: crate::DfsOriginalRepairMaterial,
+    object: crate::DfsObjectMetadata,
+    shard: crate::DfsMetadataShardConfig,
+    filesystem: crate::DfsFileSystemConfig,
+    receiver: sinomo_core::node::NodeId,
+    projection_generation: u64,
+    authority_generation: u64,
+    content_identity: crate::content_store::ReceivedRepairFixtureIdentity,
+}
+
+impl NativeContentOnlyRepairAdmission {
+    pub(crate) fn revalidate(&self, material: &crate::DfsOriginalRepairMaterial) -> std::result::Result<(), crate::DfsError> {
+        if &self.material != material { return Err(crate::DfsError::Metadata { message: "native content-only Repair changed its original".into() }); }
+        self.provider.validate_content_only_repair_owner(&self.execution, &self.owner)?;
+        let content_identity = self.provider.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
+        if content_identity != self.content_identity { return Err(crate::DfsError::Metadata { message: "native content-only Repair physical content expectation changed".into() }); }
+        let (shard, filesystem, projection_generation) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver)?;
+        if shard != self.shard || filesystem != self.filesystem || projection_generation != self.projection_generation
+            || self.provider.authority.generation() != self.authority_generation {
+            return Err(crate::DfsError::Metadata { message: "native content-only Repair configuration advanced".into() });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn provenance(&self) -> NativeContentOnlyRepairProvenance {
+        NativeContentOnlyRepairProvenance {
+            receiver: self.receiver.clone(), admitted_shard: self.shard.clone(),
+            effect: NativeRepairEffectManifest::ReceiverContentAndLocalCacheOnly,
+        }
+    }
+
+    /// Called under the content mutation owner and its actual sentinel writer.
+    /// Native configuration revalidation precedes those locks; this comparison
+    /// never takes metadata/projection locks or opens another content store.
+    pub(crate) fn check_content_owner(&self, store: &crate::LocalContentStore, store_incarnation: &str) -> std::result::Result<(), crate::ContentStoreError> {
+        self.content_identity.check_original_store(store, store_incarnation)
+    }
+    pub(crate) fn check_content_store(&self, store: &crate::LocalContentStore) -> std::result::Result<(), crate::ContentStoreError> {
+        self.content_identity.check_original_store_identity(store)
+    }
+}
+
+impl DfsPublicationExecutionProvider {
+    fn validate_content_only_repair_owner(&self, execution: &DfsPublicationExecutionOwners, owner: &DfsPublicationOwnerScope) -> std::result::Result<(), crate::DfsError> {
+        let layout = self.data_owner.selected_original_data_layout().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
+            .ok_or_else(|| crate::DfsError::Metadata { message: "selected content-only Repair has no checked actual native fixture owner".into() })?;
+        layout.stage(owner.file_system_id(), owner.shard_id(), owner.root())?;
+        if self.authority.storage_generation() != self.storage_generation
+            || self.data_root != execution.data_root
+            || self.data_owner.physical_data_root() != self.data_root
+            || !Arc::ptr_eq(&self.data_owner, &execution._data_owner)
+            || !execution.admits(owner, owner.file_system_id(), owner.shard_id())
+        {
+            return Err(crate::DfsError::Metadata { message: "content-only Repair lacks its current native owner/admission/storage generation".into() });
+        }
+        let current = DfsPublicationOwnerScope::for_backend(owner.root(), owner.file_system_id().clone(), owner.shard_id().clone())?;
+        if &current != owner {
+            return Err(crate::DfsError::Metadata { message: "content-only Repair metadata owner was physically replaced".into() });
+        }
+        Ok(())
+    }
+
+    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, u64), crate::DfsError> {
+        material.validate()?;
+        let command = &material.original.command;
+        let error = || crate::DfsError::Metadata { message: "content-only Repair has no exact current nonauthoring native configuration".into() };
+        // This is the existing observed-consensus-floor check, with no new KV
+        // read/hydration. The legacy publication cache alone cannot certify it.
+        let view = self.authority.write_configuration_projection()?.ok_or_else(error)?;
+        let key = crate::file_system_config_key(&command.file_system_id);
+        let filesystem = view.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key))
+            .ok_or_else(error)?.decode::<crate::DfsFileSystemConfig>()?;
+        let shards = view.entries(&crate::metadata_shards_prefix(&command.file_system_id)).ok_or_else(error)?
+            .iter().map(|entry| entry.decode::<crate::DfsMetadataShardConfig>()).collect::<std::result::Result<Vec<_>, _>>()?;
+        let shard = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &shards, &object.path)?
+            .ok_or_else(error)?;
+        if filesystem.file_system_id != command.file_system_id
+            || object.file_system_id != command.file_system_id || object.object_id != command.object_id
+            || shard.primary_node_id != material.original.source_node_id
+            || &shard.primary_node_id == receiver || !shard.replica_node_ids.contains(receiver)
+            || &material.original.target_node_id != receiver
+            || command.authority_shard.as_ref() != Some(&shard)
+            || command.object_metadata.as_ref().is_none_or(|head| head.file_system_id != object.file_system_id || head.object_id != object.object_id || head.path != object.path)
+        { return Err(error()); }
+        // The callback performs comparisons only. No preflight, filesystem I/O
+        // or projection reentry is permitted while its existing lock is held.
+        let generation = self.authority.with_current_publication_configuration(&command.file_system_id, |generation, current_shards, current_fs| {
+            (current_fs.as_ref() == Some(&filesystem)
+                && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &current_shards, &object.path)
+                    .is_ok_and(|selected| selected.as_ref() == Some(&shard))).then_some(generation)
+        })?.flatten().ok_or_else(error)?;
+        Ok((shard, filesystem, generation))
+    }
+
+    pub(crate) fn admit_content_only_original_repair(self: &Arc<Self>, execution: Arc<DfsPublicationExecutionOwners>, owner: DfsPublicationOwnerScope, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId) -> std::result::Result<NativeContentOnlyRepairAdmission, crate::DfsError> {
+        self.validate_content_only_repair_owner(&execution, &owner)?;
+        let authority_generation = self.authority.generation();
+        let content_identity = self.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
+        let (shard, filesystem, projection_generation) = self.content_only_repair_configuration(material, object, receiver)?;
+        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), projection_generation, authority_generation, content_identity };
+        admission.revalidate(material)?;
+        Ok(admission)
+    }
+}
 impl DfsPublicationExecutionOwners {
     /// Representation context from the retained physical owner only. This
     /// does not grant genesis, publication or successor execution authority.
@@ -763,6 +889,14 @@ impl std::ops::Deref for DfsPreparedPublication {
 }
 
 impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
+    pub(crate) fn selects_original_repair_wire_target(&self, target: &sinomo_core::node::NodeId) -> std::result::Result<bool, crate::DfsError> {
+        let owner = if let Some(execution) = self.publication_execution.current() { Some(Arc::clone(&execution._data_owner)) }
+            else if let Some(provider) = self.publication_provider.current() {
+                if provider.authority.storage_generation() != provider.storage_generation { return Err(crate::DfsError::Metadata { message: "original Repair fixture provider storage advanced".into() }); }
+                Some(Arc::clone(&provider.data_owner))
+            } else { None };
+        owner.map(|owner| owner.selects_original_repair_target(target).map_err(|error| crate::DfsError::Metadata { message: error.to_string() })).transpose().map(|selected| selected.unwrap_or(false))
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn native_publication_owner_for_observation(
         &self,

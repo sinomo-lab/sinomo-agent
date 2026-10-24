@@ -1,5 +1,9 @@
 use super::*;
 
+fn open_daemon_native_content_store(data_dir: &SinomoDataDir) -> Result<LocalContentStore, crate::DfsError> {
+    crate::runtime_host::open_dfs_runtime_content_store(data_dir).map_err(|error| crate::DfsError::Metadata { message: error.to_string() })
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonDfsPublishPlanningAttemptOutcome {
@@ -399,7 +403,7 @@ pub(super) fn try_take_daemon_dfs_message_mutation_service_for_maintenance(
         if cache.is_none() {
             let content_store = match retained_content_store {
                 Some(content_store) => content_store,
-                None => sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?,
+                None => open_daemon_native_content_store(data_dir)?,
             };
             let resident_metadata_backend =
                 try_open_daemon_dfs_resident_metadata_backend_for_authority_generation(
@@ -661,6 +665,7 @@ pub(super) fn daemon_dfs_message_preempts_maintenance(
     match message {
         sinomo_dfs::DfsNetworkMessage::CommitVersion(_) => false,
         sinomo_dfs::DfsNetworkMessage::RepairReplica(command) => !command.background_repair,
+        sinomo_dfs::DfsNetworkMessage::SelectedOriginalRepair(_) => false,
         sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command)
             if matches!(
                 command.operation,
@@ -1487,7 +1492,7 @@ pub(crate) fn open_daemon_dfs_message_service_lane(
     peer_node_ids: Vec<NodeId>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Arc<DaemonDfsMessageServiceLaneHandle>, sinomo_dfs::DfsError> {
-    let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let content = open_daemon_native_content_store(data_dir)?;
     open_daemon_dfs_message_service_lane_with_content(
         data_dir,
         cluster_paths,
@@ -1696,7 +1701,7 @@ pub(crate) fn prepare_daemon_dfs_commit_promotion_recovery(
             },
         )?;
     let open_recovery_service = || {
-        let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+        let content = open_daemon_native_content_store(data_dir)?;
         let (peer_transport, async_peer_transport) =
             daemon_dfs_peer_transports_on_runtime(data_dir, runtime);
         let transport = DfsNodeTransport::new_with_peer_transports_for_nodes_and_detached_state(
@@ -2110,7 +2115,7 @@ pub(crate) fn daemon_dfs_message_cache_entry<'a>(
                 )
             }
             None => (
-                sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?,
+                open_daemon_native_content_store(data_dir)?,
                 None,
             ),
         };

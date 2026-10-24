@@ -225,6 +225,37 @@ pub struct DfsDataOwnerLock {
     file: File,
     physical_data_root: PathBuf,
     selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    original_repair_fixture: Option<DfsOriginalRepairFixture>,
+}
+
+/// Explicit prospective fixture expectations, never admission/authority DATA.
+/// It retains neither DATA owner nor resident content handle.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DfsOriginalRepairFixture {
+    identity: Arc<Mutex<Option<crate::content_store::ReceivedRepairFixtureIdentity>>>,
+    targets: Arc<Mutex<std::collections::BTreeSet<NodeId>>>,
+}
+impl DfsOriginalRepairFixture {
+    fn open(&self, owner: &DfsDataOwnerLock) -> Result<LocalContentStore, DfsRuntimeError> {
+        owner.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture has no actual checked native DATA layout owner".into() })?;
+        let expected = self.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture expectation poisoned".into() })?;
+        let identity = expected.as_ref().ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture has no explicitly admitted physical content identity".into() })?;
+        if !identity.is_at_root(&owner.physical_data_root.join("dfs/content")) { return Err(DfsRuntimeError::Parse { detail: "original Repair fixture belongs to another actual DATA owner".into() }); }
+        LocalContentStore::reopen_received_repair_fixture(identity).map_err(Into::into)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    fn admit(&self, owner: &DfsDataOwnerLock) -> Result<(), DfsRuntimeError> {
+        owner.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture admission requires its actual checked native owner".into() })?;
+        let mut expected = self.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture expectation poisoned".into() })?;
+        if let Some(identity) = expected.as_ref() {
+            if !identity.is_at_root(&owner.physical_data_root.join("dfs/content")) { return Err(DfsRuntimeError::Parse { detail: "original Repair fixture cannot adopt another DATA owner".into() }); }
+            LocalContentStore::reopen_received_repair_fixture(identity)?;
+        } else {
+            let (_, identity) = LocalContentStore::new_original_repair_fixture(owner.physical_data_root.join("dfs/content"))?;
+            *expected = Some(identity);
+        }
+        Ok(())
+    }
 }
 
 /// Explicit per-native-fixture expectation retained across component reopen.
@@ -232,6 +263,7 @@ pub struct DfsDataOwnerLock {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DfsSelectedOriginalDataFixture {
     layout: Arc<Mutex<Option<Arc<crate::DfsSelectedOriginalDataLayout>>>>,
+    original_repair: Option<DfsOriginalRepairFixture>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -242,6 +274,19 @@ impl DfsSelectedOriginalDataFixture {
         })?;
         let actual = owner.admit_selected_original_fixture(expected.clone())?;
         *expected = Some(actual);
+        if let Some(fixture) = &self.original_repair {
+            fixture.admit(owner)?;
+            owner.original_repair_fixture = Some(fixture.clone());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_original_repair() -> Self {
+        Self { original_repair: Some(DfsOriginalRepairFixture::default()), ..Self::default() }
+    }
+
+    pub(crate) fn select_original_repair_target(&self, target: NodeId) -> Result<(), DfsRuntimeError> {
+        self.original_repair.as_ref().ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture not admitted before native start".into() })?.targets.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture target mutex poisoned".into() })?.insert(target);
         Ok(())
     }
 
@@ -262,6 +307,11 @@ impl DfsSelectedOriginalDataFixture {
             return Err(DfsRuntimeError::Parse {
                 detail: "selected native fixture retained another layout expectation".into(),
             });
+        }
+        match (&self.original_repair, &owner.original_repair_fixture) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if Arc::ptr_eq(&expected.identity, &actual.identity) => { actual.open(owner)?; }
+            _ => return Err(DfsRuntimeError::Parse { detail: "retained owner cannot change original Repair fixture admission".into() }),
         }
         Ok(())
     }
@@ -294,6 +344,26 @@ pub fn storage_file_identity(file: &File) -> std::io::Result<(u64, u64)> {
 }
 
 impl DfsDataOwnerLock {
+    pub(crate) fn original_repair_content_identity(&self) -> Result<crate::content_store::ReceivedRepairFixtureIdentity, DfsRuntimeError> {
+        self.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair content identity has no actual checked DATA owner".into() })?;
+        let fixture = self.original_repair_fixture.as_ref().ok_or_else(|| DfsRuntimeError::Parse { detail: "actual DATA owner has no original Repair content fixture".into() })?;
+        let identity = fixture.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair content expectation poisoned".into() })?.clone()
+            .ok_or_else(|| DfsRuntimeError::Parse { detail: "actual DATA owner has no admitted physical content identity".into() })?;
+        if !identity.is_at_root(&self.physical_data_root.join("dfs/content")) { return Err(DfsRuntimeError::Parse { detail: "original Repair content expectation belongs to another actual DATA owner".into() }); }
+        identity.check_original_physical_identity()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn selects_original_repair_target(&self, target: &NodeId) -> Result<bool, DfsRuntimeError> {
+        self.original_repair_fixture.as_ref().map(|fixture| fixture.targets.lock().map(|targets| targets.contains(target)).map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture target mutex poisoned".into() })).transpose().map(|selected| selected.unwrap_or(false))
+    }
+
+    fn open_native_content(&self) -> Result<LocalContentStore, DfsRuntimeError> {
+        match &self.original_repair_fixture {
+            Some(fixture) => fixture.open(self),
+            None => LocalContentStore::new(self.physical_data_root.join("dfs/content")).map_err(Into::into),
+        }
+    }
     /// The actual retained owner may carry an explicit fixture reader. The
     /// context owns no DATA lock and therefore creates no owner-lifetime cycle.
     pub(crate) fn selected_original_data_layout(
@@ -415,6 +485,7 @@ impl DfsDataOwnerLock {
             file,
             physical_data_root,
             selected_original_data_layout: None,
+            original_repair_fixture: None,
         })
     }
 
@@ -1886,14 +1957,18 @@ pub fn open_dfs_runtime_service(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let content = open_dfs_runtime_content_store(data_dir)?;
     open_dfs_runtime_service_with_content(data_dir, runtime, content)
 }
 
 pub fn open_dfs_runtime_content_store(
     data_dir: &SinomoDataDir,
 ) -> Result<LocalContentStore, DfsRuntimeError> {
-    LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(Into::into)
+    if let Some(owner) = daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(data_dir))? {
+        owner.open_native_content()
+    } else {
+        LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(Into::into)
+    }
 }
 
 /// sinomo:kv-configuration: Discover configured membership and capability offers through the active native owner's bounded configuration client.
@@ -1998,7 +2073,7 @@ pub fn open_dfs_runtime_service_on_shard(
     runtime: Option<&tokio::runtime::Handle>,
     expected: &crate::DfsMetadataShardConfig,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let content = open_dfs_runtime_content_store(data_dir)?;
     open_dfs_runtime_service_for_effect(data_dir, runtime, content, Some(expected))
 }
 

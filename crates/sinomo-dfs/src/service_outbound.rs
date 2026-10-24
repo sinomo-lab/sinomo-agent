@@ -746,9 +746,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // This durable unknown attempt exists before either synchronous
                 // or detached transport can observe the reader/head.
                 store.record_original_repair_attempt(&routed_message)?;
-                requests.push(DfsRoutedSend::new(
-                    target_node_id.clone(),
-                    DfsRoutedCall::with_attachment(
+                let mut call = DfsRoutedCall::with_attachment(
                         routed_message,
                         DfsOutboundAttachment::from_reader(
                             reader,
@@ -758,8 +756,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 .as_deref()
                                 .expect("enrolled Repair hash"),
                         ),
-                    ),
-                ));
+                    );
+                if self.selects_original_repair_wire_target(target_node_id)? {
+                    let birth = store.original_repair_for_slot(intent_id, target_node_id)?.ok_or_else(pending_error)?;
+                    call = call.with_original_repair(birth.original_wire_material()?)?;
+                }
+                requests.push(DfsRoutedSend::new(target_node_id.clone(), call));
                 continue;
             }
             let (_, reader) = self.open_content_hash_stream(
