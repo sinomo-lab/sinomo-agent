@@ -541,29 +541,6 @@ impl NativeContentOnlyRepairAdmission {
     }
 }
 
-/// Finish one original-Repair read capture without holding projection locks
-/// over content I/O. A floor read can withdraw the publication after cloning
-/// its Arc, so pointer equality alone cannot establish a current capture.
-pub(crate) fn validate_original_repair_configuration_capture(
-    authority: &Arc<crate::DfsMetadataAuthorityRuntime>,
-    captured: &Arc<crate::DfsWriteConfigurationProjection>,
-    projection_generation: u64,
-) -> std::result::Result<(), crate::DfsError> {
-    let current = authority.write_configuration_projection()?.ok_or_else(|| {
-        crate::DfsError::Metadata {
-            message: "original Repair configuration capture lost its native publication".into(),
-        }
-    })?;
-    if !Arc::ptr_eq(captured, &current)
-        || authority.projection_generation() != projection_generation
-    {
-        return Err(crate::DfsError::Metadata {
-            message: "original Repair configuration changed during current capture".into(),
-        });
-    }
-    Ok(())
-}
-
 impl DfsPublicationExecutionProvider {
     fn validate_content_only_repair_owner(&self, execution: &DfsPublicationExecutionOwners, owner: &DfsPublicationOwnerScope) -> std::result::Result<(), crate::DfsError> {
         let layout = self.data_owner.selected_original_data_layout().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
@@ -591,7 +568,8 @@ impl DfsPublicationExecutionProvider {
         let error = || crate::DfsError::Metadata { message: "content-only Repair has no exact current nonauthoring native configuration".into() };
         // This is the existing observed-consensus-floor check, with no new KV
         // read/hydration. The legacy publication cache alone cannot certify it.
-        let view = self.authority.write_configuration_projection()?.ok_or_else(error)?;
+        let snapshot = self.authority.current_original_repair_configuration(&command.file_system_id)?;
+        let view = &snapshot.view;
         let key = crate::file_system_config_key(&command.file_system_id);
         let filesystem = view.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key))
             .ok_or_else(error)?.decode::<crate::DfsFileSystemConfig>()?;
@@ -608,15 +586,16 @@ impl DfsPublicationExecutionProvider {
             || command.authority_shard.as_ref() != Some(&shard)
             || command.object_metadata.as_ref().is_none_or(|head| head.file_system_id != object.file_system_id || head.object_id != object.object_id || head.path != object.path)
         { return Err(error()); }
-        // The callback performs comparisons only. No preflight, filesystem I/O
-        // or projection reentry is permitted while its existing lock is held.
-        let generation = self.authority.with_current_publication_configuration(&command.file_system_id, |generation, current_shards, current_fs| {
-            (current_fs.as_ref() == Some(&filesystem)
-                && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &current_shards, &object.path)
-                    .is_ok_and(|selected| selected.as_ref() == Some(&shard))).then_some(generation)
-        })?.flatten().ok_or_else(error)?;
-        validate_original_repair_configuration_capture(&self.authority, &view, generation)?;
-        Ok((shard, filesystem, generation, view))
+        // These owned inputs came from one configuration -> projection locked
+        // capture. Every policy/semantic check runs after those locks release.
+        if snapshot.filesystem.as_ref() != Some(&filesystem)
+            || !crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                &command.file_system_id, &snapshot.shards, &object.path,
+            ).is_ok_and(|selected| selected.as_ref() == Some(&shard))
+        {
+            return Err(error());
+        }
+        Ok((shard, filesystem, snapshot.projection_generation, snapshot.view))
     }
 
     pub(crate) fn admit_content_only_original_repair(self: &Arc<Self>, execution: Arc<DfsPublicationExecutionOwners>, owner: DfsPublicationOwnerScope, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, intent: &crate::DfsWriteIntentRecord) -> std::result::Result<NativeContentOnlyRepairAdmission, crate::DfsError> {
