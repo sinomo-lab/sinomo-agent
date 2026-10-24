@@ -676,6 +676,118 @@ impl Drop for DaemonDfsMaintenanceServiceReturn<'_> {
     }
 }
 
+/// One fixture's real location withdrawal on the retained Main owner. This
+/// reuses ordinary admission, queue persistence, checked return and edge emission;
+/// it neither reconstructs retry state nor requests broad recovery.
+#[cfg(test)]
+pub(crate) fn withdraw_remote_replica_on_main_for_test(
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    object: &crate::DfsObjectId,
+    version: &crate::DfsVersion,
+    content_hash: &Option<String>,
+    holder: &NodeId,
+    deadline: std::time::Instant,
+) -> Result<DfsMessageCommittedWork, crate::DfsError> {
+    let native_error = |error: DaemonError| crate::DfsError::Metadata {
+        message: error.to_string(),
+    };
+    let paths = DaemonPaths::new(data_dir);
+    let owner = require_daemon_dfs_data_owner_lock(&paths).map_err(native_error)?;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)
+        .map_err(crate::DfsError::from_network)?;
+    let DaemonDfsMaintenanceAdmission {
+        _lifecycle_guard: lifecycle,
+        _mutation_admission: admission,
+    } = block_on_dfs_cluster_future(runtime, async {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            acquire_daemon_dfs_maintenance_admission(data_dir),
+        )
+        .await
+        .map_err(|_| sinomo_core::service::ServiceError::Service(
+            "native withdrawal fixture exhausted its existing admission budget".into(),
+        ))?
+        .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+    })?;
+    let mut admission = Some(admission);
+    let retained = take_daemon_dfs_message_mutation_service_for_maintenance(
+        data_dir, &cluster_paths, &state, runtime, None,
+    )?;
+    let mut returned = DaemonDfsMaintenanceServiceReturn {
+        data_dir, cluster_paths: &cluster_paths, runtime, retained: Some(retained),
+    };
+    let scope = DfsMessageExecutionScope::GlobalExclusive;
+    let publication = crate::publication_guard::DfsPublicationExecutionScope::enter(
+        data_dir.root(), scope.clone(), &mut admission, owner,
+    )?;
+    let tracker = DfsCommittedWorkTracker::new();
+    let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, crate::DfsError> {
+        let retained = returned.retained.as_mut().expect("actual native withdrawal lane");
+        let provider = crate::DfsPublicationExecutionProvider::from_execution_owners(
+            &publication.owners(), Arc::clone(&retained.metadata_authority_generation),
+            runtime.clone(),
+        )?;
+        let service = &mut retained.lane.service;
+        let _execution = service.publication_execution.install(publication.owners());
+        let _provider = service.publication_provider.install(provider);
+        service.set_committed_work_tracker(tracker.clone());
+        if std::time::Instant::now() >= deadline {
+            return Err(crate::DfsError::Metadata {
+                message: "native withdrawal fixture expired before its actual effect".into(),
+            });
+        }
+        let previous = service.set_transport_operation_deadline(Some(deadline));
+        let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.capture_mounted_mutation(|service| {
+                service.mark_remote_read_location_missing(object, version, content_hash, holder)
+            })
+        }));
+        service.set_transport_operation_deadline(previous);
+        let (outcome, records) = match report {
+            Ok(report) => (Ok(report.outcome), report.committed_repair_records),
+            Err(panic) => (Err(panic), service.take_message_committed_repair_queue_records()),
+        };
+        let persisted = persist_daemon_dfs_repair_queue_records(data_dir, records);
+        Ok((outcome, persisted))
+    }));
+    // Contexts above leave before the permit is returned. Keep admission until
+    // the SAME service is back in its checked native cache, on all outcomes.
+    let finished = publication.finish();
+    let restored = returned.restore();
+    drop(returned);
+    drop(admission);
+    drop(lifecycle);
+    let committed = tracker.take();
+    emit_daemon_dfs_committed_edges(
+        data_dir, &cluster_paths, &scope, runtime, None, committed, &[],
+    );
+    // A post-commit error or panic retains priority over cleanup errors, while
+    // an otherwise successful operation must also prove persistence/return.
+    let (outcome, persisted) = match attempted {
+        Ok(attempted) => attempted?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    match outcome {
+        Err(panic) => std::panic::resume_unwind(panic),
+        Ok(outcome) => outcome?,
+    }
+    persisted?;
+    finished?;
+    if !restored? {
+        return Err(crate::DfsError::Metadata {
+            message: "native withdrawal fixture could not return its same Main lane".into(),
+        });
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(crate::DfsError::Metadata {
+            message: "native withdrawal fixture completed beyond its unchanged budget".into(),
+        });
+    }
+    Ok(committed)
+}
+
 pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
