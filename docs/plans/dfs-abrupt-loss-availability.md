@@ -2,61 +2,80 @@
 
 ## Current development checkpoint — 2026-10-24
 
-The DFS lane develops independently in `dev/dfs`. Local code checkpoint
-`a3b9363a` preserves R8 source `3a445694` (4,900 inputs). R4 passed typecheck,
-eight tooling controls and no-run; sealed executable `f5227860` then executed
-all35 controls across two disjoint local panels: **31PASS/4FAIL**, zero incomplete
-or unrun. The five directory controls all passed. All own fixture/checkpoint,
-archive and cleanup stages passed. This does not erase historical R7 failures.
+The independent `dev/dfs` lane has local code checkpoint `c4bc7289`. R14 source
+`d2d87d604c5d7d15cb62d317738e20501874098c01fcef08732fec1e6318eb3f`
+contains 4,900 qualified inputs. Own-source typecheck passed in 16.477 seconds,
+libtest generation in 235.017 seconds, and artifact sealing passed. The sealed
+executable is `9a4808e7adf85894cb54b3ea42d21b45101e7612b3f7372bf53618dbd68be9ca`.
 
-Commit `b9a86c0b` forwards the retained owner's checked selected layout through
-three native-genesis cold opens. R9 source `fdd2b4f2` passed typecheck18.115s and
-no-run202.415s, producing sealed executable `41067208`. Four unchanged native
-regressions executed: **1PASS/3FAIL**. The default-reader protection control now
-passes; native handoff cases still fail at the existing startup deadline. Two
-separate diagnostic repeats retained real transport errors and trace evidence:
-passive B/C already have ordinary shard directories before selected admission,
-which correctly rejects them with FileExists. No silent adoption is permitted.
+The exact 55-case panel executed **54 PASS / 1 FAIL / 0 incomplete / 0 unrun**.
+Its new install-expiry case failed in the shared genuine-original lost-reply
+setup before reaching the expiry assertion. One unchanged, panic-capture-only
+diagnostic then passed that case in 5.764 seconds and reached the actual expiry,
+fenced-handle, retained DATA and fresh cold-rebind assertions. The full-panel
+failure remains timing-sensitive and unattributed; the diagnostic does not turn
+that panel green. The prior 54 controls passed on R14, including authenticated
+native DATA installation/reopen, exact invalid-input rejection, both receiver
+clock controls, selected queue persistence, disabled B association and hard-policy
+rejection. Imported DATA and disabled association still cannot dispatch.
 
-The N7 branch commit `b9e38d4d` was actually merged as `cfb6fd8a` without conflicts.
-It adds two authenticated rejection/routed-budget controls; they are authored
-but **uncompiled/unrun** after merge. The isolated successor association remains
-under review and has not been merged. Current source differs from R9; no runtime
-pass transfers to these additions. No Docker, main rollout, push or deployment
-occurred. Own bounded work uses the DFS-local lock and16GiB/no-swap scope.
+Current-source full DFS/KV boundary lint passed all 11 UI controls (two accepts,
+nine intended rejects) and DFS/history/attachments library analysis in 12.242
+seconds. Default library analysis does not cover test-only branches. Native
+fixtures, per-case checkpoints, unconditional archives and owned cleanup passed;
+the panel retained 2,297 files and drained 113 recorded groups. No Docker or
+production process was operated, and no abrupt process/partition result follows.
 
-R8 replaces the selected-layout directory check's inappropriate regular-file
-predicate with a directory-specific physical-identity check and adds five focused
-controls. It preserves directory/non-symlink type and before/opened/after device
-and inode binding while allowing ordinary child-entry metadata changes. The
-shared regular-file predicate and named-owner checks are unchanged. Separate
-operation tooling batches ownership checks without changing the maintained
-fixture helper or converting an earlier archive timeout into success.
+The exact receipts are retained under
+`data/operations/dfs-availability-20261023/`: I25 build `d9ec96c2`, I26 panel
+`bd5c6cfa`, I27 diagnostic `12036b1d`, and I28 boundary `353d42aa`.
+
+Recent local integration boundaries, all without merge conflicts:
+
+- `25a8f32c` merges the disabled-association hard-prohibition preflight. It reads
+  retained exact-filesystem policy only, rejects immutable/current forbids and
+  foreign LocalOwned retention, and introduces no KV fallback or execution permit.
+- `9abd1e12` adds the genuine committed forbidden-B native control.
+- `931a6ab2` merges the test-only exact source pause and early routed-carrier
+  allocation, preserving production retries and existing deadlines.
+- `6044bb87` merges the actual-owner selected-reader forwarding and post-marker
+  expiry/cold-rebind control. `c4bc7289` creates missing nested test parents without
+  changing selected-store physical checks.
+
+The directory identity correction retains directory/non-symlink type and
+before/opened/after device/inode binding. Ordinary child-entry metadata changes
+are allowed; the shared regular-file predicate and named-owner checks are unchanged.
+Operation-local archive tooling checks every owned group/session and batches
+native fixture ownership scans. It changes neither the maintained helper nor the
+historical archive timeout verdict.
 
 | Retained checkpoint | Actual result and limit |
 |---|---|
-| Selected local DATA `3eb87ca5` | Twenty local persistence/V1 controls passed. This does not prove authenticated native ingress or successor execution. |
-| N3 R7 `0344ec57`, executable `c9966eb3` | Thirty controls executed: 23 passed and seven failed at selected-directory setup. All 30 preservation checkpoints passed. The inner archive worker separately timed out with exit 124 after 120.056863 seconds; both complete 420-file archives and original results remain retained. |
-| R8 `3a445694`, R4 build | Check/build/tooling passed; all35 exact controls executed31PASS/4FAIL on f5227860. Source/artifact-specific result, no earlier pass transferred. |
-| Original R67 `40394f47`, executable `17295eb6` | Eight non-recovery observation controls passed; the unchanged positive successor-continuation assertion failed. Original request/body, committed intent and content evidence remain retained. |
+| Selected local DATA `3eb87ca5` | Twenty local persistence/V1 controls passed; no native authority proof. |
+| N3 R7 `0344ec57`, ELF `c9966eb3` | 23 PASS / 7 FAIL at directory setup. Inner archive timed out at 120.056863 seconds; both complete 420-file archives remain retained. |
+| R8 `3a445694`, ELF `f5227860` | 31 PASS / 4 FAIL across two disjoint panels, including all five directory controls. |
+| R12 `1544262d` | 47 PASS / 2 FAIL; exact trace exposed the receiver-pause fault-budget exhaustion. |
+| R13 `1e7af604` | 50 PASS / 4 FAIL; current-source lint passed. Helper reader-context and nested fixture-parent defects were subsequently corrected. |
+| R14 `d2d87d60` | Full 55-case panel 54 PASS / 1 setup FAIL; separate unchanged expiry diagnostic PASS; current-source lint PASS. |
+| Original R67 `40394f47`, ELF `17295eb6` | Eight observation controls passed; the unchanged positive successor-continuation assertion failed. Original request/body, committed intent and content evidence remain retained. |
 
-N7 invalid source/prefix/scope and unbudgeted selected-input controls are now
-authored and merged, but uncompiled/unrun. Install-cap expiry and
-freeze-before-first-capture restart controls remain unrepresented. Current-source full DFS/KV lint is a separate unrun gate. Checked B
-execution, C1 serving/admission floor, receiver Terminal/current-application and
-root-retirement protocol, metadata quorum, W/N degraded admission, abrupt-loss
-acceptance and Sinomo-only quietness remain open. Default V1/P0 continuation and
-immutable original identity stay authoritative; imported DATA grants no executor
-authority. The original R67 failure is still required at the successor milestone.
+The next N7 control is freeze-before-first-capture with normal native-owner
+restart and externally retained selected context. It is not yet implemented or
+executed. The expiry test covers repeated rebind of already-installed DATA, not
+first-install crash or abrupt process loss. Receiver Prepared/Terminal provenance,
+checked B replay/dispatch and causal application remain separate. A response,
+readable content, receipt or disabled association cannot provide those guarantees.
+V1/P0 remains a required compatibility boundary; the original R67 positive
+successor assertion is still open. C1 serving/admission, root retirement,
+metadata quorum, W/N degraded admission, abrupt-loss acceptance and Sinomo-only
+CPU/disk/network quietness remain unimplemented or unexecuted acceptance gates.
 
 Local commits and reviewed, tested local merges between isolated DFS subtasks are
-the integration boundaries. The DFS lane neither uses another worktree's build
-lock nor requests peer capacity, source release or handback approval. It sends no
-peer progress/completion messages. Its bounded launches serialize only this
-worktree, retain source/artifact/runtime correspondence and prove owned cleanup.
-`dev/debug` owns the Docker debug cluster; `main` owns real-cluster rollout. This
-lane performs neither operation and remains nonblocking for rollout. No merge
-into either lane, push or deployment is authorized by this plan.
+the integration boundaries. New launches use only the DFS-local lock and own
+16 GiB/no-swap limits, source/artifact/runtime qualification and actual cleanup.
+There is no peer capacity/source-release/handback workflow. `dev/debug` owns its
+Docker cluster and `main` owns real rollout; this lane operates neither, remains
+nonblocking, and has no authorization to merge into either lane, push or deploy.
 
 ## Historical checkpoints
 
