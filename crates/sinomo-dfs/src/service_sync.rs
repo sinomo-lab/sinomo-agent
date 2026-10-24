@@ -4737,10 +4737,43 @@ mod native_selected_data_tests {
             let reader = runtime.client(node).unwrap();
             assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
         }
-        let mut held = Some(Box::new(runtime.deny_background_replica_before_claim(&owner).unwrap()) as Box<dyn Send>);
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        // Stop the next claim after the real receiver's reply is captured and
+        // discarded. A polling loop must not race another attempt before it
+        // observes the first durable lost-reply cut. This changes no queue fact,
+        // retry clock, response or authority; the ordinary callback still owns
+        // persisting the actual failure below.
+        let claim_window = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let window = Arc::clone(&claim_window);
+        let captured_replies = Arc::clone(&replies);
+        let expected_owner = owner.clone();
+        let expected_holder = holder.clone();
+        let expected_object = stat.object_id.clone();
+        let expected_version = stat.version.clone();
+        let context = runtime.component_context(&owner).unwrap();
+        let held = Some(Box::new(crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+            context.data_dir(), Arc::new(move |point, command, _| {
+                let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim {
+                    background_repair: true, kind, intent_id_digest, target_id_digest, ..
+                } = point else { return Ok(()); };
+                assert!(command.is_none());
+                let captured_loss = matches!(kind, sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+                    && captured_replies.lock().unwrap().iter().any(|routed: &DfsRoutedMessage| {
+                    let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
+                    routed.source_node_id == expected_holder && routed.target_node_id == expected_owner
+                        && response.object_id == expected_object && response.version == expected_version
+                        && *blake3::hash(response.intent_id.as_bytes()).as_bytes() == intent_id_digest
+                        && *blake3::hash(expected_holder.as_str().as_bytes()).as_bytes() == target_id_digest
+                });
+                if !window.load(std::sync::atomic::Ordering::Acquire) || captured_loss {
+                    return Err(DfsError::Cancelled { operation: "negative claim boundary around actual captured reply loss" });
+                }
+                Ok(())
+            }),
+        )) as Box<dyn Send>);
+        drop(context);
         let held_promoted = Some(Box::new(runtime.deny_background_replica_before_claim(&promoted).unwrap()) as Box<dyn Send>);
         let capture = runtime.capture_checkpointed_background_repairs(&owner, 8).unwrap();
-        let replies = Arc::new(Mutex::new(Vec::new()));
         runtime.install_fault(FaultRule {
             source: Some(owner.clone()), target: Some(holder.clone()),
             route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()), call_id: None,
@@ -4750,7 +4783,7 @@ mod native_selected_data_tests {
         let mut source = runtime.metadata_primary_service(path).unwrap();
         source.mark_remote_read_location_missing(&stat.object_id, &stat.version, &stat.content_hash, &holder).unwrap();
         drop(source);
-        drop(held.take());
+        claim_window.store(true, std::sync::atomic::Ordering::Release);
         let queue = runtime.selected_original_data_layout(&owner).unwrap().queue().unwrap();
         let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         let birth = loop {
@@ -4782,7 +4815,7 @@ mod native_selected_data_tests {
             let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
             eprintln!("SELECTED_GENUINE_LOST_REPLY_TICK {:?}", tick.outcome);
         };
-        held = Some(Box::new(runtime.deny_background_replica_before_claim(&owner).unwrap()) as Box<dyn Send>);
+        claim_window.store(false, std::sync::atomic::Ordering::Release);
         runtime.clear_faults();
         assert_eq!(capture.omitted_count(), 0);
         drop(capture);
