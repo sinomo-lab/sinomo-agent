@@ -157,6 +157,9 @@ fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
 
 #[cfg(test)]
 thread_local! {
+    // A selected-only slow-boundary fault after real marker synchronization.
+    // The callback observes the existing clock; it cannot replace its deadline.
+    pub(crate) static SELECTED_INSTALL_AFTER_MARKER_SYNC: std::cell::RefCell<Option<(PathBuf, String, Box<dyn FnOnce(Instant)>)>> = const { std::cell::RefCell::new(None) };
     static METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_DURABLE_TABLE_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

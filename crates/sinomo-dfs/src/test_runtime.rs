@@ -3695,8 +3695,15 @@ impl DfsTestRuntime {
         {
             return Ok(None);
         }
+        // Carry only the explicit reader capability of this retained native
+        // owner. A marker/path must never opt a default observer into it.
+        let selected_layout = owner.selected_original_data_layout().map_err(|error| {
+            crate::DfsError::Metadata { message: error.to_string() }
+        })?;
         let Some(marker) =
-            crate::read_local_dfs_metadata_shard_write_freeze(context.data_dir(), &shard)?
+            crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                context.data_dir(), &shard, selected_layout.as_deref(),
+            )?
         else {
             return Ok(None);
         };
