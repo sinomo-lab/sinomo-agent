@@ -5579,16 +5579,20 @@ mod native_selected_data_tests {
                     assert_eq!(page.cut, cut);
                     loop {
                         let paused = paused_pages.lock().unwrap();
+                        assert!(Instant::now() <= capture_deadline,
+                            "exact decoded selected page must pause within the existing 5s setup budget");
                         assert!(paused.len() <= 16);
                         if !paused.is_empty() {
                             assert!(paused.iter().all(|command| command.prefix_probe.as_ref()
                                 .and_then(|probe| probe.repair_custody.as_ref())
                                 .is_some_and(|actual| actual.cut == cut)));
+                            assert!(paused.iter().any(|command| command.prefix_probe.as_ref()
+                                .and_then(|probe| probe.repair_custody.as_ref())
+                                .is_some_and(|actual| actual == &page)),
+                                "the paused decoded command must include this exact source page");
                             break;
                         }
                         drop(paused);
-                        assert!(Instant::now() <= capture_deadline,
-                            "exact decoded selected page must pause within the existing 5s setup budget");
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
@@ -5817,16 +5821,20 @@ mod native_selected_data_tests {
                     assert_eq!(page.cut, cut);
                     loop {
                         let paused = paused_pages.lock().unwrap();
+                        assert!(Instant::now() <= capture_deadline,
+                            "exact decoded selected page must pause within the existing 5s setup budget");
                         assert!(paused.len() <= 16);
                         if !paused.is_empty() {
                             assert!(paused.iter().all(|command| command.prefix_probe.as_ref()
                                 .and_then(|probe| probe.repair_custody.as_ref())
                                 .is_some_and(|actual| actual.cut == cut)));
+                            assert!(paused.iter().any(|command| command.prefix_probe.as_ref()
+                                .and_then(|probe| probe.repair_custody.as_ref())
+                                .is_some_and(|actual| actual == &page)),
+                                "the paused decoded command must include this exact source page");
                             break;
                         }
                         drop(paused);
-                        assert!(Instant::now() <= capture_deadline,
-                            "exact decoded selected page must pause within the existing 5s setup budget");
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let sealed = page.selected_original_data.as_ref().expect("genuine selected original");
