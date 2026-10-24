@@ -457,6 +457,7 @@ pub(crate) struct NativeContentOnlyRepairAdmission {
     receiver: sinomo_core::node::NodeId,
     projection_generation: u64,
     authority_generation: u64,
+    configuration_origin: Arc<crate::DfsWriteConfigurationProjection>,
     content_identity: crate::content_store::ReceivedRepairFixtureIdentity,
     immutable_policy: crate::DfsReplicationPolicy,
 }
@@ -467,9 +468,11 @@ impl NativeContentOnlyRepairAdmission {
         self.provider.validate_content_only_repair_owner(&self.execution, &self.owner)?;
         let content_identity = self.provider.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
         if content_identity != self.content_identity { return Err(crate::DfsError::Metadata { message: "native content-only Repair physical content expectation changed".into() }); }
-        let (shard, filesystem, projection_generation) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver, &self.immutable_policy)?;
+        let (shard, filesystem, projection_generation, configuration) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver, &self.immutable_policy)?;
         let authority_generation = self.provider.authority.generation();
-        if shard != self.shard || filesystem != self.filesystem || projection_generation != self.projection_generation
+        let same_proof_origin = configuration.has_same_native_proof_origin(&self.configuration_origin);
+        if shard != self.shard || filesystem != self.filesystem || projection_generation < self.projection_generation
+            || !same_proof_origin
             || authority_generation != self.authority_generation {
             #[cfg(any(test, feature = "test-support"))]
             {
@@ -478,7 +481,7 @@ impl NativeContentOnlyRepairAdmission {
                 // A diagnostic write failure must preserve the original error.
                 let _ = writeln!(
                     std::io::stderr().lock(),
-                    "NATIVE_ORIGINAL_REPAIR_CONFIGURATION_CHANGED request={} intent={} receiver={} shard_equal={} filesystem_equal={} projection_expected={} projection_current={} authority_expected={} authority_current={}",
+                    "NATIVE_ORIGINAL_REPAIR_CONFIGURATION_CHANGED request={} intent={} receiver={} shard_equal={} filesystem_equal={} projection_expected={} projection_current={} authority_expected={} authority_current={} same_native_proof_origin={} revision_expected={} revision_current={}",
                     material.original.command.request_id,
                     material.original.command.intent_id,
                     self.receiver,
@@ -488,9 +491,26 @@ impl NativeContentOnlyRepairAdmission {
                     projection_generation,
                     self.authority_generation,
                     authority_generation,
+                    same_proof_origin,
+                    self.configuration_origin.revision().0,
+                    configuration.revision().0,
                 );
             }
             return Err(crate::DfsError::Metadata { message: "native content-only Repair configuration advanced".into() });
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if projection_generation > self.projection_generation {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "NATIVE_ORIGINAL_REPAIR_CONTIGUOUS_CONFIGURATION request={} projection_expected={} projection_current={} authority={} same_native_proof_origin=true revision_expected={} revision_current={}",
+                material.original.command.request_id,
+                self.projection_generation,
+                projection_generation,
+                authority_generation,
+                self.configuration_origin.revision().0,
+                configuration.revision().0,
+            );
         }
         Ok(())
     }
@@ -521,6 +541,29 @@ impl NativeContentOnlyRepairAdmission {
     }
 }
 
+/// Finish one original-Repair read capture without holding projection locks
+/// over content I/O. A floor read can withdraw the publication after cloning
+/// its Arc, so pointer equality alone cannot establish a current capture.
+pub(crate) fn validate_original_repair_configuration_capture(
+    authority: &Arc<crate::DfsMetadataAuthorityRuntime>,
+    captured: &Arc<crate::DfsWriteConfigurationProjection>,
+    projection_generation: u64,
+) -> std::result::Result<(), crate::DfsError> {
+    let current = authority.write_configuration_projection()?.ok_or_else(|| {
+        crate::DfsError::Metadata {
+            message: "original Repair configuration capture lost its native publication".into(),
+        }
+    })?;
+    if !Arc::ptr_eq(captured, &current)
+        || authority.projection_generation() != projection_generation
+    {
+        return Err(crate::DfsError::Metadata {
+            message: "original Repair configuration changed during current capture".into(),
+        });
+    }
+    Ok(())
+}
+
 impl DfsPublicationExecutionProvider {
     fn validate_content_only_repair_owner(&self, execution: &DfsPublicationExecutionOwners, owner: &DfsPublicationOwnerScope) -> std::result::Result<(), crate::DfsError> {
         let layout = self.data_owner.selected_original_data_layout().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
@@ -541,7 +584,7 @@ impl DfsPublicationExecutionProvider {
         Ok(())
     }
 
-    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, immutable_policy: &crate::DfsReplicationPolicy) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, u64), crate::DfsError> {
+    fn content_only_repair_configuration(&self, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, immutable_policy: &crate::DfsReplicationPolicy) -> std::result::Result<(crate::DfsMetadataShardConfig, crate::DfsFileSystemConfig, u64, Arc<crate::DfsWriteConfigurationProjection>), crate::DfsError> {
         material.validate()?;
         crate::service_repair::ensure_repair_content_not_forbidden(receiver, immutable_policy, "selected receiver")?;
         let command = &material.original.command;
@@ -572,7 +615,8 @@ impl DfsPublicationExecutionProvider {
                 && crate::select_metadata_shard_config_for_path_strict_default_sifs_split(&command.file_system_id, &current_shards, &object.path)
                     .is_ok_and(|selected| selected.as_ref() == Some(&shard))).then_some(generation)
         })?.flatten().ok_or_else(error)?;
-        Ok((shard, filesystem, generation))
+        validate_original_repair_configuration_capture(&self.authority, &view, generation)?;
+        Ok((shard, filesystem, generation, view))
     }
 
     pub(crate) fn admit_content_only_original_repair(self: &Arc<Self>, execution: Arc<DfsPublicationExecutionOwners>, owner: DfsPublicationOwnerScope, material: &crate::DfsOriginalRepairMaterial, object: &crate::DfsObjectMetadata, receiver: &sinomo_core::node::NodeId, intent: &crate::DfsWriteIntentRecord) -> std::result::Result<NativeContentOnlyRepairAdmission, crate::DfsError> {
@@ -581,8 +625,8 @@ impl DfsPublicationExecutionProvider {
         self.validate_content_only_repair_owner(&execution, &owner)?;
         let authority_generation = self.authority.generation();
         let content_identity = self.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
-        let (shard, filesystem, projection_generation) = self.content_only_repair_configuration(material, object, receiver, &intent.policy)?;
-        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), projection_generation, authority_generation, content_identity, immutable_policy: intent.policy.clone() };
+        let (shard, filesystem, projection_generation, configuration_origin) = self.content_only_repair_configuration(material, object, receiver, &intent.policy)?;
+        let admission = NativeContentOnlyRepairAdmission { provider: Arc::clone(self), execution, owner, material: material.clone(), object: object.clone(), shard, filesystem, receiver: receiver.clone(), projection_generation, authority_generation, configuration_origin, content_identity, immutable_policy: intent.policy.clone() };
         admission.revalidate(material)?;
         Ok(admission)
     }

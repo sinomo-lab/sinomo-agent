@@ -40,6 +40,15 @@ impl DfsWriteConfigurationProjection {
         self.revision
     }
 
+    /// Contiguous replay keeps these native bootstrap inputs unchanged. This
+    /// relation is not permission: callers still need a fresh resident-floor
+    /// check, a stable current capture, and their native authority/store fences.
+    pub(crate) fn has_same_native_proof_origin(&self, previous: &Self) -> bool {
+        self.authority == previous.authority
+            && self.floor == previous.floor
+            && self.revision >= previous.revision
+    }
+
     /// Returns a complete borrowed range only inside one of the proven scopes.
     pub fn entries(&self, prefix: &str) -> Option<&[KvEntry]> {
         let scope = DFS_WRITE_CONFIGURATION_PREFIXES
