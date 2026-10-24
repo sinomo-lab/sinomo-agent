@@ -379,7 +379,9 @@ pub(crate) fn remove_superseded_daemon_listeners(
     }
 }
 
-fn daemon_tcp_endpoint_is_listener_advertisement(endpoint: &ClusterEndpointRecord) -> bool {
+pub(crate) fn daemon_tcp_endpoint_is_listener_advertisement(
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
     matches!(
         endpoint.transport,
         ClusterTransportKind::Loopback | ClusterTransportKind::LanTcp

@@ -903,6 +903,100 @@ mod tests {
     }
 
     #[test]
+    fn local_listener_replacement_survives_peer_merge_without_hiding_member_changes() {
+        for newer in [false, true] {
+            for source in [
+                sinomo_base::ClusterEndpointSource::Observed,
+                sinomo_base::ClusterEndpointSource::Mdns,
+            ] {
+                let root = sinomo_testdir::TestDir::new("local-listener-peer-merge");
+                let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+                paths.ensure().expect("paths");
+                let mut local = test_state("local_listener_peer_merge");
+                let remote = add_learner(&mut local, "peer_listener_remote");
+                let current = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+                let index = local
+                    .members
+                    .iter()
+                    .position(|m| m.node_id == local.local_node_id)
+                    .unwrap();
+                local.members[index].endpoints = vec![current.clone()];
+                let original = local.members[index].clone();
+                let mut peer = local.clone();
+                let mut retired = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+                retired.source = source;
+                let mut relay = observed_listener(&local.local_node_id, "peer-relay-placeholder");
+                relay.address = "https://relay.invalid/peer".to_string();
+                relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+                relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+                relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+                let incoming = &mut peer.members[index];
+                incoming.endpoints = vec![retired, relay.clone()];
+                incoming.updated_at += time::Duration::seconds(if newer { 1 } else { -1 });
+                incoming.state = ClusterMemberState::Removed;
+                incoming.display_name = "newer peer membership".to_string();
+                let mut expected = if newer { incoming.clone() } else { original };
+                expected.endpoints = vec![current, relay];
+                cleanup_member_endpoint_duplicates(&mut expected);
+                expected
+                    .endpoints
+                    .sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+                let remote_member = peer
+                    .members
+                    .iter_mut()
+                    .find(|m| m.node_id == remote)
+                    .unwrap();
+                remote_member.endpoints = vec![observed_listener(&remote, "10.0.0.3:21353")];
+                remote_member.updated_at += time::Duration::seconds(1);
+                let expected_remote = remote_member.clone();
+                assert!(crate::member_store::merge_cluster_state_from_peer(
+                    &mut local, peer
+                ));
+                // Endpoint order is not routing identity; compare every field
+                // after canonicalizing only this unordered collection.
+                local.members[index]
+                    .endpoints
+                    .sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+                assert_eq!(
+                    local.members[index], expected,
+                    "a peer cannot replace owned listeners; newer membership fields must still apply"
+                );
+                assert_eq!(
+                    local.members.iter().find(|m| m.node_id == remote).unwrap(),
+                    &expected_remote
+                );
+                write_cluster_state(&paths, &local).expect("persist merged peer view");
+                let reopened =
+                    read_cluster_state_without_kv(&paths).expect("read physical local state");
+                assert_eq!(
+                    reopened
+                        .members
+                        .iter()
+                        .find(|m| m.node_id == local.local_node_id)
+                        .unwrap(),
+                    &expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_mdns_hint_does_not_override_newer_peer_member() {
+        let mut local = test_state("local_mdns_peer_merge");
+        let mut hint = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        hint.source = sinomo_base::ClusterEndpointSource::Mdns;
+        local.members[0].endpoints = vec![hint];
+        let mut peer = local.clone();
+        peer.members[0].endpoints = vec![observed_listener(&local.local_node_id, "10.0.0.4:21353")];
+        peer.members[0].updated_at += time::Duration::seconds(1);
+        let expected = peer.members[0].clone();
+        assert!(crate::member_store::merge_cluster_state_from_peer(
+            &mut local, peer
+        ));
+        assert_eq!(local.members[0], expected);
+    }
+
+    #[test]
     fn local_listener_overlay_retains_non_listener_published_routes() {
         let root = sinomo_testdir::TestDir::new("local-listener-published-relay");
         let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
