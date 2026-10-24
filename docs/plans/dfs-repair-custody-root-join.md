@@ -2,13 +2,16 @@
 
 ## Current development boundary — 2026-10-24
 
-This remains an unfinished local custody design, extended by selected native
-non-executing DATA. Current R8 source `3a445694` passed R4's fresh typecheck
-(16.165 seconds), eight operation-tooling controls, own-source no-run build
-(218.667 seconds), artifact sealing (3.021 seconds) and archive phase
-(2.506 seconds over four recorded groups). **Its 35 Rust controls remain unrun at
-this checkpoint.** These stage results are neither native custody acceptance nor
-takeover/quietness measurements.
+The source-qualified R8 panel (`3a445694`/`f5227860`) executed all35 controls:
+31PASS/4FAIL, including five passing directory controls. Its build/tooling and
+actual archive/cleanup stages passed. The reviewed genesis-context correction
+is committed as `b9a86c0b`; R9 `fdd2b4f2` typecheck/no-run passed, and four native
+regressions on `41067208` produced1PASS/3FAIL. Native startup still exposes an
+ordinary passive-root creation before selected admission; original failures and
+actual diagnostic observations remain preserved. No custody/Terminal/executor
+acceptance follows from these partial results. N7 branch `b9e38d4d` was merged
+without conflicts as `cfb6fd8a`, adding two uncompiled/unrun rejection controls.
+The [availability plan](dfs-abrupt-loss-availability.md) carries current details.
 
 The earlier `3eb87ca5` local DATA panel actually passed twenty controls. R7 source
 `0344ec57`/executable `c9966eb3` executed all thirty controls with 23 passes and
@@ -25,9 +28,8 @@ Original R67's positive successor-continuation assertion remains failed on its
 `40394f47`/`17295eb6` source/artifact. Its original request/body, committed intent
 and readable content cannot grant B execution. Selected DATA does not close that
 failure or complete the receiver Terminal, current-application, payload/root
-retirement or C1 admission protocol. Four N7 native controls remain unrepresented:
-invalid source/prefix/scope, unbudgeted selected input, install-cap expiry and
-freeze-before-first-capture restart. Current-source DFS/KV lint, metadata quorum,
+retirement or C1 admission protocol. Two N7 controls (invalid input and unbudgeted routing) are authored but unrun;
+install-cap expiry and freeze-before-first-capture restart remain unrepresented. Current-source DFS/KV lint, metadata quorum,
 abrupt-loss and Sinomo-only quietness also remain open.
 
 DFS development now serializes only its own worktree using a local build/test

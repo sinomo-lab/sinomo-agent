@@ -2,15 +2,28 @@
 
 ## Current development checkpoint — 2026-10-24
 
-The DFS lane develops independently in `dev/dfs`; its current pre-commit HEAD is
-`f520a20d`. Source R8 is frozen at
-`3a445694f3d742cb2a8ede4ded77b3c878b70283838f31a10265a345f3a05eac`
-(4,900 inputs). R4 passed fresh library/test-target typecheck in 16.165 seconds,
-all eight operation-tooling controls, own-source libtest no-run in 218.667 seconds,
-and artifact sealing in 3.021 seconds. Its archive phase passed in 2.506 seconds
-over four recorded groups. These are measured stage durations, not latency SLOs
-or evidence that Rust tests passed. **All 35 R8 Rust controls remain UNRUN at this
-documentation checkpoint.**
+The DFS lane develops independently in `dev/dfs`. Local code checkpoint
+`a3b9363a` preserves R8 source `3a445694` (4,900 inputs). R4 passed typecheck,
+eight tooling controls and no-run; sealed executable `f5227860` then executed
+all35 controls across two disjoint local panels: **31PASS/4FAIL**, zero incomplete
+or unrun. The five directory controls all passed. All own fixture/checkpoint,
+archive and cleanup stages passed. This does not erase historical R7 failures.
+
+Commit `b9a86c0b` forwards the retained owner's checked selected layout through
+three native-genesis cold opens. R9 source `fdd2b4f2` passed typecheck18.115s and
+no-run202.415s, producing sealed executable `41067208`. Four unchanged native
+regressions executed: **1PASS/3FAIL**. The default-reader protection control now
+passes; native handoff cases still fail at the existing startup deadline. Two
+separate diagnostic repeats retained real transport errors and trace evidence:
+passive B/C already have ordinary shard directories before selected admission,
+which correctly rejects them with FileExists. No silent adoption is permitted.
+
+The N7 branch commit `b9e38d4d` was actually merged as `cfb6fd8a` without conflicts.
+It adds two authenticated rejection/routed-budget controls; they are authored
+but **uncompiled/unrun** after merge. The isolated successor association remains
+under review and has not been merged. Current source differs from R9; no runtime
+pass transfers to these additions. No Docker, main rollout, push or deployment
+occurred. Own bounded work uses the DFS-local lock and16GiB/no-swap scope.
 
 R8 replaces the selected-layout directory check's inappropriate regular-file
 predicate with a directory-specific physical-identity check and adds five focused
@@ -24,12 +37,12 @@ fixture helper or converting an earlier archive timeout into success.
 |---|---|
 | Selected local DATA `3eb87ca5` | Twenty local persistence/V1 controls passed. This does not prove authenticated native ingress or successor execution. |
 | N3 R7 `0344ec57`, executable `c9966eb3` | Thirty controls executed: 23 passed and seven failed at selected-directory setup. All 30 preservation checkpoints passed. The inner archive worker separately timed out with exit 124 after 120.056863 seconds; both complete 420-file archives and original results remain retained. |
-| R8 `3a445694`, R4 build | Check, eight tooling controls, no-run and sealing passed; the independent remaining30 panel executed26PASS/4FAIL; the five focused directory controls have a separate pending receipt. No earlier pass transfers to changed Rust. |
+| R8 `3a445694`, R4 build | Check/build/tooling passed; all35 exact controls executed31PASS/4FAIL on f5227860. Source/artifact-specific result, no earlier pass transferred. |
 | Original R67 `40394f47`, executable `17295eb6` | Eight non-recovery observation controls passed; the unchanged positive successor-continuation assertion failed. Original request/body, committed intent and content evidence remain retained. |
 
-The four unrepresented N7 native controls remain: invalid source/prefix/scope;
-unbudgeted selected input; install-cap expiry; and freeze-before-first-capture
-restart. Current-source full DFS/KV lint is a separate unrun gate. Checked B
+N7 invalid source/prefix/scope and unbudgeted selected-input controls are now
+authored and merged, but uncompiled/unrun. Install-cap expiry and
+freeze-before-first-capture restart controls remain unrepresented. Current-source full DFS/KV lint is a separate unrun gate. Checked B
 execution, C1 serving/admission floor, receiver Terminal/current-application and
 root-retirement protocol, metadata quorum, W/N degraded admission, abrupt-loss
 acceptance and Sinomo-only quietness remain open. Default V1/P0 continuation and

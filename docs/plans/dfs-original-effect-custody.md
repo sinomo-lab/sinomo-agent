@@ -2,12 +2,16 @@
 
 ## Current development boundary — 2026-10-24
 
-R8 Rust source `3a445694` contains the local custody/content-witness foundations
-and selected native non-executing DATA candidate. R4 passed fresh typecheck in
-16.165 seconds, all eight operation-tooling controls, own-source no-run in
-218.667 seconds and artifact sealing in 3.021 seconds. **All 35 R8 Rust controls
-remain unrun at this checkpoint.** Compilation and tooling checks grant no
-original-custody, receiver Terminal or successor-execution certificate.
+The source-qualified R8 panel (`3a445694`/`f5227860`) executed all35 controls:
+31PASS/4FAIL, including five passing directory controls. Its build/tooling and
+actual archive/cleanup stages passed. The reviewed genesis-context correction
+is committed as `b9a86c0b`; R9 `fdd2b4f2` typecheck/no-run passed, and four native
+regressions on `41067208` produced1PASS/3FAIL. Native startup still exposes an
+ordinary passive-root creation before selected admission; original failures and
+actual diagnostic observations remain preserved. No custody/Terminal/executor
+acceptance follows from these partial results. N7 branch `b9e38d4d` was merged
+without conflicts as `cfb6fd8a`, adding two uncompiled/unrun rejection controls.
+The [availability plan](dfs-abrupt-loss-availability.md) carries current details.
 
 Preserved evidence includes the twenty passing local DATA controls on `3eb87ca5`;
 the R7 `0344ec57`/`c9966eb3` panel's 23 passes, seven actual setup failures and
@@ -19,7 +23,7 @@ request/body, committed intent and content evidence remain unchanged.
 Immutable origin and current fenced executor remain separate. Selected DATA
 installation does not grant B execution, assert complete survivor coverage or
 erase legacy uncertainty. P0 preserves default V1 continuation; missing historical
-bodies cannot be invented. The four missing N7 native controls, current-source
+bodies cannot be invented. Two authored but unrun and two missing N7 native controls, current-source
 DFS/KV lint, checked successor joins, C1 floor, Terminal/current application,
 root retirement, metadata quorum, abrupt-loss and Sinomo-only quietness remain
 open. The [availability plan](dfs-abrupt-loss-availability.md) records the exact
