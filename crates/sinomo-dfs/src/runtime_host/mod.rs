@@ -236,6 +236,7 @@ pub(crate) struct DfsOriginalRepairFixture {
     targets: Arc<Mutex<std::collections::BTreeSet<NodeId>>>,
 }
 impl DfsOriginalRepairFixture {
+    #[cfg(any(test, feature = "test-support"))]
     fn open(&self, owner: &DfsDataOwnerLock) -> Result<LocalContentStore, DfsRuntimeError> {
         owner.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse { detail: "original Repair fixture has no actual checked native DATA layout owner".into() })?;
         let expected = self.identity.lock().map_err(|_| DfsRuntimeError::Parse { detail: "original Repair fixture expectation poisoned".into() })?;
@@ -360,7 +361,10 @@ impl DfsDataOwnerLock {
 
     fn open_native_content(&self) -> Result<LocalContentStore, DfsRuntimeError> {
         match &self.original_repair_fixture {
+            #[cfg(any(test, feature = "test-support"))]
             Some(fixture) => fixture.open(self),
+            #[cfg(not(any(test, feature = "test-support")))]
+            Some(_) => Err(DfsRuntimeError::Parse { detail: "original Repair fixture content is unavailable in a production reader".into() }),
             None => LocalContentStore::new(self.physical_data_root.join("dfs/content")).map_err(Into::into),
         }
     }

@@ -401,7 +401,9 @@ impl DfsPublicationProviderSlot {
             previous,
         }
     }
-    fn current(&self) -> Option<Arc<DfsPublicationExecutionProvider>> {
+    /// Borrow the actual installed provider, not publication permission. Every
+    /// consumer must still enter its native owner/admission validation path.
+    pub(crate) fn current(&self) -> Option<Arc<DfsPublicationExecutionProvider>> {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
