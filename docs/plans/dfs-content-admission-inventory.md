@@ -61,7 +61,14 @@ separate selector input and cannot replace any inventory fact.
 
 The proposed next selector consumes the strict inventory plus the already-cached
 storage/path snapshot, exact policy and existing pins. It returns exactly N
-desired IDs, observed preferred transfer IDs and deferred desired IDs separately.
+desired IDs, attemptable transfer IDs, fresh observed-ready IDs and known-deferred
+desired IDs separately. Unknown/stale storage/path observations remain attemptable
+under admitted configuration and the existing hard-refusal checks; lease expiry
+never requires periodic configuration refresh. Missing remote path evidence is
+unknown, never observed-ready; a healthy local coordinator needs no self-edge.
+Observed-ready is diagnostic and never supplies W. Canonical advertisement zones must agree with the policy zone
+map that will be persisted; conflicting/missing material rejects rather than
+validating one plan and storing another.
 Every desired ID belongs to the inventory. Historical locations may rank an
 admitted member but cannot reintroduce an excluded member.
 

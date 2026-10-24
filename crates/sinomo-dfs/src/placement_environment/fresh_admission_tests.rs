@@ -129,7 +129,8 @@ fn fresh_admission_retains_n_and_defers_optional_unavailable_target() {
         plan.placement.preferred_commit_nodes,
         vec![f.b.clone(), f.c.clone()]
     );
-    assert_eq!(plan.observed_writable_node_ids, vec![f.b, f.c]);
+    assert_eq!(plan.observed_ready_node_ids, vec![f.b.clone(), f.c.clone()]);
+    assert_eq!(plan.attemptable_node_ids, vec![f.b, f.c]);
     assert_eq!(plan.deferred_desired_node_ids, vec![f.a]);
     assert_eq!(plan.configuration_revision, KvRevision(11));
     assert_eq!(f.request.policy.desired_replicas, 3);
@@ -247,8 +248,88 @@ fn fresh_admission_unknown_or_stale_endpoint_evidence_does_not_declare_node_fail
         }
         let plan = f.plan(&[], &[]).unwrap();
         assert!(plan.deferred_desired_node_ids.is_empty());
-        assert_eq!(plan.observed_writable_node_ids.len(), 3);
+        assert_eq!(plan.attemptable_node_ids.len(), 3);
+        assert!(!plan.observed_ready_node_ids.contains(&f.a));
     }
+}
+
+#[test]
+fn fresh_admission_quiet_stale_survivors_remain_attemptable_without_refresh() {
+    let mut f = Fixture::new();
+    let expired = OffsetDateTime::now_utc() - time::Duration::minutes(10);
+    for target in &mut f.inventory.targets {
+        if target.advertisement.node_id != f.a {
+            target.advertisement.storage_freshness = DfsObservationFreshness::Stale;
+            target.advertisement.updated_at = expired;
+            target.advertisement.expires_at = Some(expired);
+        }
+    }
+    for path in &mut f.snapshot.paths {
+        if path.target_node_id == f.c {
+            path.expires_at = expired;
+        }
+    }
+    let plan = f.plan(&[], &[]).unwrap();
+    assert_eq!(plan.attemptable_node_ids, vec![f.b.clone(), f.c.clone()]);
+    assert!(plan.observed_ready_node_ids.is_empty());
+    assert_eq!(plan.deferred_desired_node_ids, vec![f.a]);
+    assert_eq!(plan.placement.desired_replica_nodes.len(), 3);
+    assert_eq!(plan.placement.preferred_commit_nodes.len(), 2);
+}
+
+#[test]
+fn fresh_admission_missing_remote_path_stays_attemptable_without_ready_claim() {
+    let mut f = Fixture::new();
+    f.snapshot.paths.retain(|path| path.target_node_id != f.c);
+    let plan = f.plan(&[], &[]).unwrap();
+    assert_eq!(plan.attemptable_node_ids, vec![f.b.clone(), f.c.clone()]);
+    assert_eq!(plan.observed_ready_node_ids, vec![f.b]);
+    assert_eq!(plan.deferred_desired_node_ids, vec![f.a]);
+}
+
+#[test]
+fn fresh_admission_unknown_required_and_pinned_targets_keep_existing_eligibility() {
+    let mut f = Fixture::new();
+    f.inventory
+        .targets
+        .iter_mut()
+        .find(|target| target.advertisement.node_id == f.a)
+        .unwrap()
+        .provider_observed_ready = true;
+    let path = f
+        .snapshot
+        .paths
+        .iter_mut()
+        .find(|path| path.target_node_id == f.a)
+        .unwrap();
+    path.state = DfsPlacementPathState::Unknown;
+    f.request.policy.required_node_ids = vec![f.a.clone()];
+    let plan = f.plan(&[], std::slice::from_ref(&f.a)).unwrap();
+    assert!(plan.placement.desired_replica_nodes.contains(&f.a));
+    assert!(plan.attemptable_node_ids.contains(&f.a));
+    assert!(!plan.observed_ready_node_ids.contains(&f.a));
+}
+
+#[test]
+fn fresh_admission_conflicting_zone_sources_cannot_satisfy_persisted_policy() {
+    let mut f = Fixture::new();
+    f.request.policy.min_distinct_zones = 2;
+    f.inventory
+        .targets
+        .iter_mut()
+        .find(|target| target.advertisement.node_id == f.a)
+        .unwrap()
+        .advertisement
+        .zone = Some("west".into());
+    let original_policy = f.request.policy.clone();
+    assert!(
+        f.plan(&[], &[]).is_err(),
+        "all actual targets are west; stale east policy cannot satisfy minzones"
+    );
+    assert_eq!(
+        f.request.policy, original_policy,
+        "selector cannot silently repair the persisted operation body"
+    );
 }
 
 #[test]

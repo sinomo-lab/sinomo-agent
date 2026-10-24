@@ -782,7 +782,8 @@ pub(crate) fn plan_replicas_with_placement_snapshot(
 #[derive(Debug)]
 pub(crate) struct DfsFreshContentAdmissionPlan {
     pub(crate) placement: DfsReplicaPlacementPlan,
-    pub(crate) observed_writable_node_ids: Vec<NodeId>,
+    pub(crate) attemptable_node_ids: Vec<NodeId>,
+    pub(crate) observed_ready_node_ids: Vec<NodeId>,
     pub(crate) deferred_desired_node_ids: Vec<NodeId>,
     pub(crate) configuration_revision: sinomo_core::kv::KvRevision,
 }
@@ -803,6 +804,15 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
             reason: "fresh deferred placement requires eventual W<N".into(),
         });
     }
+    for target in &inventory.targets {
+        if target.advertisement.zone.as_ref()
+            != request.policy.node_zones.get(&target.advertisement.node_id)
+        {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: "fresh placement zone evidence differs from its persisted policy".into(),
+            });
+        }
+    }
     let now = OffsetDateTime::now_utc();
     let observations = inventory
         .targets
@@ -819,15 +829,7 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
                 advertisement.node_id.clone(),
                 advertisement.capacity_weight.max(1),
             )
-            .map(|candidate| {
-                candidate.with_zone(advertisement.zone.clone().or_else(|| {
-                    request
-                        .policy
-                        .node_zones
-                        .get(&advertisement.node_id)
-                        .cloned()
-                }))
-            })
+            .map(|candidate| candidate.with_zone(advertisement.zone.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     crate::distributed::validate_candidate_set(&canonical.candidates, &canonical.policy)?;
@@ -843,12 +845,7 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let writable = |candidate: CandidateEvidence<'_>| {
-        let node_ready = candidate.node.is_some_and(|node| {
-            node.freshness_at(now) == DfsObservationFreshness::Fresh
-                && node.accepts_new_content
-                && node.storage_health != DfsHealthState::Critical
-        });
+    let attemptable = |candidate: CandidateEvidence<'_>| {
         let provider_ready = provider_readiness
             .get(&candidate.candidate.node_id)
             .copied()
@@ -859,7 +856,27 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
             path.freshness_at(now) != DfsObservationFreshness::Fresh
                 || path.state != DfsPlacementPathState::Unreachable
         });
-        node_ready && provider_ready && path_not_known_failed
+        // Stale storage observations remain unknown. Admission comes from the
+        // current inventory; this observation never substitutes for a receipt.
+        provider_ready && path_not_known_failed
+    };
+    let observed_ready = |candidate: CandidateEvidence<'_>| {
+        attemptable(candidate)
+            && candidate.node.is_some_and(|node| {
+                node.freshness_at(now) == DfsObservationFreshness::Fresh
+                    && matches!(
+                        node.storage_health,
+                        DfsHealthState::Healthy | DfsHealthState::Degraded
+                    )
+            })
+            && (candidate.candidate.node_id == canonical.coordinator_node_id
+                || candidate.path.is_some_and(|path| {
+                    path.freshness_at(now) == DfsObservationFreshness::Fresh
+                        && matches!(
+                            path.state,
+                            DfsPlacementPathState::Healthy | DfsPlacementPathState::Degraded
+                        )
+                }))
     };
     let mut eligible = canonical
         .candidates
@@ -881,18 +898,19 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
         .filter(|candidate| {
             // Current storage refusal remains hard. A failed optional path can
             // defer delivery while preserving an otherwise admitted desired node.
-            candidate_is_eligible(
-                CandidateEvidence {
-                    path: None,
-                    ..*candidate
-                },
-                now,
-            )
+            candidate.node.is_some_and(|node| node.accepts_new_content)
+                && candidate_is_eligible(
+                    CandidateEvidence {
+                        path: None,
+                        ..*candidate
+                    },
+                    now,
+                )
         })
         .collect::<Vec<_>>();
     eligible.sort_by(|left, right| {
-        writable(*right)
-            .cmp(&writable(*left))
+        attemptable(*right)
+            .cmp(&attemptable(*left))
             .then_with(|| compare_candidate_evidence(&canonical, *left, *right, now))
     });
     for required in canonical
@@ -903,11 +921,11 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
     {
         if !eligible
             .iter()
-            .any(|candidate| &candidate.candidate.node_id == required && writable(*candidate))
+            .any(|candidate| &candidate.candidate.node_id == required && attemptable(*candidate))
         {
             return Err(DfsDistributedError::InvalidReplicaSet {
                 reason: format!(
-                    "required or pinned node {required} is not currently writable in admitted fresh placement"
+                    "required or pinned node {required} is currently unavailable in admitted fresh placement"
                 ),
             });
         }
@@ -956,8 +974,8 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
     // Preserve the selected hard-constraint set while placing actual preferred
     // W attempts before optional deferred targets for the existing stage budget.
     selected.sort_by(|left, right| {
-        writable(*right)
-            .cmp(&writable(*left))
+        attemptable(*right)
+            .cmp(&attemptable(*left))
             .then_with(|| compare_candidate_evidence(&canonical, *left, *right, now))
     });
     let desired_replica_nodes = selected
@@ -965,22 +983,27 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
         .map(|candidate| candidate.candidate.node_id.clone())
         .collect::<Vec<_>>();
     crate::validate_replication_plan(&desired_replica_nodes, &canonical.policy)?;
-    let observed_writable_node_ids = selected
+    let attemptable_node_ids = selected
         .iter()
-        .filter(|candidate| writable(**candidate))
+        .filter(|candidate| attemptable(**candidate))
         .map(|candidate| candidate.candidate.node_id.clone())
         .collect::<Vec<_>>();
-    if observed_writable_node_ids.len() < canonical.policy.min_commit_replicas {
+    if attemptable_node_ids.len() < canonical.policy.min_commit_replicas {
         return Err(DfsDistributedError::InvalidReplicaSet {
-            reason: "admitted fresh placement has fewer observed writable targets than W".into(),
+            reason: "admitted fresh placement has fewer attemptable targets than W".into(),
         });
     }
     let deferred_desired_node_ids = selected
         .iter()
-        .filter(|candidate| !writable(**candidate))
+        .filter(|candidate| !attemptable(**candidate))
         .map(|candidate| candidate.candidate.node_id.clone())
         .collect();
-    let preferred_commit_nodes = observed_writable_node_ids
+    let observed_ready_node_ids = selected
+        .iter()
+        .filter(|candidate| observed_ready(**candidate))
+        .map(|candidate| candidate.candidate.node_id.clone())
+        .collect();
+    let preferred_commit_nodes = attemptable_node_ids
         .iter()
         .take(canonical.policy.min_commit_replicas)
         .cloned()
@@ -990,7 +1013,8 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
             desired_replica_nodes,
             preferred_commit_nodes,
         },
-        observed_writable_node_ids,
+        attemptable_node_ids,
+        observed_ready_node_ids,
         deferred_desired_node_ids,
         configuration_revision: inventory.configuration_revision,
     })
