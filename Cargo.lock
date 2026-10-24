@@ -9587,11 +9587,14 @@ dependencies = [
 name = "sinomo-app-use-module"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
+ "serde_json",
  "sinomo-core",
  "sinomo-device",
  "sinomo-module-api",
  "windows",
+ "x11rb 0.13.2",
 ]
 
 [[package]]

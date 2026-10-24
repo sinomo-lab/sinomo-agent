@@ -501,6 +501,9 @@ const ANDROID_LIFECYCLE_DEX: &[u8] = include_bytes!(env!("SINOMO_ANDROID_LIFECYC
 pub(crate) fn start_android_lifecycle_monitor(android_app: sui::AndroidApp) {
     let app = android_app.clone();
     android_app.run_on_java_main_thread(Box::new(move || {
+        if let Err(error) = crate::android_app_use_consent::install(&app) {
+            tracing::warn!(%error, "Android App Use local consent UI is unavailable");
+        }
         if let Err(error) = install_android_lifecycle_monitor(&app) {
             // Keep the app usable on vendor runtimes that reject DEX loading.
             // Window focus still gates work, and this fallback is logged rather

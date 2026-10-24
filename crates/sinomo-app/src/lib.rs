@@ -37,6 +37,9 @@ static ANDROID_SAFE_AREA: std::sync::OnceLock<std::sync::RwLock<sui::Insets>> =
 #[cfg(all(target_os = "android", feature = "mobile"))]
 static ANDROID_APP: std::sync::OnceLock<sui::AndroidApp> = std::sync::OnceLock::new();
 
+#[cfg(any(test, all(target_os = "android", feature = "mobile")))]
+mod android_app_use_consent;
+
 #[cfg(all(target_os = "android", feature = "mobile"))]
 static ANDROID_UI_HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<sui::UiHandle>>> =
     std::sync::OnceLock::new();

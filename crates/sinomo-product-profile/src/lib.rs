@@ -304,12 +304,10 @@ pub fn base_component_catalog(
         }
     }
 
-    if profile.resource_class == ProductResourceClass::Standard
-        && matches!(
-            profile.host_role,
-            ComponentHostRole::Main | ComponentHostRole::Embedded
-        )
-    {
+    if matches!(
+        profile.host_role,
+        ComponentHostRole::Main | ComponentHostRole::Embedded
+    ) {
         use sinomo_actions::desktop::{self, DesktopModule};
         {
             let kind = DesktopModule::AppUse;
@@ -476,7 +474,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_modules_follow_standard_main_embedded_and_disable_profiles() {
+    fn app_use_follows_main_embedded_mobile_and_disable_profiles() {
         use sinomo_actions::desktop::DesktopModule;
         let root = SinomoDataDir::new(std::env::temp_dir().join(format!(
             "sinomo-desktop-profile-{}",
@@ -485,6 +483,7 @@ mod tests {
         for profile in [
             ProductComponentProfile::main(false),
             ProductComponentProfile::embedded(false),
+            ProductComponentProfile::mobile_embedded(false),
         ] {
             let catalog = base_component_catalog(&root, profile).unwrap();
             {
@@ -492,10 +491,7 @@ mod tests {
                 assert!(catalog.factory(kind.module_id().as_str()).is_some());
             }
         }
-        for profile in [
-            ProductComponentProfile::shadow(false),
-            ProductComponentProfile::mobile_embedded(false),
-        ] {
+        for profile in [ProductComponentProfile::shadow(false)] {
             let catalog = base_component_catalog(&root, profile).unwrap();
             {
                 let kind = DesktopModule::AppUse;

@@ -10,6 +10,12 @@ Query `{"action":"capabilities"}` first. The native App Use OS provider must be
 installed. Unsupported platforms and unavailable capabilities are explicit;
 installation and discovery never grant local capture/input consent.
 
+Linux support requires a local X11 session; native Wayland/Xwayland are
+unsupported. Android supports explicit raw mode only, after the user enables
+accessibility, screen sharing and exact-display grants locally. Query raw
+targets directly when capabilities report no background input. Never request
+or infer a silent mode change from a failed input batch.
+
 Prefer **background** control. `{"action":"targets"}` defaults to
 `"mode":"background"` and lists windows. Preserve the complete target identity
 (handle, process ID, thread ID, process creation time). Open with
@@ -73,6 +79,15 @@ origin. `key` uses Set-1 scan codes (Enter is 28). `relative_move` accepts `dx,d
 Driver-free gamepad support is conditional; report Unsupported honestly. Send a
 separate neutral state to release held controller inputs. Window-only
 `move_in_frame` is unavailable in raw mode.
+
+On Android, `move` sets a virtual touch point. Left-button down/move/up submits
+a finite tap/drag on release; `release_all` or close discards an unfinished
+gesture. Wheel events submit swipes. Text requires a focused accessible
+non-password editor. Only raw key codes 1 (Escape/Back), 14 (Backspace) and 28
+(Enter) are supported; gamepads and other keys are unavailable. Screen-share
+stop or rotation invalidates the target and requires fresh local consent.
+On Linux, text is limited to the current X11 keyboard map and wheel deltas must
+be multiples of 120. Observe the visual result before continuing.
 
 Always close using `{"action":"close","session_id":ID}`, including after failure.
 Input leases expire after 30 seconds idle; all sessions have bounded lifetimes

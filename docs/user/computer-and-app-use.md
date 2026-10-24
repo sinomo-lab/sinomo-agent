@@ -3,7 +3,8 @@
 App Use provides one skill and one control tool with two explicit modes.
 Background OS window messages are preferred: they do not move the user's pointer,
 take keyboard focus, or require the app to be foreground. The agent can select
-raw desktop input when background control is unsuitable. There is no automatic
+raw desktop input when background control is unsuitable or unavailable on the
+platform. There is no automatic
 fallback or replay of a failed batch.
 
 | Mode | Target and capture | Input |
@@ -11,12 +12,18 @@ fallback or replay of a failed batch.
 | `background` (default) | Exact window; continuous compositor capture even while occluded | Posted virtual-key, character and mouse messages |
 | `raw` (explicit) | Exact monitor; continuous compositor capture | Scan-code keyboard, Unicode text, absolute/relative mouse, buttons, wheels and conditional gamepad injection |
 
-Windows capture and input are implemented in the independently built
-[App Use OS provider](../../modules/desktop/app-use/README.md). It uses Windows
-Graphics Capture/D3D11, PostMessageW, SendInput and conditional InputInjector
-without installing drivers. Other platforms explicitly report unsupported
-capabilities. Common actions, events, media encoding and transmission remain in
-the host runtime. Shadow/mobile profiles omit the linked App Use host service.
+Native capture and input are implemented in the independently built
+[App Use OS provider](../../modules/desktop/app-use/README.md).
+
+| Platform | Available behavior |
+|---|---|
+| Windows | Background and raw modes using Windows Graphics Capture/D3D11, PostMessageW, SendInput and conditional InputInjector |
+| Linux X11 | Background client-window capture and synthetic events; raw virtual-desktop capture and XTest input; no gamepads |
+| Android | Explicit raw display mode, MediaProjection capture, accessibility touch/text input; no background mode or gamepads |
+| Native Wayland / Xwayland / other systems | Explicitly unsupported |
+
+Common actions, events, media encoding and transmission remain in the host
+runtime. Main and embedded/mobile profiles expose App Use; shadow profiles omit it.
 
 ## Installation and local consent
 
@@ -26,6 +33,15 @@ Build and activate the OS provider with the ordinary native-module lifecycle:
 cargo build -p sinomo-app-use-module
 sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v1 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
 ```
+
+On Linux the artifact is `target/debug/libsinomo_app_use_module.so`. The daemon
+needs access to the user's local X11 session (`DISPLAY` and `XAUTHORITY`).
+See the provider's [Android setup](../../modules/desktop/app-use/README.md#android)
+for APK packaging and native artifact activation. On Android, open Sinomo and
+enable Remote Management locally, then use the **Sinomo App Use** launcher entry
+to enable accessibility, share the display, and grant capture with optional
+input for that exact share. Each new share needs a fresh grant. Android OS consent
+does not turn on Remote Management automatically.
 
 The linked `module.app-use` host service exposes the shared tools and media
 routes. Its existing Settings/CLI enablement controls apply:
@@ -54,6 +70,9 @@ permission store through a live host callback and rechecks consent at the OS
 boundary. Revocation stops video and releases held inputs. Neither tool changes
 permissions. Windows identities contain handle, PID, thread ID and process
 creation time; re-enumerate after recreation.
+Linux identities use the X11 window ID, the server-reported local owner PID and
+process start time. Android display identities change on each screen share;
+rotation ends the old share to prevent input using stale coordinates.
 
 ## Unified agent tools
 
@@ -76,6 +95,12 @@ switching to raw. A raw session can interrupt the user's keyboard/mouse and
 change foreground.
 
 Background `key` codes are Windows virtual keys; raw codes are Set-1 scan codes.
+Linux translates supported codes to the current X11 keyboard mapping; text is
+limited to mapped characters. Android supports raw Escape/Back (1), Backspace
+(14) and Enter (28); text edits the focused accessible non-password field.
+On Android, left-button down/move/up becomes a finite touch gesture on release,
+and wheel events become swipes. Closing or releasing the lease discards an
+unfinished gesture. There is no held hardware keyboard or gamepad endpoint.
 Background `move` uses physical client pixels; raw uses physical virtual-desktop
 pixels. Prefer background `move_in_frame` for image grounding: provide normalized
 fractions of the full image plus its current source dimensions. The provider

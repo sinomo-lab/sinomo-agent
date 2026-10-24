@@ -98,6 +98,8 @@ build_apk() {
   require_command cargo
   ensure_debug_keystore
   cargo apk build -p sinomo-app-android --target-dir "${CARGO_TARGET_DIR}"
+  python3 modules/desktop/app-use/android/package.py "${apk_path}" \
+    --keystore "${debug_keystore}" --password-env CARGO_APK_DEV_KEYSTORE_PASSWORD
 }
 
 install_apk() {

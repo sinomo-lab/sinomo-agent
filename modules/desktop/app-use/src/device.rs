@@ -2,7 +2,13 @@
 #[cfg(target_os = "windows")]
 #[path = "windows.rs"]
 mod platform;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod platform;
+#[cfg(target_os = "android")]
+#[path = "android.rs"]
+mod platform;
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
 #[path = "unsupported.rs"]
 mod platform;
 use sinomo_core::node::LocalNodePermissionStore;
@@ -115,6 +121,10 @@ impl InputState {
     }
     pub fn release_all(&mut self) -> DesktopResult<()> {
         let mut failure = None;
+        // Android touch paths are buffered until button-up. Cancel that path
+        // before releasing tracked buttons so cleanup cannot submit a gesture.
+        #[cfg(target_os = "android")]
+        self.input.cancel_pending();
         // Monitor removal must not strand global held keys. A destroyed HWND
         // has no global input state and must never receive cleanup via a new owner.
         if !self.target.is_window() || platform::validate_target(&self.target).is_ok() {

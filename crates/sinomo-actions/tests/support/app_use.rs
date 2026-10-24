@@ -7,7 +7,12 @@ pub fn install(root: &Path) -> NativeDylibModuleInstallResult {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/debug/sinomo_app_use_module.dll")
+                .join("../../target/debug")
+                .join(format!(
+                    "{}sinomo_app_use_module{}",
+                    std::env::consts::DLL_PREFIX,
+                    std::env::consts::DLL_SUFFIX
+                ))
         });
     install_native_dylib_module_from_file(
         root,
