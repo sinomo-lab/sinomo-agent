@@ -393,6 +393,122 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(execution.admits(&owner, &command.file_system_id, &shard_id))
     }
 
+    /// Explicit selected-only DATA join. The current native B owner supplies
+    /// admission; neither the imported A stamp nor the resulting association
+    /// grants dispatch, receipt application, closure or root retirement.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn associate_installed_repair_executor_disabled(
+        &mut self,
+        assignment: &DfsMetadataShardConfig,
+        producer: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<crate::repair_queue_store::ImportedRepairExecutorAssociation>, DfsError>
+    {
+        let invalid = || DfsError::Metadata {
+            message: "disabled imported Repair association has no exact current native executor"
+                .into(),
+        };
+        if assignment.primary_node_id != self.node_id || producer == &self.node_id {
+            return Err(invalid());
+        }
+        let shard_id = DfsMetadataShardId::new(&assignment.shard_id);
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Err(invalid());
+        };
+        let Some(layout) =
+            backend.selected_original_data_layout(&assignment.file_system_id, &shard_id)?
+        else {
+            return Ok(None);
+        };
+        let scope = backend.publication_owner_scope(&assignment.file_system_id, &shard_id)?;
+        let owner = crate::runtime_host::publication_runtime_owner(scope.root())
+            .map_err(|error| DfsError::Metadata {
+                message: error.to_string(),
+            })?
+            .ok_or_else(invalid)?;
+        layout.check_owner(&owner)?;
+        let queue = layout.queue()?;
+        let Some(imported) = queue.installed_original_handoff_data(producer, request_id)? else {
+            return Ok(None);
+        };
+        if imported.material.cut.handoff.desired_shard != *assignment {
+            return Err(invalid());
+        }
+        // This uses the real provider's existing configuration/storage checks
+        // and exact native admission. No prepared operation is created here.
+        let _execution = self.acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: assignment.file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch: assignment.epoch,
+            operation_id: request_id.to_owned(),
+        })?;
+        let execution = self.publication_execution.current().ok_or_else(invalid)?;
+        if !execution.admits(&scope, &assignment.file_system_id, &shard_id) {
+            return Err(invalid());
+        }
+        let _fence = crate::publication_guard::shard_fence_guard(&scope);
+        let backend = self.metadata_backend.as_ref().ok_or_else(invalid)?;
+        let freeze = backend
+            .metadata_shard_write_freeze(&shard_id)?
+            .ok_or_else(invalid)?;
+        if freeze.activated_epoch != Some(assignment.epoch)
+            || freeze.repair_custody.as_ref() != Some(&imported.material.cut)
+            || backend.metadata_shard_authoritative_writes_frozen(&shard_id)?
+        {
+            return Err(invalid());
+        }
+        let DfsNetworkMessage::RepairReplica(command) = &imported.material.birth.original.message
+        else {
+            return Err(invalid());
+        };
+        let object = backend
+            .get_object_on_shard(&shard_id, &command.object_id)?
+            .ok_or_else(invalid)?;
+        let intent = backend
+            .get_intent_on_shard(&shard_id, &command.object_id, &command.intent_id)?
+            .ok_or_else(invalid)?;
+        if object.file_system_id != command.file_system_id
+            || object.version != command.version
+            || object.content_hash.as_deref() != Some(command.content_hash.as_str())
+            || object.content_size_bytes
+                != Some(imported.material.birth.attachment.total_size_bytes)
+            || intent.file_system_id != command.file_system_id
+            || intent.object_id != command.object_id
+            || intent.target_version != command.version
+            || intent.content_hash.as_deref() != Some(command.content_hash.as_str())
+            || intent.status != DfsWriteIntentStatus::Committed
+            || !intent
+                .desired_replica_node_ids
+                .contains(&imported.material.birth.original.target_node_id)
+            || self
+                .certified_local_metadata_owner_shard_for_object(&object)?
+                .as_ref()
+                != Some(assignment)
+        {
+            return Err(invalid());
+        }
+        // Resolve B content from the actual retained DATA owner, not an
+        // arbitrary service content handle or the imported A physical root.
+        let data_dir = sinomo_core::local::SinomoDataDir::new(owner.physical_data_root());
+        let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+        let association = queue.associate_imported_executor_disabled(
+            &imported,
+            &self.node_id,
+            assignment,
+            &content,
+        )?;
+        layout.check_owner(&owner)?;
+        if self
+            .certified_local_metadata_owner_shard_for_object(&object)?
+            .as_ref()
+            != Some(assignment)
+            || !execution.admits(&scope, &assignment.file_system_id, &shard_id)
+        {
+            return Err(invalid());
+        }
+        Ok(Some(association))
+    }
+
     /// Read exact persisted application material under the ACTUAL native
     /// execution admission. A retained provider/empty job list is insufficient.
     fn already_applied_original_repair(
@@ -5745,6 +5861,56 @@ pub(crate) fn enroll_prepared_repair_targets_in_store(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod imported_executor_admission_tests {
+    use super::*;
+
+    #[test]
+    fn imported_executor_association_refuses_content_only_service_without_native_backend() {
+        let root = sinomo_testdir::TestDir::new("imported-executor-no-native-owner");
+        let content = LocalContentStore::new(root.join("content")).unwrap();
+        let object = DfsObjectId::from_legacy_named("disabled-import-object").unwrap();
+        let version = DfsVersion::from_legacy_named("disabled-import-version").unwrap();
+        let bytes = b"content existence does not supply native authority";
+        let manifest = content
+            .put_object_version(object.as_str(), version.as_str(), bytes)
+            .unwrap();
+        let local = NodeId::from_legacy_named("disabled-import-local").unwrap();
+        let producer = NodeId::from_legacy_named("disabled-import-original").unwrap();
+        let assignment = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "root".into(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![producer.clone()],
+            epoch: 8,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut service = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(local),
+            content,
+        );
+        assert!(
+            service
+                .associate_installed_repair_executor_disabled(
+                    &assignment,
+                    &producer,
+                    "unproven-original",
+                )
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .content
+                .read_object_version(object.as_str(), version.as_str())
+                .unwrap()
+                .0,
+            manifest
+        );
+        assert!(!root.join("repair.sobj").exists());
+    }
 }
 
 #[cfg(test)]

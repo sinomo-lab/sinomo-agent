@@ -25,6 +25,12 @@ const DFS_REPAIR_QUEUE_LOG_MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_DFS_REPAIR_QUEUE_COMPACTION_LOG_BYTES: u64 = 4 * 1024 * 1024;
 const SELECTED_ORIGINAL_FIXTURE_MARKER: &str = "selected-original-data-fixture-v2.sobj";
 
+#[cfg(test)]
+thread_local! {
+    // Actual content sync has completed; neither owner mutex is held here.
+    static BEFORE_IMPORTED_EXECUTOR_APPEND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SelectedOriginalFixtureMarker {
@@ -175,6 +181,11 @@ pub enum RepairCustodyChange {
         material: Box<RepairOriginalImportMaterial>,
         installer_queue_incarnation: String,
     },
+    /// A local content hold associated with an imported origin. This remains
+    /// DATA: it grants no carrier, completion, application or release permit.
+    AssociateImportedExecutor {
+        binding: Box<ImportedRepairExecutorBinding>,
+    },
     Enroll {
         birth: Box<RepairOriginalBirth>,
     },
@@ -206,6 +217,8 @@ struct RepairCustodySnapshot {
     births: Vec<RepairOriginalBirth>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     imported_original_data: Vec<ImportedRepairOriginalData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    imported_executor_associations: Vec<ImportedRepairExecutorAssociation>,
 }
 
 /// Exact captured material. This contains no executor or root-release permit.
@@ -222,6 +235,37 @@ pub(crate) struct ImportedRepairOriginalData {
     pub(crate) material: RepairOriginalImportMaterial,
     installer_queue_incarnation: String,
     installed_at_sequence: u64,
+}
+
+/// Immutable A origin and B-local physical retention are deliberately separate.
+/// In particular, `bound_assignment` is historical DATA, not current authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportedRepairExecutorBinding {
+    origin: crate::content_store::RepairPayloadSubject,
+    original_command_digest: String,
+    captured_birth_digest: String,
+    imported_at_sequence: u64,
+    installer_queue_incarnation: String,
+    executor_node_id: NodeId,
+    bound_assignment: crate::DfsMetadataShardConfig,
+    local_root: crate::content_store::RepairPayloadRoot,
+}
+
+/// Synced disabled association. It is intentionally absent from every native
+/// birth/attempt index and cannot construct a ClosedRepairBirth.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportedRepairExecutorAssociation {
+    binding: ImportedRepairExecutorBinding,
+    associated_at_sequence: u64,
+}
+
+impl ImportedRepairExecutorAssociation {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn local_root(&self) -> &crate::content_store::RepairPayloadRoot {
+        &self.binding.local_root
+    }
 }
 
 impl RepairOriginalImportMaterial {
@@ -262,6 +306,9 @@ struct RepairCustodyIndex {
     incarnation: String,
     births: BTreeMap<crate::content_store::RepairPayloadSubject, RepairOriginalBirth>,
     imported_original_data: BTreeMap<(String, String), ImportedRepairOriginalData>,
+    imported_executor_associations: BTreeMap<(String, String), ImportedRepairExecutorAssociation>,
+    // Conflict index only. Never consulted as runnable/native original work.
+    associated_slots: BTreeMap<DfsRepairQueueKey, (String, String)>,
     slots: BTreeMap<DfsRepairQueueKey, crate::content_store::RepairPayloadSubject>,
     closed_requests:
         BTreeMap<(DfsRepairQueueKey, String), crate::content_store::RepairPayloadSubject>,
@@ -480,7 +527,10 @@ impl RepairCustodyIndex {
         let Some(snapshot) = snapshot else {
             return Ok(Self::default());
         };
-        if !selected_reader && !snapshot.imported_original_data.is_empty() {
+        if !selected_reader
+            && (!snapshot.imported_original_data.is_empty()
+                || !snapshot.imported_executor_associations.is_empty())
+        {
             return Err(custody_error("default queue reader rejects selected original DATA"));
         }
         if snapshot.incarnation.is_empty() {
@@ -534,6 +584,33 @@ impl RepairCustodyIndex {
                 return Err(custody_error("duplicate imported original DATA in snapshot"));
             }
         }
+        for association in snapshot.imported_executor_associations {
+            result.validate_executor_binding(&association.binding)?;
+            if association.associated_at_sequence <= association.binding.imported_at_sequence
+                || association.associated_at_sequence > floor
+            {
+                return Err(custody_error(
+                    "executor association exceeds its exact snapshot prefix",
+                ));
+            }
+            let wire_key = (
+                association.binding.origin.producer.clone(),
+                association.binding.origin.request_id.clone(),
+            );
+            let imported = &result.imported_original_data[&wire_key];
+            result
+                .associated_slots
+                .insert(imported.material.birth.key()?, wire_key.clone());
+            if result
+                .imported_executor_associations
+                .insert(wire_key, association)
+                .is_some()
+            {
+                return Err(custody_error(
+                    "duplicate imported executor association in snapshot",
+                ));
+            }
+        }
         Ok(result)
     }
 
@@ -542,7 +619,62 @@ impl RepairCustodyIndex {
             incarnation: self.incarnation.clone(),
             births: self.births.values().cloned().collect(),
             imported_original_data: self.imported_original_data.values().cloned().collect(),
+            imported_executor_associations: self
+                .imported_executor_associations
+                .values()
+                .cloned()
+                .collect(),
         })
+    }
+
+    fn validate_executor_binding(
+        &self,
+        binding: &ImportedRepairExecutorBinding,
+    ) -> Result<(), DfsError> {
+        let wire_key = (
+            binding.origin.producer.clone(),
+            binding.origin.request_id.clone(),
+        );
+        let imported = self.imported_original_data.get(&wire_key).ok_or_else(|| {
+            custody_error("executor association has no exact installed original DATA")
+        })?;
+        self.validate_import(&imported.material, &binding.installer_queue_incarnation)?;
+        let birth = &imported.material.birth;
+        let desired = &imported.material.cut.handoff.desired_shard;
+        if imported.installed_at_sequence != binding.imported_at_sequence
+            || imported.installer_queue_incarnation != binding.installer_queue_incarnation
+            || birth.root.subject != binding.origin
+            || birth.root.original_command_digest != binding.original_command_digest
+            || birth.captured_data_digest()? != binding.captured_birth_digest
+            || binding.executor_node_id == birth.original.source_node_id
+            || desired.primary_node_id != binding.executor_node_id
+            || desired != &binding.bound_assignment
+            || binding.local_root.subject != birth.root.subject
+            || binding.local_root.original_command_digest != birth.root.original_command_digest
+            || binding.local_root.source != birth.root.source
+            || binding.local_root.store_incarnation.is_empty()
+            || binding.local_root.store_incarnation == birth.root.store_incarnation
+        {
+            return Err(custody_error(
+                "executor association changed its imported origin or local retention",
+            ));
+        }
+        let key = birth.key()?;
+        if self.slots.contains_key(&key)
+            || self
+                .associated_slots
+                .get(&key)
+                .is_some_and(|existing| existing != &wire_key)
+            || self
+                .imported_executor_associations
+                .get(&wire_key)
+                .is_some_and(|existing| existing.binding != *binding)
+        {
+            return Err(custody_error(
+                "executor association conflicts with unresolved slot ownership",
+            ));
+        }
+        Ok(())
     }
 
     fn validate_import(&self, material: &RepairOriginalImportMaterial, installer: &str) -> Result<(), DfsError> {
@@ -568,6 +700,9 @@ impl RepairCustodyIndex {
 
     fn validate_change(&self, change: &RepairCustodyChange) -> Result<(), DfsError> {
         match change {
+            RepairCustodyChange::AssociateImportedExecutor { binding } => {
+                self.validate_executor_binding(binding)?;
+            }
             RepairCustodyChange::ImportOriginalData { material, installer_queue_incarnation } => {
                 self.validate_import(material, installer_queue_incarnation)?;
             }
@@ -582,6 +717,9 @@ impl RepairCustodyIndex {
             }
             RepairCustodyChange::Enroll { birth } => {
                 birth.validate(&self.incarnation)?;
+                if self.associated_slots.contains_key(&birth.key()?) {
+                    return Err(custody_error("native enrollment cannot replace a disabled imported executor association"));
+                }
                 if self.imported_original_data.contains_key(&(birth.original.source_node_id.to_string(), birth.root.subject.request_id.clone())) {
                     return Err(custody_error("native enrollment cannot replace an imported original identity"));
                 }
@@ -786,6 +924,26 @@ impl RepairCustodyIndex {
     ) -> Result<(), DfsError> {
         self.validate_change(change)?;
         match change {
+            RepairCustodyChange::AssociateImportedExecutor { binding } => {
+                if sequence <= binding.imported_at_sequence {
+                    return Err(custody_error(
+                        "executor association does not follow its exact import",
+                    ));
+                }
+                let wire_key = (
+                    binding.origin.producer.clone(),
+                    binding.origin.request_id.clone(),
+                );
+                let imported = &self.imported_original_data[&wire_key];
+                self.associated_slots
+                    .insert(imported.material.birth.key()?, wire_key.clone());
+                self.imported_executor_associations
+                    .entry(wire_key)
+                    .or_insert_with(|| ImportedRepairExecutorAssociation {
+                        binding: *binding.clone(),
+                        associated_at_sequence: sequence,
+                    });
+            }
             RepairCustodyChange::ImportOriginalData { material, installer_queue_incarnation } => {
                 self.imported_original_data.entry(material.wire_key()).or_insert_with(|| ImportedRepairOriginalData {
                     material: *material.clone(),
@@ -1510,7 +1668,12 @@ impl DfsRepairQueueState {
             ));
         }
         for change in changes {
-            if matches!(change, RepairCustodyChange::ImportOriginalData { .. }) && self.selected_fixture.is_none() {
+            if matches!(
+                change,
+                RepairCustodyChange::ImportOriginalData { .. }
+                    | RepairCustodyChange::AssociateImportedExecutor { .. }
+            ) && self.selected_fixture.is_none()
+            {
                 return Err(custody_error("selected original DATA requires its admitted physical fixture"));
             }
             self.custody.validate_change(change)?;
@@ -2519,6 +2682,152 @@ impl LocalDfsRepairQueueStore {
         Ok(state.custody.imported_original_data.get(&(producer.to_string(), request_id.to_owned())).cloned())
     }
 
+    /// Read disabled DATA through the existing queue recovery path. The value
+    /// grants no current content, native original/attempt or completion permit.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn imported_executor_association(
+        &self,
+        producer: &NodeId,
+        request_id: &str,
+    ) -> Result<Option<ImportedRepairExecutorAssociation>, DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        Ok(state
+            .custody
+            .imported_executor_associations
+            .get(&(producer.to_string(), request_id.to_owned()))
+            .cloned())
+    }
+
+    /// Join actual local content retention to one exact installed foreign
+    /// original. The caller separately proves current native B admission. No
+    /// association is inserted into an executable/native-birth index.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn associate_imported_executor_disabled(
+        &self,
+        imported: &ImportedRepairOriginalData,
+        executor: &NodeId,
+        assignment: &crate::DfsMetadataShardConfig,
+        content: &crate::LocalContentStore,
+    ) -> Result<ImportedRepairExecutorAssociation, DfsError> {
+        let identity = self.selected_fixture.as_ref().ok_or_else(|| {
+            custody_error("disabled executor association requires an explicit selected queue")
+        })?;
+        self.validate_selected_original_fixture(identity)?;
+        imported.material.validate()?;
+        let wire_key = imported.material.wire_key();
+        {
+            let mut state = self.lock_state()?;
+            state.refresh_from_disk()?;
+            if state.custody.imported_original_data.get(&wire_key) != Some(imported)
+                || assignment != &imported.material.cut.handoff.desired_shard
+                || &assignment.primary_node_id != executor
+                || executor == &imported.material.birth.original.source_node_id
+            {
+                return Err(custody_error(
+                    "disabled association does not name its exact installed handoff/executor",
+                ));
+            }
+        }
+        let birth = &imported.material.birth;
+        let crate::DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+            return Err(custody_error(
+                "executor association requires an imported Repair",
+            ));
+        };
+        // Reject a different local representation before retaining it. The
+        // existing capture may fall back to Blob, which is not evidence for a
+        // Manifest original in this deliberately narrow first slice.
+        let source = match content
+            .open_object_version_stream(command.object_id.as_str(), command.version.as_str())
+        {
+            Ok((manifest, _reader)) => {
+                crate::content_store::RepairPayloadSource::Manifest(manifest)
+            }
+            Err(error) => {
+                let crate::content_store::RepairPayloadSource::Blob {
+                    content_hash,
+                    size_bytes,
+                } = &birth.root.source
+                else {
+                    return Err(error.into());
+                };
+                let reader = content.open_blob_stream(content_hash)?;
+                if reader.size_bytes() != *size_bytes {
+                    return Err(custody_error(
+                        "local original payload has another exact size",
+                    ));
+                }
+                birth.root.source.clone()
+            }
+        };
+        if source != birth.root.source {
+            return Err(custody_error(
+                "local original payload differs from its sealed source representation",
+            ));
+        }
+        let retained = content.capture_repair_payload(
+            birth.root.subject.clone(),
+            birth.root.original_command_digest.clone(),
+            command.object_id.as_str(),
+            command.version.as_str(),
+            &command.content_hash,
+            birth.attachment.total_size_bytes,
+        )?;
+        let binding = ImportedRepairExecutorBinding {
+            origin: birth.root.subject.clone(),
+            original_command_digest: birth.root.original_command_digest.clone(),
+            captured_birth_digest: birth.captured_data_digest()?,
+            imported_at_sequence: imported.installed_at_sequence,
+            installer_queue_incarnation: imported.installer_queue_incarnation.clone(),
+            executor_node_id: executor.clone(),
+            bound_assignment: assignment.clone(),
+            local_root: retained.root().clone(),
+        };
+        content.validate_repair_payload_root(retained.root())?;
+        #[cfg(test)]
+        BEFORE_IMPORTED_EXECUTOR_APPEND.with(|slot| {
+            if let Some(callback) = slot.borrow_mut().take() {
+                callback();
+            }
+        });
+        // Retain the owned reader through this writer append, but never enter
+        // the content owner while holding the queue state/writer lock.
+        let association = {
+            let mut state = self.lock_state()?;
+            state.with_writer_lock(|state| {
+                state.refresh_from_disk()?;
+                if state.custody.imported_original_data.get(&wire_key) != Some(imported) {
+                    return Err(custody_error(
+                        "original import changed before disabled association",
+                    ));
+                }
+                state.custody.validate_executor_binding(&binding)?;
+                if !state
+                    .custody
+                    .imported_executor_associations
+                    .contains_key(&wire_key)
+                {
+                    state.append_operations_held(vec![DfsRepairQueueOperation::RepairCustody {
+                        change: Box::new(RepairCustodyChange::AssociateImportedExecutor {
+                            binding: Box::new(binding.clone()),
+                        }),
+                    }])?;
+                }
+                if let Err(error) = state.sync_selected_import(identity.root()) {
+                    state.loaded = false;
+                    state.resync_on_load = true;
+                    return Err(error);
+                }
+                Ok(state.custody.imported_executor_associations[&wire_key].clone())
+            })?
+        };
+        // A replacement or failed final qualification retains historical DATA;
+        // it must never turn the stored root into a current-use capability.
+        content.validate_repair_payload_root(retained.root())?;
+        Ok(association)
+    }
+
     /// Import into the SAME queue/log/fsync path, without replacing any other
     /// producer. A crash before the page receipt can replay exact rows only.
     pub(crate) fn install_handoff_records(
@@ -3403,8 +3712,11 @@ fn replay_repair_queue_log(
                     record.record_start
                 ),
             })?;
-        if !selected_reader && batch.operations.iter().any(|operation| matches!(operation,
-            DfsRepairQueueOperation::RepairCustody { change } if matches!(change.as_ref(), RepairCustodyChange::ImportOriginalData { .. })))
+        if !selected_reader
+            && batch.operations.iter().any(|operation| matches!(operation,
+                DfsRepairQueueOperation::RepairCustody { change } if matches!(change.as_ref(),
+                    RepairCustodyChange::ImportOriginalData { .. }
+                        | RepairCustodyChange::AssociateImportedExecutor { .. })))
         {
             return Err(custody_error("default queue replay rejects selected original DATA"));
         }
@@ -3651,6 +3963,499 @@ pub(crate) mod tests {
     use crate::{DfsObjectId, DfsVersion};
     use std::fs::OpenOptions;
     use std::io::Write as _;
+
+    mod imported_executor_association_tests {
+        use super::*;
+
+        struct Fixture {
+            source_queue: LocalDfsRepairQueueStore,
+            source_content: crate::LocalContentStore,
+            queue: LocalDfsRepairQueueStore,
+            identity: SelectedOriginalFixtureIdentity,
+            content: crate::LocalContentStore,
+            original: crate::DfsRoutedMessage,
+            imported: ImportedRepairOriginalData,
+            assignment: crate::DfsMetadataShardConfig,
+        }
+
+        // Real queue/content writers, export, stage and install. The supplied
+        // handoff/configuration VALUES test local DATA persistence only; this
+        // helper does not impersonate native cluster authority or execution.
+        fn fixture(root: &Path) -> Fixture {
+            let (source_queue, source_content, original, attachment, retained, source_identity) =
+                selected_original_fixture(&root.join("source"));
+            source_queue
+                .enroll_original_repair(&original, &attachment, &retained)
+                .unwrap();
+            source_queue
+                .record_original_repair_attempt(&original)
+                .unwrap();
+            source_queue
+                .record_original_repair_delivery(
+                    &original,
+                    Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied),
+                )
+                .unwrap();
+            let crate::DfsNetworkMessage::RepairReplica(command) = &original.message else {
+                panic!("Repair fixture");
+            };
+            let retiring = command.authority_shard.clone().unwrap();
+            let assignment = crate::DfsMetadataShardConfig {
+                primary_node_id: NodeId::from_legacy_named("disabled-import-executor").unwrap(),
+                replica_node_ids: vec![retiring.primary_node_id.clone()],
+                epoch: retiring.epoch + 1,
+                ..retiring.clone()
+            };
+            let handoff = crate::DfsMetadataShardMembershipHandoff {
+                cause: crate::DfsMetadataShardHandoffCause::Membership,
+                handoff_id: "disabled-import-association".into(),
+                desired_shard: assignment.clone(),
+                required_prepared_sequence: 17,
+                required_head_watermark: None,
+                retiring_primary_fence: Some(crate::DfsMetadataShardMembershipHandoffFence {
+                    handoff_id: "disabled-import-association".into(),
+                    primary_node_id: retiring.primary_node_id.clone(),
+                    journal_sequence: 17,
+                    state_fingerprint: "local-association-persistence-only".into(),
+                }),
+                retiring_shard: retiring,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let export = crate::repair_handoff::RepairHandoffExport::capture_selected_original(
+                &source_identity,
+                &handoff,
+                &source_queue,
+                &command.request_id,
+                |_| Ok(true),
+                deadline,
+            )
+            .unwrap();
+            let (queue, identity) =
+                LocalDfsRepairQueueStore::new_selected_original_fixture(root.join("destination"))
+                    .unwrap();
+            for ordinal in 0..export.cut.page_count {
+                crate::repair_handoff::receive_selected_original_data(
+                    &identity,
+                    &export.page(ordinal).unwrap(),
+                    deadline,
+                )
+                .unwrap();
+            }
+            assert!(
+                crate::repair_handoff::install_selected_original_data(
+                    &identity,
+                    &export.cut,
+                    &queue,
+                    deadline
+                )
+                .unwrap()
+            );
+            let imported = queue
+                .installed_original_handoff_data(&original.source_node_id, &command.request_id)
+                .unwrap()
+                .unwrap();
+            let content = crate::LocalContentStore::new(identity.root().join("content")).unwrap();
+            let bytes = source_content
+                .read_object_version(command.object_id.as_str(), command.version.as_str())
+                .unwrap()
+                .1;
+            content
+                .put_object_version(command.object_id.as_str(), command.version.as_str(), &bytes)
+                .unwrap();
+            Fixture {
+                source_queue,
+                source_content,
+                queue,
+                identity,
+                content,
+                original,
+                imported,
+                assignment,
+            }
+        }
+
+        fn associate(f: &Fixture) -> ImportedRepairExecutorAssociation {
+            f.queue
+                .associate_imported_executor_disabled(
+                    &f.imported,
+                    &f.assignment.primary_node_id,
+                    &f.assignment,
+                    &f.content,
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn imported_executor_retains_actual_b_content_without_enabling_native_execution() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-disabled");
+            let f = fixture(root.path());
+            let before = f.queue.view().unwrap().records;
+            let association = associate(&f);
+            let birth = &f.imported.material.birth;
+            assert_eq!(association.local_root().subject, birth.root.subject);
+            assert_eq!(association.local_root().source, birth.root.source);
+            assert_ne!(
+                association.local_root().store_incarnation,
+                birth.root.store_incarnation
+            );
+            f.content
+                .inspect_repair_payload_root(association.local_root())
+                .unwrap();
+            let mut reader = f
+                .content
+                .open_retained_repair_payload(association.local_root())
+                .unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+            let crate::DfsNetworkMessage::RepairReplica(command) = &f.original.message else {
+                panic!("Repair fixture");
+            };
+            assert_eq!(
+                bytes,
+                f.source_content
+                    .read_object_version(command.object_id.as_str(), command.version.as_str())
+                    .unwrap()
+                    .1
+            );
+            assert_eq!(
+                f.source_queue
+                    .original_repair(&f.original)
+                    .unwrap()
+                    .unwrap(),
+                *birth
+            );
+            assert_eq!(
+                f.queue
+                    .installed_original_handoff_data(
+                        &f.original.source_node_id,
+                        &command.request_id
+                    )
+                    .unwrap()
+                    .unwrap(),
+                f.imported
+            );
+            assert_eq!(f.queue.view().unwrap().records, before);
+            assert!(
+                f.queue
+                    .original_repair_for_slot(&command.intent_id, &f.original.target_node_id)
+                    .unwrap()
+                    .is_none()
+            );
+            let mut carrier = f.original.clone();
+            carrier.source_node_id = f.assignment.primary_node_id.clone();
+            carrier.frame_id += 1;
+            carrier.message_id += 1;
+            assert!(f.queue.original_repair(&carrier).unwrap().is_none());
+            assert!(f.queue.record_original_repair_attempt(&carrier).is_err());
+            assert!(f.queue.validate_original_repair_dispatch(&carrier).is_err());
+            let response = original_response(&f.original, true);
+            assert!(
+                f.queue
+                    .observe_original_repair_result(&carrier.source_node_id, &response)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                f.queue
+                    .closed_repair_birth(&birth.root.subject)
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Even an ordinary fresh native birth cannot turn this slot into
+            // a new semantic request. This retained root remains a safe orphan.
+            let mut native = carrier;
+            if let crate::DfsNetworkMessage::RepairReplica(command) = &mut native.message {
+                command.authority_shard = Some(f.assignment.clone());
+                command.request_id.push_str("-must-not-replace");
+            }
+            let payload = f
+                .content
+                .capture_repair_payload(
+                    repair_subject(&f.queue.custody_incarnation().unwrap(), &native).unwrap(),
+                    original_repair_digest(&native, &birth.attachment).unwrap(),
+                    command.object_id.as_str(),
+                    command.version.as_str(),
+                    &command.content_hash,
+                    birth.attachment.total_size_bytes,
+                )
+                .unwrap();
+            assert!(
+                f.queue
+                    .enroll_original_repair(&native, &birth.attachment, &payload)
+                    .is_err()
+            );
+            assert_eq!(
+                f.queue
+                    .imported_executor_association(&f.original.source_node_id, &command.request_id)
+                    .unwrap(),
+                Some(association)
+            );
+        }
+
+        #[test]
+        fn imported_executor_duplicate_lost_reply_reopen_and_compaction_keep_one_association() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-reopen");
+            let mut f = fixture(root.path());
+            let first = associate(&f); // Drop the caller reply; the queue is already synced.
+            let sequence = f.queue.view().unwrap().head_sequence;
+            assert_eq!(associate(&f), first);
+            assert_eq!(f.queue.view().unwrap().head_sequence, sequence);
+            LocalDfsRepairQueueStore::evict_for_test(f.identity.snapshot_path());
+            f.queue =
+                LocalDfsRepairQueueStore::reopen_selected_original_fixture(&f.identity).unwrap();
+            assert_eq!(associate(&f), first);
+            f.queue
+                .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+                .unwrap();
+            LocalDfsRepairQueueStore::evict_for_test(f.identity.snapshot_path());
+            f.queue =
+                LocalDfsRepairQueueStore::reopen_selected_original_fixture(&f.identity).unwrap();
+            assert_eq!(associate(&f), first);
+            assert_eq!(f.queue.view().unwrap().head_sequence, sequence);
+            assert_eq!(
+                first.binding.origin.request_id,
+                f.imported.material.birth.root.subject.request_id
+            );
+        }
+
+        #[test]
+        fn imported_executor_conflicting_origin_assignment_and_physical_root_do_not_append() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-conflicts");
+            let f = fixture(root.path());
+            let sequence = f.queue.view().unwrap().head_sequence;
+            let mut changed = f.imported.clone();
+            changed.installed_at_sequence += 1;
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &changed,
+                        &f.assignment.primary_node_id,
+                        &f.assignment,
+                        &f.content
+                    )
+                    .is_err()
+            );
+            let mut changed = f.imported.clone();
+            if let crate::DfsNetworkMessage::RepairReplica(command) =
+                &mut changed.material.birth.original.message
+            {
+                command.expected_base_version =
+                    Some(DfsVersion::from_legacy_named("invented-base").unwrap());
+            }
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &changed,
+                        &f.assignment.primary_node_id,
+                        &f.assignment,
+                        &f.content
+                    )
+                    .is_err()
+            );
+            let mut changed_assignment = f.assignment.clone();
+            changed_assignment.epoch += 1;
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &f.imported,
+                        &changed_assignment.primary_node_id,
+                        &changed_assignment,
+                        &f.content
+                    )
+                    .is_err()
+            );
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &f.imported,
+                        &f.assignment.primary_node_id,
+                        &f.assignment,
+                        &f.source_content
+                    )
+                    .is_err(),
+                "A physical store cannot become B retention"
+            );
+            assert_eq!(f.queue.view().unwrap().head_sequence, sequence);
+            assert!(
+                f.queue
+                    .imported_executor_association(
+                        &f.original.source_node_id,
+                        &f.imported.material.birth.root.subject.request_id
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn imported_executor_requires_exact_local_version_not_blob_fallback() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-missing-version");
+            let f = fixture(root.path());
+            let missing = crate::LocalContentStore::new(root.join("missing-content")).unwrap();
+            let sequence = f.queue.view().unwrap().head_sequence;
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &f.imported,
+                        &f.assignment.primary_node_id,
+                        &f.assignment,
+                        &missing
+                    )
+                    .is_err()
+            );
+            let crate::DfsNetworkMessage::RepairReplica(command) = &f.original.message else {
+                panic!("Repair fixture");
+            };
+            let bytes = f
+                .source_content
+                .read_object_version(command.object_id.as_str(), command.version.as_str())
+                .unwrap()
+                .1;
+            missing
+                .put_object_version_blob_only(
+                    command.object_id.as_str(),
+                    command.version.as_str(),
+                    &bytes,
+                )
+                .unwrap();
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &f.imported,
+                        &f.assignment.primary_node_id,
+                        &f.assignment,
+                        &missing
+                    )
+                    .is_err()
+            );
+            assert!(
+                missing
+                    .retained_repair_for_slot(
+                        &f.original.source_node_id.to_string(),
+                        &f.original.target_node_id.to_string(),
+                        &command.intent_id
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(f.queue.view().unwrap().head_sequence, sequence);
+            assert!(
+                f.queue
+                    .imported_executor_association(&f.original.source_node_id, &command.request_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn imported_executor_interruption_after_content_sync_retains_orphan_then_reuses_it() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-content-crash-cut");
+            let mut f = fixture(root.path());
+            let sequence = f.queue.view().unwrap().head_sequence;
+            BEFORE_IMPORTED_EXECUTOR_APPEND.with(|slot| {
+                *slot.borrow_mut() =
+                    Some(Box::new(|| panic!("stop after actual content root sync")))
+            });
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| associate(&f))).is_err()
+            );
+            let crate::DfsNetworkMessage::RepairReplica(command) = &f.original.message else {
+                panic!("Repair fixture");
+            };
+            let retained = f
+                .content
+                .retained_repair_for_slot(
+                    &f.original.source_node_id.to_string(),
+                    &f.original.target_node_id.to_string(),
+                    &command.intent_id,
+                )
+                .unwrap()
+                .unwrap();
+            f.content.inspect_repair_payload_root(&retained).unwrap();
+            assert_eq!(f.queue.view().unwrap().head_sequence, sequence);
+            assert!(
+                f.queue
+                    .imported_executor_association(&f.original.source_node_id, &command.request_id)
+                    .unwrap()
+                    .is_none()
+            );
+            LocalDfsRepairQueueStore::evict_for_test(f.identity.snapshot_path());
+            f.queue =
+                LocalDfsRepairQueueStore::reopen_selected_original_fixture(&f.identity).unwrap();
+            assert_eq!(*associate(&f).local_root(), retained);
+        }
+
+        #[test]
+        fn imported_executor_physical_replacement_cannot_renew_stored_association() {
+            let root = sinomo_testdir::TestDir::new("imported-executor-store-replaced");
+            let f = fixture(root.path());
+            let association = associate(&f);
+            let sequence = f.queue.view().unwrap().head_sequence;
+            let content_root = f.identity.root().join("content");
+            fs::rename(&content_root, root.join("retained-old-content")).unwrap();
+            fs::create_dir(&content_root).unwrap();
+            assert!(
+                f.queue
+                    .associate_imported_executor_disabled(
+                        &f.imported,
+                        &f.assignment.primary_node_id,
+                        &f.assignment,
+                        &f.content,
+                    )
+                    .is_err()
+            );
+            assert_eq!(f.queue.view().unwrap().head_sequence, sequence);
+            assert_eq!(
+                f.queue
+                    .imported_executor_association(
+                        &f.original.source_node_id,
+                        &f.imported.material.birth.root.subject.request_id,
+                    )
+                    .unwrap(),
+                Some(association),
+                "historical DATA remains, without renewed physical authority"
+            );
+        }
+
+        #[test]
+        fn imported_executor_snapshot_validates_origin_and_default_reader_rejects_without_mutation()
+        {
+            let root = sinomo_testdir::TestDir::new("imported-executor-snapshot");
+            let f = fixture(root.path());
+            associate(&f);
+            f.queue
+                .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+                .unwrap();
+            let snapshot = read_repair_queue_snapshot(f.identity.snapshot_path()).unwrap();
+            let floor = snapshot.applied_through_sequence;
+            let original = snapshot.custody.clone().unwrap();
+            let mut broken = original.clone();
+            broken.imported_executor_associations[0]
+                .binding
+                .local_root
+                .store_incarnation = f.imported.material.birth.root.store_incarnation.clone();
+            assert!(RepairCustodyIndex::from_snapshot(Some(broken), floor, true).is_err());
+            let mut broken = original.clone();
+            broken.imported_executor_associations[0].associated_at_sequence = broken
+                .imported_executor_associations[0]
+                .binding
+                .imported_at_sequence;
+            assert!(RepairCustodyIndex::from_snapshot(Some(broken), floor, true).is_err());
+            assert!(RepairCustodyIndex::from_snapshot(Some(original), floor, false).is_err());
+
+            // Actual current codec bytes under an ordinary path, with no
+            // selected marker: fail before repair/append, never silently omit.
+            let ordinary_path = root.join("ordinary.sobj");
+            let bytes = encode_sobj(&snapshot).unwrap();
+            write_file_atomic(&ordinary_path, &bytes).unwrap();
+            let ordinary = LocalDfsRepairQueueStore::new(&ordinary_path);
+            assert!(ordinary.view().is_err());
+            assert!(ordinary.view().is_err());
+            assert_eq!(fs::read(&ordinary_path).unwrap(), bytes);
+            assert!(!repair_queue_active_log_path(&ordinary_path).exists());
+        }
+    }
 
     // These use the actual file writers/replay. They test local persistence,
     // not receiver idempotency, process/partition recovery or survivor custody.
