@@ -1,6 +1,61 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-24 R23
+## Current development checkpoint — 2026-10-24 R25
+
+Local code commit `2d78a291` has source
+`e350c2e0fd4c29508095a6ca21b16dfd0b0f1bba846d8ac36ae5505db35759fe`
+(4,903 inputs) and sealed own executable
+`056cc84114f0504d06e0b9d59bb7ec310ecd98456dd6940452c41cd629f3cd97`.
+Fresh check/build/seal passed. The disjoint I59 seven-case and I60 remaining
+126-case panels executed all **133 unique controls once: 133 PASS, zero failed,
+incomplete or unrun**. Current-source DFS/KV lint passed its own library,
+11 UI controls and DFS/history/attachments analysis. This is a selected development
+panel, not full availability acceptance.
+
+The genuine native A→C receiver control now reached Prepared→Bound→Terminal
+before its reply was lost. It verified the complete original/body, exact response,
+A's retained uncertainty/root, C compaction and native-owner stop/reopen. The
+sender controls verified renewed carriers with unchanged original identities,
+actual owned attachment forwarding and ordinary correlation. Inspection controls
+verified physical-owner/layout rejection and cold noncertifying, nontruncating
+reads. These are in-process native/object-RPC/file-writer tests, not OS process loss.
+
+The native fresh-create W=2/N=3 control also passed, retaining desired N=3 and
+A's repair deficit while B/C held exact content and then healing A normally.
+Metadata participants remained healthy. General overwrites and metadata-outage
+availability are not established; full-participant metadata proof is unchanged.
+
+R24's native configuration-generation refusal remains failed and unattributed.
+R25 kept its guard unchanged and added failure-only diagnostics, which did not
+fire in the passing run. Earlier source/compiler/preservation failures and the
+original R67 positive successor-continuation failure remain retained. No result
+was reclassified or uncertain effect recreated under another identity.
+
+Recent conflict-free local merges: cc073382/a7a9fb56 for actual-owner dispatch
+inspection and whole-call forwarding;88fd6bcd/fd84679f for strict fresh child-root
+fixtures.2d78a291 adds bounded failure-only diagnostics. No generated artifacts
+are committed. Exact tables and receipts are in
+`data/operations/dfs-availability-20261023/R25-REPORT.md` and
+`R25-COMBINED-RESULT.json`: I58 build43464e6d, I59 focused51d0a73b,
+I60 remaininga47ecd6b, I61 boundary6fdc13d8. All owned lifetimes and archives
+were verified after normal cleanup; unavailable metrics remain explicit.
+
+Next isolated work is one native authenticated-source negative and a reviewed
+private historical-result query using existing queue/content/native owners.
+The query requires no B payload, cannot rerun Repair or apply a receipt, and
+releases/reacquires current admission around its exact direct-return RPC. It is
+not yet implemented or tested in this checkpoint. Checked B execution/application,
+C1 serving/admission, root retirement, majority metadata history/fencing,
+abrupt process/partition/reconnect and Sinomo-only quietness remain open.
+
+Local commits and actual tested merges are integration boundaries. Launches use
+only the DFS-local lock and own16GiB/no-swap limits with exact qualification and
+cleanup. No debugger synchronization, Docker operation, push, production/main
+rollout or merge into another lane occurs; this development remains nonblocking.
+
+## Historical checkpoints
+
+### Preserved R23 checkpoint
 
 Local code commit `37e6129604834e77aabbba56beb81abd9b784d39` has qualified
 source `14cb88d94479b813a318694127d21939a488a4a60ee259b0bae080919ff9615d`
@@ -44,7 +99,6 @@ limits with actual source/artifact/runtime checks and cleanup. There is no peer
 capacity/source-release/handback workflow. dev/debug owns Docker and main owns
 rollout; this lane operates neither, pushes nowhere and remains nonblocking.
 
-## Historical checkpoints
 
 ### Preserved R19 checkpoint
 
