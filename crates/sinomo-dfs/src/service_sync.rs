@@ -1029,17 +1029,36 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_deref()
                 .expect("handoff backend checked");
             let scope = backend.publication_owner_scope(&retiring.file_system_id, &shard_id)?;
-            Some(crate::repair_handoff::RepairHandoffExport::capture(
-                scope.root(),
-                &handoff,
-                &store,
-                |record| {
-                    Ok(backend
-                        .get_object_on_shard(&shard_id, &record.object_id)?
-                        .is_some_and(|object| object.file_system_id == retiring.file_system_id))
-                },
-                deadline,
-            )?)
+            let belongs = |record: &crate::DfsRepairAttemptRecord| {
+                Ok(backend.get_object_on_shard(&shard_id, &record.object_id)?
+                    .is_some_and(|object| object.file_system_id == retiring.file_system_id))
+            };
+            Some(if let Some(layout) = backend.selected_original_data_layout(&retiring.file_system_id, &shard_id)? {
+                let owner = crate::runtime_host::publication_runtime_owner(scope.root())
+                    .map_err(|error| DfsError::Metadata { message: error.to_string() })?
+                    .ok_or_else(|| DfsError::Metadata { message: "selected source lost its native DATA owner".into() })?;
+                layout.check_owner(&owner)?;
+                store.validate_selected_original_fixture(layout.queue_layout())?;
+                if let Some(request) = layout.selected_request(&handoff)? {
+                    let (_, birth) = store.selected_original_handoff_data(&self.node_id, &request)?;
+                    let crate::DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+                        return Err(DfsError::Metadata { message: "selected source has no genuine Repair".into() });
+                    };
+                    if command.file_system_id != retiring.file_system_id
+                        || backend.get_object_on_shard(&shard_id, &command.object_id)?
+                            .is_none_or(|object| object.file_system_id != retiring.file_system_id)
+                    {
+                        return Err(DfsError::Metadata { message: "selected original is outside the exact frozen source shard".into() });
+                    }
+                }
+                crate::repair_handoff::RepairHandoffExport::capture_native_layout(
+                    scope.root(), &layout, &handoff, belongs, deadline,
+                )?
+            } else {
+                crate::repair_handoff::RepairHandoffExport::capture(
+                    scope.root(), &handoff, &store, belongs, deadline,
+                )?
+            })
         } else {
             None
         };
@@ -4646,4 +4665,463 @@ mod tests {
         }
         fixture.finish();
     }
+}
+
+#[cfg(test)]
+mod native_selected_data_tests {
+    use super::*;
+    use crate::*;
+    use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcOrigin, RpcPhase};
+    use std::sync::{Arc, Mutex};
+
+    struct GenuineNativeOriginal {
+        runtime: DfsTestRuntime,
+        shard: DfsMetadataShardConfig,
+        promoted: NodeId,
+        holder: NodeId,
+        birth: crate::repair_queue_store::RepairOriginalBirth,
+        held: Option<Box<dyn Send>>,
+        held_promoted: Option<Box<dyn Send>>,
+    }
+
+    fn genuine_native_original(name: &str) -> GenuineNativeOriginal {
+        let path = "/services/selected-original-data.bin";
+        let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
+        let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
+        for node in &nodes[1..] { runtime.define_node(node.clone()).unwrap(); }
+        for node in &nodes { runtime.select_original_data_fixture_before_start(node).unwrap(); }
+        runtime.start_nodes().unwrap();
+        let configs = runtime.metadata_shards().unwrap();
+        let fs = runtime.file_system().file_system_id;
+        let shard = crate::select_metadata_shard_config_for_path(&fs, &configs, path)
+            .unwrap().unwrap();
+        let owner = shard.primary_node_id.clone();
+        let mut peers = nodes.iter().filter(|node| **node != owner).cloned();
+        let promoted = peers.next().unwrap();
+        let holder = peers.next().unwrap();
+        assert!(shard.replica_node_ids.contains(&promoted) && shard.replica_node_ids.contains(&holder));
+        let mut policy = DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+        policy.required_node_ids = vec![owner.clone(), holder.clone()];
+        runtime.apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, policy).unwrap();
+        let mut writer = runtime.client(&owner).unwrap();
+        assert!(writer.transport.delegates_local_namespace_authority());
+        let seed_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let previous = writer.set_transport_operation_deadline(Some(seed_deadline));
+        let bytes = vec![0x5a; 4096];
+        let stat = writer.posix_write_file(path, &bytes, DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+            replica_candidates: vec![owner.clone(), holder.clone()],
+            wait_for_commit: true, foreground_replica_repair: true,
+        }).unwrap();
+        let synced = writer.posix_sync_file(path, DfsPosixSyncKind::File).unwrap();
+        assert!(Instant::now() <= seed_deadline, "unchanged registered Main seed budget");
+        assert_eq!(writer.transport.operation_deadline(), Some(seed_deadline));
+        assert_eq!(synced.target.version, stat.version);
+        assert_eq!(synced.content_evidence.required_receipts, 2);
+        writer.set_transport_operation_deadline(previous);
+        drop(writer);
+        for node in [&owner, &holder] {
+            let reader = runtime.client(node).unwrap();
+            assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
+        }
+        let mut held = Some(Box::new(runtime.deny_background_replica_before_claim(&owner).unwrap()) as Box<dyn Send>);
+        let held_promoted = Some(Box::new(runtime.deny_background_replica_before_claim(&promoted).unwrap()) as Box<dyn Send>);
+        let capture = runtime.capture_checkpointed_background_repairs(&owner, 8).unwrap();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        runtime.install_fault(FaultRule {
+            source: Some(owner.clone()), target: Some(holder.clone()),
+            route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()), call_id: None,
+            origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
+            action: FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id: None, captured: Arc::clone(&replies) },
+        });
+        let mut source = runtime.metadata_primary_service(path).unwrap();
+        source.mark_remote_read_location_missing(&stat.object_id, &stat.version, &stat.content_hash, &holder).unwrap();
+        drop(source);
+        drop(held.take());
+        let queue = runtime.selected_original_data_layout(&owner).unwrap().queue().unwrap();
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let birth = loop {
+            let found = capture.records().iter().find_map(|captured| {
+                queue.original_repair(&captured.message).unwrap().filter(|birth| {
+                    let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else { return false; };
+                    birth.closed_at_sequence.is_none() && !birth.attempts.is_empty()
+                        && queue.records_for_targets(&command.intent_id, std::slice::from_ref(&holder)).unwrap()
+                            .iter().any(|row| row.transfer_request_id.as_deref() == Some(command.request_id.as_str())
+                                && !row.in_flight && row.last_error.is_some()
+                                && row.transfer_delivery_state == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied))
+                })
+            });
+            if let Some(birth) = found {
+                let exact_lost_reply = replies.lock().unwrap().iter().any(|routed| {
+                    let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
+                    if routed.source_node_id != holder || routed.target_node_id != owner
+                        || !matches!(response.result, DfsBlobTransferResult::Durable { .. } | DfsBlobTransferResult::Committed { .. })
+                    { return false; }
+                    let mut checked = birth.clone();
+                    checked.observed.push(response.clone());
+                    // Validate this candidate reply with the existing full
+                    // original validator, without persisting any observation.
+                    checked.validate(&birth.root.subject.queue_incarnation).is_ok()
+                });
+                if exact_lost_reply { break birth; }
+            }
+            let remaining = deadline.checked_duration_since(Instant::now()).expect("actual lost reply reaches original queue within unchanged 5s budget");
+            let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
+            eprintln!("SELECTED_GENUINE_LOST_REPLY_TICK {:?}", tick.outcome);
+        };
+        held = Some(Box::new(runtime.deny_background_replica_before_claim(&owner).unwrap()) as Box<dyn Send>);
+        runtime.clear_faults();
+        assert_eq!(capture.omitted_count(), 0);
+        drop(capture);
+        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else { panic!("genuine Repair"); };
+        assert_eq!(command.object_id, stat.object_id);
+        assert_eq!(command.version, stat.version);
+        assert_eq!(birth.original.source_node_id, owner);
+        assert_eq!(birth.attachment.total_size_bytes, 4096);
+        assert_eq!(birth.root.subject.request_id, command.request_id);
+        assert_eq!(birth.root.original_command_digest,
+            crate::repair_queue_store::original_repair_digest(&birth.original, &birth.attachment).unwrap());
+        GenuineNativeOriginal { runtime, shard, promoted, holder, birth, held, held_promoted }
+    }
+
+    #[test]
+    fn native_selected_original_data_installs_authenticated_nonexecuting_inventory_and_reopens() {
+        let mut fixture = genuine_native_original("native-selected-original-data-install");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = fixture.shard.primary_node_id.clone();
+            let layout_a = fixture.runtime.selected_original_data_layout(&owner).unwrap();
+            let layout_b = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
+            let request = fixture.birth.root.subject.request_id.clone();
+            let mut source = fixture.runtime.metadata_primary_service("/services/selected-original-data.bin").unwrap();
+            let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
+            let control = fixture.runtime.shared_control_plane().unwrap();
+            let proposed = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
+            fixture.runtime.select_genuine_original_before_handoff(&owner, &request, &proposed).unwrap();
+            let mut different = proposed.clone(); different.handoff_id.push_str("-another");
+            assert!(layout_a.selected_request(&different).is_err());
+            drop(fence);
+            let deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            let result = source.reconcile_pending_metadata_shard_membership_handoffs(
+                &fixture.runtime.metadata_shards().unwrap(), DEFAULT_DFS_POSIX_SYNC_TIMEOUT);
+            drop(source);
+            if let Err(error) = result {
+                assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, deadline).unwrap(),
+                    Some(proposed.desired_shard.clone()), "actual handoff error: {error}");
+            }
+            let shard_id = DfsMetadataShardId::new(&fixture.shard.shard_id);
+            let marker = loop {
+                let marker = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                    fixture.runtime.data_dir(&fixture.promoted), &shard_id, Some(&layout_b)).unwrap();
+                if let Some(marker) = marker.filter(|marker| marker.activated_epoch == Some(proposed.desired_shard.epoch)) { break marker; }
+                let remaining = deadline.checked_duration_since(Instant::now()).expect("native DATA installation uses unchanged handoff deadline");
+                let tick = fixture.runtime.maintenance_tick(&fixture.promoted, remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)).unwrap();
+                eprintln!("SELECTED_DATA_REBIND_TICK {:?}; foreign content claims deliberately held", tick.outcome);
+            };
+            let cut = marker.repair_custody.as_ref().expect("actual activated custody cut");
+            assert_eq!(cut.version, 2);
+            assert_eq!(cut.handoff.handoff_id, proposed.handoff_id);
+            let installed_queue = layout_b.queue().unwrap();
+            let installed = installed_queue.installed_original_handoff_data(&owner, &request).unwrap().unwrap();
+            let source_directory = crate::local_dfs_metadata_shard_path(fixture.runtime.data_dir(&owner), &shard_id)
+                .join("journal/repair-handoffs-v1")
+                .join(format!("{}-source", blake3::hash(cut.handoff.handoff_id.as_bytes()).to_hex()));
+            let actual_source_cut: DfsRepairHandoffCut = crate::metadata_io::read_sobj_optional(&source_directory.join("cut.sobj")).unwrap().unwrap();
+            assert_eq!(actual_source_cut, *cut);
+            let mut source_rows = Vec::new();
+            let mut sealed_birth = None;
+            for ordinal in 0..cut.page_count {
+                let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&source_directory.join(format!("{ordinal}.sobj"))).unwrap().unwrap();
+                page.validate_selected_original_data().unwrap();
+                assert_eq!(page.cut, *cut);
+                assert_eq!(page.ordinal, ordinal);
+                if ordinal == 0 { sealed_birth = page.selected_original_data.map(|birth| *birth); }
+                source_rows.extend(page.records);
+            }
+            let sealed_birth = sealed_birth.unwrap();
+            assert_eq!(source_rows.len() as u64, cut.record_count);
+            assert_eq!(installed.material.birth, sealed_birth);
+            assert_eq!(sealed_birth.original, fixture.birth.original);
+            assert_eq!(sealed_birth.attachment, fixture.birth.attachment);
+            assert_eq!(sealed_birth.root, fixture.birth.root);
+            assert_eq!(sealed_birth.captured_data_digest().unwrap(), cut.selected_original_data.as_ref().unwrap().captured_birth_digest);
+            assert_eq!(installed.material.cut, *cut);
+            let actual_rows = installed_queue.view().unwrap().records;
+            assert!(source_rows.iter().all(|row| actual_rows.contains(row)), "every row in the actual filtered source cut survives; unrelated B rows are permitted");
+            let DfsNetworkMessage::RepairReplica(command) = &fixture.birth.original.message else { unreachable!() };
+            assert!(installed_queue.original_repair_for_slot(&command.intent_id, &fixture.holder).unwrap().is_none());
+            assert!(installed_queue.validate_original_repair_dispatch(&fixture.birth.original).is_err());
+            assert!(installed_queue.record_original_repair_attempt(&fixture.birth.original).is_err());
+            let (clocks, omitted) = layout_b.receiver_clocks().unwrap();
+            assert_eq!(omitted, 0); assert!(!clocks.is_empty());
+            assert!(clocks.iter().all(|(_, captured, cutoff)| cutoff.duration_since(*captured) == Duration::from_secs(5)));
+            assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+            assert!(fixture.runtime.rpc_observations().iter().any(|call| call.source == owner
+                && call.target == fixture.promoted && call.route == DFS_METADATA_JOURNAL_BATCH_ROUTE
+                && call.origin == RpcOrigin::RegisteredHost && call.phase == RpcPhase::Completed));
+            // Route evidence and exact host clock records are separate facts;
+            // journal RpcObservation currently does not decode request IDs.
+            assert!(fixture.runtime.client(&fixture.promoted).unwrap().content()
+                .read_object_version(command.object_id.as_str(), command.version.as_str()).is_err(),
+                "DATA installation did not copy object bytes or confer B payload custody");
+            let receiver_root = crate::local_dfs_metadata_shard_path(fixture.runtime.data_dir(&fixture.promoted), &shard_id);
+            let mut prior_checkpoint = marker.clone();
+            for (index, directory) in ["/services/selected-post-activation-background", "/services/selected-post-activation-foreground"].iter().enumerate() {
+                // Actual Main append exercises the native backend -> append ->
+                // scheduler context join at unchanged publication thresholds.
+                let mut writer = fixture.runtime.client(&fixture.promoted).unwrap();
+                let append_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                let previous = writer.set_transport_operation_deadline(Some(append_deadline));
+                writer.posix_mkdir(directory).unwrap();
+                assert!(Instant::now() <= append_deadline, "post-activation Main append keeps its existing 5s budget");
+                assert_eq!(writer.transport.operation_deadline(), Some(append_deadline));
+                writer.set_transport_operation_deadline(previous);
+                drop(writer);
+                let before_forcing = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                    fixture.runtime.data_dir(&fixture.promoted), &shard_id, Some(&layout_b)).unwrap().unwrap();
+                assert_eq!(before_forcing, prior_checkpoint,
+                    "this small append must not have independently checkpointed before its phase-specific storage control");
+                if index == 0 {
+                    let _writer = crate::metadata_lock::metadata_write_lock(receiver_root.clone(),
+                        crate::metadata_cursor::journal_write_lock_path(&receiver_root)).unwrap();
+                    let state = crate::metadata_table_store::read_metadata_table_state(&receiver_root).unwrap();
+                    // Explicit fixture-only physical forcing exercises the real
+                    // worker/marker writer. It is not production pressure or
+                    // quietness/latency acceptance; production limits are unchanged.
+                    crate::metadata_table_apply::schedule_metadata_table_checkpoint_with_layout(
+                        &receiver_root, &state.tables, 0, state.table_log_offset, None, Some(Arc::clone(&layout_b))).unwrap();
+                    drop(_writer);
+                    crate::metadata_table_apply::wait_for_metadata_table_checkpoint_workers_for_test(&receiver_root);
+                } else {
+                    let _writer = crate::metadata_lock::metadata_write_lock(receiver_root.clone(),
+                        crate::metadata_cursor::journal_write_lock_path(&receiver_root)).unwrap();
+                    let state = crate::metadata_table_store::read_metadata_table_state(&receiver_root).unwrap();
+                    let mut tables = state.tables;
+                    let mut offset = state.table_log_offset;
+                    let mut sequence = state.materialized_through_sequence.unwrap_or(0);
+                    let mut fingerprint = state.snapshot_fingerprint;
+                    let mut proof = state.prefix_proof;
+                    crate::metadata_table_apply::compact_metadata_table_log_if_needed(&receiver_root,
+                        crate::metadata_table_apply::TableMaterializationState {
+                            selected_original_data_layout: Some(Arc::clone(&layout_b)), read_snapshot_cache: None,
+                            tables: &mut tables, table_log_offset: &mut offset, materialized_through_sequence: &mut sequence,
+                            table_snapshot_fingerprint: &mut fingerprint, prefix_proof: &mut proof,
+                        }, 0).unwrap();
+                }
+                let _writer = crate::metadata_lock::metadata_write_lock(receiver_root.clone(),
+                    crate::metadata_cursor::journal_write_lock_path(&receiver_root)).unwrap();
+                let checkpointed = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                    fixture.runtime.data_dir(&fixture.promoted), &shard_id, Some(&layout_b)).unwrap().unwrap();
+                let snapshot_path = crate::metadata_table_store::metadata_table_snapshot_path(&receiver_root);
+                let snapshot = crate::metadata_snapshot::read_snapshot(&receiver_root, std::fs::File::open(snapshot_path).unwrap()).unwrap();
+                assert_eq!(checkpointed.repair_custody.as_ref(), Some(cut));
+                assert!(checkpointed.rebind_prefix_proof.journal_sequence > prior_checkpoint.rebind_prefix_proof.journal_sequence,
+                    "each forced writer must advance from its immediately preceding marker");
+                assert_eq!(Some(checkpointed.rebind_prefix_proof.clone()), snapshot.prefix_proof,
+                    "marker names the actual installed checkpoint prefix");
+                prior_checkpoint = checkpointed;
+            }
+            installed_queue.compact_if_needed(crate::DfsRepairQueueCompactionOptions { force: true, ..Default::default() }).unwrap();
+            fixture.runtime.stop_node(&fixture.promoted).unwrap();
+            installed_queue.reload_from_disk_on_next_access();
+            fixture.runtime.reopen_node(fixture.promoted.clone()).unwrap();
+            let reopened = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap().queue().unwrap();
+            let after = reopened.installed_original_handoff_data(&owner, &request).unwrap().unwrap();
+            assert_eq!(after, installed);
+            let reopened_marker = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                fixture.runtime.data_dir(&fixture.promoted), &shard_id, Some(&layout_b)).unwrap().unwrap();
+            assert_eq!(reopened_marker, prior_checkpoint);
+            assert!(reopened.validate_original_repair_dispatch(&fixture.birth.original).is_err());
+        }));
+        let report = serde_json::json!({
+            "positive_assertions_passed":outcome.is_ok(), "initial_original":&fixture.birth,
+            "qualification":"Native non-executing DATA control only. No foreign B execution, Terminal/root retirement, C1 or availability acceptance. Initial attempt facts may precede the final sealed source cut."
+        });
+        if let Err(error) = std::fs::write(fixture.runtime.data_dir(&fixture.shard.primary_node_id).root()
+            .join("native-selected-data-result.json"), serde_json::to_vec_pretty(&report).unwrap())
+        { eprintln!("native DATA report write failed: {error}"); }
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("native DATA cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("normal native DATA fixture drain");
+    }
+
+    fn receiver_custody_files(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn visit(base: &Path, path: &Path, result: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            if !path.exists() { return; }
+            if path.is_file() {
+                result.push((path.strip_prefix(base).unwrap().to_path_buf(), std::fs::read(path).unwrap()));
+            } else {
+                for entry in std::fs::read_dir(path).unwrap() { visit(base, &entry.unwrap().path(), result); }
+            }
+        }
+        let mut result = Vec::new();
+        for relative in ["journal/membership-handoff-write-freeze.sobj", "journal/repair-handoffs-v1", "coordination/metadata-prefix-ack-floors"] {
+            visit(root, &root.join(relative), &mut result);
+        }
+        result.sort_by(|a,b| a.0.cmp(&b.0)); result
+    }
+
+    /// The real A protocol creates the frozen export. A negative transport gate
+    /// holds its delivery while the actual B host's entry clock is exercised.
+    /// Supplying an argument to the host method is not transport authentication;
+    /// the separate positive control exercises that wire boundary.
+    fn native_selected_receiver_clock_control(after_processing: bool) {
+        let name = if after_processing { "native-selected-clock-after-processing" } else { "native-selected-clock-before-poll" };
+        let mut fixture = genuine_native_original(name);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = fixture.shard.primary_node_id.clone();
+            let mut source = fixture.runtime.metadata_primary_service("/services/selected-original-data.bin").unwrap();
+            let fence = source.metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id).unwrap();
+            let control = fixture.runtime.shared_control_plane().unwrap();
+            let proposed = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
+            fixture.runtime.select_genuine_original_before_handoff(&owner, &fixture.birth.root.subject.request_id, &proposed).unwrap();
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            fixture.runtime.install_fault(FaultRule {
+                source: Some(owner.clone()), target: Some(fixture.promoted.clone()),
+                route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
+                origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 16,
+                action: FaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
+            });
+            let configs = fixture.runtime.metadata_shards().unwrap();
+            let phase_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            drop(fence);
+            std::thread::scope(|scope| {
+                let producer = scope.spawn(move || source.reconcile_pending_metadata_shard_membership_handoffs(
+                    &configs, DEFAULT_DFS_POSIX_SYNC_TIMEOUT));
+                let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let shard = DfsMetadataShardId::new(&fixture.shard.shard_id);
+                    let source_directory = crate::local_dfs_metadata_shard_path(fixture.runtime.data_dir(&owner), &shard)
+                        .join("journal/repair-handoffs-v1")
+                        .join(format!("{}-source", blake3::hash(proposed.handoff_id.as_bytes()).to_hex()));
+                    let capture_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                    let cut: DfsRepairHandoffCut = loop {
+                        let captured = crate::metadata_io::read_sobj_optional(&source_directory.join("cut.sobj")).unwrap();
+                        assert!(Instant::now() <= capture_deadline, "real protocol source export before unchanged 5s setup budget");
+                        if let Some(cut) = captured { break cut; }
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    cut.validate_selected_original_data().unwrap();
+                    let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&source_directory.join("0.sobj")).unwrap().unwrap();
+                    page.validate_selected_original_data().unwrap();
+                    assert_eq!(page.cut, cut);
+                    let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
+                        .get_metadata_shard_membership_handoff(&fixture.shard.file_system_id, &fixture.shard.shard_id)).unwrap().unwrap();
+                    assert_eq!(pending, cut.handoff);
+                    assert!(pending.retiring_primary_fence.is_some());
+                    let data = Arc::new(fixture.runtime.data_dir(&fixture.promoted).clone());
+                    let handle = fixture.runtime.runtime_handle();
+                    let host = Arc::new(crate::runtime_host::DaemonDfsDataPlaneHost::new_on_runtime(
+                        crate::runtime_host::DfsRuntimePaths::for_host_role(&data, sinomo_module::ComponentHostRole::Embedded), &handle));
+                    let context_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                    let context = loop {
+                        let context = handle.block_on(host.retained_metadata_replica_shard_context(
+                            Arc::clone(&data), fixture.shard.file_system_id.clone(), shard.clone()).unwrap()).unwrap();
+                        assert!(Instant::now() <= context_deadline, "actual retained B context must reach exact pending fence within its normal budget");
+                        if let Some(context) = context.filter(|context| context.pending_membership_handoff.as_ref() == Some(&pending)) { break context; }
+                    };
+                    let request_id = format!("native-selected-clock-{}", proposed.handoff_id);
+                    let fence = pending.retiring_primary_fence.as_ref().unwrap();
+                    let command = DfsMetadataJournalBatchCommand {
+                        request_id: request_id.clone(), source_node_id: Some(owner.clone()),
+                        file_system_id: Some(fixture.shard.file_system_id.clone()), authority_epoch: Some(fixture.shard.epoch),
+                        verify_prefix_only: true, authority_probe: None, durable_replication: None,
+                        prefix_probe: Some(DfsMetadataPrefixProbe {
+                            barrier_id: format!("native-selected-clock-barrier-{}", proposed.handoff_id),
+                            file_system_id: Some(fixture.shard.file_system_id.clone()), authority_epoch: Some(fixture.shard.epoch),
+                            shard_id: shard.clone(), journal_sequence: fence.journal_sequence,
+                            state_fingerprint: fence.state_fingerprint.clone(), primary_handoff_id: Some(proposed.handoff_id.clone()),
+                            repair_custody: Some(page.clone()),
+                        }),
+                        batch: DfsMetadataJournalFrameBatch { shard_id: shard.clone(), journal_frames: Vec::new(), next_after_sequence: fence.journal_sequence },
+                    };
+                    let layout = fixture.runtime.selected_original_data_layout(&fixture.promoted).unwrap();
+                    let receiver_root = crate::local_dfs_metadata_shard_path(&data, &shard);
+                    let before_files = receiver_custody_files(&receiver_root);
+                    let response = if after_processing {
+                        let (started, release) = crate::runtime_host::install_daemon_dfs_message_committed_edge_test_hook(&request_id);
+                        let actual_host = Arc::clone(&host);
+                        let caller = owner.clone();
+                        let task = handle.spawn(async move {
+                            actual_host.apply_metadata_journal_batch(data, caller, command, Some(context)).await
+                        });
+                        let at_edge = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            started.recv_timeout(Duration::from_secs(5)).expect("actual post-processing edge reached within its unchanged wait");
+                            let (clocks, omitted) = layout.receiver_clocks().unwrap();
+                            assert_eq!(omitted, 0);
+                            let matching: Vec<_> = clocks.iter().filter(|(id, _, _)| *id == request_id).collect();
+                            assert_eq!(matching.len(), 1);
+                            let (_, captured, cutoff) = matching[0];
+                            assert_eq!(cutoff.duration_since(*captured), Duration::from_secs(5));
+                            let received = receiver_root.join("journal/repair-handoffs-v1")
+                                .join(format!("{}-received", blake3::hash(proposed.handoff_id.as_bytes()).to_hex()));
+                            let staged: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&received.join("0.sobj")).unwrap().unwrap();
+                            assert_eq!(staged, page, "actual DATA is synchronized before the selected post-processing fault");
+                            assert!(received.join("received.sobj").is_file());
+                            assert_ne!(receiver_custody_files(&receiver_root), before_files);
+                            std::thread::sleep(cutoff.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
+                        }));
+                        let _ = release.send(());
+                        let response = handle.block_on(task).expect("actual host child drained").unwrap();
+                        if let Err(error) = at_edge { std::panic::resume_unwind(error); }
+                        assert!(matches!(&response.result, DfsMetadataJournalBatchResult::Rejected { code: DfsMetadataRejectionCode::Other, reason }
+                            if reason.contains("expired after processing")), "{response:?}");
+                        response
+                    } else {
+                        let future = host.apply_metadata_journal_batch(data, owner.clone(), command, Some(context));
+                        let (clocks, omitted) = layout.receiver_clocks().unwrap();
+                        assert_eq!(omitted, 0);
+                        let matching: Vec<_> = clocks.iter().filter(|(id, _, _)| *id == request_id).collect();
+                        assert_eq!(matching.len(), 1, "entry captures before the returned future is polled");
+                        let (_, captured, cutoff) = matching[0];
+                        assert_eq!(cutoff.duration_since(*captured), Duration::from_secs(5));
+                        std::thread::sleep(cutoff.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
+                        let response = handle.block_on(future).unwrap();
+                        assert!(matches!(&response.result, DfsMetadataJournalBatchResult::Rejected { code: DfsMetadataRejectionCode::Other, reason }
+                            if reason.contains("selected receiver processing budget")), "{response:?}");
+                        assert_eq!(receiver_custody_files(&receiver_root), before_files,
+                            "expired entry must not freeze/bind/write a floor or stage selected DATA");
+                        response
+                    };
+                    assert!(!response.verified_prefix_only);
+                    assert!(response.verified_authority_probe_id.is_none());
+                    assert!(layout.queue().unwrap().installed_original_handoff_data(&owner, &fixture.birth.root.subject.request_id).unwrap().is_none(),
+                        "staged DATA or a late rejected response never installs queue custody");
+                }));
+                fixture.runtime.clear_faults();
+                gate.add_permits(16);
+                let produced = producer.join().expect("real source handoff child drained");
+                if let Err(error) = checks { std::panic::resume_unwind(error); }
+                if let Err(error) = produced {
+                    assert_eq!(fixture.runtime.observe_completed_native_handoff(&control, &proposed, phase_deadline).unwrap(),
+                        Some(proposed.desired_shard.clone()), "real handoff after releasing only the negative gate: {error}");
+                }
+            });
+        }));
+        fixture.runtime.clear_faults();
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("native selected clock cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("native selected clock fixture drains normally");
+    }
+
+    #[test]
+    fn native_selected_receiver_clock_is_captured_before_poll_and_expired_input_cannot_stage() {
+        native_selected_receiver_clock_control(false);
+    }
+
+    #[test]
+    fn native_selected_receiver_expiry_after_processing_retains_data_without_ack() {
+        native_selected_receiver_clock_control(true);
+    }
+
 }

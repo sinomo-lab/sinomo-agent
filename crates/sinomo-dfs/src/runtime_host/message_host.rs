@@ -998,12 +998,25 @@ fn try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
         Some(previous) => {
             previous.into_reconfigured_for_replica_repair(metadata_root, shards, local_node_id)?
         }
-        None => sinomo_dfs::open_local_sharded_metadata_backend_for_replica_repair(
-            metadata_root,
-            shards,
-            local_node_id,
-        )?
-        .into_resident(),
+        None => {
+            let selected = sinomo_dfs::runtime_host::publication_runtime_owner(&metadata_root)
+                .map_err(|error| sinomo_dfs::MetadataBackendError::Rejected {
+                    code: sinomo_dfs::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?
+                .map(|owner| owner.selected_original_data_layout())
+                .transpose().map_err(|error| sinomo_dfs::MetadataBackendError::Rejected {
+                    code: sinomo_dfs::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?.flatten();
+            if let Some(layout) = selected {
+                sinomo_dfs::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
+                    metadata_root, shards, local_node_id, layout,
+                )?.into_resident()
+            } else {
+                sinomo_dfs::open_local_sharded_metadata_backend_for_replica_repair(
+                    metadata_root, shards, local_node_id,
+                )?.into_resident()
+            }
+        },
     };
     backend.initialize_bounded_status_snapshots()?;
     daemon_dfs_require_retained_authority(authority_generation, expected_generation)?;
@@ -1374,7 +1387,13 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
         let data_dir = SinomoDataDir::new(data_root);
         let paths = DaemonPaths::new(&data_dir);
         worker.set_background_delivery_handler(move |event| {
-            crate::runtime_message::checkpoint_detached_replica_delivery(&data_dir, event)
+            let selected = publication_runtime_owner(&crate::default_dfs_metadata_shards_root(&data_dir))
+                .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
+                .map(|owner| owner.selected_original_data_layout()).transpose()
+                .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?.flatten();
+            crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
+                &data_dir, event, selected.as_deref(),
+            )
         });
         let response_runtime = tokio_runtime.clone();
         worker.set_background_response_handler(move |message, original| {

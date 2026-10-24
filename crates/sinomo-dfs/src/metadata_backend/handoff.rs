@@ -12,7 +12,10 @@ impl LocalSobjMetadataBackend {
     pub(super) fn membership_handoff_write_freeze(
         &self,
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
-        read_sobj_optional(&self.membership_handoff_write_freeze_path())
+        crate::metadata_api::read_handoff_freeze_with_layout(
+            &self.membership_handoff_write_freeze_path(),
+            self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+        )
     }
 
     pub(super) fn freeze_for_membership_handoff(
@@ -86,7 +89,10 @@ impl LocalSobjMetadataBackend {
                 .filter(|freeze| freeze.handoff_id == handoff_id)
                 .and_then(|freeze| freeze.repair_custody.clone()),
         };
-        write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
+        crate::metadata_api::write_handoff_freeze_with_layout(
+                &self.membership_handoff_write_freeze_path(), &freeze,
+                self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+            )?;
         self.instance_authority_epoch = None;
         Ok(freeze)
     }
@@ -95,6 +101,23 @@ impl LocalSobjMetadataBackend {
         &mut self,
         cut: &crate::DfsRepairHandoffCut,
     ) -> Result<()> {
+        if cut.version == 2 {
+            let (filesystem, layout) = self.selected_original_data_layout.as_ref().ok_or_else(|| MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected cut has no admitted native backend reader".into(),
+            })?;
+            layout.stage(filesystem, &self.shard_id, &self.root)?;
+            if filesystem != &cut.handoff.retiring_shard.file_system_id {
+                return Err(MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other,
+                    message: "selected cut belongs to another filesystem".into(),
+                });
+            }
+            cut.validate_selected_original_data()
+                .map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?;
+        }
         let _lock = self.begin_metadata_write_allow_frozen()?;
         let mut freeze = self.membership_handoff_write_freeze()?.ok_or_else(|| {
             MetadataBackendError::Serde(
@@ -120,7 +143,10 @@ impl LocalSobjMetadataBackend {
         }
         if freeze.repair_custody.is_none() {
             freeze.repair_custody = Some(cut.clone());
-            write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
+            crate::metadata_api::write_handoff_freeze_with_layout(
+                &self.membership_handoff_write_freeze_path(), &freeze,
+                self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+            )?;
         }
         Ok(())
     }
@@ -200,8 +226,12 @@ impl LocalSobjMetadataBackend {
             }
             activated.rebind_prefix_proof = rebound_prefix_proof.clone();
         }
-        if activated != existing {
-            write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
+        if activated != existing || (self.selected_original_data_layout.is_some()
+            && activated.repair_custody.as_ref().is_some_and(|cut| cut.version == 2)) {
+            crate::metadata_api::write_handoff_freeze_with_layout(
+                &self.membership_handoff_write_freeze_path(), &activated,
+                self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+            )?;
         }
         Ok(true)
     }
@@ -225,6 +255,11 @@ impl LocalSobjMetadataBackend {
         active_shard: &DfsMetadataShardConfig,
         checked_prefix: &DfsMetadataPrefixProof,
     ) -> Result<bool> {
+        // NEW selected install-owner processing clock, distinct from A's
+        // transport window and the earlier receiver RPC. V1 ignores it.
+        let selected_install_clock = self.selected_original_data_layout.as_ref()
+            .map(|_| std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let mut selected_install_deadline = None;
         let lock = self.begin_metadata_write_allow_frozen()?;
         let rebound_prefix_proof = self.prefix_proof.clone().ok_or_else(|| {
             MetadataBackendError::Serde(format!(
@@ -261,11 +296,24 @@ impl LocalSobjMetadataBackend {
                     "activated repair custody differs from the exact successor assignment".into(),
                 ));
             }
-            if !crate::repair_handoff::install_next_page(&self.root, &cut)
-                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
-            {
-                return Ok(false);
-            }
+            let complete = if let Some((_, layout)) = &self.selected_original_data_layout {
+                if cut.version == 2 { selected_install_deadline = selected_install_clock; }
+                crate::repair_handoff::install_native_layout(
+                    &self.root, layout, &cut, selected_install_deadline,
+                ).map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?
+            } else {
+                crate::repair_handoff::install_next_page(&self.root, &cut)
+                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            };
+            if !complete { return Ok(false); }
+        }
+        if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected install processing budget expired before activation; DATA retained".into(),
+            });
         }
         let previous_instance_authority_epoch =
             self.instance_authority_epoch.replace(active_shard.epoch);
@@ -285,6 +333,13 @@ impl LocalSobjMetadataBackend {
                 return Err(error);
             }
         }
+        if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.instance_authority_epoch = previous_instance_authority_epoch;
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected install processing budget expired after marker sync; durable marker retained, readiness withheld".into(),
+            });
+        }
         // Rebind owns the actual writer while replaying durable current
         // decisions. It never authors a new terminal operation for a hidden
         // prepare, and independently opened retiring instances stay fenced.
@@ -292,6 +347,13 @@ impl LocalSobjMetadataBackend {
         if let Err(error) = recovery {
             self.instance_authority_epoch = previous_instance_authority_epoch;
             return Err(error);
+        }
+        if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.instance_authority_epoch = previous_instance_authority_epoch;
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected install processing budget expired after replay; durable progress retained, readiness withheld".into(),
+            });
         }
         drop(lock);
         Ok(true)

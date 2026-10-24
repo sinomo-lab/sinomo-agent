@@ -224,6 +224,47 @@ impl From<crate::ContentStoreError> for DfsRuntimeError {
 pub struct DfsDataOwnerLock {
     file: File,
     physical_data_root: PathBuf,
+    selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+}
+
+/// Explicit per-native-fixture expectation retained across component reopen.
+/// It owns representation identities only, never an OS owner or authority.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DfsSelectedOriginalDataFixture {
+    layout: Arc<Mutex<Option<Arc<crate::DfsSelectedOriginalDataLayout>>>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DfsSelectedOriginalDataFixture {
+    pub(crate) fn admit(&self, owner: &mut DfsDataOwnerLock) -> Result<(), DfsRuntimeError> {
+        let mut expected = self.layout.lock().map_err(|_| DfsRuntimeError::Parse {
+            detail: "selected native fixture expectation poisoned".into(),
+        })?;
+        let actual = owner.admit_selected_original_fixture(expected.clone())?;
+        *expected = Some(actual);
+        Ok(())
+    }
+
+    pub(crate) fn layout(&self) -> Result<Arc<crate::DfsSelectedOriginalDataLayout>, DfsRuntimeError> {
+        self.layout.lock().map_err(|_| DfsRuntimeError::Parse {
+            detail: "selected native fixture expectation poisoned".into(),
+        })?.clone().ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "selected native fixture has no admitted actual owner yet".into(),
+        })
+    }
+
+    pub(crate) fn validate_retained(&self, owner: &DfsDataOwnerLock) -> Result<(), DfsRuntimeError> {
+        let expected = self.layout()?;
+        let actual = owner.selected_original_data_layout()?.ok_or_else(|| DfsRuntimeError::Parse {
+            detail: "selected native fixture cannot adopt an ordinary retained owner".into(),
+        })?;
+        if !Arc::ptr_eq(&expected, &actual) {
+            return Err(DfsRuntimeError::Parse {
+                detail: "selected native fixture retained another layout expectation".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Read-only platform identity DATA for one actually held file handle.
@@ -253,6 +294,43 @@ pub fn storage_file_identity(file: &File) -> std::io::Result<(u64, u64)> {
 }
 
 impl DfsDataOwnerLock {
+    /// The actual retained owner may carry an explicit fixture reader. The
+    /// context owns no DATA lock and therefore creates no owner-lifetime cycle.
+    pub(crate) fn selected_original_data_layout(
+        &self,
+    ) -> Result<Option<Arc<crate::DfsSelectedOriginalDataLayout>>, DfsRuntimeError> {
+        if let Some(layout) = &self.selected_original_data_layout {
+            layout.check_owner(self).map_err(|error| DfsRuntimeError::Parse {
+                detail: error.to_string(),
+            })?;
+        }
+        Ok(self.selected_original_data_layout.clone())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn admit_selected_original_fixture(
+        &mut self,
+        expected: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    ) -> Result<Arc<crate::DfsSelectedOriginalDataLayout>, DfsRuntimeError> {
+        if self.selected_original_data_layout.is_some() {
+            return Err(DfsRuntimeError::Parse {
+                detail: "selected native representation was already admitted".into(),
+            });
+        }
+        let layout = match expected {
+            Some(layout) => {
+                layout.reopen(self).map_err(|error| DfsRuntimeError::Parse {
+                    detail: error.to_string(),
+                })?;
+                layout
+            }
+            None => crate::DfsSelectedOriginalDataLayout::fresh(self)
+                .map_err(|error| DfsRuntimeError::Parse { detail: error.to_string() })?,
+        };
+        self.selected_original_data_layout = Some(Arc::clone(&layout));
+        Ok(layout)
+    }
+
     pub(crate) fn physical_data_root(&self) -> &Path {
         &self.physical_data_root
     }
@@ -336,6 +414,7 @@ impl DfsDataOwnerLock {
         Ok(Self {
             file,
             physical_data_root,
+            selected_original_data_layout: None,
         })
     }
 
@@ -2011,6 +2090,7 @@ fn open_dfs_runtime_service_for_effect(
     // The client view owns no resident ingress checkout across a remote RPC.
     // Each effect still acquires its normal admission and physical writer;
     // replicas keep their actual per-shard resident ingress sessions available.
+    let selected_layout = owner.selected_original_data_layout()?;
     let metadata: Box<dyn crate::DfsMetadataBackend> = if let Some(expected) = effect {
         if expected.primary_node_id != state.local_node_id || !shards.contains(expected) {
             return Err(DfsRuntimeError::Parse {
@@ -2020,21 +2100,32 @@ fn open_dfs_runtime_service_for_effect(
         let root = crate::default_dfs_metadata_shards_root(data_dir)
             .join(crate::metadata_keys::key_segment(&expected.shard_id));
         Box::new(
-            crate::LocalSobjMetadataBackend::new(
-                crate::DfsMetadataShardId::new(expected.shard_id.clone()),
-                root,
-            )
+            (if let Some(layout) = &selected_layout {
+                crate::LocalSobjMetadataBackend::new_with_selected_layout(
+                    expected.file_system_id.clone(),
+                    crate::DfsMetadataShardId::new(expected.shard_id.clone()), root, Arc::clone(layout),
+                )
+            } else {
+                crate::LocalSobjMetadataBackend::new(
+                    crate::DfsMetadataShardId::new(expected.shard_id.clone()), root,
+                )
+            })
             .map_err(|error| DfsRuntimeError::Parse {
                 detail: error.to_string(),
             })?,
         )
     } else {
         Box::new(
-            crate::open_local_sharded_metadata_backend_for_replica_repair(
-                crate::default_dfs_metadata_shards_root(data_dir),
-                shards,
-                &state.local_node_id,
-            )
+            (if let Some(layout) = selected_layout {
+                crate::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
+                    crate::default_dfs_metadata_shards_root(data_dir), shards,
+                    &state.local_node_id, layout,
+                )
+            } else {
+                crate::open_local_sharded_metadata_backend_for_replica_repair(
+                    crate::default_dfs_metadata_shards_root(data_dir), shards, &state.local_node_id,
+                )
+            })
             .map_err(|error| DfsRuntimeError::Parse {
                 detail: error.to_string(),
             })?,

@@ -36,6 +36,9 @@ enum CanonicalKey {
     Blob(String),
     Version(VersionKey),
     Reservation(ContentStoreReservationIdentity),
+    RepairPayload(RepairPayloadSubject),
+    ReceivedPrepared(received_repair::ReceivedRepairKey),
+    ReceivedBound(received_repair::ReceivedRepairKey),
     DeletedBlob(String),
 }
 
@@ -142,6 +145,9 @@ fn canonical_record_count(view: &InlineBindingView) -> u64 {
     (view.blobs.len() as u64)
         .saturating_add(view.versions.len() as u64)
         .saturating_add(view.reservations.len() as u64)
+        .saturating_add(view.repair_payloads.len() as u64)
+        .saturating_add(view.received_repairs.len() as u64)
+        .saturating_add(view.received_bindings.len() as u64)
         .saturating_add(view.deleted_blobs.len() as u64)
 }
 /// Each step seeks after the last exact key instead of rescanning an ordinal
@@ -198,7 +204,12 @@ fn canonical_next<'a>(
             return Some((CanonicalKey::Version(key.clone()), operation, None));
         }
     }
-    if !matches!(after, Some(CanonicalKey::DeletedBlob(_))) {
+    if after.is_none()
+        || matches!(
+            after,
+            Some(CanonicalKey::Blob(_) | CanonicalKey::Version(_) | CanonicalKey::Reservation(_))
+        )
+    {
         let entry = match after {
             Some(CanonicalKey::Reservation(key)) => {
                 view.reservations.range((Excluded(key), Unbounded)).next()
@@ -214,6 +225,67 @@ fn canonical_next<'a>(
                     }
                     InlineReservationState::Released => InlineOperation::Release(identity.clone()),
                 },
+                None,
+            ));
+        }
+    }
+    if !matches!(
+        after,
+        Some(
+            CanonicalKey::ReceivedPrepared(_)
+                | CanonicalKey::ReceivedBound(_)
+                | CanonicalKey::DeletedBlob(_)
+        )
+    ) {
+        let entry = match after {
+            Some(CanonicalKey::RepairPayload(key)) => view
+                .repair_payloads
+                .range((Excluded(key), Unbounded))
+                .next(),
+            _ => view.repair_payloads.first_key_value(),
+        };
+        if let Some((subject, state)) = entry {
+            return Some((
+                CanonicalKey::RepairPayload(subject.clone()),
+                InlineOperation::RestoreRepairPayload {
+                    root: state.root.clone(),
+                    released: state.released,
+                },
+                None,
+            ));
+        }
+    }
+    if !matches!(
+        after,
+        Some(CanonicalKey::ReceivedBound(_) | CanonicalKey::DeletedBlob(_))
+    ) {
+        let entry = match after {
+            Some(CanonicalKey::ReceivedPrepared(key)) => view
+                .received_repairs
+                .range((Excluded(key), Unbounded))
+                .next(),
+            _ => view.received_repairs.first_key_value(),
+        };
+        if let Some((key, prepared)) = entry {
+            return Some((
+                CanonicalKey::ReceivedPrepared(key.clone()),
+                InlineOperation::RestoreReceivedRepairPrepared(prepared.clone()),
+                None,
+            ));
+        }
+    }
+    if !matches!(after, Some(CanonicalKey::DeletedBlob(_))) {
+        let entry = match after {
+            Some(CanonicalKey::ReceivedBound(key)) => view
+                .received_bindings
+                .range((Excluded(key), Unbounded))
+                .next(),
+            _ => view.received_bindings.first_key_value(),
+        };
+        if let Some((key, binding)) = entry {
+            return Some((
+                CanonicalKey::ReceivedBound(key.clone()),
+                InlineOperation::RestoreReceivedRepairBound(binding.clone()),
                 None,
             ));
         }
@@ -244,7 +316,7 @@ fn next_record<'a>(
     Ok((
         key,
         InlineRecord {
-            format_version: INLINE_FORMAT_VERSION,
+            format_version: plan.source.catalog.format_version,
             store_incarnation: plan.source.catalog.store_incarnation.clone(),
             generation: plan.target,
             sequence: ordinal
@@ -336,7 +408,7 @@ impl CompactionDriver<'_> {
             sealed_digest: None,
         });
         Ok(InlineCatalog {
-            format_version: INLINE_FORMAT_VERSION,
+            format_version: self.plan.source.catalog.format_version,
             store_incarnation: self.plan.source.catalog.store_incarnation.clone(),
             generation: self.plan.target,
             segments,
@@ -634,7 +706,11 @@ impl MigrationDriver for CompactionDriver<'_> {
     }
     fn discard_staging(&mut self, _: &MigrationJob) -> std::result::Result<(), String> {
         (|| -> Result<()> {
-            let current = read_catalog(self.root, &self.plan.source.catalog.store_incarnation)?;
+            let current = read_catalog_for_format(
+                self.root,
+                &self.plan.source.catalog.store_incarnation,
+                self.current.catalog.format_version,
+            )?;
             if current.generation == self.plan.target {
                 return Err(inline_error(
                     "refusing to discard a published compaction generation",
@@ -978,6 +1054,134 @@ mod tests {
             assert_ne!(job.phase, MigrationPhase::Superseded);
         }
         panic!("bounded copy/verify did not progress");
+    }
+
+    #[test]
+    fn received_repair_compaction_restart_preserves_pending_bound_material_and_phase_identity() {
+        let root = sinomo_testdir::TestDir::new("received-repair-compaction-restart");
+        let (store, identity) =
+            LocalContentStore::new_received_repair_fixture(root.join("content")).unwrap();
+        let requester =
+            sinomo_core::node::NodeId::from_legacy_named("received-repair-compaction-requester")
+                .unwrap();
+        let receiver =
+            sinomo_core::node::NodeId::from_legacy_named("received-repair-compaction-receiver")
+                .unwrap();
+        let make_command = |request: &str, bytes: &[u8]| crate::DfsRepairReplicaCommand {
+            request_id: request.into(),
+            background_repair: false,
+            intent_id: format!("intent-{request}"),
+            file_system_id: crate::sifs_file_system_id(),
+            object_id: crate::DfsObjectId::from_legacy_named(request).unwrap(),
+            expected_base_version: None,
+            version: crate::DfsVersion::from_legacy_named("target").unwrap(),
+            content_hash: content_hash(bytes),
+            bytes: bytes.to_vec(),
+            object_metadata: None,
+            authority_shard: None,
+        };
+        let pending = make_command("pending", b"pending material root");
+        let bound = make_command("bound", b"bound material root");
+        store
+            .prepare_received_repair(&requester, &receiver, &pending)
+            .unwrap()
+            .unwrap();
+        let prepared = store
+            .prepare_received_repair(&requester, &receiver, &bound)
+            .unwrap()
+            .unwrap();
+        store
+            .store_prepared_received_repair(&prepared, &bound.bytes)
+            .unwrap();
+        {
+            let _owner = store.content_mutation_guard().unwrap();
+            let _reservation = store.lock_content_reservations_for_write().unwrap();
+            store
+                .inline_delete_version_unlocked(
+                    bound.object_id.as_str(),
+                    bound.version.as_str(),
+                    &bound.content_hash,
+                )
+                .unwrap();
+        }
+        let before_pending = store
+            .received_repair_test_snapshot(&requester, &pending.request_id)
+            .unwrap()
+            .unwrap();
+        let before_bound = store
+            .received_repair_test_snapshot(&requester, &bound.request_id)
+            .unwrap()
+            .unwrap();
+        let stats = store.stats().unwrap();
+        force_plan(&store);
+        drive_to_publishing(&store);
+        INLINE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some((store.root.clone(), InlineFault::CatalogParentSync))
+        });
+        assert!(store.advance_inline_compaction(false, true).is_err());
+        let fixture_root = store.root.clone();
+        drop(store);
+        INLINE_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some((fixture_root, InlineFault::CatalogCertification))
+        });
+        assert!(LocalContentStore::reopen_received_repair_fixture(&identity).is_err());
+        let store = LocalContentStore::reopen_received_repair_fixture(&identity).unwrap();
+        for _ in 0..8 {
+            store.advance_inline_compaction(false, true).unwrap();
+        }
+        assert_eq!(
+            store
+                .received_repair_test_snapshot(&requester, &pending.request_id)
+                .unwrap()
+                .unwrap(),
+            before_pending
+        );
+        assert_eq!(
+            store
+                .received_repair_test_snapshot(&requester, &bound.request_id)
+                .unwrap()
+                .unwrap(),
+            before_bound
+        );
+        assert!(
+            store
+                .read_manifest(bound.object_id.as_str(), bound.version.as_str())
+                .is_err(),
+            "historical association cannot republish a deleted manifest"
+        );
+        assert_eq!(store.stats().unwrap(), stats);
+        let roots = store.content_reservation_roots().unwrap();
+        assert!(roots.content_hashes.contains(&pending.content_hash));
+        assert!(roots.content_hashes.contains(&bound.content_hash));
+        let prepared = store
+            .prepare_received_repair(&requester, &receiver, &pending)
+            .unwrap()
+            .unwrap();
+        store
+            .store_prepared_received_repair(&prepared, &pending.bytes)
+            .unwrap();
+        // A retained historical bound phase is not current live binding authority.
+        assert!(
+            store
+                .store_prepared_received_repair(
+                    &store
+                        .prepare_received_repair(&requester, &receiver, &bound)
+                        .unwrap()
+                        .unwrap(),
+                    &bound.bytes
+                )
+                .is_err()
+        );
+        drop(store);
+        let store = LocalContentStore::reopen_received_repair_fixture(&identity).unwrap();
+        assert_eq!(
+            store
+                .read_object_version(pending.object_id.as_str(), pending.version.as_str())
+                .unwrap()
+                .1,
+            pending.bytes
+        );
+        assert_eq!(store.read_blob(&bound.content_hash).unwrap(), bound.bytes);
     }
 
     #[test]

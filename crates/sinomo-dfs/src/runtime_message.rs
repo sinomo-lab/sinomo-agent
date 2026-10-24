@@ -25,13 +25,25 @@ pub(crate) fn checkpoint_detached_replica_delivery(
     data_dir: &sinomo_core::local::SinomoDataDir,
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
 ) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
+    checkpoint_detached_replica_delivery_with_layout(data_dir, event, None)
+}
+
+pub(crate) fn checkpoint_detached_replica_delivery_with_layout(
+    data_dir: &sinomo_core::local::SinomoDataDir,
+    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
+    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
+) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
     use crate::node_transport::DfsBackgroundReplicaDeliveryEvent;
     use crate::node_transport::DfsBackgroundReplicaDispatch;
     use sinomo_api::dfs::maintenance::DfsRepairTransferKind;
     use sinomo_core::network::NetworkDeliveryState;
-    let store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
-        crate::default_dfs_repair_attempt_snapshot_path(data_dir),
-    );
+    let store = if let Some(layout) = layout {
+        layout.queue()?
+    } else {
+        crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+            crate::default_dfs_repair_attempt_snapshot_path(data_dir),
+        )
+    };
     let matches = |message: &crate::DfsRoutedMessage, record: &crate::DfsRepairAttemptRecord| {
         let DfsNetworkMessage::RepairReplica(command) = &message.message else {
             return false;
@@ -61,14 +73,16 @@ pub(crate) fn checkpoint_detached_replica_delivery(
                     .ok_or_else(|| crate::DfsError::Metadata {
                         message: "native background repair has no original authority shard".into(),
                     })?;
-            if crate::read_local_dfs_metadata_shard_write_freeze(
-                data_dir,
-                &crate::DfsMetadataShardId::new(&shard.shard_id),
+            if crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                data_dir, &crate::DfsMetadataShardId::new(&shard.shard_id), layout,
             )?
             .is_some_and(|freeze| freeze.activated_epoch != Some(shard.epoch))
             {
                 return Ok(DfsBackgroundReplicaDispatch::Fenced);
             }
+            let original = store.validate_original_repair_dispatch(&message)?;
+            LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"))
+                .inspect_repair_payload_root(&original.root)?;
             let (records, _) = store.observe_transfer_targets(
                 &command.intent_id,
                 std::slice::from_ref(&message.target_node_id),
@@ -95,6 +109,7 @@ pub(crate) fn checkpoint_detached_replica_delivery(
                     message: "detached repair outcome differs from its pre-dispatch custody".into(),
                 });
             }
+            store.record_original_repair_delivery(&message, delivery_state)?;
             let mut desired = before.clone();
             desired.transfer_delivery_state = if producer.retrying_unresolved_transfer {
                 crate::service_repair::join_transfer_delivery(

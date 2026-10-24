@@ -1079,12 +1079,26 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         &self,
     ) -> Result<Option<crate::repair_queue_store::LocalDfsRepairQueueStore>> {
         let root = if let Some(execution) = self.publication_execution.current() {
+            if let Some(layout) = execution._data_owner.selected_original_data_layout()
+                .map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?
+            {
+                return layout.queue().map(Some);
+            }
             execution.data_root().to_path_buf()
         } else if let Some(provider) = self.publication_provider.current() {
             if provider.authority.storage_generation() != provider.storage_generation {
                 return Err(MetadataBackendError::Serde(
                     "repair queue provider storage generation advanced".into(),
                 ));
+            }
+            if let Some(layout) = provider.data_owner.selected_original_data_layout()
+                .map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?
+            {
+                return layout.queue().map(Some);
             }
             provider.data_root.clone()
         } else {
@@ -1183,6 +1197,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             .publication_execution
             .current()
             .map(|execution| sinomo_core::local::SinomoDataDir::new(execution.data_root()));
+        let selected_store = if data_dir.is_some() { self.owned_repair_queue_store()? } else { None };
         let mut born_targets =
             std::collections::BTreeMap::<String, BTreeSet<sinomo_core::node::NodeId>>::new();
         let committed = {
@@ -1190,9 +1205,15 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             let pending = &self.writes.pending_writes;
             let mut enroll = |births: &[crate::DfsRepairAttemptRecord]| {
                 if let Some(data_dir) = &data_dir {
-                    crate::service_repair::enroll_prepared_repair_targets(
-                        data_dir, current, pending, births,
-                    )?;
+                    if let Some(store) = &selected_store {
+                        crate::service_repair::enroll_prepared_repair_targets_in_store(
+                            data_dir, store, current, pending, births,
+                        )?;
+                    } else {
+                        crate::service_repair::enroll_prepared_repair_targets(
+                            data_dir, current, pending, births,
+                        )?;
+                    }
                     for birth in births {
                         born_targets
                             .entry(birth.intent_id.clone())

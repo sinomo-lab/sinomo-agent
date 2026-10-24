@@ -4,11 +4,29 @@ impl LocalContentStore {
     /// Initializes only the current catalog. Existing content roots must be
     /// converted by the storage preparation provider before opening.
     pub(in crate::content_store) fn initialize_inline_bindings(&self) -> Result<()> {
+        self.initialize_bindings_for_explicit_owner(INLINE_FORMAT_VERSION)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn initialize_received_repair_fixture_bindings(&self) -> Result<()> {
+        self.initialize_bindings_for_explicit_owner(RECEIVED_REPAIR_FIXTURE_VERSION)
+    }
+
+    fn initialize_bindings_for_explicit_owner(&self, expected_format: u32) -> Result<()> {
+        if self.inline_store.owner.expected_format != expected_format {
+            return Err(inline_error(
+                "initializer differs from explicit content owner capability",
+            ));
+        }
         let _owner = self.content_mutation_guard()?;
         let reservation = self.lock_content_reservations_for_write()?;
         let root = &self.inline_store.owner.root;
         if catalog_path(root).exists() {
-            let catalog = read_catalog(root, &reservation.sentinel.store_incarnation)?;
+            let catalog = read_catalog_for_format(
+                root,
+                &reservation.sentinel.store_incarnation,
+                expected_format,
+            )?;
             return certify_catalog(root, &catalog);
         }
         let bindings = root.join(INLINE_BINDING_DIR);
@@ -37,7 +55,7 @@ impl LocalContentStore {
             return Err(inline_error("unpublished initial catalog contains records"));
         }
         let catalog = InlineCatalog {
-            format_version: INLINE_FORMAT_VERSION,
+            format_version: expected_format,
             store_incarnation: reservation.sentinel.store_incarnation.clone(),
             generation: 1,
             segments: vec![InlineSegment {

@@ -248,6 +248,24 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         Ok(None)
     }
 
+    fn selected_original_data_layout(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<Arc<crate::DfsSelectedOriginalDataLayout>>> {
+        let Some((filesystem, layout)) = &self.selected_original_data_layout else {
+            return Ok(None);
+        };
+        if filesystem != file_system_id || shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected layout getter names another backend scope".into(),
+            });
+        }
+        layout.stage(filesystem, shard_id, &self.root)?;
+        Ok(Some(Arc::clone(layout)))
+    }
+
     fn publication_owner_scope(
         &self,
         file_system_id: &DfsFileSystemId,

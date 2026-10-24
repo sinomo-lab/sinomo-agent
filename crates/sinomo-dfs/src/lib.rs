@@ -510,6 +510,7 @@ pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,
     DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
+    DfsSelectedOriginalDataLayout,
     DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{

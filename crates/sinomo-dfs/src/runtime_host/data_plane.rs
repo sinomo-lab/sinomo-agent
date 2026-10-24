@@ -875,7 +875,29 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         command: sinomo_dfs::DfsMetadataJournalBatchCommand,
         context: Option<sinomo_dfs::DfsMetadataReplicaShardContext>,
     ) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsMetadataJournalBatchResponse> {
+        // NEW selected-only receiver processing clock. Capture before the
+        // async body; earlier service authority lookup is outside this cap.
+        let selected_clock = command.prefix_probe.as_ref()
+            .and_then(|probe| probe.repair_custody.as_ref())
+            .filter(|page| page.cut.version == 2)
+            .map(|_| {
+                let captured = std::time::Instant::now();
+                (captured, captured + Duration::from_secs(5))
+            });
         let data_owner = self.require_data_owner();
+        #[cfg(any(test, feature = "test-support"))]
+        let selected_clock_observation = (|| -> Result<(), DfsDataPlaneHostError> {
+            if let Some((captured, deadline)) = selected_clock {
+                let owner = data_owner.as_ref().map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+                if let Some(layout) = owner.selected_original_data_layout()
+                    .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?
+                {
+                    layout.observe_receiver_clock(&command.request_id, captured, deadline)
+                        .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+                }
+            }
+            Ok(())
+        })();
         let validation = self.validate_data_dir(data_dir.as_ref());
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
@@ -883,6 +905,8 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         Box::pin(async move {
             let _data_owner = data_owner?;
             validation?;
+            #[cfg(any(test, feature = "test-support"))]
+            selected_clock_observation?;
             #[cfg(any(test, feature = "test-support"))]
             let diagnostic = command.authority_probe.as_ref().filter(|probe| {
                 matches!(&probe.operation, crate::DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
@@ -977,11 +1001,13 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                         } else {
                             command.batch.decoded()
                         };
-                        let response = sinomo_dfs::process_dfs_metadata_journal_batch(
-                            backend,
-                            Some(context),
-                            command,
-                        );
+                        let response = if let Some((captured, deadline)) = selected_clock {
+                            crate::metadata_replication::process_dfs_metadata_journal_batch_with_selected_receiver_budget(
+                                backend, Some(context), command, captured, deadline,
+                            )
+                        } else {
+                            sinomo_dfs::process_dfs_metadata_journal_batch(backend, Some(context), command)
+                        };
                         #[cfg(any(test, feature = "test-support"))]
                         if let Some((root, probe, started)) = &diagnostic_apply {
                             crate::native_boundary_diagnostics::record(root, "replica-authority-applied", || serde_json::json!({
@@ -1070,6 +1096,14 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                         .await;
                     }
                 }
+            }
+            if selected_clock.is_some_and(|(_, deadline)| std::time::Instant::now() >= deadline)
+                && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
+            {
+                return Ok(daemon_dfs_metadata_journal_rejection_for(
+                    response.request_id, response.shard_id, rejection_next_after_sequence,
+                    "selected receiver processing budget expired after processing; DATA retained without ACK",
+                ));
             }
             Ok(response)
         })

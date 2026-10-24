@@ -383,6 +383,7 @@ struct LocalMetadataShardSlot {
     config: DfsMetadataShardConfig,
     root: PathBuf,
     open_mode: LocalMetadataShardOpenMode,
+    selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     initialization: Mutex<()>,
     backend: OnceLock<Box<LocalSobjMetadataBackend>>,
 }
@@ -399,6 +400,7 @@ struct ResidentLocalMetadataShardSlot {
     config: DfsMetadataShardConfig,
     root: PathBuf,
     open_mode: LocalMetadataShardOpenMode,
+    selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     state: Mutex<ResidentLocalMetadataShardState>,
     available: Condvar,
     async_available: tokio::sync::Notify,
@@ -567,6 +569,7 @@ impl ResidentLocalMetadataShardSlot {
             config,
             root,
             open_mode,
+            selected_original_data_layout,
             initialization: _,
             backend,
         } = slot;
@@ -578,6 +581,7 @@ impl ResidentLocalMetadataShardSlot {
             config: config.clone(),
             root,
             open_mode,
+            selected_original_data_layout,
             state: Mutex::new(match backend {
                 Some(backend) => ResidentLocalMetadataShardState::Available(backend),
                 None => ResidentLocalMetadataShardState::Unopened,
@@ -592,7 +596,7 @@ impl ResidentLocalMetadataShardSlot {
     }
 
     fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode).map(Box::new)
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone()).map(Box::new)
     }
 
     fn try_checkout(self: &Arc<Self>) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
@@ -1330,17 +1334,31 @@ impl ResidentLocalShardedMetadataBackend {
                 Ok(reusable)
             },
         )??;
+        let selected_layout = self.inner.shards.values()
+            .find_map(|slot| slot.selected_original_data_layout.clone());
+        if let Some(layout) = &selected_layout {
+            layout.check_routing_root(&root)?;
+            if self.inner.shards.values().any(|slot| slot.selected_original_data_layout.as_ref()
+                .is_none_or(|other| !Arc::ptr_eq(other, layout)))
+            {
+                return Err(MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other,
+                    message: "resident selected layout context is inconsistent".into(),
+                });
+            }
+        }
         let retained_ids = reusable.keys().cloned().collect::<BTreeSet<_>>();
         // Release changed/removed slots and the predecessor router before
         // normal current opening. Retained exact slots keep their one shared
         // checkout state, status and instance; no second pool is opened.
         drop(self);
-        let mut current = LocalShardedMetadataBackend::open_with_retained_shards(
+        let mut current = LocalShardedMetadataBackend::open_with_retained_shards_and_layout(
             root,
             shards,
             true,
             Some(local_node_id),
             &retained_ids,
+            selected_layout,
         )?
         .into_resident();
         let inner = Arc::get_mut(&mut current.inner).ok_or_else(|| {
@@ -1644,6 +1662,7 @@ impl ResidentLocalShardedMetadataBackend {
                 config,
                 root: slot.root.clone(),
                 open_mode: slot.open_mode,
+                selected_original_data_layout: slot.selected_original_data_layout.clone(),
                 initialization: Mutex::new(()),
                 backend: OnceLock::new(),
             };
@@ -1803,6 +1822,7 @@ impl LocalMetadataShardSlot {
             config,
             root,
             open_mode,
+            selected_original_data_layout: None,
             initialization: Mutex::new(()),
             backend: OnceLock::new(),
         }
@@ -1813,7 +1833,7 @@ impl LocalMetadataShardSlot {
     }
 
     fn open_backend(&self) -> Result<Box<LocalSobjMetadataBackend>> {
-        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode).map(Box::new)
+        open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode, self.selected_original_data_layout.clone()).map(Box::new)
     }
 
     fn backend(&self) -> Result<&LocalSobjMetadataBackend> {
@@ -1861,8 +1881,30 @@ fn open_local_metadata_shard_backend(
     config: &DfsMetadataShardConfig,
     root: &Path,
     open_mode: LocalMetadataShardOpenMode,
+    selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
 ) -> Result<LocalSobjMetadataBackend> {
     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+    if let Some(layout) = selected_layout {
+        if open_mode == LocalMetadataShardOpenMode::Inspection {
+            return LocalSobjMetadataBackend::open_for_inspection_with_layout(
+                shard_id, root.to_path_buf(), Some((config.file_system_id.clone(), layout)),
+            );
+        }
+        // Representation failure is non-repairable. Actual normal replica
+        // corruption keeps its existing repair-only fallback below.
+        match LocalSobjMetadataBackend::new_with_selected_layout(
+            config.file_system_id.clone(), shard_id.clone(), root.to_path_buf(), Arc::clone(&layout),
+        ) {
+            Ok(backend) => return Ok(backend),
+            Err(error) if open_mode == LocalMetadataShardOpenMode::ReplicaRepair
+                && crate::metadata_replication::metadata_backend_open_error_allows_snapshot_repair(&error) => {
+                return LocalSobjMetadataBackend::open_for_replica_repair_with_layout(
+                    shard_id, root.to_path_buf(), Some((config.file_system_id.clone(), layout)),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let mut backend = match open_mode {
         LocalMetadataShardOpenMode::Strict => {
             LocalSobjMetadataBackend::new(shard_id, root.to_path_buf())?
@@ -1928,6 +1970,17 @@ impl LocalShardedMetadataBackend {
     ) -> Result<Self> {
         let root = root.into();
         Self::open_with(root, shards, true, Some(local_node_id))
+    }
+
+    pub(crate) fn new_with_replica_repair_and_layout(
+        root: PathBuf,
+        shards: Vec<DfsMetadataShardConfig>,
+        local_node_id: &NodeId,
+        layout: Arc<crate::DfsSelectedOriginalDataLayout>,
+    ) -> Result<Self> {
+        Self::open_with_retained_shards_and_layout(
+            root, shards, true, Some(local_node_id), &BTreeSet::new(), Some(layout),
+        )
     }
 
     /// Open a sharded backend for read-only inspection/status.
@@ -2009,11 +2062,32 @@ impl LocalShardedMetadataBackend {
 
     fn open_with_retained_shards(
         root: PathBuf,
-        mut shards: Vec<DfsMetadataShardConfig>,
+        shards: Vec<DfsMetadataShardConfig>,
         initialize_layout: bool,
         replica_repair_local_node_id: Option<&NodeId>,
         retained_ids: &BTreeSet<DfsMetadataShardId>,
     ) -> Result<Self> {
+        Self::open_with_retained_shards_and_layout(
+            root, shards, initialize_layout, replica_repair_local_node_id, retained_ids, None,
+        )
+    }
+
+    fn open_with_retained_shards_and_layout(
+        root: PathBuf,
+        mut shards: Vec<DfsMetadataShardConfig>,
+        initialize_layout: bool,
+        replica_repair_local_node_id: Option<&NodeId>,
+        retained_ids: &BTreeSet<DfsMetadataShardId>,
+        selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    ) -> Result<Self> {
+        if let Some(layout) = &selected_layout {
+            layout.check_routing_root(&root)?;
+        } else {
+            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+                .map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?;
+        }
         if shards.is_empty() {
             return Err(MetadataBackendError::Serde(
                 "local sharded metadata backend requires at least one shard".to_string(),
@@ -2024,10 +2098,13 @@ impl LocalShardedMetadataBackend {
                 &root,
                 &crate::DfsStoragePreparationScope::MetadataRouting,
             )?;
+            if let Some(layout) = &selected_layout { layout.check_routing_root(&root)?; }
             create_dir_all(root.join("shard-index").join("objects"))?;
         }
+        if let Some(layout) = &selected_layout { layout.check_routing_root(&root)?; }
         canonicalize_routing_topology(&mut shards);
         let routing_history = load_routing_topology_history(&root, &shards, initialize_layout)?;
+        if let Some(layout) = &selected_layout { layout.check_routing_root(&root)?; }
         let mut shard_configs = BTreeMap::new();
         let mut shard_slots = Vec::with_capacity(shards.len());
         for shard in shards {
@@ -2051,10 +2128,14 @@ impl LocalShardedMetadataBackend {
             } else {
                 LocalMetadataShardOpenMode::Strict
             };
-            shard_slots.push((
-                shard_id,
-                LocalMetadataShardSlot::new(shard, shard_root, open_mode),
-            ));
+            if let Some(layout) = &selected_layout {
+                #[cfg(any(test, feature = "test-support"))]
+                if initialize_layout { layout.admit_stage(&shard.file_system_id, &shard_id, &shard_root)?; }
+                layout.stage(&shard.file_system_id, &shard_id, &shard_root)?;
+            }
+            let mut slot = LocalMetadataShardSlot::new(shard, shard_root, open_mode);
+            slot.selected_original_data_layout = selected_layout.clone();
+            shard_slots.push((shard_id, slot));
         }
         let replica_repair_local_node_id = replica_repair_local_node_id.cloned();
         let (eager_slots, deferred_slots): (Vec<_>, Vec<_>) =
@@ -2100,6 +2181,12 @@ impl LocalShardedMetadataBackend {
             .iter()
             .map(|topology| compile_routing_indexes(topology.iter().cloned()))
             .collect::<Result<Vec<_>>>()?;
+        if let Some(layout) = &selected_layout {
+            layout.check_routing_root(&root)?;
+            for (shard_id, config) in &shard_configs {
+                layout.stage(&config.file_system_id, &DfsMetadataShardId::new(shard_id), &root.join(key_segment(shard_id)))?;
+            }
+        }
 
         Ok(Self {
             root,
@@ -3470,6 +3557,23 @@ impl LocalShardedMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    fn selected_original_data_layout(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<Arc<crate::DfsSelectedOriginalDataLayout>>> {
+        let Some(slot) = self.shards.get(shard_id) else { return Ok(None); };
+        let Some(layout) = &slot.selected_original_data_layout else { return Ok(None); };
+        if &slot.config.file_system_id != file_system_id {
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected router getter names another filesystem".into(),
+            });
+        }
+        layout.stage(file_system_id, shard_id, &slot.root)?;
+        Ok(Some(Arc::clone(layout)))
+    }
+
     #[cfg(test)]
     fn test_receipt_scan_counts_by_shard(&self) -> BTreeMap<DfsMetadataShardId, (usize, usize)> {
         self.shards

@@ -19,6 +19,18 @@ use crate::transfer::{
 };
 use crate::*;
 
+/// Minted only after admitted native receipt application, or an admitted
+/// exact persisted application read. The queue seals settlement atomically.
+/// An observed response alone cannot construct this application witness.
+pub(crate) struct AppliedOriginalRepair {
+    observed: crate::repair_queue_store::RepairObservedResult,
+}
+impl AppliedOriginalRepair {
+    pub(crate) fn observed(&self) -> &crate::repair_queue_store::RepairObservedResult {
+        &self.observed
+    }
+}
+
 /// Observe the actual producer maps without changing transfer custody.
 fn pending_repair_transfer_observation<'a>(
     pending: &'a PendingNetworkedWrite,
@@ -357,6 +369,206 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .cloned()
     }
 
+    fn original_repair_execution_admits(
+        &self,
+        birth: &crate::repair_queue_store::RepairOriginalBirth,
+    ) -> Result<bool, DfsError> {
+        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+            return Ok(false);
+        };
+        if birth.original.source_node_id != self.node_id {
+            return Ok(false);
+        }
+        let Some(shard) = command.authority_shard.as_ref() else {
+            return Ok(false);
+        };
+        let (Some(backend), Some(execution)) = (
+            self.metadata_backend.as_ref(),
+            self.publication_execution.current(),
+        ) else {
+            return Ok(false);
+        };
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let owner = backend.publication_owner_scope(&command.file_system_id, &shard_id)?;
+        Ok(execution.admits(&owner, &command.file_system_id, &shard_id))
+    }
+
+    /// Read exact persisted application material under the ACTUAL native
+    /// execution admission. A retained provider/empty job list is insufficient.
+    fn already_applied_original_repair(
+        &self,
+        birth: &crate::repair_queue_store::RepairOriginalBirth,
+        observed: crate::repair_queue_store::RepairObservedResult,
+    ) -> Result<Option<AppliedOriginalRepair>, DfsError> {
+        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+            return Ok(None);
+        };
+        let Some(shard) = command.authority_shard.as_ref() else {
+            return Ok(None);
+        };
+        let (Some(backend), Some(execution)) = (
+            self.metadata_backend.as_ref(),
+            self.publication_execution.current(),
+        ) else {
+            return Ok(None);
+        };
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let owner = backend.publication_owner_scope(&command.file_system_id, &shard_id)?;
+        if !execution.admits(&owner, &command.file_system_id, &shard_id) {
+            return Ok(None);
+        }
+        let Some(receipt) = backend.get_receipt_on_shard(
+            &shard_id,
+            &command.object_id,
+            &command.version,
+            &birth.original.target_node_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        if receipt.receipt.file_system_id != command.file_system_id
+            || receipt.receipt.object_id != command.object_id
+            || receipt.receipt.committed_version != command.version
+            || receipt.replica_node_id != birth.original.target_node_id
+            || receipt.content_hash.as_deref() != Some(command.content_hash.as_str())
+        {
+            return Ok(None);
+        }
+        // put_metadata_receipt also maintains visible-head locations. Both
+        // effects must already exist; never rewrite a newer head to settle old work.
+        if let Some(object) = backend.get_object(&command.object_id)?
+            && object.version == command.version
+            && object.kind != DfsObjectKind::Tombstone
+            && (object.file_system_id != command.file_system_id
+                || object.content_hash.as_deref() != Some(command.content_hash.as_str())
+                || !object
+                    .current_locations
+                    .contains(&birth.original.target_node_id))
+        {
+            return Ok(None);
+        }
+        Ok(Some(AppliedOriginalRepair { observed }))
+    }
+
+    /// Resolve at most this selected target. The stored original supplies
+    /// correlation; only exact already-applied evidence can settle it here.
+    /// Missing evidence stays pending. No transport/new metadata effect/ID occurs.
+    fn recover_observed_original_repair(
+        &mut self,
+        birth: &crate::repair_queue_store::RepairOriginalBirth,
+    ) -> Result<bool, DfsError> {
+        let Some(response) = birth
+            .observed
+            .iter()
+            .find(|response| matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !self.original_repair_execution_admits(birth)? {
+            return Ok(false);
+        }
+        let Some(store) = self.owned_repair_queue_store()? else {
+            return Err(DfsError::Distributed {
+                message: "stored result recovery requires the actual native owner".into(),
+            });
+        };
+        // This revalidates every response field against the complete synced
+        // head and persists/deduplicates the exact observation, not a Boolean.
+        let observed = store
+            .observe_original_repair_result(&self.node_id, &response)?
+            .ok_or_else(|| DfsError::Distributed {
+                message: "stored result lost original custody".into(),
+            })?;
+        if let Some(applied) = self.already_applied_original_repair(birth, observed.clone())? {
+            let closed = store.close_applied_original_repair(&applied)?;
+            self.content.release_repair_payload(&closed)?;
+            // This branch authors no metadata or network effect, including
+            // when the intent was compacted and no repair job remains.
+            return Ok(true);
+        }
+        // A missing receipt may be a LATER authoritative withdrawal, not a
+        // crash before first application. Stable request/intent/version/hash
+        // and current authority do not order this old positive against that
+        // negative observation. Reauthoring metadata here would erase a valid
+        // deficit without contacting the holder. Retain original custody until
+        // the existing metadata contract provides causal application evidence.
+        Ok(false)
+    }
+
+    fn recover_observed_original_repair_page(
+        &mut self,
+        limit: usize,
+        intents: Option<&BTreeSet<String>>,
+        exclusions: Option<&DfsMaintenanceExecutionExclusions>,
+    ) -> Result<usize, DfsError> {
+        let Some(store) = self.owned_repair_queue_store()? else {
+            return Ok(0);
+        };
+        let page = store.observed_original_repair_page(limit)?;
+        let mut recovered = 0;
+        for birth in page {
+            let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+                return Err(DfsError::Distributed {
+                    message: "original recovery page contains another effect".into(),
+                });
+            };
+            if intents.is_some_and(|intents| !intents.contains(&command.intent_id))
+                || exclusions
+                    .is_some_and(|excluded| excluded.contains(&birth.original.target_node_id))
+            {
+                continue;
+            }
+            // At most `limit` visits even when rows/jobs disappeared. Pending
+            // visits do not consume send capacity and cannot starve unrelated
+            // ordinary repair behind the same permanently missing evidence.
+            recovered += usize::from(self.recover_observed_original_repair(&birth)?);
+        }
+        Ok(recovered)
+    }
+
+    fn original_repair_request_for_target(
+        &mut self,
+        intent: &str,
+        target: &NodeId,
+        pending: &PendingNetworkedWrite,
+    ) -> Result<Option<String>, DfsError> {
+        if let Some(store) = self.owned_repair_queue_store()?
+            && let Some(birth) = store.original_repair_for_slot(intent, target)?
+        {
+            if self.recover_observed_original_repair(&birth)? {
+                return Ok(None);
+            }
+            let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+                return Err(DfsError::Distributed {
+                    message: "original custody is not Repair".into(),
+                });
+            };
+            if !birth.observed.is_empty() {
+                return Ok(None);
+            }
+            if birth.original.source_node_id != self.node_id
+                || pending
+                    .repair_inflight_request_ids
+                    .get(target)
+                    .is_some_and(|id| id != &command.request_id)
+                || pending.stage_inflight_request_ids.contains_key(target)
+            {
+                return Err(DfsError::Distributed {
+                    message: "original Repair awaits exact same-producer recovery".into(),
+                });
+            }
+            return Ok(Some(command.request_id.clone()));
+        }
+        Ok(Some(
+            pending
+                .repair_inflight_request_ids
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| self.next_request_id()),
+        ))
+    }
+
     fn prepare_repair_fanout_jobs(
         &mut self,
         job: &DistributedRepairJob,
@@ -366,11 +578,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusions: &DfsMaintenanceExecutionExclusions,
         consumed: &mut BTreeSet<(String, NodeId)>,
     ) -> Result<Vec<(DistributedRepairJob, String)>, DfsError> {
-        let request_id = pending
-            .repair_inflight_request_ids
-            .get(&job.missing_replica_node_id)
-            .cloned()
-            .unwrap_or_else(|| self.next_request_id());
+        let Some(request_id) = self.original_repair_request_for_target(
+            &job.intent_id,
+            &job.missing_replica_node_id,
+            pending,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
         let mut fanout = vec![(job.clone(), request_id)];
         if remaining > 1
             && let Some(companion) =
@@ -386,11 +601,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .cloned()
                 .expect("same-intent pending repair validated");
             if self.pending_repair_targets_current_content(&companion, &companion_pending)? {
-                let request_id = companion_pending
-                    .repair_inflight_request_ids
-                    .get(&companion.missing_replica_node_id)
-                    .cloned()
-                    .unwrap_or_else(|| self.next_request_id());
+                let Some(request_id) = self.original_repair_request_for_target(
+                    &companion.intent_id,
+                    &companion.missing_replica_node_id,
+                    &companion_pending,
+                )?
+                else {
+                    return Ok(fanout);
+                };
                 consumed.insert((
                     companion.intent_id.clone(),
                     companion.missing_replica_node_id.clone(),
@@ -1206,14 +1424,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &command.content_hash,
                 )
             })
-            .and_then(|()| {
-                self.store_command_bytes(
-                    &command.object_id,
-                    &command.version,
-                    &command.content_hash,
-                    &command.bytes,
-                )
-            }) {
+            .and_then(|()| self.store_received_repair_content(&requester_node_id, &command))
+        {
             Ok(()) => {
                 let local_node_id = self.node_id.clone();
                 match self.commit_replica_metadata_cache(
@@ -1251,6 +1463,54 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.version,
             result,
         ))
+    }
+
+    // This local fixture-gated content proof does not replace any preflight,
+    // later metadata publication or reply handling. Default stores return None
+    // without I/O and take precisely the existing V1 content path.
+    fn store_received_repair_content(
+        &self,
+        requester: &NodeId,
+        command: &DfsRepairReplicaCommand,
+    ) -> Result<(), DfsError> {
+        fn content_error(error: crate::ContentStoreError) -> DfsError {
+            match error {
+                crate::ContentStoreError::BlobHashMismatch { expected, actual } => {
+                    DfsError::ContentHashMismatch { expected, actual }
+                }
+                error => error.into(),
+            }
+        }
+        let Some(prepared) = self
+            .content
+            .prepare_received_repair(requester, &self.node_id, command)
+            .map_err(content_error)?
+        else {
+            return self.store_command_bytes(
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+                &command.bytes,
+            );
+        };
+        #[cfg(test)]
+        self.content
+            .received_repair_after_prepared_test_cut()
+            .map_err(content_error)?;
+        let effect = self
+            .content
+            .store_prepared_received_repair(&prepared, &command.bytes)
+            .map_err(content_error)?;
+        if effect.captured_request_id() != command.request_id
+            || effect.manifest().object_id != command.object_id.as_str()
+            || effect.manifest().version != command.version.as_str()
+            || effect.manifest().content_hash != command.content_hash
+        {
+            return Err(DfsError::Distributed {
+                message: "received Repair content witness changed its invocation".into(),
+            });
+        }
+        Ok(())
     }
 
     /// A served reply can run in a different service lane from its sender.
@@ -1601,6 +1861,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
+        // Persist the complete exactly correlated response BEFORE any metadata
+        // restoration, authority lookup or application can fail. Legacy has no
+        // original body and stays explicitly outside this stronger closure.
+        let original_store = self.owned_repair_queue_store()?;
+        let observed_original = if let Some(store) = &original_store {
+            store.observe_original_repair_result(&self.node_id, &response)?
+        } else {
+            None
+        };
+        if matches!(response.result, DfsBlobTransferResult::Committed { .. })
+            && let (Some(store), Some(observed)) = (&original_store, &observed_original)
+            && let Some(birth) = store.original_repair_for_result(&self.node_id, &response)?
+            && let Some(applied) = self.already_applied_original_repair(&birth, observed.clone())?
+        {
+            let closed = store.close_applied_original_repair(&applied)?;
+            self.content.release_repair_payload(&closed)?;
+            let DfsBlobTransferResult::Committed { content_hash } = response.result else {
+                unreachable!()
+            };
+            return Ok(NetworkedDfsServiceEvent::ReplicaRepaired {
+                intent_id: response.intent_id,
+                object_id: response.object_id,
+                version: response.version,
+                replica_node_id: response.replica_node_id,
+                content_hash,
+            });
+        }
         self.restore_pending_write_for_intent_if_missing(&response.intent_id, &response.object_id)?;
         if let Err(error) = self.restore_repair_response_custody(&response) {
             return Ok(NetworkedDfsServiceEvent::RepairRejected {
@@ -1633,6 +1920,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             content_hash,
                         )?;
                         service.record_owned_repair_terminal_response(&response)?;
+                        if matches!(response.result, DfsBlobTransferResult::Committed { .. })
+                            && let (Some(store), Some(observed)) =
+                                (&original_store, &observed_original)
+                        {
+                            if let Some(birth) =
+                                store.original_repair_for_result(&service.node_id, &response)?
+                                && let Some(applied) = service
+                                    .already_applied_original_repair(&birth, observed.clone())?
+                            {
+                                let closed = store.close_applied_original_repair(&applied)?;
+                                // Queue unlock precedes content mutation. Missing
+                                // exact application evidence retains custody.
+                                service.content.release_repair_payload(&closed)?;
+                            }
+                        }
+
                         service.coordinator.record_durable_receipt(
                             &response.intent_id,
                             response.replica_node_id.clone(),
@@ -1903,6 +2206,11 @@ where
         };
         let repair_attempts = restored.as_slice();
         self.restore_repair_attempt_records_merging(repair_attempts);
+        let recovered_original_count = self.recover_observed_original_repair_page(
+            max_scheduled,
+            None,
+            Some(execution_exclusions),
+        )?;
         let settled_keys = repair_attempts
             .iter()
             .filter(|record| {
@@ -1926,7 +2234,8 @@ where
                 ..Default::default()
             });
         }
-        let mut budget = DfsRepairMaintenanceBudget::new(max_scheduled);
+        let mut budget =
+            DfsRepairMaintenanceBudget::new(max_scheduled.saturating_sub(recovered_original_count));
         if advance_retry_tick {
             self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
             self.expire_stale_fetch_requests();
@@ -2602,6 +2911,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let restored = self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
         let repair_attempts = restored.as_slice();
         self.restore_repair_attempt_records(repair_attempts);
+        let recovered_original_count =
+            self.recover_observed_original_repair_page(max_scheduled, intent_filter, None)?;
         if (self.writes.pending_writes.is_empty() && self.coordinator.repair_jobs().is_empty())
             || max_scheduled == 0
             || intent_filter.is_some_and(BTreeSet::is_empty)
@@ -2610,7 +2921,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
         self.expire_stale_fetch_requests();
-        let mut budget = DfsRepairMaintenanceBudget::new(max_scheduled);
+        let mut budget =
+            DfsRepairMaintenanceBudget::new(max_scheduled.saturating_sub(recovered_original_count));
         self.retry_pending_stages_scoped_bounded(intent_filter, &mut budget)?;
         let repair_jobs = self.coordinator.repair_jobs().to_vec();
         let mut scheduled = Vec::new();
@@ -5314,6 +5626,17 @@ pub(crate) fn enroll_prepared_repair_targets(
         return Ok(());
     }
     let store = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(data_dir));
+    enroll_prepared_repair_targets_in_store(data_dir, &store, current, pending, births)
+}
+
+pub(crate) fn enroll_prepared_repair_targets_in_store(
+    data_dir: &sinomo_core::local::SinomoDataDir,
+    store: &LocalDfsRepairQueueStore,
+    current: &BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
+    pending: &BTreeMap<String, PendingNetworkedWrite>,
+    births: &[DfsRepairAttemptRecord],
+) -> crate::metadata_error::Result<()> {
+    if births.is_empty() { return Ok(()); }
     let invalid = |message: &str| crate::MetadataBackendError::Serde(message.into());
     let (view, observed) = store
         .view_for_maintenance()
@@ -5425,8 +5748,904 @@ pub(crate) fn enroll_prepared_repair_targets(
 }
 
 #[cfg(test)]
+mod received_repair_content_tests {
+    use super::*;
+    use crate::runtime_host::{DfsDataOwnerLock, DfsRuntimePaths};
+    use sinomo_core::DfsObjectPolicy;
+    use sinomo_core::kv::InProcessKvStore;
+    use sinomo_core::local::SinomoDataDir;
+    use sinomo_core::node::{
+        DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY, cluster_capability_policy_key,
+        cluster_member_key,
+    };
+
+    // Capture member/capability DATA verbatim from ordinary native startup,
+    // following the maintained control_plane unit-fixture pattern. It grants
+    // no live transaction, publication proof or backend authority to this copy.
+    fn receiver_control_plane(
+        requester: &NodeId,
+        local: &NodeId,
+    ) -> (
+        SharedDfsControlPlaneKvClient<InProcessKvStore>,
+        DfsMetadataShardConfig,
+    ) {
+        let requester = requester.clone();
+        let local = local.clone();
+        std::thread::spawn(move || {
+            let mut runtime = crate::test_runtime::DfsTestRuntime::new(
+                "received-repair-captured-cp-data",
+                requester.clone(),
+            )
+            .unwrap();
+            runtime.define_node(local.clone()).unwrap();
+            runtime.start_nodes().unwrap();
+            let shard = runtime.root_shard().unwrap();
+            assert_eq!(shard.primary_node_id, requester);
+            assert!(shard.replica_node_ids.contains(&local));
+            let paths = sinomo_core::network::ClusterPaths::new(runtime.data_dir(&requester));
+            let mut source = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+                &paths,
+                &runtime.runtime_handle(),
+            );
+            let nodes = [&requester, &local];
+            let keys = nodes
+                .iter()
+                .flat_map(|node| {
+                    [
+                        cluster_member_key(node),
+                        cluster_capability_policy_key(node),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let entries = source.get_authoritative_consistent(&keys).unwrap();
+            assert_eq!(entries.len(), keys.len());
+            let mut data = InProcessKvStore::new();
+            for (key, entry) in keys.into_iter().zip(entries) {
+                if let Some(entry) = entry {
+                    assert_eq!(entry.key, key);
+                    data.put(entry.key, entry.value, None).unwrap();
+                }
+            }
+            for node in nodes {
+                let member = data
+                    .get(&cluster_member_key(node))
+                    .unwrap()
+                    .decode::<sinomo_core::ClusterMemberRecord>()
+                    .unwrap();
+                assert_eq!(&member.node_id, node);
+                assert!(member.state.is_authorized());
+                assert!(
+                    member
+                        .capabilities
+                        .iter()
+                        .any(|c| c.as_str() == DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY)
+                );
+            }
+            DfsControlPlaneStore::new(&mut data)
+                .put_metadata_shard(&shard)
+                .unwrap();
+            drop(source);
+            runtime.close().unwrap();
+            (SharedDfsControlPlaneKvClient::new(data), shard)
+        })
+        .join()
+        .expect("ordinary native configuration DATA producer")
+    }
+
+    // No backend is fabricated. These local receiver controls exercise owner,
+    // base, content and normal cache/reply handling, not backend intent/receipt
+    // or current-publication authority. Those need native metadata fixtures.
+    fn receiver(
+        content: LocalContentStore,
+    ) -> (
+        NetworkedDfsService<DfsNodeTransport>,
+        NodeId,
+        DfsRepairReplicaCommand,
+    ) {
+        let requester = NodeId::from_legacy_named("received-repair-owner").unwrap();
+        let local = NodeId::from_legacy_named("received-repair-local").unwrap();
+        let (control_plane, shard) = receiver_control_plane(&requester, &local);
+        let mut service = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(local),
+            content,
+        )
+        .with_control_plane(control_plane);
+        let object = DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named("received-repair-object").unwrap(),
+            file_system_id: crate::sifs_file_system_id(),
+            path: "/received-repair.bin".into(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: requester.clone(),
+            current_locations: vec![requester.clone()],
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: DfsVersion::from_legacy_named("base").unwrap(),
+            policy: DfsObjectPolicy::LocalOwned,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        service.metadata.add_object(object.clone()).unwrap();
+        let selected = service
+            .select_metadata_shard_for_object(&object)
+            .unwrap()
+            .expect("fixture shard");
+        assert_eq!(selected, shard);
+        assert_ne!(
+            selected.primary_node_id, service.node_id,
+            "exercise the existing nonauthoritative replica cache branch"
+        );
+        let bytes = b"actual receiver captured owned body".to_vec();
+        let command = DfsRepairReplicaCommand {
+            request_id: "actual-received-repair".into(),
+            background_repair: true,
+            intent_id: "actual-received-intent".into(),
+            file_system_id: object.file_system_id,
+            object_id: object.object_id,
+            expected_base_version: Some(object.version),
+            version: DfsVersion::from_legacy_named("target").unwrap(),
+            content_hash: crate::content_hash(&bytes),
+            bytes,
+            object_metadata: None,
+            authority_shard: None,
+        };
+        (service, requester, command)
+    }
+
+    #[test]
+    fn received_repair_default_v1_receiver_keeps_normal_content_and_metadata_result() {
+        let root = sinomo_testdir::TestDir::new("received-repair-default-receiver");
+        let data = SinomoDataDir::new(root.path());
+        let _owner = DfsDataOwnerLock::acquire(&DfsRuntimePaths::new(&data)).unwrap();
+        let content = LocalContentStore::new(data.dfs_dir().join("content")).unwrap();
+        let (mut service, requester, command) = receiver(content);
+        let event = service
+            .handle_repair_replica(requester.clone(), command.clone())
+            .unwrap();
+        assert!(
+            matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
+            "{event:?}"
+        );
+        assert_eq!(
+            service
+                .content
+                .read_object_version(command.object_id.as_str(), command.version.as_str())
+                .unwrap()
+                .1,
+            command.bytes
+        );
+        assert_eq!(
+            service.metadata.object(&command.object_id).unwrap().version,
+            command.version
+        );
+        assert!(
+            service
+                .content
+                .received_repair_test_snapshot(&requester, &command.request_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn received_repair_fixture_receiver_binds_exact_capture_and_keeps_metadata_path() {
+        let root = sinomo_testdir::TestDir::new("received-repair-fixture-receiver");
+        let (content, identity) =
+            LocalContentStore::new_received_repair_fixture(root.join("content")).unwrap();
+        let (mut service, requester, command) = receiver(content);
+        let event = service
+            .handle_repair_replica(requester.clone(), command.clone())
+            .unwrap();
+        assert!(
+            matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
+            "{event:?}"
+        );
+        let object = service.metadata.object(&command.object_id).unwrap();
+        assert_eq!(object.version, command.version);
+        assert_eq!(object.content_hash.as_ref(), Some(&command.content_hash));
+        assert!(object.current_locations.contains(&service.node_id));
+        let before = service
+            .content
+            .received_repair_test_snapshot(&requester, &command.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.command, command);
+        assert!(before.bound_id.is_some());
+        drop(service);
+        let store = LocalContentStore::reopen_received_repair_fixture(&identity).unwrap();
+        assert_eq!(
+            store
+                .received_repair_test_snapshot(&requester, &command.request_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .read_object_version(command.object_id.as_str(), command.version.as_str())
+                .unwrap()
+                .1,
+            command.bytes
+        );
+    }
+
+    #[test]
+    fn received_repair_receiver_preflight_rejections_create_no_capture_or_binding() {
+        for fault in ["requester", "base", "body"] {
+            let root = sinomo_testdir::TestDir::new(&format!("received-repair-preflight-{fault}"));
+            let (content, _) =
+                LocalContentStore::new_received_repair_fixture(root.join("content")).unwrap();
+            let (mut service, requester, command) = receiver(content);
+            let mut incoming = command.clone();
+            let sender = match fault {
+                "requester" => NodeId::from_legacy_named("unauthorized-node").unwrap(),
+                "base" => {
+                    incoming.expected_base_version =
+                        Some(DfsVersion::from_legacy_named("wrong-base").unwrap());
+                    requester.clone()
+                }
+                "body" => {
+                    incoming.bytes = b"body does not match declared hash".to_vec();
+                    requester.clone()
+                }
+                _ => unreachable!(),
+            };
+            let event = service
+                .handle_repair_replica(sender.clone(), incoming)
+                .unwrap();
+            assert!(
+                matches!(event, NetworkedDfsServiceEvent::RepairRejected { .. }),
+                "{fault}: {event:?}"
+            );
+            assert!(
+                service
+                    .content
+                    .received_repair_test_snapshot(&sender, &command.request_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                service
+                    .content
+                    .read_manifest(command.object_id.as_str(), command.version.as_str())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn received_repair_receiver_unsupported_new_body_uses_ordinary_durable_path() {
+        for large_body in [true, false] {
+            let root = sinomo_testdir::TestDir::new(&format!(
+                "received-repair-receiver-large-fallback-{large_body}"
+            ));
+            let (content, identity) =
+                LocalContentStore::new_received_repair_fixture(root.join("content")).unwrap();
+            let (mut service, requester, mut command) = receiver(content);
+            if large_body {
+                command.bytes = vec![17; 32 * 1024];
+            } else {
+                command.intent_id = "x".repeat(65 * 1024);
+            }
+            command.content_hash = crate::content_hash(&command.bytes);
+            let event = service
+                .handle_repair_replica(requester.clone(), command.clone())
+                .unwrap();
+            assert!(
+                matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
+                "{event:?}"
+            );
+            assert!(
+                service
+                    .content
+                    .received_repair_test_snapshot(&requester, &command.request_id)
+                    .unwrap()
+                    .is_none()
+            );
+            drop(service);
+            let store = LocalContentStore::reopen_received_repair_fixture(&identity).unwrap();
+            assert_eq!(
+                store
+                    .read_object_version(command.object_id.as_str(), command.version.as_str())
+                    .unwrap()
+                    .1,
+                command.bytes
+            );
+            let roots = store.content_reservation_roots().unwrap();
+            assert!(
+                roots
+                    .reservations
+                    .iter()
+                    .any(|r| r.identity.object_id == command.object_id.as_str()
+                        && r.identity.version == command.version.as_str()
+                        && r.identity.content_hash == command.content_hash)
+            );
+        }
+    }
+
+    #[test]
+    fn received_repair_receiver_cut_reopens_prepared_only_then_binds_same_identity() {
+        let root = sinomo_testdir::TestDir::new("received-repair-receiver-cut");
+        let (content, identity) =
+            LocalContentStore::new_received_repair_fixture(root.join("content")).unwrap();
+        content.arm_received_repair_after_prepared_test_cut();
+        let (mut service, requester, command) = receiver(content);
+        let event = service
+            .handle_repair_replica(requester.clone(), command.clone())
+            .unwrap();
+        assert!(
+            matches!(&event, NetworkedDfsServiceEvent::RepairRejected { reason, .. } if reason.contains("after Prepared")),
+            "{event:?}"
+        );
+        let before = service
+            .content
+            .received_repair_test_snapshot(&requester, &command.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.command, command);
+        assert_eq!(before.bound_id, None);
+        assert!(
+            service
+                .content
+                .read_manifest(command.object_id.as_str(), command.version.as_str())
+                .is_err()
+        );
+        drop(service); // No service/store handle survives the actual file-backed reopen.
+        let content = LocalContentStore::reopen_received_repair_fixture(&identity).unwrap();
+        assert_eq!(
+            content
+                .received_repair_test_snapshot(&requester, &command.request_id)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        let (mut service, requester, retry) = receiver(content);
+        assert_eq!(retry, command);
+        let event = service
+            .handle_repair_replica(requester.clone(), retry)
+            .unwrap();
+        assert!(
+            matches!(event, NetworkedDfsServiceEvent::ReplicaRepaired { .. }),
+            "{event:?}"
+        );
+        let after = service
+            .content
+            .received_repair_test_snapshot(&requester, &command.request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.prepared_id, before.prepared_id);
+        assert_eq!(after.prepared_seal, before.prepared_seal);
+        assert_eq!(after.command, before.command);
+        assert!(after.bound_id.is_some());
+    }
+}
+
+#[cfg(test)]
 mod receipt_projection_tests {
     use super::*;
+
+    /// Test-only use of the EXISTING caller-deadline contract. Registered Main
+    /// delegates namespace work, so routed sync clamps its internal requested
+    /// timeout to this earlier deadline; no production timeout is changed.
+    fn registered_seed_sync_with_deadline(
+        writer: &mut NetworkedDfsService<DfsNodeTransport>,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<DfsPosixFileSyncCertificate, DfsPosixError> {
+        assert!(writer.transport.delegates_local_namespace_authority());
+        assert_eq!(writer.transport.operation_deadline(), Some(deadline));
+        let result = writer.posix_sync_file(path, DfsPosixSyncKind::File);
+        assert_eq!(
+            writer.transport.operation_deadline(),
+            Some(deadline),
+            "nested sync must preserve the stricter caller deadline"
+        );
+        result
+    }
+
+    /// Both arms use fresh native roots with the same deterministic node IDs,
+    /// configuration, policy, payload and one binary. Only the seed preparation
+    /// contract differs. The 5s budget starts BEFORE write in both arms; R41
+    /// started its 5s clock after write, so this comparison is stricter.
+    fn controlled_seed_arm(
+        registered_main: bool,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let name = "native-original-repair-seed-pair";
+        let path = "/services/original-repair-seed-pair.bin";
+        let bytes = b"native original Repair body";
+        let (runtime, browser, config) =
+            crate::test_support::current_native_metadata_service(name, 2, path)?;
+        drop(browser);
+        let owner = config.primary_node_id.clone();
+        let peer = config.replica_node_ids[0].clone();
+        runtime.apply_placement_policy(
+            &owner,
+            path,
+            DfsPlacementScope::Subtree,
+            DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2)
+                .unwrap(),
+        )?;
+        let mut policy_reader = runtime.metadata_primary_service(path)?;
+        let (_, _, actual_policy) = policy_reader
+            .managed_replication_policy_for_path(
+                path,
+                sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+                2,
+            )
+            .map_err(|error| error.to_string())?;
+        if actual_policy.min_commit_replicas != 1 || actual_policy.desired_replicas != 2 {
+            return Err(format!(
+                "unexpected effective seed policy {actual_policy:?}"
+            ));
+        }
+        drop(policy_reader);
+        let mut writer = if registered_main {
+            runtime.client(&owner)?
+        } else {
+            runtime.metadata_primary_service(path)?
+        };
+        if writer.transport.delegates_local_namespace_authority() != registered_main {
+            return Err("seed opener has wrong actual namespace owner".into());
+        }
+        let namespace_capture = runtime.capture_namespace_requests(&owner, 32)?;
+        let started = std::time::Instant::now();
+        let budget = sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let deadline = started + budget;
+        let previous_deadline = writer.set_transport_operation_deadline(Some(deadline));
+        let observation_cursor = runtime.rpc_observations().len();
+        let mut report = serde_json::json!({
+            "arm":if registered_main {"registered-main-write-sync"} else {"owning-core-write-maintenance"},
+            "configuration":config, "effective_policy":format!("{actual_policy:?}"),
+            "path":path, "payload_bytes":bytes.len(), "caller_budget_seconds":budget.as_secs_f64(),
+            "clock_start":"before-write", "phase":"write", "prepared":false,
+            "root":runtime.data_dir(&owner).root(), "maintenance_calls":[],
+            "local_fallback_exclusion":"not claimed; typed Main ingress and strict returned elapsed budget are checked"
+        });
+        let written = writer.posix_write_file(
+            path,
+            bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                replica_candidates: vec![owner.clone(), peer.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        );
+        report["write_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
+        let stat = match written {
+            Ok(stat) => Some(stat),
+            Err(error) => {
+                report["write_error"] = serde_json::json!(error.to_string());
+                None
+            }
+        };
+        let barrier_started = std::time::Instant::now();
+        let mut maintenance_calls = Vec::new();
+        // Errors belong to this arm's measured outcome, never an early return
+        // that skips the common explicit runtime drain/report tail below.
+        let barrier: std::result::Result<(), String> = (|| {
+            let stat = stat.as_ref().ok_or("write failed; barrier not attempted")?;
+            report["phase"] = serde_json::json!("barrier");
+            if registered_main {
+                registered_seed_sync_with_deadline(&mut writer, path, deadline)
+                    .map_err(|error| error.to_string())
+                    .and_then(|certificate| {
+                        if certificate.target.version == stat.version
+                            && certificate.content_evidence.required_receipts == 2
+                        {
+                            Ok(())
+                        } else {
+                            Err("sync returned a different immutable target or durability".into())
+                        }
+                    })
+            } else {
+                loop {
+                    let receipts = writer
+                        .metadata_backend()
+                        .ok_or("seed Core has no backend")?
+                        .receipts_for_version(&stat.object_id, &stat.version)
+                        .map_err(|error| error.to_string())?;
+                    if receipts.len() == 2 {
+                        break Ok(());
+                    }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break Err("same 5s seed caller deadline expired".into());
+                    }
+                    let tick = runtime.maintenance_tick(&owner, remaining)?;
+                    maintenance_calls.push(format!("{:?}", tick.outcome));
+                    if let Err(error) = tick.outcome {
+                        break Err(error);
+                    }
+                }
+            }
+        })();
+        let within_budget = std::time::Instant::now() <= deadline;
+        let deadline_preserved = writer.transport.operation_deadline() == Some(deadline);
+        report["barrier_seconds"] = serde_json::json!(barrier_started.elapsed().as_secs_f64());
+        report["seed_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
+        report["within_caller_budget"] = serde_json::json!(within_budget);
+        report["caller_deadline_preserved"] = serde_json::json!(deadline_preserved);
+        report["barrier_result"] = serde_json::json!(format!("{barrier:?}"));
+        report["maintenance_calls"] = serde_json::json!(maintenance_calls);
+        writer.set_transport_operation_deadline(previous_deadline);
+        let events = runtime.rpc_observations();
+        let observations_complete =
+            events.len() >= observation_cursor && runtime.observation_dropped_count() == 0;
+        let main_namespace_completions = events
+            .get(observation_cursor..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|event| {
+                event.route == DFS_DATA_NAMESPACE_ROUTE
+                    && event.origin == crate::test_runtime::RpcOrigin::RegisteredHost
+                    && event.phase == crate::test_runtime::RpcPhase::Completed
+            })
+            .count();
+        let raw_requests = namespace_capture.records();
+        let typed_sync_requests = raw_requests.iter().filter(|message| stat.as_ref().is_some_and(|stat| matches!(&message.message,
+            DfsNetworkMessage::NamespaceRequest(request) if matches!(&request.operation,
+                DfsNamespaceOperation::FileSync { target, .. } if target.file_system_id == stat.file_system_id && target.object_id == stat.object_id && target.version == stat.version && Some(target.content_hash.clone()) == stat.content_hash)
+        ))).collect::<Vec<_>>();
+        report["observations_complete"] = serde_json::json!(observations_complete);
+        report["registered_main_namespace_completions"] =
+            serde_json::json!(main_namespace_completions);
+        report["actual_typed_main_file_sync_requests"] = serde_json::json!(typed_sync_requests);
+        report["captured_namespace_requests"] = serde_json::json!(raw_requests);
+        drop(namespace_capture);
+        drop(writer);
+        // Common validation follows the measured barrier in BOTH arms. Keep its
+        // cost and any partial result/error, then close the actual owner even
+        // when write, maintenance, receipt inspection or binding reads failed.
+        let check_started = std::time::Instant::now();
+        let validation: std::result::Result<bool, String> = (|| {
+            let stat = stat
+                .as_ref()
+                .ok_or("write failed; immutable target unavailable")?;
+            report["stat"] = serde_json::json!({
+                "file_system_id":stat.file_system_id,
+                "object_id":stat.object_id,
+                "version":stat.version,
+                "content_hash":stat.content_hash
+            });
+            let inspector = runtime.metadata_primary_service(path)?;
+            let receipts = inspector
+                .metadata_backend()
+                .ok_or("seed inspector has no backend")?
+                .receipts_for_version(&stat.object_id, &stat.version)
+                .map_err(|error| error.to_string())?;
+            let exact_receipts = receipts.len() == 2
+                && receipts
+                    .iter()
+                    .map(|receipt| receipt.replica_node_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from([owner.clone(), peer.clone()])
+                && receipts.iter().all(|receipt| {
+                    receipt.receipt.file_system_id == stat.file_system_id
+                        && receipt.receipt.object_id == stat.object_id
+                        && receipt.receipt.committed_version == stat.version
+                        && receipt.content_hash == stat.content_hash
+                });
+            report["exact_receipts"] = serde_json::json!(exact_receipts);
+            report["receipts"] = serde_json::json!(receipts);
+            report["bindings"] = serde_json::json!([]);
+            let mut exact_bindings = true;
+            for node in [&owner, &peer] {
+                let actual = runtime.client(node)?;
+                let binding = match actual
+                    .content()
+                    .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+                {
+                    Ok((manifest, contents)) => {
+                        let exact =
+                            Some(manifest.content_hash) == stat.content_hash && contents == bytes;
+                        exact_bindings &= exact;
+                        serde_json::json!({"node":node,"exact":exact,"bytes":contents.len()})
+                    }
+                    Err(error) => {
+                        exact_bindings = false;
+                        serde_json::json!({"node":node,"exact":false,"error":error.to_string()})
+                    }
+                };
+                report["bindings"].as_array_mut().unwrap().push(binding);
+            }
+            report["exact_live_bindings"] = serde_json::json!(exact_bindings);
+            Ok(exact_receipts && exact_bindings)
+        })();
+        report["post_barrier_validation_seconds"] =
+            serde_json::json!(check_started.elapsed().as_secs_f64());
+        report["total_seed_and_validation_seconds"] =
+            serde_json::json!(started.elapsed().as_secs_f64());
+        report["prepared"] = serde_json::json!(
+            barrier.is_ok()
+                && within_budget
+                && deadline_preserved
+                && observations_complete
+                && validation == Ok(true)
+                && (!registered_main
+                    || (main_namespace_completions > 0 && !typed_sync_requests.is_empty()))
+        );
+        if let Err(error) = validation {
+            report["validation_error"] = serde_json::json!(error);
+        }
+        let report_path = runtime
+            .data_dir(&owner)
+            .root()
+            .join("controlled-seed-arm.json");
+        if let Err(error) =
+            std::fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap())
+        {
+            report["artifact_write_error"] = serde_json::json!(error.to_string());
+        }
+        let drain_started = std::time::Instant::now();
+        let drained = runtime.close();
+        report["drain_seconds"] = serde_json::json!(drain_started.elapsed().as_secs_f64());
+        report["drain_result"] = serde_json::json!(format!("{drained:?}"));
+        report["drain_ok"] = serde_json::json!(drained.is_ok());
+        // Retention-all preserves the root until the maintained outer helper
+        // archives and verifies it. Outside that helper normal cleanup may
+        // already have removed the path; stdout still retains the final report.
+        if report_path.exists() {
+            if let Err(error) =
+                std::fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap())
+            {
+                report["artifact_write_error"] = serde_json::json!(error.to_string());
+            }
+        }
+        Ok(report)
+    }
+
+    #[test]
+    fn original_repair_seed_preparation_same_budget_controlled_comparison() {
+        let core = controlled_seed_arm(false).unwrap_or_else(|error| serde_json::json!({"arm":"owning-core-write-maintenance","setup_error":error,"prepared":false}));
+        let main = controlled_seed_arm(true).unwrap_or_else(|error| serde_json::json!({"arm":"registered-main-write-sync","setup_error":error,"prepared":false}));
+        let report = serde_json::json!({"order":["owning-core-write-maintenance","registered-main-write-sync"],"arms":[core,main],"production":"same current source-qualified binary for both arms","controls":"same deterministic node IDs/configuration, explicit W1/N2, payload, options and 5s caller deadline before write","limits":"one ordered fresh-root pair; cluster/root/request/version identities and cache state differ; current production/config differs from R41; no sole historical attribution or SLO claim"});
+        eprintln!(
+            "CONTROLLED_SEED_COMPARISON {}",
+            serde_json::to_string(&report).unwrap()
+        );
+        let path = std::env::temp_dir().join(format!(
+            "controlled-seed-comparison-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        let core = &report["arms"][0];
+        let main = &report["arms"][1];
+        assert!(
+            core.get("setup_error").is_none() && main.get("setup_error").is_none(),
+            "incomplete controlled setup: {report}"
+        );
+        assert_eq!(
+            core["configuration"], main["configuration"],
+            "the pair must share exact shard configuration"
+        );
+        assert!(
+            core.get("artifact_write_error").is_none()
+                && main.get("artifact_write_error").is_none(),
+            "paired evidence could not be preserved: {report}"
+        );
+        assert_eq!(core["effective_policy"], main["effective_policy"]);
+        assert_eq!(core["caller_budget_seconds"], main["caller_budget_seconds"]);
+        assert_eq!(core["clock_start"], main["clock_start"]);
+        assert_eq!(
+            core["drain_ok"], true,
+            "old-arm owner must drain normally; seed failure is not cleanup success"
+        );
+        assert_eq!(main["drain_ok"], true, "Main owner must drain normally");
+        assert_eq!(
+            main["prepared"], true,
+            "registered Main seed must pass unchanged/stricter budget and exact baseline checks; old-arm result is evidence, not a required failure: {report}"
+        );
+    }
+
+    #[test]
+    fn original_repair_native_completion_preserves_result_and_closes_exact_root() {
+        let name = "native-original-repair-custody";
+        let path = "/services/original-repair-custody.bin";
+        let bytes = b"native original Repair body";
+        let (runtime, browser, config) =
+            crate::test_support::current_native_metadata_service(name, 2, path).unwrap();
+        drop(browser);
+        let owner = config.primary_node_id;
+        let peer = config.replica_node_ids[0].clone();
+        runtime
+            .apply_placement_policy(
+                &owner,
+                path,
+                DfsPlacementScope::Subtree,
+                DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2)
+                    .unwrap(),
+            )
+            .unwrap();
+        // Registered Main owns caller binding. Its normal sync barrier has a
+        // distinct operation contract from one bounded maintenance invocation.
+        let mut writer = runtime.client(&owner).unwrap();
+        let seed_capture = runtime.capture_namespace_requests(&owner, 32).unwrap();
+        let seed_started = std::time::Instant::now();
+        let seed_deadline = seed_started + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let previous_deadline = writer.set_transport_operation_deadline(Some(seed_deadline));
+        let stat = writer
+            .posix_write_file(
+                path,
+                bytes,
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(1, 2).unwrap(),
+                    replica_candidates: vec![owner.clone(), peer.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        let synced = registered_seed_sync_with_deadline(&mut writer, path, seed_deadline);
+        let seed_seconds = seed_started.elapsed().as_secs_f64();
+        writer.set_transport_operation_deadline(previous_deadline);
+        eprintln!(
+            "CONTROLLED_NATIVE_SEED seconds={seed_seconds} caller_budget=5 clock_start=before-write result={synced:?}"
+        );
+        assert!(
+            std::time::Instant::now() <= seed_deadline,
+            "registered Main seed exceeded the unchanged/stricter 5s caller budget"
+        );
+        let synced = synced.unwrap();
+        assert_eq!(synced.target.version, stat.version);
+        assert_eq!(synced.content_evidence.required_receipts, 2);
+        let seed_requests = seed_capture.records();
+        assert!(seed_requests.iter().any(|message| matches!(&message.message,
+            DfsNetworkMessage::NamespaceRequest(request) if matches!(&request.operation,
+                DfsNamespaceOperation::FileSync { target, .. } if target.file_system_id == stat.file_system_id && target.object_id == stat.object_id && target.version == stat.version && Some(target.content_hash.clone()) == stat.content_hash)
+        )), "seed must enter actual typed Main FileSync");
+        drop(seed_capture);
+        drop(writer);
+        let mut writer = runtime.metadata_primary_service(path).unwrap();
+        let receipts = writer
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &stat.version)
+            .unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.replica_node_id.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner.clone(), peer.clone()])
+        );
+        assert!(receipts.iter().all(|receipt| receipt.receipt.file_system_id
+            == stat.file_system_id
+            && receipt.receipt.object_id == stat.object_id
+            && receipt.receipt.committed_version == stat.version
+            && receipt.content_hash == stat.content_hash));
+        for node in [&owner, &peer] {
+            let actual = runtime.client(node).unwrap();
+            let (manifest, contents) = actual
+                .content()
+                .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+                .unwrap();
+            assert_eq!(Some(manifest.content_hash), stat.content_hash);
+            assert_eq!(contents, bytes);
+        }
+        let capture = runtime
+            .capture_checkpointed_background_repairs(&owner, 8)
+            .unwrap();
+        writer
+            .mark_remote_read_location_missing(
+                &stat.object_id,
+                &stat.version,
+                &stat.content_hash,
+                &peer,
+            )
+            .unwrap();
+        drop(writer);
+        let store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
+            crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&owner)),
+        );
+        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let mut recent_ticks = std::collections::VecDeque::with_capacity(8);
+        let birth = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "normal Main repair budget");
+            let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
+            assert!(
+                tick.outcome.is_ok(),
+                "normal Main custody completion: {:?}",
+                tick.outcome
+            );
+            recent_ticks.push_back(tick);
+            if recent_ticks.len() > 8 {
+                recent_ticks.pop_front();
+            }
+            if let Some(birth) = capture.records().iter().find_map(|captured| {
+                store
+                    .original_repair(&captured.message)
+                    .unwrap()
+                    .filter(|birth| birth.closed_at_sequence.is_some())
+            }) {
+                break birth;
+            }
+            let within_budget = std::time::Instant::now() < deadline;
+            if !within_budget {
+                // Failure-only observations of existing owners. Never extend
+                // the caller budget, publish work or infer a reply/authority.
+                let captured = capture.records();
+                eprintln!(
+                    "ORIGINAL_REPAIR_TIMEOUT capture_count={} omitted={} recent_ticks={recent_ticks:#?}",
+                    captured.len(),
+                    capture.omitted_count()
+                );
+                let mut ids = BTreeSet::new();
+                for call in &captured {
+                    if let DfsNetworkMessage::RepairReplica(command) = &call.message.message {
+                        ids.insert(command.request_id.clone());
+                    }
+                    eprintln!(
+                        "ORIGINAL_REPAIR_CAPTURE head={:?} descriptor={:?} birth={:?}",
+                        call.message,
+                        call.descriptor,
+                        store.original_repair(&call.message)
+                    );
+                }
+                eprintln!(
+                    "ORIGINAL_REPAIR_QUEUE {:?}",
+                    store.view().map(|view| view.records)
+                );
+                let events = runtime.rpc_observations();
+                let matching = events
+                    .iter()
+                    .filter(|event| {
+                        event
+                            .dfs_request_id
+                            .as_ref()
+                            .is_some_and(|id| ids.contains(id))
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "ORIGINAL_REPAIR_RPC exact_request_events={matching:#?} dropped={}",
+                    runtime.observation_dropped_count()
+                );
+            }
+            assert!(
+                within_budget,
+                "actual original Repair completion within normal existing budget"
+            );
+        };
+        assert_eq!(capture.omitted_count(), 0);
+        assert!(!birth.attempts.is_empty());
+        assert!(
+            birth
+                .observed
+                .iter()
+                .any(|response| matches!(response.result, DfsBlobTransferResult::Committed { .. }))
+        );
+        let closed = store
+            .closed_repair_birth(&birth.root.subject)
+            .unwrap()
+            .expect("durable closure");
+        let content = crate::LocalContentStore::open_for_inspection(
+            runtime.data_dir(&owner).dfs_dir().join("content"),
+        );
+        assert!(
+            content.inspect_repair_payload_root(&birth.root).is_err(),
+            "closed root is released, not a live retention promise"
+        );
+        let actual = runtime.client(&peer).unwrap();
+        assert_eq!(
+            actual
+                .content()
+                .read_blob(stat.content_hash.as_deref().unwrap())
+                .unwrap(),
+            bytes
+        );
+        drop(actual);
+        assert_eq!(closed.root(), &birth.root);
+    }
 
     #[test]
     fn bounded_repair_restore_observes_receipt_published_by_another_actual_owner_lane() {

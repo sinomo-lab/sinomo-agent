@@ -1589,6 +1589,7 @@ struct Node {
     resources: sinomo_device::NodeResourceMonitor,
     reconciler: Option<ComponentReconciler>,
     mounted_context: Option<ComponentContext>,
+    selected_original_fixture: Option<crate::runtime_host::DfsSelectedOriginalDataFixture>,
 }
 
 /// Read-only copies of actual namespace read heads at native Main ingress.
@@ -2406,6 +2407,7 @@ impl DfsTestRuntime {
                 resources: sinomo_device::NodeResourceMonitor::default(),
                 reconciler: None,
                 mounted_context: None,
+                selected_original_fixture: None,
             },
         );
         Ok(Self {
@@ -2492,6 +2494,7 @@ impl DfsTestRuntime {
                 resources: sinomo_device::NodeResourceMonitor::default(),
                 reconciler: None,
                 mounted_context: None,
+                selected_original_fixture: None,
             },
         );
         Ok(())
@@ -2673,9 +2676,14 @@ impl DfsTestRuntime {
     fn node_component_factories(
         &self,
         dfs_enabled: bool,
+        node: &NodeId,
     ) -> Result<Vec<Arc<dyn sinomo_module::ComponentFactory>>, String> {
-        let dfs: Arc<dyn sinomo_module::ComponentFactory> =
-            Arc::new(crate::component_factory().map_err(|error| error.to_string())?);
+        let dfs: Arc<dyn sinomo_module::ComponentFactory> = if let Some(fixture) = &self.nodes[node].selected_original_fixture {
+            Arc::new(crate::service::component_factory_with_selected_original_data_fixture(fixture.clone())
+                .map_err(|error| error.to_string())?)
+        } else {
+            Arc::new(crate::component_factory().map_err(|error| error.to_string())?)
+        };
         let dfs_id = dfs.descriptor().component_id.clone();
         let catalog: Arc<dyn sinomo_module::ComponentFactory> = Arc::new(
             sinomo_module::cluster_service_catalog_publisher_component_factory()
@@ -2690,6 +2698,11 @@ impl DfsTestRuntime {
             factories.insert(0, dfs);
         }
         for supplied in &self.component_factories {
+            if self.nodes[node].selected_original_fixture.is_some()
+                && supplied.descriptor().component_id == dfs_id
+            {
+                return Err("selected native fixture cannot be replaced by a supplied DFS factory".into());
+            }
             if !dfs_enabled && supplied.descriptor().component_id == dfs_id {
                 continue;
             }
@@ -2713,7 +2726,7 @@ impl DfsTestRuntime {
         node: &NodeId,
         enabled: bool,
     ) -> Result<(), String> {
-        let factories = self.node_component_factories(enabled)?;
+        let factories = self.node_component_factories(enabled, node)?;
         let endpoint = self
             .fabric
             .nodes
@@ -2825,6 +2838,28 @@ impl DfsTestRuntime {
         Ok(())
     }
 
+    /// Explicit fresh physical representation before native mounting. Ordinary
+    /// fixtures keep their current factory and readers without modification.
+    pub(crate) fn select_original_data_fixture_before_start(&mut self, node: &NodeId) -> Result<(), String> {
+        let native = self.nodes.get_mut(node).ok_or("unknown selected fixture node")?;
+        if native.reconciler.is_some() || native.mounted_context.is_some() || native.selected_original_fixture.is_some() {
+            return Err("selected representation must be supplied once before native mounting".into());
+        }
+        native.selected_original_fixture = Some(crate::runtime_host::DfsSelectedOriginalDataFixture::default());
+        Ok(())
+    }
+
+    pub(crate) fn selected_original_data_layout(&self, node: &NodeId) -> Result<Arc<crate::DfsSelectedOriginalDataLayout>, String> {
+        self.nodes[node].selected_original_fixture.as_ref()
+            .ok_or("native fixture did not select original DATA representation")?
+            .layout().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn select_genuine_original_before_handoff(&self, node: &NodeId, request_id: &str, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<(), String> {
+        self.selected_original_data_layout(node)?.select_original(node, request_id, handoff)
+            .map_err(|error| error.to_string())
+    }
+
     fn mount_node(&mut self, node: &NodeId) -> Result<(), String> {
         if self.nodes[node].reconciler.is_some() {
             return Err("duplicate live DFS test node".into());
@@ -2854,7 +2889,7 @@ impl DfsTestRuntime {
             .with_object_rpc_transport(carrier)
             .with_event_bus(ComponentEventBus::default());
         let mut reconciler = ComponentReconciler::new(context, ServiceRegistry::default());
-        let factories = self.node_component_factories(true)?;
+        let factories = self.node_component_factories(true, node)?;
         reconciler
             .reconcile(&factories)
             .map_err(|e| e.to_string())?;

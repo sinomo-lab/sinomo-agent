@@ -422,6 +422,19 @@ pub fn dfs_completed_local_primary_handoff_rebind_count(
     active_shards: &[crate::DfsMetadataShardConfig],
     authority_entries: &[KvEntry],
 ) -> Result<usize, DfsError> {
+    dfs_completed_local_primary_handoff_rebind_count_with_layout(
+        data_dir, local_node_id, pending_handoffs, active_shards, authority_entries, None,
+    )
+}
+
+pub(crate) fn dfs_completed_local_primary_handoff_rebind_count_with_layout(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    pending_handoffs: &[crate::DfsMetadataShardMembershipHandoff],
+    active_shards: &[crate::DfsMetadataShardConfig],
+    authority_entries: &[KvEntry],
+    selected_layout: Option<&crate::DfsSelectedOriginalDataLayout>,
+) -> Result<usize, DfsError> {
     let pending_shards = pending_handoffs
         .iter()
         .map(|handoff| {
@@ -440,7 +453,7 @@ pub fn dfs_completed_local_primary_handoff_rebind_count(
             continue;
         }
         let shard_id = crate::DfsMetadataShardId::new(active.shard_id.clone());
-        let Some(freeze) = crate::read_local_dfs_metadata_shard_write_freeze(data_dir, &shard_id)?
+        let Some(freeze) = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(data_dir, &shard_id, selected_layout)?
         else {
             continue;
         };
@@ -551,12 +564,9 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
         .filter(|handoff| handoff.retiring_shard.primary_node_id == *local_node_id)
         .count();
     let completed_local_primary_handoff_rebind_count =
-        dfs_completed_local_primary_handoff_rebind_count(
-            data_dir,
-            local_node_id,
-            &membership_handoffs,
-            &active_shards,
-            authority_entries,
+        dfs_completed_local_primary_handoff_rebind_count_with_layout(
+            data_dir, local_node_id, &membership_handoffs, &active_shards, authority_entries,
+            selected_native_layout_for_maintenance(data_dir)?.as_deref(),
         )?;
 
     Ok(DfsPendingMaintenanceWork {
@@ -702,7 +712,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         message_sender,
         control_plane,
     )?;
-    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut maintenance_host = native_maintenance_host(data_dir.clone())?;
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport =
         DfsMetadataNodeTransport::new(peer_node_ids, metadata_sender, snapshot_sender);
@@ -950,7 +960,7 @@ where
         return Ok(None);
     }
 
-    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut maintenance_host = native_maintenance_host(data_dir.clone())?;
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
         peer_node_ids,
@@ -1019,7 +1029,7 @@ where
             authoritative_prefix.clone(),
         )?;
     let metadata_shards = authoritative_topology.metadata_shards(&file_system.file_system_id)?;
-    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut maintenance_host = native_maintenance_host(data_dir.clone())?;
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
         peer_node_ids,
@@ -1146,7 +1156,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
     if let Some(committed_work_tracker) = committed_work_tracker {
         service.set_committed_work_tracker(committed_work_tracker);
     }
-    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut maintenance_host = native_maintenance_host(data_dir.clone())?;
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
         peer_node_ids,
@@ -1435,6 +1445,15 @@ pub struct LocalDfsMaintenanceHost {
 }
 
 impl LocalDfsMaintenanceHost {
+    fn with_queue(data_dir: SinomoDataDir, repair_queue_store: crate::LocalDfsRepairQueueStore) -> Self {
+        Self {
+            data_dir, repair_queue_store,
+            repair_queue_observation: None,
+            repair_page_observation: None,
+            repair_page_generation_change: None,
+        }
+    }
+
     pub fn new(data_dir: SinomoDataDir) -> Self {
         let repair_queue_store = crate::repair_queue_store::LocalDfsRepairQueueStore::new(
             default_dfs_repair_attempt_snapshot_path(&data_dir),
@@ -1625,6 +1644,30 @@ pub fn default_dfs_anti_entropy_cursor_path(
             "{}.sobj",
             dfs_path_safe_segment(&file_system_id.to_string())
         ))
+}
+
+/// Existing native owner supplies explicit fixture DATA, never a path flag.
+pub(crate) fn selected_native_layout_for_maintenance(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<Arc<crate::DfsSelectedOriginalDataLayout>>, DfsError> {
+    crate::runtime_host::publication_runtime_owner(&crate::default_dfs_metadata_shards_root(data_dir))
+        .map_err(|error| DfsError::Metadata { message: error.to_string() })?
+        .map(|owner| owner.selected_original_data_layout()).transpose()
+        .map(|layout| layout.flatten())
+        .map_err(|error| DfsError::Metadata { message: error.to_string() })
+}
+
+fn native_maintenance_host(data_dir: SinomoDataDir) -> Result<LocalDfsMaintenanceHost, DfsError> {
+    if let Some(layout) = selected_native_layout_for_maintenance(&data_dir)? {
+        Ok(LocalDfsMaintenanceHost::with_queue(data_dir, layout.queue()?))
+    } else { Ok(LocalDfsMaintenanceHost::new(data_dir)) }
+}
+
+pub(crate) fn read_native_repair_attempt_snapshot(data_dir: &SinomoDataDir) -> Result<Option<DfsRepairAttemptSnapshot>, DfsError> {
+    if let Some(layout) = selected_native_layout_for_maintenance(data_dir)? {
+        let view = layout.queue()?.view()?;
+        Ok((!view.records.is_empty()).then_some(DfsRepairAttemptSnapshot { records: view.records }))
+    } else { read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir)) }
 }
 
 pub fn default_dfs_repair_attempt_snapshot_path(data_dir: &SinomoDataDir) -> PathBuf {

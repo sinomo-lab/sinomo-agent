@@ -314,6 +314,20 @@ pub fn component_factory_with_storage_preparation(
 fn component_factory_with_preparation(
     preparation: Option<crate::DfsStoragePreparationProviderBuilder>,
 ) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_selected_layout(preparation, None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn component_factory_with_selected_original_data_fixture(
+    fixture: crate::runtime_host::DfsSelectedOriginalDataFixture,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_selected_layout(None, Some(fixture))
+}
+
+fn component_factory_with_selected_layout(
+    preparation: Option<crate::DfsStoragePreparationProviderBuilder>,
+    selected_fixture: Option<crate::runtime_host::DfsSelectedOriginalDataFixture>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     let descriptor =
         sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?
             .with_offer(sifs_path_access_service_offer())
@@ -353,12 +367,53 @@ fn component_factory_with_preparation(
                     &data_dir,
                     context.host_role(),
                 );
+                // Reject the experimental representation before acquiring
+                // (and writing) the physical owner lock on a default mount.
+                if selected_fixture.is_none() {
+                    for root in [
+                        crate::default_dfs_metadata_shards_root(&data_dir),
+                        crate::default_dfs_repair_attempt_snapshot_path(&data_dir)
+                            .parent().expect("native queue has a parent").to_path_buf(),
+                    ] {
+                        crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+                            .map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                    }
+                }
                 let data_owner = match crate::source_adoption::retained_owner_for_mount(context)? {
-                    Some(actual_retained_owner) => actual_retained_owner,
-                    None => Arc::new(crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
-                        .map_err(|error| sinomo_module::ComponentError::Component {
-                            component_id: caller.component_id.clone(), detail: error.to_string(),
-                        })?),
+                    Some(actual_retained_owner) => {
+                        if selected_fixture.is_none() && actual_retained_owner.selected_original_data_layout()
+                            .map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?.is_some()
+                        {
+                            return Err(sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(),
+                                detail: "default DFS mount cannot inherit a selected DATA layout".into(),
+                            });
+                        }
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(fixture) = &selected_fixture {
+                            fixture.validate_retained(&actual_retained_owner).map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                        }
+                        actual_retained_owner
+                    }
+                    None => {
+                        let mut actual = crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                            .map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(fixture) = &selected_fixture {
+                            fixture.admit(&mut actual).map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                        }
+                        Arc::new(actual)
+                    }
                 };
                 #[cfg(any(test, feature = "test-support"))]
                 let native_trace_mount = crate::native_shard_trace::register_mount(
@@ -1520,6 +1575,38 @@ mod tests {
         .expect("same retained volume OS lease released");
         drop(owner);
         runtime.close().expect("drain shared runtime");
+    }
+
+    #[test]
+    fn default_component_factory_rejects_selected_native_layout_before_owner_lock_mutation() {
+        use sinomo_module::ComponentFactory as _;
+        let name = "default-mount-selected-native-root";
+        let node = NodeId::from_legacy_named(name).unwrap();
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, node.clone()).unwrap();
+        runtime.select_original_data_fixture_before_start(&node).unwrap();
+        runtime.start_nodes().unwrap();
+        let context = runtime.component_context(&node).unwrap();
+        let path = runtime.data_dir(&node).root().join("daemon/data-owner.lock");
+        let before_bytes = std::fs::read(&path).unwrap();
+        let before_identity = std::fs::symlink_metadata(&path).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let factory = component_factory().unwrap();
+            let mounted = factory.mount(&context);
+            let error = match mounted {
+                Err(error) => error,
+                Ok(scope) => { drop(scope); panic!("default mount adopted experimental DATA"); }
+            };
+            assert!(error.to_string().contains("default reader rejects selected original physical layout"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+            assert!(crate::repair_queue_store::same_file_observation(&before_identity, &std::fs::symlink_metadata(&path).unwrap()));
+        }));
+        drop(context);
+        let closed = runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("default selected mount cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("selected owner survives rejected default mount and drains normally");
     }
 
     #[test]

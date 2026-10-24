@@ -369,7 +369,7 @@ pub(super) fn refresh_daemon_dfs_repair_queue_nonempty(
     data_dir: &SinomoDataDir,
 ) -> Result<bool, sinomo_dfs::DfsError> {
     let nonempty =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir))?
+        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(data_dir)?
             .is_some_and(|snapshot| !snapshot.records.is_empty());
     record_daemon_dfs_repair_queue_nonempty(data_dir, nonempty);
     Ok(nonempty)
@@ -696,12 +696,9 @@ pub(super) fn daemon_dfs_completed_local_primary_handoff_rebind_count(
     active_shards: &[DfsMetadataShardConfig],
     authority_entries: &[KvEntry],
 ) -> Result<usize, DaemonError> {
-    sinomo_dfs::dfs_completed_local_primary_handoff_rebind_count(
-        data_dir,
-        local_node_id,
-        pending_handoffs,
-        active_shards,
-        authority_entries,
+    sinomo_dfs::maintenance::dfs_completed_local_primary_handoff_rebind_count_with_layout(
+        data_dir, local_node_id, pending_handoffs, active_shards, authority_entries,
+        sinomo_dfs::maintenance::selected_native_layout_for_maintenance(data_dir)?.as_deref(),
     )
     .map_err(Into::into)
 }
@@ -731,7 +728,7 @@ pub(super) fn daemon_dfs_pending_reactive_maintenance_work_from_authority_entrie
         return daemon_dfs_mounted_mutation_pending_work(&data_dir, now_unix_nanos);
     }
     let repair_attempt_records =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(&data_dir)?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
     record_daemon_dfs_repair_queue_nonempty(&data_dir, !repair_attempt_records.is_empty());
@@ -897,7 +894,7 @@ fn daemon_dfs_pending_maintenance_work_with_topology(
             &authority_entries,
         )?;
     let repair_attempt_records =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(&data_dir)?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
     let placement_prefix =

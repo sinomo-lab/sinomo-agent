@@ -637,6 +637,131 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .retained_content_transfer_required(intent_id, object_id, version)?;
         let mut requests = Vec::with_capacity(targets.len());
         for (target_node_id, request_id) in targets {
+            if matches!(
+                kind,
+                ReplicaTransferKind::Repair | ReplicaTransferKind::BackgroundRepair
+            ) && (!matches!(kind, ReplicaTransferKind::BackgroundRepair) || retained_transfer)
+                && let Some(store) = self.owned_repair_queue_store()?
+                && store
+                    .original_repair_for_slot(intent_id, target_node_id)?
+                    .is_some()
+            {
+                return Err(DfsError::Distributed {
+                    message: "alternate Repair dispatch cannot bypass an unresolved original"
+                        .into(),
+                });
+            }
+            // Only current native background Repair enters this custody slice.
+            // Stage, retained repair and non-native transports keep their owners.
+            if matches!(kind, ReplicaTransferKind::BackgroundRepair)
+                && !retained_transfer
+                && let Some(store) = self.owned_repair_queue_store()?
+            {
+                let pending_error = || DfsError::Distributed {
+                    message: format!(
+                        "original Repair custody pending for intent {intent_id}, target {target_node_id}; identity/body cannot be reconstructed or replaced"
+                    ),
+                };
+                let incarnation = store.custody_incarnation()?;
+                let existing = store.original_repair_for_slot(intent_id, target_node_id)?;
+                let (routed_message, reader, descriptor) = if let Some(birth) = existing {
+                    let DfsNetworkMessage::RepairReplica(original) = &birth.original.message else {
+                        return Err(pending_error());
+                    };
+                    if original.request_id != *request_id
+                        || !birth.observed.is_empty()
+                        || birth.original.source_node_id != self.node_id
+                        || original.file_system_id != *file_system_id
+                        || original.object_id != *object_id
+                        || original.version != *version
+                        || original.content_hash != content_hash
+                        || birth.attachment.total_size_bytes != total_size_bytes
+                    {
+                        return Err(pending_error());
+                    }
+                    // Reuse the complete immutable original command, including
+                    // authority and base. Only carrier correlation is renewed.
+                    let reader = self.content.open_retained_repair_payload(&birth.root)?;
+                    let routed = self
+                        .next_dfs_routed_message(target_node_id, birth.original.message.clone());
+                    (routed, reader, birth.attachment)
+                } else {
+                    if store.legacy_repair_is_uncovered(intent_id, target_node_id)?
+                        || self
+                            .writes
+                            .pending_writes
+                            .get(intent_id)
+                            .and_then(|pending| pending.repair_retries.get(target_node_id))
+                            .is_some_and(|retry| {
+                                retry.unresolved_custody_without_request
+                                    || retry.retrying_unresolved_transfer
+                                    || retry.inflight
+                            })
+                    {
+                        return Err(pending_error());
+                    }
+                    if let Some(root) = self.content.retained_repair_for_slot(
+                        &self.node_id.to_string(),
+                        &target_node_id.to_string(),
+                        intent_id,
+                    )? {
+                        let Some(closed) = store.closed_repair_birth(&root.subject)? else {
+                            return Err(pending_error());
+                        };
+                        self.content.release_repair_payload(&closed)?;
+                    }
+                    let message = DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                        background_repair: true,
+                        request_id: request_id.clone(),
+                        intent_id: intent_id.to_owned(),
+                        file_system_id: file_system_id.clone(),
+                        object_id: object_id.clone(),
+                        expected_base_version: expected_base_version.clone(),
+                        version: version.clone(),
+                        content_hash: content_hash.to_owned(),
+                        bytes: Vec::new(),
+                        object_metadata: object_metadata.clone(),
+                        authority_shard: authority_shard.clone(),
+                    });
+                    let routed = self.next_dfs_routed_message(target_node_id, message);
+                    let descriptor = DfsRpcAttachmentDescriptor {
+                        total_size_bytes,
+                        content_hash: Some(content_hash.to_owned()),
+                    };
+                    let subject = crate::repair_queue_store::repair_subject(&incarnation, &routed)?;
+                    let digest =
+                        crate::repair_queue_store::original_repair_digest(&routed, &descriptor)?;
+                    let retained = self.content.capture_repair_payload(
+                        subject,
+                        digest,
+                        object_id.as_str(),
+                        version.as_str(),
+                        content_hash,
+                        total_size_bytes,
+                    )?;
+                    store.enroll_original_repair(&routed, &descriptor, &retained)?;
+                    let (_, reader) = retained.into_parts();
+                    (routed, reader, descriptor)
+                };
+                // This durable unknown attempt exists before either synchronous
+                // or detached transport can observe the reader/head.
+                store.record_original_repair_attempt(&routed_message)?;
+                requests.push(DfsRoutedSend::new(
+                    target_node_id.clone(),
+                    DfsRoutedCall::with_attachment(
+                        routed_message,
+                        DfsOutboundAttachment::from_reader(
+                            reader,
+                            descriptor.total_size_bytes,
+                            descriptor
+                                .content_hash
+                                .as_deref()
+                                .expect("enrolled Repair hash"),
+                        ),
+                    ),
+                ));
+                continue;
+            }
             let (_, reader) = self.open_content_hash_stream(
                 object_id,
                 version,

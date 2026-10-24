@@ -35,6 +35,333 @@ use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
 
+/// Explicit native-fixture representation context. This grants neither transfer
+/// authorization nor serving/execution authority and cannot be deserialized.
+/// Ordinary native constructors never create or infer one from disk or a page.
+#[derive(Debug)]
+pub struct DfsSelectedOriginalDataLayout {
+    data_root: std::path::PathBuf,
+    data_identity: (u64, u64),
+    owner_identity: (u64, u64),
+    queue: crate::repair_queue_store::LocalDfsRepairQueueStore,
+    queue_layout: crate::repair_queue_store::SelectedOriginalFixtureIdentity,
+    routing_layout: crate::repair_queue_store::SelectedOriginalFixtureIdentity,
+    stages: std::sync::Mutex<BTreeMap<(DfsFileSystemId, crate::DfsMetadataShardId), crate::repair_queue_store::SelectedOriginalFixtureIdentity>>,
+    selection: std::sync::Mutex<Option<(NodeId, DfsFileSystemId, crate::DfsMetadataShardId, String, crate::DfsMetadataShardMembershipHandoff)>>,
+    #[cfg(any(test, feature = "test-support"))]
+    receiver_clocks: std::sync::Mutex<(Vec<(String, std::time::Instant, std::time::Instant)>, usize)>,
+}
+
+fn selected_layout_rejection(message: impl Into<String>) -> MetadataBackendError {
+    MetadataBackendError::Rejected {
+        code: crate::DfsMetadataRejectionCode::Other,
+        message: message.into(),
+    }
+}
+
+impl DfsSelectedOriginalDataLayout {
+    /// Directory entries may change length/timestamps/link count without
+    /// replacing the physical directory. Only stable platform identity and
+    /// physical directory type bind these three observations to the held handle.
+    fn same_directory_observations(
+        before: &std::fs::Metadata,
+        opened: &std::fs::Metadata,
+        after: &std::fs::Metadata,
+    ) -> bool {
+        if [before, opened, after].iter().any(|metadata| {
+            !metadata.is_dir() || metadata.file_type().is_symlink()
+        }) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let identity = (opened.dev(), opened.ino());
+            (before.dev(), before.ino()) == identity
+                && (after.dev(), after.ino()) == identity
+        }
+        #[cfg(not(unix))]
+        {
+            // No timestamp/path fallback for unavailable directory identity.
+            false
+        }
+    }
+
+    fn directory_identity(path: &std::path::Path) -> Result<(u64, u64)> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(selected_layout_rejection("selected native root is not a physical directory"));
+        }
+        let file = std::fs::File::open(path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let opened = file.metadata()
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let after = std::fs::symlink_metadata(path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if !Self::same_directory_observations(&metadata, &opened, &after) {
+            return Err(selected_layout_rejection("selected native directory changed while opening its physical identity"));
+        }
+        crate::runtime_host::storage_file_identity(&file)
+            .map_err(|error| selected_layout_rejection(error.to_string()))
+    }
+
+    fn named_owner_identity(data_root: &std::path::Path) -> Result<(u64, u64)> {
+        let path = data_root.join("daemon/data-owner.lock");
+        let before = std::fs::symlink_metadata(&path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if !before.is_file() || before.file_type().is_symlink() {
+            return Err(selected_layout_rejection("selected named owner is not a physical file"));
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let opened = file.metadata().map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let after = std::fs::symlink_metadata(&path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if after.file_type().is_symlink()
+            || !crate::repair_queue_store::same_file_observation(&before, &opened)
+            || !crate::repair_queue_store::same_file_observation(&opened, &after)
+        { return Err(selected_layout_rejection("selected named owner changed while opening")); }
+        crate::runtime_host::storage_file_identity(&file)
+            .map_err(|error| selected_layout_rejection(error.to_string()))
+    }
+
+    /// Recheck physical identity only; the caller independently retains native
+    /// DATA ownership and the ordinary current authority/admission proof.
+    pub(crate) fn check(&self) -> Result<()> {
+        if Self::directory_identity(&self.data_root)? != self.data_identity {
+            return Err(selected_layout_rejection("selected native DATA root was replaced"));
+        }
+        if Self::named_owner_identity(&self.data_root)? != self.owner_identity
+        {
+            return Err(selected_layout_rejection("selected native owner file was replaced"));
+        }
+        self.queue.validate_selected_original_fixture(&self.queue_layout)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        self.routing_layout.check().map_err(|error| selected_layout_rejection(error.to_string()))
+    }
+
+    pub(crate) fn check_owner(&self, owner: &crate::runtime_host::DfsDataOwnerLock) -> Result<()> {
+        self.check()?;
+        if owner.physical_data_root() != self.data_root
+            || owner.storage_owner_file_identity()
+                .map_err(|error| selected_layout_rejection(error.to_string()))? != self.owner_identity
+        {
+            return Err(selected_layout_rejection("selected layout belongs to another retained DATA owner"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queue(&self) -> Result<crate::repair_queue_store::LocalDfsRepairQueueStore> {
+        self.check()?;
+        Ok(self.queue.clone())
+    }
+
+    pub(crate) fn queue_layout(&self) -> &crate::repair_queue_store::SelectedOriginalFixtureIdentity {
+        &self.queue_layout
+    }
+
+    pub(crate) fn check_routing_root(&self, root: &std::path::Path) -> Result<()> {
+        self.check()?;
+        if self.routing_layout.root() != root {
+            return Err(selected_layout_rejection("selected router names another metadata root"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage(
+        &self,
+        filesystem: &DfsFileSystemId,
+        shard: &crate::DfsMetadataShardId,
+        root: &std::path::Path,
+    ) -> Result<crate::repair_queue_store::SelectedOriginalFixtureIdentity> {
+        self.check()?;
+        let stages = self.stages.lock()
+            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?;
+        let stage = stages.get(&(filesystem.clone(), shard.clone()))
+            .ok_or_else(|| selected_layout_rejection("backend has no explicitly admitted selected stage"))?;
+        if stage.root() != root {
+            return Err(selected_layout_rejection("selected backend names another physical stage"));
+        }
+        stage.check().map_err(|error| selected_layout_rejection(error.to_string()))?;
+        Ok(stage.clone())
+    }
+
+    /// Only an explicit fresh native fixture creates its expected stage before
+    /// the backend's first preparation/recovery read. Reopen reuses this entry.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn admit_stage(
+        &self,
+        filesystem: &DfsFileSystemId,
+        shard: &crate::DfsMetadataShardId,
+        root: &std::path::Path,
+    ) -> Result<()> {
+        self.check()?;
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&self.data_root);
+        let expected = crate::default_dfs_metadata_shards_root(&data_dir)
+            .join(crate::metadata_keys::key_segment(&shard.0));
+        if expected != root {
+            return Err(selected_layout_rejection("selected shard root is outside its exact native layout"));
+        }
+        let mut stages = self.stages.lock()
+            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?;
+        let key = (filesystem.clone(), shard.clone());
+        if let Some(stage) = stages.get(&key) {
+            stage.check().map_err(|error| selected_layout_rejection(error.to_string()))?;
+            if stage.root() != root {
+                return Err(selected_layout_rejection("selected shard root changed across reopen"));
+            }
+            return Ok(());
+        }
+        if stages.values().any(|stage| stage.root() == root) {
+            return Err(selected_layout_rejection("selected physical shard already belongs to another filesystem"));
+        }
+        let parent = root.parent().ok_or_else(|| selected_layout_rejection("selected stage has no parent"))?;
+        std::fs::create_dir_all(parent).map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let stage = self.queue_layout.admit_staging_root(root.to_path_buf())
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        stages.insert(key, stage);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn fresh(owner: &crate::runtime_host::DfsDataOwnerLock) -> Result<std::sync::Arc<Self>> {
+        let data_root = owner.physical_data_root().to_path_buf();
+        let data_identity = Self::directory_identity(&data_root)?;
+        let owner_identity = owner.storage_owner_file_identity()
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if Self::named_owner_identity(&data_root)? != owner_identity
+        {
+            return Err(selected_layout_rejection("fresh selected fixture lost its actual named DATA lock"));
+        }
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&data_root);
+        let metadata = crate::default_dfs_metadata_shards_root(&data_dir);
+        if metadata.exists() && std::fs::read_dir(&metadata)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?.next().is_some()
+        {
+            return Err(selected_layout_rejection("fresh selected native fixture cannot adopt existing metadata"));
+        }
+        let snapshot = crate::default_dfs_repair_attempt_snapshot_path(&data_dir);
+        let queue_root = snapshot.parent().ok_or_else(|| selected_layout_rejection("selected queue has no parent"))?.to_path_buf();
+        let parent = queue_root.parent().ok_or_else(|| selected_layout_rejection("selected queue has no namespace"))?;
+        std::fs::create_dir_all(parent).map_err(|error| selected_layout_rejection(error.to_string()))?;
+        Self::directory_identity(parent)?;
+        let (queue, queue_layout) = crate::repair_queue_store::LocalDfsRepairQueueStore::new_selected_original_fixture_at(queue_root, snapshot)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let routing_layout = queue_layout.admit_staging_root(metadata)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        sinomo_core::storage::durable_file::sync_directory(&data_root)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if let Some(parent) = data_root.parent() {
+            sinomo_core::storage::durable_file::sync_directory(parent)
+                .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        }
+        let context = std::sync::Arc::new(Self {
+            data_identity,
+            owner_identity,
+            data_root, queue, queue_layout, routing_layout,
+            stages: std::sync::Mutex::new(BTreeMap::new()),
+            selection: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            receiver_clocks: std::sync::Mutex::new((Vec::new(), 0)),
+        });
+        context.check_owner(owner)?;
+        Ok(context)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reopen(&self, owner: &crate::runtime_host::DfsDataOwnerLock) -> Result<()> {
+        self.check_owner(owner)?;
+        crate::repair_queue_store::LocalDfsRepairQueueStore::reopen_selected_original_fixture(&self.queue_layout)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        for stage in self.stages.lock()
+            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?.values()
+        {
+            stage.check().map_err(|error| selected_layout_rejection(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Bind the genuine control-owner-generated handoff while the fixture
+    /// holds the existing publication fence, before its first native freeze.
+    /// The fixture chose this real original/desired role before proposing it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn select_original(&self, producer: &NodeId, request: &str, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<()> {
+        let (_, birth) = self.queue()?.selected_original_handoff_data(producer, request)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let crate::DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+            return Err(selected_layout_rejection("selected native birth is not Repair"));
+        };
+        let shard = command.authority_shard.as_ref()
+            .ok_or_else(|| selected_layout_rejection("selected native birth has no original shard"))?;
+        if handoff.retiring_primary_fence.is_some() || handoff.handoff_id.is_empty()
+            || handoff.retiring_shard.primary_node_id != *producer
+            || handoff.retiring_shard.file_system_id != command.file_system_id
+            || handoff.retiring_shard.shard_id != shard.shard_id
+            || handoff.desired_shard.file_system_id != command.file_system_id
+            || handoff.desired_shard.shard_id != shard.shard_id
+            || handoff.desired_shard.primary_node_id == *producer
+            || handoff.retiring_shard.epoch.checked_add(1) != Some(handoff.desired_shard.epoch)
+            || shard.epoch > handoff.retiring_shard.epoch
+        {
+            return Err(selected_layout_rejection("selected origin needs its exact unfenced generated role handoff"));
+        }
+        let key = (producer.clone(), command.file_system_id.clone(), crate::DfsMetadataShardId::new(&shard.shard_id), request.to_owned(), handoff.clone());
+        let stages = self.stages.lock()
+            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?;
+        let freeze_path = stages.get(&(command.file_system_id.clone(), crate::DfsMetadataShardId::new(&shard.shard_id)))
+            .map(|stage| stage.root().join("journal/membership-handoff-write-freeze.sobj"));
+        drop(stages);
+        if let Some(path) = freeze_path {
+            if read_handoff_freeze_with_layout(&path, Some(self))?
+                .is_some_and(|freeze| freeze.activated_epoch.is_none())
+            {
+                return Err(selected_layout_rejection("selected original must be fixed before its pending native freeze"));
+            }
+        }
+        let mut selection = self.selection.lock()
+            .map_err(|_| selected_layout_rejection("selected native origin selection poisoned"))?;
+        if selection.as_ref().is_some_and(|prior| prior != &key) {
+            return Err(selected_layout_rejection("selected native original cannot change"));
+        }
+        *selection = Some(key);
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn observe_receiver_clock(&self, request: &str, captured: std::time::Instant, deadline: std::time::Instant) -> Result<()> {
+        let mut observations = self.receiver_clocks.lock()
+            .map_err(|_| selected_layout_rejection("native receiver-clock observation poisoned"))?;
+        if observations.0.len() < crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT {
+            observations.0.push((request.to_owned(), captured, deadline));
+        } else { observations.1 = observations.1.saturating_add(1); }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn receiver_clocks(&self) -> Result<(Vec<(String, std::time::Instant, std::time::Instant)>, usize)> {
+        self.receiver_clocks.lock().map(|observations| observations.clone())
+            .map_err(|_| selected_layout_rejection("native receiver-clock observation poisoned"))
+    }
+
+    pub(crate) fn selected_request(&self, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<Option<String>> {
+        self.check()?;
+        let selection = self.selection.lock()
+            .map_err(|_| selected_layout_rejection("selected native origin selection poisoned"))?;
+        let Some((_, fs, shard, request, expected)) = selection.as_ref() else { return Ok(None); };
+        if *fs != handoff.retiring_shard.file_system_id || shard.0 != handoff.retiring_shard.shard_id {
+            return Ok(None);
+        }
+        let mut actual = handoff.clone();
+        // Only the independently authenticated native fence may be added.
+        actual.retiring_primary_fence = None;
+        if &actual != expected {
+            return Err(selected_layout_rejection("selected native handoff differs from its exact fixture expectation"));
+        }
+        Ok(Some(request.clone()))
+    }
+}
+
 /// Durable shard-local freeze installed while a same-primary membership
 /// handoff carries the retiring authority's exact state.
 ///
@@ -81,6 +408,9 @@ pub struct DfsMetadataShardWriteFreeze {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum DfsMetadataShardWriteFreezeWire {
+    SelectedOriginalDataV2 {
+        selected_original_data_v2: DfsMetadataShardWriteFreezePayload,
+    },
     CustodyV1 {
         repair_custody_v1: DfsMetadataShardWriteFreezePayload,
     },
@@ -112,7 +442,9 @@ impl From<DfsMetadataShardWriteFreeze> for DfsMetadataShardWriteFreezeWire {
             rebind_prefix_proof: value.rebind_prefix_proof,
             repair_custody: value.repair_custody,
         };
-        if payload.repair_custody.is_some() {
+        if payload.repair_custody.as_ref().is_some_and(|cut| cut.version == 2) {
+            Self::SelectedOriginalDataV2 { selected_original_data_v2: payload }
+        } else if payload.repair_custody.is_some() {
             Self::CustodyV1 {
                 repair_custody_v1: payload,
             }
@@ -120,6 +452,113 @@ impl From<DfsMetadataShardWriteFreeze> for DfsMetadataShardWriteFreezeWire {
             Self::Legacy(payload)
         }
     }
+}
+
+/// Explicit selected-owner codec. The ordinary Deserialize above deliberately
+/// rejects this envelope; callers cannot select this reader from wire contents.
+pub(crate) fn read_handoff_freeze_with_layout(
+    path: &std::path::Path,
+    layout: Option<&DfsSelectedOriginalDataLayout>,
+) -> Result<Option<DfsMetadataShardWriteFreeze>> {
+    let Some(layout) = layout else {
+        reject_default_handoff_layout(path)?;
+        return crate::metadata_io::read_sobj_optional(path);
+    };
+    check_handoff_layout_path(layout, path)?;
+    let wire: Option<DfsMetadataShardWriteFreezeWire> = crate::metadata_io::read_sobj_optional(path)
+        .map_err(|error| selected_layout_rejection(error.to_string()))?;
+    let result = match wire {
+        None => None,
+        Some(DfsMetadataShardWriteFreezeWire::SelectedOriginalDataV2 { selected_original_data_v2: payload }) => {
+            let cut = payload.repair_custody.as_ref()
+                .ok_or_else(|| selected_layout_rejection("selected freeze has no exact custody cut"))?;
+            cut.validate_selected_original_data()
+                .map_err(|error| selected_layout_rejection(error.to_string()))?;
+            Some(DfsMetadataShardWriteFreeze {
+                handoff_id: payload.handoff_id,
+                retiring_epoch: payload.retiring_epoch,
+                activated_epoch: payload.activated_epoch,
+                journal_sequence: payload.journal_sequence,
+                state_fingerprint: payload.state_fingerprint,
+                rebind_prefix_proof: payload.rebind_prefix_proof,
+                repair_custody: payload.repair_custody,
+            })
+        }
+        Some(wire) => Some(DfsMetadataShardWriteFreeze::try_from(wire)
+            .map_err(selected_layout_rejection)?),
+    };
+    check_handoff_layout_path(layout, path)?;
+    Ok(result)
+}
+
+pub(crate) fn write_handoff_freeze_with_layout(
+    path: &std::path::Path,
+    freeze: &DfsMetadataShardWriteFreeze,
+    layout: Option<&DfsSelectedOriginalDataLayout>,
+) -> Result<()> {
+    if let Some(layout) = layout {
+        check_handoff_layout_path(layout, path)?;
+        if let Some(cut) = &freeze.repair_custody {
+            if cut.version == 2 {
+                cut.validate_selected_original_data()
+                    .map_err(|error| selected_layout_rejection(error.to_string()))?;
+            } else {
+                cut.validate().map_err(|error| selected_layout_rejection(error.to_string()))?;
+            }
+        }
+    } else {
+        reject_default_handoff_layout(path)?;
+        if freeze.repair_custody.as_ref().is_some_and(|cut| cut.version != 1) {
+            return Err(selected_layout_rejection("default writer rejects selected freeze representation"));
+        }
+    }
+    if let Some(layout) = layout.filter(|_| freeze.repair_custody.as_ref().is_some_and(|cut| cut.version == 2)) {
+        let root = path.parent().and_then(std::path::Path::parent)
+            .ok_or_else(|| selected_layout_rejection("selected freeze has no shard root"))?;
+        let stage = layout.stages.lock()
+            .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?
+            .values().find(|stage| stage.root() == root).cloned()
+            .ok_or_else(|| selected_layout_rejection("selected freeze has no admitted stage"))?;
+        let generation = crate::repair_handoff::publish_and_certify_selected(path, freeze)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        crate::repair_handoff::sync_selected_namespace(&stage, path.parent().expect("freeze journal parent"))
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        let current = std::fs::symlink_metadata(path)
+            .map_err(|error| selected_layout_rejection(error.to_string()))?;
+        if !crate::repair_queue_store::same_file_observation(&generation, &current) {
+            return Err(selected_layout_rejection("selected freeze generation changed across its namespace barriers"));
+        }
+        check_handoff_layout_path(layout, path)?;
+        return Ok(());
+    }
+    crate::metadata_io::write_sobj_atomic(path, freeze)?;
+    if let Some(layout) = layout { check_handoff_layout_path(layout, path)?; }
+    Ok(())
+}
+
+pub(crate) fn validate_handoff_layout_root(layout: &DfsSelectedOriginalDataLayout, root: &std::path::Path) -> Result<()> {
+    check_handoff_layout_path(layout, &root.join("journal/membership-handoff-write-freeze.sobj"))
+}
+
+fn reject_default_handoff_layout(path: &std::path::Path) -> Result<()> {
+    let root = path.parent().and_then(std::path::Path::parent)
+        .ok_or_else(|| selected_layout_rejection("handoff freeze has no shard root"))?;
+    crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(root)
+        .map_err(|error| selected_layout_rejection(error.to_string()))
+}
+
+fn check_handoff_layout_path(layout: &DfsSelectedOriginalDataLayout, path: &std::path::Path) -> Result<()> {
+    layout.check()?;
+    let root = path.parent().and_then(std::path::Path::parent)
+        .ok_or_else(|| selected_layout_rejection("selected freeze has no shard root"))?;
+    if path != root.join("journal/membership-handoff-write-freeze.sobj") {
+        return Err(selected_layout_rejection("selected freeze names another marker path"));
+    }
+    let stages = layout.stages.lock()
+        .map_err(|_| selected_layout_rejection("selected native stage registry poisoned"))?;
+    let stage = stages.values().find(|stage| stage.root() == root)
+        .ok_or_else(|| selected_layout_rejection("selected freeze has no admitted physical stage"))?;
+    stage.check().map_err(|error| selected_layout_rejection(error.to_string()))
 }
 
 impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
@@ -465,6 +904,15 @@ pub struct DfsForeignShardSourceEvictionPlan {
 }
 
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
+    /// Representation admission of this exact handle, never mutation or
+    /// handoff authorization. Ordinary backends retain their default reader.
+    fn selected_original_data_layout(
+        &self,
+        _file_system_id: &DfsFileSystemId,
+        _shard_id: &crate::DfsMetadataShardId,
+    ) -> Result<Option<std::sync::Arc<DfsSelectedOriginalDataLayout>>> {
+        Ok(None)
+    }
     fn plan_cross_shard_pin_transfer(
         &self,
         transfer_id: &str,
@@ -2468,4 +2916,213 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         subscription: &mut DfsMetadataSubscription,
     ) -> Result<DfsMetadataJournalBatch>;
+}
+
+#[cfg(test)]
+mod selected_native_layout_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn layout(name: &str) -> (sinomo_testdir::TestDir, sinomo_core::local::SinomoDataDir,
+        crate::runtime_host::DfsDataOwnerLock, Arc<DfsSelectedOriginalDataLayout>) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let data = sinomo_core::local::SinomoDataDir::new(root.path());
+        let mut owner = crate::runtime_host::DfsDataOwnerLock::acquire(
+            &crate::runtime_host::DfsRuntimePaths::new(&data)).unwrap();
+        let selected = owner.admit_selected_original_fixture(None).unwrap();
+        (root, data, owner, selected)
+    }
+
+    fn files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, at: &Path, result: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { visit(root, &path, result); }
+                else { result.push((path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(path).unwrap())); }
+            }
+        }
+        let mut result = Vec::new(); visit(root, root, &mut result);
+        result.sort_by(|a,b| a.0.cmp(&b.0)); result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_native_directory_identity_accepts_genuine_directory() {
+        let root = sinomo_testdir::TestDir::new("selected-directory-genuine");
+        let before = std::fs::symlink_metadata(root.path()).unwrap();
+        let file = std::fs::File::open(root.path()).unwrap();
+        let opened = file.metadata().unwrap();
+        let after = std::fs::symlink_metadata(root.path()).unwrap();
+        assert!(!crate::repair_queue_store::same_file_observation(&before, &opened),
+            "the unchanged regular-file predicate rejects directories");
+        assert!(DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &after));
+        assert_eq!(DfsSelectedOriginalDataLayout::directory_identity(root.path()).unwrap(),
+            crate::runtime_host::storage_file_identity(&file).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_native_directory_identity_accepts_child_entry_metadata_changes() {
+        let root = sinomo_testdir::TestDir::new("selected-directory-child-changes");
+        let before = std::fs::symlink_metadata(root.path()).unwrap();
+        let file = std::fs::File::open(root.path()).unwrap();
+        let opened = file.metadata().unwrap();
+        let expected = crate::runtime_host::storage_file_identity(&file).unwrap();
+        let child = root.path().join("child");
+        std::fs::write(&child, b"ordinary directory entry").unwrap();
+        // Ensure a visible incidental timestamp difference without a sleep or
+        // depending on the filesystem's clock granularity.
+        file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH)).unwrap();
+        let after = std::fs::symlink_metadata(root.path()).unwrap();
+        assert_ne!(before.modified().unwrap(), after.modified().unwrap());
+        assert!(DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &after));
+        assert_eq!(DfsSelectedOriginalDataLayout::directory_identity(root.path()).unwrap(), expected);
+        std::fs::remove_file(child).unwrap();
+        let after_remove = std::fs::symlink_metadata(root.path()).unwrap();
+        assert!(DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &after_remove));
+        assert_eq!(DfsSelectedOriginalDataLayout::directory_identity(root.path()).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_native_directory_identity_rejects_replacement_after_open() {
+        let root = sinomo_testdir::TestDir::new("selected-directory-after-open");
+        let data = sinomo_core::local::SinomoDataDir::new(root.path().join("data"));
+        let mut owner = crate::runtime_host::DfsDataOwnerLock::acquire(
+            &crate::runtime_host::DfsRuntimePaths::new(&data)).unwrap();
+        let selected = owner.admit_selected_original_fixture(None).unwrap();
+        let path = data.root();
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let opened = file.metadata().unwrap();
+        let expected = crate::runtime_host::storage_file_identity(&file).unwrap();
+        std::fs::rename(&path, root.path().join("retained-data")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert!(!DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &after));
+        assert_ne!(DfsSelectedOriginalDataLayout::directory_identity(&path).unwrap(), expected);
+        let error = selected.check().unwrap_err();
+        assert!(error.to_string().contains("selected native DATA root was replaced"), "{error}");
+        assert!(std::fs::read_dir(&path).unwrap().next().is_none(),
+            "the rejected replacement was not initialized or repaired");
+        // Retained directory and descriptor stay live through the assertions,
+        // preventing inode reuse from obscuring the replacement control.
+        drop(file);
+        drop(selected);
+        drop(owner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_native_directory_identity_rejects_replacement_before_open() {
+        let root = sinomo_testdir::TestDir::new("selected-directory-before-open");
+        let path = root.path().join("named");
+        std::fs::create_dir(&path).unwrap();
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        let retained_file = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, root.path().join("retained")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let opened = file.metadata().unwrap();
+        let after = std::fs::symlink_metadata(&path).unwrap();
+        assert_ne!(crate::runtime_host::storage_file_identity(&retained_file).unwrap(),
+            crate::runtime_host::storage_file_identity(&file).unwrap());
+        assert!(!DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &after),
+            "opened and after agree, but the original named directory was replaced");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_native_directory_identity_rejects_file_and_symlink_alias() {
+        let root = sinomo_testdir::TestDir::new("selected-directory-alias");
+        let named = root.path().join("real-directory");
+        std::fs::create_dir(&named).unwrap();
+        let before = std::fs::symlink_metadata(&named).unwrap();
+        let file = std::fs::File::open(&named).unwrap();
+        let opened = file.metadata().unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&named, &alias).unwrap();
+        let alias_metadata = std::fs::symlink_metadata(&alias).unwrap();
+        assert!(DfsSelectedOriginalDataLayout::directory_identity(&alias).is_err());
+        assert!(!DfsSelectedOriginalDataLayout::same_directory_observations(&before, &opened, &alias_metadata));
+        let ordinary_file = root.path().join("regular-file");
+        std::fs::write(&ordinary_file, b"not a directory").unwrap();
+        assert!(DfsSelectedOriginalDataLayout::directory_identity(&ordinary_file).is_err());
+        assert_eq!(std::fs::read(ordinary_file).unwrap(), b"not a directory");
+        assert_eq!(std::fs::read_link(alias).unwrap(), named);
+    }
+
+    #[test]
+    fn selected_native_v1_freeze_default_readers_and_writers_reject_before_mutation() {
+        let (_root, data, _owner, layout) = layout("selected-native-default-v1-freeze");
+        let fs = DfsFileSystemId::from_legacy_named("selected-native-physical-fs").unwrap();
+        let shard = crate::DfsMetadataShardId::new("selected-native-shard");
+        let root = crate::local_dfs_metadata_shard_path(&data, &shard);
+        let mut backend = crate::LocalSobjMetadataBackend::new_with_selected_layout(
+            fs.clone(), shard.clone(), root.clone(), Arc::clone(&layout)).unwrap();
+        let freeze = backend.freeze_metadata_shard_for_membership_handoff(&shard, "selected-native-v1", 7).unwrap().unwrap();
+        assert!(freeze.repair_custody.is_none());
+        drop(backend);
+        let path = root.join("journal/membership-handoff-write-freeze.sobj");
+        let before = files(&data.root());
+        assert_eq!(read_handoff_freeze_with_layout(&path, Some(&layout)).unwrap(), Some(freeze.clone()));
+        assert!(read_handoff_freeze_with_layout(&path, None).is_err());
+        assert!(write_handoff_freeze_with_layout(&path, &freeze, None).is_err());
+        assert!(crate::read_local_dfs_metadata_shard_write_freeze(&data, &shard).is_err());
+        assert!(crate::LocalSobjMetadataBackend::new(shard.clone(), &root).is_err());
+        assert!(crate::LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &root).is_err());
+        assert!(crate::LocalSobjMetadataBackend::open_for_replica_repair(shard, &root).is_err());
+        assert_eq!(files(&data.root()), before, "unsupported reader does not recover, repair or rewrite even the initial V1 marker");
+    }
+
+    #[test]
+    fn selected_native_open_rejects_stage_replaced_by_preparation_before_recovery() {
+        let (_root, data, _owner, layout) = layout("selected-native-preparation-replacement");
+        let fs = DfsFileSystemId::from_legacy_named("selected-native-preparation-fs").unwrap();
+        let shard = crate::DfsMetadataShardId::new("selected-native-preparation-shard");
+        let stage = crate::local_dfs_metadata_shard_path(&data, &shard);
+        layout.admit_stage(&fs, &shard, &stage).unwrap();
+        let expected_stage = stage.clone();
+        let retained = stage.with_extension("retained");
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&called);
+        let registration = crate::register_dfs_storage_preparation_provider(data.root().to_owned(),
+            Arc::new(move |root, scope, _| {
+                assert_eq!(root, expected_stage);
+                assert!(matches!(scope, crate::DfsStoragePreparationScope::Metadata(_)));
+                assert!(!observed.swap(true, std::sync::atomic::Ordering::SeqCst));
+                std::fs::rename(root, &retained).unwrap();
+                std::fs::create_dir(root).unwrap();
+                std::fs::write(root.join("replacement-sentinel"), b"new physical owner").unwrap();
+                Ok(crate::DfsStoragePreparation::Ready)
+            }), None).unwrap();
+        assert!(crate::LocalSobjMetadataBackend::new_with_selected_layout(fs, shard, stage.clone(), layout).is_err());
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(files(&stage), vec![(PathBuf::from("replacement-sentinel"), b"new physical owner".to_vec())]);
+        drop(registration);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_native_owner_alias_and_replaced_stage_never_rebind_layout() {
+        let (_root, data, _owner, layout) = layout("selected-native-owner-identity");
+        let owner_path = data.root().join("daemon/data-owner.lock");
+        let retained_owner = owner_path.with_extension("retained");
+        std::fs::rename(&owner_path, &retained_owner).unwrap();
+        std::os::unix::fs::symlink(&retained_owner, &owner_path).unwrap();
+        assert!(layout.check().is_err(), "a symlink to the still-locked old inode is not the actual named owner");
+        std::fs::remove_file(&owner_path).unwrap();
+        std::fs::rename(&retained_owner, &owner_path).unwrap();
+        layout.check().unwrap();
+        let fs = DfsFileSystemId::from_legacy_named("selected-native-owner-fs").unwrap();
+        let shard = crate::DfsMetadataShardId::new("selected-native-owner-shard");
+        let stage = crate::local_dfs_metadata_shard_path(&data, &shard);
+        layout.admit_stage(&fs, &shard, &stage).unwrap();
+        std::fs::rename(&stage, stage.with_extension("retained")).unwrap();
+        std::fs::create_dir(&stage).unwrap();
+        assert!(layout.stage(&fs, &shard, &stage).is_err());
+        assert!(layout.admit_stage(&fs, &shard, &stage).is_err(), "reopen cannot adopt a replacement");
+        assert!(files(&stage).is_empty());
+    }
 }

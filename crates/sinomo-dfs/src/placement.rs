@@ -2821,12 +2821,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ),
                 })
                 .collect::<Vec<_>>();
-            crate::service_repair::enroll_prepared_repair_targets(
-                &sinomo_core::local::SinomoDataDir::new(execution.data_root()),
-                &self.repair_attempt_records,
-                &self.writes.pending_writes,
-                &births,
-            )?;
+            if let Some(store) = self.owned_repair_queue_store()? {
+                crate::service_repair::enroll_prepared_repair_targets_in_store(
+                    &sinomo_core::local::SinomoDataDir::new(execution.data_root()),
+                    &store, &self.repair_attempt_records, &self.writes.pending_writes, &births,
+                )?;
+            } else {
+                crate::service_repair::enroll_prepared_repair_targets(
+                    &sinomo_core::local::SinomoDataDir::new(execution.data_root()),
+                    &self.repair_attempt_records, &self.writes.pending_writes, &births,
+                )?;
+            }
         }
         if self.coordinator.capture_active_repair_jobs(&intent_id) {
             self.record_message_committed_work(DfsMessageCommittedWork {
