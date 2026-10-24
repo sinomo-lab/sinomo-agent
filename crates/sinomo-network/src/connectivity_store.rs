@@ -1602,7 +1602,7 @@ fn local_cluster_connectivity_raw_persisted_records_stable(
         .map(|record| (cluster_connectivity_record_key(record), record.clone()))
         .collect::<BTreeMap<_, _>>();
     if replace_source_records {
-        candidate.retain(|(_, candidate_source_node_id, _), _| {
+        candidate.retain(|(candidate_source_node_id, _, _), _| {
             candidate_source_node_id != source_node_id
         });
     }
@@ -3228,8 +3228,24 @@ mod tests {
         assert_eq!(
             read_local_cluster_connectivity_records_for_source(&paths, &local)
                 .expect("read source after newer removal"),
-            vec![initial_a],
+            vec![initial_a.clone()],
             "the newer complete set removes omitted keys without rewriting stable retained evidence"
+        );
+        let persisted =
+            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)
+                .expect("read actual persisted source set")
+                .expect("remaining endpoint is persisted");
+        assert_eq!(
+            persisted,
+            vec![initial_a.clone()],
+            "a cache-only omission must not leave the removed endpoint on disk"
+        );
+        invalidate_local_cluster_connectivity_cache(&paths).expect("normal external-writer reload");
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local)
+                .expect("reopen persisted source set"),
+            vec![initial_a],
+            "the removed endpoint must not reappear after cache invalidation"
         );
     }
 
