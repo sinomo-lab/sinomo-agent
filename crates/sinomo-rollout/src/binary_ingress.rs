@@ -69,7 +69,19 @@ pub struct PreparedRolloutBinaryActivation {
     pub rollout_paths: SelfRolloutPaths,
     pub manifest: ClusterRolloutBinaryManifest,
     // Serializes ingress and activation for this upload across daemon processes.
-    _upload_lock: fs::File,
+    _upload_lock: RolloutUploadLock,
+}
+
+// A duplicated descriptor (for example across fork before exec) must not retain
+// admission after the actual ingress/activation owner has ended. No alias is
+// exposed to callers; the guard moves with PreparedRolloutBinaryActivation.
+#[derive(Debug)]
+struct RolloutUploadLock(fs::File);
+
+impl Drop for RolloutUploadLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 #[derive(Debug)]
@@ -128,6 +140,7 @@ where
         path: lock_path.display().to_string(),
         detail: format!("upload is already being received or activated: {error}"),
     })?;
+    let upload_lock = RolloutUploadLock(upload_lock);
     ensure_rollout_upload_manifest(&rollout_paths, &request.manifest)?;
     let receipt = read_rollout_binary_receipt(&rollout_paths, &request.manifest)?;
     let activation_claim = upload_dir.join("activation-started.sobj");
@@ -299,6 +312,7 @@ pub(crate) fn reclaim_upload_payloads(
         if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
             continue;
         }
+        let _lock = RolloutUploadLock(lock);
         let manifest: ClusterRolloutBinaryManifest =
             match read_object(&upload.join("manifest.sobj")) {
                 Ok(m) => m,
@@ -726,6 +740,55 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(replay, RolloutBinaryIngress::Complete(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replay_waits_for_activation_owner_but_not_a_surviving_descriptor_alias() {
+        let root = sinomo_testdir::TestDir::new("rollout-activation-descriptor-lifetime");
+        let bytes = b"candidate";
+        let mut upload = request(bytes);
+        upload.activate = true;
+        let first = receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+            .await
+            .expect("actual prepared activation owner");
+        let alias = match &first {
+            RolloutBinaryIngress::Activate(prepared) => {
+                prepared._upload_lock.0.try_clone().unwrap()
+            }
+            RolloutBinaryIngress::Complete(_) => panic!("first upload must own activation"),
+        };
+        let busy = receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+            .await
+            .expect_err("live activation owner must exclude another receiver");
+        assert!(matches!(busy, RolloutError::Io { detail, .. }
+            if detail.contains("already being received or activated")));
+        drop(first);
+        let paths = SelfRolloutPaths::new(&root);
+        let partial = rollout_upload_artifact_path(&paths, &upload.manifest.upload_id, "binary")
+            .expect("original payload path");
+        fs::remove_file(&partial).expect("simulate payload moved by interrupted activation");
+        let replay = receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+            .await
+            .expect("ended activation owner releases its lock despite a descriptor alias");
+        let RolloutBinaryIngress::Complete(response) = replay else {
+            panic!("uncertain activation must not activate again");
+        };
+        assert_eq!(response.status, "in-progress");
+        assert!(
+            !partial.exists(),
+            "same-identity replay must not recreate payloads"
+        );
+        let status = read_rollout_upload_status(&paths, &upload.manifest).unwrap();
+        assert!(status.activation_started);
+        assert!(
+            status.receipt.is_none(),
+            "uncertainty is not a fabricated terminal receipt"
+        );
+        assert!(
+            alias.metadata().is_ok(),
+            "descriptor alias really remains open"
+        );
     }
 
     #[tokio::test]
