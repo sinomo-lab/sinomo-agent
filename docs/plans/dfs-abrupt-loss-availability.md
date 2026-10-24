@@ -1,6 +1,42 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-24 R29
+## Current development checkpoint — 2026-10-24 R30
+
+Local code merge `3280966922517cc0a546a4eee8acde77e14f0555` integrates reviewed
+snapshot correction `8b3163fc`. Source `9a7b0cf3` contains 4,904 inputs; its own
+sealed executable is `c01d2db1`. Fresh check/build/seal passed. Two disjoint panels
+executed **150 unique controls once: 150 PASS, zero failed, incomplete or unrun**.
+The current full DFS/KV boundary passed its lint library, all 11 UI controls and
+DFS/history/attachments library analysis. All owned lifetimes and unconditional
+fixture archives were verified after normal cleanup.
+
+Named snapshot fields fix R29's two heterogeneous-tuple encoding failures without
+changing live tuples, events, writer/sequence validation or default V1 behavior.
+Actual controls now preserve exact empty-state compatibility, recorded delivery
+states, Pending history and genuine Terminal across compaction/cold replay. The
+original clocks and assertions remain intact. All R29 failures remain sealed.
+
+All seven native historical-query controls passed, including no B payload,
+missing-Terminal Pending, exact reply binding, C certification/reopen cuts,
+physical replacement, retiring B and later real A receipt withdrawal. Historical
+results remain observations: no B Repair effect, current receipt application,
+birth closure or root release is authorized. Same-C applied-receipt withdrawal
+is the next concrete native coverage gap; exact V7 stored-frame retry/reopen is a
+parallel test-only task. No general framework or participant reduction was added.
+
+Evidence with standard tables is in `R30-REPORT.md` and
+`R30-COMBINED-RESULT.json` under `data/operations/dfs-availability-20261023/`:
+I76 build `0fb31f8f`, I77 focused `f751c768`, I78 remainder `fbab7138`,
+I79 boundary `189de44c`. These are selected development results, not full abrupt
+availability. Original R67 remains unresolved; complete custody coverage,
+C1/checked B effects, causal application/withdrawal, root retirement, metadata
+majority history/fencing and real OS abrupt-loss/partition/reconnect/quietness
+remain open. Local commits/actual merges are the boundaries; no Docker, peer
+synchronization, push, deployment or cross-lane merge occurs.
+
+## Historical checkpoints
+
+### Preserved R29 checkpoint
 
 Local merge `dc2c96e991ce0d834006432b033e66c237eada5f` integrates the private
 historical-query branch `708cad79`. Source `6de91a23` has 4,904 inputs; its own
@@ -32,8 +68,6 @@ checked B effects, causal withdrawal, C1, root retirement, metadata quorum and r
 abrupt-process/partition/reconnect/Sinomo-only quietness remain open. This remains
 independent nonblocking development, with only the DFS-local lock and no Docker,
 production activation, push or merge into dev/debug or main.
-
-## Historical checkpoints
 
 ### Preserved R28 checkpoint
 
