@@ -4950,6 +4950,556 @@ mod native_selected_data_tests {
         closed.expect("normal native DATA fixture drain");
     }
 
+    #[test]
+    fn native_selected_imported_executor_requires_b_payload_and_retains_disabled_origin() {
+        let path = "/services/selected-original-data.bin";
+        let mut fixture = genuine_native_original("native-selected-disabled-executor");
+        let mut facts = serde_json::json!({
+            "missing_b_payload_rejected":false,
+            "unrelated_main_work_completed":false,
+            "fixture_prepared_b_bytes":false,
+            "retiring_assignment_rejected":false,
+            "native_b_associated":false,
+            "native_b_reopen_duplicate_matched":false,
+            "dispatch_observation_qualification":"held_promoted pre-claim guard remains installed; no unguarded scheduler coverage"
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owner = fixture.shard.primary_node_id.clone();
+            let promoted = fixture.promoted.clone();
+            let layout_b = fixture
+                .runtime
+                .selected_original_data_layout(&promoted)
+                .unwrap();
+            let request = fixture.birth.root.subject.request_id.clone();
+            let mut source = fixture.runtime.metadata_primary_service(path).unwrap();
+            let fence = source
+                .metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id)
+                .unwrap();
+            let control = fixture.runtime.shared_control_plane().unwrap();
+            let proposed = control
+                .with_client(|kv| {
+                    DfsControlPlaneStore::new(kv.as_mut())
+                        .request_metadata_shard_primary_handoff(&fixture.shard, &promoted)
+                })
+                .unwrap()
+                .unwrap();
+            fixture
+                .runtime
+                .select_genuine_original_before_handoff(&owner, &request, &proposed)
+                .unwrap();
+            drop(fence);
+            let handoff_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+            let result = source.reconcile_pending_metadata_shard_membership_handoffs(
+                &fixture.runtime.metadata_shards().unwrap(),
+                handoff_deadline.saturating_duration_since(Instant::now()),
+            );
+            drop(source);
+            if let Err(error) = result {
+                assert_eq!(
+                    fixture
+                        .runtime
+                        .observe_completed_native_handoff(&control, &proposed, handoff_deadline,)
+                        .unwrap(),
+                    Some(proposed.desired_shard.clone()),
+                    "actual handoff error: {error}"
+                );
+            }
+            let shard_id = DfsMetadataShardId::new(&fixture.shard.shard_id);
+            let marker = loop {
+                let marker =
+                    crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                        fixture.runtime.data_dir(&promoted),
+                        &shard_id,
+                        Some(&layout_b),
+                    )
+                    .unwrap();
+                if let Some(marker) = marker
+                    .filter(|marker| marker.activated_epoch == Some(proposed.desired_shard.epoch))
+                {
+                    break marker;
+                }
+                let remaining = handoff_deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("disabled association retains the existing 45s handoff budget");
+                let tick = fixture
+                    .runtime
+                    .maintenance_tick(
+                        &promoted,
+                        remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                    )
+                    .unwrap();
+                eprintln!("SELECTED_ASSOCIATION_REBIND_TICK {:?}", tick.outcome);
+            };
+            assert!(
+                Instant::now() <= handoff_deadline,
+                "handoff did not renew its 45s caller budget"
+            );
+            let assignment = proposed.desired_shard.clone();
+            assert_eq!(
+                fixture
+                    .runtime
+                    .metadata_shards()
+                    .unwrap()
+                    .iter()
+                    .find(|shard| shard.file_system_id == assignment.file_system_id
+                        && shard.shard_id == assignment.shard_id),
+                Some(&assignment)
+            );
+            let queue = layout_b.queue().unwrap();
+            let installed = queue
+                .installed_original_handoff_data(&owner, &request)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                marker.repair_custody.as_ref(),
+                Some(&installed.material.cut)
+            );
+            assert_eq!(installed.material.birth.original, fixture.birth.original);
+            assert_eq!(
+                installed.material.birth.attachment,
+                fixture.birth.attachment
+            );
+            assert_eq!(installed.material.birth.root, fixture.birth.root);
+            let DfsNetworkMessage::RepairReplica(command) = &fixture.birth.original.message else {
+                panic!("genuine original Repair");
+            };
+            assert_eq!(
+                command.authority_shard.as_ref().unwrap().primary_node_id,
+                owner
+            );
+            assert!(command.authority_shard.as_ref().unwrap().epoch < assignment.epoch);
+            let source_queue = fixture
+                .runtime
+                .selected_original_data_layout(&owner)
+                .unwrap()
+                .queue()
+                .unwrap();
+            let source_before = source_queue
+                .original_repair(&fixture.birth.original)
+                .unwrap()
+                .unwrap();
+            let original_digest = crate::repair_queue_store::original_repair_digest(
+                &fixture.birth.original,
+                &fixture.birth.attachment,
+            )
+            .unwrap();
+            assert_eq!(
+                original_digest,
+                installed.material.birth.root.original_command_digest
+            );
+            let missing_manifest = fixture
+                .runtime
+                .data_dir(&promoted)
+                .dfs_dir()
+                .join("content/objects")
+                .join(command.object_id.as_str())
+                .join(command.version.as_str())
+                .join("manifest.sobj");
+            let captured_absence = fixture
+                .runtime
+                .client(&promoted)
+                .unwrap()
+                .content()
+                .read_manifest(command.object_id.as_str(), command.version.as_str())
+                .expect_err("actual metadata installation leaves this exact B manifest absent");
+            match &captured_absence {
+                ContentStoreError::Io { path, source } => {
+                    assert_eq!(path, &missing_manifest);
+                    assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                }
+                other => panic!(
+                    "corruption/unsupported storage is not a missing-payload control: {other:?}"
+                ),
+            }
+            let expected_missing = DfsError::from(captured_absence);
+
+            let mut successor = fixture.runtime.metadata_primary_service(path).unwrap();
+            let association_scope = DfsPreparedOperationScope {
+                file_system_id: assignment.file_system_id.clone(),
+                shard_id: shard_id.clone(),
+                owner_epoch: assignment.epoch,
+                operation_id: request.clone(),
+            };
+            let missing_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            // Use the real retained native provider, never a test-made owner
+            // or permit. Holding this exact admission also excludes the same
+            // item's maintenance writer from the before/after observations.
+            let missing_admission = successor
+                .acquire_prepared_execution(&association_scope)
+                .unwrap();
+            let before_missing = queue.view().unwrap();
+            let missing = successor
+                .associate_installed_repair_executor_disabled(&assignment, &owner, &request)
+                .expect_err("a native B executor still needs its exact local payload");
+            assert!(
+                Instant::now() <= missing_deadline,
+                "missing-payload call keeps the existing 5s operation bound"
+            );
+            match (missing, expected_missing) {
+                (
+                    DfsError::ContentStore { message: actual },
+                    DfsError::ContentStore { message: expected },
+                ) => {
+                    assert_eq!(
+                        actual, expected,
+                        "association must return the exact captured B manifest absence"
+                    );
+                }
+                (actual, expected) => panic!(
+                    "native authority/corruption failure is not the captured absence: actual={actual:?}, expected={expected:?}"
+                ),
+            }
+            assert_eq!(queue.view().unwrap(), before_missing);
+            assert!(
+                queue
+                    .imported_executor_association(&owner, &request)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                queue
+                    .installed_original_handoff_data(&owner, &request)
+                    .unwrap()
+                    .unwrap(),
+                installed
+            );
+            facts["missing_b_payload_rejected"] = serde_json::json!(true);
+            drop(missing_admission);
+            drop(successor);
+
+            // Missing content affects this local join only. Exercise an actual
+            // unrelated Main mutation at the unchanged network deadline.
+            let mut unrelated = fixture.runtime.client(&promoted).unwrap();
+            let unrelated_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let previous = unrelated.set_transport_operation_deadline(Some(unrelated_deadline));
+            unrelated
+                .posix_mkdir("/services/selected-association-unrelated")
+                .unwrap();
+            assert!(Instant::now() <= unrelated_deadline);
+            assert_eq!(
+                unrelated.transport.operation_deadline(),
+                Some(unrelated_deadline)
+            );
+            unrelated.set_transport_operation_deadline(previous);
+            drop(unrelated);
+            facts["unrelated_main_work_completed"] = serde_json::json!(true);
+
+            // Explicit fixture precondition, not A->B/C->B transport evidence,
+            // a receipt, metadata publication or an original-origin rewrite.
+            let holder = fixture.runtime.client(&fixture.holder).unwrap();
+            let exact_bytes = holder
+                .content()
+                .read_object_version(command.object_id.as_str(), command.version.as_str())
+                .unwrap()
+                .1;
+            assert_eq!(crate::content_hash(&exact_bytes), command.content_hash);
+            assert_eq!(
+                exact_bytes.len() as u64,
+                fixture.birth.attachment.total_size_bytes
+            );
+            drop(holder);
+            let content_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let b_content = LocalContentStore::new(
+                fixture
+                    .runtime
+                    .data_dir(&promoted)
+                    .dfs_dir()
+                    .join("content"),
+            )
+            .unwrap();
+            let prepared = b_content
+                .put_object_version(
+                    command.object_id.as_str(),
+                    command.version.as_str(),
+                    &exact_bytes,
+                )
+                .unwrap();
+            assert!(Instant::now() <= content_deadline);
+            assert_eq!(prepared.content_hash, command.content_hash);
+            assert_eq!(
+                prepared.size_bytes,
+                fixture.birth.attachment.total_size_bytes
+            );
+            facts["fixture_prepared_b_bytes"] = serde_json::json!(true);
+
+            // The real A->B assignment change has already completed. The
+            // retiring A assignment cannot authorize B's new association even
+            // now that B has qualifying bytes. No second handoff is invented.
+            let mut successor = fixture.runtime.metadata_primary_service(path).unwrap();
+            assert!(
+                successor
+                    .metadata_backend()
+                    .unwrap()
+                    .get_receipt_on_shard(
+                        &shard_id,
+                        &command.object_id,
+                        &command.version,
+                        &promoted,
+                    )
+                    .unwrap()
+                    .is_none(),
+                "fixture-prepared B bytes do not mint a receipt"
+            );
+            let stale_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let stale_admission = successor
+                .acquire_prepared_execution(&association_scope)
+                .unwrap();
+            let before_stale = queue.view().unwrap();
+            assert!(
+                successor
+                    .associate_installed_repair_executor_disabled(&fixture.shard, &owner, &request,)
+                    .is_err()
+            );
+            assert_eq!(queue.view().unwrap(), before_stale);
+            assert!(
+                queue
+                    .imported_executor_association(&owner, &request)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(Instant::now() <= stale_deadline);
+            facts["retiring_assignment_rejected"] = serde_json::json!(true);
+            drop(stale_admission);
+
+            let b_capture = fixture
+                .runtime
+                .capture_checkpointed_background_repairs(&promoted, 8)
+                .unwrap();
+            let association_deadline =
+                Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let association_admission = successor
+                .acquire_prepared_execution(&association_scope)
+                .unwrap();
+            let before_association = queue.view().unwrap();
+            let association = successor
+                .associate_installed_repair_executor_disabled(&assignment, &owner, &request)
+                .unwrap()
+                .expect("actual native B admission binds the qualified local payload");
+            assert!(Instant::now() <= association_deadline);
+            assert_eq!(
+                association.local_root().subject,
+                installed.material.birth.root.subject
+            );
+            assert_eq!(
+                association.local_root().original_command_digest,
+                original_digest
+            );
+            assert_eq!(
+                association.local_root().source,
+                installed.material.birth.root.source
+            );
+            assert_ne!(
+                association.local_root().store_incarnation,
+                installed.material.birth.root.store_incarnation
+            );
+            b_content
+                .inspect_repair_payload_root(association.local_root())
+                .unwrap();
+            let after_association = queue.view().unwrap();
+            assert!(after_association.head_sequence > before_association.head_sequence);
+            assert_eq!(after_association.records, before_association.records);
+            drop(association_admission);
+            let duplicate_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let duplicate_admission = successor
+                .acquire_prepared_execution(&association_scope)
+                .unwrap();
+            let before_duplicate = queue.view().unwrap();
+            assert_eq!(
+                successor
+                    .associate_installed_repair_executor_disabled(&assignment, &owner, &request,)
+                    .unwrap(),
+                Some(association.clone())
+            );
+            assert!(Instant::now() <= duplicate_deadline);
+            assert_eq!(queue.view().unwrap(), before_duplicate);
+            assert_eq!(
+                queue
+                    .installed_original_handoff_data(&owner, &request)
+                    .unwrap()
+                    .unwrap(),
+                installed
+            );
+            assert_eq!(
+                source_queue
+                    .original_repair(&fixture.birth.original)
+                    .unwrap()
+                    .unwrap(),
+                source_before
+            );
+            assert!(
+                successor
+                    .metadata_backend()
+                    .unwrap()
+                    .get_receipt_on_shard(
+                        &shard_id,
+                        &command.object_id,
+                        &command.version,
+                        &promoted,
+                    )
+                    .unwrap()
+                    .is_none(),
+                "disabled association never publishes the fixture bytes"
+            );
+            facts["native_b_associated"] = serde_json::json!(true);
+            facts["association_data"] = serde_json::to_value(&association).unwrap();
+
+            // The immutable A command is not restamped. Only a candidate B
+            // carrier envelope is changed here, and every native lookup must
+            // keep refusing it; no carrier is handed to any transport.
+            let mut carrier = fixture.birth.original.clone();
+            carrier.source_node_id = promoted.clone();
+            carrier.frame_id += 1;
+            carrier.message_id += 1;
+            assert!(
+                queue
+                    .original_repair_for_slot(&command.intent_id, &fixture.holder)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(queue.original_repair(&carrier).unwrap().is_none());
+            assert!(queue.record_original_repair_attempt(&carrier).is_err());
+            assert!(queue.validate_original_repair_dispatch(&carrier).is_err());
+            assert!(
+                queue
+                    .closed_repair_birth(&installed.material.birth.root.subject)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(queue.view().unwrap(), before_duplicate);
+            // Guarded absence only: held_promoted remains installed. The
+            // native lookup/attempt rejections above independently prove that
+            // association DATA grants no dispatch permit; this is not an
+            // unguarded native scheduling/executor liveness control.
+            assert_eq!(b_capture.omitted_count(), 0);
+            assert!(
+                b_capture
+                    .records()
+                    .iter()
+                    .all(|captured| match &captured.message.message {
+                        DfsNetworkMessage::RepairReplica(actual) => actual.request_id != request,
+                        _ => true,
+                    })
+            );
+            assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+            assert!(
+                !fixture
+                    .runtime
+                    .rpc_observations()
+                    .iter()
+                    .any(|call| call.source == promoted
+                        && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                        && call.dfs_request_id.as_deref() == Some(request.as_str()))
+            );
+            drop(b_capture); // Do not retain an observation DATA owner across stop/reopen.
+            drop(b_content);
+            drop(duplicate_admission);
+            drop(successor);
+
+            queue
+                .compact_if_needed(crate::DfsRepairQueueCompactionOptions {
+                    force: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            fixture.runtime.stop_node(&promoted).unwrap();
+            queue.reload_from_disk_on_next_access();
+            fixture.runtime.reopen_node(promoted.clone()).unwrap();
+            let reopened = fixture
+                .runtime
+                .selected_original_data_layout(&promoted)
+                .unwrap()
+                .queue()
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .imported_executor_association(&owner, &request)
+                    .unwrap(),
+                Some(association.clone())
+            );
+            assert_eq!(
+                reopened
+                    .installed_original_handoff_data(&owner, &request)
+                    .unwrap()
+                    .unwrap(),
+                installed
+            );
+            assert!(
+                reopened
+                    .validate_original_repair_dispatch(&carrier)
+                    .is_err()
+            );
+            assert!(
+                reopened
+                    .closed_repair_birth(&installed.material.birth.root.subject)
+                    .unwrap()
+                    .is_none()
+            );
+            let reopen_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+            let mut current = fixture.runtime.metadata_primary_service(path).unwrap();
+            let reopen_admission = current
+                .acquire_prepared_execution(&association_scope)
+                .unwrap();
+            let before_reopen_duplicate = reopened.view().unwrap();
+            assert_eq!(
+                current
+                    .associate_installed_repair_executor_disabled(&assignment, &owner, &request,)
+                    .unwrap(),
+                Some(association)
+            );
+            assert_eq!(
+                reopened.view().unwrap(),
+                before_reopen_duplicate,
+                "native reopen duplicate must not append or rewrite queue DATA"
+            );
+            assert!(Instant::now() <= reopen_deadline);
+            drop(reopen_admission);
+            // The same held_promoted guard also qualifies this observation.
+            assert_eq!(fixture.runtime.observation_dropped_count(), 0);
+            assert!(
+                !fixture
+                    .runtime
+                    .rpc_observations()
+                    .iter()
+                    .any(|call| call.source == promoted
+                        && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                        && call.dfs_request_id.as_deref() == Some(request.as_str()))
+            );
+            assert_eq!(
+                source_queue
+                    .original_repair(&fixture.birth.original)
+                    .unwrap()
+                    .unwrap(),
+                source_before
+            );
+            facts["native_b_reopen_duplicate_matched"] = serde_json::json!(true);
+        }));
+        let report = serde_json::json!({
+            "native_assertions_passed":outcome.is_ok(), "initial_original":&fixture.birth,
+            "facts":facts,
+            "qualification":"Native disabled-association DATA control. B bytes are fixture-prepared through the actual local writer, not transferred. A->B retiring-role rejection is not a second reconfiguration trace. Absence of B dispatch is observed with held_promoted installed; native lookup/attempt rejections do not claim unguarded scheduler coverage. No successor dispatch, receiver Terminal/dedup, causal application, root retirement, C1 or availability proof."
+        });
+        if let Err(error) = std::fs::write(
+            fixture
+                .runtime
+                .data_dir(&fixture.shard.primary_node_id)
+                .root()
+                .join("native-selected-association-result.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        ) {
+            eprintln!("native disabled association report write failed: {error}");
+        }
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed {
+                eprintln!("native disabled association cleanup also failed: {close_error}");
+            }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("normal native disabled association fixture drain");
+    }
+
     fn receiver_custody_files(root: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
         fn visit(base: &Path, path: &Path, result: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
             if !path.exists() { return; }
