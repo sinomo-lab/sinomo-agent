@@ -3403,23 +3403,6 @@ impl DfsTestRuntime {
         )
         .map_err(|error| error.to_string())
     }
-
-    /// Preserve the actual native withdrawal's follow-up work on the same Main
-    /// lane used by maintenance, instead of dropping a separate Core shell.
-    pub(crate) fn withdraw_remote_replica_on_main(
-        &self,
-        owner: &NodeId,
-        object: &crate::DfsObjectId,
-        version: &crate::DfsVersion,
-        content_hash: &Option<String>,
-        holder: &NodeId,
-    ) -> Result<crate::DfsMessageCommittedWork, String> {
-        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-        crate::runtime_host::withdraw_remote_replica_on_main_for_test(
-            self.data_dir(owner), executor().handle(), object, version, content_hash, holder, deadline,
-        ).map_err(|error| error.to_string())
-    }
-
     /// Run history collection through each ordinary current owning-shard opener.
     pub fn gc_metadata_history_on_current_primaries(
         &self,
