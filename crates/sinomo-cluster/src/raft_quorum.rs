@@ -1434,17 +1434,15 @@ fn cluster_kv_quorum_commit_phase_trace(
         detail = %detail,
         "cluster KV quorum commit phase"
     );
-    if cluster_kv_quorum_commit_stderr_trace_enabled() {
-        eprintln!(
-            "[sinomo cluster join] KV quorum phase={phase} request_id={request_id} local_node={local_node_id} duration_us={duration_us} commit_elapsed_us={commit_elapsed_us} emission_delay_us={emission_delay_us} term={term} log_index={log_index} revision={revision} outcome={outcome}: {detail}"
-        );
-    }
+    // This event already carries every phase field. A second raw stderr copy
+    // bypasses the installed tracing sinks' retention/live-writing policy and
+    // can leave buffered log writes after the operation has finished.
 }
 
-static CLUSTER_JOIN_STDERR_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+static CLUSTER_JOIN_TRACE_REQUESTED: OnceLock<bool> = OnceLock::new();
 
-fn cluster_kv_quorum_commit_stderr_trace_enabled() -> bool {
-    *CLUSTER_JOIN_STDERR_TRACE_ENABLED.get_or_init(|| {
+fn cluster_kv_quorum_commit_legacy_trace_requested() -> bool {
+    *CLUSTER_JOIN_TRACE_REQUESTED.get_or_init(|| {
         std::env::var("SINOMO_CLUSTER_JOIN_TRACE")
             .ok()
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
@@ -1453,11 +1451,128 @@ fn cluster_kv_quorum_commit_stderr_trace_enabled() -> bool {
 
 fn cluster_kv_quorum_commit_trace_enabled() -> bool {
     tracing::enabled!(target: "sinomo.cluster.formation", tracing::Level::TRACE)
-        || cluster_kv_quorum_commit_stderr_trace_enabled()
+        || cluster_kv_quorum_commit_legacy_trace_requested()
 }
 
 const CLUSTER_KV_QUORUM_COMMIT_TRACE_RECORD_LIMIT: usize = 32;
 const CLUSTER_KV_QUORUM_COMMIT_TRACE_DETAIL_LIMIT: usize = 512;
+
+#[cfg(test)]
+mod quorum_trace_retention_tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct PhaseCapture(Arc<Mutex<Vec<serde_json::Map<String, serde_json::Value>>>>);
+
+    impl tracing::Subscriber for PhaseCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "sinomo.cluster.formation"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(serde_json::Map<String, serde_json::Value>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().into(), format!("{value:?}").into());
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.insert(field.name().into(), value.into());
+                }
+            }
+            let mut fields = Fields(Default::default());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    #[test]
+    fn quorum_phase_keeps_structured_fields_without_raw_stderr() {
+        const CASE: &str = "raft_quorum::quorum_trace_retention_tests::quorum_phase_keeps_structured_fields_without_raw_stderr";
+        // The legacy environment flag and stderr belong to one actual process.
+        // Keep normal parent workers and other tests' subscribers untouched.
+        if std::env::var("SINOMO_QUORUM_TRACE_CONTROL_CHILD").as_deref() != Ok(CASE) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env("SINOMO_QUORUM_TRACE_CONTROL_CHILD", CASE)
+                .env("SINOMO_CLUSTER_JOIN_TRACE", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "child failed: {stdout}\n{stderr}");
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+            let fields = stdout
+                .lines()
+                .find(|line| line.starts_with("QUORUM_TRACE_FIELDS="))
+                .unwrap();
+            println!("{fields}");
+            println!("captured_child_stderr={stderr:?}");
+            assert!(
+                stderr.is_empty(),
+                "routine phase diagnostics bypassed the configured tracing sinks: {stderr}"
+            );
+            return;
+        }
+
+        let request_id = KvRequestId::generate();
+        let node_id = NodeId::generate();
+        let capture = PhaseCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            // Emitter control only: no protocol work or successful reply is
+            // supplied. These zero authority/index fields are not a receipt.
+            cluster_kv_quorum_commit_phase_trace(
+                "retention-control",
+                &request_id,
+                &node_id,
+                Duration::from_micros(3),
+                Duration::from_micros(5),
+                Duration::from_micros(7),
+                0,
+                0,
+                0,
+                "observation-only",
+                format_args!("unchanged structured diagnostic"),
+            );
+        });
+        let rows = capture.0.lock().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "enabled structured phase must remain collected"
+        );
+        let fields = &rows[0];
+        assert_eq!(fields["phase"], "retention-control");
+        assert_eq!(fields["request_id"], request_id.to_string());
+        assert_eq!(fields["local_node_id"], node_id.to_string());
+        assert_eq!(fields["duration_us"], 3);
+        assert_eq!(fields["commit_elapsed_us"], 5);
+        assert_eq!(fields["emission_delay_us"], 7);
+        assert_eq!(fields["term"], 0);
+        assert_eq!(fields["log_index"], 0);
+        assert_eq!(fields["revision"], 0);
+        assert_eq!(fields["outcome"], "observation-only");
+        assert_eq!(fields["detail"], "unchanged structured diagnostic");
+        assert_eq!(fields["message"], "cluster KV quorum commit phase");
+        println!(
+            "QUORUM_TRACE_FIELDS={}",
+            serde_json::to_string(fields).unwrap()
+        );
+    }
+}
 
 struct ClusterKvQuorumCommitTraceRecord {
     phase: &'static str,

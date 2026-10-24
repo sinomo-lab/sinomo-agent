@@ -175,6 +175,14 @@ existing outputs; routine enabled records stay in memory. Panic diagnostics and
 explicit operational/domain/audit journals are unchanged. A process crash loses
 unexported memory history; no power-loss durability is promised for text exports.
 
+Cluster KV quorum phase records use the existing
+`sinomo.cluster.formation` TRACE event, including request/node identity, phase,
+timings, term, log index, revision, outcome and detail. For these records,
+`SINOMO_CLUSTER_JOIN_TRACE` continues to request bounded phase timing capture;
+it does not enable a duplicate raw stderr writer. Collection still obeys the
+global filter, and persistent formatting uses the same explicit live-writing
+control as other routine records.
+
 Export recent history explicitly through the existing bounded APIs, for example:
 
 ```sh
