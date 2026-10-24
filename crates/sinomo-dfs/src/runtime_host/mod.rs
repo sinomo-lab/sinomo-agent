@@ -3287,6 +3287,8 @@ use reconciliation_host::{
 };
 mod maintenance_runtime;
 #[cfg(test)]
+pub(crate) use maintenance_runtime::withdraw_remote_replica_on_main_for_test;
+#[cfg(test)]
 use maintenance_runtime::*;
 pub(crate) use maintenance_runtime::{
     DaemonDfsMaintenanceTickOutcome, daemon_dfs_background_network_work_deferred,

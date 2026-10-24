@@ -5153,9 +5153,11 @@ mod native_selected_data_tests {
             origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
             action: FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id: None, captured: Arc::clone(&replies) },
         });
-        let mut source = runtime.metadata_primary_service(path).unwrap();
-        source.mark_remote_read_location_missing(&stat.object_id, &stat.version, &stat.content_hash, &holder).unwrap();
-        drop(source);
+        let withdrawal = runtime.withdraw_remote_replica_on_main(
+            &owner, &stat.object_id, &stat.version, &stat.content_hash, &holder,
+        ).unwrap();
+        assert!(withdrawal.publish_metadata && withdrawal.repair_maintenance,
+            "actual native location withdrawal retains its committed follow-up work");
         claim_window.store(true, std::sync::atomic::Ordering::Release);
         let selected_layout = runtime.selected_original_data_layout(&owner).unwrap();
         let queue = selected_layout.queue().unwrap();
