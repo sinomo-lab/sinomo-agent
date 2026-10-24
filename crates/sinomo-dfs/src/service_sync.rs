@@ -5075,8 +5075,8 @@ mod native_selected_data_tests {
             policy.forbidden_node_ids.push(promoted.clone());
         }
         runtime.apply_placement_policy(&owner, path, DfsPlacementScope::Subtree, policy).unwrap();
-        // Candidates are hints. Resolve the actual managed constraints so the
-        // seed really places the exact bytes on A/C, leaving promoted B empty.
+        // Candidates are hints. Resolve the actual managed A/C constraints;
+        // the first real background Repair will create C's copy below.
         let mut policy_reader = runtime.metadata_primary_service(path).unwrap();
         let planned_policy = policy_reader.managed_write_replication_policy_for_path(
             path, sinomo_core::DfsObjectPolicy::ReplicatedEventual, 2,
@@ -5087,42 +5087,18 @@ mod native_selected_data_tests {
         assert_eq!(planned_policy.required_node_ids.iter().cloned().collect::<BTreeSet<_>>(), required);
         assert_eq!(planned_policy.forbidden_node_ids.contains(&promoted), forbid_promoted);
         drop(policy_reader);
-        let mut writer = runtime.client(&owner).unwrap();
-        assert!(writer.transport.delegates_local_namespace_authority());
-        let seed_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-        let previous = writer.set_transport_operation_deadline(Some(seed_deadline));
-        let bytes = vec![0x5a; 4096];
-        let stat = writer.posix_write_file(path, &bytes, DfsWriteOptions {
-            policy: planned_policy,
-            replica_candidates: vec![owner.clone(), holder.clone()],
-            wait_for_commit: true, foreground_replica_repair: true,
-        }).unwrap();
-        let synced = writer.posix_sync_file(path, DfsPosixSyncKind::File).unwrap();
-        assert!(Instant::now() <= seed_deadline, "unchanged registered Main seed budget");
-        assert_eq!(writer.transport.operation_deadline(), Some(seed_deadline));
-        assert_eq!(synced.target.version, stat.version);
-        assert_eq!(synced.content_evidence.required_receipts, 2);
-        eprintln!("SELECTED_NATIVE_SEED_RECEIPTS {:?}", synced.content_evidence.receipt_node_ids);
-        assert_eq!(synced.content_evidence.receipt_node_ids.iter().cloned().collect::<BTreeSet<_>>(), required);
-        writer.set_transport_operation_deadline(previous);
-        drop(writer);
-        for node in [&owner, &holder] {
-            let reader = runtime.client(node).unwrap();
-            assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
-        }
         let replies = Arc::new(Mutex::new(Vec::new()));
-        // Stop the next claim after the real receiver's reply is captured and
-        // discarded. A polling loop must not race another attempt before it
-        // observes the first durable lost-reply cut. This changes no queue fact,
-        // retry clock, response or authority; the ordinary callback still owns
-        // persisting the actual failure below.
+        // Hold the FIRST background claim before seeding. The actual returned
+        // stat supplies its identity before release; no body/request is minted
+        // by this gate. After captured reply loss, block another attempt while
+        // the ordinary callback persists the exact uncertainty below.
         let claim_window = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seeded_identity = Arc::new(Mutex::new(None::<(DfsObjectId, DfsVersion)>));
         let window = Arc::clone(&claim_window);
+        let expected_identity = Arc::clone(&seeded_identity);
         let captured_replies = Arc::clone(&replies);
         let expected_owner = owner.clone();
         let expected_holder = holder.clone();
-        let expected_object = stat.object_id.clone();
-        let expected_version = stat.version.clone();
         let context = runtime.component_context(&owner).unwrap();
         let held = Some(Box::new(crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
             context.data_dir(), Arc::new(move |point, command, _| {
@@ -5130,15 +5106,21 @@ mod native_selected_data_tests {
                     background_repair: true, kind, intent_id_digest, target_id_digest, ..
                 } = point else { return Ok(()); };
                 assert!(command.is_none());
+                if !window.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(DfsError::Cancelled { operation: "negative claim boundary around actual captured reply loss" });
+                }
+                let identity = expected_identity.lock().unwrap();
+                let (expected_object, expected_version) = identity.as_ref()
+                    .expect("only the actual committed seed can release its claim window");
                 let captured_loss = matches!(kind, sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
                     && captured_replies.lock().unwrap().iter().any(|routed: &DfsRoutedMessage| {
                     let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
                     routed.source_node_id == expected_holder && routed.target_node_id == expected_owner
-                        && response.object_id == expected_object && response.version == expected_version
+                        && &response.object_id == expected_object && &response.version == expected_version
                         && *blake3::hash(response.intent_id.as_bytes()).as_bytes() == intent_id_digest
                         && *blake3::hash(expected_holder.as_str().as_bytes()).as_bytes() == target_id_digest
                 });
-                if !window.load(std::sync::atomic::Ordering::Acquire) || captured_loss {
+                if captured_loss {
                     return Err(DfsError::Cancelled { operation: "negative claim boundary around actual captured reply loss" });
                 }
                 Ok(())
@@ -5153,11 +5135,41 @@ mod native_selected_data_tests {
             origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
             action: FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id: None, captured: Arc::clone(&replies) },
         });
-        let withdrawal = runtime.withdraw_remote_replica_on_main(
-            &owner, &stat.object_id, &stat.version, &stat.content_hash, &holder,
-        ).unwrap();
-        assert!(withdrawal.publish_metadata && withdrawal.repair_maintenance,
-            "actual native location withdrawal retains its committed follow-up work");
+        let mut writer = runtime.client(&owner).unwrap();
+        assert!(writer.transport.delegates_local_namespace_authority());
+        let seed_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let previous = writer.set_transport_operation_deadline(Some(seed_deadline));
+        let bytes = vec![0x5a; 4096];
+        let stat = writer.posix_write_file(path, &bytes, DfsWriteOptions {
+            policy: planned_policy,
+            replica_candidates: vec![owner.clone(), holder.clone()],
+            wait_for_commit: true, foreground_replica_repair: false,
+        }).unwrap();
+        assert!(Instant::now() <= seed_deadline, "unchanged registered Main seed budget");
+        assert_eq!(writer.transport.operation_deadline(), Some(seed_deadline));
+        writer.set_transport_operation_deadline(previous);
+        assert_eq!(writer.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
+        drop(writer);
+        let seed_owner = runtime.metadata_primary_service(path).unwrap();
+        let backend = seed_owner.metadata_backend().unwrap();
+        let intents = backend.intents_for_object(&stat.object_id).unwrap();
+        assert!(intents.iter().any(|intent| intent.target_version == stat.version
+            && intent.status == DfsWriteIntentStatus::Committed
+            && intent.policy.min_commit_replicas == 1 && intent.policy.desired_replicas == 2
+            && intent.desired_replica_node_ids.iter().cloned().collect::<BTreeSet<_>>() == required));
+        let receipts = backend.receipts_for_version(&stat.object_id, &stat.version).unwrap();
+        assert_eq!(receipts.iter().map(|receipt| receipt.replica_node_id.clone()).collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner.clone()]), "committed W1 seed precedes C's first background effect");
+        eprintln!("SELECTED_NATIVE_SEED_RECEIPTS {:?}", receipts.iter().map(|receipt| &receipt.replica_node_id).collect::<Vec<_>>());
+        drop(seed_owner);
+        assert!(capture.records().is_empty() && replies.lock().unwrap().is_empty());
+        assert_eq!(capture.omitted_count(), 0);
+        assert_eq!(runtime.observation_dropped_count(), 0);
+        assert!(!runtime.rpc_observations().iter().any(|call|
+            call.source == owner && call.target == holder && call.route == DFS_DATA_REPAIR_REPLICA_ROUTE),
+            "no real A-to-C Repair can precede the closed first-effect gate");
+        assert!(Instant::now() <= seed_deadline, "unchanged complete seed preparation budget");
+        *seeded_identity.lock().unwrap() = Some((stat.object_id.clone(), stat.version.clone()));
         claim_window.store(true, std::sync::atomic::Ordering::Release);
         let selected_layout = runtime.selected_original_data_layout(&owner).unwrap();
         let queue = selected_layout.queue().unwrap();
@@ -5219,6 +5231,17 @@ mod native_selected_data_tests {
         assert_eq!(birth.root.subject.request_id, command.request_id);
         assert_eq!(birth.root.original_command_digest,
             crate::repair_queue_store::original_repair_digest(&birth.original, &birth.attachment).unwrap());
+        // C's bytes are now proved after its actual positive response was lost,
+        // not supplied by setup or inferred from an A-side receipt or timeout.
+        for node in [&owner, &holder] {
+            let reader = runtime.client(node).unwrap();
+            assert_eq!(reader.content().read_object_version(stat.object_id.as_str(), stat.version.as_str()).unwrap().1, bytes);
+        }
+        let empty_successor = runtime.client(&promoted).unwrap();
+        assert!(matches!(empty_successor.content().read_manifest(stat.object_id.as_str(), stat.version.as_str()),
+            Err(crate::ContentStoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound),
+            "the genuine source/copy cut leaves B without the exact version");
+        drop(empty_successor);
         GenuineNativeOriginal { runtime, shard, promoted, holder, birth, held, held_promoted }
     }
 
