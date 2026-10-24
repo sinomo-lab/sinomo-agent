@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicUsize;
 struct NativeInputs {
     authority: KvAuthorityProof,
     floor: KvLocalRead<Option<KvEntry>>,
-    scopes: [Vec<KvEntry>; 3],
+    scopes: [Vec<KvEntry>; 4],
     floor_unavailable: bool,
 }
 
@@ -95,6 +95,7 @@ impl NativeProjectionHost {
                         encode_kv_value(&provider).unwrap(),
                         8,
                     )],
+                    Vec::new(),
                 ],
                 floor_unavailable: false,
             }),
@@ -265,6 +266,57 @@ fn configuration_delta(revision: u64, entry: Option<KvEntry>) -> ClusterKvCommit
         .into(),
         final_key_states: vec![ClusterKvCommittedKeyState { key, entry }].into(),
     }
+}
+
+#[tokio::test]
+async fn write_configuration_runtime_lends_four_scope_inventory_without_warm_prefix_reads() {
+    let host = NativeProjectionHost::new(true);
+    {
+        let mut inputs = host.inputs.lock().unwrap();
+        let config: ClusterKvRaftConfigRecord =
+            inputs.floor.value.as_ref().unwrap().decode().unwrap();
+        let member = sinomo_core::ClusterMemberRecord::local_voter(
+            config.cluster_id,
+            host.local.clone(),
+            "native-owner",
+            "native-owner-key",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        inputs.scopes[3] = vec![fixture_entry(
+            &sinomo_core::node::cluster_member_key(&host.local),
+            encode_kv_value(&member).unwrap(),
+            8,
+        )];
+        let mut provider: sinomo_core::service::ServiceInstanceRecord =
+            inputs.scopes[2][0].decode().unwrap();
+        provider.interface_id = format!("sinomo.object-rpc/{}", crate::DFS_RPC_CATEGORY);
+        provider.interface_version = crate::DFS_PROTOCOL.into();
+        provider.locality = sinomo_core::service::ServiceDiscoveryLocality::Cluster;
+        inputs.scopes[2][0].value = encode_kv_value(&provider).unwrap();
+    }
+    let runtime = attach(&host);
+    runtime.request_authoritative_refresh();
+    host.run_next().await;
+    let view = runtime.write_configuration_projection().unwrap().unwrap();
+    let inventory = view.admitted_content_targets().unwrap();
+    assert_eq!(inventory.targets.len(), 1);
+    assert_eq!(inventory.targets[0].advertisement.node_id, host.local);
+    assert!(inventory.targets[0].provider_observed_ready);
+    let read_prefixes = host.reads.lock().unwrap().clone();
+    assert_eq!(
+        read_prefixes,
+        DFS_WRITE_CONFIGURATION_PREFIXES.map(str::to_owned).to_vec()
+    );
+    for _ in 0..3 {
+        let current = runtime.write_configuration_projection().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&current, &view));
+        assert_eq!(current.admitted_content_targets().unwrap().targets.len(), 1);
+    }
+    assert_eq!(host.read_count(), DFS_WRITE_CONFIGURATION_PREFIXES.len());
+    host.inputs.lock().unwrap().floor_unavailable = true;
+    assert!(runtime.write_configuration_projection().is_err());
+    assert_eq!(host.read_count(), DFS_WRITE_CONFIGURATION_PREFIXES.len());
+    host.discard_queued();
 }
 
 #[tokio::test]
@@ -1039,7 +1091,7 @@ async fn write_configuration_pending_bundle_publication_wakes_existing_readiness
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     let inputs = host.inputs.lock().unwrap().clone();
-    let mut reads: [KvAuthoritativeRead<Vec<KvEntry>>; 3] =
+    let mut reads: [KvAuthoritativeRead<Vec<KvEntry>>; 4] =
         std::array::from_fn(|scope| KvAuthoritativeRead {
             value: inputs.scopes[scope].clone(),
             authority: inputs.authority,
@@ -1586,7 +1638,10 @@ async fn required_revision_withdraws_configuration_before_queued_refresh_runs() 
         current.content_advertisements().unwrap()[0].zone.as_deref(),
         Some("new-authoritative-zone")
     );
-    assert_eq!(host.read_count(), reads + 3);
+    assert_eq!(
+        host.read_count(),
+        reads + DFS_WRITE_CONFIGURATION_PREFIXES.len()
+    );
     assert_eq!(host.queued_count(), 0);
     assert_eq!(runtime.storage_generation(), storage_generation);
 }
@@ -1636,7 +1691,7 @@ async fn native_host_preflight_joins_configuration_after_first_prefix_is_publish
         runtime.write_configuration_readiness().unwrap(),
         crate::DfsWriteConfigurationReadiness::Ready(Some(_))
     ));
-    assert_eq!(host.read_count(), 3);
+    assert_eq!(host.read_count(), DFS_WRITE_CONFIGURATION_PREFIXES.len());
     assert_eq!(host.queued_count(), 0);
 }
 
@@ -1688,7 +1743,10 @@ async fn admission_fence_rejects_partial_configuration_after_same_generation_ref
             runtime.generation()
         )
     );
-    assert_eq!(host.read_count(), 6);
+    assert_eq!(
+        host.read_count(),
+        2 * DFS_WRITE_CONFIGURATION_PREFIXES.len()
+    );
     assert_eq!(host.queued_count(), 0);
 }
 
@@ -1702,7 +1760,7 @@ async fn configuration_published_between_pending_read_and_waiter_check_is_revali
     let generation = runtime.generation();
     let reads = host.read_count();
     let publications = host.spawned.load(Ordering::Acquire);
-    // Retain the actual three-prefix native publication. Deliver it at the
+    // Retain the actual four-prefix native publication. Deliver it at the
     // precise read/check boundary, as the existing refresh owner can do.
     let published = Mutex::new(Some(std::mem::take(
         &mut *runtime.write_configuration.lock().unwrap(),
@@ -1778,7 +1836,7 @@ async fn retained_control_client_joins_configuration_after_early_filesystem_pref
             .is_err(),
         "an unavailable native floor remains terminal on a warm client"
     );
-    assert_eq!(host.read_count(), 3);
+    assert_eq!(host.read_count(), DFS_WRITE_CONFIGURATION_PREFIXES.len());
     assert_eq!(host.spawned.load(Ordering::Acquire), 1);
     assert_eq!(host.queued_count(), 0);
 }
@@ -1788,7 +1846,7 @@ async fn queued_refresh_preserves_configuration_completed_by_committed_delta() {
     let host = NativeProjectionHost::new(true);
     let runtime = attach(&host);
     let inputs = host.inputs.lock().unwrap().clone();
-    let mut reads: [KvAuthoritativeRead<Vec<KvEntry>>; 3] =
+    let mut reads: [KvAuthoritativeRead<Vec<KvEntry>>; 4] =
         std::array::from_fn(|scope| KvAuthoritativeRead {
             value: inputs.scopes[scope].clone(),
             authority: inputs.authority,

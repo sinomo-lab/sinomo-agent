@@ -20,6 +20,9 @@ use crate::intent::{stable_operation_order_token, stable_write_intent_id};
 use crate::transfer::{PendingNetworkedWrite, PendingNetworkedWritePatch};
 use crate::*;
 
+#[cfg(test)]
+mod fresh_admission_native_tests;
+
 /// Internal write execution choices. Content identity and the consumed input
 /// remain explicit parameters of the byte, reader and manifest entry points.
 #[derive(Clone, Debug, Default)]
@@ -38,6 +41,34 @@ pub(crate) enum DfsWriteCreation {
     #[default]
     Upsert,
     Exclusive,
+    /// A result of the existing namespace caller's actual lookup/allocation,
+    /// never a wire claim or inference from the transient overlay index.
+    FreshNamespace {
+        exclusive: bool,
+    },
+}
+
+impl DfsWriteCreation {
+    pub(crate) fn from_namespace_resolution(exclusive: bool, created: bool) -> Self {
+        if created {
+            Self::FreshNamespace { exclusive }
+        } else if exclusive {
+            Self::Exclusive
+        } else {
+            Self::Upsert
+        }
+    }
+
+    fn is_exclusive(self) -> bool {
+        matches!(
+            self,
+            Self::Exclusive | Self::FreshNamespace { exclusive: true }
+        )
+    }
+
+    pub(crate) fn is_fresh_namespace(self) -> bool {
+        matches!(self, Self::FreshNamespace { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -148,6 +179,204 @@ pub(crate) struct PreviousRoutedWriteState {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn snapshot_fresh_namespace_replication_plan(
+        &self,
+        object: &DfsObjectMetadata,
+        target_version: &DfsVersion,
+        policy: &DfsReplicationPolicy,
+        creation: DfsWriteCreation,
+        repair: DfsWriteRepair,
+    ) -> Result<Option<(Vec<NodeId>, DfsReplicationPolicy)>, DfsError> {
+        if !creation.is_fresh_namespace()
+            || repair != DfsWriteRepair::Background
+            || object.policy != DfsObjectPolicy::ReplicatedEventual
+            || object.kind != DfsObjectKind::File
+            || policy.min_commit_replicas >= policy.desired_replicas
+            || self.publication_provider.current().is_none()
+        {
+            return Ok(None);
+        }
+        let unavailable = |message: &str| DfsError::Metadata {
+            message: message.into(),
+        };
+        let control = self.control_plane.as_deref().ok_or_else(|| {
+            unavailable("fresh native placement has no retained configuration owner")
+        })?;
+        let configuration = control
+            .write_configuration_projection()?
+            .ok_or_else(|| unavailable("fresh native placement has no complete configuration"))?;
+        let filesystem = configuration
+            .file_system_config(&object.file_system_id)?
+            .filter(|config| config.file_system_id == object.file_system_id)
+            .ok_or_else(|| {
+                unavailable("fresh native placement has no exact filesystem configuration")
+            })?;
+        let prefix = format!("{}/", crate::metadata_shards_prefix(&object.file_system_id));
+        let shard_entries = configuration
+            .entries(&prefix)
+            .ok_or_else(|| unavailable("fresh native placement has no complete shard scope"))?;
+        let shards = crate::metadata_shard_index_from_authority_entries(shard_entries)
+            .remove(&object.file_system_id.to_string())
+            .ok_or_else(|| {
+                unavailable("fresh native placement has no exact filesystem shard records")
+            })?
+            .map_err(|message| DfsError::Metadata { message })?;
+        let shard = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &object.file_system_id,
+            &shards,
+            &object.path,
+        )?
+        .ok_or_else(|| unavailable("fresh native placement has no exact object shard"))?;
+        if shard.primary_node_id == self.node_id
+            && !self.transport.delegates_local_namespace_authority()
+        {
+            // Requester-side selection is planning DATA only. The actual local
+            // author must independently own admission and prove canonical
+            // absence; a transient overlay may have survived a failed read.
+            let execution = self.publication_execution.current().ok_or_else(|| {
+                unavailable("fresh native placement has no actual shard execution admission")
+            })?;
+            let backend = self.metadata_backend.as_deref().ok_or_else(|| {
+                unavailable("fresh native placement has no actual metadata backend")
+            })?;
+            let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+            let scope = backend.publication_owner_scope(&object.file_system_id, &shard_id)?;
+            if !execution.admits(&scope, &object.file_system_id, &shard_id) {
+                return Err(unavailable(
+                    "fresh native placement lacks its actual shard admission",
+                ));
+            }
+            if backend
+                .get_object_on_shard(&shard_id, &object.object_id)?
+                .is_some()
+            {
+                return Err(unavailable(
+                    "fresh namespace object already has canonical metadata",
+                ));
+            }
+            if let Some(existing) =
+                backend.get_object_by_path(&object.file_system_id, &object.path)?
+            {
+                if existing.kind != DfsObjectKind::Tombstone
+                    || self
+                        .transient_metadata_predecessor_object_ids
+                        .get(&object.object_id)
+                        != Some(&existing.object_id)
+                {
+                    return Err(unavailable(
+                        "fresh namespace path absence or predecessor changed",
+                    ));
+                }
+            }
+        }
+        let resolved = crate::placement::resolve_placement_policy(
+            &filesystem,
+            &object.path,
+            object.policy.clone(),
+            policy.desired_replicas,
+        )?;
+        if resolved.source_path.is_some()
+            && (resolved.policy.consistency != object.policy
+                || resolved.policy.min_commit_replicas != policy.min_commit_replicas
+                || resolved.policy.desired_replicas != policy.desired_replicas
+                || resolved.policy.required_node_ids != policy.required_node_ids
+                || resolved.policy.forbidden_node_ids != policy.forbidden_node_ids
+                || resolved.policy.min_distinct_zones != policy.min_distinct_zones)
+        {
+            return Err(unavailable(
+                "fresh namespace placement differs from its current managed policy",
+            ));
+        }
+        let inventory = configuration.admitted_content_targets()?;
+        let mut zones = policy.node_zones.clone();
+        for advertisement in configuration.content_advertisements()? {
+            if let Some(zone) = advertisement.zone {
+                if zones
+                    .get(&advertisement.node_id)
+                    .is_some_and(|captured| captured != &zone)
+                {
+                    return Err(unavailable(
+                        "fresh namespace placement has conflicting captured zone evidence",
+                    ));
+                }
+                zones.insert(advertisement.node_id, zone);
+            }
+        }
+        let effective_policy =
+            DfsReplicationPolicy::new(policy.min_commit_replicas, policy.desired_replicas)?
+                .with_placement_constraints(
+                    policy.required_node_ids.clone(),
+                    policy.forbidden_node_ids.clone(),
+                    policy.min_distinct_zones,
+                    zones,
+                )?;
+        let request = DfsReplicaPlacementRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version: target_version.clone(),
+            coordinator_node_id: self.node_id.clone(),
+            policy: effective_policy.clone(),
+            candidates: Vec::new(),
+        };
+        let pinned = self
+            .content_pin_node_ids
+            .get(&object.object_id)
+            .cloned()
+            .unwrap_or_default();
+        let snapshot = self.placement_snapshot_cache.snapshot();
+        let plan =
+            crate::placement_environment::plan_fresh_eventual_replicas_with_admitted_targets(
+                &request,
+                &inventory,
+                snapshot.as_deref(),
+                &object.current_locations,
+                &pinned.into_iter().collect::<Vec<_>>(),
+            )?;
+        dfs_perf_trace!(
+            "fresh_namespace_content_plan configuration_revision={} desired={} attemptable={} observed_ready={} deferred={}",
+            plan.configuration_revision.0,
+            plan.placement.desired_replica_nodes.len(),
+            plan.attemptable_node_ids.len(),
+            plan.observed_ready_node_ids.len(),
+            plan.deferred_desired_node_ids.len(),
+        );
+        Ok(Some((
+            plan.placement.desired_replica_nodes,
+            effective_policy,
+        )))
+    }
+
+    pub(crate) fn plan_namespace_creation_replicas(
+        &self,
+        request: &DfsWriteRequest,
+        object: &DfsObjectMetadata,
+        candidate_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+        creation: DfsWriteCreation,
+        repair: DfsWriteRepair,
+    ) -> Result<DfsReplicaPlacementPlan, DfsError> {
+        if let Some((desired_replica_nodes, policy)) = self
+            .snapshot_fresh_namespace_replication_plan(
+                object,
+                &request.target_version,
+                &policy,
+                creation,
+                repair,
+            )?
+        {
+            let preferred_commit_nodes = desired_replica_nodes
+                .iter()
+                .take(policy.min_commit_replicas)
+                .cloned()
+                .collect();
+            return Ok(DfsReplicaPlacementPlan {
+                desired_replica_nodes,
+                preferred_commit_nodes,
+            });
+        }
+        self.plan_distributed_eventual_replicas(request, candidate_nodes, policy)
+    }
+
     fn snapshot_replication_plan(
         &self,
         object: &DfsObjectMetadata,
@@ -280,6 +509,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
+        creation: DfsWriteCreation,
+        repair: DfsWriteRepair,
     ) -> Result<PreparedDistributedWrite, DfsError> {
         let object = self.current_object_for_write(object_id)?;
         let local_owned = object.policy == DfsObjectPolicy::LocalOwned;
@@ -303,6 +534,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
             (desired_replica_nodes, policy)
+        } else if let Some(plan) = self.snapshot_fresh_namespace_replication_plan(
+            &object,
+            target_version,
+            &policy,
+            creation,
+            repair,
+        )? {
+            plan
         } else {
             self.normalize_distributed_write_replication_plan(
                 &object,
@@ -1325,6 +1564,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            if options.publication.is_current() && expected_base_version.is_none() {
+                options.creation
+            } else {
+                DfsWriteCreation::Upsert
+            },
+            options.repair,
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard)
@@ -1727,7 +1972,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .validate()
             .map_err(|message| DfsError::Metadata { message })?;
         let touch_parent_on_create = options.touch_parent_on_create;
-        let exclusive_create = options.creation == DfsWriteCreation::Exclusive;
+        let exclusive_create = options.creation.is_exclusive();
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
         let operation_id = options.operation_id;
 
@@ -1754,6 +1999,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            if publication.is_current() && expected_base_version.is_none() {
+                options.creation
+            } else {
+                DfsWriteCreation::Upsert
+            },
+            options.repair,
         )?;
         if !publication.is_current() {
             if touch_parent_on_create
@@ -2073,7 +2324,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         let touch_parent_on_create = options.touch_parent_on_create;
-        let exclusive_create = options.creation == DfsWriteCreation::Exclusive;
+        let exclusive_create = options.creation.is_exclusive();
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
         let replay_response_journal = options.replay_response_journal;
         let operation_id = options.operation_id;
@@ -2093,6 +2344,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
+            if options.publication.is_current() && expected_base_version.is_none() {
+                options.creation
+            } else {
+                DfsWriteCreation::Upsert
+            },
+            options.repair,
         )?;
         let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
             Some(shard)
@@ -2580,7 +2837,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: DfsDistributedWriteOptions,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let touch_parent_on_create = options.touch_parent_on_create;
-        let exclusive_create = options.creation == DfsWriteCreation::Exclusive;
+        let exclusive_create = options.creation.is_exclusive();
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
         let detach_request = options.dispatch == DfsWriteDispatch::Detached;
         let replay_response_journal = options.replay_response_journal;
@@ -2832,7 +3089,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let trace_started = Instant::now();
         let touch_parent_on_create = options.touch_parent_on_create;
-        let exclusive_create = options.creation == DfsWriteCreation::Exclusive;
+        let exclusive_create = options.creation.is_exclusive();
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
         let detach_request = options.dispatch == DfsWriteDispatch::Detached;
         let replay_response_journal = options.replay_response_journal;
