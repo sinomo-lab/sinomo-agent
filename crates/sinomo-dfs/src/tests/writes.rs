@@ -691,9 +691,13 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
     let path = "/services/async-repair.txt";
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     placement.required_node_ids = vec![local.clone(), remote.clone()];
-    runtime
+    let applied = runtime
         .apply_placement_policy(&local, path, DfsPlacementScope::SelfOnly, placement.clone())
         .unwrap();
+    // Finish the accepted setup job before creating the object whose original
+    // write repair is measured below. Otherwise that independent job can also
+    // schedule a placement repair for the same newly created version.
+    finish_native_placement_fixture_apply(&runtime, &applied);
     for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
         runtime.install_fault(crate::test_runtime::FaultRule {
             source: Some(local.clone()),
