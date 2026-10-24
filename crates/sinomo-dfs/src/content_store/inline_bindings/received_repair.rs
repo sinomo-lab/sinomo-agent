@@ -320,6 +320,42 @@ impl LocalContentStore {
         Ok(store)
     }
 
+    /// Observe an explicitly admitted original fixture without recovering or
+    /// certifying its readable log. The expectation comes from the DATA owner,
+    /// never from a marker or a live registry entry.
+    pub(crate) fn original_repair_inspection_context(
+        identity: &ReceivedRepairFixtureIdentity,
+    ) -> Result<RepairPayloadInspectionContext> {
+        identity.check_original_physical_identity()?;
+        let store = Self::received_repair_fixture_handle(&identity.root, identity.format);
+        if store.inline_store.identity_error.is_some() {
+            return Err(inline_error(
+                "inspection has a conflicting live content owner",
+            ));
+        }
+        {
+            let mut accepted = store
+                .inline_store
+                .owner
+                .received_repair_identity
+                .lock()
+                .map_err(|_| inline_error("fixture identity mutex poisoned"))?;
+            if accepted.as_ref().is_some_and(|old| old != identity) {
+                return Err(inline_error(
+                    "inspection cannot adopt another physical content owner",
+                ));
+            }
+            *accepted = Some(identity.clone());
+        }
+        let sentinel = decode_content_reservation_batch_sentinel(&read_file(
+            &store.content_reservation_batch_sentinel_path(),
+        )?)?;
+        identity.check_original_store(&store, &sentinel.store_incarnation)?;
+        store.validate_owner_sentinel(&sentinel)?;
+        identity.check_original_physical_identity()?;
+        Ok(RepairPayloadInspectionContext { store })
+    }
+
     fn received_repair_fixture_handle(root: &Path, format: u32) -> Self {
         let lease = InlineStoreLease::new_for_format(root, format);
         Self {
@@ -909,6 +945,151 @@ mod tests {
         let (store, identity) =
             LocalContentStore::new_received_repair_fixture(root.join("content")).unwrap();
         (root, store, identity)
+    }
+
+    fn inspection_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                if metadata.is_dir() {
+                    collect(root, &entry.path(), files);
+                } else {
+                    assert!(metadata.is_file());
+                    files.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files);
+        files
+    }
+
+    fn inspection_payload(store: &LocalContentStore) -> RetainedRepairPayload {
+        let manifest = store
+            .put_object_version("inspection-object", "v1", b"actual retained dispatch bytes")
+            .unwrap();
+        store
+            .capture_repair_payload(
+                RepairPayloadSubject {
+                    queue_incarnation: "inspection-queue".into(),
+                    producer: "producer".into(),
+                    target: "target".into(),
+                    intent_id: "inspection-intent".into(),
+                    request_id: "inspection-request".into(),
+                },
+                "d".repeat(64),
+                &manifest.object_id,
+                &manifest.version,
+                &manifest.content_hash,
+                manifest.size_bytes,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn repair_payload_inspection_default_owner_preserves_files() {
+        let root = sinomo_testdir::TestDir::new("dispatch-inspection-default");
+        let store = LocalContentStore::new(root.join("content")).unwrap();
+        let payload = inspection_payload(&store);
+        let before = inspection_files(&store.root);
+        let context = RepairPayloadInspectionContext::for_default(&store.root);
+        context.inspect(payload.root()).unwrap();
+        assert_eq!(inspection_files(&store.root), before);
+    }
+
+    #[test]
+    fn repair_payload_inspection_explicit_private_owner_preserves_files() {
+        let root = sinomo_testdir::TestDir::new("dispatch-inspection-private");
+        let (store, identity) =
+            LocalContentStore::new_original_repair_fixture(root.join("content")).unwrap();
+        let payload = inspection_payload(&store);
+        let before = inspection_files(&store.root);
+        let context = LocalContentStore::original_repair_inspection_context(&identity).unwrap();
+        context.inspect(payload.root()).unwrap();
+        assert!(
+            RepairPayloadInspectionContext::for_default(&store.root)
+                .inspect(payload.root())
+                .unwrap_err()
+                .to_string()
+                .contains("different explicit layout capability")
+        );
+        assert_eq!(inspection_files(&store.root), before);
+    }
+
+    #[test]
+    fn repair_payload_inspection_rejects_foreign_incarnation_and_replaced_owner() {
+        let root = sinomo_testdir::TestDir::new("dispatch-inspection-foreign");
+        let (store, identity) =
+            LocalContentStore::new_original_repair_fixture(root.join("content")).unwrap();
+        let payload = inspection_payload(&store);
+        let (other, other_identity) =
+            LocalContentStore::new_original_repair_fixture(root.join("other")).unwrap();
+        let before = inspection_files(&root);
+        let context = LocalContentStore::original_repair_inspection_context(&identity).unwrap();
+        let foreign =
+            LocalContentStore::original_repair_inspection_context(&other_identity).unwrap();
+        assert!(foreign.inspect(payload.root()).is_err());
+        let mut wrong_incarnation = payload.root().clone();
+        wrong_incarnation.store_incarnation = "foreign-incarnation".into();
+        assert!(context.inspect(&wrong_incarnation).is_err());
+        assert_eq!(inspection_files(&root), before);
+        fs::rename(&store.root, root.join("retired-content")).unwrap();
+        fs::create_dir(&store.root).unwrap();
+        let replaced = inspection_files(&root);
+        assert!(LocalContentStore::original_repair_inspection_context(&identity).is_err());
+        assert!(context.inspect(payload.root()).is_err());
+        assert_eq!(inspection_files(&root), replaced);
+        drop(other);
+    }
+
+    #[test]
+    fn repair_payload_inspection_cold_read_does_not_certify_or_truncate() {
+        let root = sinomo_testdir::TestDir::new("dispatch-inspection-cold");
+        let (store, identity) =
+            LocalContentStore::new_original_repair_fixture(root.join("content")).unwrap();
+        let payload = inspection_payload(&store);
+        let (payload_root, reader) = payload.into_parts();
+        let previous_owner = Arc::downgrade(&store.inline_store.owner);
+        let segment = {
+            let state = store.inline_store.owner.state.lock().unwrap();
+            let catalog = state.catalog.as_ref().unwrap();
+            segment_path(
+                &store.root,
+                catalog.generation,
+                catalog.segments.last().unwrap().id,
+            )
+        };
+        drop(reader);
+        drop(store);
+        assert!(
+            previous_owner.upgrade().is_none(),
+            "all prior stores and retained readers must be dropped"
+        );
+        // Authored incomplete active-suffix cut, not an OS crash or sync claim.
+        let first_byte = fs::read(&segment).unwrap()[0];
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(&[first_byte])
+            .unwrap();
+        let before = inspection_files(&root);
+        let context = LocalContentStore::original_repair_inspection_context(&identity).unwrap();
+        assert!(!context.store.content_reservation_writer_initialized);
+        context.inspect(&payload_root).unwrap();
+        let state = context.store.inline_store.owner.state.lock().unwrap();
+        assert!(state.writer.is_none());
+        assert!(state.uncertain);
+        assert_eq!(state.certified_active_end, 0);
+        assert!(state.certified_catalog.is_none() && state.certified_identity.is_none());
+        assert_eq!(state.active_end + 1, fs::metadata(&segment).unwrap().len());
+        drop(state);
+        assert_eq!(inspection_files(&root), before);
     }
 
     #[test]

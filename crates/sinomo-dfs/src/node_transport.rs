@@ -2618,41 +2618,23 @@ impl DfsNodeTransport {
         Ok(())
     }
 
-    fn send_routed_message_attachment_to_peer(
+    fn send_routed_attachment_call_to_peer(
         &mut self,
         target_node_id: &NodeId,
-        routed_message: DfsRoutedMessage,
-        attachment: DfsOutboundAttachment,
+        call: DfsRoutedCall,
         require_local_source: bool,
         #[cfg(any(test, feature = "test-support"))] native_context: Option<
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
         if target_node_id == &self.local_node_id
-            && !self.routes_local_request_to_main(target_node_id, &routed_message.message)
+            && !self.routes_local_request_to_main(target_node_id, &call.message.message)
         {
-            let max_bytes =
-                usize::try_from(attachment.descriptor.total_size_bytes).map_err(|_| {
-                    NetworkError::ResourceExhausted {
-                        operation: "materialize loopback DFS attachment".to_string(),
-                        requested_bytes: usize::MAX,
-                    }
-                })?;
-            let bytes = collect_dfs_attachment_source_sync(attachment.source, max_bytes).map_err(
-                |source| NetworkError::Io {
-                    operation: "collect loopback DFS request attachment".to_string(),
-                    detail: source.to_string(),
-                },
-            )?;
-            let message = crate::body_rpc::attach_dfs_routed_message_attachment(
-                routed_message,
-                attachment.descriptor,
-                bytes,
-            )?;
+            let message = crate::materialize_dfs_routed_call_sync(call)?;
             self.incoming_messages.push_back(message);
             return Ok(());
         }
-        self.validate_routed_message_target(target_node_id, &routed_message, require_local_source)?;
+        self.validate_routed_message_target(target_node_id, &call.message, require_local_source)?;
         let Some(peer_transport) = self.peer_transport.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS attachment to {target_node_id}"),
@@ -2660,8 +2642,7 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let (command, call) =
-            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(routed_message, attachment))?;
+        let (command, call) = dfs_routed_call_rpc_call(call)?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         #[cfg(any(test, feature = "test-support"))]
@@ -2715,18 +2696,20 @@ impl DfsNodeTransport {
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
-        match call.attachment {
-            Some(attachment) => self.send_routed_message_attachment_to_peer(
+        if call.attachment.is_some() {
+            self.send_routed_attachment_call_to_peer(
                 target_node_id,
-                call.message,
-                attachment,
+                call,
                 require_local_source,
                 #[cfg(any(test, feature = "test-support"))]
                 native_context.clone(),
-            ),
-            None => {
-                self.send_routed_message_to_peer(target_node_id, call.message, require_local_source)
-            }
+            )
+        } else if call.original_repair.is_some() {
+            Err(NetworkError::Serialization {
+                detail: "selected Repair call lost its owned attachment".into(),
+            })
+        } else {
+            self.send_routed_message_to_peer(target_node_id, call.message, require_local_source)
         }
     }
 
@@ -3641,36 +3624,23 @@ impl DfsNodeTransport {
         Ok(())
     }
 
-    async fn send_routed_message_attachment_to_peer_async(
+    async fn send_routed_attachment_call_to_peer_async(
         &mut self,
         target_node_id: &NodeId,
-        routed_message: DfsRoutedMessage,
-        attachment: DfsOutboundAttachment,
+        call: DfsRoutedCall,
         require_local_source: bool,
         #[cfg(any(test, feature = "test-support"))] native_context: Option<
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
         if target_node_id == &self.local_node_id
-            && !self.routes_local_request_to_main(target_node_id, &routed_message.message)
+            && !self.routes_local_request_to_main(target_node_id, &call.message.message)
         {
-            let max_bytes =
-                usize::try_from(attachment.descriptor.total_size_bytes).map_err(|_| {
-                    NetworkError::ResourceExhausted {
-                        operation: "materialize async loopback DFS attachment".to_string(),
-                        requested_bytes: usize::MAX,
-                    }
-                })?;
-            let bytes = attachment.source.collect_to_vec(max_bytes).await?;
-            let message = crate::body_rpc::attach_dfs_routed_message_attachment(
-                routed_message,
-                attachment.descriptor,
-                bytes,
-            )?;
+            let message = crate::message_transport::materialize_dfs_routed_call(call).await?;
             self.incoming_messages.push_back(message);
             return Ok(());
         }
-        self.validate_routed_message_target(target_node_id, &routed_message, require_local_source)?;
+        self.validate_routed_message_target(target_node_id, &call.message, require_local_source)?;
         let Some(peer_transport) = self.async_peer_transport.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS attachment to {target_node_id}"),
@@ -3678,8 +3648,7 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let (command, call) =
-            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(routed_message, attachment))?;
+        let (command, call) = dfs_routed_call_rpc_call(call)?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         #[cfg(any(test, feature = "test-support"))]
@@ -3736,26 +3705,26 @@ impl DfsNodeTransport {
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
-        match call.attachment {
-            Some(attachment) => {
-                self.send_routed_message_attachment_to_peer_async(
-                    target_node_id,
-                    call.message,
-                    attachment,
-                    require_local_source,
-                    #[cfg(any(test, feature = "test-support"))]
-                    native_context.clone(),
-                )
-                .await
-            }
-            None => {
-                self.send_routed_message_to_peer_async(
-                    target_node_id,
-                    call.message,
-                    require_local_source,
-                )
-                .await
-            }
+        if call.attachment.is_some() {
+            self.send_routed_attachment_call_to_peer_async(
+                target_node_id,
+                call,
+                require_local_source,
+                #[cfg(any(test, feature = "test-support"))]
+                native_context.clone(),
+            )
+            .await
+        } else if call.original_repair.is_some() {
+            Err(NetworkError::Serialization {
+                detail: "selected Repair call lost its owned attachment".into(),
+            })
+        } else {
+            self.send_routed_message_to_peer_async(
+                target_node_id,
+                call.message,
+                require_local_source,
+            )
+            .await
         }
     }
 }
@@ -5496,6 +5465,348 @@ mod tests {
                 DfsOutboundAttachment::from_bytes(bytes, content_hash),
             ),
         )
+    }
+
+    #[derive(Default)]
+    struct CapturingOriginalRepairPeer {
+        calls: Mutex<
+            Vec<(
+                DfsMessageCommand,
+                crate::DfsRpcAttachmentDescriptor,
+                Vec<u8>,
+            )>,
+        >,
+    }
+
+    impl CapturingOriginalRepairPeer {
+        fn capture(
+            &self,
+            target: &NodeId,
+            call: ObjectRpcCall,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&call.request)
+                .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+            assert_eq!(&head.command.routed_message.target_node_id, target);
+            let max_bytes = usize::try_from(head.attachment.total_size_bytes).unwrap();
+            let bytes = collect_dfs_attachment_source_sync(call.body, max_bytes)?;
+            assert_eq!(bytes.len(), max_bytes);
+            assert_eq!(
+                head.attachment.content_hash.as_deref(),
+                Some(crate::content_hash(&bytes).as_str())
+            );
+            let replies = match &head.command.routed_message.message {
+                DfsNetworkMessage::SelectedOriginalRepair(selected) => {
+                    assert!(
+                        selected.bytes.is_empty(),
+                        "the body is owned by the actual RPC attachment"
+                    );
+                    let command = &selected.material.original.command;
+                    vec![DfsRoutedMessage {
+                        source_node_id: target.clone(),
+                        target_node_id: head.command.routed_message.source_node_id.clone(),
+                        frame_id: head.command.routed_message.frame_id,
+                        message_id: head.command.routed_message.message_id,
+                        message: DfsNetworkMessage::RepairReplicaResponse(
+                            crate::DfsRepairReplicaResponse {
+                                request_id: command.request_id.clone(),
+                                intent_id: command.intent_id.clone(),
+                                file_system_id: command.file_system_id.clone(),
+                                object_id: command.object_id.clone(),
+                                version: command.version.clone(),
+                                replica_node_id: target.clone(),
+                                // Correlation fixture only: this peer makes no content/Terminal claim.
+                                result: DfsBlobTransferResult::Rejected {
+                                    reason: "wire capture fixture has no receiver effect".into(),
+                                },
+                            },
+                        ),
+                    }]
+                }
+                DfsNetworkMessage::StageBlob(_) => Vec::new(),
+                other => {
+                    return Err(DfsPeerTransportError::new(format!(
+                        "unexpected captured attachment {other:?}"
+                    )));
+                }
+            };
+            let route = call.request.route;
+            let request_id = head.command.request_id.clone();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((head.command, head.attachment, bytes));
+            ObjectRpcResponse::encode_body(
+                &route,
+                &DfsMessageResponse {
+                    request_id,
+                    outbound_messages: replies,
+                },
+            )
+            .map(ObjectRpcResult::value)
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+        }
+    }
+
+    impl DfsPeerTransport for CapturingOriginalRepairPeer {
+        fn call_object_rpc(
+            &self,
+            target: &NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.capture(target, call)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for CapturingOriginalRepairPeer {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target: &'a NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            Box::pin(async move { self.capture(target, call) })
+        }
+    }
+
+    fn file_backed_original_attachment(
+        root: &std::path::Path,
+    ) -> (DfsRoutedCall, crate::DfsOriginalRepairMaterial, Vec<u8>) {
+        let (queue, content, message, descriptor, payload, _identity) =
+            crate::repair_queue_store::tests::selected_original_fixture(root);
+        queue
+            .enroll_original_repair(&message, &descriptor, &payload)
+            .unwrap();
+        queue.record_original_repair_attempt(&message).unwrap();
+        let material = queue
+            .original_repair(&message)
+            .unwrap()
+            .unwrap()
+            .original_wire_material()
+            .unwrap();
+        let bytes = content
+            .read_object_version(
+                material.original.command.object_id.as_str(),
+                material.original.command.version.as_str(),
+            )
+            .unwrap()
+            .1;
+        // A renewed transport attempt keeps the durable original head intact.
+        let mut carrier = message;
+        carrier.frame_id = carrier.frame_id.checked_add(100).unwrap();
+        carrier.message_id = carrier.message_id.checked_add(200).unwrap();
+        queue.record_original_repair_attempt(&carrier).unwrap();
+        assert_eq!(
+            queue
+                .original_repair(&carrier)
+                .unwrap()
+                .unwrap()
+                .original_wire_material()
+                .unwrap(),
+            material
+        );
+        let (_, reader) = payload.into_parts();
+        let call = DfsRoutedCall::with_attachment(
+            carrier,
+            DfsOutboundAttachment::from_reader(
+                reader,
+                descriptor.total_size_bytes,
+                descriptor.content_hash.as_deref().unwrap(),
+            ),
+        )
+        .with_original_repair(material.clone())
+        .unwrap();
+        (call, material, bytes)
+    }
+
+    fn assert_original_attachment_capture(
+        peer: &CapturingOriginalRepairPeer,
+        carrier: &DfsRoutedMessage,
+        material: &crate::DfsOriginalRepairMaterial,
+        bytes: &[u8],
+    ) {
+        let calls = peer.calls.lock().unwrap();
+        let (head, descriptor, captured_bytes) = &calls[0];
+        assert_eq!(head.routed_message.source_node_id, carrier.source_node_id);
+        assert_eq!(head.routed_message.target_node_id, carrier.target_node_id);
+        assert_eq!(head.request_id, format!("dfs_message_{}", carrier.frame_id));
+        assert_eq!(head.routed_message.frame_id, carrier.frame_id);
+        assert_eq!(head.routed_message.message_id, carrier.message_id);
+        let DfsNetworkMessage::SelectedOriginalRepair(selected) = &head.routed_message.message
+        else {
+            panic!("actual peer must receive the selected envelope");
+        };
+        assert_eq!(selected.material, *material);
+        assert_ne!(
+            head.routed_message.frame_id,
+            selected.material.original.frame_id
+        );
+        assert_ne!(
+            head.routed_message.message_id,
+            selected.material.original.message_id
+        );
+        assert_eq!(descriptor, &material.attachment);
+        assert_eq!(captured_bytes, bytes);
+    }
+
+    #[test]
+    fn native_sync_attachment_sender_preserves_selected_original_and_ordinary_correlation() {
+        let root = sinomo_testdir::TestDir::new("selected-original-sync-peer");
+        let (call, material, bytes) = file_backed_original_attachment(root.path());
+        let original = call.message.clone();
+        let peer = Arc::new(CapturingOriginalRepairPeer::default());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            Duration::from_secs(1),
+            sync_peer,
+            async_peer,
+        );
+        transport
+            .send_routed_call(&original.target_node_id, call)
+            .unwrap();
+        assert_original_attachment_capture(&peer, &original, &material, &bytes);
+        let returned = transport.drain_incoming_messages().unwrap();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].frame_id, original.frame_id);
+        assert_eq!(returned[0].message_id, original.message_id);
+        assert!(all_background_replica_response_identity_matches(
+            &original.source_node_id,
+            &original,
+            &returned[0]
+        ));
+        transport
+            .send_routed_call(
+                &original.target_node_id,
+                test_stage_attachment_send(
+                    &original.source_node_id,
+                    &original.target_node_id,
+                    20,
+                    "ordinary-sync",
+                )
+                .call,
+            )
+            .unwrap();
+        assert!(matches!(
+            &peer.calls.lock().unwrap()[1].0.routed_message.message,
+            DfsNetworkMessage::StageBlob(_)
+        ));
+        // A message-only sender may not silently downgrade the selected call.
+        let sent = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&sent);
+        let sender: DfsMessageSender = Arc::new(move |_, command, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut unsupported = DfsNodeTransport::new_with_message_sender_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            sender,
+            None,
+            Duration::from_secs(1),
+        );
+        let more = sinomo_testdir::TestDir::new("selected-original-unsupported-sync");
+        let (call, _, _) = file_backed_original_attachment(more.path());
+        assert!(
+            unsupported
+                .send_routed_call(&original.target_node_id, call)
+                .is_err()
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        let missing = sinomo_testdir::TestDir::new("selected-original-missing-attachment-sync");
+        let (mut call, _, _) = file_backed_original_attachment(missing.path());
+        call.attachment = None;
+        assert!(
+            matches!(transport.send_routed_call(&original.target_node_id, call),
+            Err(NetworkError::Serialization { detail }) if detail == "selected Repair call lost its owned attachment")
+        );
+        assert_eq!(peer.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_async_attachment_sender_preserves_selected_original_and_ordinary_correlation() {
+        let root = sinomo_testdir::TestDir::new("selected-original-async-peer");
+        let (call, material, bytes) = file_backed_original_attachment(root.path());
+        let original = call.message.clone();
+        let peer = Arc::new(CapturingOriginalRepairPeer::default());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            Duration::from_secs(1),
+            sync_peer,
+            async_peer,
+        );
+        transport
+            .send_routed_call_async(&original.target_node_id, call)
+            .await
+            .unwrap();
+        assert_original_attachment_capture(&peer, &original, &material, &bytes);
+        let returned = transport.drain_incoming_messages().unwrap();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].frame_id, original.frame_id);
+        assert_eq!(returned[0].message_id, original.message_id);
+        assert!(all_background_replica_response_identity_matches(
+            &original.source_node_id,
+            &original,
+            &returned[0]
+        ));
+        transport
+            .send_routed_call_async(
+                &original.target_node_id,
+                test_stage_attachment_send(
+                    &original.source_node_id,
+                    &original.target_node_id,
+                    20,
+                    "ordinary-async",
+                )
+                .call,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &peer.calls.lock().unwrap()[1].0.routed_message.message,
+            DfsNetworkMessage::StageBlob(_)
+        ));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&sent);
+        let sender: DfsMessageSender = Arc::new(move |_, command, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut unsupported = DfsNodeTransport::new_with_message_sender_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            sender,
+            None,
+            Duration::from_secs(1),
+        );
+        let more = sinomo_testdir::TestDir::new("selected-original-unsupported-async");
+        let (call, _, _) = file_backed_original_attachment(more.path());
+        assert!(
+            unsupported
+                .send_routed_call_async(&original.target_node_id, call)
+                .await
+                .is_err()
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        let missing = sinomo_testdir::TestDir::new("selected-original-missing-attachment-async");
+        let (mut call, _, _) = file_backed_original_attachment(missing.path());
+        call.attachment = None;
+        assert!(
+            matches!(transport.send_routed_call_async(&original.target_node_id, call).await,
+            Err(NetworkError::Serialization { detail }) if detail == "selected Repair call lost its owned attachment")
+        );
+        assert_eq!(peer.calls.lock().unwrap().len(), 2);
     }
 
     #[test]

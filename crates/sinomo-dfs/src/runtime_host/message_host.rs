@@ -1392,12 +1392,19 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
         let data_dir = SinomoDataDir::new(data_root);
         let paths = DaemonPaths::new(&data_dir);
         worker.set_background_delivery_handler(move |event| {
-            let selected = publication_runtime_owner(&crate::default_dfs_metadata_shards_root(&data_dir))
-                .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
-                .map(|owner| owner.selected_original_data_layout()).transpose()
+            let owner = publication_runtime_owner(&crate::default_dfs_metadata_shards_root(&data_dir))
+                .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
+            let selected = owner.as_ref().map(|owner| owner.selected_original_data_layout()).transpose()
                 .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?.flatten();
+            let inspection = if matches!(&event, crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch { .. }) {
+                owner.as_ref().map(|owner| owner.repair_payload_inspection_context()).transpose()
+                    .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
+            } else { None };
             crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
-                &data_dir, event, selected.as_deref(),
+                &data_dir,
+                event,
+                selected.as_deref(),
+                inspection.as_ref(),
             )
         });
         let response_runtime = tokio_runtime.clone();
