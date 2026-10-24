@@ -230,6 +230,56 @@ pub(crate) async fn pause_decoded_write_commit_publication(
     Ok(())
 }
 
+/// Negative-only pause for the selected DATA page of one actual handoff. This
+/// receives the already decoded, source-authenticated command; it never reads
+/// the request stream or supplies a response, prefix proof or custody ACK.
+pub(crate) async fn pause_decoded_selected_original_custody(
+    command: &crate::DfsMetadataJournalBatchCommand,
+) -> Result<(), ServiceError> {
+    let selected = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
+        let Some(fabric) = context.fabric.upgrade() else { return Ok(None); };
+        let observation = &context.observation;
+        if observation.route != crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+            || command.source_node_id.as_ref() != Some(&observation.source)
+            || !command.verify_prefix_only
+            || command.authority_probe.is_some()
+            || command.durable_replication.is_some()
+            || !command.batch.journal_frames.is_empty()
+        { return Ok(None); }
+        let Some(probe) = command.prefix_probe.as_ref() else { return Ok(None); };
+        let Some(page) = probe.repair_custody.as_ref() else { return Ok(None); };
+        if page.cut.version != 2 || page.cut.selected_original_data.is_none() {
+            return Ok(None);
+        }
+        let mut rules = fabric.faults.lock().unwrap();
+        let Some(rule) = rules.iter_mut().find(|rule| {
+            matches!(&rule.action, FaultAction::PauseSelectedOriginalCustody { handoff_id, .. }
+                if !handoff_id.is_empty()
+                    && probe.primary_handoff_id.as_ref() == Some(handoff_id)
+                    && &page.cut.handoff.handoff_id == handoff_id)
+                && rule.source.as_ref().is_none_or(|id| id == &observation.source)
+                && rule.target.as_ref().is_none_or(|id| id == &observation.target)
+                && rule.route.as_ref().is_none_or(|route| route == &observation.route)
+                && rule.origin.is_none_or(|origin| origin == observation.origin)
+                && rule.call_id.is_none_or(|id| id == observation.call_id)
+        }) else { return Ok(None); };
+        if rule.remaining_hits == 0 {
+            fabric.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
+            return Err(ServiceError::Service("bounded selected custody pause exhausted".into()));
+        }
+        rule.remaining_hits -= 1;
+        let FaultAction::PauseSelectedOriginalCustody { gate, captured, .. } = &rule.action else { unreachable!() };
+        captured.lock().unwrap().push(command.clone());
+        Ok(Some(Arc::clone(gate)))
+    }).unwrap_or(Ok(None))?;
+    if let Some(gate) = selected {
+        let permit = gate.acquire().await
+            .map_err(|_| ServiceError::Service("selected custody pause closed".into()))?;
+        permit.forget();
+    }
+    Ok(())
+}
+
 /// Bounded negative changes to replies already produced by native read RPC.
 #[derive(Clone, Copy)]
 pub enum ReadReplyFault {
@@ -318,6 +368,13 @@ pub enum FaultAction {
     /// Hold a real committed-write journal publication before receiver ingress.
     /// Prepare/authority RPCs remain untouched; no successful reply is supplied.
     PauseWriteCommitPublication {
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
+    /// Pause only an already decoded selected-v2 custody prefix page for this
+    /// handoff. Ordinary journal/topology traffic consumes no fault hits.
+    PauseSelectedOriginalCustody {
+        handoff_id: String,
         gate: Arc<Semaphore>,
         captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
     },
@@ -425,6 +482,23 @@ struct Fabric {
     transfers: Mutex<Vec<Transfer>>,
 }
 impl Fabric {
+    fn close_paused_faults_for_node(&self, node: &NodeId) {
+        for rule in self.faults.lock().unwrap().iter() {
+            if rule.target.as_ref().is_none_or(|id| id == node)
+                || rule.source.as_ref().is_none_or(|id| id == node)
+            {
+                if let FaultAction::PauseBeforeDispatch(gate)
+                | FaultAction::PauseWriteCommitPublication { gate, .. }
+                | FaultAction::PauseSelectedOriginalCustody { gate, .. }
+                | FaultAction::PauseAfterDispatch(gate)
+                | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
+                {
+                    gate.close();
+                }
+            }
+        }
+    }
+
     fn record_returned_error(&self, call_id: u64, error: &NetworkError) {
         let detail = format!("{error:?}");
         let mut bounded = detail.chars().take(2048).collect::<String>();
@@ -480,7 +554,8 @@ impl Fabric {
                     FaultAction::AlterStatReplyAfterDispatch { .. } => false,
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
-                    FaultAction::PauseWriteCommitPublication { .. } => false,
+                    FaultAction::PauseWriteCommitPublication { .. }
+                    | FaultAction::PauseSelectedOriginalCustody { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
                             observation.dfs_intent_id.as_ref() == Some(expected)
@@ -4324,19 +4399,7 @@ impl DfsTestRuntime {
             endpoint.accepting.store(false, Ordering::Release);
             endpoint
         };
-        for rule in self.fabric.faults.lock().unwrap().iter() {
-            if rule.target.as_ref().is_none_or(|id| id == node)
-                || rule.source.as_ref().is_none_or(|id| id == node)
-            {
-                if let FaultAction::PauseBeforeDispatch(gate)
-                | FaultAction::PauseWriteCommitPublication { gate, .. }
-                | FaultAction::PauseAfterDispatch(gate)
-                | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
-                {
-                    gate.close()
-                }
-            }
-        }
+        self.fabric.close_paused_faults_for_node(node);
         let node_state = self
             .nodes
             .get_mut(node)
@@ -5354,6 +5417,185 @@ mod normal_native_kv_admission_tests {
         );
         assert_eq!(std::fs::read(&wal).unwrap(), before);
         native.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod selected_custody_pause_tests {
+    use super::*;
+    use std::task::{Context, Poll, Waker};
+
+    struct FilterFixture {
+        fabric: Arc<Fabric>,
+        context: NativeRpcCallContext,
+        command: DfsMetadataJournalBatchCommand,
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<DfsMetadataJournalBatchCommand>>>,
+    }
+
+    fn filter_fixture() -> FilterFixture {
+        // Typed subtype-filter inputs only. No endpoint or receiver is mounted,
+        // and the page deliberately supplies no executable original/certificate.
+        // These tests cannot prove authentication, custody or native handoff.
+        let source = NodeId::from_legacy_named("selected-pause-source").unwrap();
+        let target = NodeId::from_legacy_named("selected-pause-target").unwrap();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(), shard_id: "services".into(),
+            primary_node_id: source.clone(), replica_node_ids: vec![target.clone()], epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let handoff_id = "selected-pause-exact-handoff".to_owned();
+        let handoff = DfsMetadataShardMembershipHandoff {
+            cause: DfsMetadataShardHandoffCause::Membership, handoff_id: handoff_id.clone(),
+            retiring_shard: shard.clone(), desired_shard: DfsMetadataShardConfig {
+                primary_node_id: target.clone(), replica_node_ids: vec![source.clone()], epoch: 2,
+                ..shard.clone()
+            },
+            required_prepared_sequence: 1, required_head_watermark: None,
+            retiring_primary_fence: Some(DfsMetadataShardMembershipHandoffFence {
+                handoff_id: handoff_id.clone(), primary_node_id: source.clone(),
+                journal_sequence: 1, state_fingerprint: "filter-only".into(),
+            }),
+        };
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: "selected-pause-probe".into(), source_node_id: Some(source.clone()),
+            file_system_id: Some(shard.file_system_id.clone()), authority_epoch: Some(1),
+            verify_prefix_only: true, authority_probe: None, durable_replication: None,
+            prefix_probe: Some(DfsMetadataPrefixProbe {
+                barrier_id: "selected-pause-barrier".into(),
+                file_system_id: Some(shard.file_system_id.clone()), authority_epoch: Some(1),
+                shard_id: DfsMetadataShardId::new(&shard.shard_id), journal_sequence: 1,
+                state_fingerprint: "filter-only".into(), primary_handoff_id: Some(handoff_id.clone()),
+                repair_custody: Some(DfsRepairHandoffPage {
+                    cut: DfsRepairHandoffCut {
+                        version: 2, handoff, queue_sequence: 1, page_count: 1, record_count: 0,
+                        digest: "0".repeat(64),
+                        selected_original_data: Some(crate::repair_handoff::SelectedRepairOriginalDataCut {
+                            source_queue_incarnation: "filter-only-incarnation".into(), producer: source.clone(),
+                            request_id: "filter-only-original".into(), original_digest: "0".repeat(64),
+                            captured_birth_digest: "0".repeat(64),
+                        }),
+                    },
+                    ordinal: 0, previous_digest: String::new(), records: Vec::new(), selected_original_data: None,
+                }),
+            }),
+            batch: DfsMetadataJournalFrameBatch {
+                shard_id: DfsMetadataShardId::new(&shard.shard_id), journal_frames: Vec::new(), next_after_sequence: 1,
+            },
+        };
+        let gate = Arc::new(Semaphore::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let fabric = Arc::new(Fabric {
+            dropped_observations: AtomicUsize::new(0), exhausted_budgets: AtomicUsize::new(0),
+            next_call: AtomicU64::new(1), nodes: Mutex::new(BTreeMap::new()),
+            faults: Mutex::new(vec![FaultRule {
+                source: Some(source.clone()), target: Some(target.clone()),
+                route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
+                origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
+                action: FaultAction::PauseSelectedOriginalCustody {
+                    handoff_id, gate: Arc::clone(&gate), captured: Arc::clone(&captured),
+                },
+            }]),
+            observations: Mutex::new(Vec::new()), observation_checkpoints: Mutex::new(Vec::new()),
+            transfers: Mutex::new(Vec::new()),
+        });
+        let carrier = Carrier { host_identity: None, source, fabric: Arc::clone(&fabric), origin: RpcOrigin::RegisteredHost };
+        let call = ObjectRpcCall::value(ObjectRpcRequest::encode_body(
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE, crate::DFS_RPC_CATEGORY, &command).unwrap());
+        let observation = carrier.observation(&target, &call, ClusterObjectRpcOptions::default(), true);
+        assert!(fabric.fault(&observation, &call.request).is_none(),
+            "the generic predecode fault path cannot consume this subtype rule");
+        let context = NativeRpcCallContext { fabric: Arc::downgrade(&fabric), observation };
+        FilterFixture { fabric, context, command, gate, captured }
+    }
+
+    #[test]
+    fn selected_custody_pause_filters_decoded_subtype_and_exact_handoff_without_spending_other_hits() {
+        let fixture = filter_fixture();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut negatives = Vec::new();
+        let mut ordinary = fixture.command.clone();
+        ordinary.verify_prefix_only = false; ordinary.prefix_probe = None;
+        negatives.push(ordinary);
+        let mut ordinary_probe = fixture.command.clone();
+        ordinary_probe.prefix_probe.as_mut().unwrap().repair_custody = None;
+        negatives.push(ordinary_probe);
+        let mut v1 = fixture.command.clone();
+        let cut = &mut v1.prefix_probe.as_mut().unwrap().repair_custody.as_mut().unwrap().cut;
+        cut.version = 1; cut.selected_original_data = None;
+        negatives.push(v1);
+        let mut other = fixture.command.clone();
+        let probe = other.prefix_probe.as_mut().unwrap();
+        probe.primary_handoff_id = Some("another-handoff".into());
+        probe.repair_custody.as_mut().unwrap().cut.handoff.handoff_id = "another-handoff".into();
+        negatives.push(other);
+        let mut mismatched = fixture.command.clone();
+        mismatched.prefix_probe.as_mut().unwrap().primary_handoff_id = Some("another-handoff".into());
+        negatives.push(mismatched);
+        let mut no_selected_material = fixture.command.clone();
+        no_selected_material.prefix_probe.as_mut().unwrap().repair_custody.as_mut().unwrap().cut.selected_original_data = None;
+        negatives.push(no_selected_material);
+        for command in &negatives {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+                pause_decoded_selected_original_custody(command)));
+            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        }
+        for observation in [
+            RpcObservation { origin: RpcOrigin::ExplicitFixtureRpc, ..fixture.context.observation.clone() },
+            RpcObservation { target: fixture.context.observation.source.clone(), ..fixture.context.observation.clone() },
+            RpcObservation { route: crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE.into(), ..fixture.context.observation.clone() },
+        ] {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
+                NativeRpcCallContext { observation, ..fixture.context.clone() },
+                pause_decoded_selected_original_custody(&fixture.command)));
+            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        }
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 1);
+        assert!(fixture.captured.lock().unwrap().is_empty());
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        let mut exact = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+            pause_decoded_selected_original_custody(&fixture.command)));
+        assert!(matches!(exact.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 0);
+        assert_eq!(*fixture.captured.lock().unwrap(), vec![fixture.command.clone()]);
+        fixture.gate.add_permits(1);
+        assert!(matches!(exact.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        // Exhaustion belongs only to another exact selected call; unrelated
+        // commands remain unpaused even after the selected budget is spent.
+        for command in &negatives {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+                pause_decoded_selected_original_custody(command)));
+            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        }
+        let mut exhausted = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+            pause_decoded_selected_original_custody(&fixture.command)));
+        assert!(matches!(exhausted.as_mut().poll(&mut context), Poll::Ready(Err(_))));
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn selected_custody_pause_node_stop_closes_only_the_owned_pending_gate() {
+        let fixture = filter_fixture();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+            pause_decoded_selected_original_custody(&fixture.command)));
+        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
+        let unrelated = NodeId::from_legacy_named("selected-pause-unrelated").unwrap();
+        fixture.fabric.close_paused_faults_for_node(&unrelated);
+        assert!(!fixture.gate.is_closed());
+        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
+        // Exercise the same close function used by stop_node_inner, without
+        // inventing an endpoint lifetime, response or native admission.
+        fixture.fabric.close_paused_faults_for_node(&fixture.context.observation.target);
+        assert!(fixture.gate.is_closed());
+        match pause.as_mut().poll(&mut context) {
+            Poll::Ready(Err(error)) => assert!(error.to_string().contains("selected custody pause closed")),
+            other => panic!("stopping the selected owner must release its waiter: {other:?}"),
+        }
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.captured.lock().unwrap().len(), 1);
     }
 }
 

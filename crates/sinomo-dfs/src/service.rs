@@ -981,7 +981,10 @@ impl Service for DfsService {
                         return Ok(ServiceDisposition::Continue);
                     }
                     #[cfg(any(test, feature = "test-support"))]
-                    crate::test_runtime::pause_decoded_write_commit_publication(&command).await?;
+                    {
+                        crate::test_runtime::pause_decoded_write_commit_publication(&command).await?;
+                        crate::test_runtime::pause_decoded_selected_original_custody(&command).await?;
+                    }
                     let may_have_deferred_materialization =
                         command.durable_replication.is_some() || command.authority_probe.is_some();
                     let materialize_shard_id = command.batch.shard_id.clone();
