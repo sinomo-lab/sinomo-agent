@@ -4918,6 +4918,125 @@ mod native_selected_data_tests {
         genuine_native_original_with_forbidden_promoted(name, false)
     }
 
+    // Failure-only observations: never open/recover a queue owner or change the
+    // failed predicate. Each source is a separate, racing diagnostic read.
+    fn retain_genuine_original_timeout_diagnostic(
+        runtime: &DfsTestRuntime,
+        owner: &NodeId,
+        holder: &NodeId,
+        snapshot_path: &std::path::Path,
+        capture: &crate::test_runtime::NativeCheckpointedBackgroundRepairCapture,
+        replies: &Mutex<Vec<DfsRoutedMessage>>,
+    ) -> std::result::Result<(), String> {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let commands = catch_unwind(AssertUnwindSafe(|| capture.records()))
+            .map_err(|_| "checkpointed-command observation panicked");
+        let captured_replies = replies.try_lock()
+            .map(|replies| (replies.len(), replies.iter().take(32).cloned().collect::<Vec<_>>()))
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => "captured replies busy",
+                std::sync::TryLockError::Poisoned(_) => "captured replies poisoned",
+            });
+        let rpc = catch_unwind(AssertUnwindSafe(|| runtime.rpc_observations()))
+            .map(|window| {
+                let window_count = window.len();
+                let mut matching = window.into_iter().filter(|event|
+                    event.source == *owner && event.target == *holder
+                        && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                        && event.origin == RpcOrigin::RegisteredHost
+                ).collect::<Vec<_>>();
+                let matching_count = matching.len();
+                let omitted = matching_count.saturating_sub(64);
+                matching.drain(..omitted);
+                (window_count, matching_count, matching)
+            })
+            .map_err(|_| "current RPC-window observation panicked");
+        let mut keys = BTreeSet::new();
+        if let Ok(commands) = &commands {
+            for captured in commands.iter().take(8) {
+                if captured.message.source_node_id != *owner { continue; }
+                if let DfsNetworkMessage::RepairReplica(command) = &captured.message.message {
+                    keys.insert(crate::repair_queue_store::DfsRepairQueueKey {
+                        intent_id: command.intent_id.clone(),
+                        missing_replica_node_id: captured.message.target_node_id.clone(),
+                    });
+                }
+            }
+        }
+        if let Ok((_, replies)) = &captured_replies {
+            for routed in replies {
+                if routed.target_node_id != *owner { continue; }
+                if let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message {
+                    keys.insert(crate::repair_queue_store::DfsRepairQueueKey {
+                        intent_id: response.intent_id.clone(),
+                        missing_replica_node_id: routed.source_node_id.clone(),
+                    });
+                }
+            }
+        }
+        if let Ok((_, _, rpc)) = &rpc {
+            for event in rpc {
+                if let Some(intent_id) = &event.dfs_intent_id {
+                    keys.insert(crate::repair_queue_store::DfsRepairQueueKey {
+                        intent_id: intent_id.clone(),
+                        missing_replica_node_id: event.target.clone(),
+                    });
+                }
+            }
+        }
+        let observed_key_count = keys.len();
+        let queue = keys.into_iter().take(8).map(|key| {
+            match catch_unwind(AssertUnwindSafe(|| {
+                crate::repair_queue_store::LocalDfsRepairQueueStore::observe_registered_original_for_slot(
+                    snapshot_path, &key, crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT as u64,
+                )
+            })) {
+                Ok(observed) => serde_json::json!({"key": key, "observation": observed}),
+                Err(_) => serde_json::json!({"key": key, "unavailable": "non-recovering queue observation panicked"}),
+            }
+        }).collect::<Vec<_>>();
+        let diagnostic = serde_json::json!({
+            "qualification": "failure-only, per-call racing observations; unavailable/cold/dirty/uncertain is not absence; readable bytes are not durable ACK, Terminal, custody or execution authority; RPC Completed precedes possible reply loss",
+            "failed_predicate": "actual lost reply reaches original queue within unchanged 5s budget",
+            "owner": owner, "holder": holder, "admitted_queue_snapshot": snapshot_path,
+            "checkpointed_commands": match commands {
+                Ok(commands) => serde_json::json!({
+                    "observed_count": commands.len(),
+                    "capture_omitted_count": capture.omitted_count(),
+                    "diagnostic_omitted_count": commands.len().saturating_sub(8),
+                    "records": commands.iter().take(8).map(|captured| serde_json::json!({
+                        "message": captured.message, "descriptor": captured.descriptor,
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(error) => serde_json::json!({"unavailable": error, "capture_omitted_count": capture.omitted_count()}),
+            },
+            "captured_replies": match captured_replies {
+                Ok((count, replies)) => serde_json::json!({"observed_count": count,
+                    "diagnostic_omitted_count": count.saturating_sub(32), "records": replies,
+                    "qualification": "actual captured responses including negative dispositions; no positive-only filter"}),
+                Err(error) => serde_json::json!({"unavailable": error}),
+            },
+            "rpc": match rpc {
+                Ok((window_count, matching_count, records)) => serde_json::json!({
+                    "current_window_count": window_count, "matching_count": matching_count,
+                    "diagnostic_omitted_count": matching_count.saturating_sub(64),
+                    "runtime_dropped_count": runtime.observation_dropped_count(),
+                    "records": records.iter().map(|record| format!("{record:?}")).collect::<Vec<_>>(),
+                    "selection": "latest owner-to-holder registered Repair observations in current window only; no seed-intent filter; prior checkpoint windows not read",
+                }),
+                Err(error) => serde_json::json!({"unavailable": error,
+                    "runtime_dropped_count": runtime.observation_dropped_count()}),
+            },
+            "resident_queue": {"observed_key_count": observed_key_count,
+                "omitted_key_count": observed_key_count.saturating_sub(8), "records": queue,
+                "qualification": "only intent/target keys actually present in retained commands, replies or RPC observations; no enumeration, normal owner lookup, recovery or resync"},
+        });
+        let encoded = serde_json::to_string_pretty(&diagnostic).map_err(|error| error.to_string())?;
+        eprintln!("SELECTED_GENUINE_LOST_REPLY_TIMEOUT {encoded}");
+        std::fs::write(runtime.data_dir(owner).root().join("boundary-diagnostic-genuine-original-timeout.json"), encoded)
+            .map_err(|error| error.to_string())
+    }
+
     fn genuine_native_original_with_forbidden_promoted(
         name: &str,
         forbid_promoted: bool,
@@ -5025,7 +5144,8 @@ mod native_selected_data_tests {
         source.mark_remote_read_location_missing(&stat.object_id, &stat.version, &stat.content_hash, &holder).unwrap();
         drop(source);
         claim_window.store(true, std::sync::atomic::Ordering::Release);
-        let queue = runtime.selected_original_data_layout(&owner).unwrap().queue().unwrap();
+        let selected_layout = runtime.selected_original_data_layout(&owner).unwrap();
+        let queue = selected_layout.queue().unwrap();
         let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         let birth = loop {
             let found = capture.records().iter().find_map(|captured| {
@@ -5052,7 +5172,23 @@ mod native_selected_data_tests {
                 });
                 if exact_lost_reply { break birth; }
             }
-            let remaining = deadline.checked_duration_since(Instant::now()).expect("actual lost reply reaches original queue within unchanged 5s budget");
+            let remaining = deadline.checked_duration_since(Instant::now());
+            if remaining.is_none() {
+                let diagnostic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    retain_genuine_original_timeout_diagnostic(
+                        &runtime, &owner, &holder, selected_layout.queue_layout().snapshot_path(),
+                        &capture, &replies,
+                    )
+                }));
+                // Diagnostic failure must not replace the original panic or
+                // bypass the runtime's normal unwinding/fixture preservation.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if !matches!(diagnostic, Ok(Ok(()))) {
+                        eprintln!("SELECTED_GENUINE_TIMEOUT_DIAGNOSTIC_UNAVAILABLE {diagnostic:?}");
+                    }
+                }));
+            }
+            let remaining = remaining.expect("actual lost reply reaches original queue within unchanged 5s budget");
             let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
             eprintln!("SELECTED_GENUINE_LOST_REPLY_TICK {:?}", tick.outcome);
         };
