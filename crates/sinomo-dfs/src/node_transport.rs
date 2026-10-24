@@ -5573,7 +5573,7 @@ mod tests {
         root: &std::path::Path,
     ) -> (DfsRoutedCall, crate::DfsOriginalRepairMaterial, Vec<u8>) {
         let (queue, content, message, descriptor, payload, _identity) =
-            crate::repair_queue_store::tests::selected_original_fixture(root);
+            crate::repair_queue_store::tests::selected_original_fixture(&root.join("source"));
         queue
             .enroll_original_repair(&message, &descriptor, &payload)
             .unwrap();
