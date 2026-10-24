@@ -332,14 +332,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &object.current_locations,
                 &pinned.into_iter().collect::<Vec<_>>(),
             )?;
-        dfs_perf_trace!(
+        dfs_perf_trace(format_args!(
             "fresh_namespace_content_plan configuration_revision={} desired={} attemptable={} observed_ready={} deferred={}",
             plan.configuration_revision.0,
             plan.placement.desired_replica_nodes.len(),
             plan.attemptable_node_ids.len(),
             plan.observed_ready_node_ids.len(),
             plan.deferred_desired_node_ids.len(),
-        );
+        ));
         Ok(Some((
             plan.placement.desired_replica_nodes,
             effective_policy,
