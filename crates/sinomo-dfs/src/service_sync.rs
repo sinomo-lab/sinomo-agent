@@ -5545,11 +5545,15 @@ mod native_selected_data_tests {
                 .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
             fixture.runtime.select_genuine_original_before_handoff(&owner, &fixture.birth.root.subject.request_id, &proposed).unwrap();
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let paused_pages = Arc::new(Mutex::new(Vec::new()));
             fixture.runtime.install_fault(FaultRule {
                 source: Some(owner.clone()), target: Some(fixture.promoted.clone()),
                 route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
                 origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 16,
-                action: FaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
+                action: FaultAction::PauseSelectedOriginalCustody {
+                    handoff_id: proposed.handoff_id.clone(), gate: Arc::clone(&gate),
+                    captured: Arc::clone(&paused_pages),
+                },
             });
             let configs = fixture.runtime.metadata_shards().unwrap();
             let phase_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
@@ -5573,6 +5577,20 @@ mod native_selected_data_tests {
                     let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&source_directory.join("0.sobj")).unwrap().unwrap();
                     page.validate_selected_original_data().unwrap();
                     assert_eq!(page.cut, cut);
+                    loop {
+                        let paused = paused_pages.lock().unwrap();
+                        assert!(paused.len() <= 16);
+                        if !paused.is_empty() {
+                            assert!(paused.iter().all(|command| command.prefix_probe.as_ref()
+                                .and_then(|probe| probe.repair_custody.as_ref())
+                                .is_some_and(|actual| actual.cut == cut)));
+                            break;
+                        }
+                        drop(paused);
+                        assert!(Instant::now() <= capture_deadline,
+                            "exact decoded selected page must pause within the existing 5s setup budget");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
                         .get_metadata_shard_membership_handoff(&fixture.shard.file_system_id, &fixture.shard.shard_id)).unwrap().unwrap();
                     assert_eq!(pending, cut.handoff);
@@ -5765,11 +5783,15 @@ mod native_selected_data_tests {
                 .request_metadata_shard_primary_handoff(&fixture.shard, &fixture.promoted)).unwrap().unwrap();
             fixture.runtime.select_genuine_original_before_handoff(&owner, &fixture.birth.root.subject.request_id, &proposed).unwrap();
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let paused_pages = Arc::new(Mutex::new(Vec::new()));
             fixture.runtime.install_fault(FaultRule {
                 source: Some(owner.clone()), target: Some(fixture.promoted.clone()),
                 route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
                 origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 16,
-                action: FaultAction::PauseBeforeDispatch(Arc::clone(&gate)),
+                action: FaultAction::PauseSelectedOriginalCustody {
+                    handoff_id: proposed.handoff_id.clone(), gate: Arc::clone(&gate),
+                    captured: Arc::clone(&paused_pages),
+                },
             });
             let configs = fixture.runtime.metadata_shards().unwrap();
             let phase_deadline = Instant::now() + DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
@@ -5793,6 +5815,20 @@ mod native_selected_data_tests {
                     let page: DfsRepairHandoffPage = crate::metadata_io::read_sobj_optional(&source_directory.join("0.sobj")).unwrap().unwrap();
                     page.validate_selected_original_data().unwrap();
                     assert_eq!(page.cut, cut);
+                    loop {
+                        let paused = paused_pages.lock().unwrap();
+                        assert!(paused.len() <= 16);
+                        if !paused.is_empty() {
+                            assert!(paused.iter().all(|command| command.prefix_probe.as_ref()
+                                .and_then(|probe| probe.repair_custody.as_ref())
+                                .is_some_and(|actual| actual.cut == cut)));
+                            break;
+                        }
+                        drop(paused);
+                        assert!(Instant::now() <= capture_deadline,
+                            "exact decoded selected page must pause within the existing 5s setup budget");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     let sealed = page.selected_original_data.as_ref().expect("genuine selected original");
                     assert_eq!(sealed.original, fixture.birth.original);
                     assert_eq!(sealed.attachment, fixture.birth.attachment);
