@@ -1745,7 +1745,7 @@ impl<M: InteractionModel> Agent<M> {
             .map(|issue| issue.tool.as_str())
             .collect::<BTreeSet<_>>();
         let all_tool_descriptors = match self.config.definition.output_format {
-            AgentOutputFormat::JsonDecision => tool_plan
+            AgentOutputFormat::JsonDecision | AgentOutputFormat::NativeTools => tool_plan
                 .model_visible_descriptors()
                 .into_iter()
                 .filter(|descriptor| !unready_visible_tools.contains(descriptor.spec.name.as_str()))

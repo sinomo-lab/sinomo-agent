@@ -1,0 +1,29 @@
+[package]
+name = "sinomo-app-use-module"
+version.workspace = true
+description = "Native OS capture and input provider for unified App Use"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml", "README.md"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[package.metadata.sinomo.native-dylib]
+module-id = "module.app-use.os"
+interface-version = "sinomo.app-use.os.v1"
+cache-key = "module/desktop/app-use"
+source = "rollout:modules/desktop/app-use"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+serde.workspace = true
+sinomo-core.workspace = true
+sinomo-device.workspace = true
+sinomo-module-api.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = ["Foundation", "Graphics_Capture", "Graphics_DirectX_Direct3D11", "UI_Input_Preview_Injection", "Gaming_Input", "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

@@ -290,6 +290,7 @@ pub enum NativeVideoSampleFormat {
     Yuyv,
     Rgb8,
     Bgr8,
+    Bgra8,
     Gray8,
 }
 
@@ -767,6 +768,13 @@ fn validate_native_video_sample(sample: &NativeVideoSample) -> Result<(), Native
                 sample.width.saturating_mul(3),
             )?;
         }
+        NativeVideoSampleFormat::Bgra8 => validate_native_video_plane(
+            &sample.planes[0],
+            sample.data.len(),
+            sample.width,
+            sample.height,
+            sample.width.saturating_mul(4),
+        )?,
         NativeVideoSampleFormat::Gray8 => validate_native_video_plane(
             &sample.planes[0],
             sample.data.len(),
@@ -910,12 +918,14 @@ fn native_video_sample_from_contiguous(
         NativeVideoSampleFormat::Yuyv
         | NativeVideoSampleFormat::Rgb8
         | NativeVideoSampleFormat::Bgr8
+        | NativeVideoSampleFormat::Bgra8
         | NativeVideoSampleFormat::Gray8 => {
             let minimum_stride = match format {
                 NativeVideoSampleFormat::Yuyv => width.div_ceil(2).saturating_mul(4),
                 NativeVideoSampleFormat::Rgb8 | NativeVideoSampleFormat::Bgr8 => {
                     width.saturating_mul(3)
                 }
+                NativeVideoSampleFormat::Bgra8 => width.saturating_mul(4),
                 NativeVideoSampleFormat::Gray8 => width,
                 NativeVideoSampleFormat::Mjpeg | NativeVideoSampleFormat::Nv12 => unreachable!(),
             };

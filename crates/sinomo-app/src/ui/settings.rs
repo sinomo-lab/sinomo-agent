@@ -1586,7 +1586,8 @@ const AGENT_MCP_PROTOCOL_ERA_OPTIONS: &[&str] = &[
     "Handshake (2025-11-25 and earlier)",
 ];
 const AGENT_ROLE_OPTIONS: &[&str] = &["Main", "Background", "Deliberation", "Evolution"];
-const AGENT_OUTPUT_FORMAT_OPTIONS: &[&str] = &["JSON decision", "Plain text"];
+const AGENT_OUTPUT_FORMAT_OPTIONS: &[&str] =
+    &["JSON decision", "Plain text", "Native tools and text"];
 
 impl AgentForm {
     fn from_definition(definition: AgentDefinition) -> Self {
@@ -5510,12 +5511,14 @@ fn output_format_index(output_format: &AgentOutputFormat) -> usize {
     match output_format {
         AgentOutputFormat::JsonDecision => 0,
         AgentOutputFormat::Text => 1,
+        AgentOutputFormat::NativeTools => 2,
     }
 }
 
 fn output_format_for_index(index: usize) -> AgentOutputFormat {
     match index {
         1 => AgentOutputFormat::Text,
+        2 => AgentOutputFormat::NativeTools,
         _ => AgentOutputFormat::JsonDecision,
     }
 }

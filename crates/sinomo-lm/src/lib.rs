@@ -18,6 +18,7 @@ mod local_responses;
 mod nvidia;
 mod openai;
 mod realtime_audio;
+mod realtime_model;
 #[cfg(feature = "webrtc-media")]
 pub mod realtime_webrtc;
 mod responses_tools;
@@ -26,6 +27,7 @@ mod scripted;
 #[cfg(feature = "test-cases")]
 mod test_cases;
 mod vendor_api;
+mod video_grounding;
 
 pub use anthropic::{ANTHROPIC_DEFAULT_MODEL, AnthropicConfig, AnthropicProvider};
 pub use claude::{
@@ -85,12 +87,16 @@ pub use realtime_audio::{
     RealtimeSession, RealtimeSessionFuture, RealtimeVideoFrameDetail, RealtimeVideoFrameFormat,
     RealtimeVideoFrameInput, RealtimeVideoInputConfig, RealtimeVideoPixelFormat,
     RealtimeWebrtcCall, connect_realtime_session, create_realtime_webrtc_call,
-    minicpm_input_audio_append_payload, minicpm_input_video_frame_payload, minicpm_realtime_ws_url,
-    minicpm_realtime_ws_url_for_video, minicpm_session_update_payload,
-    openai_input_audio_append_payload, openai_input_video_frame_payload,
-    openai_output_truncate_payload, openai_realtime_ws_url, openai_response_cancel_payload,
-    openai_session_update_payload, openai_tool_result_payload, parse_realtime_audio_event,
-    realtime_audio_event_from_value, realtime_call_session_payload, realtime_sideband_ws_url,
+    encode_realtime_video_frame, minicpm_input_audio_append_payload,
+    minicpm_input_video_frame_payload, minicpm_realtime_ws_url, minicpm_realtime_ws_url_for_video,
+    minicpm_session_update_payload, openai_input_audio_append_payload,
+    openai_input_video_frame_payload, openai_output_truncate_payload, openai_realtime_ws_url,
+    openai_response_cancel_payload, openai_session_update_payload, openai_tool_result_payload,
+    parse_realtime_audio_event, realtime_audio_event_from_value, realtime_call_session_payload,
+    realtime_sideband_ws_url,
+};
+pub use realtime_model::{
+    RealtimeModelProvider, RealtimeModelVideoObservation, RealtimeModelVideoSource,
 };
 #[cfg(feature = "scripted-provider")]
 pub use scripted::{
@@ -154,6 +160,12 @@ pub struct LanguageModelMessage {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LanguageModelRequestItem {
+    /// Inline visual evidence supplied by the host after capture/read
+    /// authorization. Image bytes are not model-visible prose.
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
     /// Opaque, provider/model-bound state required to replay a signed model turn.
     ProviderContinuation {
         continuation: LanguageModelProviderContinuation,
@@ -3388,6 +3400,7 @@ fn codex_provider_for_model_with_options_and_credentials(
         client_version: config_default.client_version,
         default_model: default_model.clone(),
         credentials_path: credentials_path.or(config_default.credentials_path),
+        allow_credential_refresh: config_default.allow_credential_refresh,
         transport_health_timeout: config_default.transport_health_timeout,
     };
     CodexProvider::new(

@@ -125,6 +125,7 @@ impl SinomoTestCase {
                 metrics: BTreeMap::new(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 errors: Vec::new(),
+                artifacts: Vec::new(),
             };
         }
         match (self.run)(context) {
@@ -136,6 +137,7 @@ impl SinomoTestCase {
                 metrics: context.take_metrics(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 errors: Vec::new(),
+                artifacts: context.take_artifacts(),
             },
             Err(error) => SinomoTestReport {
                 case: self.metadata.clone(),
@@ -145,11 +147,17 @@ impl SinomoTestCase {
                 metrics: context.take_metrics(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 errors: vec![error.to_string()],
+                artifacts: context.take_artifacts(),
             },
         }
     }
 
     fn preflight(&self, context: &SinomoTestContext) -> Option<SinomoTestOutcome> {
+        if let Some(reason) = context.stop_reason() {
+            return Some(SinomoTestOutcome::skipped(format!(
+                "suite stopped: {reason}"
+            )));
+        }
         for requirement in &self.metadata.requirements {
             match requirement {
                 SinomoTestRequirement::LiveNetwork if !context.live => {
@@ -278,6 +286,17 @@ pub struct SinomoTestReport {
     pub metrics: BTreeMap<String, SinomoTestMetric>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<SinomoTestArtifact>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SinomoTestArtifact {
+    pub path: PathBuf,
+    pub media_type: String,
+    pub label: String,
+    pub bytes: u64,
+    pub blake3: String,
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +341,8 @@ pub struct SinomoTestContext {
     runtime_capabilities: BTreeSet<String>,
     diagnostics: serde_json::Map<String, serde_json::Value>,
     metrics: BTreeMap<String, SinomoTestMetric>,
+    artifacts: Vec<SinomoTestArtifact>,
+    stop_reason: Option<String>,
 }
 
 impl SinomoTestContext {
@@ -337,6 +358,8 @@ impl SinomoTestContext {
             runtime_capabilities: BTreeSet::new(),
             diagnostics: Default::default(),
             metrics: BTreeMap::new(),
+            artifacts: Vec::new(),
+            stop_reason: None,
         }
     }
 
@@ -506,6 +529,50 @@ impl SinomoTestContext {
     pub fn take_metrics(&mut self) -> BTreeMap<String, SinomoTestMetric> {
         std::mem::take(&mut self.metrics)
     }
+
+    /// Register completed evidence, including evidence from failed cases.
+    pub fn record_artifact(
+        &mut self,
+        path: impl AsRef<Path>,
+        media_type: &str,
+        label: &str,
+    ) -> Result<(), SinomoTestError> {
+        use std::io::Read;
+        let path =
+            std::fs::canonicalize(path).map_err(|e| SinomoTestError::failed(e.to_string()))?;
+        let mut file =
+            std::fs::File::open(&path).map_err(|e| SinomoTestError::failed(e.to_string()))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut bytes = 0;
+        let mut buffer = [0u8; 65536];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(|e| SinomoTestError::failed(e.to_string()))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            bytes += count as u64;
+        }
+        self.artifacts.push(SinomoTestArtifact {
+            path,
+            media_type: media_type.into(),
+            label: label.into(),
+            bytes,
+            blake3: hasher.finalize().to_hex().to_string(),
+        });
+        Ok(())
+    }
+    pub fn take_artifacts(&mut self) -> Vec<SinomoTestArtifact> {
+        std::mem::take(&mut self.artifacts)
+    }
+    pub fn request_stop(&mut self, reason: impl Into<String>) {
+        self.stop_reason = Some(reason.into());
+    }
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
+    }
 }
 
 fn new_test_run_id() -> String {
@@ -622,6 +689,39 @@ macro_rules! sinomo_test_case {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_case_retains_hashed_artifacts_and_stop_prevents_later_execution() {
+        use super::*;
+        let root = sinomo_testdir::TestDir::new("runtime-test-artifacts");
+        let path = root.path().join("evidence.bin");
+        std::fs::write(&path, b"retained failure evidence").unwrap();
+        fn fail(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+            let path = ctx.required_parameter("artifact")?.to_string();
+            ctx.record_artifact(path, "application/octet-stream", "failure evidence")?;
+            ctx.request_stop("authentication expired");
+            Err(SinomoTestError::failed("intentional failure"))
+        }
+        fn never(_: &mut SinomoTestContext) -> SinomoTestResult {
+            panic!("stopped suite executed another case");
+        }
+        let mut context =
+            SinomoTestContext::new(root.path()).with_parameter("artifact", path.to_string_lossy());
+        let report =
+            SinomoTestCase::new("failure", "fixture", ["test"], [], fail).run(&mut context);
+        assert_eq!(report.status, SinomoTestStatus::Failed);
+        assert_eq!(report.artifacts.len(), 1);
+        assert_eq!(
+            report.artifacts[0].blake3,
+            blake3::hash(b"retained failure evidence")
+                .to_hex()
+                .to_string()
+        );
+        let skipped =
+            SinomoTestCase::new("later", "fixture", ["test"], [], never).run(&mut context);
+        assert_eq!(skipped.status, SinomoTestStatus::Skipped);
+        assert!(skipped.artifacts.is_empty());
+        assert!(path.is_file());
+    }
     use super::*;
 
     sinomo_test_case! {

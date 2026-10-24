@@ -107,6 +107,17 @@ fn chat_messages_from_items(items: &[LanguageModelRequestItem]) -> Vec<serde_jso
 
     for item in items {
         match item {
+            LanguageModelRequestItem::Image {
+                media_type,
+                data_base64,
+            } => {
+                flush_pending_assistant(
+                    &mut messages,
+                    &mut pending_assistant_content,
+                    &mut pending_assistant_tool_calls,
+                );
+                messages.push(serde_json::json!({"role":"user", "content":[{"type":"image_url", "image_url":{"url":format!("data:{media_type};base64,{data_base64}"), "detail":"high"}}]}));
+            }
             LanguageModelRequestItem::ProviderContinuation { continuation } => {
                 flush_pending_assistant(
                     &mut messages,

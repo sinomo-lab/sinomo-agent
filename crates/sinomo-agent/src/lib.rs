@@ -535,13 +535,15 @@ pub enum AgentOutputFormat {
     #[default]
     JsonDecision,
     Text,
+    /// Native provider function calls with a plain-text final answer.
+    NativeTools,
 }
 
 impl AgentOutputFormat {
     pub fn language_model_response_format(&self) -> LanguageModelResponseFormat {
         match self {
             Self::JsonDecision => LanguageModelResponseFormat::JsonObject,
-            Self::Text => LanguageModelResponseFormat::Text,
+            Self::Text | Self::NativeTools => LanguageModelResponseFormat::Text,
         }
     }
 }
@@ -1943,9 +1945,23 @@ pub fn product_module_tool_projection(
         sinomo_product_profile::ProductComponentProfile::main(cluster_initialized),
     )
     .map_err(|error| error.to_string())?;
-    Ok(AgentModuleToolProjection::from_registry(
-        components.modules(),
-    ))
+    let mut projection = AgentModuleToolProjection::from_registry(components.modules());
+    // Catalog registrations retain installed metadata and skills when a linked
+    // component is disabled. Only active component routes are callable tools.
+    let inactive = components
+        .native_rust_control_targets()
+        .into_iter()
+        .filter(|target| !target.active)
+        .filter_map(|target| {
+            sinomo_runtime::module::ModuleId::from_legacy_named(target.legacy_id).ok()
+        })
+        .collect::<Vec<_>>();
+    for registration in &mut projection.registrations {
+        if inactive.contains(registration.module_id()) {
+            registration.surfaces.object_rpc_routes.clear();
+        }
+    }
+    Ok(projection)
 }
 
 #[derive(Clone, Debug, Error)]
@@ -2430,15 +2446,8 @@ fn render_agent_system_prompt_with_tools_json(
     tools_json: &str,
 ) -> String {
     let mut prompt = definition.system_prompt.trim().to_string();
-    match definition.output_format {
-        AgentOutputFormat::JsonDecision => {
-            prompt.push_str("\n\n");
-            prompt.push_str(agent_decision_output_contract());
-        }
-        AgentOutputFormat::Text => {
-            prompt.push_str("\n\nRespond directly in plain text.");
-        }
-    }
+    prompt.push_str("\n\n");
+    prompt.push_str(agent_output_contract(&definition.output_format));
     prompt.push_str("\n\n");
     prompt.push_str(tool_label);
     prompt.push_str(":\n```json\n");
@@ -2451,6 +2460,9 @@ pub fn agent_output_contract(output_format: &AgentOutputFormat) -> &'static str 
     match output_format {
         AgentOutputFormat::JsonDecision => agent_decision_output_contract(),
         AgentOutputFormat::Text => "Respond directly in plain text.",
+        AgentOutputFormat::NativeTools => {
+            "Use the provided native function tools when an action is needed. Continue using tools until the task is complete or blocked, then give a concise plain-text answer. Do not encode tool calls in prose or JSON decision envelopes."
+        }
     }
 }
 
@@ -2604,7 +2616,7 @@ pub fn parse_agent_loop_response(
 ) -> Result<AgentLoopDecision, AgentError> {
     match output_format {
         AgentOutputFormat::JsonDecision => parse_agent_loop_decision(raw),
-        AgentOutputFormat::Text => Ok(AgentLoopDecision {
+        AgentOutputFormat::Text | AgentOutputFormat::NativeTools => Ok(AgentLoopDecision {
             response_mode: AgentLoopResponseMode::Answer,
             text: raw.trim().to_string(),
             tool_calls: Vec::new(),

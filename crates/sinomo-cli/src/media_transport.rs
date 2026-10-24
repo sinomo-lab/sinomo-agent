@@ -23,6 +23,55 @@ const MEDIA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds how many frames queue between the call path and the outbound stream.
 const MEDIA_FRAME_QUEUE_CAPACITY: usize = 32;
 
+pub(crate) async fn open_desktop_video_source(
+    data_dir: &SinomoDataDir,
+    node_id: &NodeId,
+    app: bool,
+    session_id: String,
+    encoding: sinomo_lm::RealtimeVideoInputConfig,
+) -> Result<sinomo_video::stream::RemoteVideoSource, CliError> {
+    use sinomo_actions::desktop::{DesktopModule, DesktopStreamRequest, MEDIA_CATEGORY};
+    let kind = DesktopModule::AppUse;
+    let client = media_daemon_client(data_dir, node_id).await?;
+    let request = DesktopStreamRequest {
+        session_id,
+        frames_per_second: 30,
+        include_cursor: !app,
+        encoding,
+    };
+    let call = network::ObjectRpcCall::encode_value(kind.capture_route(), MEDIA_CATEGORY, request)
+        .map_err(|e| media_network_error(node_id, e))?;
+    let result = client
+        .object_rpc_call_to_target_async(node_id, call, MEDIA_CONNECT_TIMEOUT, true)
+        .await
+        .map_err(|e| media_network_error(node_id, e))?;
+    result
+        .response
+        .error_detail()
+        .map_err(|e| media_network_error(node_id, e))?;
+    if result.response.route != kind.capture_route() {
+        return Err(media_network_error(
+            node_id,
+            "video response route mismatch",
+        ));
+    }
+    let metadata: serde_json::Value = result
+        .response
+        .decode_body()
+        .map_err(|e| media_network_error(node_id, e))?;
+    if metadata.get("version").and_then(serde_json::Value::as_u64)
+        != Some(u64::from(sinomo_video::stream::VIDEO_STREAM_VERSION))
+    {
+        return Err(media_network_error(
+            node_id,
+            "unsupported video stream version",
+        ));
+    }
+    Ok(sinomo_video::stream::RemoteVideoSource::from_body(
+        result.body,
+    ))
+}
+
 fn media_network_error(node_id: &NodeId, detail: impl std::fmt::Display) -> CliError {
     CliError::Network {
         address: node_id.to_string(),

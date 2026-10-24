@@ -17,5 +17,6 @@ default = ["native-workers"]
 native-workers = []
 
 [dependencies]
+sinomo-actions.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }
 tracing.workspace = true

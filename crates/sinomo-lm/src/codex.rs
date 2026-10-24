@@ -80,6 +80,8 @@ pub struct OpenAiResponsesCodexConfig {
     pub client_version: String,
     pub default_model: String,
     pub credentials_path: Option<PathBuf>,
+    /// Disable for read-only verification that must stop when stored auth fails.
+    pub allow_credential_refresh: bool,
     /// Connect and per-read health timeout. This is not a total RPC deadline:
     /// every successfully received response-body chunk resets the read timer.
     pub transport_health_timeout: Duration,
@@ -94,6 +96,7 @@ impl Default for OpenAiResponsesCodexConfig {
             client_version: CODEX_MODELS_CLIENT_VERSION.to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
             credentials_path: default_codex_credentials_path(),
+            allow_credential_refresh: true,
             transport_health_timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
         }
     }
@@ -843,7 +846,18 @@ impl OpenAiResponsesCodexClient {
         ))
     }
 
+    fn check_credential_refresh_allowed(&self) -> Result<(), LanguageModelError> {
+        if self.config.allow_credential_refresh {
+            return Ok(());
+        }
+        Err(LanguageModelError::AuthenticationRequired {
+            provider: CODEX_PROVIDER_ID.to_string(),
+            detail: "Stored Codex credentials require authentication; credential refresh is disabled for this client".into(),
+        })
+    }
+
     pub fn refresh_chatgpt_tokens(&self) -> Result<CodexChatGptTokens, LanguageModelError> {
+        self.check_credential_refresh_allowed()?;
         let current = self.chatgpt_tokens()?;
         if current.refresh_token.trim().is_empty() {
             return Err(LanguageModelError::AuthenticationRequired {
@@ -1296,6 +1310,7 @@ impl OpenAiResponsesCodexClient {
         http: &reqwest::Client,
         request: &CodexModelRequest,
     ) -> Result<CodexChatGptTokens, LanguageModelError> {
+        self.check_credential_refresh_allowed()?;
         let current = self.chatgpt_tokens()?;
         if current.refresh_token.trim().is_empty() {
             return Err(LanguageModelError::AuthenticationRequired {
@@ -2425,6 +2440,12 @@ fn codex_message_from_request_item(
     tools: &[LanguageModelToolSpec],
 ) -> Option<CodexMessage> {
     match item {
+        LanguageModelRequestItem::Image {
+            media_type,
+            data_base64,
+        } => Some(CodexMessage::raw_item(serde_json::json!({
+            "type":"message", "role":"user", "content":[{"type":"input_image", "image_url":format!("data:{media_type};base64,{data_base64}"), "detail":"high"}]
+        }))),
         LanguageModelRequestItem::ProviderContinuation { .. } => None,
         LanguageModelRequestItem::Message { role, content } => {
             if content.trim().is_empty() {
@@ -3127,6 +3148,34 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
         }
+    }
+
+    #[test]
+    fn visual_evidence_is_native_image_input_and_preserves_exact_model() {
+        let mut input = request();
+        input.model = "gpt-6.1-sol".into();
+        input.items = vec![
+            LanguageModelRequestItem::message(LanguageModelRole::User, "Read this test screen."),
+            LanguageModelRequestItem::Image {
+                media_type: "image/jpeg".into(),
+                data_base64: "dGVzdA==".into(),
+            },
+        ];
+        let mut transport = transport_request();
+        transport.model = input.model.clone();
+        transport.messages = DefaultCodexContextManager::default().prepare_messages(&input);
+        let payload = openai_responses_codex_payload(&transport);
+        assert_eq!(payload["model"], "gpt-6.1-sol");
+        let images: Vec<_> = payload["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("content").and_then(|v| v.as_array()))
+            .flatten()
+            .filter(|part| part["type"] == "input_image")
+            .collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["image_url"], "data:image/jpeg;base64,dGVzdA==");
     }
 
     pub(super) fn transport_client(
@@ -3991,6 +4040,30 @@ mod tests {
         let detail = error.to_string();
         assert!(detail.contains("503 Service Unavailable"), "{detail}");
         assert!(detail.contains("maintenance"), "{detail}");
+    }
+
+    #[test]
+    fn codex_verification_stops_on_unauthorized_without_refresh() {
+        let (base_url, server) = test_server(move |listener| {
+            let mut stream = accept_expected(&listener, "accept verification request");
+            assert!(read_http_request(&mut stream).starts_with("POST /responses "));
+            write_json_response(&mut stream, "401 Unauthorized", "{}");
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-no-refresh");
+        let mut client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+        client.config.allow_credential_refresh = false;
+        let path = client.credentials_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let error = client
+            .complete_streaming(&transport_request(), &mut |_| {})
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            LanguageModelError::AuthenticationRequired { .. }
+        ));
+        assert!(error.to_string().contains("refresh is disabled"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]

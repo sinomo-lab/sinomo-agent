@@ -223,6 +223,10 @@ pub struct RealtimeVideoInputConfig {
     pub detail: RealtimeVideoFrameDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_frame_rate_hz: Option<u32>,
+    /// Draw normalized coordinate rulers/grid after resizing, without changing
+    /// the viewport. Opt-in grounding aid shared by recording and model input.
+    #[serde(default)]
+    pub coordinate_grid: bool,
 }
 
 impl Default for RealtimeVideoInputConfig {
@@ -233,6 +237,7 @@ impl Default for RealtimeVideoInputConfig {
             max_dimension: Some(DEFAULT_VIDEO_MAX_DIMENSION),
             detail: RealtimeVideoFrameDetail::Auto,
             max_frame_rate_hz: Some(2),
+            coordinate_grid: false,
         }
     }
 }
@@ -524,11 +529,6 @@ impl RealtimeAudioSessionConfig {
                     return Err(RealtimeAudioError::InvalidConfig {
                         detail: "Codex realtime audio input must be 16-bit PCM little-endian"
                             .to_string(),
-                    });
-                }
-                if self.input_video.is_some() {
-                    return Err(RealtimeAudioError::InvalidConfig {
-                        detail: "Codex realtime sessions do not accept video input".to_string(),
                     });
                 }
             }
@@ -1080,7 +1080,10 @@ pub struct RealtimeAudioSession {
     pending: VecDeque<RealtimeAudioEvent>,
     webrtc_call: Option<RealtimeWebrtcCall>,
     media: Option<Box<dyn RealtimeMediaTransport>>,
+    server_event_observer: Option<Box<RealtimeServerEventObserver>>,
 }
+
+type RealtimeServerEventObserver = dyn FnMut(&serde_json::Value) + Send;
 
 impl RealtimeSession for RealtimeAudioSession {
     fn config(&self) -> &RealtimeAudioSessionConfig {
@@ -1275,6 +1278,7 @@ impl RealtimeAudioSession {
             pending: VecDeque::new(),
             webrtc_call,
             media: None,
+            server_event_observer: None,
         };
         if session.webrtc_call.is_some() {
             return Ok(session);
@@ -1294,6 +1298,17 @@ impl RealtimeAudioSession {
 
     pub fn config(&self) -> &RealtimeAudioSessionConfig {
         &self.config
+    }
+
+    /// Observe original server events, including final usage and response status
+    /// which are not retained by every normalized event. The callback runs on
+    /// the receive path; keep it bounded and redact sensitive data before logging.
+    pub fn with_server_event_observer(
+        mut self,
+        observer: impl FnMut(&serde_json::Value) + Send + 'static,
+    ) -> Self {
+        self.server_event_observer = Some(Box::new(observer));
+        self
     }
 
     /// Returns the negotiated call when this session rides a WebRTC peer connection.
@@ -1377,14 +1392,10 @@ impl RealtimeAudioSession {
             });
         }
         let payload = match self.config.provider {
-            RealtimeAudioProvider::OpenAi => openai_input_video_frame_payload(frame),
-            RealtimeAudioProvider::MiniCpmO => minicpm_input_video_frame_payload(frame),
-            RealtimeAudioProvider::Codex => {
-                return Err(RealtimeAudioError::UnsupportedOperation {
-                    operation: "video input",
-                    provider: RealtimeAudioProvider::Codex.provider_id(),
-                });
+            RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => {
+                openai_input_video_frame_payload(frame)
             }
+            RealtimeAudioProvider::MiniCpmO => minicpm_input_video_frame_payload(frame),
         };
         self.send_json(payload).await
     }
@@ -1412,6 +1423,34 @@ impl RealtimeAudioSession {
     pub async fn request_response(&mut self) -> Result<(), RealtimeAudioError> {
         self.send_json(serde_json::json!({ "type": "response.create" }))
             .await
+    }
+
+    /// Append host-provided text without triggering a model response.
+    pub async fn send_text(&mut self, text: &str) -> Result<(), RealtimeAudioError> {
+        self.require_openai("text input")?;
+        self.send_json(
+            serde_json::json!({"type":"conversation.item.create","item":{
+                "type":"message","role":"user","content":[{"type":"input_text","text":text}]
+            }}),
+        )
+        .await
+    }
+
+    /// Refresh the agent's current instructions and authorized tool projection.
+    /// The caller must wait for session.updated before requesting a response.
+    pub async fn update_agent_context(
+        &mut self,
+        instructions: &str,
+        tools: &[RealtimeAudioToolDefinition],
+        max_output_tokens: Option<u32>,
+    ) -> Result<(), RealtimeAudioError> {
+        self.require_openai("agent context")?;
+        self.send_json(openai_agent_context_update_payload(
+            instructions,
+            tools,
+            max_output_tokens,
+        ))
+        .await
     }
 
     /// Adds a function call result to the conversation and optionally asks the
@@ -1536,12 +1575,40 @@ impl RealtimeAudioSession {
             .map_err(|source| RealtimeAudioError::WebSocket {
                 detail: source.to_string(),
             })?;
+        if let Some(event) = realtime_control_frame_event(&message) {
+            // tokio-websockets queues pong/close acknowledgements; flushing is
+            // required even while the agent is otherwise only receiving.
+            self.ws
+                .flush()
+                .await
+                .map_err(|e| RealtimeAudioError::WebSocket {
+                    detail: e.to_string(),
+                })?;
+            if let Some(observer) = self.server_event_observer.as_mut() {
+                let value = match &event {
+                    RealtimeAudioEvent::Raw { value, .. } => value.clone(),
+                    RealtimeAudioEvent::Closed { reason } => {
+                        serde_json::json!({"type":"transport.closed","reason":reason})
+                    }
+                    _ => unreachable!(),
+                };
+                observer(&value);
+            }
+            return Ok(event);
+        }
         let text = message
             .as_text()
             .ok_or_else(|| RealtimeAudioError::Protocol {
                 detail: "server sent a non-text websocket frame".to_string(),
             })?;
-        parse_realtime_audio_event(self.config.provider, text)
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|source| RealtimeAudioError::Json {
+                detail: source.to_string(),
+            })?;
+        if let Some(observer) = self.server_event_observer.as_mut() {
+            observer(&value);
+        }
+        realtime_audio_event_from_value(self.config.provider, value)
     }
 
     /// Reads decoded audio from the media path and presents it as an ordinary output event.
@@ -1914,6 +1981,19 @@ fn openai_realtime_session_document(config: &RealtimeAudioSessionConfig) -> serd
     session
 }
 
+fn openai_agent_context_update_payload(
+    instructions: &str,
+    tools: &[RealtimeAudioToolDefinition],
+    max_output_tokens: Option<u32>,
+) -> serde_json::Value {
+    let tools:Vec<_>=tools.iter().map(|tool|serde_json::json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters})).collect();
+    let mut session = serde_json::json!({"type":"realtime","instructions":instructions,"tools":tools,"tool_choice":"auto"});
+    if let Some(limit) = max_output_tokens {
+        session["max_output_tokens"] = limit.into();
+    }
+    serde_json::json!({"type":"session.update","session":session})
+}
+
 pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> serde_json::Value {
     serde_json::json!({
         "type": "session.update",
@@ -1985,7 +2065,9 @@ pub fn minicpm_input_audio_append_payload(chunk: &RealtimeAudioInputChunk) -> se
     payload
 }
 
-fn encode_realtime_video_frame(
+/// Shared media encoder for realtime sessions and routed video sources.
+/// Call on a media/blocking worker, never on a render or async executor thread.
+pub fn encode_realtime_video_frame(
     frame: &RealtimeVideoFrameInput,
     config: &RealtimeVideoInputConfig,
 ) -> Result<RealtimeEncodedVideoFrameInput, RealtimeAudioError> {
@@ -2016,6 +2098,9 @@ fn encode_realtime_video_frame(
         }
     }
 
+    if config.coordinate_grid {
+        super::video_grounding::draw_coordinate_grid(&mut image);
+    }
     let encoded_width = image.width();
     let encoded_height = image.height();
     let mut encoded = Vec::new();
@@ -2173,6 +2258,25 @@ pub fn minicpm_input_video_frame_payload(
         payload["timestamp_ms"] = serde_json::json!(timestamp_ms);
     }
     payload
+}
+
+fn realtime_control_frame_event(message: &Message) -> Option<RealtimeAudioEvent> {
+    if message.is_ping() || message.is_pong() {
+        let kind = if message.is_ping() {
+            "transport.ping"
+        } else {
+            "transport.pong"
+        };
+        return Some(RealtimeAudioEvent::Raw {
+            event_type: kind.into(),
+            value: serde_json::json!({"type":kind}),
+        });
+    }
+    message
+        .as_close()
+        .map(|(code, reason)| RealtimeAudioEvent::Closed {
+            reason: format!("{code:?}: {reason}"),
+        })
 }
 
 pub fn parse_realtime_audio_event(
@@ -2738,6 +2842,52 @@ mod tests {
             .with_transport(RealtimeAudioTransport::webrtc("v=0"))
             .validate()
             .expect("a WebRTC Codex session is valid");
+    }
+
+    #[test]
+    fn codex_realtime_accepts_video_frames_over_the_shared_protocol() {
+        for transport in [
+            RealtimeAudioTransport::default(),
+            RealtimeAudioTransport::webrtc("v=0"),
+        ] {
+            let config =
+                RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "gpt-realtime-2")
+                    .with_transport(transport)
+                    .with_video_input(RealtimeVideoInputConfig::default());
+            config
+                .validate()
+                .expect("Codex uses the OpenAI realtime image input protocol");
+        }
+    }
+
+    #[test]
+    fn realtime_agent_context_update_has_required_type_and_can_withdraw_tools() {
+        let payload = openai_agent_context_update_payload("new instructions", &[], Some(512));
+        assert_eq!(payload["session"]["type"], "realtime");
+        assert_eq!(payload["session"]["instructions"], "new instructions");
+        assert_eq!(payload["session"]["tools"], serde_json::json!([]));
+        assert_eq!(payload["session"]["max_output_tokens"], 512);
+        assert!(
+            payload["session"].get("audio").is_none(),
+            "do not reset active audio configuration"
+        );
+    }
+
+    #[test]
+    fn realtime_websocket_control_frames_are_not_json_protocol_errors() {
+        for frame in [
+            Message::ping(Vec::<u8>::new()),
+            Message::pong(Vec::<u8>::new()),
+        ] {
+            assert!(matches!(
+                realtime_control_frame_event(&frame),
+                Some(RealtimeAudioEvent::Raw { .. })
+            ));
+        }
+        assert!(
+            matches!(realtime_control_frame_event(&Message::close(Some(tokio_websockets::CloseCode::NORMAL_CLOSURE),"done")),Some(RealtimeAudioEvent::Closed{reason}) if reason.contains("done"))
+        );
+        assert!(realtime_control_frame_event(&Message::text("{}")).is_none());
     }
 
     #[test]

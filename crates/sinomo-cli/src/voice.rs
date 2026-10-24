@@ -162,7 +162,10 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
     if let Some(format) = options.input_format {
         config.input_format = format;
     }
-    if !options.video_frames.is_empty() || options.native_camera {
+    if !options.video_frames.is_empty()
+        || options.native_camera
+        || options.desktop_session.is_some()
+    {
         config.input_video = Some(sinomo_lm::RealtimeVideoInputConfig {
             frame_format: options
                 .video_format
@@ -516,7 +519,7 @@ async fn run_voice_call_async(
     .await?;
     let input_sequence;
     let mut input_video_frames = input_video_frames;
-    if options.native_microphone || options.native_camera {
+    if options.native_microphone || options.native_camera || options.desktop_session.is_some() {
         let native_report = run_native_voice_loop(
             session.as_mut(),
             &mut state,
@@ -766,6 +769,30 @@ async fn run_native_voice_loop(
     initial_video_frames: u64,
 ) -> Result<NativeVoiceLoopReport, CliError> {
     let microphone = open_voice_audio_source(config, options).await?;
+    let desktop = if let Some(desktop_session) = &options.desktop_session {
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let node = options
+            .desktop_node
+            .as_deref()
+            .map(NodeId::from_legacy_named)
+            .transpose()
+            .map_err(|e| CliError::Parse {
+                detail: e.to_string(),
+            })?
+            .unwrap_or_else(|| voice_local_node_id(&data_dir));
+        Some(
+            crate::media_transport::open_desktop_video_source(
+                &data_dir,
+                &node,
+                options.desktop_app,
+                desktop_session.clone(),
+                config.input_video.clone().unwrap_or_default(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let camera = if options.native_camera {
         let camera_config = native_voice_camera_capture_config(options);
         Some(sinomo_video::start_native_camera_capture(camera_config).map_err(native_video_error)?)
@@ -850,6 +877,34 @@ async fn run_native_voice_loop(
                 next_video_send_at = now + video_send_interval;
                 progressed = true;
             }
+        }
+        if let Some(desktop) = &desktop
+            && Instant::now() >= next_video_send_at
+            && let Some((metadata, mut frame)) = desktop
+                .take_latest()
+                .map_err(|detail| CliError::Parse { detail })?
+        {
+            frame.detail = options.video_detail;
+            frame.sequence = video_sequence;
+            session
+                .send_encoded_video_frame(&frame)
+                .await
+                .map_err(realtime_audio_error)?;
+            let mut record = sinomo_agent::AgentVideoFrameInput::new(
+                sinomo_agent::AgentVideoDirection::Input,
+                video_sequence,
+                provider_id.to_string(),
+                model.to_string(),
+                frame.format,
+            );
+            record.provider_session_id = state.provider_session_id.clone();
+            record.timestamp_ms = Some(metadata.timestamp_ns / 1_000_000);
+            store
+                .append_video_frame(session_id, record, &frame.image)
+                .map_err(agent_session_store_error)?;
+            video_sequence = video_sequence.saturating_add(1);
+            next_video_send_at = Instant::now() + video_send_interval;
+            progressed = true;
         }
         match session
             .receive_event_with_timeout(Duration::from_millis(1))
@@ -1307,6 +1362,52 @@ fn agent_session_store_error(error: sinomo_agent::AgentSessionStoreError) -> Cli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_tools_project_from_the_complete_product_catalog_and_withdraw_when_disabled() {
+        use sinomo_actions::desktop::*;
+        let root = sinomo_testdir::TestDir::new("desktop-agent-tool-projection");
+        let data_dir = SinomoDataDir::new(&root);
+        let projection = sinomo_agent::product_module_tool_projection(&data_dir).unwrap();
+        let bindings = projection.project_bindings();
+        {
+            let route = APP_CONTROL_ROUTE;
+            assert_eq!(
+                bindings
+                    .iter()
+                    .filter(|binding| binding.route == route)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            !bindings
+                .iter()
+                .any(|binding| { [APP_CAPTURE_ROUTE].contains(&binding.route.as_str()) })
+        );
+        sinomo_runtime::module::set_native_rust_module_enabled(
+            &data_dir.root(),
+            &DesktopModule::AppUse.module_id(),
+            false,
+            "test",
+            "tool withdrawal",
+        )
+        .unwrap();
+        let projection = sinomo_agent::product_module_tool_projection(&data_dir).unwrap();
+        assert!(
+            !projection
+                .project_bindings()
+                .iter()
+                .any(|binding| binding.route == APP_CONTROL_ROUTE)
+        );
+        assert!(
+            projection
+                .registrations
+                .iter()
+                .flat_map(|r| &r.surfaces.declarative_resources)
+                .any(|skill| skill.id == "app-use")
+        );
+    }
 
     #[test]
     fn voice_call_options_parse_minicpm_audio_defaults() {

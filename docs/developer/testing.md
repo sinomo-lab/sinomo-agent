@@ -178,6 +178,130 @@ continuation state are dropped, but review every recording before keeping any
 of it. Recordings expect only the outputs of the previous reply's tool calls;
 tighten their checks by hand.
 
+## Live Desktop Agent Verification (Windows)
+
+Build the opt-in fixture host, then run the real agent against owned test windows:
+
+```powershell
+cargo build -p sinomo -p sinomo-app-use-module --features sinomo/desktop-e2e
+.\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop
+# Run just one case:
+.\scripts\test-desktop-agent.ps1 -Model gpt-6.1-sol -UseInteractiveDesktop -Case agent.desktop.app-drag-resize
+# Persistent Realtime session, live capture and native function calls:
+.\scripts\test-desktop-agent.ps1 -AgentRuntime realtime -Model gpt-realtime-2 -UseInteractiveDesktop
+# Exercise app grounding with video deliberately smaller than the source UI:
+.\scripts\test-desktop-agent.ps1 -AgentRuntime realtime -Model gpt-realtime-2 -UseInteractiveDesktop -Case agent.desktop.app-drag-resize -CaptureMaxDimension 768 -CoordinateGrid
+```
+
+The launcher loads `sinomo_app_use_module.dll` beside the test binary;
+`-AppUseModule` selects another explicitly built artifact. Its hash is recorded
+and the normal native installer activates it only in the fresh test data directory.
+No OS implementation is linked into the fixture host. Background and raw cases
+use the same control tool with an explicit session mode.
+
+The launcher requires `ffmpeg` and `ffprobe` on PATH and an existing Sinomo Codex
+credential. `-Credentials` can select another stored credential file. It reads
+the token without copying it into the result bundle, checks expiry before each
+model request, disables credential refresh, and stops the suite on missing,
+expired or rejected credentials. The requested model is sent unchanged; absence
+from a provider's menu does not trigger model substitution.
+
+Each case creates a fresh data directory, local resource grants, a component
+host with the unified App Use service, its installed native OS artifact, and a real `AgentSessionRuntime`. The normal
+module tool projection and service dispatch handle actual model tool calls.
+Local object-RPC uses production body framing and ownership through the network
+test-support adapter. No daemon, cluster, operator workspace or distributed
+settings are required or changed. This exercises the local agent-to-device
+path; it does not establish cross-node routing behavior.
+
+Both modes observe the continuous shared Sinomo media stream and wait for a
+post-action frame before requesting the next model response. Responses mode
+sends a native image with each request. Realtime mode uses one persistent
+`RealtimeModelProvider` connection behind the same `AgentSessionRuntime`, with
+`native_tools` output format. The agent executor still owns tool policy,
+execution, cancellation, traces and stored sessions. Frames continue at 2 Hz
+while the Realtime response is generated; the independent capture and video
+recording remain active throughout tool execution. This is JPEG frame input
+over WebSocket, not a native WebRTC video track.
+
+Realtime tool calls are dispatched only after a successful terminal
+`response.done`. Results are sent back once with their original provider call
+IDs, and failed connections are not silently reconnected or replayed. Typed
+module request schemas and per-frame geometry are included in the model context.
+App input uses `move_in_frame`: normalized fractions of the full window image
+plus the frame's source dimensions. The device converts them to client/message
+coordinates, accounts for DPI, and rejects stale sizes after a resize. Video
+encoding and model-side resizing do not require the agent to scale pixel
+coordinates. Resize and subsequent actions use separate observe/act steps.
+The Windows device integration test covers physical and normalized input in
+both per-monitor-aware and DPI-unaware windows without foreground or pointer
+changes (`cargo test -p sinomo-actions --test app_use_native_windows -- --ignored --test-threads=1`).
+`-CoordinateGrid` enables content-independent coordinate rulers in the shared
+encoder after resizing, without changing the viewport. The recording and model
+receive the same annotated frames. This is an optional grounding aid, not control
+detection or fixture-specific target coordinates; it defaults off.
+Realtime runs additionally retain redacted server events,
+usage, returned PCM speech and `recording-with-audio.mp4`; the latter aligns
+speech to receipt/playback time on the screen recording timeline. Recording
+finalization has a bounded encoder deadline.
+
+| Case | Independent acceptance condition |
+|---|---|
+| `agent.desktop.app-form` | Submit a fresh code, set counter to 3 and toggle ON while another window retains focus and the pointer stays unchanged |
+| `agent.desktop.app-drag-resize` | Resize, drag into a target, scroll exactly three ticks and submit the code in an occluded background window |
+| `agent.desktop.computer-form` | Complete the form through raw input while the owned full-screen fixture retains foreground |
+| `agent.desktop.gamepad-capability` | Attempt native neutral gamepad injection and close the input lease; unsupported hosts are explicitly skipped |
+| `agent.desktop.gamepad-state` | Observe A, stick and trigger values through XInput or Windows.Gaming.Input, then observe neutral before closing the lease; unsupported hosts are explicitly skipped |
+
+`-UseInteractiveDesktop` explicitly allows the owned windows on the current
+desktop. Setup may click an owned, hit-tested window to establish foreground,
+restoring the pointer before measurements begin. Raw tests occupy the primary
+display and move the pointer. Avoid user input during the run. Foreground and desktop checks stop raw input and frame
+forwarding when ownership changes; a hidden watchdog stops only the exact owned
+child on timeout or launcher failure and restores the previous desktop, pointer
+and foreground. These guards are test isolation, not a security sandbox.
+Without that flag, the launcher uses a separate Win32 desktop. On the verified
+Windows host, WGC returned a zero-sized capture item there even after painting
+and activating the window; interactive fixture mode was required. The harness
+does not silently switch modes. `-FixtureOnly` records a short setup diagnostic
+and returns **skipped**, explicitly stating that no model ran.
+
+Results go into a new `benchmark-results/desktop-agent-*` directory. Each case
+retains its MP4, frame timeline, exact model observations, agent trace, RPC
+receipts, independent application-state assertions and `ffprobe` validation.
+The report attaches files with MIME type, size and BLAKE3 digest, including on
+failure. `source.json` records the binary hash, Git revision and dirty-source
+hashes. MP4 recording uses FFmpeg only as an artifact sink after Sinomo's shared
+encoder and media transport; repeated latest frames preserve recording time
+and are declared in its metadata. Failed runs are retained, and reusing an
+existing run directory is rejected.
+
+## Live Realtime Visual Probe
+
+The small ignored test below uses the stored Codex credential with
+`gpt-realtime-2`. It sends four synthetic JPEG frames through the shared encoder
+and production Realtime WebSocket session, asks for two short spoken responses,
+and independently checks random codes, colors, shapes, positions and frame order.
+It captures neither the desktop nor the microphone, and starts no cluster.
+
+```powershell
+$env:SINOMO_CODEX_CREDENTIALS_FILE = Join-Path $env:USERPROFILE '.sinomo/configs/lm/credentials/codex.json'
+$env:SINOMO_REALTIME_VIDEO_ARTIFACTS = Join-Path $PWD ('benchmark-results/realtime-video-' + [Guid]::NewGuid().ToString('N'))
+cargo test -p sinomo-lm --test codex_realtime_video_e2e -- --ignored --nocapture
+```
+
+Use a fresh artifact directory each time. The test disables credential refresh,
+checks expiry before connecting, and verifies the credential file is unchanged.
+Artifacts include exact encoded frames, returned PCM WAV audio, redacted server
+events, terminal response status/usage, expected answers and an independent
+verdict. A visual recognition error fails the strict test even when transport
+and API processing succeed; retain that evidence.
+
+This verifies sequential image input to a Realtime model, not a native WebRTC
+video track. Successful subscription-token authentication establishes observed
+access only. The server's token usage and before/after shared account counters
+do not establish an undocumented subscription billing rule.
+
 ## Formal Verification
 
 The Quint harness pins Quint 0.32.0 and Apalache 0.56.1. It classifies models

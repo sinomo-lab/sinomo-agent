@@ -8,6 +8,14 @@ pub(super) fn contents(request: &LanguageModelRequest, model: &str) -> Vec<Value
     let mut signed_calls = std::collections::BTreeSet::new();
     for item in provider_request_items(request, "gemini", model) {
         match item {
+            LanguageModelRequestItem::Image {
+                media_type,
+                data_base64,
+            } => append(
+                &mut contents,
+                "user",
+                json!({"inlineData":{"mimeType":media_type, "data":data_base64}}),
+            ),
             LanguageModelRequestItem::ProviderContinuation { continuation } => {
                 signed_calls.extend(continuation.tool_call_ids);
                 contents.extend(continuation.items);

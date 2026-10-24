@@ -304,6 +304,37 @@ pub fn base_component_catalog(
         }
     }
 
+    if profile.resource_class == ProductResourceClass::Standard
+        && matches!(
+            profile.host_role,
+            ComponentHostRole::Main | ComponentHostRole::Embedded
+        )
+    {
+        use sinomo_actions::desktop::{self, DesktopModule};
+        {
+            let kind = DesktopModule::AppUse;
+            let enabled = kind.enabled(&data_dir.root()).unwrap_or(false);
+            let registration = desktop::module_registration(kind);
+            builder = if enabled {
+                register_module_factory(
+                    builder,
+                    registration,
+                    desktop::component_factory(kind)
+                        .expect("desktop component descriptor must be valid"),
+                )?
+            } else {
+                builder.register_module(registration)?
+            };
+            builder = builder.register_native_rust_control_target(
+                sinomo_runtime::module::NativeRustModuleServiceTarget::new(
+                    kind.legacy_id(),
+                    enabled,
+                    true,
+                    "node-local desktop capture and control; requires explicit local consent",
+                ),
+            )?;
+        }
+    }
     builder = register_installed_native_dylib_modules(builder, &data_dir.root())?;
 
     builder.build()
@@ -443,6 +474,75 @@ fn register_module_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_modules_follow_standard_main_embedded_and_disable_profiles() {
+        use sinomo_actions::desktop::DesktopModule;
+        let root = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-desktop-profile-{}",
+            sinomo_runtime::core::Id::generate()
+        )));
+        for profile in [
+            ProductComponentProfile::main(false),
+            ProductComponentProfile::embedded(false),
+        ] {
+            let catalog = base_component_catalog(&root, profile).unwrap();
+            {
+                let kind = DesktopModule::AppUse;
+                assert!(catalog.factory(kind.module_id().as_str()).is_some());
+            }
+        }
+        for profile in [
+            ProductComponentProfile::shadow(false),
+            ProductComponentProfile::mobile_embedded(false),
+        ] {
+            let catalog = base_component_catalog(&root, profile).unwrap();
+            {
+                let kind = DesktopModule::AppUse;
+                assert!(catalog.modules().get(&kind.module_id()).is_none());
+            }
+        }
+        sinomo_runtime::module::set_native_rust_module_enabled(
+            &root.root(),
+            &DesktopModule::AppUse.module_id(),
+            false,
+            "test",
+            "unified app-use disable",
+        )
+        .unwrap();
+        let catalog = base_component_catalog(&root, ProductComponentProfile::main(false)).unwrap();
+        assert!(
+            catalog
+                .factory(DesktopModule::AppUse.module_id().as_str())
+                .is_none()
+        );
+        assert!(
+            !sinomo_runtime::node::LocalNodePermissionStore::new(root.root())
+                .load()
+                .unwrap()
+                .remote_management_enabled()
+        );
+        std::fs::remove_dir_all(root.root()).unwrap();
+    }
+
+    #[test]
+    fn desktop_modules_do_not_change_storage_ownership() {
+        use sinomo_actions::desktop::DesktopModule;
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-desktop-storage-{}",
+            sinomo_runtime::core::Id::generate()
+        )));
+        let catalog =
+            base_component_catalog(&data_dir, ProductComponentProfile::main(true)).unwrap();
+        let without = catalog
+            .without_module(&DesktopModule::AppUse.module_id())
+            .unwrap();
+        let with_layout =
+            sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&catalog).unwrap();
+        let without_layout =
+            sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&without).unwrap();
+        assert_eq!(with_layout, without_layout);
+    }
 
     #[test]
     fn main_profile_owns_dfs_and_sandbox_factories_while_shadow_owns_neither() {

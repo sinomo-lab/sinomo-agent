@@ -162,6 +162,8 @@ pub(crate) fn run_test_command(command: TestCliCommand) -> Result<(), CliError> 
 
 pub(crate) fn test_registry() -> Result<SinomoTestRegistry, CliError> {
     let builder = sinomo_lm::register_lm_test_cases(SinomoTestRegistry::builder());
+    #[cfg(all(feature = "desktop-e2e", target_os = "windows"))]
+    let builder = super::test_cases_desktop::register(builder);
     let builder = crate::commands::test_cases_network::register_network_cluster_test_cases(builder);
     let builder = crate::commands::test_cases_agent::register_agent_cluster_test_cases(builder);
     let builder =
@@ -533,6 +535,7 @@ mod tests {
             diagnostics: serde_json::Value::Object(Default::default()),
             metrics: BTreeMap::new(),
             errors: Vec::new(),
+            artifacts: Vec::new(),
         }
     }
 

@@ -37,6 +37,9 @@ pub struct VoiceCallOptions {
     pub microphone_node: Option<String>,
     pub native_camera: bool,
     pub camera_device: Option<String>,
+    pub desktop_session: Option<String>,
+    pub desktop_node: Option<String>,
+    pub desktop_app: bool,
     pub native_speaker: bool,
     pub speaker_device: Option<String>,
     /// Node the speaker is attached to; `None` means the node running the call.
@@ -75,6 +78,9 @@ impl Default for VoiceCallOptions {
             microphone_node: None,
             native_camera: false,
             camera_device: None,
+            desktop_session: None,
+            desktop_node: None,
+            desktop_app: false,
             native_speaker: false,
             speaker_device: None,
             speaker_node: None,
@@ -191,6 +197,17 @@ fn voice_cli_spec() -> CliCommandSpec {
                 CliOptionSpec::flag("--native-camera", "use a native camera")
                     .with_aliases(["--camera"]),
                 free("--camera-device", "camera selector", "selector"),
+                free(
+                    "--computer-stream",
+                    "Computer Use capture session",
+                    "session-id",
+                ),
+                free("--app-stream", "App Use capture session", "session-id"),
+                free(
+                    "--video-node",
+                    "node hosting the desktop capture session",
+                    "node-id",
+                ),
                 CliOptionSpec::flag("--native-speaker", "use a native speaker")
                     .with_aliases(["--speaker"]),
                 free("--speaker-device", "speaker selector", "selector"),
@@ -288,6 +305,27 @@ fn parse_voice_call_matches(
     options.native_camera =
         matches.contains("--native-camera") || matches.contains("--camera-device");
     options.camera_device = matches.value("--camera-device").map(str::to_string);
+    if matches.contains("--computer-stream") && matches.contains("--app-stream") {
+        return Err(CliParseError::Parse {
+            detail: "choose --computer-stream or --app-stream".into(),
+        });
+    }
+    options.desktop_session = matches
+        .value("--computer-stream")
+        .or_else(|| matches.value("--app-stream"))
+        .map(str::to_string);
+    options.desktop_app = matches.contains("--app-stream");
+    options.desktop_node = matches.value("--video-node").map(str::to_string);
+    if options.desktop_session.is_some() && options.native_camera {
+        return Err(CliParseError::Parse {
+            detail: "desktop streams and native camera are mutually exclusive".into(),
+        });
+    }
+    if options.desktop_node.is_some() && options.desktop_session.is_none() {
+        return Err(CliParseError::Parse {
+            detail: "--video-node requires --computer-stream or --app-stream".into(),
+        });
+    }
     options.native_speaker = matches.contains("--native")
         || matches.contains("--native-speaker")
         || matches.contains("--speaker-device");
@@ -323,7 +361,11 @@ fn parse_voice_call_matches(
     if !options.video_frames.is_empty() && !input_specified && options.input.is_none() {
         options.audio_input = false;
     }
-    if !options.audio_input && options.video_frames.is_empty() && !options.native_camera {
+    if !options.audio_input
+        && options.video_frames.is_empty()
+        && !options.native_camera
+        && options.desktop_session.is_none()
+    {
         return Err(CliParseError::Parse {
             detail: "voice call needs audio input, native camera, or at least one --video-frame"
                 .to_string(),
@@ -382,4 +424,25 @@ fn parse_video_detail(value: &str) -> Result<crate::RealtimeVideoFrameDetail, Cl
 /// Parse this domain's arguments without executing a command.
 pub fn parse_voice_command(args: &[String]) -> Result<VoiceCliCommand, CliParseError> {
     parse_command_args(voice_cli_spec(), args, parse_voice_matches)
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<VoiceCliCommand, CliParseError> {
+        parse_voice_command(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+    #[test]
+    fn desktop_stream_allows_video_only_calls_and_rejects_ambiguous_sources() {
+        let VoiceCliCommand::Call(options) =
+            parse(&["call", "--app-stream", "session", "--no-audio"]).unwrap()
+        else {
+            panic!("call");
+        };
+        assert_eq!(options.desktop_session.as_deref(), Some("session"));
+        assert!(options.desktop_app);
+        assert!(parse(&["call", "--app-stream", "a", "--computer-stream", "b"]).is_err());
+        assert!(parse(&["call", "--app-stream", "a", "--native-camera"]).is_err());
+        assert!(parse(&["call", "--video-node", "node"]).is_err());
+    }
 }

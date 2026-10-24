@@ -1,5 +1,7 @@
 //! Video and screen perception event producer skeleton.
 
+pub mod stream;
+
 use serde::{Deserialize, Serialize};
 use sinomo_gateway::{InputChunk, InputModality};
 use sinomo_runtime::core::{
@@ -245,6 +247,7 @@ pub fn native_video_sample_to_surface_frame(
         }
         NativeVideoSampleFormat::Rgb8
         | NativeVideoSampleFormat::Bgr8
+        | NativeVideoSampleFormat::Bgra8
         | NativeVideoSampleFormat::Gray8 => {
             (sample.width, sample.height, convert_packed_to_rgba(sample)?)
         }
@@ -303,6 +306,15 @@ fn convert_packed_to_rgba(sample: &NativeVideoSample) -> Result<Vec<u8>, NativeV
                 NativeVideoSampleFormat::Gray8 => {
                     let value = row[x];
                     rgba.extend_from_slice(&[value, value, value, 255]);
+                }
+                NativeVideoSampleFormat::Bgra8 => {
+                    let offset = x * 4;
+                    rgba.extend_from_slice(&[
+                        row[offset + 2],
+                        row[offset + 1],
+                        row[offset],
+                        row[offset + 3],
+                    ]);
                 }
                 _ => unreachable!("packed conversion only receives RGB, BGR, or gray"),
             }

@@ -939,6 +939,13 @@ impl AgentModuleToolProjection {
             for route in &registration.surfaces.object_rpc_routes {
                 let base_name = module_object_rpc_tool_name(&route.category, &route.operation);
                 let name = unique_module_tool_name(base_name, &mut names);
+                let mut input_schema = serde_json::json!({"type":"object","properties":{
+                    "route_key":{"type":"string","description":"Optional routing key for the module invocation."},
+                    "input":route.request_schema.clone().unwrap_or_else(||serde_json::json!({"description":"Route-specific object-RPC request payload."}))
+                }});
+                if route.request_schema.is_some() {
+                    input_schema["required"] = serde_json::json!(["input"]);
+                }
                 let descriptor = AgentToolDescriptor::new(AgentToolSpec::new(
                     AgentToolKind::ModuleObjectRpc,
                     name,
@@ -958,18 +965,7 @@ impl AgentModuleToolProjection {
                 ])
                 .with_capabilities([AgentToolCapability::CallModule])
                 .with_required_local_permissions(route.required_local_permissions.clone())
-                .with_input_schema(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "route_key": {
-                            "type": "string",
-                            "description": "Optional routing key for the module invocation."
-                        },
-                        "input": {
-                            "description": "Route-specific object-RPC request payload."
-                        }
-                    }
-                }))
+                .with_input_schema(input_schema)
                 .with_output_schema(serde_json::json!({
                     "type": "object",
                     "description": "Route-specific object-RPC response payload."
@@ -1606,6 +1602,41 @@ pub enum AgentToolProgressEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_route_request_schema_reaches_the_model_tool_payload() {
+        use sinomo_runtime::{
+            core::TrustRing,
+            module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleSurfaces},
+        };
+        let schema = serde_json::json!({"type":"object","properties":{"button":{"type":"string","enum":["left","right"]}},"required":["button"]});
+        let mut registration = ModuleRegistration::native_rust(
+            sinomo_runtime::module::ModuleId::from_legacy_named("module.schema-test").unwrap(),
+            "1.0.0",
+            "schema-test",
+            "schema-test",
+            "schema-test",
+            TrustRing::R2TrustedService,
+            "schema-test",
+        );
+        registration.surfaces = ModuleSurfaces::default().with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                "/schema/test",
+                "schema-test",
+                "schema.test",
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .with_request_schema(schema.clone()),
+        );
+        let projected = AgentModuleToolProjection::new()
+            .with_registration(registration)
+            .project_descriptors();
+        assert_eq!(projected[0].input_schema["properties"]["input"], schema);
+        assert_eq!(
+            projected[0].input_schema["required"],
+            serde_json::json!(["input"])
+        );
+    }
 
     fn test_descriptor(name: &str) -> AgentToolDescriptor {
         AgentToolDescriptor::new(AgentToolSpec::new(

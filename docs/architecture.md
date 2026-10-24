@@ -434,6 +434,14 @@ types.
 `sinomo-api` has no dependency on the daemon, DFS implementation, module host,
 or observation recorder. Server adapters live in `sinomo-daemon`; mounted DFS
 transports live in `sinomo-dfs`; module persistence stays in `sinomo-module`.
+Computer Use and App Use are independently enabled components hosted by standard
+main/embedded products. Their device layer owns driver-free native capture and
+input, rechecking node-local consent and exact resource exposure at each effect.
+App input uses window messages without claiming the user's focus or pointer.
+Capture produces bounded native video samples; encoding and streaming reuse the
+video/realtime and routed object-RPC media paths. Component leases own held input,
+capture workers and cancellation. See [Computer Use and App Use](user/computer-and-app-use.md).
+
 Frontend module changes go through daemon RPC. `sinomo-module-api` remains the
 small native ABI package and owns the data-only metric exporter vocabulary in
 its `observe` module. App-local media and sign-in remain client capabilities.

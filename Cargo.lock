@@ -9492,9 +9492,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-testdir",
+ "sinomo-video",
  "thiserror 2.0.20",
  "time",
+ "tokio",
+ "windows",
 ]
 
 [[package]]
@@ -9576,6 +9581,17 @@ dependencies = [
  "sinomo-app",
  "sinomo-ui",
  "tracing",
+]
+
+[[package]]
+name = "sinomo-app-use-module"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-core",
+ "sinomo-device",
+ "sinomo-module-api",
+ "windows",
 ]
 
 [[package]]
@@ -9670,6 +9686,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sinomo-actions",
  "sinomo-agent",
  "sinomo-audio",
  "sinomo-client",
@@ -9687,6 +9704,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wat",
+ "windows",
 ]
 
 [[package]]
@@ -9824,8 +9842,10 @@ dependencies = [
  "cpal",
  "nokhwa",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sinomo-core",
+ "sinomo-testdir",
  "thiserror 2.0.20",
  "tokio",
  "v4l",
@@ -10272,6 +10292,7 @@ dependencies = [
 name = "sinomo-product-profile"
 version = "0.1.0"
 dependencies = [
+ "sinomo-actions",
  "sinomo-runtime",
  "tracing",
 ]
@@ -10550,11 +10571,13 @@ dependencies = [
 name = "sinomo-test"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "sinomo-api",
  "sinomo-cli-registry",
  "sinomo-core",
+ "sinomo-testdir",
  "thiserror 2.0.20",
 ]
 
@@ -10812,8 +10835,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-gateway",
+ "sinomo-lm",
  "sinomo-runtime",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
