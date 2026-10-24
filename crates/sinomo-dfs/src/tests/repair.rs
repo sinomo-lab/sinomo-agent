@@ -2623,12 +2623,83 @@ pub(super) fn assert_native_remote_manifest_fetch_deferral(name: &str, foregroun
         // Main owns the durable queue and its actual producer admission. A
         // public browser's private retry maps do not drive that queue.
         runtime.request_repair_reconciliation(&primary).unwrap();
-        runtime
-            .maintenance_tick(&primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
-            .unwrap()
-            .outcome
+        let completion_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let maintenance = runtime
+            .maintenance_tick(
+                &primary,
+                completion_deadline.saturating_duration_since(Instant::now()),
+            )
             .unwrap();
+        maintenance.outcome.as_ref().unwrap();
+        let matches_original = |captured: &crate::test_runtime::CapturedFetchReply| {
+            matches!(&captured.routed.message,
+                DfsNetworkMessage::FetchBlobResponse(response)
+                if response.intent_id == intent && response.object_id == request.object_id
+                    && response.version == request.target_version)
+        };
+        let after_tick_reply_count = captured_fetch.lock().unwrap().len();
+        let after_tick_matched = captured_fetch.lock().unwrap().iter().any(&matches_original);
+        // Main hands off the original call after maintenance admission releases.
+        // One returned tick is not transport completion. Observe that SAME call
+        // within the existing budget, without issuing another maintenance turn.
+        let matched_within_budget = loop {
+            let matched = captured_fetch.lock().unwrap().iter().any(&matches_original);
+            let remaining = completion_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            if matched {
+                break true;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        };
         let replies = captured_fetch.lock().unwrap().clone();
+        {
+            // Retain both cuts, including any reply still absent at the deadline.
+            // Diagnostic I/O cannot replace or mask the exact assertion below.
+            let diagnostic = runtime
+                .data_dir(&primary)
+                .root()
+                .join("boundary-diagnostic-post-commit-fetch.json");
+            let captured = serde_json::json!({
+                "operation_id": operation, "intent_id": intent, "request": request,
+                "primary": primary, "requester": requester,
+                "content_hash": manifest.content_hash, "bytes": manifest.size_bytes,
+                "maintenance": format!("{maintenance:#?}"),
+                "after_tick_reply_count": after_tick_reply_count,
+                "after_tick_matched_original": after_tick_matched,
+                "matched_within_original_budget": matched_within_budget,
+                "matched_original_at_final_observation": replies.iter().any(&matches_original),
+                "remaining_original_budget_ns": completion_deadline.saturating_duration_since(Instant::now()).as_nanos().to_string(),
+                "captured_reply_count": replies.len(),
+                "reply_heads": replies.iter().take(8).map(|captured| {
+                    let mut head = serde_json::json!({
+                        "rpc_request_id": captured.rpc_request_id,
+                        "source": captured.routed.source_node_id,
+                        "target": captured.routed.target_node_id,
+                    });
+                    if let DfsNetworkMessage::FetchBlobResponse(response) = &captured.routed.message {
+                        head["request_id"] = serde_json::json!(response.request_id);
+                        head["intent_id"] = serde_json::json!(response.intent_id);
+                        head["object_id"] = serde_json::json!(response.object_id);
+                        head["version"] = serde_json::json!(response.version);
+                        if let DfsFetchBlobResult::Found { content_hash, bytes } = &response.result {
+                            head["found"] = serde_json::json!({"hash":content_hash,"byte_count":bytes.len()});
+                        }
+                    }
+                    head
+                }).collect::<Vec<_>>(),
+                "reply_heads_omitted": replies.len().saturating_sub(8),
+                "rpc_omitted": runtime.observation_dropped_count(),
+                "rpc_at_final_observation": format!("{:#?}", runtime.rpc_observations()),
+                "qualification": "Actual returned tick and same original detached reply; one unchanged network budget starts before tick. No recovery lookup, additional tick, new write identity, enlarged deadline or supplied reply."
+            });
+            eprintln!(
+                "post-commit fetch diagnostic {:?}: {:?}",
+                diagnostic,
+                std::fs::write(&diagnostic, serde_json::to_vec_pretty(&captured).unwrap())
+            );
+        }
         let original = replies
             .iter()
             .find(|captured| {
@@ -2638,6 +2709,10 @@ pub(super) fn assert_native_remote_manifest_fetch_deferral(name: &str, foregroun
                 && response.version == request.target_version)
             })
             .expect("actual Main's selected post-commit Fetch reply");
+        assert!(
+            matched_within_budget,
+            "the original detached Fetch must finish within the unchanged network budget"
+        );
         assert_eq!(original.routed.source_node_id, requester);
         assert_eq!(original.routed.target_node_id, primary);
         let DfsNetworkMessage::FetchBlobResponse(response) = &original.routed.message else {
