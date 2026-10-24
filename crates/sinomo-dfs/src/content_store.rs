@@ -1313,6 +1313,24 @@ pub struct LocalContentStore {
     stream_manifest_validation_count: Arc<AtomicU64>,
 }
 
+/// Explicit reader representation for dispatch observation only. This owns no
+/// DATA lock and grants no writer, durable-prefix or publication capability.
+pub(crate) struct RepairPayloadInspectionContext {
+    store: LocalContentStore,
+}
+
+impl RepairPayloadInspectionContext {
+    pub(crate) fn for_default(root: impl Into<PathBuf>) -> Self {
+        Self {
+            store: LocalContentStore::open_for_inspection(root),
+        }
+    }
+
+    pub(crate) fn inspect(&self, root: &RepairPayloadRoot) -> Result<()> {
+        self.store.inspect_repair_payload_root(root)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct ValidatedContentManifest {
     manifest: ContentManifest,

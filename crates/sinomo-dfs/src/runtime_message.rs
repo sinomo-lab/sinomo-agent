@@ -25,13 +25,14 @@ pub(crate) fn checkpoint_detached_replica_delivery(
     data_dir: &sinomo_core::local::SinomoDataDir,
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
 ) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
-    checkpoint_detached_replica_delivery_with_layout(data_dir, event, None)
+    checkpoint_detached_replica_delivery_with_layout(data_dir, event, None, None)
 }
 
 pub(crate) fn checkpoint_detached_replica_delivery_with_layout(
     data_dir: &sinomo_core::local::SinomoDataDir,
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
     layout: Option<&crate::DfsSelectedOriginalDataLayout>,
+    inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
 ) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
     use crate::node_transport::DfsBackgroundReplicaDeliveryEvent;
     use crate::node_transport::DfsBackgroundReplicaDispatch;
@@ -81,8 +82,12 @@ pub(crate) fn checkpoint_detached_replica_delivery_with_layout(
                 return Ok(DfsBackgroundReplicaDispatch::Fenced);
             }
             let original = store.validate_original_repair_dispatch(&message)?;
-            LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"))
-                .inspect_repair_payload_root(&original.root)?;
+            if let Some(inspection) = inspection {
+                inspection.inspect(&original.root)?;
+            } else {
+                LocalContentStore::open_for_inspection(data_dir.dfs_dir().join("content"))
+                    .inspect_repair_payload_root(&original.root)?;
+            }
             let (records, _) = store.observe_transfer_targets(
                 &command.intent_id,
                 std::slice::from_ref(&message.target_node_id),

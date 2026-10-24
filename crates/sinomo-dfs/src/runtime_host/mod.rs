@@ -368,6 +368,28 @@ impl DfsDataOwnerLock {
             None => LocalContentStore::new(self.physical_data_root.join("dfs/content")).map_err(Into::into),
         }
     }
+
+    pub(crate) fn repair_payload_inspection_context(
+        &self,
+    ) -> Result<crate::content_store::RepairPayloadInspectionContext, DfsRuntimeError> {
+        match &self.original_repair_fixture {
+            #[cfg(any(test, feature = "test-support"))]
+            Some(_) => LocalContentStore::original_repair_inspection_context(
+                &self.original_repair_content_identity()?,
+            )
+            .map_err(Into::into),
+            #[cfg(not(any(test, feature = "test-support")))]
+            Some(_) => Err(DfsRuntimeError::Parse {
+                detail: "original Repair fixture inspection is unavailable in a production reader"
+                    .into(),
+            }),
+            None => Ok(
+                crate::content_store::RepairPayloadInspectionContext::for_default(
+                    self.physical_data_root.join("dfs/content"),
+                ),
+            ),
+        }
+    }
     /// The actual retained owner may carry an explicit fixture reader. The
     /// context owns no DATA lock and therefore creates no owner-lifetime cycle.
     pub(crate) fn selected_original_data_layout(
