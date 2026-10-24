@@ -794,7 +794,7 @@ pub(crate) struct DfsFreshContentAdmissionPlan {
 pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
     request: &DfsReplicaPlacementRequest,
     inventory: &crate::write_configuration_inputs::DfsAdmittedContentTargets,
-    snapshot: &DfsPlacementSnapshot,
+    snapshot: Option<&DfsPlacementSnapshot>,
     current_replica_node_ids: &[NodeId],
     pinned_replica_node_ids: &[NodeId],
 ) -> Result<DfsFreshContentAdmissionPlan, DfsDistributedError> {
@@ -891,7 +891,8 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
         .map(|(index, candidate)| CandidateEvidence {
             candidate,
             node: observations.get(index),
-            path: placement_candidate_path(&canonical, snapshot, candidate),
+            path: snapshot
+                .and_then(|snapshot| placement_candidate_path(&canonical, snapshot, candidate)),
             current: current.contains(&candidate.node_id),
             pinned: pinned.contains(&candidate.node_id),
         })
@@ -976,6 +977,16 @@ pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
     selected.sort_by(|left, right| {
         attemptable(*right)
             .cmp(&attemptable(*left))
+            .then_with(|| {
+                let required = |candidate: &CandidateEvidence<'_>| {
+                    candidate.pinned
+                        || canonical
+                            .policy
+                            .required_node_ids
+                            .contains(&candidate.candidate.node_id)
+                };
+                required(right).cmp(&required(left))
+            })
             .then_with(|| compare_candidate_evidence(&canonical, *left, *right, now))
     });
     let desired_replica_nodes = selected

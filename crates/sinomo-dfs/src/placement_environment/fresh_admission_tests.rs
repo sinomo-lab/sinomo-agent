@@ -110,7 +110,7 @@ impl Fixture {
         plan_fresh_eventual_replicas_with_admitted_targets(
             &self.request,
             &self.inventory,
-            &self.snapshot,
+            Some(&self.snapshot),
             current,
             pinned,
         )
@@ -288,6 +288,22 @@ fn fresh_admission_missing_remote_path_stays_attemptable_without_ready_claim() {
 }
 
 #[test]
+fn fresh_admission_missing_snapshot_keeps_paths_unknown_without_ready_claim() {
+    let f = Fixture::new();
+    let plan = plan_fresh_eventual_replicas_with_admitted_targets(
+        &f.request,
+        &f.inventory,
+        None,
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(plan.attemptable_node_ids, vec![f.b.clone(), f.c.clone()]);
+    assert_eq!(plan.observed_ready_node_ids, vec![f.b]);
+    assert_eq!(plan.deferred_desired_node_ids, vec![f.a]);
+}
+
+#[test]
 fn fresh_admission_unknown_required_and_pinned_targets_keep_existing_eligibility() {
     let mut f = Fixture::new();
     f.inventory
@@ -308,6 +324,35 @@ fn fresh_admission_unknown_required_and_pinned_targets_keep_existing_eligibility
     assert!(plan.placement.desired_replica_nodes.contains(&f.a));
     assert!(plan.attemptable_node_ids.contains(&f.a));
     assert!(!plan.observed_ready_node_ids.contains(&f.a));
+}
+
+#[test]
+fn fresh_admission_required_survivors_precede_optional_unknown_path_target() {
+    let mut f = Fixture::new();
+    f.inventory
+        .targets
+        .iter_mut()
+        .find(|target| target.advertisement.node_id == f.a)
+        .unwrap()
+        .provider_observed_ready = true;
+    f.snapshot
+        .paths
+        .iter_mut()
+        .find(|path| path.target_node_id == f.a)
+        .unwrap()
+        .state = DfsPlacementPathState::Unknown;
+    f.request.policy.required_node_ids = vec![f.b.clone(), f.c.clone()];
+    let plan = f.plan(&[], &[]).unwrap();
+    assert_eq!(
+        plan.placement.desired_replica_nodes,
+        vec![f.b.clone(), f.c.clone(), f.a.clone()]
+    );
+    assert_eq!(
+        plan.placement.preferred_commit_nodes,
+        vec![f.b.clone(), f.c.clone()]
+    );
+    assert_eq!(plan.attemptable_node_ids, vec![f.b, f.c, f.a]);
+    assert!(plan.deferred_desired_node_ids.is_empty());
 }
 
 #[test]

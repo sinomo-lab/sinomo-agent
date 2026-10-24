@@ -87,7 +87,9 @@ rules, distinct zones, exact N and every request/policy consistency check remain
 binding. Confirmed W=N, foreground-all-N, local-owned and unsupported/unknown
 native input paths retain existing strict behavior. Unknown path evidence is not
 declared unavailable; a directed endpoint failure remains Unknown as networking
-currently projects it. Prefer usable B/C observations before optional deferred A;
+currently projects it. Required/pinned attemptable targets retain transfer
+priority before optional attemptable targets. Prefer usable B/C observations
+before optional deferred A;
 actual exact receipts alone satisfy W.
 
 ## S2. Reuse the existing write and deficit owners
@@ -99,6 +101,44 @@ consumes the desired order. The existing committed intent and version
 `content_durability` retain all N IDs/policy; ordinary commit creates missing
 target repair jobs and the normal message/queue capture persists that work.
 No repair-loop, receiver, queue or new scheduling framework is needed here.
+
+## S3. Actual creation context, never a wire freshness claim
+
+The private creation context is produced from the POSIX caller's successful
+lookup/new-object allocation and from the routed owner's actual `created` result
+after its ordinary stable-operation replay check. The transient overlay index
+is not this proof: its existing classification intentionally tolerates failed
+backend reads. No serialized field, request/intent ID, body or epoch changes.
+Foreground requests do not acquire the fresh context even when an existing
+server optimization chooses background repair internally.
+
+Requester selection is planning DATA only. The actual native author independently
+requires its current shard mutation admission and error-propagating exact
+canonical object/path absence (or its exact existing tombstone predecessor).
+The current managed policy and complete zone evidence come from the same
+retained configuration as target inventory. Existing regular files, retained
+writes, patches and non-fresh callers keep the old selector. Only a new regular
+file without a base version can use the bounded fresh path. A missing advisory
+snapshot means unknown paths; it is not permission and starts no new monitor.
+
+The initial authored native control is a new registered-Main create with healthy
+metadata, managed required B/C placement and denied A content RPCs. It records
+the actual advisory snapshot without publishing a synthetic path state. The
+original write RPC completes at its real receiver before its transport reply is
+discarded. Only that completed reply-loss rule is removed; A content remains
+denied while the existing read-only stable-create reconciliation checks the
+same operation, requester, object, version, hash, size and committed intent.
+It must not emit another distributed-write RPC. The fixture then performs a
+fresh Core inspection and ordinary all-N heal. It is not an OS/process restart.
+The reconciliation receipt represents exact durable operation identity/status,
+not the transient repair-job list from the original response. Stable operation
+identity is retained, but the existing local POSIX retry path can reach strict planning
+before known-result replay when lookup already returns a committed object. This
+slice does not claim that direct same-write-API retry under continued content
+outage is available; that ordering needs explicit review. No uncertain operation
+is replaced under a new identity. Existing operation reconciliation and the
+normal owner-side replay rules remain unchanged. This authored control is
+uncompiled/unrun; its source is not native acceptance evidence.
 
 ## Initial focused controls and evidence limits
 
