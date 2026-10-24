@@ -468,8 +468,28 @@ impl NativeContentOnlyRepairAdmission {
         let content_identity = self.provider.data_owner.original_repair_content_identity().map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?;
         if content_identity != self.content_identity { return Err(crate::DfsError::Metadata { message: "native content-only Repair physical content expectation changed".into() }); }
         let (shard, filesystem, projection_generation) = self.provider.content_only_repair_configuration(material, &self.object, &self.receiver, &self.immutable_policy)?;
+        let authority_generation = self.provider.authority.generation();
         if shard != self.shard || filesystem != self.filesystem || projection_generation != self.projection_generation
-            || self.provider.authority.generation() != self.authority_generation {
+            || authority_generation != self.authority_generation {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                use std::io::Write as _;
+                // Failure-only observation, not a replacement authority cut.
+                // A diagnostic write failure must preserve the original error.
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "NATIVE_ORIGINAL_REPAIR_CONFIGURATION_CHANGED request={} intent={} receiver={} shard_equal={} filesystem_equal={} projection_expected={} projection_current={} authority_expected={} authority_current={}",
+                    material.original.command.request_id,
+                    material.original.command.intent_id,
+                    self.receiver,
+                    shard == self.shard,
+                    filesystem == self.filesystem,
+                    self.projection_generation,
+                    projection_generation,
+                    self.authority_generation,
+                    authority_generation,
+                );
+            }
             return Err(crate::DfsError::Metadata { message: "native content-only Repair configuration advanced".into() });
         }
         Ok(())
