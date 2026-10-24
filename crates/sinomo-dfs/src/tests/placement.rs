@@ -430,12 +430,22 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
         .posix_mkdir("/users/shared")
         .expect("writer routed mkdir");
     let bytes = b"replica-converged bytes".to_vec();
-    writer
-        .posix_write_file(
+    let mut write_options = DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]);
+    write_options.policy = writer
+        .managed_write_replication_policy_for_path(
             "/users/shared/from-writer.txt",
-            &bytes,
-            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+            DfsObjectPolicy::ReplicatedEventual,
+            1,
         )
+        .unwrap();
+    assert_eq!(write_options.policy.min_commit_replicas, 1);
+    assert_eq!(write_options.policy.desired_replicas, 1);
+    assert_eq!(
+        write_options.policy.required_node_ids,
+        vec![writer_node.clone()]
+    );
+    writer
+        .posix_write_file("/users/shared/from-writer.txt", &bytes, write_options)
         .expect("writer routed write");
     assert_eq!(
         writer

@@ -1134,8 +1134,17 @@ fn sifs_cluster_write_options(node_id: &NodeId) -> DfsWriteOptions {
 /// metadata-shard primary, so the write routes over the network) and pumps the
 /// cluster until the writer observes the committed content at the path.
 fn sifs_cluster_routed_posix_write(cluster: &mut SifsPosixCluster, path: &str, bytes: &[u8]) {
-    let expected_hash = content_hash(bytes);
     let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    sifs_cluster_routed_posix_write_with_options(cluster, path, bytes, options);
+}
+
+fn sifs_cluster_routed_posix_write_with_options(
+    cluster: &mut SifsPosixCluster,
+    path: &str,
+    bytes: &[u8],
+    options: DfsWriteOptions,
+) {
+    let expected_hash = content_hash(bytes);
     match cluster.writer.posix_write_file(path, bytes, options) {
         Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
         Err(error) => panic!("routed POSIX write to {path} failed: {error}"),
