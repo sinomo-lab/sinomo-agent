@@ -12,7 +12,7 @@ impl LocalContentStore {
         self.initialize_bindings_for_explicit_owner(RECEIVED_REPAIR_FIXTURE_VERSION)
     }
 
-    fn initialize_bindings_for_explicit_owner(&self, expected_format: u32) -> Result<()> {
+    pub(super) fn initialize_bindings_for_explicit_owner(&self, expected_format: u32) -> Result<()> {
         if self.inline_store.owner.expected_format != expected_format {
             return Err(inline_error(
                 "initializer differs from explicit content owner capability",

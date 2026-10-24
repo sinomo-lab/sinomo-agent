@@ -1574,6 +1574,84 @@ pub struct DfsMessageResponse {
     pub outbound_messages: Vec<DfsRoutedMessage>,
 }
 
+/// Complete immutable ordinary Repair head. Keeping the command typed avoids
+/// recursive selected-envelope grammars; these values come from the source's
+/// actual durable birth, never from current receiver metadata.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairHead {
+    pub(crate) source_node_id: NodeId,
+    pub(crate) target_node_id: NodeId,
+    pub(crate) frame_id: u64,
+    pub(crate) message_id: u64,
+    pub(crate) command: DfsRepairReplicaCommand,
+}
+
+impl DfsOriginalRepairHead {
+    pub(crate) fn routed(&self) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: self.source_node_id.clone(),
+            target_node_id: self.target_node_id.clone(),
+            frame_id: self.frame_id,
+            message_id: self.message_id,
+            message: DfsNetworkMessage::RepairReplica(self.command.clone()),
+        }
+    }
+}
+
+/// Wire DATA describing one prospectively admitted original. It grants no
+/// execution, authoring, result, acknowledgement or successor permission.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsOriginalRepairMaterial {
+    pub(crate) subject: crate::content_store::RepairPayloadSubject,
+    pub(crate) original: DfsOriginalRepairHead,
+    pub(crate) attachment: crate::DfsRpcAttachmentDescriptor,
+    pub(crate) command_digest: String,
+}
+
+impl DfsOriginalRepairMaterial {
+    pub(crate) fn validate(&self) -> Result<(), crate::DfsError> {
+        let command = &self.original.command;
+        let subject = &self.subject;
+        if subject.queue_incarnation.is_empty()
+            || subject.producer != self.original.source_node_id.as_str()
+            || subject.target != self.original.target_node_id.as_str()
+            || subject.intent_id != command.intent_id
+            || subject.request_id != command.request_id
+            || command.request_id.is_empty()
+            || !command.background_repair
+            || !command.bytes.is_empty()
+            || command.authority_shard.is_none()
+            || self.attachment.content_hash.as_deref() != Some(command.content_hash.as_str())
+            || self.command_digest != crate::repair_queue_store::original_repair_digest(
+                &self.original.routed(), &self.attachment,
+            )?
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "selected original Repair material is not exact".into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn matches_carrier(&self, carrier: &DfsRoutedMessage) -> bool {
+        self.original.source_node_id == carrier.source_node_id
+            && self.original.target_node_id == carrier.target_node_id
+            && carrier.message == DfsNetworkMessage::RepairReplica(self.original.command.clone())
+    }
+}
+
+/// Strict, prospective A-only receiver grammar. The immutable head stays
+/// unchanged when real attachment decoding fills the separate invocation body.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsSelectedOriginalRepairCommand {
+    pub(crate) version: u32,
+    pub(crate) material: DfsOriginalRepairMaterial,
+    pub(crate) bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataJournalBatchResult {
@@ -1644,6 +1722,8 @@ pub enum DfsNetworkMessage {
     MetadataSnapshotInstallResponse(DfsMetadataSnapshotInstallResponse),
     ContentRootCatalogPageRequest(DfsContentRootCatalogPageRequest),
     ContentRootCatalogPageResponse(DfsContentRootCatalogPage),
+    // Append new variants so existing ordinal-based codecs keep V1 indices.
+    SelectedOriginalRepair(DfsSelectedOriginalRepairCommand),
 }
 
 impl DfsMetadataJournalBatchResult {

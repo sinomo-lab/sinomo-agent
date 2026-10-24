@@ -125,6 +125,7 @@ impl PreparedRepairContentWitness {
 pub(crate) struct ReceivedRepairFixtureIdentity {
     root: PathBuf,
     store_incarnation: String,
+    format: u32,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -134,6 +135,28 @@ pub(crate) struct ReceivedRepairFixtureIdentity {
 }
 
 impl ReceivedRepairFixtureIdentity {
+    pub(crate) fn is_at_root(&self, root: &Path) -> bool { self.root == root }
+    pub(crate) fn check_original_physical_identity(&self) -> Result<()> {
+        if self.format != ORIGINAL_REPAIR_FIXTURE_VERSION { return Err(inline_error("expected original Repair identity is not private4")); }
+        self.check_directory()
+    }
+
+    /// Compare an actual writer's physical identity with the expectation
+    /// retained by the native DATA owner. This performs no recovery or sync.
+    pub(crate) fn check_original_store_identity(&self, store: &LocalContentStore) -> Result<()> {
+        self.check_original_physical_identity()?;
+        if store.inline_store.owner.expected_format != ORIGINAL_REPAIR_FIXTURE_VERSION
+            || store.root != self.root
+            || store.inline_store.owner.received_repair_identity.lock().map_err(|_| inline_error("fixture identity mutex poisoned"))?.as_ref() != Some(self)
+        { return Err(inline_error("original Repair content store differs from actual native owner expectation")); }
+        Ok(())
+    }
+
+    pub(crate) fn check_original_store(&self, store: &LocalContentStore, store_incarnation: &str) -> Result<()> {
+        self.check_original_store_identity(store)?;
+        if store_incarnation != self.store_incarnation { return Err(inline_error("original Repair writer sentinel differs from actual native content incarnation")); }
+        Ok(())
+    }
     fn check_directory(&self) -> Result<()> {
         let metadata =
             fs::symlink_metadata(&self.root).map_err(|source| ContentStoreError::Io {
@@ -165,7 +188,14 @@ impl LocalContentStore {
     pub(crate) fn new_received_repair_fixture(
         root: impl Into<PathBuf>,
     ) -> Result<(Self, ReceivedRepairFixtureIdentity)> {
-        let root = root.into();
+        Self::new_received_repair_fixture_for_format(root.into(), RECEIVED_REPAIR_FIXTURE_VERSION)
+    }
+
+    pub(crate) fn new_original_repair_fixture(root: impl Into<PathBuf>) -> Result<(Self, ReceivedRepairFixtureIdentity)> {
+        Self::new_received_repair_fixture_for_format(root.into(), ORIGINAL_REPAIR_FIXTURE_VERSION)
+    }
+
+    fn new_received_repair_fixture_for_format(root: PathBuf, format: u32) -> Result<(Self, ReceivedRepairFixtureIdentity)> {
         // Atomic fresh creation: never convert/adopt even an existing empty root.
         fs::create_dir(&root).map_err(|source| ContentStoreError::Io {
             path: root.clone(),
@@ -178,9 +208,9 @@ impl LocalContentStore {
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(inline_error("fresh fixture root changed before admission"));
         }
-        let mut store = Self::received_repair_fixture_handle(&root);
+        let mut store = Self::received_repair_fixture_handle(&root, format);
         if store.inline_store.identity_error.is_some()
-            || store.inline_store.owner.expected_format != RECEIVED_REPAIR_FIXTURE_VERSION
+            || store.inline_store.owner.expected_format != format
             || store
                 .inline_store
                 .owner
@@ -204,7 +234,7 @@ impl LocalContentStore {
         create_dir_all(store.root.join("objects"))?;
         create_dir_all(store.root.join("staging"))?;
         store.initialize_content_reservation_writer_state()?;
-        store.initialize_received_repair_fixture_bindings()?;
+        store.initialize_bindings_for_explicit_owner(format)?;
         initialize_file_reclamation_lock(&store.root)?;
         let sentinel = store
             .inline_sentinel_unlocked()?
@@ -212,6 +242,7 @@ impl LocalContentStore {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         let identity = ReceivedRepairFixtureIdentity {
+            format,
             root: store.root.clone(),
             store_incarnation: sentinel.store_incarnation,
             #[cfg(unix)]
@@ -238,7 +269,7 @@ impl LocalContentStore {
         identity: &ReceivedRepairFixtureIdentity,
     ) -> Result<Self> {
         identity.check_directory()?;
-        let mut store = Self::received_repair_fixture_handle(&identity.root);
+        let mut store = Self::received_repair_fixture_handle(&identity.root, identity.format);
         if store.inline_store.identity_error.is_some() {
             return Err(inline_error(
                 "fixture reopen has a conflicting live content owner",
@@ -269,7 +300,7 @@ impl LocalContentStore {
         read_catalog_for_format(
             &store.root,
             &identity.store_incarnation,
-            RECEIVED_REPAIR_FIXTURE_VERSION,
+            identity.format,
         )?;
         store.content_reservation_writer_initialized = true;
         let reservation = store.lock_content_reservations_for_write()?;
@@ -289,8 +320,8 @@ impl LocalContentStore {
         Ok(store)
     }
 
-    fn received_repair_fixture_handle(root: &Path) -> Self {
-        let lease = InlineStoreLease::new_for_format(root, RECEIVED_REPAIR_FIXTURE_VERSION);
+    fn received_repair_fixture_handle(root: &Path, format: u32) -> Self {
+        let lease = InlineStoreLease::new_for_format(root, format);
         Self {
             root: lease.root().to_owned(),
             inline_store: lease,
@@ -313,7 +344,7 @@ impl LocalContentStore {
         &self,
         sentinel: Option<&ContentStoreReservationBatchSentinel>,
     ) -> Result<()> {
-        if self.inline_store.owner.expected_format != RECEIVED_REPAIR_FIXTURE_VERSION {
+        if !matches!(self.inline_store.owner.expected_format, RECEIVED_REPAIR_FIXTURE_VERSION | ORIGINAL_REPAIR_FIXTURE_VERSION) {
             return Ok(());
         }
         let accepted = self
@@ -324,7 +355,7 @@ impl LocalContentStore {
             .map_err(|_| inline_error("fixture identity mutex poisoned"))?;
         if let Some(identity) = accepted.as_ref() {
             identity.check_directory()?;
-            if identity.root != self.root
+            if identity.root != self.root || identity.format != self.inline_store.owner.expected_format
                 || sentinel.is_some_and(|s| s.store_incarnation != identity.store_incarnation)
             {
                 return Err(inline_error(
@@ -335,7 +366,7 @@ impl LocalContentStore {
         Ok(())
     }
 
-    fn require_received_repair_fixture_identity(&self) -> Result<()> {
+    pub(super) fn require_received_repair_fixture_identity(&self) -> Result<()> {
         if self
             .inline_store
             .owner

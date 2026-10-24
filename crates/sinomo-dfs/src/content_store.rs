@@ -24,6 +24,7 @@ use fs2::FileExt;
 #[cfg(feature = "storage-conversion")]
 pub use inline_bindings::{ContentStoreStagingRow, ContentStoreStagingWriter};
 use inline_bindings::{InlineReservationState, InlineStoreLease, InlineVersionState};
+pub(crate) use inline_bindings::{BoundOriginalRepairContent, ReceivedRepairFixtureIdentity};
 pub use readers::{BlobRangeReader, BlobReader, ObjectVersionReader};
 use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
@@ -1076,10 +1077,8 @@ impl LocalContentStore {
         let sentinel = decode_content_reservation_batch_sentinel(&read_file(
             &self.content_reservation_batch_sentinel_path(),
         )?)?;
-        validate_content_reservation_batch_sentinel(&sentinel)?;
-        if sentinel.store_incarnation != root.store_incarnation
-            || sentinel.content_binding_layout != inline_bindings::INLINE_BINDING_LAYOUT
-        {
+        self.validate_repair_payload_owner(&sentinel)?;
+        if sentinel.store_incarnation != root.store_incarnation {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: "Repair dispatch physical store identity changed".into(),
             });

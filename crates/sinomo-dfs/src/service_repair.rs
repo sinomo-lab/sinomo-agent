@@ -19,6 +19,38 @@ use crate::transfer::{
 };
 use crate::*;
 
+/// Only the actual selected native receiver can construct this outcome after
+/// its fixed content/cache branch succeeds. It is not a serialized capability.
+pub(crate) struct NativeOriginalRepairOutcome {
+    admission: crate::publication_guard::NativeContentOnlyRepairAdmission,
+    response: DfsRepairReplicaResponse,
+    prepared_seal: String,
+    bound_id: u64,
+}
+impl NativeOriginalRepairOutcome {
+    pub(crate) fn revalidate(&self, material: &DfsOriginalRepairMaterial, prepared_seal: &str, bound_id: u64) -> Result<(), DfsError> {
+        self.admission.revalidate(material)?;
+        if self.prepared_seal != prepared_seal || self.bound_id != bound_id {
+            return Err(DfsError::Metadata { message: "native Repair outcome changed its actual bound-content phase".into() });
+        }
+        Ok(())
+    }
+    pub(crate) fn response(&self) -> &DfsRepairReplicaResponse { &self.response }
+    pub(crate) fn provenance(&self) -> crate::publication_guard::NativeContentOnlyRepairProvenance { self.admission.provenance() }
+    pub(crate) fn check_content_owner(&self, store: &LocalContentStore, incarnation: &str) -> Result<(), crate::ContentStoreError> { self.admission.check_content_owner(store, incarnation) }
+    pub(crate) fn check_content_store(&self, store: &LocalContentStore) -> Result<(), crate::ContentStoreError> { self.admission.check_content_store(store) }
+}
+
+/// The ordinary base validator deliberately permits retained same-hash bytes.
+/// This prospective current-content-only slice cannot roll a later metadata
+/// generation back while applying its receiver-local cache substep.
+fn ensure_selected_original_exact_current_content(current_version: &DfsVersion, current_hash: Option<&str>, command: &DfsRepairReplicaCommand) -> Result<(), DfsError> {
+    if current_version != &command.version || current_hash != Some(command.content_hash.as_str()) {
+        return Err(DfsError::Metadata { message: "selected original Repair target is not the exact current version/hash".into() });
+    }
+    Ok(())
+}
+
 /// Minted only after admitted native receipt application, or an admitted
 /// exact persisted application read. The queue seals settlement atomically.
 /// An observed response alone cannot construct this application witness.
@@ -1655,6 +1687,55 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             command.version,
             result,
         ))
+    }
+
+    /// Prospective A-only receiver foundation. Selected errors propagate with
+    /// no domain reply: an uncertain durable phase is never a Rejected result.
+    pub(crate) fn handle_selected_original_repair(&mut self, requester: NodeId, selected: DfsSelectedOriginalRepairCommand) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        self.content.requires_original_repair_fixture()?;
+        selected.material.validate()?;
+        let material = &selected.material;
+        let command = &material.original.command;
+        if selected.version != 1 || requester != material.original.source_node_id || self.node_id != material.original.target_node_id {
+            return Err(DfsError::Metadata { message: "selected Repair authenticated original/executor/receiver differs".into() });
+        }
+        let backend = self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair requires its actual native backend".into() })?;
+        let object = backend.get_object(&command.object_id)?.ok_or_else(|| DfsError::UnknownObject { object_id: command.object_id.clone() })?;
+        ensure_selected_original_exact_current_content(&object.version, object.content_hash.as_deref(), command)?;
+        let stamp = command.authority_shard.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair original has no authority stamp".into() })?;
+        let owner = backend.publication_owner_scope(&command.file_system_id, &DfsMetadataShardId::new(stamp.shard_id.clone()))?;
+        let execution = self.publication_execution.current().ok_or_else(|| DfsError::Metadata { message: "selected Repair has no actual native mutation admission".into() })?;
+        let provider = self.publication_provider.current().ok_or_else(|| DfsError::Metadata { message: "selected Repair has no current native publication provider".into() })?;
+        let admission = provider.admit_content_only_original_repair(execution, owner, material, &object, &self.node_id)?;
+        // These existing checks are read-only. In particular, the ordinary
+        // potentially authoring object/helper and metadata-cache path are NOT
+        // called anywhere in this selected branch.
+        self.ensure_current_replica_publication(&command.intent_id, &command.object_id)?;
+        self.ensure_replica_command_authorized_with_metadata(&requester, &command.intent_id, &command.object_id, command.object_metadata.as_ref(), command.authority_shard.as_ref())?;
+        self.ensure_replica_command_hash_matches_intent(&command.intent_id, &command.object_id, &command.content_hash)?;
+        self.ensure_no_conflicting_pending_replica_write("selected repair", &requester, &command.intent_id, &command.object_id, &command.version, &command.content_hash)?;
+        self.ensure_command_base_matches_current("selected repair", &command.object_id, command.expected_base_version.as_ref(), &command.version, &command.content_hash)?;
+        self.ensure_metadata_receipt_accepts(&command.object_id, &command.version, &self.node_id, &command.content_hash)?;
+        let prepared = self.content.prepare_original_repair(material, &selected.bytes, &admission)?;
+        #[cfg(test)]
+        self.content.received_repair_after_prepared_test_cut()?;
+        let bound = self.content.bind_original_repair_content(&prepared, &selected.bytes)?;
+        admission.revalidate(material)?;
+        let object = self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata { message: "selected Repair lost its actual native backend".into() })?
+            .get_object(&command.object_id)?.ok_or_else(|| DfsError::UnknownObject { object_id: command.object_id.clone() })?;
+        ensure_selected_original_exact_current_content(&object.version, object.content_hash.as_deref(), command)?;
+        // Explicitly local cache only. Never call add_file_system,
+        // add_object_metadata, put_metadata_receipt, or a V7 publication helper.
+        if !self.metadata.filesystems.contains_key(&object.file_system_id) {
+            self.metadata.add_file_system(DfsFileSystem { file_system_id: object.file_system_id.clone(), display_name: object.file_system_id.to_string(), owner_node_id: object.owner_node_id.clone(), retention_policies: Default::default(), module_metadata: Default::default(), subtree_policies: Vec::new() });
+        }
+        self.metadata.add_object(object)?;
+        self.commit_local_metadata(&command.object_id, &command.version, &command.content_hash, dfs_now_unix_nanos())?;
+        let response = DfsRepairReplicaResponse { request_id: command.request_id.clone(), intent_id: command.intent_id.clone(), file_system_id: command.file_system_id.clone(), object_id: command.object_id.clone(), version: command.version.clone(), replica_node_id: self.node_id.clone(), result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() } };
+        let outcome = NativeOriginalRepairOutcome { admission, response, prepared_seal: bound.prepared_seal().into(), bound_id: bound.bound_id() };
+        let response = self.content.finish_original_repair(&bound, &outcome)?;
+        self.send_dfs_message_if_routable(&requester, DfsNetworkMessage::RepairReplicaResponse(response.clone()))?;
+        Ok(self.repair_replica_result_event(response.intent_id, response.object_id, response.version, response.result))
     }
 
     // This local fixture-gated content proof does not replace any preflight,
@@ -6000,6 +6081,55 @@ mod received_repair_content_tests {
         DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY, cluster_capability_policy_key,
         cluster_member_key,
     };
+
+    #[test]
+    fn selected_original_rejects_older_target_even_when_current_hash_matches() {
+        let root = sinomo_testdir::TestDir::new("selected-original-no-cache-head-rollback");
+        let (queue, _source, message, descriptor, retained, _layout) = crate::repair_queue_store::tests::selected_original_fixture(&root.join("source"));
+        queue.enroll_original_repair(&message, &descriptor, &retained).unwrap();
+        let original = queue.original_repair(&message).unwrap().unwrap();
+        let material = original.original_wire_material().unwrap();
+        let command = &material.original.command;
+        let before = queue.view().unwrap();
+        ensure_selected_original_exact_current_content(&command.version, Some(&command.content_hash), command).unwrap();
+        let later = DfsVersion::from_legacy_named("later-metadata-only-head").unwrap();
+        assert_ne!(later, command.version);
+        let error = ensure_selected_original_exact_current_content(&later, Some(&command.content_hash), command).unwrap_err();
+        assert!(error.to_string().contains("exact current version/hash"));
+        assert!(ensure_selected_original_exact_current_content(&command.version, None, command).is_err());
+        assert!(ensure_selected_original_exact_current_content(&command.version, Some("different-content"), command).is_err());
+        assert_eq!(queue.view().unwrap(), before);
+        assert_eq!(queue.original_repair(&message).unwrap(), Some(original));
+        // This tests the exact readonly guard used before Prepared and again
+        // before local cache application. It is not a native epoch/race proof.
+    }
+
+    #[test]
+    fn selected_original_default_old_fixture_and_missing_native_owner_never_apply() {
+        let root = sinomo_testdir::TestDir::new("selected-original-reject-unadmitted-native");
+        let (queue, _source, message, descriptor, retained, _layout) = crate::repair_queue_store::tests::selected_original_fixture(&root.join("source"));
+        queue.enroll_original_repair(&message, &descriptor, &retained).unwrap();
+        let material = queue.original_repair(&message).unwrap().unwrap().original_wire_material().unwrap();
+        for format in [2,3,4] {
+            let case = root.join(format!("format-{format}"));
+            std::fs::create_dir_all(&case).unwrap();
+            let content_root = case.join("content");
+            let content = match format {
+                2 => LocalContentStore::new(&content_root).unwrap(),
+                3 => LocalContentStore::new_received_repair_fixture(&content_root).unwrap().0,
+                _ => LocalContentStore::new_original_repair_fixture(&content_root).unwrap().0,
+            };
+            let catalog = content_root.join("inline-bindings/current.sobj");
+            let before = std::fs::read(&catalog).unwrap();
+            let mut service = NetworkedDfsService::new(crate::test_runtime::DfsTestRuntime::local_transport(material.original.target_node_id.clone()), content);
+            let error = service.handle_selected_original_repair(material.original.source_node_id.clone(), DfsSelectedOriginalRepairCommand { version: 1, material: material.clone(), bytes: b"complete original attachment".to_vec() }).unwrap_err();
+            assert!(error.to_string().contains(if format == 4 { "actual native backend" } else { "explicit native fixture" }), "{error}");
+            assert!(service.metadata.objects.is_empty() && service.metadata.filesystems.is_empty());
+            assert_eq!(std::fs::read(&catalog).unwrap(), before);
+            assert!(service.content.read_object_version(material.original.command.object_id.as_str(), material.original.command.version.as_str()).is_err());
+            if format == 4 { assert!(service.content.original_repair_test_snapshot(&material).unwrap().is_none()); }
+        }
+    }
 
     // Capture member/capability DATA verbatim from ordinary native startup,
     // following the maintained control_plane unit-fixture pattern. It grants

@@ -4817,11 +4817,18 @@ mod native_selected_data_tests {
         name: &str,
         forbid_promoted: bool,
     ) -> GenuineNativeOriginal {
+        genuine_native_original_with_receiver_foundation(name, forbid_promoted, false)
+    }
+
+    fn genuine_native_original_with_receiver_foundation(name: &str, forbid_promoted: bool, receiver_foundation: bool) -> GenuineNativeOriginal {
         let path = "/services/selected-original-data.bin";
         let nodes = DfsTestRuntime::ordered_node_ids(name, 3);
         let mut runtime = DfsTestRuntime::new(name, nodes[0].clone()).unwrap();
         for node in &nodes[1..] { runtime.define_node(node.clone()).unwrap(); }
-        for node in &nodes { runtime.select_original_data_fixture_before_start(node).unwrap(); }
+        for node in &nodes {
+            if receiver_foundation { runtime.select_original_repair_fixture_before_start(node).unwrap(); }
+            else { runtime.select_original_data_fixture_before_start(node).unwrap(); }
+        }
         runtime.start_nodes().unwrap();
         let configs = runtime.metadata_shards().unwrap();
         let fs = runtime.file_system().file_system_id;
@@ -4832,6 +4839,12 @@ mod native_selected_data_tests {
         let promoted = peers.next().unwrap();
         let holder = peers.next().unwrap();
         assert!(shard.replica_node_ids.contains(&promoted) && shard.replica_node_ids.contains(&holder));
+        if receiver_foundation {
+            // Physical fixture representation is selected before startup for
+            // all potential receivers. Actual A/C roles come ONLY from the
+            // current native assignment above; this does not seed authority.
+            runtime.select_original_repair_wire_target(&owner, holder.clone()).unwrap();
+        }
         let mut policy = DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
         policy.required_node_ids = vec![owner.clone(), holder.clone()];
         if forbid_promoted {
@@ -4964,6 +4977,50 @@ mod native_selected_data_tests {
         assert_eq!(birth.root.original_command_digest,
             crate::repair_queue_store::original_repair_digest(&birth.original, &birth.attachment).unwrap());
         GenuineNativeOriginal { runtime, shard, promoted, holder, birth, held, held_promoted }
+    }
+
+    #[test]
+    fn native_original_repair_receiver_records_exact_content_terminal_before_lost_reply() {
+        let mut fixture = genuine_native_original_with_receiver_foundation("native-original-repair-terminal", false, true);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let material = fixture.birth.original_wire_material().unwrap();
+            let receiver = fixture.runtime.client(&fixture.holder).unwrap();
+            let before = receiver.content().original_repair_test_snapshot(&material).unwrap().unwrap();
+            assert_eq!(before.material, material);
+            assert_eq!(before.bytes, vec![0x5a; 4096]);
+            assert!(before.prepared_id < before.bound_id.unwrap());
+            assert!(before.bound_id.unwrap() < before.terminal_id.unwrap());
+            let command = &material.original.command;
+            assert_eq!(before.response, Some(DfsRepairReplicaResponse {
+                request_id: command.request_id.clone(), intent_id: command.intent_id.clone(),
+                file_system_id: command.file_system_id.clone(), object_id: command.object_id.clone(),
+                version: command.version.clone(), replica_node_id: fixture.holder.clone(),
+                result: DfsBlobTransferResult::Committed { content_hash: command.content_hash.clone() },
+            }));
+            // This is the real A queue after the actual C response was lost.
+            // A's original identity/body/root and uncertain attempt remain.
+            let queue = fixture.runtime.selected_original_data_layout(&fixture.shard.primary_node_id).unwrap().queue().unwrap();
+            let retained = queue.original_repair_for_slot(&command.intent_id, &fixture.holder).unwrap().unwrap();
+            assert_eq!(retained.original_wire_material().unwrap(), material);
+            assert_eq!(retained.root, fixture.birth.root);
+            assert!(retained.observed.is_empty());
+            assert!(retained.closed_at_sequence.is_none());
+            // Explicit fixture-only forcing, not production load/performance
+            // evidence. The same real catalog/compactor must retain Terminal.
+            receiver.content().compact_original_repair_fixture_for_test().unwrap();
+            assert_eq!(receiver.content().original_repair_test_snapshot(&material).unwrap(), Some(before.clone()));
+            drop(receiver);
+            fixture.runtime.stop_node(&fixture.holder).unwrap();
+            fixture.runtime.reopen_node(fixture.holder.clone()).unwrap();
+            let reopened = fixture.runtime.client(&fixture.holder).unwrap();
+            assert_eq!(reopened.content().original_repair_test_snapshot(&material).unwrap(), Some(before));
+            assert_eq!(reopened.content().read_object_version(command.object_id.as_str(), command.version.as_str()).unwrap().1, vec![0x5a;4096]);
+        }));
+        drop(fixture.held.take());
+        drop(fixture.held_promoted.take());
+        let closed = fixture.runtime.close();
+        if let Err(error) = outcome { std::panic::resume_unwind(error); }
+        closed.unwrap();
     }
 
     #[test]

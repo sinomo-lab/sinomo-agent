@@ -74,6 +74,10 @@ pub(crate) fn attach_dfs_message_request_attachment(
         | DfsNetworkMessage::RepairRetainedBlob(command) => command.bytes = bytes,
         DfsNetworkMessage::StagePatch(command) => command.bytes = bytes,
         DfsNetworkMessage::RepairReplica(command) => command.bytes = bytes,
+        DfsNetworkMessage::SelectedOriginalRepair(command) => {
+            validate_selected_original_repair_attachment(command, &head.attachment)?;
+            command.bytes = bytes;
+        }
         DfsNetworkMessage::MetadataSnapshotInstall(_) => {
             return Err(serialization_error(
                 "native snapshot images require the owned streamed attachment path",
@@ -131,6 +135,21 @@ pub(crate) fn attach_dfs_message_request_attachment(
         }
     }
     Ok(head.command)
+}
+
+pub(crate) fn validate_selected_original_repair_attachment(
+    command: &crate::DfsSelectedOriginalRepairCommand,
+    descriptor: &DfsRpcAttachmentDescriptor,
+) -> Result<(), NetworkError> {
+    command.material.validate().map_err(|error| serialization_error(error.to_string()))?;
+    if command.version != 1 || !command.bytes.is_empty()
+        || descriptor != &command.material.attachment
+        || descriptor.total_size_bytes > 16 * 1024
+        || SinomoObjectCodec::network_frame().encode(command)?.len() > 64 * 1024
+    {
+        return Err(serialization_error("selected original Repair attachment exceeds or changes admitted material"));
+    }
+    Ok(())
 }
 
 pub(crate) fn attach_dfs_routed_message_attachment(

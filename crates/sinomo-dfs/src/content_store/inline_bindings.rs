@@ -10,10 +10,18 @@ mod compaction;
 mod completion;
 mod operations;
 mod received_repair;
+mod original_repair;
+pub(crate) use original_repair::BoundOriginalRepairContent;
+pub(crate) use received_repair::ReceivedRepairFixtureIdentity;
 pub(super) use operations::open_verified_inline_payload;
 #[cfg(feature = "storage-conversion")]
 pub use operations::{ContentStoreStagingRow, ContentStoreStagingWriter};
 pub(crate) use received_repair::PreparedReceivedRepairRef;
+#[derive(Clone, Copy)]
+pub(super) enum RepairBindingPrepared<'a> {
+    Decoded(&'a PreparedReceivedRepairRef),
+    Original(&'a original_repair::PreparedOriginalRepairRef),
+}
 mod read_snapshot;
 mod root_identity;
 #[cfg(test)]
@@ -33,6 +41,8 @@ pub(super) const INLINE_BINDING_DIR: &str = "inline-bindings";
 const INLINE_FORMAT_VERSION: u32 = 2;
 const RECEIVED_REPAIR_FIXTURE_VERSION: u32 = 3;
 const RECEIVED_REPAIR_FIXTURE_LAYOUT: &str = "inline-bindings-received-repair-fixture-v3";
+const ORIGINAL_REPAIR_FIXTURE_VERSION: u32 = 4;
+const ORIGINAL_REPAIR_FIXTURE_LAYOUT: &str = "inline-bindings-original-repair-fixture-v4";
 const INLINE_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const INLINE_FRAME_HEADER_LIMIT: u32 = 64 * 1024;
 const INLINE_OWNER_LOCK: &str = "content-owner.lock";
@@ -133,6 +143,16 @@ enum InlineOperation {
         reservation: Option<ContentStoreReservationRecord>,
     },
     RestoreReceivedRepairBound(received_repair::ReceivedRepairBinding),
+    OriginalRepairPrepared(original_repair::OriginalRepairPrepared),
+    RestoreOriginalRepairPrepared(original_repair::OriginalRepairPrepared),
+    OriginalRepairBound {
+        binding: original_repair::OriginalRepairBinding,
+        published_at_unix_nanos: u64,
+        reservation: Option<ContentStoreReservationRecord>,
+    },
+    RestoreOriginalRepairBound(original_repair::OriginalRepairBinding),
+    OriginalRepairTerminal(original_repair::OriginalRepairTerminal),
+    RestoreOriginalRepairTerminal(original_repair::OriginalRepairTerminal),
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +215,9 @@ impl InlineBlobEntry {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct InlineBindingView {
+    original_repairs: BTreeMap<original_repair::OriginalRepairKey, original_repair::OriginalRepairPrepared>,
+    original_bindings: BTreeMap<original_repair::OriginalRepairKey, original_repair::OriginalRepairBinding>,
+    original_terminals: BTreeMap<original_repair::OriginalRepairKey, original_repair::OriginalRepairTerminal>,
     received_repairs:
         BTreeMap<received_repair::ReceivedRepairKey, received_repair::ReceivedRepairPrepared>,
     received_bindings:
@@ -311,7 +334,9 @@ pub(super) struct InlineStoreLease {
 
 impl InlineStoreLease {
     pub(super) fn expected_layout(&self) -> &'static str {
-        if self.owner.expected_format == RECEIVED_REPAIR_FIXTURE_VERSION {
+        if self.owner.expected_format == ORIGINAL_REPAIR_FIXTURE_VERSION {
+            ORIGINAL_REPAIR_FIXTURE_LAYOUT
+        } else if self.owner.expected_format == RECEIVED_REPAIR_FIXTURE_VERSION {
             RECEIVED_REPAIR_FIXTURE_LAYOUT
         } else {
             INLINE_BINDING_LAYOUT
@@ -969,6 +994,14 @@ fn validate_operation(
                 incarnation,
             )?;
         }
+        InlineOperation::OriginalRepairPrepared(_)
+        | InlineOperation::RestoreOriginalRepairPrepared(_)
+        | InlineOperation::OriginalRepairBound { .. }
+        | InlineOperation::RestoreOriginalRepairBound(_)
+        | InlineOperation::OriginalRepairTerminal(_)
+        | InlineOperation::RestoreOriginalRepairTerminal(_) => {
+            original_repair::validate_operation_data(view, operation, payload_hash, payload_bytes, incarnation)?;
+        }
     }
     Ok(())
 }
@@ -1183,6 +1216,16 @@ fn apply_operation(
         InlineOperation::RestoreReceivedRepairBound(binding) => {
             received_repair::apply_binding(view, binding);
         }
+        InlineOperation::OriginalRepairPrepared(prepared) => original_repair::apply_prepared(view, prepared, Some(location)),
+        InlineOperation::RestoreOriginalRepairPrepared(prepared) => original_repair::apply_prepared(view, prepared, None),
+        InlineOperation::OriginalRepairBound { binding, published_at_unix_nanos, reservation } => {
+            apply_operation(view, InlineOperation::Link { manifest: binding.manifest.clone(), published_at_unix_nanos, reservation }, location, sequence);
+            original_repair::apply_binding(view, binding);
+        }
+        InlineOperation::RestoreOriginalRepairBound(binding) => original_repair::apply_binding(view, binding),
+        InlineOperation::OriginalRepairTerminal(terminal) | InlineOperation::RestoreOriginalRepairTerminal(terminal) => {
+            view.original_terminals.insert(terminal.key.clone(), terminal);
+        }
         InlineOperation::DeleteVersion {
             object_id,
             version,
@@ -1247,6 +1290,10 @@ fn replay_catalog(root: &Path, catalog: &InlineCatalog) -> Result<(InlineBinding
                         ));
                     }
                     received_repair::validate_phase_sequence(&record.operation, record.sequence)?;
+                    if original_repair::fixture_operation(&record.operation) && catalog.format_version != ORIGINAL_REPAIR_FIXTURE_VERSION {
+                        return Err(inline_error("original Repair record lacks explicit fixture admission"));
+                    }
+                    original_repair::validate_phase_sequence(&record.operation, record.sequence)?;
                     let payload_hash = format!(
                         "{HASH_PREFIX}{}",
                         blake3::Hash::from_bytes(*frame.payload_checksum()).to_hex()
@@ -1444,6 +1491,9 @@ fn append_operation(
             "received Repair write lacks explicit fixture owner",
         ));
     }
+    if original_repair::fixture_operation(&operation) && state.expected_format != Some(ORIGINAL_REPAIR_FIXTURE_VERSION) {
+        return Err(inline_error("original Repair write lacks explicit fixture owner"));
+    }
     validate_operation(
         &state.view,
         &operation,
@@ -1458,6 +1508,7 @@ fn append_operation(
         .checked_add(1)
         .ok_or_else(|| inline_error("record sequence exhausted"))?;
     received_repair::validate_phase_sequence(&operation, sequence)?;
+    original_repair::validate_phase_sequence(&operation, sequence)?;
     let record = InlineRecord {
         format_version: catalog.format_version,
         store_incarnation: sentinel.store_incarnation.clone(),
@@ -1569,6 +1620,14 @@ fn append_operation(
 }
 
 impl LocalContentStore {
+    pub(in crate::content_store) fn validate_repair_payload_owner(&self, sentinel: &ContentStoreReservationBatchSentinel) -> Result<()> {
+        self.validate_owner_sentinel(sentinel)?;
+        if !matches!(self.inline_store.owner.expected_format, INLINE_FORMAT_VERSION | ORIGINAL_REPAIR_FIXTURE_VERSION) {
+            return Err(inline_error("Repair payload requires its actual default or explicitly admitted original fixture owner"));
+        }
+        Ok(())
+    }
+
     pub(in crate::content_store) fn validate_owner_sentinel(
         &self,
         sentinel: &ContentStoreReservationBatchSentinel,
@@ -1576,8 +1635,8 @@ impl LocalContentStore {
         if self.inline_store.owner.expected_format == INLINE_FORMAT_VERSION {
             return validate_content_reservation_batch_sentinel(sentinel);
         }
-        if self.inline_store.owner.expected_format != RECEIVED_REPAIR_FIXTURE_VERSION
-            || sentinel.content_binding_layout != RECEIVED_REPAIR_FIXTURE_LAYOUT
+        if !matches!(self.inline_store.owner.expected_format, RECEIVED_REPAIR_FIXTURE_VERSION | ORIGINAL_REPAIR_FIXTURE_VERSION)
+            || sentinel.content_binding_layout != self.inline_store.expected_layout()
         {
             return Err(inline_error(
                 "sentinel differs from explicit fixture owner layout",

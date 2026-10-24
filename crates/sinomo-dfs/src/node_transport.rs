@@ -445,10 +445,17 @@ pub fn dfs_routed_call_rpc_call(
     let DfsRoutedCall {
         message,
         attachment,
+        original_repair,
     } = call;
-    let command = DfsMessageCommand {
+    let expected = DfsMessageCommand {
         request_id: format!("dfs_message_{}", message.frame_id),
         routed_message: message,
+    };
+    let command = DfsMessageCommand {
+        request_id: expected.request_id.clone(),
+        routed_message: crate::message_transport::selected_original_repair_wire_message(
+            expected.routed_message.clone(), original_repair,
+        )?,
     };
     let rpc_call = match attachment {
         Some(attachment) if attachment.descriptor.total_size_bytes == 0 => {
@@ -465,7 +472,7 @@ pub fn dfs_routed_call_rpc_call(
                 Vec::new(),
             )?;
             let rpc_call = dfs_message_rpc_call(&command)?;
-            return Ok((command, rpc_call));
+            return Ok((expected, rpc_call));
         }
         Some(attachment) => {
             let request = dfs_message_rpc_request(&command)?;
@@ -478,7 +485,7 @@ pub fn dfs_routed_call_rpc_call(
         }
         None => dfs_message_rpc_call(&command)?,
     };
-    Ok((command, rpc_call))
+    Ok((expected, rpc_call))
 }
 
 pub(crate) fn value_response_from_rpc_result(
@@ -7361,6 +7368,7 @@ impl DfsNodeTransport {
         let DfsRoutedCall {
             message,
             attachment,
+            original_repair,
         } = call;
         if &message.target_node_id != target_node_id {
             return Err(NetworkError::FrameTargetMismatch {
@@ -7391,6 +7399,7 @@ impl DfsNodeTransport {
             let message = crate::materialize_dfs_routed_call_sync(DfsRoutedCall {
                 message,
                 attachment,
+                original_repair,
             })?;
             self.served_mut().inbound_messages.push_back(message);
             return Ok(());
@@ -7407,6 +7416,7 @@ impl DfsNodeTransport {
             DfsRoutedCall {
                 message,
                 attachment,
+                original_repair,
             },
             true,
             #[cfg(any(test, feature = "test-support"))]
@@ -7425,6 +7435,7 @@ impl DfsNodeTransport {
             let DfsRoutedCall {
                 message,
                 attachment,
+                original_repair,
             } = call;
             if &message.target_node_id != target_node_id {
                 return Err(NetworkError::FrameTargetMismatch {
@@ -7456,6 +7467,7 @@ impl DfsNodeTransport {
                     crate::message_transport::materialize_dfs_routed_call(DfsRoutedCall {
                         message,
                         attachment,
+                        original_repair,
                     })
                     .await?;
                 self.served_mut().inbound_messages.push_back(message);
@@ -7471,6 +7483,7 @@ impl DfsNodeTransport {
                 DfsRoutedCall {
                     message,
                     attachment,
+                    original_repair,
                 },
                 true,
                 #[cfg(any(test, feature = "test-support"))]

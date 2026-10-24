@@ -417,6 +417,29 @@ fn closed_repair_proof(
 }
 
 impl RepairOriginalBirth {
+    /// Copy the actual durable ordinary head without interpreting current
+    /// placement or manufacturing an origin from retry scheduling DATA.
+    pub(crate) fn original_wire_material(&self) -> Result<crate::DfsOriginalRepairMaterial, DfsError> {
+        self.validate(&self.root.subject.queue_incarnation)?;
+        let crate::DfsNetworkMessage::RepairReplica(command) = &self.original.message else {
+            return Err(custody_error("original wire material requires ordinary Repair"));
+        };
+        let material = crate::DfsOriginalRepairMaterial {
+            subject: self.root.subject.clone(),
+            original: crate::DfsOriginalRepairHead {
+                source_node_id: self.original.source_node_id.clone(),
+                target_node_id: self.original.target_node_id.clone(),
+                frame_id: self.original.frame_id,
+                message_id: self.original.message_id,
+                command: command.clone(),
+            },
+            attachment: self.attachment.clone(),
+            command_digest: self.root.original_command_digest.clone(),
+        };
+        material.validate()?;
+        Ok(material)
+    }
+
     pub(crate) fn captured_data_digest(&self) -> Result<String, DfsError> {
         #[derive(Serialize)]
         struct Captured<'a> { domain: &'static str, birth: &'a RepairOriginalBirth }
@@ -4805,6 +4828,41 @@ pub(crate) mod tests {
             )
             .unwrap();
         (store, content, message, descriptor, payload)
+    }
+
+    #[test]
+    fn original_wire_material_preserves_file_backed_birth_and_ordinary_carrier() {
+        let root = sinomo_testdir::TestDir::new("original-repair-wire-material");
+        let (queue, content, message, descriptor, payload) = original_fixture(root.path());
+        queue.enroll_original_repair(&message, &descriptor, &payload).unwrap();
+        queue.record_original_repair_attempt(&message).unwrap();
+        let birth = queue.original_repair(&message).unwrap().unwrap();
+        let material = birth.original_wire_material().unwrap();
+        assert_eq!(material.original.routed(), message);
+        assert_eq!(material.attachment, descriptor);
+        assert_eq!(material.subject, birth.root.subject);
+        let call = crate::DfsRoutedCall::with_attachment(message.clone(), crate::DfsOutboundAttachment::from_reader(
+            content.open_retained_repair_payload(&birth.root).unwrap(), descriptor.total_size_bytes, descriptor.content_hash.as_deref().unwrap(),
+        )).with_original_repair(material.clone()).unwrap();
+        let (expected, wire) = crate::dfs_routed_call_rpc_call(call).unwrap();
+        assert_eq!(expected.routed_message, message);
+        let head: crate::body_rpc::DfsAttachmentMessageCommand = wire.request.decode_body().unwrap();
+        let crate::DfsNetworkMessage::SelectedOriginalRepair(selected) = head.command.routed_message.message else { panic!("strict selected grammar"); };
+        assert_eq!(selected.material, material);
+        assert!(selected.bytes.is_empty());
+        assert_eq!(head.attachment, descriptor);
+        let call = crate::DfsRoutedCall::with_attachment(message.clone(), crate::DfsOutboundAttachment::from_reader(
+            content.open_retained_repair_payload(&birth.root).unwrap(), descriptor.total_size_bytes, descriptor.content_hash.as_deref().unwrap(),
+        )).with_original_repair(material.clone()).unwrap();
+        let decoded = crate::materialize_dfs_routed_call_sync(call).unwrap();
+        let crate::DfsNetworkMessage::SelectedOriginalRepair(decoded) = decoded.message else { panic!("strict selected grammar"); };
+        assert_eq!(decoded.material, material);
+        assert_eq!(decoded.bytes, b"complete original attachment");
+        assert!(decoded.material.original.command.bytes.is_empty());
+        let mut changed = material;
+        changed.original.command.expected_base_version = Some(crate::DfsVersion::from_legacy_named("changed-original-base").unwrap());
+        assert!(changed.validate().is_err());
+        assert_eq!(queue.original_repair(&message).unwrap().unwrap(), birth);
     }
 
     fn original_response(
