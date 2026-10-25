@@ -21,6 +21,10 @@ use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod completion_candidate;
+pub use completion_candidate::{
+    RepairCompletionCandidateInput, RepairCompletionCandidateProvenance,
+};
 mod history;
 pub(crate) use history::ImportedRepairHistoryQuery;
 
@@ -225,6 +229,11 @@ pub enum RepairCustodyChange {
         query_ref: crate::DfsOriginalRepairHistoryQueryRef,
         returned: crate::DfsRoutedMessage,
     },
+    /// Appended to preserve every existing SOBJ enum ordinal.
+    /// Dormant selected-fixture DATA; never an authenticated completion proof.
+    RetainCompletionCandidate {
+        input: Box<RepairCompletionCandidateInput>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -238,6 +247,8 @@ struct RepairCustodySnapshot {
     imported_executor_associations: Vec<ImportedRepairExecutorAssociation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     imported_history_queries: Vec<history::ImportedRepairHistorySnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained_completion_candidates: Vec<completion_candidate::RetainedRepairCompletionCandidate>,
 }
 
 /// Exact captured material. This contains no executor or root-release permit.
@@ -337,6 +348,11 @@ struct RepairCustodyIndex {
     closed_requests:
         BTreeMap<(DfsRepairQueueKey, String), crate::content_store::RepairPayloadSubject>,
     observed_pending: std::collections::BTreeSet<crate::content_store::RepairPayloadSubject>,
+    // DATA only. Never consulted by native scheduling/observation/execution.
+    retained_completion_candidates: BTreeMap<
+        completion_candidate::RepairCompletionCandidateKey,
+        completion_candidate::RetainedRepairCompletionCandidate,
+    >,
 }
 
 /// A synced result observation is not a local-application/closure proof.
@@ -577,7 +593,8 @@ impl RepairCustodyIndex {
         if !selected_reader
             && (!snapshot.imported_original_data.is_empty()
                 || !snapshot.imported_executor_associations.is_empty()
-                || !snapshot.imported_history_queries.is_empty())
+                || !snapshot.imported_history_queries.is_empty()
+                || !snapshot.retained_completion_candidates.is_empty())
         {
             return Err(custody_error("default queue reader rejects selected original DATA"));
         }
@@ -665,6 +682,9 @@ impl RepairCustodyIndex {
         for query in snapshot.imported_history_queries {
             result.restore_history_query(query, floor)?;
         }
+        for candidate in snapshot.retained_completion_candidates {
+            result.restore_completion_candidate(candidate, floor)?;
+        }
         Ok(result)
     }
 
@@ -679,6 +699,7 @@ impl RepairCustodyIndex {
                 .cloned()
                 .collect(),
             imported_history_queries: self.imported_history_queries.values().map(ImportedRepairHistoryQuery::snapshot).collect(),
+            retained_completion_candidates: self.retained_completion_candidates.values().cloned().collect(),
         })
     }
 
@@ -755,6 +776,9 @@ impl RepairCustodyIndex {
 
     fn validate_change(&self, change: &RepairCustodyChange) -> Result<(), DfsError> {
         match change {
+            RepairCustodyChange::RetainCompletionCandidate { input } => {
+                self.validate_new_completion_candidate(input)?;
+            }
             RepairCustodyChange::BeginImportedHistoryQuery { .. }
             | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
             | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. } => self.validate_history_change(change)?,
@@ -982,6 +1006,9 @@ impl RepairCustodyIndex {
     ) -> Result<(), DfsError> {
         self.validate_change(change)?;
         match change {
+            RepairCustodyChange::RetainCompletionCandidate { input } => {
+                self.apply_completion_candidate(input, sequence)?;
+            }
             RepairCustodyChange::BeginImportedHistoryQuery { .. }
             | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
             | RepairCustodyChange::ObserveImportedHistoryQueryResult { .. } => self.apply_history_change(change, sequence)?,
@@ -1772,6 +1799,7 @@ impl DfsRepairQueueState {
         if operations.is_empty() {
             return Ok((self.head_sequence, 0));
         }
+        completion_candidate::validate_candidate_frame(&operations)?;
 
         validate_repair_queue_operations(&self.records, &operations)?;
         self.custody.validate_scheduling_changes(&operations)?;
@@ -1793,6 +1821,7 @@ impl DfsRepairQueueState {
             if matches!(
                 change,
                 RepairCustodyChange::ImportOriginalData { .. }
+                    | RepairCustodyChange::RetainCompletionCandidate { .. }
                     | RepairCustodyChange::AssociateImportedExecutor { .. }
                     | RepairCustodyChange::BeginImportedHistoryQuery { .. }
                     | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
@@ -3891,6 +3920,7 @@ fn replay_repair_queue_log(
             && batch.operations.iter().any(|operation| matches!(operation,
                 DfsRepairQueueOperation::RepairCustody { change } if matches!(change.as_ref(),
                     RepairCustodyChange::ImportOriginalData { .. }
+                        | RepairCustodyChange::RetainCompletionCandidate { .. }
                         | RepairCustodyChange::AssociateImportedExecutor { .. }
                     | RepairCustodyChange::BeginImportedHistoryQuery { .. }
                     | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
@@ -3898,6 +3928,7 @@ fn replay_repair_queue_log(
         {
             return Err(custody_error("default queue replay rejects selected original DATA"));
         }
+        completion_candidate::validate_candidate_frame(&batch.operations)?;
         if selected_reader { history::validate_history_frame(&batch.operations)?; }
         if batch.sequence <= snapshot_floor {
             if custody.incarnation.is_empty()
