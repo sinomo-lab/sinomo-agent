@@ -946,6 +946,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(store) = self.owned_repair_queue_store()?
             && let Some(birth) = store.original_repair_for_slot(intent, target)?
         {
+            #[cfg(any(test, feature = "test-support"))]
+            if store.native_original_completion_pending(&birth.original)?
+                || self.native_publication_owner_for_observation()
+                    .map(|(_, owner)| owner.native_repair_custody_return_pending(&birth.original))
+                    .transpose()?.unwrap_or(false)
+            {
+                // Known returned DATA is pending custody/settlement. Do not
+                // claim a new carrier or turn this hold into receipt evidence.
+                return Ok(None);
+            }
             if self.recover_observed_original_repair(&birth)? {
                 return Ok(None);
             }

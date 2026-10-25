@@ -429,6 +429,86 @@ pub struct DfsPublicationExecutionOwners {
     _data_owner: Arc<DfsDataOwnerLock>,
 }
 
+/// Historical provenance captured while the ordinary producer actually owns
+/// mutation admission. This retains no admission/ExecutionOwners Arc and is
+/// never a successor or receipt-application permission.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub(crate) struct NativeRepairProducerAdmission {
+    provider: Arc<DfsPublicationExecutionProvider>,
+    scope: DfsPublicationOwnerScope,
+    material: crate::DfsOriginalRepairMaterial,
+    assignment: crate::DfsMetadataShardConfig,
+    authority_generation: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub(crate) struct HistoricalNativeRepairProducerAdmission {
+    _scope: DfsPublicationOwnerScope,
+    _assignment: crate::DfsMetadataShardConfig,
+    _authority_generation: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NativeRepairProducerAdmission {
+    pub(crate) fn into_historical(self) -> HistoricalNativeRepairProducerAdmission {
+        HistoricalNativeRepairProducerAdmission {
+            _scope: self.scope,
+            _assignment: self.assignment,
+            _authority_generation: self.authority_generation,
+        }
+    }
+    pub(crate) fn revalidate_before_dispatch(&self) -> std::result::Result<(), crate::DfsError> {
+        let invalid = || crate::DfsError::Metadata {
+            message: "native Repair custody producer configuration or physical owner advanced"
+                .into(),
+        };
+        if self.provider.authority.generation() != self.authority_generation
+            || self.provider.authority.storage_generation() != self.provider.storage_generation
+            || !self
+                .provider
+                .data_owner
+                .owns_backend_root(self.scope.root())
+            || DfsPublicationOwnerScope::for_backend(
+                self.scope.root(),
+                self.scope.file_system_id().clone(),
+                self.scope.shard_id().clone(),
+            )? != self.scope
+        {
+            return Err(invalid());
+        }
+        let snapshot = self
+            .provider
+            .authority
+            .current_original_repair_configuration(&self.assignment.file_system_id)?;
+        let object = self
+            .material
+            .original
+            .command
+            .object_metadata
+            .as_ref()
+            .ok_or_else(invalid)?;
+        let selected = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+            &self.assignment.file_system_id,
+            &snapshot.shards,
+            &object.path,
+        )?
+        .ok_or_else(invalid)?;
+        if selected != self.assignment
+            || selected.primary_node_id != self.material.original.source_node_id
+            || snapshot
+                .filesystem
+                .as_ref()
+                .is_none_or(|fs| fs.file_system_id != self.assignment.file_system_id)
+            || self.provider.authority.generation() != self.authority_generation
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 /// Recorded provenance for the structurally nonauthoring receiver branch.
 /// Deserializing it recreates DATA, never this operation's native capability.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
@@ -1052,6 +1132,73 @@ impl std::ops::Deref for DfsPreparedPublication {
 }
 
 impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn prepare_native_repair_custody_for_owned_send(
+        &self,
+        carrier: &crate::DfsRoutedMessage,
+    ) -> std::result::Result<
+        Option<crate::runtime_host::PreparedNativeRepairCustody>,
+        crate::DfsError,
+    > {
+        let Some((data_root, owner)) = self.native_publication_owner_for_observation() else {
+            return Ok(None);
+        };
+        let Some(material) = owner.native_repair_custody_material_for_carrier(carrier)? else {
+            return Ok(None);
+        };
+        let invalid = || crate::DfsError::Metadata {
+            message: "native Repair custody preparation lacks its actual admitted producer".into(),
+        };
+        if !self.transport.supports_background_replica_dispatch()
+            || carrier.source_node_id != self.node_id
+            || !material.matches_carrier(carrier)
+        {
+            return Err(invalid());
+        }
+        let execution = self.publication_execution.current().ok_or_else(invalid)?;
+        let provider = self.publication_provider.current().ok_or_else(invalid)?;
+        let assignment = material
+            .original
+            .command
+            .authority_shard
+            .as_ref()
+            .ok_or_else(invalid)?
+            .clone();
+        let scope = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(invalid)?
+            .publication_owner_scope(
+                &assignment.file_system_id,
+                &DfsMetadataShardId::new(&assignment.shard_id),
+            )?;
+        provider.validate_content_only_repair_owner(&execution, &scope)?;
+        if !Arc::ptr_eq(&owner, &execution._data_owner)
+            || assignment.primary_node_id != self.node_id
+        {
+            return Err(invalid());
+        }
+        let admission = NativeRepairProducerAdmission {
+            authority_generation: provider.authority.generation(),
+            provider,
+            scope,
+            material: material.clone(),
+            assignment,
+        };
+        admission.revalidate_before_dispatch()?;
+        // Do not carry execution: take_admission requires its sole real owner
+        // when the ordinary service releases the producer's permit.
+        drop(execution);
+        crate::runtime_host::prepare_native_repair_custody(
+            &sinomo_core::local::SinomoDataDir::new(data_root),
+            owner,
+            admission,
+            carrier,
+            &material,
+        )
+        .map(Some)
+    }
+
     pub(crate) fn selects_original_repair_wire_target(&self, target: &sinomo_core::node::NodeId) -> std::result::Result<bool, crate::DfsError> {
         let owner = if let Some(execution) = self.publication_execution.current() { Some(Arc::clone(&execution._data_owner)) }
             else if let Some(provider) = self.publication_provider.current() {

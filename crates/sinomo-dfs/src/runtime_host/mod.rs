@@ -226,6 +226,8 @@ pub struct DfsDataOwnerLock {
     physical_data_root: PathBuf,
     selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     original_repair_fixture: Option<DfsOriginalRepairFixture>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_repair_custody: Mutex<Option<Arc<data_plane::NativeRepairCustodyScope>>>,
 }
 
 /// Explicit prospective fixture expectations, never admission/authority DATA.
@@ -512,6 +514,8 @@ impl DfsDataOwnerLock {
             physical_data_root,
             selected_original_data_layout: None,
             original_repair_fixture: None,
+            #[cfg(any(test, feature = "test-support"))]
+            native_repair_custody: Mutex::new(None),
         })
     }
 
@@ -3273,7 +3277,13 @@ pub(crate) use data_plane::{
     with_daemon_dfs_control_plane_on_runtime,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use data_plane::{OwnedOriginalRepairCompletion, call_native_original_repair_owned};
+pub(crate) use message_host::defer_native_owned_repair_completion;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use data_plane::{
+    NativeRepairCustodySelection, OwnedOriginalRepairCompletion, PreparedNativeRepairCustody,
+    call_native_original_repair_owned, prepare_native_repair_custody,
+    select_native_original_repair_custody, send_prepared_native_repair_custody,
+};
 #[cfg(feature = "storage-conversion")]
 pub use storage_import::DfsStorageImportContentReceiver;
 

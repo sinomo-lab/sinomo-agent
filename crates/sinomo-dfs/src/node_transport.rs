@@ -725,6 +725,8 @@ struct DeferredDfsPeerSend {
     // content custody and current authority on every attempt. The shared outbox
     // retains it across worker replacement; durable intent recovery owns restart.
     pending_local_responses: VecDeque<DfsRoutedMessage>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_completion: Option<Arc<crate::runtime_host::OwnedOriginalRepairCompletion>>,
     // Process-local pacing only. Durable intent/receipt hydration reconstructs
     // outstanding promotions at tier zero after restart.
     retry_attempts: u32,
@@ -904,6 +906,12 @@ impl DfsCommitPromotionIdentity {
 
 impl DeferredDfsPeerSend {
     fn eligible_for_target_policy(&self, deferred_target_node_ids: &BTreeSet<NodeId>) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.sender.is_none() && self.native_completion.is_some() {
+            // The peer has already returned. This is local physical custody,
+            // so an offline C cannot turn it into a parked network attempt.
+            return true;
+        }
         // Required content fetches and completed write replies are protocol
         // progress for an existing operation, even in Main's detached owner.
         // Advisory maintenance exclusion must not park them. The ordinary RPC
@@ -969,7 +977,7 @@ fn all_commit_version_response_identity_matches(
         && response.replica_node_id == send.target_node_id
 }
 
-fn all_background_replica_response_identity_matches(
+pub(crate) fn all_background_replica_response_identity_matches(
     local_node_id: &NodeId,
     original: &DfsRoutedMessage,
     message: &DfsRoutedMessage,
@@ -1453,7 +1461,7 @@ impl DfsNodeDetachedSendWorker {
                 return Err(error);
             }
         };
-        let (requests, observed): (Vec<_>, Vec<_>) = requests
+        let (mut requests, mut observed): (Vec<_>, Vec<_>) = requests
             .into_iter()
             .zip(observed)
             .filter_map(|(request, observation)| match observation {
@@ -1461,6 +1469,52 @@ impl DfsNodeDetachedSendWorker {
                 DfsBackgroundReplicaDispatch::Fenced => None,
             })
             .unzip();
+        let mut first_error = None;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut ordinary = Vec::new();
+            let mut ordinary_observed = Vec::new();
+            for (mut request, before) in requests.into_iter().zip(observed) {
+                let Some(prepared) = request.request.native_repair_custody.take() else {
+                    ordinary.push(request);
+                    ordinary_observed.push(before);
+                    continue;
+                };
+                let original = request.request.call.message.clone();
+                let producer = request.producer_delivery.get().copied();
+                // Only an admitted producer's private preparation reaches this
+                // concrete native call. It consumes that SAME owned body and
+                // returns before any generic inbox/ordinary local application.
+                let returned = self.transport.current_send_options("send admitted native Repair custody")
+                    .map_err(DfsError::from_network)
+                    .and_then(|options| crate::runtime_host::send_prepared_native_repair_custody(
+                        prepared, request.request.call, options,
+                    ));
+                match returned {
+                    Ok(completion) => {
+                        let completion = Arc::new(completion);
+                        if let Err(error) = crate::runtime_host::defer_native_owned_repair_completion(&completion) {
+                            first_error.get_or_insert(error);
+                            if let Err(error) = self.transport.retain_native_repair_completion(completion) {
+                                first_error.get_or_insert_with(|| DfsError::from_network(error));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let delivery_state = match &error { DfsError::NetworkDelivery { delivery_state, .. } => Some(*delivery_state), _ => None };
+                        let last_error = error.to_string();
+                        first_error.get_or_insert(error);
+                        if let (Some(handler), Some(producer), Some(before)) = (&delivery_handler, producer, before)
+                            && let Err(error) = handler(DfsBackgroundReplicaDeliveryEvent::Failed {
+                                message: original, before, producer, delivery_state, last_error,
+                            })
+                        { first_error.get_or_insert(error); }
+                    }
+                }
+            }
+            requests = ordinary;
+            observed = ordinary_observed;
+        }
         let expected = requests
             .iter()
             .zip(observed)
@@ -1480,7 +1534,6 @@ impl DfsNodeDetachedSendWorker {
                 .collect(),
             crate::service_outbound::DFS_REPLICA_BODY_FANOUT_CAP,
         );
-        let mut first_error = None;
         let returned = match self.transport.drain_incoming_messages() {
             Ok(returned) => returned,
             Err(error) => {
@@ -3000,6 +3053,8 @@ impl DfsNodeTransport {
             routed_message,
             promotion_sequence: None,
             pending_local_responses: VecDeque::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_completion: None,
             retry_attempts: 0,
         };
         let promotion_identity = send.commit_version_promotion_identity();
@@ -3238,6 +3293,23 @@ impl DfsNodeTransport {
                 }
 
                 let mut send = sends.pop_front().expect("detached send front");
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(completion) = send.native_completion.as_ref().cloned() {
+                    let result = if send.sender.is_some() || !send.pending_local_responses.is_empty() {
+                        Err(DfsError::Metadata { message: "typed native completion cannot mix a sender or raw returns".into() })
+                    } else {
+                        crate::runtime_host::defer_native_owned_repair_completion(&completion).map(|_| ())
+                    };
+                    if let Err(error) = result {
+                        replay_retries.push_back(send);
+                        first_replay_error.get_or_insert_with(|| NetworkError::Io {
+                            operation: "defer native Repair completion custody".into(), detail: error.to_string(),
+                        });
+                    }
+                    // A successful typed defer consumed only this local outbox
+                    // obligation. Never reinterpret it as an ordinary response.
+                    continue;
+                }
                 let attempted_replay = send
                     .is_replay_safe_completed_write_response()
                     .then(|| send.clone());
@@ -3304,6 +3376,10 @@ impl DfsNodeTransport {
         send: DeferredDfsPeerSend,
         current_operation_deadline: Option<Instant>,
     ) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if send.native_completion.is_some() {
+            return Err(NetworkError::Serialization { detail: "typed native completion has no network resend path".into() });
+        }
         let operation_deadline =
             Self::earlier_operation_deadline(send.operation_deadline, current_operation_deadline);
         let options = Self::clamp_send_options_to_operation_deadline(
@@ -3460,6 +3536,8 @@ impl DfsNodeTransport {
             routed_message: original,
             promotion_sequence: None,
             pending_local_responses: VecDeque::from([response]),
+            #[cfg(any(test, feature = "test-support"))]
+            native_completion: None,
             retry_attempts: 0,
         };
         // The first local attempt already failed. Reuse the existing shared
@@ -3469,6 +3547,21 @@ impl DfsNodeTransport {
             VecDeque::from([completion]),
             Instant::now(),
         )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn retain_native_repair_completion(
+        &mut self, completion: Arc<crate::runtime_host::OwnedOriginalRepairCompletion>,
+    ) -> Result<(), NetworkError> {
+        if completion.carrier().source_node_id != self.local_node_id {
+            return Err(NetworkError::Serialization { detail: "native completion belongs to another local producer".into() });
+        }
+        let send = DeferredDfsPeerSend {
+            sender: None, options: DfsObjectRpcSendOptions::new(self.connect_timeout), operation_deadline: None,
+            target_node_id: completion.carrier().target_node_id.clone(), routed_message: completion.carrier().clone(),
+            promotion_sequence: None, pending_local_responses: VecDeque::new(), native_completion: Some(completion), retry_attempts: 0,
+        };
+        self.restore_detached_peer_send_work(VecDeque::new(), VecDeque::from([send]), Instant::now())
     }
 
     fn deliver_detached_local_responses(
@@ -4249,6 +4342,10 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
         max_inflight: usize,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         #[cfg(any(test, feature = "test-support"))]
+        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+            return Box::pin(async { Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() }) });
+        }
+        #[cfg(any(test, feature = "test-support"))]
         let native_context = crate::native_shard_trace::rpc_attempt_context();
         if self.served_message.is_some() {
             self.send_served_calls_bounded_async(
@@ -4979,6 +5076,10 @@ impl DfsMessageTransport for DfsNodeTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+            return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
+        }
         if self.served_message.is_some() {
             self.send_served_calls_bounded(requests, max_inflight)
         } else {

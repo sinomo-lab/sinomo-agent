@@ -115,6 +115,8 @@ pub(crate) fn native_snapshot_routed_call(
 pub struct DfsRoutedSend {
     pub target_node_id: NodeId,
     pub call: DfsRoutedCall,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) native_repair_custody: Option<crate::runtime_host::PreparedNativeRepairCustody>,
 }
 
 impl DfsRoutedSend {
@@ -122,6 +124,8 @@ impl DfsRoutedSend {
         Self {
             target_node_id,
             call,
+            #[cfg(any(test, feature = "test-support"))]
+            native_repair_custody: None,
         }
     }
 }
@@ -300,6 +304,10 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         requests: Vec<DfsRoutedSend>,
         _max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+            return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
+        }
         Ok(requests
             .into_iter()
             .map(|request| {
@@ -523,6 +531,10 @@ pub trait AsyncDfsMessageTransport: Send {
         _max_inflight: usize,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         Box::pin(async move {
+            #[cfg(any(test, feature = "test-support"))]
+            if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+                return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
+            }
             let mut outcomes = Vec::with_capacity(requests.len());
             for request in requests {
                 let result = self
@@ -670,6 +682,10 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+            return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
+        }
         if requests.is_empty() {
             return Ok(Vec::new());
         }

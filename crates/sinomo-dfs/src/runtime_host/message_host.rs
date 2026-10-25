@@ -3132,6 +3132,12 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
+    #[cfg(any(test, feature = "test-support"))]
+    if matches!(&command.routed_message.message, DfsNetworkMessage::RepairReplicaResponse(_)) {
+        require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
+            .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
+            .reject_raw_selected_repair_response(&command.routed_message)?;
+    }
     let verified_history = prepare_daemon_dfs_verified_original_history_query(data_dir, peer_snapshot, &command, metadata_authority_preflight.as_ref())?;
     // Daemon startup owns data-directory initialization. Repeating its six
     // create_dir_all calls here turns every routed DFS message into layout I/O.
@@ -3795,6 +3801,8 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
         return Err(DaemonError::Network { address: "DFS history query".into(), detail: "history query cannot carry a semantic attachment".into() });
     }
     let data_owner_lock = require_daemon_dfs_data_owner_lock(paths)?;
+    #[cfg(any(test, feature = "test-support"))]
+    data_owner_lock.reject_raw_selected_repair_response(&command.routed_message)?;
     let trace_started = Instant::now();
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -4381,6 +4389,43 @@ pub(crate) fn handle_daemon_dfs_message_on_runtime(
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsMessageResponse, DaemonError> {
     handle_daemon_dfs_message_on_runtime_with_priority(paths, command, runtime, false, None)
+}
+
+/// Non-effect custody for an actual native return, before serving authority.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn defer_native_owned_repair_completion(
+    completion: &Arc<crate::runtime_host::OwnedOriginalRepairCompletion>,
+) -> Result<crate::repair_queue_store::DeferredNativeRepairCompletion, crate::DfsError> {
+    let result = (|| {
+        let queue = completion.custody_queue()?;
+        completion.revalidate_custody_owner(&queue)?;
+        completion.before_custody_intake()?;
+        // Reuse the existing negative namespace cut on this exact callback
+        // worker; cleanup restores its prior TLS value on every error/unwind.
+        #[cfg(test)]
+        struct NamespaceFailure(bool);
+        #[cfg(test)]
+        impl Drop for NamespaceFailure {
+            fn drop(&mut self) {
+                crate::repair_queue_store::REPAIR_QUEUE_FAIL_SELECTED_NAMESPACE.set(self.0);
+            }
+        }
+        #[cfg(test)]
+        let _namespace_failure = completion.take_namespace_failure().then(|| {
+            NamespaceFailure(
+                crate::repair_queue_store::REPAIR_QUEUE_FAIL_SELECTED_NAMESPACE.replace(true),
+            )
+        });
+        let deferred = queue.retain_native_owned_repair_completion(completion.as_ref())?;
+        completion.record_custody_deferred(&deferred);
+        Ok(deferred)
+    })();
+    if let Err(error) = &result {
+        completion.record_custody_error(error);
+    }
+    // No ordinary handler follows this typed result. In particular there is
+    // no serving-authority warm/admission, receipt application, W or Close.
+    result
 }
 
 /// A detached worker has matched this return to its authenticated peer and
