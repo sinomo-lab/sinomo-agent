@@ -1,6 +1,53 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R35
+## Current development checkpoint — 2026-10-25 R37
+
+The next bounded native-provenance slice is implemented. Queue witness
+`a4416089`, native-owned capture `65d38b5f`, and native tests `f6904f6e` were
+merged without conflicts at `0bcd6abd`. Fixture correction `3d235dd4` fixes one
+synthetic foreign-ID constructor exposed by typechecking. Exact source
+`4ec69d4f` has 4,907 inputs; sealed executable `c3f7c6b1`.
+
+The opaque queue witness binds a complete persisted original, its retained body,
+an exact carrier and one actual Attempt sequence to the resident physical owner.
+Cold, uncertain, changed or ambiguous prefixes refuse without load/recovery/sync.
+It is observational DATA, not a dispatch permit. The new native entry remains
+cfg(test/test-support) and resolves the actual registered host and live DATA
+owner. It opens the retained body itself, preserves the existing pre-dispatch
+original/freeze checks, performs one target-bound RPC and rechecks the same
+owner/attempt/content after an exact response. Only that path can construct the
+private, nonserialized completion capability. Generic inbox frames, synthetic
+correlation output and R35 unverified candidates cannot be promoted into it.
+
+Fresh check/build/seal passed, followed by **12 new controls passed**: six
+file-backed witnesses, two pure correlation controls and four actual native
+in-process transport controls. The native positive kept the exact original and
+4,096-byte content while A's queue/metadata/receipts/root remained unchanged.
+Foreign producer and ambiguous persisted attempt refused before RPC; physical
+replacement after dispatch withheld the capability with PossiblyApplied.
+Default/source authority and receiver checks were not weakened. Existing
+30/600-second outer caps and native 5-second budgets stayed unchanged.
+
+Current-source DFS/KV analysis passed all 11 UI controls and three libraries.
+Every fixture checkpoint/archive/hash/compare and owned lifetime drain passed.
+The 161 older inventory cases remain unrun on this source; R35 results remain
+separate. `R37-REPORT.md` and `R37-COMBINED-RESULT.json` bind I106 build
+`bb025b2f`, I107 execution `03390c46` and I108 boundary `8146d693`. I103's
+failed typecheck, exact source and archives remain preserved; no runtime ran in
+that attempt. No Codex peer reviews, Docker, peer scheduling or shared build lock
+were used.
+
+This is ephemeral provenance, not durable authenticated retention or production
+activation. The complete normal sender-admission ownership join and custody-only
+retired-producer intake remain separate. No C1 floor, B effect, receipt/historical
+application, Close or root release is enabled. Selected receiver Terminal replay,
+complete handoff coverage, metadata majority history and full abrupt-loss,
+partition, reconnect and Sinomo-only quietness acceptance remain open. The
+original DFS availability goal is unfinished.
+
+## Historical checkpoints
+
+### Preserved R35 checkpoint
 
 Local commit `50959901897351c9fe75aabc750f27c5b9b6521c` was merged into
 `dev/dfs` at `dbc468316f40208f30036d242543466c4ecc3787` without conflicts.
@@ -41,8 +88,6 @@ return a typed deferred outcome before application. Existing unverified candidat
 records cannot be relabeled as native evidence. Full coverage, C1/current B
 effects, causal withdrawal/settlement, root retirement, metadata majority history
 and abrupt-loss/partition/reconnect/quietness acceptance remain open.
-
-## Historical checkpoints
 
 ### Preserved R34 checkpoint
 
