@@ -1,5 +1,20 @@
 # DFS abrupt-node-loss and reconnection availability
 
+## Governing quietness invariant — 2026-10-25
+
+Quiet windows require **absolute zero writes**, including maintenance. The window
+deliberately spans maintenance so it can detect unwanted persistence. Time-only
+keepalive and renewal information stays in memory; durable updates require an
+actual semantic change. The 1 MB allowance applies only to genuine cluster
+activity, never to quiet maintenance. Earlier interpretations allowing a quiet
+maintenance write budget are superseded; historical failures and raw evidence
+remain unchanged. Do not discount or reclassify a failed quiet window as a pass.
+
+Coverage remains Sinomo-only: main/shadow processes, attributable helpers and
+delegated work, network and writeback. Whole-host activity is diagnostic. Missing
+ownership or final-I/O coverage remains blocked. This instruction changes no
+rollout permission, resource limit, accounting setup or production scope.
+
 ## Current development checkpoint — 2026-10-25 R48
 
 Three bounded local-fence failure-cut controls are integrated through normal
@@ -1297,8 +1312,12 @@ Performance evidence follows `skills/sinomo-performance-analysis/SKILL.md`:
 acceptance, per-node stage/I/O, node windows and coverage tables, including
 unavailable counters. Measure takeover latency and metadata/content transfer
 volume directly with no invented SLO or observation-overhead subtraction.
-Keep debugging/tracing/profiling and existing thresholds. Mandatory quietness
-covers Sinomo main/shadow, attributable helpers/delegates, network and writeback;
+Keep debugging/tracing/profiling and existing CPU/network thresholds. Quiet
+windows require zero writes even when maintenance runs; the activity-only 1 MB
+allowance cannot be used to pass quiet maintenance. Time-only keepalive and
+renewal state stays in memory, and persistence requires actual semantic change.
+Mandatory quietness covers Sinomo main/shadow, attributable helpers/delegates,
+network and writeback;
 whole-host activity is diagnostic only. Incomplete ownership/final-I/O/network/
 writeback coverage remains BLOCKED. Do not reapply runtime accounting setup.
 
