@@ -989,6 +989,63 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         ))
     }
 
+    /// Native returned DATA holds one exact original pending settlement. The
+    /// existing page parking path must retain its captured scheduling row too:
+    /// projecting an already-due retry from wall time would otherwise emit a
+    /// new Set on every maintenance pass despite performing no send.
+    #[cfg(any(test, feature = "test-support"))]
+    fn native_completion_held_repair_targets(
+        &self,
+        records: &[DfsRepairAttemptRecord],
+    ) -> Result<BTreeSet<(String, NodeId)>, DfsError> {
+        let mut held = BTreeSet::new();
+        if records.is_empty() {
+            return Ok(held);
+        }
+        let Some((_, owner)) = self.native_publication_owner_for_observation() else {
+            return Ok(held);
+        };
+        let Some(layout) =
+            owner
+                .selected_original_data_layout()
+                .map_err(|error| DfsError::Metadata {
+                    message: error.to_string(),
+                })?
+        else {
+            return Ok(held);
+        };
+        let store = layout.queue()?;
+        for record in records {
+            if record.transfer_kind
+                != Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+            {
+                continue;
+            }
+            let Some(birth) = store
+                .original_repair_for_slot(&record.intent_id, &record.missing_replica_node_id)?
+            else {
+                continue;
+            };
+            let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+                continue;
+            };
+            if record.transfer_request_id.as_ref() == Some(&command.request_id)
+                && record.intent_id == command.intent_id
+                && record.object_id == command.object_id
+                && record.version == command.version
+                && record.content_hash == command.content_hash
+                && record.missing_replica_node_id == birth.original.target_node_id
+                && store.native_original_completion_pending(&birth.original)?
+            {
+                held.insert((
+                    record.intent_id.clone(),
+                    record.missing_replica_node_id.clone(),
+                ));
+            }
+        }
+        Ok(held)
+    }
+
     fn prepare_repair_fanout_jobs(
         &mut self,
         job: &DistributedRepairJob,
@@ -2669,6 +2726,10 @@ where
         if max_scheduled == 0 {
             return Ok(DfsRepairPageProgress::default());
         }
+        #[cfg(any(test, feature = "test-support"))]
+        let native_held_targets = self.native_completion_held_repair_targets(repair_attempts)?;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let native_held_targets = BTreeSet::new();
         self.prune_idle_transfer_state();
         let Some(restored) = self
             .restore_pending_writes_with_source_read_mode(repair_attempts, yield_on_source_fence)?
@@ -2685,7 +2746,7 @@ where
             None,
             Some(execution_exclusions),
         )?;
-        let settled_keys = repair_attempts
+        let mut settled_keys = repair_attempts
             .iter()
             .filter(|record| {
                 self.coordinator
@@ -2699,12 +2760,14 @@ where
                 )
             })
             .collect::<BTreeSet<_>>();
+        settled_keys.extend(native_held_targets.iter().cloned());
         if (self.writes.pending_writes.is_empty() && self.coordinator.repair_jobs().is_empty())
             || max_scheduled == 0
         {
             return Ok(DfsRepairPageProgress {
                 examined_record_count: repair_attempts.len(),
                 examined: settled_keys,
+                parked: native_held_targets,
                 ..Default::default()
             });
         }
@@ -2738,10 +2801,13 @@ where
                 }));
         let mut retired_intents = Vec::new();
         let mut examined = settled_keys;
-        let mut parked = BTreeSet::new();
+        let mut parked = native_held_targets;
         let mut scheduled = Vec::new();
         let mut error = None;
         let mut consumed_repair_targets = skipped_targets.cloned().unwrap_or_default();
+        // These keys are examined/preserved, not scheduled. They consume no
+        // send capacity and cannot exclude unrelated originals to the same C.
+        consumed_repair_targets.extend(parked.iter().cloned());
         let mut placement_plans = None;
         let observed_placement_config = self
             .metadata
