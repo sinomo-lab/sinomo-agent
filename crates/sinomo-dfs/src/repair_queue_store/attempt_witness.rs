@@ -155,6 +155,36 @@ fn checked_attempt<'a>(
 }
 
 impl LocalDfsRepairQueueStore {
+    /// Identity only, before a custody writer may recover/recertify its SAME
+    /// physical queue. This does not validate a prefix, renew the witness,
+    /// reconstruct transport provenance, load, synchronize or change state.
+    pub(crate) fn check_original_repair_attempt_physical_owner(
+        &self,
+        witness: &RepairOriginalAttemptWitness,
+    ) -> Result<(), DfsError> {
+        let state = self.lock_state()?;
+        if !Arc::ptr_eq(&state.owner, &witness.owner) {
+            return Err(custody_error(
+                "original attempt witness belongs to another resident queue owner",
+            ));
+        }
+        witness.physical.check()?;
+        let physical = state.selected_fixture.as_ref().ok_or_else(|| {
+            custody_error("original attempt witness lost its physical queue owner")
+        })?;
+        physical.check()?;
+        if physical.root != witness.physical.root
+            || physical.snapshot_path != witness.physical.snapshot_path
+            || state.snapshot_path != physical.snapshot_path
+            || physical.marker != witness.physical.marker
+        {
+            return Err(custody_error(
+                "original attempt witness belongs to another physical queue incarnation",
+            ));
+        }
+        Ok(())
+    }
+
     /// Capture an exact historical queue Attempt without changing any state.
     /// The native caller must supply this queue from its actual retained DATA
     /// owner; selected representation alone supplies no authority.

@@ -73,6 +73,12 @@ impl RepairCompletionCandidateInput {
 }
 
 impl RetainedRepairCompletionCandidate {
+    // Shared local prefix-conflict checking only; this exposes no native
+    // provenance and never promotes the candidate into another record family.
+    pub(super) fn retained_sequence(&self) -> u64 {
+        self.retained_at_sequence
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn reference(&self) -> Result<RepairCompletionCandidateRef, DfsError> {
         let key = self.input.key()?;
