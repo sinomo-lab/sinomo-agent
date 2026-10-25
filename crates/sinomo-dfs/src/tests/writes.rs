@@ -120,10 +120,22 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
     );
     let read_content = || {
         control.with_client(|kv| {
-            DfsControlPlaneStore::new(kv.as_mut())
-                .content_service(service.node_id())
-                .unwrap()
-                .unwrap()
+            // Content advertisements are outside the retained filesystem
+            // prefix. A committed-observation wake does not invalidate this
+            // client's exact-key cache. Read the actual publisher's record
+            // before the original startup deadline, including on the first
+            // read after subscribing (publication may already have finished).
+            let entries = kv
+                .get_authoritative_consistent_before(
+                    &[crate::content_service_key(service.node_id())],
+                    deadline,
+                )
+                .expect("authoritative storage advertisement within the startup budget");
+            entries[0]
+                .as_ref()
+                .expect("normal startup published its content record")
+                .decode::<crate::DfsNodeAdvertisement>()
+                .expect("actual content advertisement")
         })
     };
     let initial = read_content();
