@@ -9622,9 +9622,11 @@ dependencies = [
 name = "sinomo"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde_json",
  "sinomo-cli",
  "sinomo-client",
+ "sinomo-dfs-fuse",
  "sinomo-lm",
  "sinomo-runtime",
  "sinomo-testdir",

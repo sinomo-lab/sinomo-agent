@@ -17502,8 +17502,52 @@ fn simple_sandbox_sifs_mount_points_are_isolated_by_process() {
     let second = super::simple_sandbox_sifs_mount_point_for_process(&data_dir, 222);
 
     assert_ne!(first, second);
-    assert_eq!(first, data_dir.root().join("mounts/sifs/by-process/111"));
-    assert_eq!(second, data_dir.root().join("mounts/sifs/by-process/222"));
+    assert!(
+        !first.starts_with(data_dir.root()),
+        "live mount must not overlap DATA"
+    );
+    assert!(
+        !data_dir.root().starts_with(&first),
+        "live mount must not hide DATA"
+    );
+    assert_eq!(first, root.join("data.mounts/sifs/by-process/111"));
+    assert_eq!(second, root.join("data.mounts/sifs/by-process/222"));
+}
+
+#[cfg(unix)]
+#[test]
+fn simple_sandbox_sifs_mount_points_preserve_data_alias_and_workspace_boundaries() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sifs-mount-alias");
+    let data = root.join("data");
+    fs::create_dir(&data).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let real = SinomoDataDir::new(&data);
+    let alias = SinomoDataDir::new(&alias);
+    let mount = super::simple_sandbox_sifs_mount_point_for_process(&real, 111);
+    assert_eq!(
+        mount,
+        super::simple_sandbox_sifs_mount_point_for_process(&alias, 111)
+    );
+    let lookalike = mount.join("services/fake-workspace");
+    fs::create_dir_all(&lookalike).unwrap();
+    assert!(
+        super::validate_mutating_workspace_root_with_live_mount(&real, &lookalike, None).is_err()
+    );
+    let other_process =
+        super::simple_sandbox_sifs_mount_point_for_process(&real, 222).join("services/workspace");
+    assert!(
+        super::validate_mutating_workspace_root_with_live_mount(
+            &real,
+            &other_process,
+            Some(&mount)
+        )
+        .is_err()
+    );
+    assert!(
+        super::validate_mutating_workspace_root_with_live_mount(&real, &data, Some(&mount))
+            .is_err()
+    );
 }
 
 #[test]

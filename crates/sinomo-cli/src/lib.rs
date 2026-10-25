@@ -5241,8 +5241,7 @@ fn simple_sandbox_sifs_mount_point_for_process(
     process_id: u32,
 ) -> PathBuf {
     data_dir
-        .root()
-        .join("mounts")
+        .external_mounts_dir()
         .join("sifs")
         .join("by-process")
         .join(process_id.to_string())
@@ -5298,11 +5297,12 @@ fn validate_mutating_workspace_root_with_live_mount(
         }
     }
     let data_root = absolute_normalized_path(&data_dir.root())?;
+    let mounts_root = absolute_normalized_path(&data_dir.external_mounts_dir())?;
     let is_live_sifs_workspace = verified_sifs_mount
         .map(absolute_normalized_path)
         .transpose()?
         .is_some_and(|mount_root| workspace_root.starts_with(mount_root));
-    if (workspace_root == data_root || workspace_root.starts_with(&data_root))
+    if (workspace_root.starts_with(&data_root) || workspace_root.starts_with(&mounts_root))
         && !is_live_sifs_workspace
     {
         return Err(unsafe_mutating_workspace_error(&workspace_root));

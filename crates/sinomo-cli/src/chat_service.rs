@@ -1276,13 +1276,30 @@ impl HostedChatService {
                 ),
             }
         }
+        self.delete_local_chat(data_dir, runtime, chat_id)
+    }
+
+    fn delete_local_chat(
+        &self,
+        data_dir: sinomo_runtime::local::SinomoDataDir,
+        runtime: tokio::runtime::Handle,
+        chat_id: &str,
+    ) -> Result<(), String> {
         history_delete(
             &self.daemon_address,
             &self.runtime_control,
             data_dir,
             runtime,
             chat_id,
-        )
+        )?;
+        // A durable tombstone and cancellation do not release the host's
+        // executors or mounts. Retire this node's route only after deletion
+        // succeeds; ChatHost's existing stop path releases its runtime.
+        self.hosts
+            .lock()
+            .map_err(|_| "chat host registry poisoned")?
+            .remove(chat_id);
+        Ok(())
     }
 
     /// A command from a window on another node for a chat this node hosts.
@@ -1868,13 +1885,7 @@ impl Service for HostedChatService {
                     let data_dir = ctx.data_dir.as_ref().clone();
                     let runtime = tokio::runtime::Handle::current();
                     tokio::task::spawn_blocking(move || {
-                        history_delete(
-                            &service.daemon_address,
-                            &service.runtime_control,
-                            data_dir,
-                            runtime,
-                            &payload.chat_id,
-                        )
+                        service.delete_local_chat(data_dir, runtime, &payload.chat_id)
                     })
                     .await
                     .map_err(|error| ServiceError::Service(error.to_string()))?

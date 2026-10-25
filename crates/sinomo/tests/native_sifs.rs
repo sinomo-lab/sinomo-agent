@@ -1,0 +1,371 @@
+//! Strict, opt-in kernel FUSE qualification against an isolated native daemon.
+//! No model turn is submitted. Failure retains the private DATA and receipt.
+#![cfg(all(target_os = "linux", feature = "dfs-fuse"))]
+
+use sinomo_client::{ChatDaemonClient, ChatHistoryClient, SifsBrowser, chat_contract::ChatEvent};
+use sinomo_dfs_fuse::{
+    DfsFuseMountOptions, mount_sifs_background, preflight_linux_sifs_background_mount,
+};
+use sinomo_runtime::{
+    api::{
+        DaemonApiClient, DaemonPaths, DaemonProbeStatus, DaemonStatus,
+        SINOMO_APP_DAEMON_LAUNCH_ID_ENV, probe_daemon_status,
+    },
+    cluster::ClusterControlInitRequest,
+    local::SinomoDataDir,
+};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::Write,
+    net::TcpListener,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+
+struct Node {
+    child: Child,
+    status: Option<DaemonStatus>,
+}
+
+impl Node {
+    fn start(data: &SinomoDataDir, port: u16, phase: &str) -> Self {
+        let launch = format!("native-sifs-{}-{port}-{phase}", std::process::id());
+        let mut node = Self {
+            child: Command::new(env!("CARGO_BIN_EXE_sinomo"))
+                .args([
+                    "daemon",
+                    "run",
+                    "--app-owned",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                ])
+                .arg(port.to_string())
+                .env("SINOMO_DATA_DIR", data.root())
+                .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, &launch)
+                .stdin(Stdio::piped())
+                .stdout(File::create(data.root().join(format!("{phase}.stdout"))).unwrap())
+                .stderr(File::create(data.root().join(format!("{phase}.stderr"))).unwrap())
+                .spawn()
+                .expect("start the isolated candidate daemon"),
+            status: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                node.child.try_wait().unwrap().is_none(),
+                "isolated daemon exited; inspect retained {phase}.stderr"
+            );
+            if let DaemonProbeStatus::Running(status) =
+                probe_daemon_status(&DaemonPaths::new(data), Duration::from_millis(300))
+            {
+                assert_eq!(
+                    status.pid,
+                    node.child.id(),
+                    "never attach to another process"
+                );
+                assert_eq!(status.app_launch_id.as_deref(), Some(launch.as_str()));
+                assert_eq!(status.port, port);
+                assert_eq!(status.commit.as_deref(), Some(env!("SINOMO_GIT_COMMIT")));
+                assert_eq!(
+                    fs::canonicalize(&status.data_dir).unwrap(),
+                    fs::canonicalize(data.root()).unwrap()
+                );
+                node.status = Some(status);
+                return node;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "isolated candidate readiness timed out; inspect retained logs"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn status(&self) -> &DaemonStatus {
+        self.status.as_ref().unwrap()
+    }
+
+    fn wait_exit(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "owned daemon did not drain");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn stop(&mut self) {
+        drop(self.child.stdin.take());
+        self.wait_exit();
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            drop(self.child.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if self.child.try_wait().ok().flatten().is_none() {
+                // This Child handle owns only this fixture's exact process.
+                let _ = self.child.kill();
+                eprintln!("native SIFS fixture required forced child cleanup");
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn mount_entry(path: &Path) -> Option<String> {
+    let encoded = path
+        .to_str()
+        .unwrap()
+        .replace('\\', "\\134")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012");
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .find(|line| line.split_whitespace().nth(4) == Some(encoded.as_str()))
+        .map(str::to_string)
+}
+
+fn record(file: &mut File, value: serde_json::Value) {
+    writeln!(file, "{value}").unwrap();
+    file.sync_all().unwrap();
+    eprintln!("native-sifs-evidence {value}");
+}
+
+#[test]
+#[ignore = "requires existing unprivileged /dev/fuse and fusermount; fails rather than falling back"]
+fn native_sifs_kernel_roundtrip_restart_and_cleanup() {
+    let root: PathBuf = sinomo_testdir::TestDir::new("native-sifs-kernel").keep();
+    eprintln!("native-sifs-retained-root={}", root.display());
+    let data = SinomoDataDir::new(root.join("data"));
+    data.ensure_root_layout().unwrap();
+    let mut receipt = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join("receipt.jsonl"))
+        .unwrap();
+    let binary = fs::canonicalize(env!("CARGO_BIN_EXE_sinomo")).unwrap();
+    let binary_digest = blake3::hash(&fs::read(&binary).unwrap())
+        .to_hex()
+        .to_string();
+    let mount_point = data
+        .external_mounts_dir()
+        .join("sifs/by-process")
+        .join(std::process::id().to_string());
+    let mut options = DfsFuseMountOptions::new(&mount_point).with_data_dir(data.root());
+    options.attr_ttl = Duration::ZERO;
+    options.entry_ttl = Duration::ZERO;
+    assert!(!mount_point.starts_with(data.root()) && !data.root().starts_with(&mount_point));
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"intent", "binary":binary, "binary_blake3":binary_digest,
+        "build_commit":env!("SINOMO_GIT_COMMIT"), "data":data.root(), "mount":mount_point,
+        "model_turn_submitted":false, "fallback_allowed":false, "production":false}),
+    );
+    let preflight = preflight_linux_sifs_background_mount(&options)
+        .expect("kernel/helper capability unavailable; do not escalate or use a fallback");
+    assert!(
+        preflight.direct_fuse_device_access,
+        "direct /dev/fuse access denied; stop without another route"
+    );
+    assert!(
+        !preflight.allow_other_enabled,
+        "fixture never broadens mount access"
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"kernel-preflight", "device":preflight.fuse_device,"helper":preflight.mount_helper}),
+    );
+
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut bootstrap = Node::start(&data, port, "bootstrap");
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"bootstrap", "status":bootstrap.status()}),
+    );
+    DaemonApiClient::at_address(&bootstrap.status().address)
+        .cluster_init(ClusterControlInitRequest {
+            cluster_name: "Isolated native SIFS qualification".into(),
+            node_display_name: Some("Isolated native SIFS fixture".into()),
+            node_role: None,
+        })
+        .expect("initialize only the fresh fixture DATA; no retry after an uncertain result");
+    bootstrap.wait_exit();
+    drop(bootstrap);
+
+    let mut node = Node::start(&data, port, "main");
+    let cluster = node.status().cluster.clone().expect("native Main identity");
+    assert_eq!(
+        cluster.process,
+        sinomo_runtime::node::DAEMON_MAIN_CLUSTER_ROLE
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"main", "status":node.status()}),
+    );
+    let browser = SifsBrowser::open_daemon(&node.status().address).unwrap();
+    let original = "/services/native-sifs-api-source";
+    let written = "/services/native-sifs-kernel-written";
+    let renamed = "/services/native-sifs-kernel-renamed";
+    let api_payload = format!(
+        "API {} {} {binary_digest}",
+        cluster.cluster_id, cluster.node_id
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"before-api-write", "path":original}),
+    );
+    browser
+        .write_file(original, api_payload.as_bytes())
+        .expect("original write outcome; never replay an uncertain write");
+    // Exercise the agent's actual mount producer, not just the FUSE adapter.
+    // Opening a view initializes the hosted runtime but sends no model turn.
+    let client_id = format!("native-sifs-view-{}", std::process::id());
+    let chat = ChatDaemonClient::at_address(&node.status().address, &client_id);
+    let opened = chat
+        .open()
+        .expect("open the isolated hosted chat without a turn");
+    let mut cursor = opened.next_event_sequence;
+    let ready_by = Instant::now() + Duration::from_secs(30);
+    let (session_id, info) = 'ready: loop {
+        let batch = chat
+            .events(cursor, 128, Duration::from_millis(200))
+            .unwrap();
+        cursor = batch.next_sequence;
+        for event in batch.events {
+            match event.event {
+                ChatEvent::Ready { session_id, info } => break 'ready (session_id, info),
+                ChatEvent::Error { error, .. } => panic!("hosted initialization failed: {error}"),
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < ready_by,
+            "hosted initialization did not become ready"
+        );
+    };
+    let agent_mount = data
+        .external_mounts_dir()
+        .join("sifs/by-process")
+        .join(node.status().pid.to_string());
+    let agent_mount_entry = mount_entry(&agent_mount)
+        .expect("hosted agent used a fallback instead of its real SIFS kernel mount");
+    assert!(agent_mount_entry.contains(" - fuse ") || agent_mount_entry.contains(" - fuse."));
+    assert_eq!(
+        fs::read(agent_mount.join(original.trim_start_matches('/'))).unwrap(),
+        api_payload.as_bytes()
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"hosted-agent-native-sifs", "client_id":client_id,
+        "session_id":session_id, "runtime":info, "view_generation":opened.generation,
+        "mountinfo":agent_mount_entry,"model_turn_submitted":false}),
+    );
+    // One writable mounted-mutation owner per DATA. Reuse the real agent's
+    // mount instead of attempting to create a competing mount in this test.
+    let kernel_payload = format!("kernel {session_id} {} {binary_digest}", node.status().pid);
+    let path = agent_mount.join(written.trim_start_matches('/'));
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"before-kernel-write", "path":written}),
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(kernel_payload.as_bytes()).unwrap();
+    file.sync_all()
+        .expect("commit kernel write through the native DFS boundary");
+    drop(file);
+    assert_eq!(
+        browser.read_file(written).unwrap(),
+        kernel_payload.as_bytes()
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"before-kernel-rename", "from":written,"to":renamed}),
+    );
+    fs::rename(&path, agent_mount.join(renamed.trim_start_matches('/'))).unwrap();
+    assert_eq!(
+        browser.read_file(renamed).unwrap(),
+        kernel_payload.as_bytes()
+    );
+    // Closing a view only detaches it. Retire this disposable chat through
+    // its owning service before stopping the process; never clear lease files.
+    ChatHistoryClient::at_address(&node.status().address)
+        .delete(&session_id)
+        .unwrap();
+    assert!(chat.close().unwrap().closed);
+    let retire_by = Instant::now() + Duration::from_secs(10);
+    while mount_entry(&agent_mount).is_some() {
+        assert!(
+            Instant::now() < retire_by,
+            "deleted chat retained its owned mount"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_dir(&agent_mount).unwrap().count(),
+        0,
+        "no native-directory copy can impersonate SIFS"
+    );
+    node.stop();
+    assert!(
+        mount_entry(&agent_mount).is_none(),
+        "agent's process-owned mount survived daemon shutdown"
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"drained", "pid":node.child.id(),"mount_absent":true,"child_reaped":true}),
+    );
+    drop(node);
+    let mut reopened = Node::start(&data, port, "reopened");
+    assert_eq!(
+        reopened.status().cluster.as_ref().unwrap().cluster_id,
+        cluster.cluster_id
+    );
+    assert_eq!(
+        reopened.status().cluster.as_ref().unwrap().node_id,
+        cluster.node_id
+    );
+    let browser = SifsBrowser::open_daemon(&reopened.status().address).unwrap();
+    assert_eq!(
+        browser.read_file(renamed).unwrap(),
+        kernel_payload.as_bytes()
+    );
+    let handle =
+        mount_sifs_background(options).expect("reopen only after the successful owned unmount");
+    assert_eq!(
+        fs::read(handle.mount_root().join(renamed.trim_start_matches('/'))).unwrap(),
+        kernel_payload.as_bytes()
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"reopened", "status":reopened.status(), "mountinfo":mount_entry(&mount_point)}),
+    );
+    handle.shutdown().unwrap();
+    assert!(mount_entry(&mount_point).is_none());
+    reopened.stop();
+    assert_eq!(
+        blake3::hash(&fs::read(&binary).unwrap()).to_hex().as_str(),
+        binary_digest
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"complete", "kernel_sifs_roundtrip":true,"same_data_reopen":true,
+        "mount_absent":true,"child_reaped":true,"production_readiness":false,"quietness_qualified":false}),
+    );
+}

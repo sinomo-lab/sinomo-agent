@@ -84,6 +84,17 @@ impl SinomoDataDir {
         self.root.join("files")
     }
 
+    /// Host filesystem projections must neither contain nor sit inside DATA.
+    /// This sibling holds mount points only; durable state remains in DATA.
+    /// Resolve an existing DATA alias so one node does not acquire two mount
+    /// namespaces through different spellings of its state directory.
+    pub fn external_mounts_dir(&self) -> PathBuf {
+        let root = fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let mut name = root.file_name().unwrap_or_default().to_os_string();
+        name.push(".mounts");
+        root.with_file_name(name)
+    }
+
     /// Node-local runtime state owned by dynamically loaded Sinomo modules.
     ///
     /// Module implementations append their validated module id below this

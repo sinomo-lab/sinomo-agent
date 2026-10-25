@@ -6733,6 +6733,23 @@ mod errno_tests {
         let error = validate_mount_point_preserves_data_dir(&nested_options, &nested_mount)
             .expect_err("a mount inside the data directory must also be rejected");
         assert!(error.to_string().contains("overlaps"));
+
+        let sibling = SinomoDataDir::new(&data_dir)
+            .external_mounts_dir()
+            .join("sifs/by-process/111");
+        let sibling_options = DfsFuseMountOptions::new(&sibling).with_data_dir(&data_dir);
+        validate_mount_point_preserves_data_dir(&sibling_options, &sibling)
+            .expect("generated sibling projection must preserve DATA");
+        #[cfg(unix)]
+        {
+            let alias = root.join("mount-alias");
+            std::os::unix::fs::symlink(&nested_mount, &alias).unwrap();
+            let resolved = std::fs::canonicalize(alias).unwrap();
+            assert!(
+                validate_mount_point_preserves_data_dir(&sibling_options, &resolved).is_err(),
+                "canonical aliases back into DATA remain unsafe"
+            );
+        }
     }
 
     #[test]
