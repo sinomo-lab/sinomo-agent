@@ -1,6 +1,58 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R41
+## Current development checkpoint — 2026-10-25 R42
+
+The non-activating recovery-ballot reservation prerequisite is implemented and
+executed in `cfg(test)` only. Implementation `2ca9578d` and native controls
+`6e5b0bf6` merged without conflicts at `b9998af5`. Source `561dbcac` covers4,912
+inputs; own sealed ELF `e43fa785`. Fresh I121 check/build/seal passed in
+40.129955/598.314902/3.012237s. I122 executed **all14 new controls:5 structural
+and9 native PASS**, with exactly-one-case summaries. The full I123 DFS/KV
+boundary passed11UI controls and3library analyses. The other182 of196 inventory
+IDs remain unrun on R42; no prior pass is transferred.
+
+The existing synchronous control-plane owner retains one compact sibling record
+per shard: monotonic attempt floor, floor epoch and an optional exact pending
+request. The request binds complete serving configuration, a replica candidate,
+caller-expected floor, checked epoch+1/attempt+1 and deterministic identity.
+Authoritative exact-key reads and CAS prevent reminting. Cancel clears only the
+matching pending body and preserves the floor. The root's ordered rule is
+normative: old expected floor is Spent unless the exact own request is still
+pending and passes current-authority checks; expected-current floor with pending
+is PendingHeldByOther. Existing is not ownership. Malformed IDs, invalid floor
+records, leases, overflow, stale authority and pending handoff refuse.
+
+Native in-process three-node Raft execution covers distinct/identical CAS races,
+repeated and concurrent cancellation, stale request refusal, one peer restart and
+readback, ordinary create/maintenance without freeze, real pending-handoff and
+wrong/absent authority negatives, no-I/O malformed/expired requests and corrupt
+stored values. Each used unchanged outer caps and native absolute deadlines.
+This is reservation/verification DATA, not a lease, serving epoch, promise,
+accept, ChosenFrame or metadata publication permission. The module is not
+`test-support`; no production caller, activation API, ordinary handoff behavior,
+metadata participant proof or count changes.
+
+`R42-REPORT.md` and `R42-COMBINED-RESULT.json` bind I121 build `2d7aef4f`, I122
+execution `970e01f2` and I123 boundary `9fd0aa9b`. Source and tracked state stayed
+unchanged through all three runs. I122 retained1,371 regular files; every exact
+case/checkpoint/archive/hash/compare and owned process/group/cgroup/root drain
+passed. Standard acceptance, stage/I/O, node-window and coverage tables keep
+unavailable metrics explicit. No Codex peer review, debugger coordination,
+shared build lock, Docker, account/accounting change, push or deployment occurred.
+R41 seals and all earlier failures remain immutable.
+
+Development continues beyond this prerequisite. An actual durable acceptor
+promise with immutable accepted/cut evidence and old-write fencing needs its own
+finite protocol/caller contract; the unsafe larger Claude R1/R2 gaps are not
+closed by the narrower R3/R4 reservation work. Chosen-frame evidence, original
+effect bodies/uncertainty and settlement/residency, compatible activation/store
+replacement, full survivor authority/history, real abrupt-loss/partition/rejoin
+and mandatory Sinomo-only quietness remain open. This checkpoint does not
+complete the original availability goal or authorize changing FullShard.
+
+## Historical checkpoints
+
+### Preserved R41 checkpoint
 
 The next test-only durability slice is implemented and executed. Helper
 `7e62af7e` and process controls `05d0ce37` merged without conflicts at
@@ -37,8 +89,6 @@ FullShard. The next architectural prerequisite is a finite pending-ballot
 reservation contract in the existing control-plane owner, with serving activation
 refused until independently qualified. Full original availability and mandatory
 Sinomo daemon/helper quietness remain unfinished.
-
-## Historical checkpoints
 
 ### Preserved R40 checkpoint
 
