@@ -102,7 +102,7 @@ pub enum RpcPhase {
     Constructed,
     BeforeDispatch,
     AfterDispatch,
-    /// Normal Hosted decoder returned the actual namespace header.
+    /// Normal Hosted decoder returned an actual supported typed header.
     Decoded,
     Completed,
     EndedWithoutResponse,
@@ -112,7 +112,7 @@ pub struct RpcObservation {
     pub source: NodeId,
     pub target: NodeId,
     pub call_id: u64,
-    /// Actual inline repair or normally decoded namespace head; observation never reads a body.
+    /// Actual inline repair or normally decoded typed head; observation never reads a body.
     pub dfs_frame_id: Option<u64>,
     pub dfs_intent_id: Option<String>,
     pub dfs_request_id: Option<String>,
@@ -143,7 +143,7 @@ tokio::task_local! {
     static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
 }
 
-/// Observe actual namespace/write-response identities after normal decoding and signer validation.
+/// Observe supported typed identities after normal decoding and signer validation.
 /// Streamed value bodies have already been consumed by that ordinary decoder;
 /// this observer copies only existing scalar identity fields.
 pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand) {
@@ -180,6 +180,27 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
                     observation.dfs_intent_id = Some(intent_id.clone());
                     observation.dfs_version = Some(version.clone());
                 }
+            }
+            crate::DfsNetworkMessage::RepairReplicaResponse(response)
+                if observation.route == crate::DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE =>
+            {
+                observation.dfs_request_id = Some(response.request_id.clone());
+                observation.dfs_intent_id = Some(response.intent_id.clone());
+                observation.dfs_file_system_id = Some(response.file_system_id.clone());
+                observation.dfs_object_id = Some(response.object_id.clone());
+                observation.dfs_version = Some(response.version.clone());
+            }
+            crate::DfsNetworkMessage::OriginalRepairHistoryRequest(request)
+                if observation.route == crate::DFS_DATA_READ_ROUTE =>
+            {
+                // This is the immutable original effect's identity. The actual
+                // decoded outer frame and call_id separately bind this query.
+                let original = &request.original_material.original.command;
+                observation.dfs_request_id = Some(original.request_id.clone());
+                observation.dfs_intent_id = Some(original.intent_id.clone());
+                observation.dfs_file_system_id = Some(original.file_system_id.clone());
+                observation.dfs_object_id = Some(original.object_id.clone());
+                observation.dfs_version = Some(original.version.clone());
             }
             _ => return,
         }
