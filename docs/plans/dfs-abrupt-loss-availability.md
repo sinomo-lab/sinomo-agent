@@ -1,6 +1,46 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R40
+## Current development checkpoint — 2026-10-25 R41
+
+The next test-only durability slice is implemented and executed. Helper
+`7e62af7e` and process controls `05d0ce37` merged without conflicts at
+`0fe92fe8`. Source `0316a026` has4,910 inputs; own sealed executable
+`3debf871`. Fresh check/build/seal, both new tests and the full11-UI/3-library
+DFS/KV boundary passed. The other180 of182 inventory cases remain unrun on this
+source; R40/R39 results stay separate.
+
+One parent owns two actual child processes running the genuine normal native
+fixture and custody writer. It SIGKILLed/reaped child1163567 after intake ACK and
+child1163820 after ACK plus queue compaction. Ready took10.638613s/10.570144s;
+kill/reap took10.198559ms/10.156030ms, both signal9. The parent pinned physical
+A queue/content/metadata files while each child was alive, captured raw files
+before recovery, and verified byte-identical alive/postkill data. The bounded
+forensic helper only decodes exact expected DATA into temporary maps; it never
+opens a writer, recovers/truncates, renews an ACK or recreates native authority.
+The original/body/attempt and no-Observe/no-Close state survived.
+
+This kills the whole three-node fixture process. It is local post-ACK process/file
+durability evidence, not a surviving-cluster A-loss test, power loss, mid-fsync
+crash, C1, quorum or availability acceptance. The internal killed helpers are
+not separately passing tests. All fixtures, hashes, archives and owned drains
+passed; standard timing/coverage tables keep unavailable counters explicit.
+
+`R41-REPORT.md`, `R41-COMBINED-RESULT.json` and exact child evidence
+`I119-ACTUAL-NATIVE-SIGKILL-EVIDENCE.json` bind I118 build `4763a804`, I119
+execution `7b262274` and I120 boundary `58f20ab1`. All earlier failures remain
+immutable. No Codex peer reviews or production/Docker/deployment action occurred.
+
+Development continues. Read-only Claude proposals address the larger metadata
+protocol, but chosen-frame certificates, immutable promise replies, pending-effect
+custody/settlement and compatible activation remain open; no proposal changes
+FullShard. The next architectural prerequisite is a finite pending-ballot
+reservation contract in the existing control-plane owner, with serving activation
+refused until independently qualified. Full original availability and mandatory
+Sinomo daemon/helper quietness remain unfinished.
+
+## Historical checkpoints
+
+### Preserved R40 checkpoint
 
 The selected normal sender now captures admission provenance while its real
 producer owns execution, carries the same body/attempt through the native RPC,
@@ -46,8 +86,6 @@ captured before recovery and DATA-only inspection. Full original/effect coverage
 late-fact forwarding, C1, successor effects, causal settlement/root retirement,
 metadata majority history, real abrupt-loss/partition/reconnect and mandatory
 Sinomo-only daemon/helper quietness remain open requirements.
-
-## Historical checkpoints
 
 ### Preserved R37 checkpoint
 
