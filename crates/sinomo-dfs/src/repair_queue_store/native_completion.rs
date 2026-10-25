@@ -574,6 +574,37 @@ mod tests {
             f.queue.validate_original_repair_dispatch(&f.data.carrier),
             "awaits native completion custody settlement",
         );
+        let crate::DfsNetworkMessage::RepairReplicaResponse(response) = &f.data.returned.message
+        else {
+            panic!("structural Repair response fixture");
+        };
+        rejects(
+            f.queue
+                .observe_original_repair_result(&f.data.carrier.source_node_id, response),
+            "awaits native completion custody settlement",
+        );
+        // The shared writer/replay validator also refuses a raw ordinary
+        // Observe transition before it can change any map or frame.
+        let change = RepairCustodyChange::Observe {
+            subject: f.data.material.subject.clone(),
+            response: response.clone(),
+        };
+        {
+            let mut state = f.queue.lock_state().unwrap();
+            rejects(
+                state.append_operations(vec![DfsRepairQueueOperation::RepairCustody {
+                    change: Box::new(change.clone()),
+                }]),
+                "awaits native completion custody settlement",
+            );
+            let mut replay_index = state.custody.clone();
+            let before_replay = format!("{replay_index:?}");
+            rejects(
+                replay_index.apply_change(&change, state.head_sequence + 1),
+                "awaits native completion custody settlement",
+            );
+            assert_eq!(format!("{replay_index:?}"), before_replay);
+        }
         assert_eq!(
             super::super::tests::diagnostic_fixture_state(&f.queue),
             before
@@ -584,6 +615,31 @@ mod tests {
             !f.queue
                 .native_original_completion_pending(&unrelated)
                 .unwrap()
+        );
+        // The same legacy writer contract remains available without a native
+        // fact. This synthetic local response is not native auth evidence.
+        let other_root = sinomo_testdir::TestDir::new("native-completion-observe-unheld");
+        let other = fixture(other_root.path());
+        let crate::DfsNetworkMessage::RepairReplicaResponse(other_response) =
+            &other.data.returned.message
+        else {
+            panic!("unheld Repair response fixture");
+        };
+        assert!(
+            other
+                .queue
+                .observe_original_repair_result(&other.data.carrier.source_node_id, other_response)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            other
+                .queue
+                .original_repair(&other.data.carrier)
+                .unwrap()
+                .unwrap()
+                .observed,
+            vec![other_response.clone()]
         );
     }
 
