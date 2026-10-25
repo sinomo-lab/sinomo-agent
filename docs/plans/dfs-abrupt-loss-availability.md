@@ -1,6 +1,55 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R47
+## Current development checkpoint — 2026-10-25 R48
+
+Three bounded local-fence failure-cut controls are integrated through normal
+local merges: writer hooks `96ead4dd`, in-flight control `90f18926` and owned-process
+control `b528320f`, with declaration checkpoint `ea4c460c`. Source `2b4dfd82`
+contains 4,919 inputs; own sealed ELF is `9fc4bd84`. I143 fresh check/build/seal
+passed in 45.589723/419.316414/3.209887 seconds. I144 executed **6 PASS**: three
+new controls and three affected duplicate/namespace/cooperative regressions.
+I145 full boundary passed 11 UI controls and three libraries. Other **210 of
+216 inventory IDs remain UNRUN on R48**; historical results do not transfer.
+
+The actual registered A-to-eligible-B RPC was constructed and held before
+dispatch. B installed its real local DATA fence; the same carrier then resumed
+within its original five-second deadline and was refused. Exact B journal
+frames, prefix and both ACK floors remained unchanged. This does not claim an
+already-issued ACK or A's delayed local decision was fenced.
+
+One owned-process parent ran two real three-member private-fixture children.
+Each was pinned while alive and observed killed/reaped by signal9 at its exact
+fresh writer cut: before marker publication, and after namespace sync/exact-byte
+verification but before any local result. Raw files were captured before recovery
+or writer open. The first arm establishes absence only at that owned marker
+path; the second preserves the exact stored marker. This is whole-fixture
+process death, not one-node loss with surviving peers, power loss or cold Main
+readiness. Historical cut DATA grants no RPC promise, ChosenFrame, custody,
+lease, recovery or serving authority. Cooperative markers stay preserved.
+
+I140's pre-compilation tooling refusal is immutable: a copied runner asserted
+the old R47 HEAD. Normal maintained version probes ran, but no compiler/native
+stage started and all216 controls stayed unrun. Its outer failure archive and
+drain were verified. I143 binds the sealed current plan HEAD without fallback;
+no Rust correction, cap increase or source relaxation was required.
+
+`R48-REPORT.md` and `R48-COMBINED-RESULT.json` bind exact source/artifact/measurement,
+standard acceptance/stage-I/O/node-window/coverage tables, failures and cleanup.
+Passing receipts are I143 `7fc72538`, I144 `85897ac4` and I145 `0044bd58`.
+I144 preserved 938 regular files with archive/hash/compare PASS. Sampled
+identities/groups were I14313/5, I14411/15 and I14512identities/2sessions;
+all recorded processes, own scopes/cgroups and private roots drained.
+
+Development continues. All-writer/old-decision fencing, immutable promise-cut
+versus current accepted state, exact majority ChosenFrame evidence, complete
+original-effect custody/settlement/residency and compatible serving transitions
+remain separate requirements. Actual survivor operation, abrupt loss, partition,
+reconnect/no-failback and Sinomo-only quietness remain open. No peer review,
+Docker, production activation or push occurred.
+
+## Historical checkpoints
+
+### Preserved R47 checkpoint
 
 The selected local recovery-fence DATA prerequisite is integrated and its
 corrected controls are executed. Source/native commits `8f895b89`/`d07c83a9`
@@ -53,7 +102,6 @@ operation, real abrupt-loss/partition/rejoin/no-failback and mandatory Sinomo-on
 quietness remain open. The reservation and local DATA fence do not authorize a
 count-only weakening of FullShard or complete the original availability goal.
 
-## Historical checkpoints
 
 ### Preserved R45 checkpoint
 
