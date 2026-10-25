@@ -761,7 +761,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     let birth = store.original_repair_for_slot(intent_id, target_node_id)?.ok_or_else(pending_error)?;
                     call = call.with_original_repair(birth.original_wire_material()?)?;
                 }
-                requests.push(DfsRoutedSend::new(target_node_id.clone(), call));
+                let mut send = DfsRoutedSend::new(target_node_id.clone(), call);
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    send.native_repair_custody =
+                        self.prepare_native_repair_custody_for_owned_send(&send.call.message)?;
+                }
+                requests.push(send);
                 continue;
             }
             let (_, reader) = self.open_content_hash_stream(
