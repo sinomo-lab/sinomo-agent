@@ -1,6 +1,63 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R42
+## Current development checkpoint — 2026-10-25 R45
+
+The actual native V7 local-commit/reply-loss/delayed-dissemination control now
+passes completely. Test-runtime helpers `dcd64f5a`, native control `e808fab1`,
+inspection correction `d0331e99` and one-call fault-lifetime correction `e83238b6`
+are retained in normal local Git ancestry. Current code is `8f7d717d`; source
+`1860de21` contains 4,913 inputs and own sealed executable is `2b5b0afc`.
+I131 fresh check/build/seal passed in 15.498832/200.159140/3.204852 seconds.
+I132 executed only the new lifetime control and native case: **2 PASS**.
+I133 current-source DFS/KV boundary passed 11 UI controls and three libraries.
+The other 199 of 201 inventory IDs remain unrun on R45; old results do not transfer.
+
+The native fixture uses the actual three-member metadata assignment and a managed
+4,096-byte stable conditional overwrite with content W=1/N=1 required on A.
+A real completed Committed reply is captured before loss; normal automatic
+physical-call reconciliation can return success. Both metadata peers are still
+Prepared while A's actual V7 prepare/commit, original body/base and timestamp are
+durable and the exact original commit RPCs are held. After those gates release,
+the SAME operation/body/options/base replays the same outcome without a second
+target prepare/commit or timestamp change. Both peers' actual frames converge,
+one peer normally reopens, content readback matches and strict runtime close passes.
+
+This characterizes existing ACK semantics; it does not add a gate requiring
+client ACK to await all peer commit dissemination. `published: false` means an
+exact already-local-committed retry, not a dissemination certificate. FullShard,
+source authority, semantic durability and all original deadlines remain unchanged.
+The test is native in-process evidence, not real one-node loss with survivors,
+power loss, a ChosenFrame certificate, recovery quorum or serving activation.
+
+The failures remain explicit. R43 I127 had four passes and a 600-second incomplete
+native case: its authored inspection nested a locking journal reader inside the
+same held inspection fence. The correction keeps that fence and reads existing
+durable entries/exact frames without reacquiring it. R44 I129 reached the semantic
+print but failed at close when the one-hit write-loss rule matched an automatic
+retry. The lifetime fix binds only the first physical call; distinct retries
+bypass that rule while the same call still exhausts. There is no hit/cap increase,
+reset, ignored close error or timestamp/identity substitution. I125's earlier
+zero-spawn tooling preflight refusal also remains immutable.
+
+`R43-REPORT.md`, `R44-REPORT.md` and `R45-REPORT.md` preserve source-qualified
+results, failures, standard timing/I/O/coverage tables and exact artifact hashes.
+The passing R45 receipts are I131 `01af2c77`, I132 `459c7b14` and I133 `da94fe23`.
+All case checkpoints, archives/hash/compare and owned process/group/cgroup/root
+drains passed. No peer review, debugger coordination, shared build lock, Docker,
+production, account/accounting change, push or deployment occurred.
+
+Development continues with a separately selected local recovery-fence prerequisite.
+Its contract refuses every existing cooperative marker, including activated cuts;
+local immutable ACK DATA must not become RPC, ChosenFrame, custody or serving
+permission. That source and its native tests remain uncompiled/unrun until their
+own coherent integration. Original-effect coverage/settlement/residency, actual
+promise/accepted/chosen history, compatible activation/replacement, survivor
+operation, real abrupt-loss/partition/rejoin and mandatory Sinomo-only quietness
+remain open. The original availability goal is not complete.
+
+## Historical checkpoints
+
+### Preserved R42 checkpoint
 
 The non-activating recovery-ballot reservation prerequisite is implemented and
 executed in `cfg(test)` only. Implementation `2ca9578d` and native controls
@@ -49,8 +106,6 @@ effect bodies/uncertainty and settlement/residency, compatible activation/store
 replacement, full survivor authority/history, real abrupt-loss/partition/rejoin
 and mandatory Sinomo-only quietness remain open. This checkpoint does not
 complete the original availability goal or authorize changing FullShard.
-
-## Historical checkpoints
 
 ### Preserved R41 checkpoint
 
