@@ -1,6 +1,61 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R45
+## Current development checkpoint — 2026-10-25 R47
+
+The selected local recovery-fence DATA prerequisite is integrated and its
+corrected controls are executed. Source/native commits `8f895b89`/`d07c83a9`
+merged at `b5d24430`; fixture corrections `db3f30fa`/`f16f4f24` merged normally
+at `bec81869`. Current source `3b9e138f` contains 4,917 inputs; own sealed ELF is
+`921e758a`. I137 check/build/seal passed in 9.797635/173.475585/3.288828 seconds.
+I138 executed exactly the seven corrected cases: **7 PASS**, including six
+native controls. I139 current-source boundary passed 11 UI controls and three
+libraries. Other 206 of 213 inventory IDs remain unrun on R47. Five other file
+controls and three cooperative regressions passed only on R46, not transferred.
+
+The native acceptor is an actual eligible replica B with no cooperative marker.
+A's real cooperative markers and serving assignment stay intact. Actual A-to-B
+nonempty/empty authority and prefix RPCs apply before the local fence and refuse
+after it without changing the real stored floors or prefix. The tests also
+execute duplicate/namespace recertification and cold DATA read, malformed/expired/
+spent/default/foreign-owner refusal, and pending/activated cooperative byte
+preservation. The immutable local ACK and cut are DATA only: not an RPC response,
+ChosenFrame certificate, custody proof, lease, serving or recovery authority.
+
+**Primary-writer before/after coverage is unrepresented** because the actual
+primary has an ineligible cooperative marker. Its delayed already-authorized
+local decision is not claimed fenced. Snapshot support is also not claimed:
+normal valid-snapshot refusal and unreadable replacement's existing default-reader
+protection are separate outcomes. Metadata participant proof/count, production
+activation and all hard identity/policy/store fences remain unchanged.
+
+R46 I135's **8 PASS / 7 FAIL101** remains immutable. The malformed/mixed fixture
+was rejected while constructing an invalid zero-sequence initial ACK floor; the
+fix establishes one genuine persisted preparation/prefix1 without relaxing that
+guard. Native setup met a real primary cooperative marker and used an unsuitable
+seed observation. The fix selects actual eligible B and a genuine stable Main
+overwrite with a canonical owned read, never deleting a marker or fabricating a
+body. Only two test files changed; IDs, order, caps and assertions stay intact.
+
+`R46-REPORT.md`, `R46-COMBINED-RESULT.json`, `R47-REPORT.md` and
+`R47-COMBINED-RESULT.json` retain exact source/artifact/result/measurement and
+failure evidence. Passing receipts are I137 `41028897`, I138 `25a1b3b2` and I139
+`cbc6b4d4`. I138 preserved 1,216 regular files; every case checkpoint, archive,
+hash/compare and owned process/group/cgroup/root drain passed. Standard acceptance,
+stage/I/O, node-window and coverage tables keep unavailable counters explicit.
+No peer review, debugger arbitration, shared build lock, Docker, production,
+account/accounting change, push or deployment occurred.
+
+Development continues. Actual all-writer/delayed-decision fencing, immutable
+promise cut versus mutable accepted state, exact majority ChosenFrame evidence,
+complete original-effect custody/settlement/residency, compatible activation and
+physical replacement remain separate protocol requirements. Full survivor
+operation, real abrupt-loss/partition/rejoin/no-failback and mandatory Sinomo-only
+quietness remain open. The reservation and local DATA fence do not authorize a
+count-only weakening of FullShard or complete the original availability goal.
+
+## Historical checkpoints
+
+### Preserved R45 checkpoint
 
 The actual native V7 local-commit/reply-loss/delayed-dissemination control now
 passes completely. Test-runtime helpers `dcd64f5a`, native control `e808fab1`,
@@ -54,8 +109,6 @@ own coherent integration. Original-effect coverage/settlement/residency, actual
 promise/accepted/chosen history, compatible activation/replacement, survivor
 operation, real abrupt-loss/partition/rejoin and mandatory Sinomo-only quietness
 remain open. The original availability goal is not complete.
-
-## Historical checkpoints
 
 ### Preserved R42 checkpoint
 
