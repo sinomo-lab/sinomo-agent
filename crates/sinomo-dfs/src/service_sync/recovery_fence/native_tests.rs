@@ -1,6 +1,7 @@
 //! Native owner + authoritative reservation controls. Fence results remain DATA.
 mod inflight;
 mod owned_process;
+mod rpc;
 
 use crate::control_plane::{
     DfsMetadataShardRecoveryBallotRequest, DfsRecoveryBallotBegin, metadata_shard_key,
