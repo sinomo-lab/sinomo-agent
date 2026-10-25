@@ -599,3 +599,197 @@ fn selected_recovery_refuses_valid_snapshot_and_unreadable_replacement_without_e
     assert_eq!(retained_files(&f.backend.root), shard_before);
     assert_eq!(retained_files(custody_root), custody_before);
 }
+
+#[test]
+fn selected_recovery_writer_hooks_bind_fresh_scope_and_original_deadline() {
+    use crate::metadata_api::selected_local_recovery::{
+        SelectedRecoveryWriterCut as Cut, SelectedRecoveryWriterHook as Hook,
+        SelectedRecoveryWriterObservation,
+    };
+    use std::sync::Mutex;
+    use std::time::Instant;
+    let fresh_deadline = || Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut f = fixture("selected-recovery-writer-hook-scope");
+    let root = f.backend.root.clone();
+    let request_at = |floor| {
+        DfsMetadataShardRecoveryBallotRequest::prepare(
+            &f.request.serving_shard,
+            &f.request.ballot.candidate_node_id,
+            floor,
+        )
+        .unwrap()
+    };
+    let requests: Vec<_> = (0..=5).map(request_at).collect();
+    fn unexpected(_: &SelectedRecoveryWriterObservation) -> Result<()> {
+        panic!("unrelated or duplicate publication must not observe a cut");
+    }
+    let wrong_root = Hook::install(
+        root.with_extension("another-physical-root"),
+        requests[0].clone(),
+        Cut::BeforeMarkerPublication,
+        fresh_deadline(),
+        unexpected,
+    )
+    .unwrap();
+    let first = install(&mut f).unwrap();
+    assert_eq!(wrong_root.hits(), 0);
+    drop(wrong_root);
+
+    let duplicate = Hook::install(
+        root.clone(),
+        requests[0].clone(),
+        Cut::AfterMarkerNamespaceSync,
+        fresh_deadline(),
+        unexpected,
+    )
+    .unwrap();
+    assert_eq!(install(&mut f).unwrap(), first);
+    assert_eq!(duplicate.hits(), 0);
+    assert!(
+        Hook::install(
+            root.clone(),
+            requests[0].clone(),
+            Cut::BeforeMarkerPublication,
+            fresh_deadline(),
+            unexpected,
+        )
+        .is_err(),
+        "occupied registration cannot replace its owner"
+    );
+    drop(duplicate);
+
+    let wrong_request = Hook::install(
+        root.clone(),
+        requests[2].clone(),
+        Cut::BeforeMarkerPublication,
+        fresh_deadline(),
+        unexpected,
+    )
+    .unwrap();
+    f.request = requests[1].clone();
+    install(&mut f).unwrap();
+    assert_eq!(wrong_request.hits(), 0);
+    drop(wrong_request);
+
+    for (request, cut) in [
+        (requests[2].clone(), Cut::BeforeMarkerPublication),
+        (requests[3].clone(), Cut::AfterMarkerNamespaceSync),
+    ] {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let hook = Hook::install(
+            root.clone(),
+            request.clone(),
+            cut,
+            fresh_deadline(),
+            move |data| {
+                captured.lock().unwrap().push(data.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        // No wait thread is needed for this scope control; a release never
+        // prevents observation or changes the fixed deadline check.
+        hook.release();
+        f.request = request;
+        let installed = install(&mut f).unwrap();
+        assert_eq!(hook.hits(), 1);
+        let actual = observed.lock().unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].cut, cut);
+        assert_eq!(actual[0].marker_path, marker(&f));
+        assert_eq!(actual[0].fence, installed.fence);
+        assert_eq!(
+            actual[0].stored_marker_bytes,
+            match cut {
+                Cut::BeforeMarkerPublication => None,
+                Cut::AfterMarkerNamespaceSync => Some(installed.marker_bytes.clone()),
+            }
+        );
+        drop(actual);
+        assert_eq!(install(&mut f).unwrap(), installed);
+        assert_eq!(
+            hook.hits(),
+            1,
+            "duplicate recertification is not a fresh cut"
+        );
+        drop(hook);
+    }
+
+    f.request = requests[4].clone();
+    let before = std::fs::read(marker(&f)).unwrap();
+    let expired = Hook::install(
+        root.clone(),
+        f.request.clone(),
+        Cut::BeforeMarkerPublication,
+        Instant::now(),
+        unexpected,
+    )
+    .unwrap();
+    expired.release();
+    assert!(
+        install(&mut f)
+            .unwrap_err()
+            .to_string()
+            .contains("original deadline expired")
+    );
+    assert_eq!(expired.hits(), 0);
+    assert_eq!(std::fs::read(marker(&f)).unwrap(), before);
+    drop(expired);
+    assert!(
+        Hook::install(
+            root.clone(),
+            f.request.clone(),
+            Cut::BeforeMarkerPublication,
+            fresh_deadline() + std::time::Duration::from_secs(60),
+            unexpected,
+        )
+        .is_err(),
+        "the hook cannot enlarge the existing call budget"
+    );
+    assert_eq!(
+        install(&mut f).unwrap().fence.reservation,
+        f.request,
+        "dropping the negative scope does not leave a hidden admission flag"
+    );
+
+    // Exercise the real bounded pause after synchronization. Its expiration
+    // withholds the return while retaining the actual historical marker DATA.
+    f.request = requests[5].clone();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&observed);
+    let post_sync = Hook::install(
+        root,
+        f.request.clone(),
+        Cut::AfterMarkerNamespaceSync,
+        fresh_deadline(),
+        move |data| {
+            captured.lock().unwrap().push(data.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert!(
+        install(&mut f)
+            .unwrap_err()
+            .to_string()
+            .contains("original deadline expired")
+    );
+    assert_eq!(post_sync.hits(), 1);
+    let historical = f
+        .backend
+        .selected_local_recovery_fence(&f.backend.shard_id)
+        .unwrap()
+        .unwrap();
+    let actual = observed.lock().unwrap();
+    assert_eq!(actual.len(), 1);
+    assert_eq!(actual[0].fence, historical.fence);
+    assert_eq!(
+        actual[0].stored_marker_bytes.as_deref(),
+        Some(historical.marker_bytes.as_slice())
+    );
+    assert_eq!(std::fs::read(marker(&f)).unwrap(), historical.marker_bytes);
+    drop(actual);
+    drop(post_sync);
+    assert_eq!(install(&mut f).unwrap(), historical);
+}

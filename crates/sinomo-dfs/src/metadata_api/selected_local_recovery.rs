@@ -4,9 +4,186 @@ use super::*;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub(crate) const SELECTED_LOCAL_RECOVERY_PREPARE_LIMIT: usize = 256;
 const MAX_MARKER_BYTES: u64 = 1024 * 1024;
+
+/// Negative-only cuts in one fresh selected marker publication. Neither cut
+/// is a returned durable result, native RPC acknowledgement or authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectedRecoveryWriterCut {
+    BeforeMarkerPublication,
+    AfterMarkerNamespaceSync,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedRecoveryWriterObservation {
+    pub(crate) cut: SelectedRecoveryWriterCut,
+    pub(crate) marker_path: PathBuf,
+    pub(crate) fence: DfsSelectedLocalRecoveryFence,
+    /// None before the atomic publisher; exact checked bytes after namespace
+    /// sync. This field is observation DATA, never a durable response token.
+    pub(crate) stored_marker_bytes: Option<Vec<u8>>,
+}
+
+struct SelectedRecoveryWriterHookState {
+    shard_root: PathBuf,
+    request: crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+    cut: SelectedRecoveryWriterCut,
+    deadline: Instant,
+    observer: Box<dyn Fn(&SelectedRecoveryWriterObservation) -> Result<()>>,
+    hits: std::cell::Cell<usize>,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+thread_local! {
+    // The actual synchronous selected writer and its owning test worker are
+    // the only participants. No process-wide registry or admission bit.
+    static SELECTED_RECOVERY_WRITER_HOOK: std::cell::RefCell<Option<std::rc::Rc<SelectedRecoveryWriterHookState>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Same-worker scope; Rc deliberately prevents moving a live registration to
+/// another worker. Drop always releases its own pause without renewing time.
+pub(crate) struct SelectedRecoveryWriterHook {
+    state: std::rc::Rc<SelectedRecoveryWriterHookState>,
+}
+
+impl SelectedRecoveryWriterHook {
+    pub(crate) fn install(
+        shard_root: PathBuf,
+        request: crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+        cut: SelectedRecoveryWriterCut,
+        deadline: Instant,
+        observer: impl Fn(&SelectedRecoveryWriterObservation) -> Result<()> + 'static,
+    ) -> Result<Self> {
+        if deadline
+            .checked_duration_since(Instant::now())
+            .is_some_and(|remaining| remaining > sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        {
+            return Err(selected_layout_rejection(
+                "selected recovery writer hook exceeds the existing call budget",
+            ));
+        }
+        let state = std::rc::Rc::new(SelectedRecoveryWriterHookState {
+            shard_root,
+            request,
+            cut,
+            deadline,
+            observer: Box::new(observer),
+            hits: std::cell::Cell::new(0),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        SELECTED_RECOVERY_WRITER_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_some() {
+                return Err(selected_layout_rejection(
+                    "selected recovery writer hook already registered on this worker",
+                ));
+            }
+            *slot = Some(std::rc::Rc::clone(&state));
+            Ok(Self { state })
+        })
+    }
+
+    pub(crate) fn hits(&self) -> usize {
+        self.state.hits.get()
+    }
+
+    pub(crate) fn release(&self) {
+        *self
+            .state
+            .released
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
+        self.state.release.notify_all();
+    }
+}
+
+impl Drop for SelectedRecoveryWriterHook {
+    fn drop(&mut self) {
+        self.release();
+        SELECTED_RECOVERY_WRITER_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|current| std::rc::Rc::ptr_eq(current, &self.state))
+            {
+                *slot = None;
+            }
+        });
+    }
+}
+
+fn observe_selected_recovery_writer_cut(
+    path: &Path,
+    fence: &DfsSelectedLocalRecoveryFence,
+    cut: SelectedRecoveryWriterCut,
+    stored_marker_bytes: Option<&[u8]>,
+) -> Result<()> {
+    let hook = SELECTED_RECOVERY_WRITER_HOOK.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|hook| {
+                hook.cut == cut
+                    && hook.shard_root == fence.physical.shard_root
+                    && hook.request == fence.reservation
+                    && path
+                        == hook
+                            .shard_root
+                            .join("journal/membership-handoff-write-freeze.sobj")
+            })
+            .cloned()
+    });
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    let expired =
+        || selected_layout_rejection("selected recovery writer hook original deadline expired");
+    if Instant::now() >= hook.deadline {
+        return Err(expired());
+    }
+    if hook.hits.replace(hook.hits.get().saturating_add(1)) != 0 {
+        return Err(selected_layout_rejection(
+            "selected recovery writer hook fresh-publication budget exhausted",
+        ));
+    }
+    // The thread-local slot is no longer borrowed. The observer may publish
+    // bounded Ready DATA, but does not receive the layout, writer or a permit.
+    (hook.observer)(&SelectedRecoveryWriterObservation {
+        cut,
+        marker_path: path.to_path_buf(),
+        fence: fence.clone(),
+        stored_marker_bytes: stored_marker_bytes.map(<[u8]>::to_vec),
+    })?;
+    let mut released = hook
+        .released
+        .lock()
+        .map_err(|_| selected_layout_rejection("selected recovery writer hook release poisoned"))?;
+    loop {
+        let remaining = hook
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(expired)?;
+        if *released {
+            break;
+        }
+        released = hook
+            .release
+            .wait_timeout(released, remaining)
+            .map_err(|_| selected_layout_rejection("selected recovery writer hook wait poisoned"))?
+            .0;
+    }
+    // A release which was observed only after descheduling cannot extend the
+    // original call deadline or turn an expired cut into a successful result.
+    if Instant::now() >= hook.deadline {
+        return Err(expired());
+    }
+    Ok(())
+}
 
 thread_local! {
     /// Negative-only boundary in this selected writer; tests restore it on
@@ -408,6 +585,12 @@ pub(crate) fn write_selected_local_recovery_fence(
         }
         _ => {}
     }
+    observe_selected_recovery_writer_cut(
+        path,
+        fence,
+        SelectedRecoveryWriterCut::BeforeMarkerPublication,
+        None,
+    )?;
     let generation = crate::repair_handoff::publish_and_certify_selected(path, &envelope)
         .map_err(|e| selected_layout_rejection(e.to_string()))?;
     sync_namespace(&stage, path.parent().expect("checked journal path"))?;
@@ -425,5 +608,11 @@ pub(crate) fn write_selected_local_recovery_fence(
             "selected recovery publication differs from captured bytes",
         ));
     }
+    observe_selected_recovery_writer_cut(
+        path,
+        fence,
+        SelectedRecoveryWriterCut::AfterMarkerNamespaceSync,
+        Some(&stored.marker_bytes),
+    )?;
     Ok(stored)
 }
