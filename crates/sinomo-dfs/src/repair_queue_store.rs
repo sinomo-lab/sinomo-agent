@@ -859,6 +859,11 @@ impl RepairCustodyIndex {
                 }
             }
             RepairCustodyChange::Observe { subject, response } => {
+                if self.native_completion_pending(subject) {
+                    return Err(custody_error(
+                        "original Repair awaits native completion custody settlement",
+                    ));
+                }
                 self.births
                     .get(subject)
                     .ok_or_else(|| custody_error("result has no original Repair birth"))?
@@ -2762,6 +2767,11 @@ impl LocalDfsRepairQueueStore {
                 intent_id: response.intent_id.clone(),
                 request_id: response.request_id.clone(),
             };
+            if state.custody.native_completion_pending(&subject) {
+                return Err(custody_error(
+                    "original Repair awaits native completion custody settlement",
+                ));
+            }
             let Some(birth) = state.custody.births.get(&subject) else {
                 return Ok(None);
             };
