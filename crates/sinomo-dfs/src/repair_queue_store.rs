@@ -27,6 +27,12 @@ pub use completion_candidate::{
 };
 mod attempt_witness;
 pub(crate) use attempt_witness::RepairOriginalAttemptWitness;
+mod native_completion;
+pub use native_completion::NativeOwnedRepairCompletionData;
+pub(crate) use native_completion::{
+    DeferredNativeRepairCompletion, NativeOwnedRepairCompletionRef,
+    RetainedNativeOwnedRepairCompletion,
+};
 mod history;
 pub(crate) use history::ImportedRepairHistoryQuery;
 
@@ -236,6 +242,11 @@ pub enum RepairCustodyChange {
     RetainCompletionCandidate {
         input: Box<RepairCompletionCandidateInput>,
     },
+    /// Actual native-owned return DATA, separate from unverified candidates.
+    /// Appended at the end to preserve every prior SOBJ enum ordinal.
+    RetainNativeOwnedCompletion {
+        data: Box<NativeOwnedRepairCompletionData>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -251,6 +262,8 @@ struct RepairCustodySnapshot {
     imported_history_queries: Vec<history::ImportedRepairHistorySnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retained_completion_candidates: Vec<completion_candidate::RetainedRepairCompletionCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained_native_completions: Vec<RetainedNativeOwnedRepairCompletion>,
 }
 
 /// Exact captured material. This contains no executor or root-release permit.
@@ -341,8 +354,9 @@ struct RepairCustodyIndex {
     imported_executor_associations: BTreeMap<(String, String), ImportedRepairExecutorAssociation>,
     imported_history_queries: BTreeMap<crate::DfsOriginalRepairHistoryQueryRef, ImportedRepairHistoryQuery>,
     imported_history_slots: BTreeMap<(String, String), crate::DfsOriginalRepairHistoryQueryRef>,
-    // Derived from retained imports/query phases, never another sequence
-    // allocator or persisted ledger. None reserves an actual import frame.
+    // Derived from retained import/query/native-return DATA phases, never
+    // another sequence allocator or persisted ledger. None reserves an actual
+    // import/native-return frame, not an executable query.
     history_sequences: BTreeMap<u64, Option<crate::DfsOriginalRepairHistoryQueryRef>>,
     // Conflict index only. Never consulted as runnable/native original work.
     associated_slots: BTreeMap<DfsRepairQueueKey, (String, String)>,
@@ -354,6 +368,10 @@ struct RepairCustodyIndex {
     retained_completion_candidates: BTreeMap<
         completion_candidate::RepairCompletionCandidateKey,
         completion_candidate::RetainedRepairCompletionCandidate,
+    >,
+    retained_native_completions: BTreeMap<
+        native_completion::NativeCompletionKey,
+        RetainedNativeOwnedRepairCompletion,
     >,
 }
 
@@ -596,7 +614,8 @@ impl RepairCustodyIndex {
             && (!snapshot.imported_original_data.is_empty()
                 || !snapshot.imported_executor_associations.is_empty()
                 || !snapshot.imported_history_queries.is_empty()
-                || !snapshot.retained_completion_candidates.is_empty())
+                || !snapshot.retained_completion_candidates.is_empty()
+                || !snapshot.retained_native_completions.is_empty())
         {
             return Err(custody_error("default queue reader rejects selected original DATA"));
         }
@@ -687,6 +706,9 @@ impl RepairCustodyIndex {
         for candidate in snapshot.retained_completion_candidates {
             result.restore_completion_candidate(candidate, floor)?;
         }
+        for completion in snapshot.retained_native_completions {
+            result.restore_native_completion(completion, floor)?;
+        }
         Ok(result)
     }
 
@@ -702,6 +724,7 @@ impl RepairCustodyIndex {
                 .collect(),
             imported_history_queries: self.imported_history_queries.values().map(ImportedRepairHistoryQuery::snapshot).collect(),
             retained_completion_candidates: self.retained_completion_candidates.values().cloned().collect(),
+            retained_native_completions: self.retained_native_completions.values().cloned().collect(),
         })
     }
 
@@ -778,6 +801,9 @@ impl RepairCustodyIndex {
 
     fn validate_change(&self, change: &RepairCustodyChange) -> Result<(), DfsError> {
         match change {
+            RepairCustodyChange::RetainNativeOwnedCompletion { data } => {
+                self.validate_new_native_completion(data)?;
+            }
             RepairCustodyChange::RetainCompletionCandidate { input } => {
                 self.validate_new_completion_candidate(input)?;
             }
@@ -839,6 +865,11 @@ impl RepairCustodyIndex {
                     .validate_response(response)?;
             }
             RepairCustodyChange::Attempt { subject, .. } => {
+                if self.native_completion_pending(subject) {
+                    return Err(custody_error(
+                        "original Repair awaits native completion custody settlement",
+                    ));
+                }
                 if self
                     .births
                     .get(subject)
@@ -1008,6 +1039,9 @@ impl RepairCustodyIndex {
     ) -> Result<(), DfsError> {
         self.validate_change(change)?;
         match change {
+            RepairCustodyChange::RetainNativeOwnedCompletion { data } => {
+                self.apply_native_completion(data, sequence)?;
+            }
             RepairCustodyChange::RetainCompletionCandidate { input } => {
                 self.apply_completion_candidate(input, sequence)?;
             }
@@ -1802,6 +1836,7 @@ impl DfsRepairQueueState {
             return Ok((self.head_sequence, 0));
         }
         completion_candidate::validate_candidate_frame(&operations)?;
+        native_completion::validate_native_completion_frame(&operations)?;
 
         validate_repair_queue_operations(&self.records, &operations)?;
         self.custody.validate_scheduling_changes(&operations)?;
@@ -1824,6 +1859,7 @@ impl DfsRepairQueueState {
                 change,
                 RepairCustodyChange::ImportOriginalData { .. }
                     | RepairCustodyChange::RetainCompletionCandidate { .. }
+                    | RepairCustodyChange::RetainNativeOwnedCompletion { .. }
                     | RepairCustodyChange::AssociateImportedExecutor { .. }
                     | RepairCustodyChange::BeginImportedHistoryQuery { .. }
                     | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
@@ -2601,6 +2637,11 @@ impl LocalDfsRepairQueueStore {
         state.with_writer_lock(|state| {
             state.refresh_from_disk()?;
             let subject = repair_subject(&state.custody.incarnation, message)?;
+            if state.custody.native_completion_pending(&subject) {
+                return Err(custody_error(
+                    "original Repair awaits native completion custody settlement",
+                ));
+            }
             let birth = state
                 .custody
                 .births
@@ -2626,9 +2667,19 @@ impl LocalDfsRepairQueueStore {
         &self,
         message: &crate::DfsRoutedMessage,
     ) -> Result<RepairOriginalBirth, DfsError> {
-        let birth = self.original_repair(message)?.ok_or_else(|| {
-            custody_error("native Repair dispatch lacks its complete original body")
-        })?;
+        let birth = {
+            let mut state = self.lock_state()?;
+            state.refresh_from_disk()?;
+            let subject = repair_subject(&state.custody.incarnation, message)?;
+            if state.custody.native_completion_pending(&subject) {
+                return Err(custody_error(
+                    "original Repair awaits native completion custody settlement",
+                ));
+            }
+            state.custody.births.get(&subject).cloned().ok_or_else(|| {
+                custody_error("native Repair dispatch lacks its complete original body")
+            })?
+        };
         if birth.closed_at_sequence.is_some()
             || !birth.observed.is_empty()
             || original_repair_digest(message, &birth.attachment)?
@@ -3923,6 +3974,7 @@ fn replay_repair_queue_log(
                 DfsRepairQueueOperation::RepairCustody { change } if matches!(change.as_ref(),
                     RepairCustodyChange::ImportOriginalData { .. }
                         | RepairCustodyChange::RetainCompletionCandidate { .. }
+                        | RepairCustodyChange::RetainNativeOwnedCompletion { .. }
                         | RepairCustodyChange::AssociateImportedExecutor { .. }
                     | RepairCustodyChange::BeginImportedHistoryQuery { .. }
                     | RepairCustodyChange::ObserveImportedHistoryQueryDelivery { .. }
@@ -3931,6 +3983,7 @@ fn replay_repair_queue_log(
             return Err(custody_error("default queue replay rejects selected original DATA"));
         }
         completion_candidate::validate_candidate_frame(&batch.operations)?;
+        native_completion::validate_native_completion_frame(&batch.operations)?;
         if selected_reader { history::validate_history_frame(&batch.operations)?; }
         if batch.sequence <= snapshot_floor {
             if custody.incarnation.is_empty()
