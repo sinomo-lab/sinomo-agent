@@ -519,7 +519,7 @@ pub(crate) fn write_cluster_state_unlocked(
 /// Accepted joins instead need the revision on disk as a generation fence for
 /// delayed local read/modify/write work, so only an exact revision match may
 /// take the semantic-skip path here.
-fn write_accepted_cluster_state_unlocked(
+pub(crate) fn write_accepted_cluster_state_unlocked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
@@ -994,6 +994,46 @@ mod tests {
             &mut local, peer
         ));
         assert_eq!(local.members[0], expected);
+    }
+
+    #[test]
+    fn retired_remote_listener_cannot_return_from_an_older_peer_member() {
+        let mut local = test_state("retired_remote_listener_echo");
+        let remote = add_learner(&mut local, "retired_remote_listener_target");
+        let index = local
+            .members
+            .iter()
+            .position(|member| member.node_id == remote)
+            .unwrap();
+        let current = observed_listener(&remote, "192.0.2.22:21353");
+        local.members[index].endpoints = vec![current.clone()];
+        let mut peer = local.clone();
+        let mut stale = local.members[index].clone();
+        stale.updated_at -= time::Duration::seconds(1);
+        let retired = observed_listener(&remote, "192.0.2.11:21353");
+        let hint = observed_listener(&remote, "bridge-local.example:21353");
+        let mut relay = observed_listener(&remote, "relay-placeholder");
+        relay.address = "https://relay.invalid/route".into();
+        relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+        relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+        relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+        stale.endpoints = vec![retired.clone(), hint.clone(), relay.clone()];
+        peer.members[index] = stale;
+        crate::member_store::merge_cluster_state_from_peer(&mut local, peer);
+        let endpoints = &local.members[index].endpoints;
+        assert!(endpoints.contains(&current));
+        assert!(
+            endpoints.contains(&hint),
+            "locally useful named bridge hints remain advisory routes"
+        );
+        assert!(
+            endpoints.contains(&relay),
+            "other transports retain their existing merge behavior"
+        );
+        assert!(
+            !endpoints.contains(&retired),
+            "an older peer member cannot resurrect a replaced listener"
+        );
     }
 
     #[test]

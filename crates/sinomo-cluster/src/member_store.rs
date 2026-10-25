@@ -6,7 +6,8 @@ use crate::keyspace::{
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
 use crate::local_membership::{
-    daemon_tcp_endpoint_is_listener_advertisement, remove_superseded_daemon_listeners,
+    daemon_tcp_endpoint_is_listener_advertisement, locally_learned_route_endpoint,
+    remove_superseded_daemon_listeners,
 };
 use sinomo_base::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterMemberRole,
@@ -107,6 +108,26 @@ pub(crate) fn merge_member_record(
                 .filter(|endpoint| daemon_tcp_endpoint_is_listener_advertisement(endpoint))
             {
                 upsert_member_endpoint(&mut incoming, endpoint.clone());
+            }
+        } else if incoming.updated_at < existing.updated_at
+            && existing.state.is_authorized()
+            && existing.endpoints.iter().any(|endpoint| {
+                daemon_tcp_endpoint_is_listener_advertisement(endpoint)
+                    && !locally_learned_route_endpoint(endpoint)
+            })
+        {
+            // The newer member body replaced its managed listeners. An older
+            // peer echo may still contribute other transports or a locally
+            // useful named bridge hint, but cannot resurrect retired sockets.
+            let hints = incoming
+                .endpoints
+                .iter()
+                .filter(|endpoint| locally_learned_route_endpoint(endpoint))
+                .cloned()
+                .collect::<Vec<_>>();
+            remove_superseded_daemon_listeners(&mut incoming.endpoints, &existing.endpoints);
+            for endpoint in hints {
+                upsert_member_endpoint(&mut incoming, endpoint);
             }
         }
         let mut changed = false;

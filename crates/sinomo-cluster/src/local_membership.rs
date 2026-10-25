@@ -445,7 +445,7 @@ pub(crate) fn locally_learned_remote_route_endpoints(
         .collect()
 }
 
-fn locally_learned_route_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+pub(crate) fn locally_learned_route_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
     matches!(
         endpoint.transport,
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
