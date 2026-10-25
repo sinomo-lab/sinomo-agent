@@ -11,8 +11,8 @@ use crate::{
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe, DfsMetadataPrefixProof,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNodeTransport, DfsPlacementPolicy,
-    DfsPlacementScope, DfsPosixSyncKind, DfsPreparedOperationStatus, DfsReplicationPolicy,
-    DfsWriteOptions, NetworkedDfsService,
+    DfsPlacementScope, DfsPosixSyncKind, DfsPreparedOperationRecord, DfsPreparedOperationStatus,
+    DfsReplicationPolicy, DfsWriteOptions, NetworkedDfsService,
 };
 use sinomo_core::DfsObjectPolicy;
 use sinomo_core::kv::KvEntry;
@@ -28,6 +28,8 @@ fn deadline() -> Instant {
 struct NativeFenceFixture {
     runtime: DfsTestRuntime,
     shard: DfsMetadataShardConfig,
+    acceptor: sinomo_core::node::NodeId,
+    selected: bool,
     service: Option<Service>,
     control: Option<Box<dyn DfsControlPlaneKvClient>>,
 }
@@ -55,9 +57,11 @@ impl NativeFenceFixture {
         .unwrap()
         .unwrap();
         assert_eq!(shard.replica_node_ids.len(), 2);
-        let service = runtime
-            .metadata_primary_service("/services/native-local-recovery-fence.bin")
-            .unwrap();
+        // Ordinary native formation leaves real activated cooperative markers
+        // on the initial primary. This primitive must not supersede them.
+        // Use an existing replica and prove eligibility on its actual store.
+        let acceptor = shard.replica_node_ids[0].clone();
+        let service = runtime.client(&acceptor).unwrap();
         assert!(service.native_publication_owner_for_observation().is_some());
         let mut peer = runtime.client(&shard.replica_node_ids[0]).unwrap();
         let control = peer
@@ -68,6 +72,8 @@ impl NativeFenceFixture {
         Self {
             runtime,
             shard,
+            acceptor,
+            selected,
             service: Some(service),
             control: Some(control),
         }
@@ -135,20 +141,43 @@ impl NativeFenceFixture {
     }
 
     fn no_cooperative_marker(&self) {
+        let layout = if self.selected {
+            Some(
+                self.runtime
+                    .selected_original_data_layout(&self.acceptor)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         assert!(
-            self.service
-                .as_ref()
-                .unwrap()
-                .metadata_backend()
-                .unwrap()
-                .metadata_shard_write_freeze(&self.shard_id())
-                .unwrap()
-                .is_none(),
+            crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                self.runtime.data_dir(&self.acceptor),
+                &self.shard_id(),
+                layout.as_deref(),
+            )
+            .unwrap()
+            .is_none(),
             "fresh native setup must be eligible; never erase an existing cooperative marker"
         );
     }
 
-    fn seed(&mut self, path: &str) {
+    fn current_records(&mut self) -> Vec<DfsPreparedOperationRecord> {
+        let id = self.shard_id();
+        let backend = self.service().metadata_backend_mut().unwrap();
+        backend
+            .begin_consistent_read_snapshot_on_shard(&id)
+            .unwrap();
+        let records = backend.list_prepared_operations();
+        backend.end_consistent_read_snapshot_on_shard(&id);
+        records
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.digest.shard_id == id)
+            .collect()
+    }
+
+    fn seed(&mut self, path: &str) -> DfsPreparedOperationRecord {
         let owner = &self.shard.primary_node_id;
         let mut policy =
             DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap();
@@ -160,33 +189,81 @@ impl NativeFenceFixture {
         assert!(caller.transport.delegates_local_namespace_authority());
         let cut = deadline();
         let old = caller.set_transport_operation_deadline(Some(cut));
-        let result = caller.posix_write_file(
-            path,
-            &[0x62; 4096],
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-                replica_candidates: vec![owner.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: true,
-            },
-        );
-        let sync = if result.is_ok() {
+        let options = DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 1).unwrap(),
+            replica_candidates: vec![owner.clone()],
+            wait_for_commit: true,
+            foreground_replica_repair: true,
+        };
+        let first = caller.posix_write_file(path, &[0x62; 4096], options.clone());
+        let operation = format!("native-recovery-seed-{}", sinomo_core::Id::generate());
+        let overwritten = first.as_ref().ok().map(|first| {
+            caller.posix_replace_file_if_version_from_reader_with_operation_id(
+                path,
+                &first.object_id,
+                &first.version,
+                std::io::Cursor::new(vec![0x63; 4096]),
+                options,
+                &operation,
+            )
+        });
+        let sync = if overwritten.as_ref().is_some_and(|result| result.is_ok()) {
             Some(caller.posix_sync_file(path, DfsPosixSyncKind::File))
         } else {
             None
         };
         caller.set_transport_operation_deadline(old);
-        result.unwrap();
+        let first = first.unwrap();
+        let overwritten = overwritten.unwrap().unwrap();
+        assert_eq!(overwritten.object_id, first.object_id);
+        assert_ne!(overwritten.version, first.version);
         sync.unwrap().unwrap();
         assert!(
             Instant::now() <= cut,
             "seed write and sync retain the same original 5s cap"
         );
         drop(caller);
-        // Read the seed through a newly opened actual effect owner, rather
-        // than comparing the install cut to the setup handle's old projection.
+        // A fresh Core handle alone need not refresh an existing native table
+        // projection. Read the exact normal overwrite through the existing
+        // canonical read scope, then release it before any journal lock.
+        let metadata_operation = format!(
+            "write:{}",
+            crate::intent::stable_write_intent_id(owner, &first.object_id, &operation,)
+        );
+        let mut primary = self.runtime.metadata_primary_service(path).unwrap();
+        let id = self.shard_id();
+        let backend = primary.metadata_backend_mut().unwrap();
+        backend
+            .begin_consistent_read_snapshot_on_shard(&id)
+            .unwrap();
+        let record = backend.prepared_operation_record(&metadata_operation);
+        backend.end_consistent_read_snapshot_on_shard(&id);
+        let record = record
+            .unwrap()
+            .expect("actual Main stable overwrite has its original canonical V7 record");
+        assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
+        assert_eq!(record.digest.operation_id, metadata_operation);
+        assert_eq!(record.digest.shard_id, id);
+        assert_eq!(record.digest.owner_epoch, self.shard.epoch);
+        assert_eq!(record.digest.file_system_id, self.shard.file_system_id);
+        assert_eq!(
+            record
+                .payload
+                .terminal_intent
+                .as_ref()
+                .unwrap()
+                .target_version,
+            overwritten.version
+        );
+        assert_eq!(
+            record.digest.payload_digest,
+            record.payload.canonical_digest().unwrap()
+        );
+        drop(primary);
         drop(self.service.take());
-        self.service = Some(self.runtime.metadata_primary_service(path).unwrap());
+        self.service = Some(self.runtime.client(&self.acceptor).unwrap());
+        self.current_records();
+        record
     }
 }
 
@@ -303,18 +380,25 @@ fn send_native(
 #[test]
 fn native_selected_local_recovery_fence_refuses_actual_replica_ingest_and_all_ack_purposes() {
     with_native("native-local-recovery-fence-ingress", true, |fixture| {
-        fixture.seed("/services/native-local-recovery-fence.bin");
+        let record = fixture.seed("/services/native-local-recovery-fence.bin");
+        fixture.no_cooperative_marker();
         let shard_id = fixture.shard_id();
         let primary = fixture.shard.primary_node_id.clone();
-        let target = fixture.shard.replica_node_ids[0].clone();
-        let backend = fixture.service().metadata_backend().unwrap();
-        let record = backend
-            .list_prepared_operations()
-            .unwrap()
-            .into_iter()
-            .filter(|record| record.status == DfsPreparedOperationStatus::Committed)
-            .max_by_key(|record| record.digest.prepare_sequence)
-            .expect("genuine seed published a complete V7 preparation");
+        let target = fixture.acceptor.clone();
+        let mut source = fixture
+            .runtime
+            .metadata_primary_service("/services/native-local-recovery-fence.bin")
+            .unwrap();
+        let backend = source.metadata_backend_mut().unwrap();
+        backend
+            .begin_consistent_read_snapshot_on_shard(&shard_id)
+            .unwrap();
+        let current = backend.prepared_operation_record(&record.digest.operation_id);
+        let prefix = backend.metadata_prefix_proof(&shard_id);
+        backend.end_consistent_read_snapshot_on_shard(&shard_id);
+        assert_eq!(current.unwrap(), Some(record.clone()));
+        let prefix = prefix.unwrap().unwrap();
+        let backend = source.metadata_backend().unwrap();
         let digest = record.digest;
         let batch = backend
             .journal_batch_for_shard_since_limited(
@@ -333,8 +417,8 @@ fn native_selected_local_recovery_fence_refuses_actual_replica_ingest_and_all_ac
         let frames =
             crate::metadata_replication::prepare_dfs_metadata_journal_frame_batch(backend, &batch)
                 .unwrap();
-        let prefix = backend.metadata_prefix_proof(&shard_id).unwrap().unwrap();
         assert_eq!(batch.next_after_sequence, prefix.journal_sequence);
+        drop(source);
         let probe = DfsMetadataAuthorityProbe {
             probe_id: "native-local-recovery-actual-authority".into(),
             expected_shard: fixture.shard.clone(),
@@ -508,17 +592,33 @@ fn native_selected_local_recovery_fence_recertifies_without_serving_or_writer_au
         let request = fixture.request();
         fixture.reserve(&request);
         let serving = fixture.serving_cells();
-        let prefix = fixture.prefix();
         let unresolved = fixture
-            .service()
-            .metadata_backend()
-            .unwrap()
-            .list_prepared_operations()
-            .unwrap()
+            .current_records()
             .into_iter()
             .filter(|record| record.status == DfsPreparedOperationStatus::Prepared)
             .map(|record| record.digest)
             .collect::<Vec<_>>();
+        let prefix = fixture.prefix();
+        let prefix_floor = fixture
+            .service()
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_ack_floor(&shard_id)
+            .unwrap()
+            .unwrap();
+        let authority_floor = fixture
+            .service()
+            .metadata_backend()
+            .unwrap()
+            .metadata_authority_ack_floor(&shard_id)
+            .unwrap()
+            .unwrap();
+        let primary_marker = crate::local_dfs_metadata_shard_path(
+            fixture.runtime.data_dir(&fixture.shard.primary_node_id),
+            &shard_id,
+        )
+        .join("journal/membership-handoff-write-freeze.sobj");
+        let primary_bytes = std::fs::read(&primary_marker).unwrap();
         let result = fixture
             .service()
             .install_selected_local_recovery_fence(&request, deadline())
@@ -530,16 +630,9 @@ fn native_selected_local_recovery_fence_recertifies_without_serving_or_writer_au
         );
         assert!(result.post_verification_error.is_none());
         assert_eq!(result.data.fence.reservation, request);
-        assert_eq!(
-            result.data.fence.acceptor_node_id,
-            fixture.shard.primary_node_id
-        );
+        assert_eq!(result.data.fence.acceptor_node_id, fixture.acceptor);
         assert_eq!(result.data.fence.prefix, prefix);
-        let retained_frames = exact_frames(
-            &fixture.runtime,
-            &fixture.shard.primary_node_id,
-            &fixture.shard,
-        );
+        let retained_frames = exact_frames(&fixture.runtime, &fixture.acceptor, &fixture.shard);
         assert_eq!(
             result.data.fence.inventory_kind,
             DfsLocalRecoveryInventoryKind::LegacyPrimaryAuthoredV7
@@ -553,7 +646,7 @@ fn native_selected_local_recovery_fence_recertifies_without_serving_or_writer_au
             "complete inventory at the actual local cut"
         );
         let root = crate::local_dfs_metadata_shard_path(
-            fixture.runtime.data_dir(&fixture.shard.primary_node_id),
+            fixture.runtime.data_dir(&fixture.acceptor),
             &shard_id,
         );
         let marker = root.join("journal/membership-handoff-write-freeze.sobj");
@@ -583,7 +676,7 @@ fn native_selected_local_recovery_fence_recertifies_without_serving_or_writer_au
 
         let layout = fixture
             .runtime
-            .selected_original_data_layout(&fixture.shard.primary_node_id)
+            .selected_original_data_layout(&fixture.acceptor)
             .unwrap();
         let cold = crate::LocalSobjMetadataBackend::new_with_selected_layout(
             fixture.shard.file_system_id.clone(),
@@ -600,43 +693,36 @@ fn native_selected_local_recovery_fence_recertifies_without_serving_or_writer_au
             &result.data,
         );
         drop(cold);
-        // The current global assignment is still A's. A new ordinary Main
-        // mutation nevertheless cannot cross this acceptor's durable fence.
-        let mut caller = fixture
-            .runtime
-            .client(&fixture.shard.primary_node_id)
-            .unwrap();
-        let cut = deadline();
-        let old = caller.set_transport_operation_deadline(Some(cut));
-        let attempted = caller.posix_write_file(
-            "/services/native-local-recovery-fence.bin",
-            &[0x63; 4096],
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 1).unwrap(),
-                replica_candidates: vec![fixture.shard.primary_node_id.clone()],
-                wait_for_commit: true,
-                foreground_replica_repair: true,
-            },
-        );
-        caller.set_transport_operation_deadline(old);
-        let error = attempted.expect_err("old native Main may not publish beyond the local fence");
+        // This fences B only. A retains its serving assignment and its exact
+        // cooperative marker; do not reinterpret this as revoking A's ability
+        // to finish an already-proved legacy operation.
+        let backend = fixture.service().metadata_backend_mut().unwrap();
         assert!(
-            error.to_string().contains("recovery fence"),
-            "actual native refusal: {error}"
+            backend
+                .put_metadata_prefix_ack_floor(&prefix_floor)
+                .is_err()
         );
-        assert!(Instant::now() <= cut, "no renewed post-fence write budget");
-        drop(caller);
+        assert!(
+            backend
+                .put_metadata_authority_ack_floor(&authority_floor)
+                .is_err()
+        );
+        assert_eq!(
+            backend.metadata_prefix_ack_floor(&shard_id).unwrap(),
+            Some(prefix_floor)
+        );
+        assert_eq!(
+            backend.metadata_authority_ack_floor(&shard_id).unwrap(),
+            Some(authority_floor)
+        );
         assert_eq!(std::fs::read(&marker).unwrap(), result.data.marker_bytes);
         assert_eq!(fixture.prefix(), prefix);
         assert_eq!(
-            exact_frames(
-                &fixture.runtime,
-                &fixture.shard.primary_node_id,
-                &fixture.shard
-            ),
+            exact_frames(&fixture.runtime, &fixture.acceptor, &fixture.shard),
             retained_frames
         );
         assert_eq!(fixture.serving_cells(), serving);
+        assert_eq!(std::fs::read(&primary_marker).unwrap(), primary_bytes);
     });
 }
 
@@ -732,10 +818,13 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
             fixture.reserve(&request);
             let original = fixture.shard.clone();
             let shard_id = fixture.shard_id();
+            let mut source = fixture
+                .runtime
+                .metadata_primary_service("/services/native-local-recovery-fence.bin")
+                .unwrap();
             // This is the existing source publication fence and actual accepted
             // cooperative proposal. It supplies no recovery/native RPC authority.
-            let source_fence = fixture
-                .service()
+            let source_fence = source
                 .metadata_shard_fence_guard(&original.file_system_id, &original.shard_id)
                 .unwrap();
             let control = fixture.runtime.shared_control_plane().unwrap();
@@ -748,8 +837,7 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
                 })
                 .unwrap()
                 .unwrap();
-            let freeze = fixture
-                .service()
+            let freeze = source
                 .metadata_backend_mut()
                 .unwrap()
                 .freeze_metadata_shard_for_membership_handoff(
@@ -759,6 +847,8 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
                 )
                 .unwrap()
                 .unwrap();
+            assert_eq!(freeze.handoff_id, pending.handoff_id);
+            assert_eq!(freeze.retiring_epoch, original.epoch);
             assert!(freeze.activated_epoch.is_none());
             let path = crate::local_dfs_metadata_shard_path(
                 fixture.runtime.data_dir(&original.primary_node_id),
@@ -768,15 +858,13 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
             let bytes = std::fs::read(&path).unwrap();
             let serving = fixture.serving_cells();
             assert!(
-                fixture
-                    .service()
+                source
                     .install_selected_local_recovery_fence(&request, deadline())
                     .is_err()
             );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             assert_eq!(
-                fixture
-                    .service()
+                source
                     .metadata_backend()
                     .unwrap()
                     .metadata_shard_write_freeze(&shard_id)
@@ -785,6 +873,7 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
             );
             assert_eq!(fixture.serving_cells(), serving);
             drop(source_fence);
+            drop(source);
         },
     );
     with_native(
@@ -821,6 +910,7 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
                     .unwrap(),
             );
             fixture.shard = active.clone();
+            fixture.acceptor = active.primary_node_id.clone();
             let shard_id = fixture.shard_id();
             let marker = fixture
                 .service()
@@ -865,8 +955,8 @@ fn native_local_recovery_refuses_pending_and_activated_cooperative_markers_witho
 fn native_recovery_context_refuses_a_different_actual_data_owner_before_marker_publication() {
     with_native("native-recovery-foreign-owner", true, |fixture| {
         fixture.no_cooperative_marker();
-        let owner_node = fixture.shard.primary_node_id.clone();
-        let foreign_node = fixture.shard.replica_node_ids[0].clone();
+        let owner_node = fixture.acceptor.clone();
+        let foreign_node = fixture.shard.primary_node_id.clone();
         let (_, owner) = fixture
             .service()
             .native_publication_owner_for_observation()
