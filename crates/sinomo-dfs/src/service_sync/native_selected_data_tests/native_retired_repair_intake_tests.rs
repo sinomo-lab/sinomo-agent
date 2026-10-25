@@ -639,8 +639,73 @@ fn native_retired_a_intakes_same_normal_return_before_serving_refusal() {
                 )
                 .unwrap();
         };
-        assert_eq!(marker.repair_custody.as_ref().unwrap().version, 2);
-        assert_eq!(marker.repair_custody.as_ref().unwrap().handoff, proposed);
+        let cut = marker.repair_custody.as_ref().unwrap();
+        assert_eq!(cut.version, 2);
+        let source_directory = crate::local_dfs_metadata_shard_path(
+            fixture.runtime.data_dir(&fixture.shard.primary_node_id),
+            &shard_id,
+        )
+        .join("journal/repair-handoffs-v1")
+        .join(format!(
+            "{}-source",
+            blake3::hash(proposed.handoff_id.as_bytes()).to_hex()
+        ));
+        let source_cut: DfsRepairHandoffCut =
+            crate::metadata_io::read_sobj_optional(&source_directory.join("cut.sobj"))
+                .unwrap()
+                .expect("actual source published its immutable cut before native installation");
+        source_cut.validate_selected_original_data().unwrap();
+        assert_eq!(
+            &source_cut, cut,
+            "B must retain A's exact actual fenced cut"
+        );
+        let actual_fence = source_cut
+            .handoff
+            .retiring_primary_fence
+            .as_ref()
+            .expect("actual source cut contains the retiring primary's durable fence");
+        let layout_a = fixture
+            .runtime
+            .selected_original_data_layout(&fixture.shard.primary_node_id)
+            .unwrap();
+        let source_freeze =
+            crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                fixture.runtime.data_dir(&fixture.shard.primary_node_id),
+                &shard_id,
+                Some(&layout_a),
+            )
+            .unwrap()
+            .expect("actual A freeze remains durable after role retirement");
+        assert_eq!(source_freeze.handoff_id, proposed.handoff_id);
+        assert_eq!(source_freeze.retiring_epoch, proposed.retiring_shard.epoch);
+        assert_eq!(actual_fence.handoff_id, source_freeze.handoff_id);
+        assert_eq!(
+            actual_fence.primary_node_id,
+            proposed.retiring_shard.primary_node_id
+        );
+        assert_eq!(
+            actual_fence.journal_sequence,
+            source_freeze.journal_sequence
+        );
+        assert_eq!(
+            actual_fence.state_fingerprint,
+            source_freeze.state_fingerprint
+        );
+        assert!(actual_fence.journal_sequence >= proposed.required_prepared_sequence);
+        if let Some(head) = &proposed.required_head_watermark {
+            assert!(actual_fence.journal_sequence >= head.journal_sequence);
+        }
+        // The initial proposal precedes A's acknowledgement. Preserve every
+        // proposal identity/configuration/minimum-prefix field exactly; only
+        // its absent fence is completed from the independently retained source.
+        let mut fenced_proposal = proposed.clone();
+        if let Some(initial_fence) = &proposed.retiring_primary_fence {
+            assert_eq!(initial_fence, actual_fence);
+        } else {
+            fenced_proposal.retiring_primary_fence = Some(actual_fence.clone());
+        }
+        assert_eq!(source_cut.handoff, fenced_proposal);
+        drop(layout_a);
         assert_eq!(
             fixture
                 .runtime
