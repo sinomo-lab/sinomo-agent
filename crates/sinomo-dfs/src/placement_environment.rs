@@ -725,7 +725,7 @@ fn aggregate_health(locations: &[DfsContentLocationObservation]) -> DfsHealthSta
     }
 }
 
-fn advertisement_semantics_equal(
+pub(crate) fn advertisement_semantics_equal(
     left: &DfsNodeAdvertisement,
     right: &DfsNodeAdvertisement,
 ) -> bool {

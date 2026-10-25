@@ -1715,20 +1715,75 @@ fn stable_dfs_advertisement(
             expires_at > OffsetDateTime::now_utc() + time::Duration::seconds(30)
         });
     if lease_is_fresh
-        && current.node_id == desired.node_id
         && current.accepts_metadata == desired.accepts_metadata
-        && current.accepts_content == desired.accepts_content
-        && current.capacity_weight == desired.capacity_weight
-        && current.zone == desired.zone
-        && current.storage_health == desired.storage_health
-        && current.storage_freshness == desired.storage_freshness
-        && current.usable_capacity_bytes == desired.usable_capacity_bytes
-        && current.reserved_free_bytes == desired.reserved_free_bytes
-        && current.content_location_count == desired.content_location_count
-        && current.network_metering == desired.network_metering
-        && current.advertisement_generation == desired.advertisement_generation
+        && crate::placement_environment::advertisement_semantics_equal(&current, &desired)
     {
         return current;
     }
     desired
+}
+
+#[cfg(test)]
+mod advertisement_publication_tests {
+    use super::*;
+
+    fn current() -> DfsNodeAdvertisement {
+        let mut current = DfsNodeAdvertisement::content(NodeId::generate());
+        current.storage_health = crate::DfsHealthState::Healthy;
+        current.storage_freshness = crate::DfsObservationFreshness::Fresh;
+        current.usable_capacity_bytes = Some(1024 * 1024 * 1024);
+        current.reserved_free_bytes = Some(128 * 1024 * 1024);
+        current.advertisement_generation = 2;
+        current.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::minutes(5));
+        current
+    }
+
+    #[test]
+    fn topology_reconciliation_preserves_storage_owner_sample_coalescing() {
+        let current = current();
+        let mut sampled = current.clone();
+        sampled.usable_capacity_bytes = Some(1024 * 1024 * 1024 - 4096);
+        sampled.reserved_free_bytes = Some(128 * 1024 * 1024 + 4096);
+        sampled.advertisement_generation += 1;
+        sampled.updated_at += time::Duration::seconds(1);
+        sampled.expires_at = sampled
+            .expires_at
+            .map(|expiry| expiry + time::Duration::seconds(1));
+        assert_eq!(
+            stable_dfs_advertisement(Some(current.clone()), sampled),
+            current,
+            "an unrelated topology wake cannot flush measurement fields coalesced by the storage owner"
+        );
+    }
+
+    #[test]
+    fn topology_reconciliation_preserves_semantic_changes_and_lease_renewal() {
+        let current = current();
+        let mutations: &[fn(&mut DfsNodeAdvertisement)] = &[
+            |a| a.node_id = NodeId::generate(),
+            |a| a.capacity_weight += 1,
+            |a| a.accepts_content = !a.accepts_content,
+            |a| a.accepts_metadata = !a.accepts_metadata,
+            |a| a.zone = Some("new-zone".into()),
+            |a| a.storage_health = crate::DfsHealthState::Degraded,
+            |a| a.storage_freshness = crate::DfsObservationFreshness::NeverSampled,
+            |a| a.content_location_count += 1,
+            |a| a.network_metering = crate::DfsNetworkMetering::Metered,
+            |a| a.resource_pressure = crate::DfsResourcePressure::Restricted,
+        ];
+        for mutate in mutations {
+            let mut desired = current.clone();
+            mutate(&mut desired);
+            assert_eq!(
+                stable_dfs_advertisement(Some(current.clone()), desired.clone()),
+                desired
+            );
+        }
+        let mut expired = current.clone();
+        expired.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        assert_eq!(
+            stable_dfs_advertisement(Some(expired), current.clone()),
+            current
+        );
+    }
 }

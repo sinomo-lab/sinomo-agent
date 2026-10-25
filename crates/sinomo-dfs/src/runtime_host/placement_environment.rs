@@ -808,15 +808,7 @@ fn daemon_advertisement_semantics_equal(
     left: &sinomo_dfs::DfsNodeAdvertisement,
     right: &sinomo_dfs::DfsNodeAdvertisement,
 ) -> bool {
-    left.node_id == right.node_id
-        && left.capacity_weight == right.capacity_weight
-        && left.accepts_content == right.accepts_content
-        && left.zone == right.zone
-        && left.storage_health == right.storage_health
-        && left.storage_freshness == right.storage_freshness
-        && left.content_location_count == right.content_location_count
-        && left.network_metering == right.network_metering
-        && left.resource_pressure == right.resource_pressure
+    crate::placement_environment::advertisement_semantics_equal(left, right)
 }
 
 fn daemon_advertisement_publish_required(

@@ -1591,14 +1591,7 @@ fn dfs_content_advertisement_is_current(
             expires_at > time::OffsetDateTime::now_utc() + time::Duration::seconds(30)
         });
     lease_is_fresh
-        && current.node_id == desired.node_id
-        && current.accepts_content == desired.accepts_content
-        && current.capacity_weight == desired.capacity_weight
-        && current.zone == desired.zone
-        && current.storage_health == desired.storage_health
-        && current.storage_freshness == desired.storage_freshness
-        && current.content_location_count == desired.content_location_count
-        && current.network_metering == desired.network_metering
+        && crate::placement_environment::advertisement_semantics_equal(current, desired)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
