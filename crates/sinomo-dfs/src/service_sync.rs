@@ -4904,6 +4904,8 @@ mod native_selected_data_tests {
     use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcOrigin, RpcPhase};
     use std::sync::{Arc, Mutex};
 
+    mod native_owned_repair_return_tests;
+
     struct GenuineNativeOriginal {
         runtime: DfsTestRuntime,
         shard: DfsMetadataShardConfig,
