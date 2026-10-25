@@ -3272,6 +3272,8 @@ pub(crate) use data_plane::{
     daemon_dfs_node_transport_on_runtime, daemon_dfs_peer_transports_on_runtime,
     with_daemon_dfs_control_plane_on_runtime,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use data_plane::{OwnedOriginalRepairCompletion, call_native_original_repair_owned};
 #[cfg(feature = "storage-conversion")]
 pub use storage_import::DfsStorageImportContentReceiver;
 

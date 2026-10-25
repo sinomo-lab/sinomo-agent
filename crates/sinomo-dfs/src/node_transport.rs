@@ -80,6 +80,41 @@ pub(crate) struct VerifiedOriginalRepairHistoryReturn {
 impl VerifiedOriginalRepairHistoryReturn {
     pub(crate) fn into_routed(self) -> DfsRoutedMessage { self.returned }
 }
+
+/// Correlation only. The caller must own the actual native RPC return before
+/// wrapping this DATA in an opaque transport capability. Generic senders and
+/// decoded inbox frames cannot establish that provenance.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn validate_original_repair_owned_rpc_return(
+    expected: &DfsMessageCommand,
+    response: DfsMessageResponse,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let invalid = |detail: &str| NetworkError::Serialization {
+        detail: format!("native original Repair completion {detail}"),
+    };
+    if response.request_id != expected.request_id || response.outbound_messages.len() != 1 {
+        return Err(invalid(
+            "does not contain one response for the actual outer request",
+        ));
+    }
+    let returned = response
+        .outbound_messages
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid("has no returned frame"))?;
+    if !all_background_replica_response_identity_matches(
+        &expected.routed_message.source_node_id,
+        &expected.routed_message,
+        &returned,
+    ) {
+        return Err(invalid(
+            "differs from its actual carrier identity or result hash",
+        ));
+    }
+    // The remote response owns its own frame/message IDs. Only the outbound
+    // carrier's IDs select the persisted attempt and outer request.
+    Ok(returned)
+}
 /// Refinement of `PromotionFanoutCap` in `replica_quorum_fanout.qnt`.
 const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
 /// Process-local terminal promotion identities suppress redundant hydration
@@ -5713,6 +5748,136 @@ mod tests {
         );
         assert_eq!(descriptor, &material.attachment);
         assert_eq!(captured_bytes, bytes);
+    }
+
+    fn original_repair_return_correlation_fixture(
+        root: &std::path::Path,
+    ) -> (DfsMessageCommand, DfsMessageResponse) {
+        let (call, material, _) = file_backed_original_attachment(root);
+        let expected = DfsMessageCommand {
+            request_id: format!("dfs_message_{}", call.message.frame_id),
+            routed_message: call.message.clone(),
+        };
+        let command = &material.original.command;
+        let returned = DfsRoutedMessage {
+            source_node_id: call.message.target_node_id.clone(),
+            target_node_id: call.message.source_node_id.clone(),
+            frame_id: call.message.frame_id + 1000,
+            message_id: call.message.message_id + 2000,
+            message: DfsNetworkMessage::RepairReplicaResponse(crate::DfsRepairReplicaResponse {
+                request_id: command.request_id.clone(),
+                intent_id: command.intent_id.clone(),
+                file_system_id: command.file_system_id.clone(),
+                object_id: command.object_id.clone(),
+                version: command.version.clone(),
+                replica_node_id: call.message.target_node_id.clone(),
+                // Synthetic input exercises correlation only. It never enters
+                // the private native completion constructor.
+                result: DfsBlobTransferResult::Rejected {
+                    reason: "correlation DATA only".into(),
+                },
+            }),
+        };
+        let response = DfsMessageResponse {
+            request_id: expected.request_id.clone(),
+            outbound_messages: vec![returned],
+        };
+        (expected, response)
+    }
+
+    #[test]
+    fn owned_original_repair_return_correlation_preserves_remote_carrier_ids() {
+        let root = sinomo_testdir::TestDir::new("owned-repair-return-correlation");
+        let (expected, response) = original_repair_return_correlation_fixture(root.path());
+        let returned =
+            validate_original_repair_owned_rpc_return(&expected, response.clone()).unwrap();
+        assert_eq!(returned, response.outbound_messages[0]);
+        assert_ne!(returned.frame_id, expected.routed_message.frame_id);
+        assert_ne!(returned.message_id, expected.routed_message.message_id);
+        let DfsNetworkMessage::RepairReplica(command) = &expected.routed_message.message else {
+            panic!("original Repair");
+        };
+        for result in [
+            DfsBlobTransferResult::Durable {
+                content_hash: command.content_hash.clone(),
+            },
+            DfsBlobTransferResult::Committed {
+                content_hash: command.content_hash.clone(),
+            },
+        ] {
+            let mut candidate = response.clone();
+            let DfsNetworkMessage::RepairReplicaResponse(reply) =
+                &mut candidate.outbound_messages[0].message
+            else {
+                unreachable!()
+            };
+            reply.result = result;
+            assert_eq!(
+                validate_original_repair_owned_rpc_return(&expected, candidate.clone()).unwrap(),
+                candidate.outbound_messages[0]
+            );
+        }
+    }
+
+    #[test]
+    fn owned_original_repair_return_correlation_rejects_unmatched_scope_and_count() {
+        let root = sinomo_testdir::TestDir::new("owned-repair-return-rejection");
+        let (expected, response) = original_repair_return_correlation_fixture(root.path());
+        let mut invalid = Vec::new();
+        let mut changed = response.clone();
+        changed.request_id.push_str("-other");
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages.clear();
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed
+            .outbound_messages
+            .push(response.outbound_messages[0].clone());
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages[0].message = expected.routed_message.message.clone();
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages[0].source_node_id =
+            expected.routed_message.source_node_id.clone();
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages[0].target_node_id =
+            expected.routed_message.target_node_id.clone();
+        invalid.push(changed);
+        for field in 0..7 {
+            let mut changed = response.clone();
+            let DfsNetworkMessage::RepairReplicaResponse(reply) =
+                &mut changed.outbound_messages[0].message
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => reply.request_id.push_str("-other"),
+                1 => reply.intent_id.push_str("-other"),
+                2 => reply.file_system_id = crate::DfsFileSystemId::new("another-filesystem"),
+                3 => reply.object_id = crate::DfsObjectId::generate(),
+                4 => reply.version = crate::DfsVersion::generate(),
+                5 => reply.replica_node_id = expected.routed_message.source_node_id.clone(),
+                _ => {
+                    reply.result = DfsBlobTransferResult::Committed {
+                        content_hash: "wrong-hash".into(),
+                    }
+                }
+            }
+            invalid.push(changed);
+        }
+        for candidate in invalid {
+            assert!(validate_original_repair_owned_rpc_return(&expected, candidate).is_err());
+        }
+        let mut foreground = expected.clone();
+        let DfsNetworkMessage::RepairReplica(command) = &mut foreground.routed_message.message
+        else {
+            unreachable!()
+        };
+        command.background_repair = false;
+        assert!(validate_original_repair_owned_rpc_return(&foreground, response).is_err());
     }
 
     #[test]
