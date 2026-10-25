@@ -801,11 +801,11 @@ mod tests {
 
         // A complete, correctly framed two-operation native record must fail
         // before publishing any replayed resident maps or mutating these files.
-        let mut reader = std::io::Cursor::new(&actual_log);
+        let mut reader = fs::File::open(&ordinary_log).unwrap();
         let mut last = None;
         while let Some(frame) = durable_file::read_length_prefixed_record(
             &mut reader,
-            &log,
+            &ordinary_log,
             durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little)
                 .max_record_bytes(DFS_REPAIR_QUEUE_LOG_MAX_RECORD_BYTES),
         )

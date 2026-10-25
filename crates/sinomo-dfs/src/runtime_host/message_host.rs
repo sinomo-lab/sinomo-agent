@@ -3133,7 +3133,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     #[cfg(any(test, feature = "test-support"))]
-    if matches!(&command.routed_message.message, DfsNetworkMessage::RepairReplicaResponse(_)) {
+    if matches!(&command.routed_message.message, crate::DfsNetworkMessage::RepairReplicaResponse(_)) {
         require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
             .map_err(|error| crate::DfsError::Metadata { message: error.to_string() })?
             .reject_raw_selected_repair_response(&command.routed_message)?;

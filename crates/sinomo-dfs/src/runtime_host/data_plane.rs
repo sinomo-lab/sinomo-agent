@@ -1813,7 +1813,7 @@ impl OwnedOriginalRepairCompletion {
     pub(super) fn custody_queue(
         &self,
     ) -> Result<crate::repair_queue_store::LocalDfsRepairQueueStore, crate::DfsError> {
-        self.owner
+        Ok(self.owner
             .selected_original_data_layout()
             .map_err(|e| crate::DfsError::Metadata {
                 message: e.to_string(),
@@ -1821,7 +1821,7 @@ impl OwnedOriginalRepairCompletion {
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "native completion lost selected queue".into(),
             })?
-            .queue()
+            .queue()?)
     }
     pub(super) fn before_custody_intake(self: &Arc<Self>) -> Result<(), crate::DfsError> {
         let scope = self
