@@ -4905,6 +4905,7 @@ mod native_selected_data_tests {
     use std::sync::{Arc, Mutex};
 
     mod native_owned_repair_return_tests;
+    mod native_retired_repair_intake_tests;
 
     struct GenuineNativeOriginal {
         runtime: DfsTestRuntime,
@@ -4915,6 +4916,11 @@ mod native_selected_data_tests {
         // Real C output captured before the existing reply-loss fault. It is
         // never reconstructed from content bytes or a receipt tuple.
         delayed_reply: Option<DfsRoutedMessage>,
+        // Negative fixture controls only. Defaults preserve the original
+        // first-effect/lost-reply choreography; a new intake case may release
+        // exactly one normal retry of the SAME captured logical request.
+        claim_window: Arc<std::sync::atomic::AtomicBool>,
+        allow_one_same_original_retry: Arc<std::sync::atomic::AtomicBool>,
         held: Option<Box<dyn Send>>,
         held_promoted: Option<Box<dyn Send>>,
     }
@@ -5144,8 +5150,10 @@ mod native_selected_data_tests {
         // by this gate. After captured reply loss, block another attempt while
         // the ordinary callback persists the exact uncertainty below.
         let claim_window = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let allow_one_same_original_retry = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seeded_identity = Arc::new(Mutex::new(None::<(DfsObjectId, DfsVersion)>));
         let window = Arc::clone(&claim_window);
+        let same_original_retry = Arc::clone(&allow_one_same_original_retry);
         let expected_identity = Arc::clone(&seeded_identity);
         let captured_replies = Arc::clone(&replies);
         let expected_owner = owner.clone();
@@ -5154,7 +5162,7 @@ mod native_selected_data_tests {
         let held = Some(Box::new(crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
             context.data_dir(), Arc::new(move |point, command, _| {
                 let crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeReplicaTransferClaim {
-                    background_repair: true, kind, intent_id_digest, target_id_digest, ..
+                    background_repair: true, kind, intent_id_digest, target_id_digest, request_id_digest, ..
                 } = point else { return Ok(()); };
                 assert!(command.is_none());
                 if !window.load(std::sync::atomic::Ordering::Acquire) {
@@ -5172,6 +5180,20 @@ mod native_selected_data_tests {
                         && *blake3::hash(expected_holder.as_str().as_bytes()).as_bytes() == target_id_digest
                 });
                 if captured_loss {
+                    if same_original_retry.load(std::sync::atomic::Ordering::Acquire)
+                        && captured_replies.lock().unwrap().iter().any(|routed| {
+                            let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
+                            routed.source_node_id == expected_holder && routed.target_node_id == expected_owner
+                                && &response.object_id == expected_object && &response.version == expected_version
+                                && *blake3::hash(response.intent_id.as_bytes()).as_bytes() == intent_id_digest
+                                && *blake3::hash(expected_holder.as_str().as_bytes()).as_bytes() == target_id_digest
+                                && *blake3::hash(response.request_id.as_bytes()).as_bytes() == request_id_digest
+                        })
+                        && same_original_retry.swap(false, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        window.store(false, std::sync::atomic::Ordering::Release);
+                        return Ok(());
+                    }
                     return Err(DfsError::Cancelled { operation: "negative claim boundary around actual captured reply loss" });
                 }
                 Ok(())
@@ -5436,6 +5458,8 @@ mod native_selected_data_tests {
             holder,
             birth,
             delayed_reply,
+            claim_window,
+            allow_one_same_original_retry,
             held,
             held_promoted,
         }
