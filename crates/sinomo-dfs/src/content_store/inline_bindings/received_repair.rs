@@ -134,6 +134,111 @@ pub(crate) struct ReceivedRepairFixtureIdentity {
     created: std::time::SystemTime,
 }
 
+/// Process-test DATA copied from the parent's actual precreated identity. This
+/// is neither native admission nor an identity derived from a child's marker.
+#[cfg(all(test, unix))]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OriginalRepairProcessExpectation {
+    pub(super) root: PathBuf,
+    pub(super) store_incarnation: String,
+    pub(super) format: u32,
+    pub(super) device: u64,
+    pub(super) inode: u64,
+}
+
+#[cfg(all(test, unix))]
+impl ReceivedRepairFixtureIdentity {
+    pub(super) fn original_process_expectation(
+        &self,
+    ) -> Result<OriginalRepairProcessExpectation> {
+        self.check_original_physical_identity()?;
+        Ok(OriginalRepairProcessExpectation {
+            root: self.root.clone(),
+            store_incarnation: self.store_incarnation.clone(),
+            format: self.format,
+            device: self.device,
+            inode: self.inode,
+        })
+    }
+}
+
+#[cfg(all(test, unix))]
+impl LocalContentStore {
+    pub(super) fn reopen_original_process_fixture(
+        expected: &OriginalRepairProcessExpectation,
+    ) -> Result<Self> {
+        let identity = ReceivedRepairFixtureIdentity {
+            root: expected.root.clone(),
+            store_incarnation: expected.store_incarnation.clone(),
+            format: expected.format,
+            device: expected.device,
+            inode: expected.inode,
+        };
+        identity.check_original_physical_identity()?;
+        // Bound and validate the existing sentinel BEFORE the normal reopener
+        // can install a resident expectation or perform writer recovery.
+        let path = expected
+            .root
+            .join(CONTENT_RESERVATION_DIR)
+            .join(CONTENT_RESERVATION_BATCH_SENTINEL_SHARD)
+            .join(CONTENT_RESERVATION_BATCH_SENTINEL_FILE);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > u64::from(INLINE_FRAME_HEADER_LIMIT)
+        {
+            return Err(inline_error(
+                "process fixture sentinel is not a bounded regular file",
+            ));
+        }
+        let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().map_err(|source| ContentStoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino()) {
+            return Err(inline_error(
+                "process fixture sentinel changed while opening",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(u64::from(INLINE_FRAME_HEADER_LIMIT) + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| ContentStoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if bytes.len() as u64 != metadata.len()
+            || bytes.len() > INLINE_FRAME_HEADER_LIMIT as usize
+        {
+            return Err(inline_error(
+                "process fixture sentinel changed or exceeded its bound",
+            ));
+        }
+        let sentinel = decode_content_reservation_batch_sentinel(&bytes)?;
+        if sentinel.store_incarnation != expected.store_incarnation
+            || sentinel.content_binding_layout != ORIGINAL_REPAIR_FIXTURE_LAYOUT
+        {
+            return Err(inline_error(
+                "process fixture sentinel differs from the parent's expectation",
+            ));
+        }
+        let mut common = sentinel;
+        common.content_binding_layout = CONTENT_BINDING_LAYOUT.into();
+        validate_content_reservation_batch_sentinel(&common)?;
+        identity.check_original_physical_identity()?;
+        Self::reopen_received_repair_fixture(&identity)
+    }
+}
+
 impl ReceivedRepairFixtureIdentity {
     #[cfg(test)]
     pub(crate) fn original_repair_test_fault_cleanup(&self) -> Option<OriginalRepairTestFaultCleanup> {
