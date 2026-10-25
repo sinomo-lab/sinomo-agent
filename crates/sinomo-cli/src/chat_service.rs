@@ -564,6 +564,27 @@ struct HostEnvironment {
     cluster: ChatCluster,
 }
 
+/// Handles remain owned until the component's task-drain hook joins them.
+/// The same lock closes admission and registers a newly started worker.
+#[derive(Default)]
+struct ChatWorkers {
+    stopping: bool,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    maintenance: Option<tokio::task::JoinHandle<()>>,
+    cancellation: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+fn try_drain_lock<'a, T>(
+    lock: &'a Mutex<T>,
+    label: &str,
+) -> Result<Option<std::sync::MutexGuard<'a, T>>, String> {
+    match lock.try_lock() {
+        Ok(guard) => Ok(Some(guard)),
+        Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => Err(format!("chat {label} lock poisoned")),
+    }
+}
+
 #[derive(Clone)]
 pub struct HostedChatService {
     daemon_address: String,
@@ -573,6 +594,7 @@ pub struct HostedChatService {
     clients: Arc<Mutex<HashMap<String, String>>>,
     ephemeral_clients: Arc<Mutex<std::collections::BTreeSet<String>>>,
     environment: Arc<std::sync::OnceLock<HostEnvironment>>,
+    workers: Arc<Mutex<ChatWorkers>>,
     /// Starts hosts in place of the agent runtime worker (tests).
     host_factory: Option<Arc<dyn Fn(&str) -> ChatHost + Send + Sync>>,
 }
@@ -590,8 +612,164 @@ impl HostedChatService {
             clients: Arc::new(Mutex::new(HashMap::new())),
             ephemeral_clients: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             environment: Arc::new(std::sync::OnceLock::new()),
+            workers: Arc::new(Mutex::new(ChatWorkers::default())),
             host_factory: None,
         }
+    }
+
+    fn require_running(&self) -> Result<(), String> {
+        if self
+            .workers
+            .lock()
+            .map_err(|_| "chat worker registry poisoned")?
+            .stopping
+        {
+            return Err("chat component is stopping".into());
+        }
+        Ok(())
+    }
+
+    fn spawn_worker(
+        &self,
+        name: String,
+        run: impl FnOnce() + Send + 'static,
+    ) -> Result<(), String> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| "chat worker registry poisoned")?;
+        if workers.stopping {
+            return Err("chat component is stopping".into());
+        }
+        // Reap completed hosts/followers without waiting on active work. This
+        // bounds retained handles during ordinary chat creation/deletion.
+        let mut index = 0;
+        while index < workers.threads.len() {
+            if workers.threads[index].is_finished() {
+                if workers.threads.swap_remove(index).join().is_err() {
+                    tracing::error!("completed chat worker panicked");
+                }
+            } else {
+                index += 1;
+            }
+        }
+        workers.threads.push(
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(run)
+                .map_err(|error| format!("spawn chat worker: {error}"))?,
+        );
+        Ok(())
+    }
+
+    /// Called by ComponentScope after its shutdown signal and route withdrawal.
+    /// A timeout retains every live handle for the scope's bounded retry.
+    pub(crate) async fn drain(&self, deadline: tokio::time::Instant) -> Result<(), String> {
+        loop {
+            let began = self.begin_drain()?;
+            let completed = if began {
+                if let Some(mut workers) = try_drain_lock(&self.workers, "workers")? {
+                    let mut finished = Vec::new();
+                    let mut index = 0;
+                    while index < workers.threads.len() {
+                        if workers.threads[index].is_finished() {
+                            finished.push(workers.threads.swap_remove(index));
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    let maintenance = if workers
+                        .maintenance
+                        .as_ref()
+                        .is_some_and(|task| task.is_finished())
+                    {
+                        workers.maintenance.take()
+                    } else {
+                        None
+                    };
+                    let pending = !workers.threads.is_empty()
+                        || workers.maintenance.is_some()
+                        || workers
+                            .cancellation
+                            .as_ref()
+                            .is_none_or(|task| !task.is_finished());
+                    Some((finished, maintenance, pending))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((finished, maintenance, pending)) = completed {
+                for worker in finished {
+                    worker
+                        .join()
+                        .map_err(|_| "chat worker panicked during shutdown".to_string())?;
+                }
+                if let Some(task) = maintenance {
+                    task.await
+                        .map_err(|error| format!("chat maintenance join: {error}"))?;
+                }
+                if !pending && self.clear_drained_views()? {
+                    let cancellation = try_drain_lock(&self.workers, "workers")?
+                        .and_then(|mut workers| workers.cancellation.take());
+                    if let Some(task) = cancellation {
+                        return task
+                            .await
+                            .map_err(|error| format!("chat cancellation join: {error}"))?;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("chat workers remain owned after the drain deadline".into());
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+            )
+            .await;
+        }
+    }
+
+    fn begin_drain(&self) -> Result<bool, String> {
+        let Some(mut workers) = try_drain_lock(&self.workers, "workers")? else {
+            return Ok(false);
+        };
+        workers.stopping = true;
+        if workers.cancellation.is_some() {
+            return Ok(true);
+        }
+        let Some(mut hosts) = try_drain_lock(&self.hosts, "hosts")? else {
+            return Ok(false);
+        };
+        let routes = std::mem::take(&mut *hosts);
+        drop(hosts);
+        // Retire selected queues before cancellation, without holding the
+        // route registry across a runtime callback. Keep a blocked cancellation
+        // owned so the component deadline remains observable.
+        drop(routes);
+        let control = self.runtime_control.clone();
+        workers.cancellation = Some(tokio::task::spawn_blocking(move || {
+            control
+                .cancel_live_work("chat component shutdown")
+                .map_err(|error| error.to_string())
+        }));
+        Ok(true)
+    }
+
+    fn clear_drained_views(&self) -> Result<bool, String> {
+        let Some(mut views) = try_drain_lock(&self.views, "views")? else {
+            return Ok(false);
+        };
+        let Some(mut clients) = try_drain_lock(&self.clients, "clients")? else {
+            return Ok(false);
+        };
+        let Some(mut ephemeral) = try_drain_lock(&self.ephemeral_clients, "clients")? else {
+            return Ok(false);
+        };
+        views.clear();
+        clients.clear();
+        ephemeral.clear();
+        Ok(true)
     }
 
     fn environment(&self) -> Result<HostEnvironment, String> {
@@ -621,6 +799,7 @@ impl HostedChatService {
         runtime: tokio::runtime::Handle,
         request: wire::ChatSessionOpenRequest,
     ) -> Result<wire::ChatSessionOpenResponse, String> {
+        self.require_running()?;
         validate_client_id(&request.client_id)?;
         self.init_environment(&data_dir, &runtime);
         let ephemeral = request.execution_id.is_none();
@@ -634,6 +813,7 @@ impl HostedChatService {
                 .views
                 .lock()
                 .map_err(|_| "chat view registry lock poisoned".to_string())?;
+            self.require_running()?;
             let attached = views.contains_key(&execution_id);
             if !attached {
                 if views.len() >= MAX_RESIDENT_CHAT_HOSTS {
@@ -682,10 +862,14 @@ impl HostedChatService {
                 .clone();
             (self.view_route_ready(view), generation)
         };
-        self.clients
-            .lock()
-            .map_err(|_| "chat subscription registry poisoned")?
-            .insert(request.client_id.clone(), execution_id);
+        {
+            let mut clients = self
+                .clients
+                .lock()
+                .map_err(|_| "chat subscription registry poisoned")?;
+            self.require_running()?;
+            clients.insert(request.client_id.clone(), execution_id);
+        }
         if ephemeral {
             self.ephemeral_clients
                 .lock()
@@ -807,9 +991,12 @@ impl HostedChatService {
         history: &[wire::ChatHistoryMessage],
     ) -> Result<std::sync::MutexGuard<'_, HashMap<String, ChatRoute>>, String> {
         let lock = || {
-            self.hosts
+            let hosts = self
+                .hosts
                 .lock()
-                .map_err(|_| "chat host registry poisoned".to_string())
+                .map_err(|_| "chat host registry poisoned".to_string())?;
+            self.require_running()?;
+            Ok::<_, String>(hosts)
         };
         {
             let hosts = lock()?;
@@ -854,6 +1041,7 @@ impl HostedChatService {
         chat_id: &str,
         history: &[wire::ChatHistoryMessage],
     ) -> Result<ChatHost, String> {
+        self.require_running()?;
         if let Some(factory) = &self.host_factory {
             return Ok(factory(chat_id));
         }
@@ -878,10 +1066,9 @@ impl HostedChatService {
             alive: alive.clone(),
             activity: activity.clone(),
         };
-        std::thread::Builder::new()
-            .name(format!("sinomo-chat-{chat_id}"))
-            .spawn(move || chat_host_worker(context, command_rx))
-            .map_err(|e| format!("spawn daemon chat host: {e}"))?;
+        self.spawn_worker(format!("sinomo-chat-{chat_id}"), move || {
+            chat_host_worker(context, command_rx)
+        })?;
         Ok(ChatHost {
             command_tx,
             fanout,
@@ -910,10 +1097,9 @@ impl HostedChatService {
             fanout: fanout.clone(),
             alive: alive.clone(),
         };
-        std::thread::Builder::new()
-            .name(format!("sinomo-chat-follow-{chat_id}"))
-            .spawn(move || follower.run())
-            .map_err(|e| format!("follow remote chat: {e}"))?;
+        self.spawn_worker(format!("sinomo-chat-follow-{chat_id}"), move || {
+            follower.run()
+        })?;
         Ok(RemoteChat {
             owner,
             fanout,
@@ -1616,12 +1802,26 @@ impl HostedChatService {
         &self,
         data_dir: sinomo_runtime::local::SinomoDataDir,
         runtime: tokio::runtime::Handle,
-    ) {
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| "chat worker registry poisoned")?;
+        if workers.stopping {
+            return Err("chat component is stopping".into());
+        }
+        if workers.maintenance.is_some() {
+            return Ok(());
+        }
         let service = self.clone();
         let blocking = runtime.clone();
-        runtime.spawn(async move {
+        workers.maintenance = Some(runtime.spawn(async move {
             let mut next_purge = Instant::now();
             loop {
+                if *shutdown.borrow() {
+                    break;
+                }
                 let sweep = service.clone();
                 let purge = (Instant::now() >= next_purge).then(|| {
                     next_purge = Instant::now() + DELETED_CHAT_PURGE_INTERVAL;
@@ -1652,18 +1852,28 @@ impl HostedChatService {
                     }
                 })
                 .await;
-                tokio::time::sleep(CHAT_HOST_SWEEP_INTERVAL).await;
+                // Do not abort this orchestration task while a blocking sweep
+                // is in flight: it owns that child through the await above.
+                tokio::select! {
+                    _ = tokio::time::sleep(CHAT_HOST_SWEEP_INTERVAL) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
             }
-        });
+        }));
+        Ok(())
     }
 
     pub(crate) fn recover(
         &self,
         data_dir: sinomo_runtime::local::SinomoDataDir,
         runtime: tokio::runtime::Handle,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), String> {
+        self.require_running()?;
         self.init_environment(&data_dir, &runtime);
-        self.start_maintenance(data_dir.clone(), runtime.clone());
+        self.start_maintenance(data_dir.clone(), runtime.clone(), shutdown)?;
         for execution_id in CommandJournal::discover(&data_dir.root())? {
             let client_id = format!("recovery-{}", SessionId::generate());
             self.open(
@@ -1856,6 +2066,7 @@ impl Service for HostedChatService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let service = self.clone();
         Box::pin(async move {
+            service.require_running().map_err(ServiceError::Service)?;
             let peer_route = wire::CHAT_PEER_RPC_ROUTES.contains(&request.route.as_str());
             // Peer routes serve other cluster members; everything else is the
             // local app's.
@@ -2116,6 +2327,26 @@ struct ChatHostContext {
     activity: HostActivity,
 }
 
+fn admit_host_command(
+    data_dir: &std::path::Path,
+    alive: &AtomicBool,
+    journal: Option<&(CommandJournal, String)>,
+) -> Result<Option<sinomo_runtime::rollout::RuntimeWorkLease>, String> {
+    let work = sinomo_runtime::rollout::acquire_runtime_work_until(data_dir, || {
+        !alive.load(Ordering::Acquire)
+    });
+    // Nothing has crossed the effect boundary. Keep an accepted original
+    // journal entry Pending for recovery instead of rejecting it on shutdown.
+    if !alive.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let work = work?;
+    if let Some((journal, id)) = journal {
+        journal.start(id)?;
+    }
+    Ok(Some(work))
+}
+
 /// Runs one chat: the only runtime for it on this node. Commands from every
 /// view of the chat execute here in order, and events go to all of them.
 fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>) {
@@ -2167,7 +2398,23 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
     }
     loop {
         if !alive.load(Ordering::Acquire) {
-            break;
+            // Keep the runtime registration, tools and mounts owned until
+            // cancelled turns/subagents have actually finished. Component
+            // draining joins this worker and retains it on a deadline miss.
+            let idle = SessionId::from_str(&chat.session_id())
+                .ok()
+                .is_some_and(|session| {
+                    matches!(
+                        runtime_control.has_live_work(&session),
+                        Ok(None | Some(false))
+                    )
+                })
+                && !chat.has_live_participant_work();
+            if idle {
+                break;
+            }
+            std::thread::sleep(ASYNC_CONTINUATION_POLL);
+            continue;
         }
         let (origin, journal, command) = match command_rx.recv_timeout(ASYNC_CONTINUATION_POLL) {
             Ok(HostCommand::Run {
@@ -2199,14 +2446,13 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
             }
         };
         activity.begin();
+        let work = admit_host_command(&data_dir.root(), &alive, journal.as_ref());
+        if matches!(work, Ok(None)) {
+            activity.end(SessionId::from_str(&chat.session_id()).ok());
+            break;
+        }
         let result = (|| {
-            let _work =
-                sinomo_runtime::rollout::acquire_runtime_work_until(&data_dir.root(), || {
-                    !alive.load(Ordering::Acquire)
-                })?;
-            if let Some((journal, id)) = &journal {
-                journal.start(id)?;
-            }
+            let _work = work?.expect("stopped admission handled before execution");
             if let Some(requested) = command_chat_id(&command)
                 && !requested.trim().is_empty()
                 && requested != chat_id
@@ -3906,6 +4152,193 @@ mod tests {
                 attachments: vec![],
             },
         }
+    }
+
+    #[test]
+    fn component_drain_retains_a_live_worker_after_deadline_and_closes_admission() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        let (release, held) = channel();
+        let (started, ready) = channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let completed = finished.clone();
+        service
+            .spawn_worker("owned-shutdown-control".into(), move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+                completed.store(true, Ordering::Release);
+            })
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            runtime
+                .block_on(service.drain(tokio::time::Instant::now()))
+                .is_err()
+        );
+        assert!(!finished.load(Ordering::Acquire));
+        assert_eq!(service.workers.lock().unwrap().threads.len(), 1);
+        assert!(
+            service
+                .spawn_worker("forbidden-new-owner".into(), || panic!("must not start"))
+                .is_err()
+        );
+        assert!(
+            service
+                .peer_command(peer_send("chat", "after-stop"))
+                .is_err()
+        );
+        release.send(()).unwrap();
+        runtime
+            .block_on(service.drain(tokio::time::Instant::now() + Duration::from_secs(2)))
+            .unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        assert!(service.workers.lock().unwrap().threads.is_empty());
+    }
+
+    #[test]
+    fn component_shutdown_keeps_unstarted_original_commands_pending() {
+        let root = sinomo_testdir::TestDir::new("chat-shutdown-pending-command");
+        let journal = CommandJournal::open(&root, "owner").unwrap();
+        let command = peer_send("chat", "original-request").command;
+        journal.admit("original-request", &command).unwrap();
+        let held_admission =
+            sinomo_runtime::rollout::drain_runtime_work(&root, Duration::from_secs(2)).unwrap();
+        let alive = Arc::new(AtomicBool::new(true));
+        let stopped = alive.clone();
+        let path = root.to_path_buf();
+        let receipt = (journal.clone(), "original-request".to_string());
+        let (entered, started) = channel();
+        let worker = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            admit_host_command(&path, &stopped, Some(&receipt))
+                .unwrap()
+                .is_none()
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        alive.store(false, Ordering::Release);
+        assert!(worker.join().unwrap());
+        drop(held_admission);
+        drop(journal);
+        let reopened = CommandJournal::open(&root, "owner").unwrap();
+        let (_, pending, interrupted) = reopened.recovery().unwrap();
+        assert_eq!(pending, vec![("original-request".into(), command)]);
+        assert!(!interrupted, "the effect was never admitted");
+    }
+
+    #[test]
+    fn component_shutdown_never_requeues_an_already_started_original() {
+        let root = sinomo_testdir::TestDir::new("chat-shutdown-started-command");
+        let journal = CommandJournal::open(&root, "owner").unwrap();
+        let command = peer_send("chat", "original-request").command;
+        journal.admit("original-request", &command).unwrap();
+        let alive = AtomicBool::new(true);
+        let receipt = (journal.clone(), "original-request".into());
+        let work = admit_host_command(&root, &alive, Some(&receipt))
+            .unwrap()
+            .unwrap();
+        alive.store(false, Ordering::Release);
+        drop(work);
+        drop(receipt);
+        drop(journal);
+        let reopened = CommandJournal::open(&root, "owner").unwrap();
+        let (_, pending, interrupted) = reopened.recovery().unwrap();
+        assert!(pending.is_empty());
+        assert!(interrupted, "a started effect remains uncertain");
+        assert!(reopened.admit("original-request", &command).is_err());
+    }
+
+    #[test]
+    fn component_drain_observes_deadline_while_an_existing_route_is_borrowed() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        let held = service.hosts.lock().unwrap();
+        assert!(
+            runtime
+                .block_on(service.drain(tokio::time::Instant::now()))
+                .is_err()
+        );
+        assert!(
+            service.require_running().is_err(),
+            "admission remains closed while retirement is blocked"
+        );
+        drop(held);
+        runtime
+            .block_on(service.drain(tokio::time::Instant::now() + Duration::from_secs(2)))
+            .unwrap();
+    }
+
+    #[test]
+    fn component_drain_keeps_the_maintenance_blocking_child_owned_until_join() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        let (release, held) = channel();
+        let (started, ready) = channel();
+        service.workers.lock().unwrap().maintenance = Some(runtime.spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            })
+            .await
+            .unwrap();
+        }));
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            runtime
+                .block_on(service.drain(tokio::time::Instant::now()))
+                .is_err()
+        );
+        assert!(service.workers.lock().unwrap().maintenance.is_some());
+        release.send(()).unwrap();
+        runtime
+            .block_on(service.drain(tokio::time::Instant::now() + Duration::from_secs(2)))
+            .unwrap();
+        assert!(service.workers.lock().unwrap().maintenance.is_none());
+    }
+
+    #[test]
+    fn component_drain_keeps_a_blocked_cancellation_and_reports_its_actual_error() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = AgentRuntimeControlRegistry::new();
+        let service = HostedChatService::new("127.0.0.1:1", registry.clone());
+        let (release, held) = channel();
+        let (started, ready) = channel();
+        let held = Mutex::new(held);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register_session(Arc::new(CancelRecorder(
+                SessionId::generate(),
+                calls.clone(),
+                Some(Arc::new(move || {
+                    started.send(()).unwrap();
+                    held.lock().unwrap().recv().unwrap();
+                })),
+            )))
+            .unwrap();
+        assert!(
+            runtime
+                .block_on(service.drain(tokio::time::Instant::now()))
+                .is_err()
+        );
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            service
+                .workers
+                .lock()
+                .unwrap()
+                .cancellation
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        );
+        release.send(()).unwrap();
+        let error = runtime
+            .block_on(service.drain(tokio::time::Instant::now() + Duration::from_secs(2)))
+            .unwrap_err();
+        assert!(error.contains("recorded"), "{error}");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "do not replay failed cancellation"
+        );
     }
 
     struct DecliningPeer {

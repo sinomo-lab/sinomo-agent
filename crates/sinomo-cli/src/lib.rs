@@ -819,13 +819,19 @@ pub fn hosted_agent_chat_component_factory(
             let chat_service =
                 chat_service::HostedChatService::new(daemon_address.clone(), runtime_control);
             let services = services.register(chat_service.clone());
+            let draining_chat = chat_service.clone();
+            scope.on_task_drain("hosted chat workers and mounts", move |deadline| {
+                let service = draining_chat.clone();
+                async move { service.drain(deadline).await }
+            });
             let data_dir = SinomoDataDir::new(context.data_dir_root());
             if let Some(runtime) = context.runtime().cloned() {
+                let shutdown = scope.shutdown_receiver();
                 scope.on_host_ready(move || {
                     let service = chat_service.clone();
                     let data_dir = data_dir.clone();
                     let runtime = runtime.clone();
-                    if let Err(error) = service.recover(data_dir, runtime) {
+                    if let Err(error) = service.recover(data_dir, runtime, shutdown.clone()) {
                         tracing::error!(%error, "chat execution recovery failed");
                     }
                 });
@@ -862,14 +868,36 @@ static CLI_RUNTIME_CONFIG: OnceLock<CliRuntimeConfig> = OnceLock::new();
 static PROCESS_STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(all(unix, feature = "dfs-fuse"))]
 static SIMPLE_SANDBOX_SIFS_MOUNTS: OnceLock<
-    Mutex<BTreeMap<PathBuf, Weak<Mutex<sinomo_dfs_fuse::DfsFuseMountHandle>>>>,
+    Mutex<BTreeMap<PathBuf, Weak<Mutex<SimpleSandboxSifsMountOwner>>>>,
 > = OnceLock::new();
+
+#[cfg(all(unix, feature = "dfs-fuse"))]
+struct SimpleSandboxSifsMountOwner(Option<sinomo_dfs_fuse::DfsFuseMountHandle>);
+
+#[cfg(all(unix, feature = "dfs-fuse"))]
+impl std::ops::Deref for SimpleSandboxSifsMountOwner {
+    type Target = sinomo_dfs_fuse::DfsFuseMountHandle;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("live SIFS mount owner")
+    }
+}
+
+#[cfg(all(unix, feature = "dfs-fuse"))]
+impl Drop for SimpleSandboxSifsMountOwner {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take()
+            && let Err(error) = handle.shutdown()
+        {
+            tracing::error!(%error, "agent SIFS mount retirement failed");
+        }
+    }
+}
 
 #[derive(Clone)]
 struct SimpleSandboxSifsMount {
     mount_root: PathBuf,
     #[cfg(all(unix, feature = "dfs-fuse"))]
-    handle: Arc<Mutex<sinomo_dfs_fuse::DfsFuseMountHandle>>,
+    handle: Arc<Mutex<SimpleSandboxSifsMountOwner>>,
 }
 
 #[derive(Clone)]
@@ -5220,7 +5248,7 @@ fn ensure_simple_sandbox_sifs_mount(
             detail: format!("mount live SIFS for simple sandbox: {source}"),
         })?;
     let mount_root = handle.mount_root().to_path_buf();
-    let handle = Arc::new(Mutex::new(handle));
+    let handle = Arc::new(Mutex::new(SimpleSandboxSifsMountOwner(Some(handle))));
     mounts.insert(data_root, Arc::downgrade(&handle));
     Ok(Some(SimpleSandboxSifsMount { mount_root, handle }))
 }

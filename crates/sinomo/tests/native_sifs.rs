@@ -19,13 +19,21 @@ use std::{
     io::Write,
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 struct Node {
     child: Child,
     status: Option<DaemonStatus>,
+    exit: Arc<Mutex<ExitObservation>>,
+}
+
+#[derive(Default)]
+struct ExitObservation {
+    forced: bool,
+    status: Option<ExitStatus>,
 }
 
 impl Node {
@@ -50,6 +58,7 @@ impl Node {
                 .spawn()
                 .expect("start the isolated candidate daemon"),
             status: None,
+            exit: Arc::new(Mutex::new(ExitObservation::default())),
         };
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -68,6 +77,11 @@ impl Node {
                 assert_eq!(status.app_launch_id.as_deref(), Some(launch.as_str()));
                 assert_eq!(status.port, port);
                 assert_eq!(status.commit.as_deref(), Some(env!("SINOMO_GIT_COMMIT")));
+                assert_eq!(
+                    fs::read_link(format!("/proc/{}/exe", status.pid)).unwrap(),
+                    fs::canonicalize(env!("CARGO_BIN_EXE_sinomo")).unwrap(),
+                    "kernel executable identity must match the candidate"
+                );
                 assert_eq!(
                     fs::canonicalize(&status.data_dir).unwrap(),
                     fs::canonicalize(data.root()).unwrap()
@@ -89,7 +103,11 @@ impl Node {
 
     fn wait_exit(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while self.child.try_wait().unwrap().is_none() {
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                self.exit.lock().unwrap().status = Some(status);
+                break;
+            }
             assert!(Instant::now() < deadline, "owned daemon did not drain");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -111,11 +129,12 @@ impl Drop for Node {
             }
             if self.child.try_wait().ok().flatten().is_none() {
                 // This Child handle owns only this fixture's exact process.
+                self.exit.lock().unwrap().forced = true;
                 let _ = self.child.kill();
                 eprintln!("native SIFS fixture required forced child cleanup");
             }
-            let _ = self.child.wait();
         }
+        self.exit.lock().unwrap().status = self.child.wait().ok();
     }
 }
 
@@ -138,6 +157,282 @@ fn record(file: &mut File, value: serde_json::Value) {
     writeln!(file, "{value}").unwrap();
     file.sync_all().unwrap();
     eprintln!("native-sifs-evidence {value}");
+}
+
+fn undeleted_chat_shutdown(fixture_unwind: bool) {
+    use std::os::unix::fs::MetadataExt;
+    let mode = if fixture_unwind { "unwind" } else { "normal" };
+    let root = sinomo_testdir::TestDir::new(&format!("native-sifs-undeleted-{mode}")).keep();
+    eprintln!("native-sifs-retained-root={}", root.display());
+    let data = SinomoDataDir::new(root.join("data"));
+    data.ensure_root_layout().unwrap();
+    let mut receipt = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join("receipt.jsonl"))
+        .unwrap();
+    let binary = fs::canonicalize(env!("CARGO_BIN_EXE_sinomo")).unwrap();
+    let digest = blake3::hash(&fs::read(&binary).unwrap())
+        .to_hex()
+        .to_string();
+    let options = DfsFuseMountOptions::new(data.external_mounts_dir().join("capability-check"))
+        .with_data_dir(data.root());
+    let capability = preflight_linux_sifs_background_mount(&options)
+        .expect("native FUSE capability is required, without fallback");
+    assert!(
+        capability.direct_fuse_device_access,
+        "device access denied; do not reroute"
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"intent", "mode":mode, "data":data.root(),
+        "binary":binary,"binary_blake3":digest,"build_commit":env!("SINOMO_GIT_COMMIT"),
+        "explicit_delete":false,"model_turn_submitted":false,"production":false}),
+    );
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut bootstrap = Node::start(&data, port, "bootstrap");
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"bootstrap", "status":bootstrap.status()}),
+    );
+    DaemonApiClient::at_address(&bootstrap.status().address)
+        .cluster_init(ClusterControlInitRequest {
+            cluster_name: "Isolated undeleted chat shutdown".into(),
+            node_display_name: Some("Private shutdown fixture".into()),
+            node_role: None,
+        })
+        .expect("initialize fresh private DATA once");
+    bootstrap.wait_exit();
+    drop(bootstrap);
+    let mut node = Node::start(&data, port, "main");
+    let status = node.status().clone();
+    let kernel_stat = fs::read_to_string(format!("/proc/{}/stat", status.pid)).unwrap();
+    let start_ticks = kernel_stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .to_string();
+    let data_meta = fs::metadata(data.root()).unwrap();
+    let sentinel = format!(
+        "undeleted {mode} {} {digest}",
+        status.cluster.as_ref().unwrap().node_id
+    );
+    let browser = SifsBrowser::open_daemon(&status.address).unwrap();
+    browser
+        .write_file("/services/shutdown-sentinel", sentinel.as_bytes())
+        .expect("single original sentinel write, no retry");
+    let client = ChatDaemonClient::at_address(
+        &status.address,
+        format!("shutdown-{mode}-{}", std::process::id()),
+    );
+    let opened = client
+        .open()
+        .expect("open resident chat without a model turn");
+    let mut cursor = opened.next_event_sequence;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let session = 'ready: loop {
+        let batch = client
+            .events(cursor, 128, Duration::from_millis(200))
+            .unwrap();
+        cursor = batch.next_sequence;
+        for event in batch.events {
+            match event.event {
+                ChatEvent::Ready { session_id, .. } => break 'ready session_id,
+                ChatEvent::Error { error, .. } => panic!("chat initialization: {error}"),
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident chat readiness deadline"
+        );
+    };
+    let mount = data
+        .external_mounts_dir()
+        .join("sifs/by-process")
+        .join(status.pid.to_string());
+    let kernel_mount = mount_entry(&mount).expect("real resident-agent kernel mount required");
+    assert!(kernel_mount.contains(" - fuse ") || kernel_mount.contains(" - fuse."));
+    assert_eq!(
+        fs::read(mount.join("services/shutdown-sentinel")).unwrap(),
+        sentinel.as_bytes()
+    );
+    assert!(
+        ChatHistoryClient::at_address(&status.address)
+            .list()
+            .unwrap()
+            .iter()
+            .any(|chat| chat.id == session),
+        "resident chat must exist before shutdown"
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"resident", "status":status,"start_ticks":start_ticks,
+        "data_dev":data_meta.dev(),"data_inode":data_meta.ino(),"mount":mount,"mountinfo":kernel_mount,
+        "session_id":session,"chat_undeleted":true,"subscription_closed":false}),
+    );
+    let exit = node.exit.clone();
+    if fixture_unwind {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned_node = node;
+            panic!("deliberate native fixture unwind after resident mount");
+        }));
+        let message = failed.unwrap_err();
+        assert_eq!(
+            message.downcast_ref::<&str>().copied(),
+            Some("deliberate native fixture unwind after resident mount")
+        );
+    } else {
+        node.stop();
+        drop(node);
+    }
+    let exit = exit.lock().unwrap();
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"child-exited", "mode":mode,
+        "pid":status.pid,"forced":exit.forced,"exit_code":exit.status.and_then(|s|s.code()),
+        "mount_after_exit":mount_entry(&mount),"chat_undeleted":true}),
+    );
+    assert!(
+        !exit.forced,
+        "forced termination cannot qualify graceful cleanup"
+    );
+    assert!(
+        exit.status.is_some_and(|s| s.success()),
+        "native daemon failed to shut down cleanly"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{}", status.pid)).exists(),
+        "exact owned child must be reaped"
+    );
+    assert!(
+        mount_entry(&mount).is_none(),
+        "undeleted chat left an owned kernel mount after {mode}"
+    );
+    assert_eq!(
+        fs::read_dir(&mount).unwrap().count(),
+        0,
+        "no local-directory substitute"
+    );
+    drop(exit);
+    // A new owned generation observes the original undeleted conversation;
+    // this is graceful persistence/readback, not abrupt-crash durability.
+    let mut readback = Node::start(&data, port, "readback");
+    assert_eq!(
+        readback.status().cluster.as_ref().unwrap().node_id,
+        status.cluster.as_ref().unwrap().node_id
+    );
+    assert_eq!(
+        readback.status().cluster.as_ref().unwrap().cluster_id,
+        status.cluster.as_ref().unwrap().cluster_id
+    );
+    assert_ne!(readback.status().app_launch_id, status.app_launch_id);
+    assert!(
+        ChatHistoryClient::at_address(&readback.status().address)
+            .list()
+            .unwrap()
+            .iter()
+            .any(|chat| chat.id == session),
+        "shutdown must preserve the original undeleted chat"
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"retained-chat-readback", "status":readback.status(),
+        "session_id":session,"chat_exists_not_deleted":true}),
+    );
+    // Reacquire a real agent mount on the retained DATA without touching the
+    // prior mounted-mutation session records. Leave this chat undeleted too.
+    let resumed = ChatDaemonClient::at_address(
+        &readback.status().address,
+        format!("readback-{mode}-{}", std::process::id()),
+    );
+    let opened = resumed.open().unwrap();
+    let mut cursor = opened.next_event_sequence;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let resumed_session = 'ready: loop {
+        let batch = resumed
+            .events(cursor, 128, Duration::from_millis(200))
+            .unwrap();
+        cursor = batch.next_sequence;
+        for event in batch.events {
+            match event.event {
+                ChatEvent::Ready { session_id, .. } => break 'ready session_id,
+                ChatEvent::Error { error, .. } => panic!("retained DATA mount reattach: {error}"),
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained DATA chat readiness deadline"
+        );
+    };
+    let resumed_mount = data
+        .external_mounts_dir()
+        .join("sifs/by-process")
+        .join(readback.status().pid.to_string());
+    let resumed_entry =
+        mount_entry(&resumed_mount).expect("retained DATA must remount through the native owner");
+    assert!(resumed_entry.contains(" - fuse ") || resumed_entry.contains(" - fuse."));
+    assert_eq!(
+        fs::read(resumed_mount.join("services/shutdown-sentinel")).unwrap(),
+        sentinel.as_bytes()
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"retained-data-remounted", "status":readback.status(),
+        "mount":resumed_mount,"mountinfo":resumed_entry,"session_id":resumed_session,
+        "original_session_id":session,"mutation_session_records_modified_by_fixture":false}),
+    );
+    readback.stop();
+    assert!(
+        readback
+            .exit
+            .lock()
+            .unwrap()
+            .status
+            .is_some_and(|s| s.success())
+    );
+    assert!(!readback.exit.lock().unwrap().forced);
+    assert!(!Path::new(&format!("/proc/{}", readback.status().pid)).exists());
+    assert!(
+        mount_entry(
+            &data
+                .external_mounts_dir()
+                .join("sifs/by-process")
+                .join(readback.status().pid.to_string())
+        )
+        .is_none()
+    );
+    assert_eq!(
+        blake3::hash(&fs::read(binary).unwrap()).to_hex().as_str(),
+        digest
+    );
+    record(
+        &mut receipt,
+        serde_json::json!({"phase":"complete","mode":mode,"chat_undeleted":true,
+        "kernel_mount_absent":true,"exact_child_reaped":true,"forced":false,
+        "original_chat_preserved":true,
+        "abrupt_termination_tested":false,"crash_durability_tested":false,"production_acceptance":false}),
+    );
+}
+
+#[test]
+#[ignore = "strict real kernel SIFS and private native process; explicitly invoke to qualify"]
+fn native_undeleted_chat_normal_shutdown() {
+    undeleted_chat_shutdown(false);
+}
+
+#[test]
+#[ignore = "strict parent fixture unwind; no explicit chat deletion, forced exit or fallback may pass"]
+fn native_undeleted_chat_fixture_unwind() {
+    undeleted_chat_shutdown(true);
 }
 
 #[test]

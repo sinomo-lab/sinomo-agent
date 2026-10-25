@@ -5030,6 +5030,14 @@ impl AgentChat {
                 .any(|runtime| runtime.handler().has_running_work())
     }
 
+    /// Completed or not-yet-restored continuations stay durable. Only live
+    /// participant effects keep a shutting-down host and its mounts resident.
+    pub(crate) fn has_live_participant_work(&self) -> bool {
+        self.participant_runtimes
+            .values()
+            .any(|runtime| runtime.handler().has_live_work())
+    }
+
     /// Note the channel participants whose sessions recorded detached tool
     /// calls the session has not continued with. A restarted or reopened
     /// channel has no participant runtimes until they speak, so these are

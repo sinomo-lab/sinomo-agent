@@ -8725,6 +8725,11 @@ where
             .is_some_and(|runtime| runtime.has_running_work().unwrap_or(true))
     }
 
+    pub(crate) fn has_live_work(&self) -> bool {
+        self.ready_runtime()
+            .is_some_and(|runtime| runtime.has_live_work().unwrap_or(true))
+    }
+
     pub(crate) fn has_async_updates(&self) -> bool {
         self.ready_runtime()
             .is_some_and(AgentSessionRuntime::has_async_updates)

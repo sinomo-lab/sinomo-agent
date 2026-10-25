@@ -349,6 +349,11 @@ pub trait AgentRuntimeControlSession: Send + Sync {
         Ok(true)
     }
 
+    /// Live effects to join during shutdown. Unknown hosts remain conservative.
+    fn has_live_work(&self) -> Result<bool, AgentRuntimeControlError> {
+        self.has_running_work()
+    }
+
     /// Identity of the live runtime behind this session, so a host removes
     /// only its own registration. `None` for hosts without one.
     fn runtime_identity(&self) -> Option<usize> {
@@ -433,6 +438,10 @@ where
 
     fn has_running_work(&self) -> Result<bool, AgentRuntimeControlError> {
         AgentSessionRuntime::has_running_work(self).map_err(agent_runtime_error)
+    }
+
+    fn has_live_work(&self) -> Result<bool, AgentRuntimeControlError> {
+        AgentSessionRuntime::has_live_work(self).map_err(agent_runtime_error)
     }
 
     fn runtime_identity(&self) -> Option<usize> {
@@ -523,6 +532,21 @@ impl AgentRuntimeControlRegistry {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<bool>, AgentRuntimeControlError> {
+        self.session_work(session_id, false)
+    }
+
+    pub fn has_live_work(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<bool>, AgentRuntimeControlError> {
+        self.session_work(session_id, true)
+    }
+
+    fn session_work(
+        &self,
+        session_id: &SessionId,
+        live_only: bool,
+    ) -> Result<Option<bool>, AgentRuntimeControlError> {
         let session = self
             .sessions
             .lock()
@@ -530,7 +554,13 @@ impl AgentRuntimeControlRegistry {
             .get(session_id)
             .cloned();
         session
-            .map(|session| session.has_running_work())
+            .map(|session| {
+                if live_only {
+                    session.has_live_work()
+                } else {
+                    session.has_running_work()
+                }
+            })
             .transpose()
     }
 
@@ -539,6 +569,36 @@ impl AgentRuntimeControlRegistry {
             .lock()
             .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))
             .map(|sessions| sessions.len())
+    }
+
+    /// Cancel running work owned by this registry during its host's shutdown.
+    /// Idle sessions retain their durable state for ordinary reattachment.
+    /// Callbacks run without the registry lock and every owner is attempted.
+    pub fn cancel_live_work(&self, reason: &str) -> Result<(), AgentRuntimeControlError> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| AgentRuntimeControlError::new("agent runtime registry lock poisoned"))?
+            .iter()
+            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for (id, session) in sessions {
+            if matches!(session.has_live_work(), Ok(false)) {
+                continue;
+            }
+            match session.cancel(reason.to_string()) {
+                Ok(result) if result.accepted => {}
+                Ok(_) if matches!(session.has_live_work(), Ok(false)) => {}
+                Ok(_) => errors.push(format!("session {id} declined shutdown cancellation")),
+                Err(error) => errors.push(format!("session {id}: {error}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AgentRuntimeControlError::new(errors.join("; ")))
+        }
     }
 
     fn session(

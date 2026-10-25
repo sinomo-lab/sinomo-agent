@@ -1605,15 +1605,25 @@ where
     /// Whether the session still has work in flight: a turn, including tool
     /// calls a paused turn is finishing, or running subagents.
     pub fn has_running_work(&self) -> Result<bool, AgentError> {
+        self.has_work(true)
+    }
+
+    /// Work which still executes, rather than a durable completion waiting
+    /// for a later model turn. Shutdown must retain the latter for reattach.
+    pub fn has_live_work(&self) -> Result<bool, AgentError> {
+        self.has_work(false)
+    }
+
+    fn has_work(&self, include_ready_updates: bool) -> Result<bool, AgentError> {
         let session_id = {
             let mut state = self.lock_state()?;
             state.collect_detached_completions();
-            // Detached calls and completions not yet continued with are work
-            // in flight: the host must stay to continue the session.
+            // Ordinary idle checks include ready continuations. Shutdown joins
+            // executing work while leaving those completions for reattach.
             if state.control.active_turn.is_some()
                 || state.turn_worker_running
                 || detached_calls_running(&state.control.session.session_id) > 0
-                || !state.async_updates.is_empty()
+                || (include_ready_updates && !state.async_updates.is_empty())
             {
                 return Ok(true);
             }
@@ -2499,5 +2509,76 @@ fn record_detached<M: InteractionModel>(
 ) {
     if let Err(error) = agent.session_store_record(session_id, record) {
         tracing::warn!(%session_id, %error, "record detached tool call failed");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crate::{
+        Agent, AgentRole, AgentRuntimeControlRegistry, AsyncTaskNextAction, AsyncTaskStatus,
+        AsyncTaskUpdate,
+    };
+
+    struct NoModelCalls;
+    impl InteractionModel for NoModelCalls {
+        fn complete(
+            &self,
+            _: &sinomo_lm::LanguageModelRequest,
+        ) -> Result<sinomo_lm::LanguageModelResponse, sinomo_lm::LanguageModelError> {
+            panic!("shutdown must not start a model turn");
+        }
+    }
+
+    #[test]
+    fn shutdown_live_work_query_preserves_idle_and_completed_continuations() {
+        let session_id = SessionId::generate();
+        let runtime = AgentSessionRuntime::new(
+            Agent::new(NoModelCalls, "fixture", "fixture"),
+            AgentSession::new(session_id.clone(), AgentRole::Main),
+        );
+        let registry = AgentRuntimeControlRegistry::new();
+        registry.register_runtime(runtime.clone()).unwrap();
+        let before = runtime.session_snapshot().unwrap();
+        registry.cancel_live_work("shutdown idle fixture").unwrap();
+        assert_eq!(runtime.session_snapshot().unwrap(), before);
+        let update = AsyncTaskUpdate {
+            kind: "completed-tool".into(),
+            task_id: TaskId::generate(),
+            tool_call_id: Some(TaskId::generate()),
+            status: AsyncTaskStatus::Completed,
+            summary: "stored completion still needs its original continuation".into(),
+            needs_user_attention: false,
+            result_ref: Some("original-result".into()),
+            next_action_hint: AsyncTaskNextAction::InspectResult,
+        };
+        runtime
+            .lock_state()
+            .unwrap()
+            .async_updates
+            .push(update.clone());
+        assert!(
+            runtime.has_running_work().unwrap(),
+            "ordinary idle policy must still see pending work"
+        );
+        assert!(
+            !runtime.has_live_work().unwrap(),
+            "a completed result must not force a model turn during shutdown"
+        );
+        registry
+            .cancel_live_work("shutdown completed fixture")
+            .unwrap();
+        assert_eq!(runtime.session_snapshot().unwrap(), before);
+        assert_eq!(
+            runtime.take_async_updates(),
+            vec![update],
+            "original task/call/result identities were retained"
+        );
+        runtime.lock_state().unwrap().turn_worker_running = true;
+        assert!(
+            runtime.has_live_work().unwrap(),
+            "a live worker cannot disappear from shutdown accounting"
+        );
+        runtime.lock_state().unwrap().turn_worker_running = false;
     }
 }
