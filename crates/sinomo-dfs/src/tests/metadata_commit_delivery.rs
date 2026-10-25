@@ -19,6 +19,7 @@ fn inspect(
     object: &DfsObjectId,
     intent: &str,
 ) -> Option<Evidence> {
+    let physical_root = crate::local_dfs_metadata_shard_path(runtime.data_dir(node), shard);
     crate::local_state::with_current_owned_dfs_shard_inspection(
         runtime.data_dir(node),
         shard,
@@ -26,34 +27,54 @@ fn inspect(
             let Some(record) = backend.prepared_operation_record(operation)? else {
                 return Ok(None);
             };
-            let batch = backend
-                .journal_batch_for_shard_since_limited(
-                    shard,
-                    0,
-                    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-                    DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-                )?
-                .expect("actual retained native shard journal");
+            // The owning inspection already holds this exact root's physical
+            // fence/path registration. The backend journal wrapper takes the
+            // non-reentrant writer lock again; use its existing read-only
+            // durable readers ONLY inside this already-fenced closure.
+            let entries = crate::metadata_journal::durable_journal_entries_since_limited(
+                &physical_root,
+                0,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            )?;
+            let batch = crate::metadata_journal::bounded_metadata_journal_batch(
+                shard.clone(),
+                0,
+                entries,
+                DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            )?
+            .expect("actual retained native shard journal");
+            assert_eq!(&batch.shard_id, shard);
             assert!(
                 batch.entries.len() < DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
                 "small fixture must expose its complete actual frame prefix"
             );
-            let frames = backend.journal_frames_for_batch(&batch)?;
+            let frames = crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+                &physical_root,
+                &batch
+                    .entries
+                    .iter()
+                    .map(|entry| entry.sequence)
+                    .collect::<Vec<_>>(),
+            )?;
             assert_eq!(frames.len(), batch.entries.len());
             let mut prepare_frames = Vec::new();
             let mut commit_frames = Vec::new();
             for (entry, frame) in batch.entries.iter().zip(frames) {
-                assert_eq!(frame.sequence, entry.sequence);
+                let frame =
+                    frame.expect("selected actual journal entry retains its immutable exact frame");
+                assert_eq!(frame.entry(), entry);
+                assert_eq!(&entry.shard_id, shard);
                 match &entry.mutation {
                     DfsMetadataMutation::PrepareOperationV7 { operation_id, .. }
                         if operation_id == operation =>
                     {
-                        prepare_frames.push(frame.exact_bytes.to_vec());
+                        prepare_frames.push(frame.exact_bytes().to_vec());
                     }
                     DfsMetadataMutation::CommitPreparedOperationV7 { operation_id, .. }
                         if operation_id == operation =>
                     {
-                        commit_frames.push(frame.exact_bytes.to_vec());
+                        commit_frames.push(frame.exact_bytes().to_vec());
                     }
                     _ => {}
                 }
