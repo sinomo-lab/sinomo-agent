@@ -1,6 +1,55 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R37
+## Current development checkpoint — 2026-10-25 R40
+
+The selected normal sender now captures admission provenance while its real
+producer owns execution, carries the same body/attempt through the native RPC,
+and retains the actual typed return in the existing outbox on local intake
+failure. The deferred custody path writes the original physical queue before
+serving-authority handling and returns without receipt/W publication,
+historical application, Close or root release. Generic/raw frames, unverified
+candidates and the weaker R37 direct-call capability cannot enter this intake.
+Production activation, C1 and B effects remain disabled.
+
+Local storage `0557a0b1`/`9fc3bebc`, normal lifecycle `9e56a439` and native tests
+`3a7b9c1d` were merged without conflicts. After compiler correction `afff33dd`,
+R39 actually executed14 controls: **12 PASS /2 FAIL**. The current-A case exposed
+retry-row/head churn after reopen; the retired-A case compared an unfenced
+proposal to the actual fenced handoff. Both failures remain preserved.
+
+Scoped correction `efae6d80` uses the existing exact-key parked-page path to
+preserve held rows and deadlines. Test correction `7114095c` independently
+matches A's durable source cut/freeze to B's installed cut while preserving every
+initial proposal field. Current code merge `595376bb`, source `4e755b2e` with
+4,909 inputs and ELF `7c3b711a`, passed fresh check/build/seal. The two corrected
+native controls and affected W/N regression **all passed on R40**. The other
+177 of180 inventory controls are unrun on this source; old passes do not transfer.
+Current-source DFS/KV boundary passed11 UI controls and three libraries.
+
+The native cases execute real normal admission/return, namespace-failure and
+same-cap retry, duplicate recertification, queue compaction/cold reconstruction
+and component reopen. Current A keeps rows/head and wire stable despite holding
+serving admission. After completed handoff, old A's provider still refuses
+serving authority while the SAME typed return is durably intaken locally. Exact
+original/body/attempt and metadata/receipt/root state are preserved; B gains no
+object bytes or execution permission. These remain native in-process tests,
+not OS-node-loss, power-loss, full coverage or quietness acceptance.
+
+`R40-REPORT.md` and `R40-COMBINED-RESULT.json` retain source-qualified I109–I117
+results, failures, standard measurement/coverage tables, archives and verified
+owned cleanup. No Codex peer reviews, debugger arbitration, shared build lock,
+Docker, deployment or cross-lane integration occurred.
+
+The original goal continues. The next independently executable durability step
+is an owned-process death after genuine native intake, with physical/raw evidence
+captured before recovery and DATA-only inspection. Full original/effect coverage,
+late-fact forwarding, C1, successor effects, causal settlement/root retirement,
+metadata majority history, real abrupt-loss/partition/reconnect and mandatory
+Sinomo-only daemon/helper quietness remain open requirements.
+
+## Historical checkpoints
+
+### Preserved R37 checkpoint
 
 The next bounded native-provenance slice is implemented. Queue witness
 `a4416089`, native-owned capture `65d38b5f`, and native tests `f6904f6e` were
@@ -44,8 +93,6 @@ application, Close or root release is enabled. Selected receiver Terminal replay
 complete handoff coverage, metadata majority history and full abrupt-loss,
 partition, reconnect and Sinomo-only quietness acceptance remain open. The
 original DFS availability goal is unfinished.
-
-## Historical checkpoints
 
 ### Preserved R35 checkpoint
 
