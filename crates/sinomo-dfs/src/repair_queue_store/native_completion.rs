@@ -105,6 +105,182 @@ impl RetainedNativeOwnedRepairCompletion {
     }
 }
 
+/// Forensic test DATA only. It cannot open a store, certify durability, admit a
+/// reader/owner or reconstruct the opaque native transport capability.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeCompletionProcessDataInspection {
+    retained: RetainedNativeOwnedRepairCompletion,
+    original_birth: RepairOriginalBirth,
+    snapshot_floor: u64,
+    log_head: u64,
+    log_file_bytes: u64,
+    log_valid_bytes: u64,
+}
+
+#[cfg(test)]
+impl NativeCompletionProcessDataInspection {
+    pub(crate) fn retained(&self) -> &RetainedNativeOwnedRepairCompletion {
+        &self.retained
+    }
+    pub(crate) fn original_birth(&self) -> &RepairOriginalBirth {
+        &self.original_birth
+    }
+    pub(crate) fn snapshot_floor(&self) -> u64 {
+        self.snapshot_floor
+    }
+    pub(crate) fn log_head(&self) -> u64 {
+        self.log_head
+    }
+    pub(crate) fn log_file_bytes(&self) -> u64 {
+        self.log_file_bytes
+    }
+    pub(crate) fn log_valid_bytes(&self) -> u64 {
+        self.log_valid_bytes
+    }
+}
+
+#[cfg(test)]
+const NATIVE_COMPLETION_PROCESS_INSPECTION_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+fn same_process_inspection_directory(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    if !left.is_dir()
+        || !right.is_dir()
+        || left.file_type().is_symlink()
+        || right.file_type().is_symlink()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        (left.dev(), left.ino()) == (right.dev(), right.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        left.created().ok().is_some() && left.created().ok() == right.created().ok()
+    }
+}
+
+#[cfg(test)]
+impl RetainedNativeOwnedRepairCompletion {
+    /// Inspect exactly one expected positive DATA record without any owner or
+    /// recovery path. The parent MUST pin the physical root while its genuine
+    /// child is alive, kill/reap/drain it and capture raw files before this
+    /// call, and establish no active writer for this private fixture/capture.
+    /// The size bound applies to that stable small input; racing replacements
+    /// or changes fail the before/after physical and consumed-byte checks.
+    pub(crate) fn inspect_expected_process_data_for_test(
+        snapshot_path: &Path,
+        expected: &Self,
+    ) -> Result<NativeCompletionProcessDataInspection, DfsError> {
+        let invalid = |detail: &str| {
+            custody_error(&format!(
+                "native completion process DATA inspection {detail}"
+            ))
+        };
+        let observation_error = |(status, detail): (&str, String)| {
+            invalid(&format!("unavailable ({status}): {detail}"))
+        };
+        let directory = snapshot_path
+            .parent()
+            .ok_or_else(|| invalid("has no private parent directory"))?;
+        let directory_before =
+            fs::symlink_metadata(directory).map_err(|error| fingerprint_error(directory, error))?;
+        if !same_process_inspection_directory(&directory_before, &directory_before) {
+            return Err(invalid("requires a regular physical parent directory"));
+        }
+        let log_path = repair_queue_active_log_path(snapshot_path);
+        let paths = [snapshot_path, log_path.as_path()];
+        let before = paths
+            .iter()
+            .map(|path| diagnostic_queue_metadata(path).map_err(&observation_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = before.iter().try_fold(0_u64, |sum, metadata| {
+            sum.checked_add(metadata.as_ref().map_or(0, fs::Metadata::len))
+                .ok_or_else(|| invalid("file size overflow"))
+        })?;
+        // Pure decoding reads each file; incomplete framing can reread its
+        // unacknowledged suffix. Reserve two full passes plus one exact-hash
+        // pass and growth probes, without changing the existing codecs.
+        if bytes
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add(4))
+            .is_none_or(|cost| cost > NATIVE_COMPLETION_PROCESS_INSPECTION_MAX_BYTES)
+        {
+            return Err(invalid("exceeds the fixed forensic byte budget"));
+        }
+
+        let (snapshot, consumed_snapshot) =
+            read_repair_queue_snapshot_with_fingerprint(snapshot_path)?;
+        let snapshot_floor = snapshot.applied_through_sequence;
+        let mut records = records_by_key(snapshot.records)?;
+        // `true` selects only the strict private DATA grammar in temporary
+        // maps. No store handle, production/default reader or native owner is
+        // created or admitted, and no authentication capability is returned.
+        let mut custody =
+            RepairCustodyIndex::from_snapshot(snapshot.custody, snapshot_floor, true)?;
+        let replay =
+            replay_repair_queue_log(&log_path, snapshot_floor, &mut records, &mut custody, true)?;
+        let mut remaining =
+            NATIVE_COMPLETION_PROCESS_INSPECTION_MAX_BYTES - bytes.saturating_mul(2);
+        let mut hash_bytes_read = 0;
+        let current_snapshot = diagnostic_queue_fingerprint(
+            snapshot_path,
+            &before[0],
+            &mut remaining,
+            &mut hash_bytes_read,
+        )
+        .map_err(&observation_error)?;
+        let current_log = diagnostic_queue_fingerprint(
+            &log_path,
+            &before[1],
+            &mut remaining,
+            &mut hash_bytes_read,
+        )
+        .map_err(&observation_error)?;
+        if consumed_snapshot != current_snapshot || replay.fingerprint != current_log {
+            return Err(invalid(
+                "consumed files differ from the unchanged physical cut",
+            ));
+        }
+        for (path, before) in paths.into_iter().zip(&before) {
+            let after = diagnostic_queue_metadata(path).map_err(&observation_error)?;
+            if !same_diagnostic_queue_file(before, &after) {
+                return Err(invalid("queue file identity changed during decoding"));
+            }
+        }
+        let directory_after =
+            fs::symlink_metadata(directory).map_err(|error| fingerprint_error(directory, error))?;
+        if !same_process_inspection_directory(&directory_before, &directory_after) {
+            return Err(invalid("physical parent directory changed during decoding"));
+        }
+
+        let expected_reference = expected.reference()?;
+        let retained = custody
+            .retained_native_completions
+            .get(&expected_reference.key)
+            .filter(|retained| *retained == expected)
+            .ok_or_else(|| invalid("did not prove the exact expected positive DATA record"))?;
+        if retained.reference()? != expected_reference {
+            return Err(invalid("expected DATA reference differs"));
+        }
+        let original_birth = custody
+            .births
+            .get(&expected_reference.key.subject)
+            .ok_or_else(|| invalid("did not prove the expected DATA's complete native birth"))?;
+        Ok(NativeCompletionProcessDataInspection {
+            retained: retained.clone(),
+            original_birth: original_birth.clone(),
+            snapshot_floor,
+            log_head: replay.head_sequence,
+            log_file_bytes: replay.file_bytes,
+            log_valid_bytes: replay.valid_bytes,
+        })
+    }
+}
+
 pub(super) fn validate_native_completion_frame(
     operations: &[DfsRepairQueueOperation],
 ) -> Result<(), DfsError> {
@@ -844,5 +1020,120 @@ mod tests {
                 .data,
             f.data
         );
+    }
+
+    #[test]
+    fn native_completion_forensic_expected_data_inspection_never_recovers_or_mutates() {
+        use std::io::Write as _;
+        let root = sinomo_testdir::TestDir::new("native-completion-forensic-data");
+        let f = fixture(root.path());
+        let reference = append_codec_fixture(&f);
+        f.queue
+            .compact_if_needed(DfsRepairQueueCompactionOptions::force())
+            .unwrap();
+        let expected = f
+            .queue
+            .retained_native_owned_repair_completion(&reference)
+            .unwrap();
+        let expected_birth = f.queue.original_repair(&f.data.carrier).unwrap().unwrap();
+        let before = super::super::tests::diagnostic_fixture_state(&f.queue);
+        let actual = RetainedNativeOwnedRepairCompletion::inspect_expected_process_data_for_test(
+            f.identity.snapshot_path(),
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(actual.retained(), &expected);
+        assert_eq!(actual.original_birth(), &expected_birth);
+        assert!(actual.snapshot_floor() >= expected.retained_at_sequence());
+        assert_eq!(actual.log_head(), actual.snapshot_floor());
+        assert_eq!((actual.log_file_bytes(), actual.log_valid_bytes()), (0, 0));
+        assert_eq!(
+            super::super::tests::diagnostic_fixture_state(&f.queue),
+            before
+        );
+
+        // A real incomplete suffix is reported, never recovered/truncated.
+        // This local codec fault is not the separate parent-SIGKILL evidence.
+        let log = repair_queue_active_log_path(f.identity.snapshot_path());
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(&[5, 0]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = super::super::tests::diagnostic_fixture_state(&f.queue);
+        let actual = RetainedNativeOwnedRepairCompletion::inspect_expected_process_data_for_test(
+            f.identity.snapshot_path(),
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(actual.retained(), &expected);
+        assert_eq!(actual.original_birth(), &expected_birth);
+        assert_eq!((actual.log_file_bytes(), actual.log_valid_bytes()), (2, 0));
+        let mut wrong_expected = expected.clone();
+        wrong_expected.data.returned.frame_id += 1;
+        rejects(
+            RetainedNativeOwnedRepairCompletion::inspect_expected_process_data_for_test(
+                f.identity.snapshot_path(),
+                &wrong_expected,
+            ),
+            "did not prove the exact expected positive DATA record",
+        );
+        assert_eq!(
+            super::super::tests::diagnostic_fixture_state(&f.queue),
+            before
+        );
+
+        // Sparse length exceeds the bound before any decode or full-file read.
+        let file = fs::OpenOptions::new().write(true).open(&log).unwrap();
+        file.set_len(NATIVE_COMPLETION_PROCESS_INSPECTION_MAX_BYTES)
+            .unwrap();
+        drop(file);
+        let before = fs::symlink_metadata(&log).unwrap();
+        rejects(
+            RetainedNativeOwnedRepairCompletion::inspect_expected_process_data_for_test(
+                f.identity.snapshot_path(),
+                &expected,
+            ),
+            "fixed forensic byte budget",
+        );
+        assert!(same_file_observation(
+            &before,
+            &fs::symlink_metadata(&log).unwrap()
+        ));
+
+        // A complete malformed frame remains unchanged; the helper never
+        // invokes the writer's resync/truncation or any resident reload path.
+        let corrupt = [1_u8, 0, 0, 0, 0xff];
+        write_file_atomic(&log, &corrupt).unwrap();
+        let before = super::super::tests::diagnostic_fixture_state(&f.queue);
+        rejects(
+            RetainedNativeOwnedRepairCompletion::inspect_expected_process_data_for_test(
+                f.identity.snapshot_path(),
+                &expected,
+            ),
+            "could not decode DFS repair queue log",
+        );
+        assert_eq!(
+            super::super::tests::diagnostic_fixture_state(&f.queue),
+            before
+        );
+
+        #[cfg(unix)]
+        {
+            let retained_log = root.join("retained-log");
+            fs::rename(&log, &retained_log).unwrap();
+            std::os::unix::fs::symlink(&retained_log, &log).unwrap();
+            let before = super::super::tests::diagnostic_fixture_state(&f.queue);
+            rejects(
+                RetainedNativeOwnedRepairCompletion::inspect_expected_process_data_for_test(
+                    f.identity.snapshot_path(),
+                    &expected,
+                ),
+                "NonRegular",
+            );
+            assert_eq!(
+                super::super::tests::diagnostic_fixture_state(&f.queue),
+                before
+            );
+        }
     }
 }
