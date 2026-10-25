@@ -3365,6 +3365,11 @@ impl ClusterNetworkMaintenance {
                 return ClusterConnectivityProbePendingOutcome::ProbeFailed;
             }
         };
+        // The store can coalesce a stable observation and keep its older
+        // durable expiry. Discard the speculative probe cache so the next
+        // selection seeds from that committed generation, not an unpersisted
+        // proposed renewal which could postpone probing beyond expiry.
+        self.connectivity.clear();
         let retained_publish = ClusterConnectivityPendingPublish {
             paths: paths.clone(),
             source_node_id: source_node_id.clone(),
@@ -11696,6 +11701,127 @@ mod tests {
         assert_eq!(maintenance.probe_failure_streak, 0);
         let retry = maintenance.select_connectivity_probe_plan(&paths, &state);
         assert!(retry.entries.iter().any(|entry| entry.endpoint == endpoint));
+    }
+
+    #[test]
+    fn coalesced_probe_observation_keeps_the_durable_refresh_deadline() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("probe_coalesced_expiry");
+        let now = OffsetDateTime::now_utc();
+        let remote = NodeId::from_legacy_named("probe_coalesced_expiry_remote").unwrap();
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(&remote, "127.0.0.1:1".into(), 10);
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote,
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = vec![endpoint.clone()];
+        state.members.push(member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+
+        // Controlled advisory DATA: the durable observation still has five
+        // minutes left. A same-health observation can be coalesced by the
+        // ordinary store, but its proposed expiry cannot delay the next probe.
+        // This exercises real local commit/publication, not transport liveness.
+        let retained = sinomo_core::network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now - time::Duration::seconds(600),
+            sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            std::slice::from_ref(&retained),
+        )
+        .unwrap();
+        let original_bytes = std::fs::read(&paths.connectivity_local).unwrap();
+        let snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let mut observed = retained.clone();
+        observed.observed_at = now;
+        observed.expires_at =
+            now + time::Duration::seconds(sinomo_core::network::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+        let key = cluster_connectivity_probe_key(&state.local_node_id, &endpoint);
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.connectivity_converged = true;
+        maintenance.connectivity.insert(
+            key.clone(),
+            ClusterConnectivityProbeState { record: observed },
+        );
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                probe_claimed: true,
+                connectivity_probe: Some(ClusterConnectivityPendingProbe {
+                    paths: paths.clone(),
+                    source_node_id: state.local_node_id.clone(),
+                    state: state.clone(),
+                    plan: ClusterConnectivityProbePlan {
+                        active_keys: vec![key],
+                        entries: Vec::new(),
+                        remaining_due: 0,
+                        convergence_active: false,
+                        force_probe: false,
+                        timestamp: now.format(&Rfc3339).unwrap(),
+                        now,
+                        startup_settle_active: false,
+                    },
+                    input_generation: maintenance.connectivity_input_generation,
+                    local_connectivity_snapshot: snapshot,
+                }),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            original_bytes,
+            "ordinary stable-observation coalescing must remain intact"
+        );
+        assert_eq!(
+            sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id,
+            )
+            .unwrap(),
+            vec![retained]
+        );
+        let select = |cache: &mut std::collections::BTreeMap<_, _>, at| {
+            sinomo_core::network::select_cluster_connectivity_probe_batch(
+                &paths,
+                &state,
+                cache,
+                0,
+                &ClusterNodeRole::Workstation,
+                false,
+                false,
+                false,
+                at,
+            )
+        };
+        assert!(
+            select(&mut maintenance.connectivity, now)
+                .entries
+                .is_empty()
+        );
+        let due = select(
+            &mut maintenance.connectivity,
+            now + time::Duration::seconds(181),
+        );
+        assert!(
+            due.entries.iter().any(|entry| entry.endpoint == endpoint),
+            "the retained 300s expiry must become due at the existing 120s margin; an unpersisted 900s proposal cannot postpone it"
+        );
     }
 
     #[test]
