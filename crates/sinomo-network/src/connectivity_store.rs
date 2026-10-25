@@ -1025,6 +1025,20 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
         .iter()
         .map(|record| (cluster_connectivity_record_key(record), record))
         .collect::<BTreeMap<_, _>>();
+    // A previous bounded batch may have accepted a fresh observation without
+    // rewriting its semantically identical disk row. Keep those live values
+    // as the merge base, fenced by the raw file and this snapshot generation.
+    let live_records = read_local_cluster_connectivity_records(paths)?;
+    let mut accepted_by_key = existing_by_key.clone();
+    for record in &live_records {
+        let key = cluster_connectivity_record_key(record);
+        if existing_by_key.get(&key).is_some_and(|stored| {
+            cluster_connectivity_stable_eq(stored, record)
+                && local_cluster_connectivity_routing_record_stable_eq((stored, record))
+        }) {
+            accepted_by_key.insert(key, record);
+        }
+    }
     let incoming_source_keys = records
         .iter()
         .filter(|record| {
@@ -1032,8 +1046,9 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
         })
         .map(cluster_connectivity_record_key)
         .collect::<BTreeSet<_>>();
-    let mut merged = existing_records
-        .iter()
+    let mut merged = accepted_by_key
+        .values()
+        .copied()
         .filter(|record| {
             topology.record_is_usable(record, now)
                 && (!replace_source
@@ -1050,7 +1065,7 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
     for record in records {
         if record.source_node_id == *source_node_id && topology.record_is_usable(record, now) {
             let key = cluster_connectivity_record_key(record);
-            let retained = existing_by_key
+            let retained = accepted_by_key
                 .get(&key)
                 .copied()
                 .filter(|existing| topology.record_is_usable(existing, now))
@@ -1094,11 +1109,31 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
     let records_changed = existing_records != committed_records;
     let route_records_stable =
         local_cluster_connectivity_route_records_stable(&existing_records, &committed_records);
-    let persisted_records_stable = route_records_stable
+    let persisted_records_stable = (route_records_stable
         && local_cluster_connectivity_persisted_records_stable(
             &existing_records,
             &committed_records,
-        );
+        ))
+        || (existing_records
+            .iter()
+            .all(|record| topology.record_matches_topology(record))
+            && local_cluster_connectivity_raw_persisted_records_stable(
+                &existing_records,
+                source_node_id,
+                records,
+                replace_source,
+            )
+            && records.iter().all(|record| {
+                existing_by_key
+                    .get(&cluster_connectivity_record_key(record))
+                    .is_some_and(|existing| {
+                        local_cluster_connectivity_routing_record_stable_eq((existing, record))
+                    })
+            }));
+    // Expiry only removes evidence from the live view. A bounded observation
+    // cannot turn an unprobed expired row into a durable source omission.
+    // Explicit source replacement, topology revocation and routing changes
+    // still cross the existing durable boundary.
     let persisted_records = if !persisted_records_stable {
         if committed_records.is_empty() {
             remove_optional_file(&paths.connectivity_local)?;
@@ -1250,14 +1285,31 @@ fn reconcile_local_cluster_connectivity_cache_with_persisted_records(
         records
     });
     let persisted_is_current = cached_records.as_ref().is_none_or(|cached_records| {
+        // An accepted live refresh can outlast its unchanged disk copy.
+        // Compare that key against the raw stored value, not a TTL-filtered
+        // omission. Missing/rebound/changed keys still invalidate the cache.
+        let cached_keys = cached_records
+            .iter()
+            .map(cluster_connectivity_record_key)
+            .collect::<BTreeSet<_>>();
+        let relevant_persisted = persisted_records
+            .iter()
+            .filter(|record| {
+                cluster_network_record_live(record.expires_at, now)
+                    || cached_keys.contains(&cluster_connectivity_record_key(record))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         cached_records == &live_persisted_records
             || (local_cluster_connectivity_persisted_records_stable(
-                &live_persisted_records,
+                &relevant_persisted,
                 cached_records,
             ) && local_cluster_connectivity_route_records_stable(
-                &live_persisted_records,
+                &relevant_persisted,
                 cached_records,
-            ))
+            ) && relevant_persisted.iter().zip(cached_records).all(|(stored, live)| {
+                live.observed_at >= stored.observed_at
+            }))
     });
     if persisted_is_current {
         if cached_records.is_none() && !live_persisted_records.is_empty() {
@@ -1271,7 +1323,7 @@ fn reconcile_local_cluster_connectivity_cache_with_persisted_records(
         drop(cache);
         reconcile_local_cluster_connectivity_observation_watermarks(
             paths,
-            &live_persisted_records,
+            cached_records.as_deref().unwrap_or(&live_persisted_records),
             live_persisted_records.iter(),
         )?;
         return Ok(());
@@ -1650,8 +1702,8 @@ fn local_cluster_connectivity_observation_advanced_since_snapshot(
 ///
 /// A stable record is retained only while it has more than the probe refresh
 /// margin left. Once expiry enters that margin, accepting the new observation
-/// renews the durable evidence and gives the ordinary publisher enough time to
-/// refresh cluster KV before the old record expires.
+/// refreshes the accepted in-memory evidence. Semantic stability is checked
+/// separately before writing; elapsed time alone does not renew durable data.
 fn local_cluster_connectivity_observation_is_stable(
     existing: &ClusterConnectivityRecord,
     observed: &ClusterConnectivityRecord,
@@ -2576,6 +2628,224 @@ mod tests {
     }
 
     #[test]
+    fn live_refresh_survives_persisted_expiry_without_rewriting_or_reviving_disk() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("live_refresh_persisted_expiry");
+        let expired = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now - time::Duration::seconds(1000),
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_object_file(&paths.connectivity_local, &vec![expired.clone()]).unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let fresh = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, std::slice::from_ref(&fresh)).unwrap();
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), before);
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(snapshot.persisted_records.as_slice(), &[expired]);
+        assert_eq!(
+            read_local_cluster_connectivity_records(&paths).unwrap(),
+            vec![fresh.clone()]
+        );
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), before);
+        // A newer external observation with less remaining lifetime wins;
+        // raw-file reconciliation cannot mistake it for our old disk copy.
+        let mut external = fresh;
+        external.observed_at += time::Duration::seconds(1);
+        external.expires_at = now + time::Duration::seconds(60);
+        write_object_file(&paths.connectivity_local, &vec![external.clone()]).unwrap();
+        capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(read_local_cluster_connectivity_records(&paths).unwrap(), vec![external]);
+        // A cold process has no fresh evidence, and an external authority-owned
+        // clear must still invalidate a warm process's accepted evidence.
+        remove_optional_file(&paths.connectivity_local).unwrap();
+        capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_observation_does_not_persist_time_only_expiry_omission() {
+        let (_root, paths, mut state, local, a, now) =
+            connectivity_generation_fixture("bounded_observation_expiry_omission");
+        let mut b = a.clone();
+        b.endpoint_id = ClusterEndpointId::derived("expired-unprobed", b"b");
+        b.address = "target:21354".into();
+        state
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == b.node_id)
+            .unwrap()
+            .endpoints
+            .push(b.clone());
+        let record = |endpoint: &ClusterEndpointRecord, at| {
+            cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                None,
+                None,
+                at,
+                CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            )
+        };
+        let initial = vec![
+            record(&a, now),
+            record(&b, now - time::Duration::seconds(1000)),
+        ];
+        write_object_file(&paths.connectivity_local, &initial).unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let expected = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let observed = record(&a, now + time::Duration::seconds(1));
+        let result = commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[observed],
+            &expected,
+        )
+        .unwrap();
+        assert!(
+            matches!(result, LocalClusterConnectivitySourceSetCommit::Committed { ref records, .. }
+            if records.len() == 1 && records[0].endpoint_id == a.endpoint_id)
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            before,
+            "an unprobed record expiring is not an authority-owned omission"
+        );
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .unwrap()
+                .iter()
+                .all(|r| r.endpoint_id != b.endpoint_id),
+            "expired disk evidence is never routable"
+        );
+        state
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == b.node_id)
+            .unwrap()
+            .endpoints
+            .retain(|e| e.endpoint_id != b.endpoint_id);
+        let expected = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[],
+            &expected,
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            before,
+            "a genuine endpoint revocation must still be durable"
+        );
+    }
+
+    #[test]
+    fn bounded_live_refreshes_preserve_each_other_and_observation_order() {
+        let (_root, paths, mut state, local, a, now) =
+            connectivity_generation_fixture("bounded_live_refreshes");
+        let mut b = a.clone();
+        b.endpoint_id = ClusterEndpointId::derived("bounded-live-b", b"b");
+        b.address = "target:21354".into();
+        state
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == b.node_id)
+            .unwrap()
+            .endpoints
+            .push(b.clone());
+        let record = |endpoint: &ClusterEndpointRecord, at| {
+            cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                None,
+                None,
+                at,
+                CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            )
+        };
+        write_object_file(
+            &paths.connectivity_local,
+            &vec![
+                record(&a, now - time::Duration::seconds(1000)),
+                record(&b, now - time::Duration::seconds(1000)),
+            ],
+        )
+        .unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let fresh_a = record(&a, now);
+        let fresh_b = record(&b, now);
+        for observed in [&fresh_a, &fresh_b] {
+            let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            commit_local_cluster_connectivity_observations_if_snapshot(
+                &paths,
+                &state,
+                &local,
+                std::slice::from_ref(observed),
+                &snapshot,
+            )
+            .unwrap();
+        }
+        let expected = read_local_cluster_connectivity_records(&paths).unwrap();
+        assert_eq!(
+            expected.len(),
+            2,
+            "a bounded batch cannot discard an unprobed live refresh"
+        );
+        assert!(expected.contains(&fresh_a) && expected.contains(&fresh_b));
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let older_a = record(&a, now - time::Duration::seconds(1));
+        commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[older_a],
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records(&paths).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), before);
+        invalidate_local_cluster_connectivity_cache(&paths).unwrap();
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .unwrap()
+                .is_empty(),
+            "a cold reader cannot reuse expired disk evidence as fresh"
+        );
+    }
+
+    #[test]
     fn identical_healthy_source_generation_renews_inside_expiry_margin() {
         let (_root, paths, state, local, endpoint, now) =
             connectivity_generation_fixture("connectivity_observation_expiry_refresh");
@@ -2627,7 +2897,7 @@ mod tests {
                     ..
                 } if records == std::slice::from_ref(&refreshed)
             ),
-            "expiry-driven renewal must remain a real durable generation: {outcome:?}"
+            "expiry-driven renewal must remain accepted live evidence: {outcome:?}"
         );
         assert_ne!(
             local_cluster_connectivity_content_generation(&paths),
