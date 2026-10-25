@@ -331,8 +331,9 @@ struct ChatHost {
     activity: HostActivity,
     /// When ownership was last confirmed; a host that cannot renew stops.
     renewed_at: Mutex<Instant>,
-    /// Recent peer request ids, so a retried forward runs once.
-    peer_requests: Mutex<VecDeque<String>>,
+    /// Recent admission outcomes for this host. A failed or uncertain effect
+    /// must not become an acknowledgement (or execute again) on a peer retry.
+    peer_requests: Mutex<VecDeque<(String, Result<(), String>)>>,
 }
 
 impl Drop for ChatHost {
@@ -343,20 +344,30 @@ impl Drop for ChatHost {
 }
 
 impl ChatHost {
-    /// Record a peer request id; `false` when it already ran.
-    fn admit_peer_request(&self, request_id: &str) -> bool {
+    /// Run an admitted effect once on this host. The caller holds the route
+    /// registry through the effect; only later event/history projection may
+    /// outlive that ownership guard. Duplicate successes have no new output.
+    fn with_peer_request<T>(
+        &self,
+        request_id: &str,
+        effect: impl FnOnce() -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
         let mut seen = self
             .peer_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if seen.iter().any(|seen| seen == request_id) {
-            return false;
+        if let Some((_, outcome)) = seen.iter().find(|(id, _)| id == request_id) {
+            return outcome.clone().map(|()| None);
         }
-        seen.push_back(request_id.to_string());
+        let result = effect();
+        seen.push_back((
+            request_id.to_string(),
+            result.as_ref().map(|_| ()).map_err(Clone::clone),
+        ));
         while seen.len() > 1024 {
             seen.pop_front();
         }
-        true
+        result.map(Some)
     }
 }
 
@@ -1271,32 +1282,59 @@ impl HostedChatService {
             accepted: false,
             not_owner: true,
         });
-        let fanout = {
-            let hosts = self.ensure_route(&request.chat_id, &[])?;
-            match hosts.get(&request.chat_id) {
-                Some(ChatRoute::Local(host)) => {
-                    host.activity.touch();
-                    if !host.admit_peer_request(&request.request_id) {
-                        return Ok(wire::ChatPeerCommandResponse {
-                            accepted: true,
-                            not_owner: false,
-                        });
-                    }
-                    host.fanout.clone()
-                }
-                _ => return not_owner,
-            }
-        };
-        if is_control_command(&request.command) {
+        if let Some(target) = command_chat_id(&request.command)
+            && !target.trim().is_empty()
+            && target != request.chat_id
+        {
+            return Err(format!(
+                "peer command for chat `{target}` names host `{}`",
+                request.chat_id
+            ));
+        }
+        // Resolve any storage context before the ownership guard. Control's
+        // durable history projection happens after the guarded local effect.
+        let storage = if is_control_command(&request.command) {
             let environment = self.environment()?;
-            let storage = local::AgentChatSifsStorage::new(
+            Some(local::AgentChatSifsStorage::new(
                 environment.data_dir,
                 self.daemon_address.clone(),
                 &environment.runtime,
-            );
-            handle_direct_control(&self.runtime_control, &storage, &fanout, &request.command)?;
+            ))
         } else {
-            self.dispatch(&request.origin, &request.chat_id, None, request.command)?;
+            None
+        };
+        let (fanout, control) = {
+            let hosts = self.ensure_route(&request.chat_id, &[])?;
+            let Some(ChatRoute::Local(host)) = hosts.get(&request.chat_id) else {
+                return not_owner;
+            };
+            if !host.alive.load(Ordering::Acquire) {
+                return not_owner;
+            }
+            host.activity.touch();
+            let control = host
+                .with_peer_request(&request.request_id, || {
+                    if storage.is_some() {
+                        apply_direct_control(&self.runtime_control, &request.command)
+                    } else {
+                        // Enqueue on the exact host just admitted, while retirement
+                        // and route replacement are excluded by `hosts`. Calling
+                        // dispatch here would re-resolve and possibly forward.
+                        host.command_tx
+                            .send(HostCommand::Run {
+                                origin: request.origin,
+                                journal: None,
+                                command: request.command,
+                            })
+                            .map_err(|_| "chat host stopped".to_string())?;
+                        Ok(None)
+                    }
+                })?
+                .flatten();
+            (host.fanout.clone(), control)
+        };
+        if let (Some(storage), Some(control)) = (storage, control) {
+            publish_direct_control(&storage, &fanout, control);
         }
         Ok(wire::ChatPeerCommandResponse {
             accepted: true,
@@ -2506,6 +2544,24 @@ fn handle_direct_control(
     events: &dyn ChatEventSink,
     command: &wire::ChatSessionCommand,
 ) -> Result<bool, String> {
+    let Some(control) = apply_direct_control(registry, command)? else {
+        return Ok(false);
+    };
+    publish_direct_control(storage, events, control);
+    Ok(true)
+}
+
+enum DirectControlEffect {
+    State(AgentSessionResumeResponse),
+    Input(String, AgentSessionControlResult),
+}
+
+/// Apply to the local runtime before releasing the selected host's ownership.
+/// No routed lookup or history I/O is allowed at this effect boundary.
+fn apply_direct_control(
+    registry: &AgentRuntimeControlRegistry,
+    command: &wire::ChatSessionCommand,
+) -> Result<Option<DirectControlEffect>, String> {
     let (requested_session_id, action): (&str, Box<dyn FnOnce(SessionId) -> Result<_, _>>) =
         match command {
             wire::ChatSessionCommand::Steer {
@@ -2583,12 +2639,9 @@ fn handle_direct_control(
                 let response = registry
                     .resume(AgentSessionResumeRequest { session_id })
                     .map_err(|error| error.to_string())?;
-                events.push(wire::ChatEvent::ControlState(control_resume_state(
-                    response,
-                )));
-                return Ok(true);
+                return Ok(Some(DirectControlEffect::State(response)));
             }
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
     let session_id =
         SessionId::from_str(requested_session_id).map_err(|error| error.to_string())?;
@@ -2605,9 +2658,28 @@ fn handle_direct_control(
             .map_err(|error| error.to_string())?;
         result.snapshot = unpaused.snapshot;
     }
-    project_control_input(storage, requested_session_id, &result, events);
-    events.push(wire::ChatEvent::ControlStatus(control_result(result)));
-    Ok(true)
+    Ok(Some(DirectControlEffect::Input(
+        requested_session_id.to_string(),
+        result,
+    )))
+}
+
+fn publish_direct_control(
+    storage: &local::AgentChatSifsStorage,
+    events: &dyn ChatEventSink,
+    control: DirectControlEffect,
+) {
+    match control {
+        DirectControlEffect::State(response) => {
+            events.push(wire::ChatEvent::ControlState(control_resume_state(
+                response,
+            )));
+        }
+        DirectControlEffect::Input(session, result) => {
+            project_control_input(storage, &session, &result, events);
+            events.push(wire::ChatEvent::ControlStatus(control_result(result)));
+        }
+    }
 }
 
 fn project_control_input(
@@ -3800,6 +3872,236 @@ mod tests {
         }
     }
 
+    fn peer_send(chat: &str, id: &str) -> wire::ChatPeerCommandRequest {
+        wire::ChatPeerCommandRequest {
+            chat_id: chat.into(),
+            origin: "peer/view".into(),
+            request_id: id.into(),
+            command: wire::ChatSessionCommand::Send {
+                session_id: chat.into(),
+                text: "owned command".into(),
+                attachments: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn peer_dispatch_delivers_once_to_the_selected_local_host() {
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        let (host, commands) = fake_host(Duration::ZERO);
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert("chat".into(), ChatRoute::Local(host));
+        let request = peer_send("chat", "same-request");
+        for _ in 0..2 {
+            let response = service.peer_command(request.clone()).unwrap();
+            assert!(response.accepted && !response.not_owner);
+        }
+        assert!(
+            matches!(commands.try_recv().unwrap(), HostCommand::Run { origin, journal: None, command: wire::ChatSessionCommand::Send { session_id, .. } }
+            if origin == "peer/view" && session_id == "chat")
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "same request must not queue twice"
+        );
+    }
+
+    #[test]
+    fn peer_dispatch_failed_enqueue_is_not_acknowledged_by_a_retry() {
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        let (host, commands) = fake_host(Duration::ZERO);
+        drop(commands);
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert("chat".into(), ChatRoute::Local(host));
+        let request = peer_send("chat", "failed-request");
+        let first = service.peer_command(request.clone()).unwrap_err();
+        assert_eq!(service.peer_command(request).unwrap_err(), first);
+    }
+
+    #[test]
+    fn peer_dispatch_rejects_a_command_for_another_chat_before_effects() {
+        let root = sinomo_testdir::TestDir::new("peer-dispatch-chat-binding");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = AgentRuntimeControlRegistry::new();
+        let service = service_with_environment(&root, &runtime, registry.clone());
+        let chat = SessionId::generate().to_string();
+        let other = SessionId::generate();
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register_session(Arc::new(CancelRecorder(
+                other.clone(),
+                cancelled.clone(),
+                None,
+            )))
+            .unwrap();
+        let (host, commands) = fake_host(Duration::ZERO);
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert(chat.clone(), ChatRoute::Local(host));
+        let mut request = peer_send(&chat, "mismatched-request");
+        request.command = wire::ChatSessionCommand::Cancel {
+            session_id: other.to_string(),
+            reason: "wrong chat".into(),
+        };
+        assert!(service.peer_command(request).is_err());
+        assert!(
+            cancelled.lock().unwrap().is_empty(),
+            "must not cancel a different chat on the same node"
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn peer_dispatch_partial_control_failure_is_not_reexecuted_or_acknowledged() {
+        let root = sinomo_testdir::TestDir::new("peer-dispatch-control-outcome");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = AgentRuntimeControlRegistry::new();
+        let service = service_with_environment(&root, &runtime, registry.clone());
+        let chat = SessionId::generate();
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        registry
+            .register_session(Arc::new(CancelRecorder(
+                chat.clone(),
+                cancelled.clone(),
+                None,
+            )))
+            .unwrap();
+        let (host, commands) = fake_host(Duration::ZERO);
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert(chat.to_string(), ChatRoute::Local(host));
+        // Leave normal work queued; control must not wait behind that work.
+        service
+            .peer_command(peer_send(&chat.to_string(), "queued-turn"))
+            .unwrap();
+        let mut request = peer_send(&chat.to_string(), "cancel-request");
+        request.command = wire::ChatSessionCommand::Cancel {
+            session_id: chat.to_string(),
+            reason: "cancel directly".into(),
+        };
+        let first = service.peer_command(request.clone()).unwrap_err();
+        assert_eq!(first, "recorded");
+        assert_eq!(service.peer_command(request).unwrap_err(), first);
+        assert_eq!(cancelled.lock().unwrap().as_slice(), ["cancel directly"]);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(HostCommand::Run {
+                command: wire::ChatSessionCommand::Send { .. },
+                ..
+            })
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "control never joins the worker queue"
+        );
+    }
+
+    #[test]
+    fn peer_dispatch_rejects_remote_ownership_without_forwarding() {
+        // There is deliberately no environment/peer transport to fall back to.
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        service.hosts.lock().unwrap().insert(
+            "chat".into(),
+            ChatRoute::Remote(RemoteChat {
+                owner: NodeId::from_legacy_named("other-node").unwrap(),
+                fanout: ChatFanout::default(),
+                alive: Arc::new(AtomicBool::new(true)),
+                last_active: Mutex::new(Instant::now()),
+            }),
+        );
+        let response = service
+            .peer_command(peer_send("chat", "remote-request"))
+            .unwrap();
+        assert!(!response.accepted && response.not_owner);
+    }
+
+    #[test]
+    fn peer_dispatch_does_not_replace_a_host_that_stops_during_selection() {
+        let root = sinomo_testdir::TestDir::new("peer-dispatch-retired-owner");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut service =
+            service_with_environment(&root, &runtime, AgentRuntimeControlRegistry::new());
+        let receivers = Arc::new(Mutex::new(Vec::new()));
+        let collected = receivers.clone();
+        service.host_factory = Some(Arc::new(move |_| {
+            let (host, receiver) = fake_host(Duration::ZERO);
+            // The selected worker can fail before selection returns. Do not
+            // route this same admission to a replacement worker or another node.
+            host.alive.store(false, Ordering::Release);
+            collected.lock().unwrap().push(receiver);
+            host
+        }));
+        let response = service
+            .peer_command(peer_send("chat", "retired-request"))
+            .unwrap();
+        assert!(!response.accepted && response.not_owner);
+        let receivers = receivers.lock().unwrap();
+        assert_eq!(receivers.len(), 1, "no second owner lookup or replacement");
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "retired owner receives no effect"
+        );
+    }
+
+    #[test]
+    fn peer_dispatch_binds_owner_through_the_control_effect() {
+        let root = sinomo_testdir::TestDir::new("peer-dispatch-owner-effect");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = AgentRuntimeControlRegistry::new();
+        let service = service_with_environment(&root, &runtime, registry.clone());
+        let chat = SessionId::generate();
+        let (host, commands) = fake_host(Duration::ZERO);
+        service
+            .hosts
+            .lock()
+            .unwrap()
+            .insert(chat.to_string(), ChatRoute::Local(host));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let replaced = Arc::new(AtomicBool::new(false));
+        let (hosts, attempted, selected) =
+            (service.hosts.clone(), replaced.clone(), chat.to_string());
+        let try_retire = Arc::new(move || {
+            // Exercise replacement at the actual runtime effect callback, not
+            // at an earlier status probe. The admitted owner must still hold.
+            if let Ok(mut hosts) = hosts.try_lock() {
+                hosts.remove(&selected);
+                attempted.store(true, Ordering::Release);
+            }
+        });
+        registry
+            .register_session(Arc::new(CancelRecorder(
+                chat.clone(),
+                cancelled.clone(),
+                Some(try_retire),
+            )))
+            .unwrap();
+        let mut request = peer_send(&chat.to_string(), "bound-control");
+        request.command = wire::ChatSessionCommand::Cancel {
+            session_id: chat.to_string(),
+            reason: "owned cancel".into(),
+        };
+        assert_eq!(service.peer_command(request).unwrap_err(), "recorded");
+        assert!(
+            !replaced.load(Ordering::Acquire),
+            "route changed across local admission and effect"
+        );
+        assert_eq!(cancelled.lock().unwrap().as_slice(), ["owned cancel"]);
+        assert!(commands.try_recv().is_err());
+        // The guard does not leak beyond the effect; ordinary retirement works.
+        service.hosts.lock().unwrap().remove(&chat.to_string());
+        assert!(matches!(commands.try_recv(), Ok(HostCommand::Shutdown)));
+    }
+
     #[test]
     fn closing_a_subscription_keeps_the_view_and_reconnect_replays_without_duplicate_commands() {
         let root = sinomo_testdir::TestDir::new("chat-detached-execution");
@@ -4113,7 +4415,11 @@ mod tests {
     }
 
     /// A live session that records cancellation requests.
-    struct CancelRecorder(SessionId, Arc<Mutex<Vec<String>>>);
+    struct CancelRecorder(
+        SessionId,
+        Arc<Mutex<Vec<String>>>,
+        Option<Arc<dyn Fn() + Send + Sync>>,
+    );
 
     impl sinomo_agent::AgentRuntimeControlSession for CancelRecorder {
         fn session_id(&self) -> Result<SessionId, sinomo_agent::AgentRuntimeControlError> {
@@ -4147,6 +4453,9 @@ mod tests {
             &self,
             reason: String,
         ) -> Result<AgentSessionControlResult, sinomo_agent::AgentRuntimeControlError> {
+            if let Some(before_effect) = &self.2 {
+                before_effect();
+            }
             self.1.lock().unwrap().push(reason);
             Err(sinomo_agent::AgentRuntimeControlError::new("recorded"))
         }
@@ -4208,6 +4517,7 @@ mod tests {
             .register_session(Arc::new(CancelRecorder(
                 channel_id.clone(),
                 cancels.clone(),
+                None,
             )))
             .unwrap();
 
@@ -4517,6 +4827,7 @@ mod tests {
             .register_session(Arc::new(CancelRecorder(
                 SessionId::from_str(&chat).unwrap(),
                 cancels.clone(),
+                None,
             )))
             .unwrap();
         let _ = node_b.command(wire::ChatSessionCommandRequest {
