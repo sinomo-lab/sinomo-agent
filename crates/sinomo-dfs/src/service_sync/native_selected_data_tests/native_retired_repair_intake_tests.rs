@@ -1,4 +1,7 @@
 //! Normal admitted Main returns -> custody DATA only, before serving authority.
+#[cfg(unix)]
+mod native_intake_process_tests;
+
 use super::*;
 use crate::repair_queue_store::{
     DfsRepairQueueCompactionOptions, LocalDfsRepairQueueStore, NativeOwnedRepairCompletionRef,
