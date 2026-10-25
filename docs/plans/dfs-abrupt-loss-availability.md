@@ -1,6 +1,51 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R33
+## Current development checkpoint — 2026-10-25 R34
+
+Local merge `1dadb5122963b865f0cb62f5c22141b0457bf0e0` integrates reviewed
+process-storage controls `e17be2cf` without conflicts. Source `32ae5330` has
+4,904 inputs; sealed executable `ec4393da`. Only two additive test-only Unix
+blocks changed; existing production and test bodies remain byte-identical.
+Fresh check/build/seal passed. A nine-case focused storage/owner panel and two
+additional existing read controls all passed. Current-source DFS/KV lint passed
+all 11 UI controls and three library analyses. All archives and owned lifetimes
+were verified after cleanup.
+
+The new parent actually killed and reaped two owned children with signal9 after
+synchronized Prepared and Bound. It retained raw files before normal recovery,
+then verified exact material, physical incarnation and phase IDs. Prepared had no
+Bound/Terminal; Bound preserved exact content and idempotent binding, with no
+Terminal. Wrong body/physical expectation/incarnation/default reader rejected.
+This is synthetic storage-fixture OS-process/file evidence, not native receiver
+admission, authenticated Terminal durability, power loss or three-node takeover.
+The internal killed helpers are not counted as separately passing tests.
+
+The existing native W=2,N=2 read case returned exact32KiB after one holder's real
+blob was removed, with unchanged metadata prefix/fingerprint; wrong-version
+responses also rejected. Metadata participants stayed healthy. No content-W bug
+was found or production fix invented; latest/exact metadata authorization is a
+separate availability dependency.
+
+Of R34's original153-case inventory, nine ran and144 remain unrun. The two reads
+are additional existing IDs outside that inventory. R33's full152-case pass
+remains separately qualified below. `R34-REPORT.md` and `R34-COMBINED-RESULT.json`
+bind I94 build `0c242485`, I95 storage `ea757cc6`, I96 boundary `156e355f`, and
+I97 reads `f7caf36e`; exact two-child evidence is `93f8983f`. The I91 wrapper
+mismatch failed before Cargo and remains preserved, including its inner archive
+failure and successful outer preservation/drain. No old failure is reclassified.
+
+The next checked-successor contract requires effect-free support before a new
+Prepare, durable receiver minimum across restart/replacement, lossless original
+admission/late facts and permanent canonical floor lineage. A transient capability,
+selected DATA cut or report-only preflight cannot replace those joins. Complete
+custody, current B effects, causal settlement/root retirement, metadata majority
+history and full abrupt-loss/partition/reconnect/quietness acceptance remain open.
+Independent DFS-local ownership continues; no Docker, peer permission workflow,
+production activation, push or cross-lane merge is part of this work.
+
+## Historical checkpoints
+
+### Preserved R33 checkpoint
 
 Local merge `ee68eeb7612b0aaff1e9a85076061452c59e5d52` integrates reviewed
 observation correction `64e4b86f` without conflicts. Source `b4c7e691` contains
@@ -36,8 +81,6 @@ custody coverage, C1/current B effects, causal settlement/root retirement,
 metadata majority history and real abrupt-loss/partition/reconnect/Sinomo-only
 quietness remain open. This lane uses its own local lock and limits, with no peer
 permission workflow, Docker, production activation, push or cross-lane merge.
-
-## Historical checkpoints
 
 ### Preserved R32 checkpoint
 
