@@ -25,6 +25,8 @@ mod completion_candidate;
 pub use completion_candidate::{
     RepairCompletionCandidateInput, RepairCompletionCandidateProvenance,
 };
+mod attempt_witness;
+pub(crate) use attempt_witness::RepairOriginalAttemptWitness;
 mod history;
 pub(crate) use history::ImportedRepairHistoryQuery;
 
@@ -5091,7 +5093,7 @@ pub(crate) mod tests {
 
     // Include all resident fields and queue-side file identities/content. Reads
     // may change atime, so it is deliberately not an unchanged-file assertion.
-    fn diagnostic_fixture_state(store: &LocalDfsRepairQueueStore) -> (String, serde_json::Value) {
+    pub(super) fn diagnostic_fixture_state(store: &LocalDfsRepairQueueStore) -> (String, serde_json::Value) {
         let state = store.inner.lock().unwrap();
         let resident = format!("{state:?}");
         let snapshot = state.snapshot_path.clone();
