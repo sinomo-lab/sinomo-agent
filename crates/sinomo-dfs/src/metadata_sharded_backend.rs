@@ -3557,6 +3557,21 @@ impl LocalShardedMetadataBackend {
 }
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
+    #[cfg(test)]
+    fn install_selected_local_recovery_fence(
+        &mut self,
+        reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+        context: &crate::metadata_api::DfsSelectedLocalRecoveryContext,
+    ) -> Result<crate::metadata_api::DfsSelectedLocalRecoveryFenceData> {
+        self.shard_backend_mut(&DfsMetadataShardId::new(&reservation.serving_shard.shard_id))?
+            .install_selected_local_recovery_fence(reservation, context)
+    }
+    #[cfg(test)]
+    fn selected_local_recovery_fence(&self, shard: &DfsMetadataShardId)
+        -> Result<Option<crate::metadata_api::DfsSelectedLocalRecoveryFenceData>>
+    {
+        self.shard_backend(shard)?.selected_local_recovery_fence(shard)
+    }
     fn selected_original_data_layout(
         &self,
         file_system_id: &DfsFileSystemId,

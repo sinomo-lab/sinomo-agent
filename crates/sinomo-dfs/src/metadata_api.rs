@@ -35,6 +35,17 @@ use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
 };
 
+#[cfg(test)]
+mod selected_local_recovery;
+#[cfg(test)]
+pub(crate) use selected_local_recovery::{
+    DfsLocalRecoveryInventoryKind, DfsSelectedLocalRecoveryContext,
+    DfsSelectedLocalRecoveryFence, DfsSelectedLocalRecoveryFenceData,
+    DfsSelectedLocalRecoveryPhysicalIdentity, SELECTED_LOCAL_RECOVERY_PREPARE_LIMIT,
+    FAIL_SELECTED_LOCAL_RECOVERY_NAMESPACE, read_selected_local_recovery_fence,
+    write_selected_local_recovery_fence,
+};
+
 /// Explicit native-fixture representation context. This grants neither transfer
 /// authorization nor serving/execution authority and cannot be deserialized.
 /// Ordinary native constructors never create or infer one from disk or a page.
@@ -408,6 +419,12 @@ pub struct DfsMetadataShardWriteFreeze {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 enum DfsMetadataShardWriteFreezeWire {
+    // Recognition is intentionally independent of the test-only reservation
+    // type. Even a malformed/mixed recovery payload must not fall through to a
+    // cooperative envelope and accidentally regain ordinary semantics.
+    LocalRecoveryV1 {
+        selected_local_recovery_fence_v1: LocalRecoveryFenceTag,
+    },
     SelectedOriginalDataV2 {
         selected_original_data_v2: DfsMetadataShardWriteFreezePayload,
     },
@@ -415,6 +432,41 @@ enum DfsMetadataShardWriteFreezeWire {
         repair_custody_v1: DfsMetadataShardWriteFreezePayload,
     },
     Legacy(DfsMetadataShardWriteFreezePayload),
+}
+
+struct LocalRecoveryFenceTag;
+impl<'de> serde::Deserialize<'de> for LocalRecoveryFenceTag {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let _ = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+impl serde::Serialize for LocalRecoveryFenceTag {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("local recovery recognition cannot serialize a cooperative marker"))
+    }
+}
+
+/// Fail-closed recognition only. This does not decode a recovery record into
+/// authority, and is valid on every existing ordinary writer/ACK path.
+pub(crate) fn selected_local_recovery_fence_present(
+    path: &std::path::Path,
+    layout: Option<&DfsSelectedOriginalDataLayout>,
+) -> Result<bool> {
+    if let Some(layout) = layout { check_handoff_layout_path(layout, path)?; }
+    else { reject_default_handoff_layout(path)?; }
+    let wire: Option<DfsMetadataShardWriteFreezeWire> = crate::metadata_io::read_sobj_optional(path)?;
+    Ok(matches!(wire, Some(DfsMetadataShardWriteFreezeWire::LocalRecoveryV1 { .. })))
+}
+
+pub(crate) fn require_no_selected_local_recovery_fence(
+    path: &std::path::Path,
+    layout: Option<&DfsSelectedOriginalDataLayout>,
+) -> Result<()> {
+    if selected_local_recovery_fence_present(path, layout)? {
+        return Err(selected_layout_rejection("selected local recovery fence blocks ordinary metadata evidence or mutation"));
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -469,6 +521,9 @@ pub(crate) fn read_handoff_freeze_with_layout(
         .map_err(|error| selected_layout_rejection(error.to_string()))?;
     let result = match wire {
         None => None,
+        Some(DfsMetadataShardWriteFreezeWire::LocalRecoveryV1 { .. }) => {
+            return Err(selected_layout_rejection("selected local recovery fence is not a cooperative handoff"));
+        }
         Some(DfsMetadataShardWriteFreezeWire::SelectedOriginalDataV2 { selected_original_data_v2: payload }) => {
             let cut = payload.repair_custody.as_ref()
                 .ok_or_else(|| selected_layout_rejection("selected freeze has no exact custody cut"))?;
@@ -496,6 +551,7 @@ pub(crate) fn write_handoff_freeze_with_layout(
     freeze: &DfsMetadataShardWriteFreeze,
     layout: Option<&DfsSelectedOriginalDataLayout>,
 ) -> Result<()> {
+    require_no_selected_local_recovery_fence(path, layout)?;
     if let Some(layout) = layout {
         check_handoff_layout_path(layout, path)?;
         if let Some(cut) = &freeze.repair_custody {
@@ -565,6 +621,9 @@ impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
     type Error = &'static str;
     fn try_from(wire: DfsMetadataShardWriteFreezeWire) -> std::result::Result<Self, Self::Error> {
         let payload = match wire {
+            DfsMetadataShardWriteFreezeWire::LocalRecoveryV1 { .. } => {
+                return Err("selected local recovery fence is not a cooperative handoff");
+            }
             DfsMetadataShardWriteFreezeWire::CustodyV1 {
                 repair_custody_v1: payload,
             } if payload
@@ -904,6 +963,20 @@ pub struct DfsForeignShardSourceEvictionPlan {
 }
 
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
+    #[cfg(test)]
+    fn install_selected_local_recovery_fence(
+        &mut self,
+        _reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+        _context: &DfsSelectedLocalRecoveryContext,
+    ) -> Result<DfsSelectedLocalRecoveryFenceData> {
+        Err(selected_layout_rejection("backend has no selected local recovery fence owner"))
+    }
+    #[cfg(test)]
+    fn selected_local_recovery_fence(
+        &self, _shard_id: &crate::DfsMetadataShardId,
+    ) -> Result<Option<DfsSelectedLocalRecoveryFenceData>> {
+        Err(selected_layout_rejection("backend has no selected local recovery fence reader"))
+    }
     /// Representation admission of this exact handle, never mutation or
     /// handoff authorization. Ordinary backends retain their default reader.
     fn selected_original_data_layout(
