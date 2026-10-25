@@ -545,7 +545,7 @@ fn native_local_fence_rpc_generic_direct_and_reply_as_request_refuse_without_cap
             let direct_paths = crate::runtime_host::DfsRuntimePaths::new(
                 fixture.runtime.data_dir(&request.expected_target),
             );
-            let direct = handle.block_on(crate::runtime_host::message_host::handle_daemon_dfs_message_with_encoded_size_async(
+            let direct = handle.block_on(crate::runtime_host::handle_daemon_dfs_message_with_encoded_size_async(
             &direct_paths, command.clone(), None, None, None, &handle));
             assert!(
                 direct.is_err(),
@@ -604,7 +604,7 @@ fn native_local_fence_rpc_generic_direct_and_reply_as_request_refuse_without_cap
                 raw_command(&request.expected_target, candidate, actual_reply.message);
             let reply_paths =
                 crate::runtime_host::DfsRuntimePaths::new(fixture.runtime.data_dir(candidate));
-            let direct_reply = handle.block_on(crate::runtime_host::message_host::handle_daemon_dfs_message_with_encoded_size_async(
+            let direct_reply = handle.block_on(crate::runtime_host::handle_daemon_dfs_message_with_encoded_size_async(
             &reply_paths, reply_command.clone(), None, None, None, &handle));
             assert!(direct_reply.is_err());
             assert!(
