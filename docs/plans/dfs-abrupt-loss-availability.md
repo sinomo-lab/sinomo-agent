@@ -1,6 +1,42 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-24 R30
+## Current development checkpoint — 2026-10-25 R32
+
+Local merge `7242584e4a6a669ed332aa1dd615d08d07a160e1` adds the reviewed native
+same-C withdrawal control from `56839fed`. Source `3c6430bf` has 4,904 inputs;
+sealed executable `354a1916`. Fresh check/build/seal passed. The focused panel
+executed **29 cases: 27 PASS, 2 FAIL**, with no incomplete or unrun case inside
+that panel. The other123 inventory cases were not run on R32. Current-source
+DFS/KV lint passed all11 UI controls and three library analyses; all lifetimes
+and unconditional archives were verified after cleanup.
+
+The new same-C case reached the negative closure boundary but failed its exact
+RPC-observation predicate before its receipt/recovery/handoff assertions. The
+retiring-B case returned a precise native owner/admission/storage refusal outside
+its accepted error list. Both remain FAILED. Source review found missing decoded
+identity coverage for Repair responses/history requests; the reviewed successor
+adds exact authenticated Decoded-to-terminal per-call joins and bounded failure
+capture. It changes no production guard. `R32-REPORT.md` and `R32-RESULT.json` in
+the operation directory bind I83 `0de104b3`, I84 `f6e51628`, I86 `7bd87cbf`.
+
+The separate R31 exact V7 frame test passed on source `c225bd30`, executable
+`55516360`: actual frame/timestamp equality across retry/native owner reopen,
+plus timestamp-only export and checked-replay negatives. Its573-byte frame is
+preserved. R31 changed only that test body; the other150 cases were not rerun on
+R31. Evidence is `R31-REPORT.md`, I80 `ebd74ba0`, I81 `4873df06`, I82 `9ab4dbca`.
+Prepare-only survivors still cannot reconstruct an unseen old-primary commit.
+No V7 production correction or participant weakening was made.
+
+R30's full150-case pass remains the separately qualified baseline below. Complete
+custody coverage, C1/current B effects, causal application/root retirement,
+majority metadata history and real abrupt-process/partition/reconnect/quietness
+remain open. This lane remains independent and nonblocking, using only its local
+lock and owned limits. No peer permission workflow, Docker, production, push or
+cross-lane merge is part of this work.
+
+## Historical checkpoints
+
+### Preserved R30 checkpoint
 
 Local code merge `3280966922517cc0a546a4eee8acde77e14f0555` integrates reviewed
 snapshot correction `8b3163fc`. Source `9a7b0cf3` contains 4,904 inputs; its own
@@ -33,8 +69,6 @@ C1/checked B effects, causal application/withdrawal, root retirement, metadata
 majority history/fencing and real OS abrupt-loss/partition/reconnect/quietness
 remain open. Local commits/actual merges are the boundaries; no Docker, peer
 synchronization, push, deployment or cross-lane merge occurs.
-
-## Historical checkpoints
 
 ### Preserved R29 checkpoint
 
