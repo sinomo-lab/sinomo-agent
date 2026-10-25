@@ -1840,6 +1840,60 @@ pub enum DfsBlobTransferResult {
     Rejected { reason: String },
 }
 
+/// Selected test protocol DATA only. The logical subject is the full pending
+/// reservation and target; an explicit re-call may renew only transport IDs.
+#[cfg(test)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsSelectedLocalRecoveryFenceRpcRequest {
+    pub(crate) reservation: crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+    pub(crate) expected_target: NodeId,
+}
+
+/// Remote-reported local DATA, never locally checked remote physical ownership
+/// or a promise/ChosenFrame/serving/custody certificate. BLAKE3 is the digest
+/// of the exact remote marker bytes; it is not a native authentication token.
+#[cfg(test)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsSelectedLocalRecoveryFenceRpcData {
+    pub(crate) fence: crate::metadata_api::DfsSelectedLocalRecoveryFence,
+    pub(crate) marker_digest: String,
+    pub(crate) marker_bytes: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DfsSelectedLocalRecoveryFenceRpcOutcome {
+    Fenced {
+        data: DfsSelectedLocalRecoveryFenceRpcData,
+    },
+    /// This invocation did not enter installation. An earlier invocation of
+    /// the same reservation/target may still have applied.
+    Refused {
+        reason: String,
+    },
+    /// Installation was entered; no rollback or non-application is inferred.
+    Uncertain {
+        reason: String,
+    },
+    /// Actual stored DATA without the required fresh post-check/deadline.
+    StoredButUnverified {
+        data: DfsSelectedLocalRecoveryFenceRpcData,
+        reason: String,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsSelectedLocalRecoveryFenceRpcResponse {
+    pub(crate) reservation: crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+    pub(crate) acceptor_node_id: NodeId,
+    pub(crate) outcome: DfsSelectedLocalRecoveryFenceRpcOutcome,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNetworkMessage {
@@ -1884,6 +1938,11 @@ pub enum DfsNetworkMessage {
     SelectedOriginalRepair(DfsSelectedOriginalRepairCommand),
     OriginalRepairHistoryRequest(DfsOriginalRepairHistoryRequest),
     OriginalRepairHistoryResponse(DfsOriginalRepairHistoryResponse),
+    // Test-only suffix: no existing production ordinal changes.
+    #[cfg(test)]
+    SelectedLocalRecoveryFenceRequest(DfsSelectedLocalRecoveryFenceRpcRequest),
+    #[cfg(test)]
+    SelectedLocalRecoveryFenceResponse(DfsSelectedLocalRecoveryFenceRpcResponse),
 }
 
 impl DfsMetadataJournalBatchResult {

@@ -746,6 +746,11 @@ pub use posix_model::{
     DfsPosixFileSyncEvidence, DfsPosixFileSyncTarget, DfsPosixRemoteFileRangeReadStream,
     DfsPosixRemoteFileReadStream, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
+#[cfg(test)]
+pub use protocol::{
+    DfsSelectedLocalRecoveryFenceRpcData, DfsSelectedLocalRecoveryFenceRpcOutcome,
+    DfsSelectedLocalRecoveryFenceRpcRequest, DfsSelectedLocalRecoveryFenceRpcResponse,
+};
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
     DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,

@@ -3794,6 +3794,11 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     encoded_value_bytes: Option<u64>,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DfsDataPlaneResponse, DaemonError> {
+    #[cfg(test)]
+    if matches!(&command.routed_message.message,
+        sinomo_dfs::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | sinomo_dfs::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_)) {
+        return Err(DaemonError::Network { address: "selected local recovery fence".into(), detail: "selected local recovery fence requires authenticated native RPC ingress, not generic/direct frames".into() });
+    }
     if matches!(&command.routed_message.message, sinomo_dfs::DfsNetworkMessage::OriginalRepairHistoryResponse(_)) {
         return Err(DaemonError::Network { address: "DFS history query".into(), detail: "unsolicited historical response has no direct-call owner".into() });
     }

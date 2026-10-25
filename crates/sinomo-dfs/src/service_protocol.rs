@@ -202,6 +202,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_message_label = dfs_network_message_trace_label(&message);
 
         match message {
+            #[cfg(test)]
+            DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => {
+                return Err(DfsError::Metadata { message: "selected local recovery fence requires authenticated native RPC ingress".into() });
+            }
             DfsNetworkMessage::OriginalRepairHistoryRequest(_) | DfsNetworkMessage::OriginalRepairHistoryResponse(_) => {
                 return Err(DfsError::Metadata { message: "history messages require their exact native direct-call owner".into() });
             }
