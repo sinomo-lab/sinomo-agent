@@ -2311,21 +2311,29 @@ impl ClusterNetworkMaintenance {
         // and being softened forever. An explicit environment refresh replaces
         // the marker with a new future deadline.
         let connectivity_publish_retry_waiting = self.connectivity_publish_retry_waiting(now);
-        let connectivity_publish_retry_due = self
+        let connectivity_renewal_due = self.cadence.connectivity_renewal_due(now);
+        if connectivity_renewal_due {
+            tracing::trace!(target: "sinomo.daemon.cluster_network_maintenance",
+                earliest_published_expiry = ?self.published_connectivity_expiry,
+                overdue_already_claimed = self.connectivity_overdue_claimed,
+                "connectivity renewal deadline is due");
+        }
+        let connectivity_publish_due = self
             .connectivity_publish_retry_due_duration(now)
-            .is_some_and(|duration| duration.is_zero());
+            .is_some_and(|duration| duration.is_zero())
+            || connectivity_renewal_due;
         let due = sinomo_core::network::cluster_network_maintenance_due(
             now,
             &self.schedule_with_connectivity_publish_backoff(now),
         );
         let publish_due = due.publish_due;
-        let probe_due = (due.probe_due || self.probe_retry_due(now))
+        let probe_due = (due.probe_due || self.probe_retry_due(now) || connectivity_renewal_due)
             && !connectivity_publish_retry_waiting
             && !self.probe_retry_waiting(now);
         let discovery_due = (due.discovery_due || self.discovery_retry_due(now))
             && !self.discovery_retry_waiting(now);
         let scheduled_work_due =
-            publish_due || probe_due || discovery_due || connectivity_publish_retry_due;
+            publish_due || probe_due || discovery_due || connectivity_publish_due;
         if !scheduled_work_due && !self.local_raft_resident_initialization.is_in_flight() {
             return Ok(None);
         }
@@ -2335,7 +2343,7 @@ impl ClusterNetworkMaintenance {
                 publish_due,
                 probe_due,
                 discovery_due,
-                connectivity_publish_retry_due,
+                connectivity_publish_due,
             );
         }
         let _storage_guard = self
@@ -2403,7 +2411,7 @@ impl ClusterNetworkMaintenance {
 
         let mut discovery_already_processed = false;
         if self.solo_cluster_idle
-            && (publish_due || probe_due || discovery_due || connectivity_publish_retry_due)
+            && (publish_due || probe_due || discovery_due || connectivity_publish_due)
         {
             self.idle_stats.incr_disk_reads_cluster_state();
             let mut state =
@@ -2456,7 +2464,7 @@ impl ClusterNetworkMaintenance {
         // materialized snapshot on every publish/probe deadline turns an idle
         // timer into an O(KV) filesystem scan. Concrete publications and probes
         // retain their typed quorum and freshness checks below.
-        let mut state = if publish_due || probe_due || connectivity_publish_retry_due {
+        let mut state = if publish_due || probe_due || connectivity_publish_due {
             sinomo_core::cluster::read_cluster_state_cached_async(&runtime, &cluster_paths).await
         } else {
             sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
@@ -2510,7 +2518,7 @@ impl ClusterNetworkMaintenance {
         // generation actually changed and was already written above.
         let state_after_discovery = discovered.then(|| state.clone());
 
-        if publish_due || probe_due || connectivity_publish_retry_due {
+        if publish_due || probe_due || connectivity_publish_due {
             let shadow_options = current_shadow_daemon_options_for_cluster_async(
                 data_dir,
                 DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
@@ -2541,7 +2549,7 @@ impl ClusterNetworkMaintenance {
         }
 
         let cluster_is_solo = sinomo_core::network::cluster_is_settled_solo(&state);
-        if publish_due || probe_due || connectivity_publish_retry_due {
+        if publish_due || probe_due || connectivity_publish_due {
             sinomo_core::cluster::refresh_cluster_connectivity_environment_async(
                 &runtime,
                 &cluster_paths,
@@ -2606,7 +2614,7 @@ impl ClusterNetworkMaintenance {
                     plan.entries.len(),
                     plan.remaining_due,
                     plan.convergence_active,
-                    publish_due || connectivity_publish_retry_due,
+                    publish_due || connectivity_publish_due,
                 ) {
                     sinomo_core::cluster::ClusterConnectivityProbePlanAction::Probe => {
                         let local_connectivity_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&cluster_paths)?;
@@ -2631,7 +2639,7 @@ impl ClusterNetworkMaintenance {
             } else {
                 self.finish_connectivity_convergence();
             }
-        } else if connectivity_publish_retry_due && !cluster_is_solo {
+        } else if connectivity_publish_due && !cluster_is_solo {
             // Quorum publication has its own generation and deadline. It may
             // retry while an unrelated endpoint-probe generation is backed
             // off, without claiming or completing that probe generation.
@@ -3104,6 +3112,7 @@ impl ClusterNetworkMaintenance {
         .await;
         match published {
             Some(Ok(_)) => {
+                self.observe_confirmed_connectivity_publication(&publish_host);
                 self.finish_connectivity_convergence();
                 true
             }
@@ -3219,6 +3228,19 @@ impl ClusterNetworkMaintenance {
         self.cadence.record_connectivity_publish_success(superseded);
     }
 
+    fn observe_confirmed_connectivity_publication(
+        &mut self,
+        host: &DaemonClusterControlPlaneTransport,
+    ) {
+        if let Some(expiry) = &host.confirmed_connectivity_expiry {
+            self.cadence.observe_published_connectivity_expiries(
+                [expiry.earliest, expiry.future].into_iter().flatten(),
+                expiry.wall_now,
+                expiry.now,
+            );
+        }
+    }
+
     fn connectivity_publish_superseded(&self) -> bool {
         self
             .retained_connectivity_publish
@@ -3244,6 +3266,9 @@ impl ClusterNetworkMaintenance {
     }
 
     fn settle_connectivity_without_publication(&mut self) {
+        self.cadence.published_connectivity_expiry = None;
+        self.cadence.connectivity_renewal_at = None;
+        self.cadence.connectivity_overdue_claimed = false;
         self.finish_connectivity_convergence();
     }
 
@@ -3418,6 +3443,7 @@ impl ClusterNetworkMaintenance {
         .await;
         match published {
             Some(Ok(_)) => {
+                self.observe_confirmed_connectivity_publication(&publish_host);
                 if convergence_followup_needed {
                     self.connectivity_converged = false;
                     self.record_connectivity_publish_success();
@@ -6752,6 +6778,17 @@ pub(crate) struct DaemonClusterControlPlaneTransport {
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
     active_cluster_paths: Option<ClusterPaths>,
     join_rpc_context: Option<DaemonClusterJoinRpcContext>,
+    /// Per-attempt scheduling input from the actual published source-set view;
+    /// no local observation can populate it. No record payload is retained.
+    confirmed_connectivity_expiry: Option<ConfirmedConnectivityExpiry>,
+}
+
+#[derive(Clone, Debug)]
+struct ConfirmedConnectivityExpiry {
+    earliest: Option<OffsetDateTime>,
+    future: Option<OffsetDateTime>,
+    wall_now: OffsetDateTime,
+    now: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -6777,6 +6814,7 @@ impl DaemonClusterControlPlaneTransport {
             timeouts,
             active_cluster_paths: None,
             join_rpc_context: None,
+            confirmed_connectivity_expiry: None,
         }
     }
 
@@ -7534,6 +7572,21 @@ impl sinomo_core::cluster::ClusterConnectivityPublishAsyncHost
     ) -> sinomo_core::network::ClusterMembershipRpcFuture<'a, ()> {
         Box::pin(async move {
             remember_connectivity_record_set(paths, source_node_id, records);
+            let wall_now = OffsetDateTime::now_utc();
+            let now = Instant::now();
+            let margin = time::Duration::seconds(
+                sinomo_core::network::CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS,
+            );
+            self.confirmed_connectivity_expiry = Some(ConfirmedConnectivityExpiry {
+                earliest: records.iter().map(|record| record.expires_at).min(),
+                future: records
+                    .iter()
+                    .map(|record| record.expires_at)
+                    .filter(|expiry| *expiry > wall_now + margin)
+                    .min(),
+                wall_now,
+                now,
+            });
             Ok(())
         })
     }
@@ -8401,6 +8454,9 @@ mod tests {
         (@parse [$($cadence:tt)*] [$($host:tt)*]) => {
             ClusterNetworkMaintenance {
                 cadence: sinomo_core::cluster::ClusterNetworkMaintenanceCadence {
+                    published_connectivity_expiry: None,
+                    connectivity_renewal_at: None,
+                    connectivity_overdue_claimed: false,
                     $($cadence)*
                 },
                 resource_mode: sinomo_device::NodeResourceMode::Normal,
@@ -9836,6 +9892,336 @@ mod tests {
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
         (root, paths, state)
+    }
+
+    fn expiry_scheduler_fixture(
+        name: &str,
+        count: usize,
+        published_remaining: i64,
+        fresh_local: bool,
+    ) -> (
+        sinomo_testdir::TestDir,
+        ClusterPaths,
+        ClusterBootstrapState,
+        Vec<ClusterConnectivityRecord>,
+    ) {
+        let (root, paths, mut state) = seeded_single_node_cluster_for_publish_cache_test(name);
+        let wall = OffsetDateTime::now_utc();
+        let remote = NodeId::from_legacy_named(format!("{name}_remote")).unwrap();
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            wall,
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = (0..count)
+            .map(|i| {
+                sinomo_core::network::daemon_lan_endpoint(
+                    &remote,
+                    format!("127.0.0.1:{}", 32000 + i),
+                    10,
+                )
+            })
+            .collect();
+        let published: Vec<_> = member
+            .endpoints
+            .iter()
+            .enumerate()
+            .map(|(i, endpoint)| {
+                let health = match i % 3 {
+                    0 => ClusterConnectivityState::Healthy,
+                    1 => ClusterConnectivityState::Degraded,
+                    _ => ClusterConnectivityState::Unreachable,
+                };
+                let ttl = if health == ClusterConnectivityState::Unreachable {
+                    7200
+                } else {
+                    900
+                };
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    endpoint,
+                    health,
+                    Some(1),
+                    0,
+                    None,
+                    None,
+                    wall - time::Duration::seconds(ttl - published_remaining),
+                    ttl,
+                )
+            })
+            .collect();
+        state.members.push(member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+        let mut local = published.clone();
+        if fresh_local {
+            for record in &mut local {
+                record.observed_at = wall;
+                record.expires_at = wall
+                    + time::Duration::seconds(
+                        if record.state == ClusterConnectivityState::Unreachable {
+                            7200
+                        } else {
+                            900
+                        },
+                    );
+            }
+        }
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &local,
+        )
+        .unwrap();
+        let success = published
+            .iter()
+            .map(|record| {
+                sinomo_core::kv::KvOp::put_serde(
+                    sinomo_core::cluster::cluster_connectivity_key(
+                        &record.source_node_id,
+                        &record.target_node_id,
+                        &record.endpoint_id,
+                    ),
+                    record,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        sinomo_core::cluster::append_cluster_raft_command(
+            &paths,
+            &state.local_node_id,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success,
+                failure: Vec::new(),
+            }),
+        )
+        .unwrap();
+        (root, paths, state, published)
+    }
+
+    #[test]
+    fn expiry_scheduler_tracks_confirmed_coalesced_expiry_not_local_observation() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, state, published) =
+            expiry_scheduler_fixture("expiry_confirmed", 1, 300, true);
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        let pending = maintenance
+            .plan_connectivity_publish(&paths, &state)
+            .unwrap();
+        let before =
+            std::fs::read(paths.kv_paths().raft_wal_paths(&state.local_node_id).wal).unwrap();
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_publish: Some(pending),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+        assert_eq!(
+            maintenance.published_connectivity_expiry,
+            Some(published[0].expires_at)
+        );
+        let due = maintenance.next_due_duration(Instant::now());
+        assert!(
+            due > Duration::from_secs(170) && due <= Duration::from_secs(180),
+            "confirmed expiry has 300s left: {due:?}"
+        );
+        assert_eq!(
+            std::fs::read(paths.kv_paths().raft_wal_paths(&state.local_node_id).wal).unwrap(),
+            before,
+            "far-from-margin observation-only changes remain coalesced"
+        );
+        let local = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+            &paths,
+            &state.local_node_id,
+        )
+        .unwrap();
+        assert!(local[0].expires_at > published[0].expires_at);
+        let deadline = maintenance.connectivity_renewal_at;
+        maintenance.connectivity.insert(
+            cluster_connectivity_probe_key(&state.local_node_id, &state.members[1].endpoints[0]),
+            ClusterConnectivityProbeState {
+                record: local[0].clone(),
+            },
+        );
+        let unconfirmed = DaemonClusterControlPlaneTransport::new(runtime.handle().clone());
+        maintenance.observe_confirmed_connectivity_publication(&unconfirmed);
+        assert_eq!(maintenance.connectivity_renewal_at, deadline);
+    }
+
+    #[test]
+    fn expiry_scheduler_wake_claims_real_pending_renewal_before_role_audit() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, _state, published) =
+            expiry_scheduler_fixture("expiry_tick", 1, 90, true);
+        let daemon_paths = DaemonPaths::with_root(paths.root.parent().unwrap().join("daemon"));
+        daemon_paths.ensure().unwrap();
+        let options = DaemonRunOptions::default();
+        write_daemon_status(
+            &daemon_paths,
+            &crate::DaemonStatus::new(&options, &daemon_paths, None),
+        )
+        .unwrap();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.cadence.observe_published_connectivity_expiries(
+            Some(published[0].expires_at),
+            OffsetDateTime::now_utc(),
+            Instant::now(),
+        );
+        assert_eq!(
+            maintenance.next_due_duration(Instant::now()),
+            Duration::ZERO
+        );
+        let pending = run_cluster_network_maintenance_tick_for_test(
+            &mut maintenance,
+            &daemon_paths,
+            &options,
+            &runtime,
+        )
+        .unwrap()
+        .expect("a renewal wake must select actual pending work");
+        assert!(pending.probe_claimed && pending.connectivity_publish_claimed);
+        assert!(pending.connectivity_probe.is_some() || pending.connectivity_publish.is_some());
+        assert!(
+            !pending.publish_claimed,
+            "an early renewal does not make the role audit due"
+        );
+        assert_eq!(
+            maintenance.published_connectivity_expiry,
+            Some(published[0].expires_at)
+        );
+    }
+
+    #[test]
+    fn expiry_scheduler_cancelled_publication_retains_confirmation_and_retry() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, state, published) =
+            expiry_scheduler_fixture("expiry_cancel", 1, 90, true);
+        let now = Instant::now();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.cadence.observe_published_connectivity_expiries(
+            Some(published[0].expires_at),
+            OffsetDateTime::now_utc(),
+            now,
+        );
+        maintenance
+            .cadence
+            .claim_due_classes(now, false, false, false, true);
+        let claimed = maintenance.cadence.take_connectivity_publish_claim();
+        let pending = maintenance
+            .plan_connectivity_publish(&paths, &state)
+            .unwrap();
+        runtime.block_on(maintenance.run_pending_work_until_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_publish_claimed: claimed,
+                connectivity_publish: Some(pending),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+            now.checked_sub(Duration::from_secs(1)).unwrap(),
+        ));
+        assert_eq!(
+            maintenance.published_connectivity_expiry,
+            Some(published[0].expires_at)
+        );
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 1);
+        assert!(maintenance.retained_connectivity_publish.is_some());
+        let due = maintenance.next_due_duration(Instant::now());
+        assert!(due > Duration::ZERO && due <= Duration::from_secs(1));
+        let records = maintenance
+            .retained_connectivity_publish
+            .as_ref()
+            .unwrap()
+            .records
+            .clone()
+            .unwrap();
+        let retry = maintenance
+            .plan_connectivity_publish(&paths, &state)
+            .unwrap();
+        assert_eq!(
+            retry.records.as_ref().unwrap().as_slice(),
+            records.as_slice()
+        );
+        // Execute that retained owner directly; the controlled cadence tests
+        // separately verify its retry deadline rather than sleeping here.
+        runtime.block_on(maintenance.run_pending_work_async(
+            ClusterNetworkMaintenancePendingWork {
+                connectivity_publish_claimed: true,
+                connectivity_publish: Some(retry),
+                ..Default::default()
+            },
+            runtime.handle().clone(),
+        ));
+        assert_eq!(
+            maintenance.published_connectivity_expiry,
+            records.iter().map(|record| record.expires_at).min()
+        );
+        assert!(maintenance.retained_connectivity_publish.is_none());
+        assert_eq!(maintenance.connectivity_publish_failure_streak, 0);
+        assert!(
+            maintenance.connectivity_renewal_at.unwrap()
+                > Instant::now() + Duration::from_secs(700)
+        );
+    }
+
+    #[test]
+    fn expiry_scheduler_eligible_probes_keep_role_batch_bounds_and_rotation() {
+        let (_root, paths, state, published) =
+            expiry_scheduler_fixture("expiry_batch", 35, 90, false);
+        for (role, limit) in [
+            (ClusterNodeRole::Workstation, 32),
+            (ClusterNodeRole::Mobile, 4),
+            (ClusterNodeRole::Sensor, 1),
+        ] {
+            let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+            maintenance.local_node_role = role;
+            maintenance.cadence.observe_published_connectivity_expiries(
+                published.iter().map(|r| r.expires_at).min(),
+                OffsetDateTime::now_utc(),
+                Instant::now(),
+            );
+            assert!(maintenance.cadence.connectivity_renewal_due(Instant::now()));
+            let first = maintenance.select_connectivity_probe_plan(&paths, &state);
+            assert_eq!(first.entries.len(), limit);
+            assert_eq!(first.remaining_due, 35 - limit);
+            assert!(!first.force_probe);
+            let keys: BTreeSet<_> = first
+                .entries
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect();
+            let wall = OffsetDateTime::now_utc();
+            let probed = first
+                .entries
+                .iter()
+                .map(|entry| {
+                    let mut record = entry.previous.clone().unwrap();
+                    record.observed_at = wall;
+                    record.expires_at = wall
+                        + time::Duration::seconds(
+                            if record.state == ClusterConnectivityState::Unreachable {
+                                7200
+                            } else {
+                                900
+                            },
+                        );
+                    (entry.key.clone(), record)
+                })
+                .collect();
+            maintenance.apply_connectivity_probe_plan(first, probed);
+            let next = maintenance.select_connectivity_probe_plan(&paths, &state);
+            assert_eq!(next.entries.len(), limit.min(35 - limit));
+            assert!(
+                next.entries.iter().all(|entry| !keys.contains(&entry.key)),
+                "the renewed priority entry must give the remaining bounded work its turn"
+            );
+        }
     }
 
     #[test]
