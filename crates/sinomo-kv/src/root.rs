@@ -430,7 +430,8 @@ pub use raft::{
 #[cfg(any(test, feature = "test-support"))]
 pub use raft::{
     ResidentRaftNodeRegistryPin, clear_process_local_raft_access_denial_for_test,
-    cluster_kv_raft_operation_queue_depth_for_test, evict_resident_raft_node_for_test,
+    cluster_kv_raft_operation_owner_for_test, cluster_kv_raft_operation_queue_depth_for_test,
+    evict_resident_raft_node_for_test,
     pin_resident_raft_node_registry_for_test,
 };
 #[cfg(test)]

@@ -5208,12 +5208,17 @@ mod normal_native_kv_admission_tests {
         let paths = ClusterPaths::new(native.data_dir(&nodes[0]));
         let held =
             sinomo_core::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+        // An operation permit alone leaves an idle canonical resident readable.
+        // This negative control must hold the actual mutable native checkout.
+        let resident = sinomo_core::cluster::open_cluster_raft_kv_node(&paths, &nodes[0])
+            .expect("hold actual native mutable resident");
         let (release, released) = std::sync::mpsc::channel();
         let budget = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
             .kv_txn_quorum_options(true)
             .raft_append_timeout;
         let holder = std::thread::spawn(move || {
             let observed_busy = released.recv_timeout(budget);
+            drop(resident);
             drop(held);
             observed_busy.expect("the real native read must encounter the owned admission");
         });

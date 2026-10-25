@@ -2142,9 +2142,23 @@ fn take_cluster_kv_raft_apply_failure_for_test(paths: &KvWalPaths) -> Option<usi
         .remove(&paths.root)
 }
 
+// Copies of diagnostic values only: no span, task, resident or authority lease.
+// A snapshot never prolongs the lifetime of the admission it describes.
+#[derive(Clone, Debug)]
+struct ClusterKvRaftOperationOwner {
+    generation: u64,
+    acquired_at: Instant,
+    caller: &'static std::panic::Location<'static>,
+    span_id: Option<u64>,
+    span_name: Option<&'static str>,
+}
+
+static NEXT_OPERATION_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Default)]
 struct ClusterKvRaftOperationLockState {
     held: bool,
+    owner: Option<ClusterKvRaftOperationOwner>,
     waiters: VecDeque<u64>,
     next_ticket: u64,
 }
@@ -2286,6 +2300,12 @@ impl Drop for ClusterKvRaftOperationGuard {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tracing::trace!(target: "sinomo.kv.admission",
+                gate = "operation", root = %self.root.display(),
+                owner_generation = state.owner.as_ref().map(|owner| owner.generation),
+                held_us = self.acquired_at.elapsed().as_micros() as u64,
+                "Raft operation admission released");
+            state.owner = None;
             state.held = false;
             // Every waiter re-checks its FIFO ticket. `notify_one` can wake a
             // later ticket and leave the eligible front asleep indefinitely.
@@ -2298,12 +2318,14 @@ impl Drop for ClusterKvRaftOperationGuard {
     }
 }
 
+#[track_caller]
 pub fn lock_cluster_kv_raft_operation_for_root(
     root: impl AsRef<Path>,
 ) -> Result<ClusterKvRaftOperationGuard, KvError> {
     lock_cluster_kv_raft_operation_for_root_with_wait(root, None)
 }
 
+#[track_caller]
 fn lock_cluster_kv_raft_operation_for_root_with_wait(
     root: impl AsRef<Path>,
     wait: Option<Duration>,
@@ -2354,6 +2376,7 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
         if let Some(deadline) = deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace_busy_operation_owner(&root, &state);
                 drop(state);
                 waiter.cancel("timeout");
                 return Err(KvError::Busy {
@@ -2377,6 +2400,7 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
             if timeout.timed_out()
                 && (state.held || state.waiters.front().copied() != Some(waiter.ticket))
             {
+                trace_busy_operation_owner(&root, &state);
                 drop(state);
                 waiter.cancel("timeout");
                 return Err(KvError::Busy {
@@ -2403,6 +2427,19 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
     debug_assert_eq!(dequeued_ticket, Some(waiter.ticket));
     state.held = true;
     let acquired_at = Instant::now();
+    let span = tracing::Span::current();
+    let owner = ClusterKvRaftOperationOwner {
+        generation: NEXT_OPERATION_OWNER_GENERATION.fetch_add(1, Ordering::Relaxed),
+        acquired_at,
+        caller: std::panic::Location::caller(),
+        span_id: span.id().map(|id| id.into_u64()),
+        span_name: span.metadata().map(|metadata| metadata.name()),
+    };
+    tracing::trace!(target: "sinomo.kv.admission",
+        gate = "operation", root = %root.display(), owner_generation = owner.generation,
+        owner_caller = %owner.caller, owner_span_id = owner.span_id,
+        owner_span_name = owner.span_name, "Raft operation admission acquired");
+    state.owner = Some(owner);
     drop(state);
     waiter.finish_after_dequeue("acquired");
     metrics::gauge!("sinomo.kv.raft.operation.inflight").increment(1.0);
@@ -2411,6 +2448,39 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
         lock,
         acquired_at,
     })
+}
+
+fn trace_busy_operation_owner(root: &Path, state: &ClusterKvRaftOperationLockState) {
+    let owner = state.owner.as_ref();
+    tracing::trace!(target: "sinomo.kv.admission",
+        gate = "operation", root = %root.display(), held = state.held,
+        queued_waiters = state.waiters.len(), owner_observed = owner.is_some(),
+        owner_generation = owner.map(|owner| owner.generation),
+        owner_caller = ?owner.map(|owner| owner.caller.to_string()),
+        owner_span_id = owner.and_then(|owner| owner.span_id),
+        owner_span_name = owner.and_then(|owner| owner.span_name),
+        owner_held_us = owner.map(|owner| owner.acquired_at.elapsed().as_micros() as u64),
+        "Raft operation admission busy");
+}
+
+/// Non-owning test observation of the actual operation gate, not the WAL gate.
+/// `None` means no live registry entry at this instant, not historical absence.
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_raft_operation_owner_for_test(
+    paths: &ClusterKvPaths,
+) -> Option<(u64, String, usize)> {
+    let lock = CLUSTER_KV_RAFT_OPERATION_LOCKS
+        .lock()
+        .ok()?
+        .get(&paths.root)?
+        .upgrade()?;
+    let state = lock.state.lock().ok()?;
+    let owner = state.owner.as_ref()?;
+    Some((
+        owner.generation,
+        owner.caller.to_string(),
+        state.waiters.len(),
+    ))
 }
 
 #[cfg(test)]
@@ -3277,12 +3347,14 @@ mod operation_lock_tests {
     }
 }
 
+#[track_caller]
 pub fn lock_cluster_kv_raft_operation_for_paths(
     paths: &ClusterKvPaths,
 ) -> Result<ClusterKvRaftOperationGuard, KvError> {
     lock_cluster_kv_raft_operation_for_root(&paths.root)
 }
 
+#[track_caller]
 pub fn lock_cluster_kv_raft_operation_for_wal_paths(
     paths: &KvWalPaths,
 ) -> Result<ClusterKvRaftOperationGuard, KvError> {
@@ -7795,10 +7867,12 @@ impl ClusterKvRaftStore {
         &self.paths
     }
 
+    #[track_caller]
     pub fn lock_operation(&self) -> Result<ClusterKvRaftOperationGuard, KvError> {
         lock_cluster_kv_raft_operation_for_paths(&self.paths)
     }
 
+    #[track_caller]
     fn lock_operation_with_wait(
         &self,
         wait: Duration,

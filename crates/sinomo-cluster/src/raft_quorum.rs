@@ -6491,23 +6491,43 @@ fn prepare_cluster_raft_read_index(
     record_read_index_resident_preparation(&paths.root);
     let local_node_id = probe_state.local_node_id.clone();
     let wal_paths = paths.kv_paths().raft_wal_paths(&local_node_id);
-    if admission_mode == ClusterRaftReadIndexAdmissionMode::WaitForLocal
-        && let Some(projected) = sinomo_kv::with_cluster_kv_resident_read_projection(
-            &wal_paths,
+    // The operation permit serializes mutations; it is not the ownership
+    // fence of an idle resident. Both admission modes can prepare from that
+    // same canonical view. The forwarding mode must neither wait nor barge
+    // ahead of a queued resident mutation, so use the existing projection
+    // admission with an already-reached deadline. A cold, checked-out, queued
+    // or invalid resident still follows the original try-admit/Busy path.
+    let project = |storage: &mut sinomo_kv::ClusterKvRaftResidentReadProjection<'_>| {
+        let read_state = sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_state(storage);
+        prepare_cluster_raft_read_index_from_projection(
+            storage,
+            probe_state.clone(),
             &local_node_id,
-            |storage| {
-                let read_state =
-                    sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_state(storage);
-                prepare_cluster_raft_read_index_from_projection(
-                    storage,
-                    probe_state.clone(),
-                    &local_node_id,
-                    read_state,
-                )
-            },
+            read_state,
         )
-    {
-        return projected.map_err(kv_err)?.value;
+    };
+    let projected = match admission_mode {
+        ClusterRaftReadIndexAdmissionMode::WaitForLocal => {
+            sinomo_kv::with_cluster_kv_resident_read_projection(&wal_paths, &local_node_id, project)
+        }
+        ClusterRaftReadIndexAdmissionMode::ForwardOnBusy => {
+            sinomo_kv::with_cluster_kv_resident_read_projection_before(
+                &wal_paths,
+                &local_node_id,
+                Instant::now(),
+                project,
+            )
+        }
+    };
+    if let Some(projected) = projected {
+        let prepared = projected.map_err(kv_err)?.value?;
+        if admission_mode == ClusterRaftReadIndexAdmissionMode::WaitForLocal
+            || matches!(prepared, PreparedClusterRaftReadIndex::Confirmable { .. })
+        {
+            return Ok(prepared);
+        }
+        // A shared peek must not turn Busy into a queued barrier or election.
+        // Anything requiring mutation retains the original operation admission.
     }
     let mut storage = match admission_mode {
         ClusterRaftReadIndexAdmissionMode::WaitForLocal => {
