@@ -1602,7 +1602,7 @@ fn local_cluster_connectivity_raw_persisted_records_stable(
         .map(|record| (cluster_connectivity_record_key(record), record.clone()))
         .collect::<BTreeMap<_, _>>();
     if replace_source_records {
-        candidate.retain(|(_, candidate_source_node_id, _), _| {
+        candidate.retain(|(candidate_source_node_id, _, _), _| {
             candidate_source_node_id != source_node_id
         });
     }
@@ -3228,8 +3228,97 @@ mod tests {
         assert_eq!(
             read_local_cluster_connectivity_records_for_source(&paths, &local)
                 .expect("read source after newer removal"),
-            vec![initial_a],
+            vec![initial_a.clone()],
             "the newer complete set removes omitted keys without rewriting stable retained evidence"
+        );
+        let persisted =
+            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)
+                .expect("decode actual source file")
+                .expect("nonempty source remains on disk");
+        assert_eq!(
+            persisted,
+            vec![initial_a.clone()],
+            "omission must reach disk"
+        );
+        invalidate_local_cluster_connectivity_cache(&paths)
+            .expect("invalidate only this fixture cache");
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local)
+                .expect("reopen source after omission"),
+            vec![initial_a],
+            "an omitted endpoint must not return after cache invalidation"
+        );
+    }
+
+    #[test]
+    fn full_source_omission_and_clear_preserve_another_sources_reverse_edge() {
+        let (_root, paths, state, source, endpoint, now) =
+            connectivity_generation_fixture("source_omission_reverse_edge");
+        let kept = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut omitted = kept.clone();
+        omitted.endpoint_id = ClusterEndpointId::derived("source-omission-second", b"second");
+        omitted.address = "second:21353".into();
+        let mut reverse = kept.clone();
+        reverse.source_node_id = kept.target_node_id.clone();
+        reverse.target_node_id = source.clone();
+        reverse.endpoint_id = ClusterEndpointId::derived("source-omission-reverse", b"reverse");
+        reverse.address = "source:21353".into();
+        write_local_cluster_connectivity_record_set(&paths, &source, &[kept.clone(), omitted])
+            .unwrap();
+        write_local_cluster_connectivity_record_set(
+            &paths,
+            &reverse.source_node_id,
+            std::slice::from_ref(&reverse),
+        )
+        .unwrap();
+        let mut newer = kept.clone();
+        newer.observed_at += time::Duration::seconds(1);
+        newer.expires_at += time::Duration::seconds(1);
+        write_local_cluster_connectivity_record_set(&paths, &source, &[newer]).unwrap();
+
+        let mut expected = vec![kept.clone(), reverse.clone()];
+        sort_cluster_connectivity_records(&mut expected);
+        let persisted =
+            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            persisted, expected,
+            "replace the selected source, not rows targeting that source"
+        );
+        invalidate_local_cluster_connectivity_cache(&paths).unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &source).unwrap(),
+            vec![kept]
+        );
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &reverse.source_node_id)
+                .unwrap(),
+            vec![reverse.clone()]
+        );
+
+        write_local_cluster_connectivity_record_set(&paths, &source, &[]).unwrap();
+        invalidate_local_cluster_connectivity_cache(&paths).unwrap();
+        assert!(
+            read_local_cluster_connectivity_records_for_source(&paths, &source)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)
+                .unwrap()
+                .unwrap(),
+            vec![reverse]
         );
     }
 
