@@ -784,6 +784,525 @@ mod tests {
         }
     }
 
+    // OS-process/storage controls only: these raw fixtures mint no native
+    // admission, Terminal, transport or metadata-commit evidence.
+    #[cfg(unix)]
+    mod process_storage {
+        use super::super::super::received_repair::OriginalRepairProcessExpectation;
+        use super::*;
+        use std::os::unix::{fs::MetadataExt, process::ExitStatusExt};
+        use std::process::{Child, Command, ExitStatus, Stdio};
+
+        pub(super) const HELPER: &str = "content_store::inline_bindings::original_repair::tests::original_storage_phase_process_child";
+        const INPUT_ENV: &str = "SINOMO_DFS_ORIGINAL_STORAGE_PROCESS_INPUT";
+        const BODY: &[u8] = b"complete original attachment";
+        const READY_CAP: Duration = Duration::from_secs(10);
+        const REAP_CAP: Duration = Duration::from_secs(5);
+        const RAW_CAP: usize = 1024 * 1024;
+        type TestResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        pub(super) enum Phase {
+            Prepared,
+            Bound,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Input {
+            fixture: PathBuf,
+            invocation: String,
+            phase: Phase,
+            expected: OriginalRepairProcessExpectation,
+            material: DfsOriginalRepairMaterial,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ready {
+            pid: u32,
+            invocation: String,
+            phase: Phase,
+            expected: OriginalRepairProcessExpectation,
+            material: DfsOriginalRepairMaterial,
+            body: Vec<u8>,
+            prepared_id: u64,
+            bound_id: Option<u64>,
+            terminal_id: Option<u64>,
+            response: Option<DfsRepairReplicaResponse>,
+        }
+
+        #[derive(Debug, Eq, PartialEq, Serialize)]
+        struct RawFile {
+            relative: PathBuf,
+            hash: String,
+            bytes: Vec<u8>,
+        }
+
+        fn bounded_regular_file(path: &Path, cap: usize) -> TestResult<Vec<u8>> {
+            let before = fs::symlink_metadata(path)?;
+            if !before.is_file() || before.file_type().is_symlink() || before.len() > cap as u64 {
+                return Err(format!(
+                    "not a bounded regular process fixture file: {}",
+                    path.display()
+                )
+                .into());
+            }
+            let mut file = fs::File::open(path)?;
+            let opened = file.metadata()?;
+            if (opened.dev(), opened.ino(), opened.len())
+                != (before.dev(), before.ino(), before.len())
+            {
+                return Err("process fixture file changed while opening".into());
+            }
+            let mut bytes = Vec::new();
+            (&mut file).take(cap as u64 + 1).read_to_end(&mut bytes)?;
+            let after = fs::symlink_metadata(path)?;
+            if bytes.len() as u64 != before.len()
+                || bytes.len() > cap
+                || !after.is_file()
+                || after.file_type().is_symlink()
+                || (
+                    before.dev(),
+                    before.ino(),
+                    before.len(),
+                    before.mtime(),
+                    before.mtime_nsec(),
+                ) != (
+                    after.dev(),
+                    after.ino(),
+                    after.len(),
+                    after.mtime(),
+                    after.mtime_nsec(),
+                )
+            {
+                return Err("process fixture file changed during bounded read".into());
+            }
+            Ok(bytes)
+        }
+
+        fn read_data<T: serde::de::DeserializeOwned>(path: &Path) -> TestResult<T> {
+            Ok(sinomo_object_serde::from_bytes(&bounded_regular_file(
+                path,
+                INLINE_FRAME_HEADER_LIMIT as usize,
+            )?)?)
+        }
+
+        fn write_data<T: Serialize>(path: &Path, data: &T) -> TestResult<()> {
+            let bytes = crate::metadata_io::encode_sobj(data)?;
+            if bytes.len() > INLINE_FRAME_HEADER_LIMIT as usize {
+                return Err("process fixture DATA exceeds 64KiB".into());
+            }
+            crate::metadata_io::write_file_atomic(path, &bytes)?;
+            Ok(())
+        }
+
+        fn raw_receiver(root: &Path) -> TestResult<Vec<RawFile>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                total: &mut usize,
+                entries: &mut usize,
+                rows: &mut Vec<RawFile>,
+            ) -> TestResult<()> {
+                *entries += 1;
+                if *entries > 256 {
+                    return Err("process fixture capture exceeds 256 entries".into());
+                }
+                let metadata = fs::symlink_metadata(path)?;
+                if metadata.file_type().is_symlink() {
+                    return Err("symlink in process fixture capture".into());
+                }
+                if metadata.is_dir() {
+                    for entry in fs::read_dir(path)? {
+                        visit(root, &entry?.path(), total, entries, rows)?;
+                    }
+                } else if metadata.is_file() {
+                    let bytes = bounded_regular_file(path, RAW_CAP - *total)?;
+                    *total += bytes.len();
+                    rows.push(RawFile {
+                        relative: path.strip_prefix(root)?.to_owned(),
+                        hash: blake3::hash(&bytes).to_hex().to_string(),
+                        bytes,
+                    });
+                } else {
+                    return Err("nonregular process fixture capture entry".into());
+                }
+                Ok(())
+            }
+            let mut rows = Vec::new();
+            visit(root, root, &mut 0, &mut 0, &mut rows)?;
+            rows.sort_by(|a, b| a.relative.cmp(&b.relative));
+            Ok(rows)
+        }
+
+        /// Exact Child custody, including failed Result paths. The first drain
+        /// deadline is permanent; Drop never grants another five seconds.
+        struct OwnedChild {
+            child: Option<Child>,
+            fixture: Option<sinomo_testdir::TestDir>,
+            root: PathBuf,
+            reap_deadline: Option<Instant>,
+        }
+
+        impl OwnedChild {
+            fn spawn(fixture: sinomo_testdir::TestDir, command: &mut Command) -> TestResult<Self> {
+                let root = fixture.path().to_owned();
+                match command.spawn() {
+                    Ok(child) => Ok(Self {
+                        child: Some(child),
+                        fixture: Some(fixture),
+                        root,
+                        reap_deadline: None,
+                    }),
+                    Err(error) => {
+                        eprintln!(
+                            "retained process fixture after spawn error: {}",
+                            fixture.keep().display()
+                        );
+                        Err(error.into())
+                    }
+                }
+            }
+
+            fn keep(&mut self) {
+                if let Some(fixture) = self.fixture.take() {
+                    eprintln!(
+                        "retained undrained process fixture: {}",
+                        fixture.keep().display()
+                    );
+                }
+            }
+
+            fn drain(&mut self, require_alive: bool) -> TestResult<ExitStatus> {
+                let deadline = *self
+                    .reap_deadline
+                    .get_or_insert_with(|| Instant::now() + REAP_CAP);
+                let child = self.child.as_mut().ok_or("process child already reaped")?;
+                if let Some(status) = child.try_wait()? {
+                    self.child = None;
+                    if require_alive {
+                        return Err(
+                            format!("process child exited before owned kill: {status}").into()
+                        );
+                    }
+                    if Instant::now() > deadline {
+                        return Err("process child was reaped after original 5s cleanup deadline".into());
+                    }
+                    return Ok(status);
+                }
+                child.kill()?;
+                loop {
+                    if let Some(status) = child.try_wait()? {
+                        self.child = None;
+                        if Instant::now() > deadline {
+                            return Err(
+                                "owned process child was reaped after original 5s drain".into()
+                            );
+                        }
+                        return Ok(status);
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(
+                            "owned process child was not reaped within original 5s drain".into(),
+                        );
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
+
+            fn kill_and_reap(&mut self) -> TestResult<ExitStatus> {
+                let result = self.drain(true);
+                if result.is_err() {
+                    self.keep();
+                }
+                result
+            }
+
+            fn ready(&mut self, deadline: Instant) -> TestResult<Ready> {
+                let path = self.root.join("ready.sobj");
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err("original process phase did not become Ready within 10s including spawn".into());
+                    }
+                    let child = self
+                        .child
+                        .as_mut()
+                        .ok_or("process child absent before Ready")?;
+                    if let Some(status) = child.try_wait()? {
+                        self.child = None;
+                        return Err(format!("process child exited before Ready: {status}").into());
+                    }
+                    match fs::symlink_metadata(&path) {
+                        Ok(_) => {
+                            let ready: Ready = read_data(&path)?;
+                            if ready.pid != child.id() {
+                                return Err("Ready PID differs from exact Child".into());
+                            }
+                            if Instant::now() >= deadline {
+                                return Err(
+                                    "process Ready decode completed after 10s deadline".into()
+                                );
+                            }
+                            return Ok(ready);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
+        }
+
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if self.child.is_some() {
+                    if let Err(error) = self.drain(false) {
+                        self.keep();
+                        eprintln!("exact process child cleanup unproved: {error}");
+                        if !std::thread::panicking() {
+                            panic!("exact process child cleanup unproved: {error}");
+                        }
+                    }
+                }
+            }
+        }
+
+        pub(super) fn child() -> TestResult<()> {
+            let input_path = PathBuf::from(
+                std::env::var_os(INPUT_ENV)
+                    .ok_or("ignored process helper requires its parent's explicit input")?,
+            );
+            let input: Input = read_data(&input_path)?;
+            let fixture_metadata = fs::symlink_metadata(&input.fixture)?;
+            if !input.fixture.is_absolute()
+                || !fixture_metadata.is_dir()
+                || fixture_metadata.file_type().is_symlink()
+                || input_path != input.fixture.join("input.sobj")
+                || input.expected.root != input.fixture.join("receiver")
+                || input.invocation
+                    != format!(
+                        "{}:{:?}",
+                        input
+                            .fixture
+                            .file_name()
+                            .ok_or("fixture name absent")?
+                            .to_string_lossy(),
+                        input.phase
+                    )
+            {
+                return Err("process helper paths/invocation differ from owned fixture".into());
+            }
+            let store = LocalContentStore::reopen_original_process_fixture(&input.expected)?;
+            let prepared = append_prepared(&store, input.material.clone());
+            if input.phase == Phase::Bound {
+                store.bind_original_repair_content(&prepared, BODY)?;
+            }
+            let actual = store
+                .original_repair_test_snapshot(&input.material)?
+                .ok_or("actual process phase absent")?;
+            if actual.material != input.material
+                || actual.bytes != BODY
+                || actual.terminal_id.is_some()
+                || actual.response.is_some()
+                || actual.bound_id.is_some() != (input.phase == Phase::Bound)
+            {
+                return Err(
+                    "actual process phase differs from requested storage-only state".into(),
+                );
+            }
+            write_data(
+                &input.fixture.join("ready.sobj"),
+                &Ready {
+                    pid: std::process::id(),
+                    invocation: input.invocation,
+                    phase: input.phase,
+                    expected: input.expected,
+                    material: actual.material,
+                    body: actual.bytes,
+                    prepared_id: actual.prepared_id,
+                    bound_id: actual.bound_id,
+                    terminal_id: actual.terminal_id,
+                    response: actual.response,
+                },
+            )?;
+            // Retain the live writer until the parent's kill. EOF/normal exit
+            // is a failed witness, never a substitute for SIGKILL.
+            let mut byte = [0u8];
+            let waited = io::stdin().read_exact(&mut byte);
+            std::hint::black_box(&store);
+            drop(prepared);
+            drop(store);
+            Err(format!("parent did not SIGKILL live process helper: stdin={waited:?}").into())
+        }
+
+        pub(super) fn arm(phase: Phase) {
+            let fixture = sinomo_testdir::TestDir::new("original-storage-owned-sigkill");
+            let root = fixture.path().to_owned();
+            let material = source_material(&root.join("source"));
+            let (store, identity) =
+                LocalContentStore::new_original_repair_fixture(root.join("receiver")).unwrap();
+            let expected = identity.original_process_expectation().unwrap();
+            let input = Input {
+                invocation: format!("{}:{phase:?}", root.file_name().unwrap().to_string_lossy()),
+                fixture: root.clone(),
+                phase,
+                expected: expected.clone(),
+                material: material.clone(),
+            };
+            let input_path = root.join("input.sobj");
+            write_data(&input_path, &input).unwrap();
+            let stdout = fs::File::create(root.join("child.stdout.log")).unwrap();
+            let stderr = fs::File::create(root.join("child.stderr.log")).unwrap();
+            drop(store); // Identity DATA remains; no parent physical writer remains.
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", HELPER, "--ignored", "--nocapture"])
+                .env(INPUT_ENV, &input_path)
+                .stdin(Stdio::piped())
+                .stdout(stdout)
+                .stderr(stderr);
+            let started = Instant::now();
+            let ready_deadline = started + READY_CAP; // Includes spawn, open, append and Ready sync.
+            let mut owned = OwnedChild::spawn(fixture, &mut command).unwrap();
+            let ready = owned.ready(ready_deadline).unwrap();
+            assert_eq!(ready.invocation, input.invocation);
+            assert_eq!(ready.phase, phase);
+            assert_eq!(ready.expected, expected);
+            assert_eq!(ready.material, material);
+            assert_eq!(ready.body, BODY);
+            assert!(
+                ready.prepared_id > 0 && ready.terminal_id.is_none() && ready.response.is_none()
+            );
+            assert_eq!(ready.bound_id.is_some(), phase == Phase::Bound);
+            assert!(
+                Instant::now() < ready_deadline,
+                "complete Ready validation must fit original 10s deadline"
+            );
+            let ready_elapsed = started.elapsed();
+            let kill_started = Instant::now();
+            let status = owned.kill_and_reap().unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "only parent-issued SIGKILL is this witness"
+            );
+            eprintln!(
+                "original storage process {phase:?}: pid={} Ready={ready_elapsed:?}, kill/reap={:?}, signal={:?}, root={}",
+                ready.pid,
+                kill_started.elapsed(),
+                status.signal(),
+                root.display()
+            );
+
+            // Save actual bytes/hashes BEFORE any normal writer recovery.
+            let raw = raw_receiver(&expected.root).unwrap();
+            let encoded = crate::metadata_io::encode_sobj(&raw).unwrap();
+            crate::metadata_io::write_file_atomic(&root.join("raw-postkill.sobj"), &encoded)
+                .unwrap();
+            let mut wrong_incarnation = expected.clone();
+            wrong_incarnation.store_incarnation.push_str("-changed");
+            assert!(
+                LocalContentStore::reopen_original_process_fixture(&wrong_incarnation).is_err()
+            );
+            fs::create_dir(root.join("other-directory")).unwrap();
+            let mut wrong_physical = expected.clone();
+            wrong_physical.root = root.join("other-directory");
+            assert!(LocalContentStore::reopen_original_process_fixture(&wrong_physical).is_err());
+            assert!(
+                LocalContentStore::new(expected.root.clone()).is_err(),
+                "default2 cannot adopt private4"
+            );
+            assert_eq!(
+                raw_receiver(&expected.root).unwrap(),
+                raw,
+                "refused opens must not rewrite the stored phase"
+            );
+
+            // This is actual owner recovery/certification, not an observation.
+            let store = LocalContentStore::reopen_received_repair_fixture(&identity).unwrap();
+            let actual = store
+                .original_repair_test_snapshot(&material)
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual.material, material);
+            assert_eq!(actual.bytes, BODY);
+            assert_eq!(actual.store_incarnation, expected.store_incarnation);
+            assert_eq!(actual.prepared_id, ready.prepared_id);
+            assert_eq!(actual.bound_id, ready.bound_id);
+            assert!(actual.terminal_id.is_none() && actual.response.is_none());
+            let reference = {
+                let _owner = store.content_mutation_guard().unwrap();
+                let reservation = store.lock_content_reservations_for_write().unwrap();
+                let mut state = store.inline_store.owner.state.lock().unwrap();
+                ensure_writer(
+                    &store.root,
+                    &reservation.sentinel.store_incarnation,
+                    &mut state,
+                )
+                .unwrap();
+                let prepared = state
+                    .view
+                    .original_repairs
+                    .get(&OriginalRepairKey::of(&material))
+                    .unwrap()
+                    .clone();
+                PreparedOriginalRepairRef {
+                    root: store.root.clone(),
+                    prepared,
+                }
+            };
+            assert!(
+                store
+                    .bind_original_repair_content(&reference, b"changed body")
+                    .is_err()
+            );
+            assert_eq!(
+                store.original_repair_test_snapshot(&material).unwrap(),
+                Some(actual.clone())
+            );
+            if phase == Phase::Bound {
+                let command = &material.original.command;
+                let (manifest, bytes) = store
+                    .read_object_version(command.object_id.as_str(), command.version.as_str())
+                    .unwrap();
+                assert_eq!(bytes, BODY);
+                assert_eq!(manifest.content_hash, command.content_hash);
+                assert_eq!(manifest.size_bytes, BODY.len() as u64);
+                assert_eq!(
+                    store
+                        .bind_original_repair_content(&reference, BODY)
+                        .unwrap()
+                        .bound_id(),
+                    actual.bound_id.unwrap()
+                );
+                assert_eq!(
+                    store.original_repair_test_snapshot(&material).unwrap(),
+                    Some(actual)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_storage_phases_survive_owned_process_kill() {
+        process_storage::arm(process_storage::Phase::Prepared);
+        process_storage::arm(process_storage::Phase::Bound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "owned storage-only helper; launched twice by the parent SIGKILL case"]
+    fn original_storage_phase_process_child() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        process_storage::child()
+    }
+
     #[test]
     fn original_prepared_file_replay_preserves_body_and_conflicting_incarnation_rejects() {
         let root = sinomo_testdir::TestDir::new("original-prepared-file-replay");
