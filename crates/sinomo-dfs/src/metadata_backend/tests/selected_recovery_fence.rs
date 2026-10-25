@@ -280,7 +280,16 @@ fn selected_recovery_prepare_inventory_is_complete_at_bound_and_overflow_does_no
 #[test]
 fn selected_recovery_malformed_and_mixed_tags_cannot_issue_floors_or_erase_bytes() {
     let mut f = fixture("selected-recovery-malformed-envelope");
+    // Authority ACK floors require a nonzero durable cut. Establish it via
+    // the existing owning writer/replay helper before testing bad envelopes.
+    seed_prepare_data(&mut f, 1);
     let prefix = f.backend.prefix_proof.clone().unwrap();
+    assert_eq!(prefix.journal_sequence, 1);
+    assert_eq!(f.backend.journal_last_sequence(), prefix.journal_sequence);
+    assert_eq!(
+        f.backend.materialized_through_sequence,
+        prefix.journal_sequence
+    );
     let prefix_floor = DfsMetadataPrefixAckFloor {
         shard_id: f.backend.shard_id.clone(),
         journal_sequence: prefix.journal_sequence,
