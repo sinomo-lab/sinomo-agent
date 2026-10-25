@@ -4910,6 +4910,9 @@ mod native_selected_data_tests {
         promoted: NodeId,
         holder: NodeId,
         birth: crate::repair_queue_store::RepairOriginalBirth,
+        // Real C output captured before the existing reply-loss fault. It is
+        // never reconstructed from content bytes or a receipt tuple.
+        delayed_reply: Option<DfsRoutedMessage>,
         held: Option<Box<dyn Send>>,
         held_promoted: Option<Box<dyn Send>>,
     }
@@ -5417,12 +5420,20 @@ mod native_selected_data_tests {
             Err(crate::ContentStoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound),
             "the genuine source/copy cut leaves B without the exact version");
         drop(empty_successor);
+        let delayed_reply = replies.lock().unwrap().iter().find(|routed| {
+            let DfsNetworkMessage::RepairReplicaResponse(response) = &routed.message else { return false; };
+            if routed.source_node_id != holder || routed.target_node_id != owner { return false; }
+            let mut checked = birth.clone();
+            checked.observed.push(response.clone());
+            checked.validate(&birth.root.subject.queue_incarnation).is_ok()
+        }).cloned();
         GenuineNativeOriginal {
             runtime,
             shard,
             promoted,
             holder,
             birth,
+            delayed_reply,
             held,
             held_promoted,
         }
@@ -7428,8 +7439,16 @@ mod native_selected_data_tests {
             check: impl FnOnce(&mut GenuineNativeOriginal, &DfsMetadataShardConfig,
                 &mut NetworkedDfsService<crate::DfsNodeTransport>, &LocalDfsRepairQueueStore),
         ) {
+            let fixture = genuine_native_original_with_receiver_cut(name, false, prospective_receiver, prepared_only);
+            with_query_fixture_from_original(fixture, check);
+        }
+
+        fn with_query_fixture_from_original(
+            mut fixture: GenuineNativeOriginal,
+            check: impl FnOnce(&mut GenuineNativeOriginal, &DfsMetadataShardConfig,
+                &mut NetworkedDfsService<crate::DfsNodeTransport>, &LocalDfsRepairQueueStore),
+        ) {
             let path = "/services/selected-original-data.bin";
-            let mut fixture = genuine_native_original_with_receiver_cut(name, false, prospective_receiver, prepared_only);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let owner = fixture.shard.primary_node_id.clone();
                 let request = fixture.birth.root.subject.request_id.clone();
@@ -7883,6 +7902,178 @@ mod native_selected_data_tests {
                 successor.set_transport_operation_deadline(previous);
                 assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), original_before);
                 assert!(queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+            });
+        }
+
+        #[test]
+        fn native_imported_history_query_preserves_applied_c_withdrawal() {
+            let path = "/services/selected-original-data.bin";
+            let mut fixture = genuine_native_original_with_receiver_foundation(
+                "native-imported-history-applied-c-withdrawal", false, true,
+            );
+            let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // This is a separate delayed-delivery phase; it does not renew
+                // either prior genuine seed/first-effect clock.
+                let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+                let producer = fixture.shard.primary_node_id.clone();
+                let original = fixture.birth.original.clone();
+                let material = fixture.birth.original_wire_material().unwrap();
+                let command = &material.original.command;
+                let delayed = fixture.delayed_reply.clone().expect("the real C positive was captured before reply loss");
+                let DfsNetworkMessage::RepairReplicaResponse(response) = &delayed.message else { panic!("actual C Repair response") };
+                assert_eq!(delayed.source_node_id, fixture.holder);
+                assert_eq!(delayed.target_node_id, producer);
+                assert!(matches!(&response.result, DfsBlobTransferResult::Committed { content_hash } if content_hash == &command.content_hash));
+                let mut validated = fixture.birth.clone();
+                validated.observed.push(response.clone());
+                validated.validate(&fixture.birth.root.subject.queue_incarnation).unwrap();
+                let initial = fixture.runtime.metadata_primary_service(path).unwrap();
+                assert!(initial.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap()
+                    .iter().all(|receipt| receipt.replica_node_id != fixture.holder));
+                drop(initial);
+                let c_before = fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap().unwrap();
+                assert_eq!(c_before.response.as_ref(), Some(response));
+                assert!(c_before.bound_id.is_some() && c_before.terminal_id.is_some());
+                assert_eq!(c_before.bytes, vec![0x5a;4096]);
+                let layout = fixture.runtime.selected_original_data_layout(&producer).unwrap();
+                let source_queue = layout.queue().unwrap();
+                let denial = source_queue.deny_original_repair_close_for_test(&original).unwrap();
+                assert!(source_queue.deny_original_repair_close_for_test(&original).err().unwrap()
+                    .to_string().contains("already installed"));
+                source_queue.reload_from_disk_on_next_access();
+                source_queue.view().unwrap();
+                assert_eq!(denial.hits(), 0, "arming/replay is not application or a synthetic reached fact");
+                let mut c = fixture.runtime.client(&fixture.holder).unwrap();
+                let previous = c.set_transport_operation_deadline(Some(deadline));
+                // Preserve ALL actual C frame/message/effect identities. This
+                // is its normal authenticated response route into native A.
+                let delivered = c.transport.send_routed_call(&producer, DfsRoutedCall::value(delayed.clone()));
+                assert_eq!(c.transport.operation_deadline(), Some(deadline));
+                assert!(Instant::now() <= deadline, "the delayed response cannot renew its captured 5s clock");
+                c.set_transport_operation_deadline(previous);
+                drop(c);
+                let error = delivered.expect_err("normal A publication must reach the negative common Close boundary");
+                assert!(error.to_string().contains("injected original Repair close denial after actual application"), "{error}");
+                assert!(denial.hits() > 0);
+                assert!(fixture.runtime.rpc_observations().iter().any(|call| call.source == fixture.holder && call.target == producer
+                    && call.route == DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE
+                    && call.dfs_request_id.as_deref() == Some(command.request_id.as_str())
+                    && call.dfs_frame_id == Some(delayed.frame_id)));
+                let applied = fixture.runtime.metadata_primary_service(path).unwrap();
+                let receipts = applied.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap();
+                let c_receipt = receipts.iter().find(|receipt| receipt.replica_node_id == fixture.holder).unwrap().clone();
+                assert_eq!(c_receipt.receipt.file_system_id, command.file_system_id);
+                assert_eq!(c_receipt.receipt.object_id, command.object_id);
+                assert_eq!(c_receipt.receipt.committed_version, command.version);
+                assert_eq!(c_receipt.receipt.owner_node_id, producer);
+                assert_eq!(c_receipt.content_hash.as_deref(), Some(command.content_hash.as_str()));
+                assert!(applied.metadata_backend().unwrap().get_object(&command.object_id).unwrap().unwrap()
+                    .current_locations.contains(&fixture.holder));
+                drop(applied);
+                let observed = source_queue.original_repair(&original).unwrap().unwrap();
+                assert!(observed.observed.contains(response));
+                assert!(observed.closed_at_sequence.is_none());
+                assert!(source_queue.closed_repair_birth(&observed.root.subject).unwrap().is_none());
+                fixture.runtime.client(&producer).unwrap().content().inspect_repair_payload_root(&observed.root).unwrap();
+                // The normal maintenance path must also be denied. No new C
+                // response/remote Repair is needed for its already-applied read.
+                let before_recovery = denial.hits();
+                let reply_count = fixture.runtime.rpc_observations().iter().filter(|call| call.source == fixture.holder && call.target == producer
+                    && call.route == DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE).count();
+                let remaining = deadline.checked_duration_since(Instant::now()).expect("same delayed-delivery/recovery budget");
+                let tick = fixture.runtime.maintenance_tick(&producer, remaining).unwrap();
+                assert!(Instant::now() <= deadline);
+                let tick_error = tick.outcome.as_ref().expect_err("this explicit native maintenance invocation must reach the original Close denial");
+                assert!(tick_error.contains("injected original Repair close denial after actual application"), "{tick_error}");
+                assert!(denial.hits() > before_recovery, "actual native observed recovery must hit the common Close cut: {:?}", tick.outcome);
+                assert_eq!(fixture.runtime.rpc_observations().iter().filter(|call| call.source == fixture.holder && call.target == producer
+                    && call.route == DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE).count(), reply_count);
+                let applied = fixture.runtime.metadata_primary_service(path).unwrap();
+                assert_eq!(applied.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap(), receipts);
+                drop(applied);
+                let observed = source_queue.original_repair(&original).unwrap().unwrap();
+                assert_eq!(observed.original, fixture.birth.original);
+                assert_eq!(observed.root, fixture.birth.root);
+                assert_eq!(observed.attachment, fixture.birth.attachment);
+                assert_eq!(observed.attempts, fixture.birth.attempts);
+                assert!(observed.observed.contains(response) && observed.closed_at_sequence.is_none());
+                assert_eq!(fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap(), Some(c_before));
+                // Capture the REAL post-delivery state, including known
+                // Committed, without changing any original identity/body.
+                fixture.birth = observed;
+                (denial, c_receipt)
+            }));
+            let (denial, applied_c_receipt) = match setup {
+                Ok(value) => value,
+                Err(error) => {
+                    // The setup's local denial/senders have already dropped.
+                    drop(fixture.held.take());
+                    drop(fixture.held_promoted.take());
+                    if let Err(close_error) = fixture.runtime.close() {
+                        eprintln!("same-C setup cleanup also failed: {close_error}");
+                    }
+                    std::panic::resume_unwind(error);
+                }
+            };
+            with_query_fixture_from_original(fixture, move |fixture, assignment, successor, queue| {
+                let producer = fixture.shard.primary_node_id.clone();
+                let material = fixture.birth.original_wire_material().unwrap();
+                let command = &material.original.command;
+                let source_layout = fixture.runtime.selected_original_data_layout(&producer).unwrap();
+                let source_queue = source_layout.queue().unwrap();
+                let imported = queue.installed_original_handoff_data(&producer, &command.request_id).unwrap().unwrap();
+                assert_eq!(imported.material.birth, fixture.birth, "handoff must retain the complete real open+observed source state");
+                let freeze = crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                    fixture.runtime.data_dir(&producer), &DfsMetadataShardId::new(&fixture.shard.shard_id), Some(&source_layout)).unwrap().unwrap();
+                assert_eq!(freeze.retiring_epoch, fixture.shard.epoch);
+                assert_eq!(freeze.handoff_id, imported.material.cut.handoff.handoff_id);
+                assert_eq!(assignment.primary_node_id, fixture.promoted);
+                assert_ne!(assignment.primary_node_id, producer);
+                // The existing helper reached actual B activation; A's real
+                // durable freeze/assignment, not this test guard, fences it now.
+                denial.release().unwrap();
+                let origin = source_queue.original_repair(&fixture.birth.original).unwrap().unwrap();
+                assert_eq!(origin, fixture.birth);
+                assert!(source_queue.closed_repair_birth(&origin.root.subject).unwrap().is_none());
+                let backend = successor.metadata_backend().unwrap();
+                let before_receipts = backend.receipts_for_version(&command.object_id, &command.version).unwrap();
+                assert_eq!(before_receipts.iter().find(|receipt| receipt.replica_node_id == fixture.holder), Some(&applied_c_receipt));
+                assert!(backend.get_object(&command.object_id).unwrap().unwrap().current_locations.contains(&fixture.holder));
+                let intent_before = backend.get_intent(&command.object_id, &command.intent_id).unwrap().unwrap();
+                assert!(intent_before.desired_replica_node_ids.contains(&fixture.holder));
+                let c_before = fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap();
+                successor.mark_remote_read_location_missing(&command.object_id, &command.version,
+                    &Some(command.content_hash.clone()), &fixture.holder).unwrap();
+                let backend = successor.metadata_backend().unwrap();
+                let head = backend.get_object(&command.object_id).unwrap().unwrap();
+                let version = backend.get_version(&command.object_id, &command.version).unwrap().unwrap();
+                let receipts = backend.receipts_for_version(&command.object_id, &command.version).unwrap();
+                let intent = backend.get_intent(&command.object_id, &command.intent_id).unwrap().unwrap();
+                assert!(!head.current_locations.contains(&fixture.holder));
+                assert!(!version.locations.contains(&fixture.holder));
+                assert!(receipts.iter().all(|receipt| receipt.replica_node_id != fixture.holder));
+                assert_eq!(intent.policy, intent_before.policy);
+                assert_eq!(intent.desired_replica_node_ids, intent_before.desired_replica_node_ids);
+                assert!(intent.desired_replica_node_ids.contains(&fixture.holder), "desired C plus absent canonical receipt retains the durable deficit");
+                let rows = queue.view().unwrap().records;
+                let response = query(fixture, assignment, successor);
+                assert_terminal(&response, fixture);
+                assert_eq!(query(fixture, assignment, successor), response);
+                let backend = successor.metadata_backend().unwrap();
+                assert_eq!(backend.get_object(&command.object_id).unwrap(), Some(head));
+                assert_eq!(backend.get_version(&command.object_id, &command.version).unwrap(), Some(version));
+                assert_eq!(backend.receipts_for_version(&command.object_id, &command.version).unwrap(), receipts);
+                assert_eq!(backend.get_intent(&command.object_id, &command.intent_id).unwrap(), Some(intent));
+                assert_eq!(queue.view().unwrap().records, rows);
+                assert_eq!(queue.installed_original_handoff_data(&producer, &command.request_id).unwrap(), Some(imported));
+                assert_eq!(source_queue.original_repair(&fixture.birth.original).unwrap(), Some(origin));
+                assert!(source_queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+                assert!(queue.closed_repair_birth(&fixture.birth.root.subject).unwrap().is_none());
+                assert!(queue.imported_executor_association(&producer, &command.request_id).unwrap().is_none());
+                fixture.runtime.client(&producer).unwrap().content().inspect_repair_payload_root(&fixture.birth.root).unwrap();
+                assert_eq!(fixture.runtime.client(&fixture.holder).unwrap().content().original_repair_test_snapshot(&material).unwrap(), c_before);
+                assert!(matches!(fixture.runtime.client(&fixture.promoted).unwrap().content().read_manifest(command.object_id.as_str(), command.version.as_str()),
+                    Err(ContentStoreError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound));
             });
         }
 

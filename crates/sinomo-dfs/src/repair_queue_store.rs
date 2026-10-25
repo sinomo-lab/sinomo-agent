@@ -1533,6 +1533,59 @@ struct DfsRepairQueueState {
     maintenance_cursor: Option<DfsRepairQueueKey>,
     maintenance_restart_pending: bool,
     maintenance_revisit_pending: bool,
+    // One negative native fixture cut, shared by normal and recovery handles.
+    // It is outside replay/reset state and never appears in a persisted record.
+    #[cfg(test)]
+    original_close_denial: Option<Arc<OriginalRepairCloseDenial>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct OriginalRepairCloseDenial {
+    identity: SelectedOriginalFixtureIdentity,
+    subject: crate::content_store::RepairPayloadSubject,
+    original_command_digest: String,
+    hits: std::sync::atomic::AtomicUsize,
+}
+
+/// Negative test control only. It owns no receipt/application or root-release
+/// capability and performs no I/O while releasing its shared queue-state slot.
+#[cfg(test)]
+pub(crate) struct OriginalRepairCloseDenialGuard {
+    store: LocalDfsRepairQueueStore,
+    denial: Arc<OriginalRepairCloseDenial>,
+}
+
+#[cfg(test)]
+impl OriginalRepairCloseDenialGuard {
+    pub(crate) fn hits(&self) -> usize {
+        self.denial.hits.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn clear(&self) -> Result<(), DfsError> {
+        let mut state = self.store.inner.lock().map_err(|_| custody_error("original close test-guard cleanup lock poisoned"))?;
+        match state.original_close_denial.as_ref() {
+            Some(current) if Arc::ptr_eq(current, &self.denial) => {
+                state.original_close_denial = None;
+                Ok(())
+            }
+            None => Ok(()),
+            Some(_) => Err(custody_error("original close test guard cannot clear another installed denial")),
+        }
+    }
+
+    pub(crate) fn release(self) -> Result<(), DfsError> {
+        self.clear()
+    }
+}
+
+#[cfg(test)]
+impl Drop for OriginalRepairCloseDenialGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.clear() {
+            eprintln!("original close test-guard cleanup failed: {error}");
+        }
+    }
 }
 
 impl DfsRepairQueueState {
@@ -1559,6 +1612,8 @@ impl DfsRepairQueueState {
             maintenance_cursor: None,
             maintenance_restart_pending: false,
             maintenance_revisit_pending: false,
+            #[cfg(test)]
+            original_close_denial: None,
         }
     }
 
@@ -2644,6 +2699,40 @@ impl LocalDfsRepairQueueStore {
         })
     }
 
+    /// Arm only an already synced genuine original on this actual selected
+    /// physical queue. The test later supplies its captured real reply through
+    /// native C->A networking; this method cannot supply an outcome or receipt.
+    #[cfg(test)]
+    pub(crate) fn deny_original_repair_close_for_test(
+        &self,
+        original: &crate::DfsRoutedMessage,
+    ) -> Result<OriginalRepairCloseDenialGuard, DfsError> {
+        let identity = self.selected_fixture.as_ref().ok_or_else(|| custody_error("original close denial requires its actual selected queue"))?.clone();
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        identity.check()?;
+        if state.original_close_denial.is_some() {
+            return Err(custody_error("original close denial is already installed"));
+        }
+        let subject = repair_subject(&state.custody.incarnation, original)?;
+        let birth = state.custody.births.get(&subject).ok_or_else(|| custody_error("original close denial has no genuine synced birth"))?;
+        birth.validate(&state.custody.incarnation)?;
+        if birth.original != *original || birth.closed_at_sequence.is_some()
+            || birth.observed.iter().any(|response| matches!(response.result, crate::DfsBlobTransferResult::Committed { .. }))
+        {
+            return Err(custody_error("original close denial must precede actual Committed observation on an open exact original"));
+        }
+        let denial = Arc::new(OriginalRepairCloseDenial {
+            identity,
+            subject,
+            original_command_digest: birth.root.original_command_digest.clone(),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.original_close_denial = Some(Arc::clone(&denial));
+        drop(state);
+        Ok(OriginalRepairCloseDenialGuard { store: self.clone(), denial })
+    }
+
     pub(crate) fn close_applied_original_repair(
         &self,
         applied: &crate::service_repair::AppliedOriginalRepair,
@@ -2661,6 +2750,22 @@ impl LocalDfsRepairQueueStore {
                 subject: ticket.subject.clone(),
                 observed_digest: ticket.response_digest.clone(),
             })?;
+            #[cfg(test)]
+            if let Some(denial) = state.original_close_denial.as_ref()
+                && denial.subject == ticket.subject
+                && birth.closed_at_sequence.is_none()
+            {
+                let identity = state.selected_fixture.as_ref().ok_or_else(|| custody_error("original close denial lost its selected physical queue"))?;
+                if identity.root != denial.identity.root || identity.marker != denial.identity.marker
+                    || identity.snapshot_path != denial.identity.snapshot_path
+                    || birth.root.original_command_digest != denial.original_command_digest
+                {
+                    return Err(custody_error("original close denial no longer names its actual physical origin"));
+                }
+                let _ = denial.hits.fetch_update(std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire, |hits| Some(hits.saturating_add(1)));
+                return Err(DfsError::Cancelled { operation: "injected original Repair close denial after actual application" });
+            }
             if birth.closed_at_sequence.is_some() {
                 return closed_repair_proof(&state.custody, &ticket.subject);
             }
