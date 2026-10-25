@@ -1723,6 +1723,7 @@ mod cross_shard;
 
 mod locks;
 mod maintenance;
+mod metadata_commit_delivery;
 mod namespace;
 mod namespace_prepare;
 mod namespace_requests;
