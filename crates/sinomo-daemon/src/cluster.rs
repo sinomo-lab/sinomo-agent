@@ -3269,13 +3269,17 @@ impl ClusterNetworkMaintenance {
         self.cadence.published_connectivity_expiry = None;
         self.cadence.connectivity_renewal_at = None;
         self.cadence.connectivity_overdue_claimed = false;
+        // Solo, pending-join and passive-shadow turns did not complete an
+        // active network convergence. Keep first non-solo startup eligible.
+        self.startup_settle_until = None;
         self.finish_connectivity_convergence();
     }
 
     fn finish_connectivity_convergence(&mut self) {
         let superseded = self.connectivity_publish_superseded();
         self.retained_connectivity_publish = None;
-        self.cadence.finish_connectivity_convergence(superseded);
+        self.cadence
+            .finish_connectivity_convergence(superseded, Instant::now());
     }
 
     async fn run_pending_connectivity_probe_async(
@@ -13381,6 +13385,298 @@ mod tests {
         );
     }
 
+    fn r17_pair_projection_control(
+        explicit_environment: bool,
+        count: usize,
+        unrelated_keys: usize,
+        published_remaining_seconds: i64,
+    ) -> serde_json::Value {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, mut state) =
+            seeded_single_node_cluster_for_publish_cache_test("r17_pair_projection");
+        let wall = OffsetDateTime::now_utc() - time::Duration::seconds(20);
+        let remote = NodeId::from_legacy_named("r17_pair_projection_remote").unwrap();
+        let mut member = ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            wall,
+        );
+        member.capabilities = sinomo_core::node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = (0..count)
+            .map(|i| {
+                sinomo_core::network::daemon_lan_endpoint(
+                    &remote,
+                    format!("127.0.0.1:{}", 33000 + i),
+                    10,
+                )
+            })
+            .collect();
+        let original: Vec<_> = member
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                sinomo_core::network::cluster_connectivity_record(
+                    &state,
+                    endpoint,
+                    ClusterConnectivityState::Unreachable,
+                    None,
+                    CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD,
+                    None,
+                    Some("previous failed observation".into()),
+                    wall - time::Duration::seconds(
+                        CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS - published_remaining_seconds,
+                    ),
+                    CLUSTER_CONNECTIVITY_UNREACHABLE_TTL_SECONDS,
+                )
+            })
+            .collect();
+        state.members.push(member);
+        sinomo_core::cluster::write_cluster_state(&paths, &state).unwrap();
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state).unwrap();
+        sinomo_core::network::write_local_cluster_connectivity_record_set(
+            &paths,
+            &state.local_node_id,
+            &original,
+        )
+        .unwrap();
+        let key_for = |record: &ClusterConnectivityRecord| {
+            sinomo_core::cluster::cluster_connectivity_key(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
+            )
+        };
+        let mut seed: Vec<_> = original
+            .iter()
+            .map(|record| sinomo_core::kv::KvOp::put_serde(key_for(record), record, None).unwrap())
+            .collect();
+        for i in 0..unrelated_keys {
+            seed.push(sinomo_core::kv::KvOp::Put {
+                key: format!("/test/unrelated-control/{i}"),
+                value: (0..256).map(|n| ((n * 17 + i * 31) % 251) as u8).collect(),
+                lease_id: None,
+            });
+        }
+        sinomo_core::cluster::append_cluster_raft_command(
+            &paths,
+            &state.local_node_id,
+            sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+                compares: Vec::new(),
+                success: seed,
+                failure: Vec::new(),
+            }),
+        )
+        .unwrap();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.connectivity_converged = false;
+        maintenance
+            .cadence
+            .ensure_connectivity_settle_deadline(Instant::now(), false);
+        maintenance.finish_connectivity_convergence();
+        let renewed_at = Instant::now();
+        if explicit_environment {
+            maintenance.request_network_environment_refresh(renewed_at);
+        } else {
+            maintenance.request_connectivity_refresh(renewed_at);
+        }
+        maintenance
+            .cadence
+            .ensure_connectivity_settle_deadline(renewed_at, false);
+        let initial_settle_active = maintenance
+            .startup_settle_until
+            .is_some_and(|at| renewed_at < at);
+        let mut previous = original;
+        let mut phases = Vec::new();
+        let snapshot_path = paths.kv_paths().snapshot;
+        let wal_path = paths.kv_paths().raft_wal_paths(&state.local_node_id).wal;
+        for phase in 0..2 {
+            let at = wall + time::Duration::seconds(phase * 9);
+            let phase_instant = renewed_at + Duration::from_secs((phase * 9) as u64);
+            let active = maintenance
+                .startup_settle_until
+                .is_some_and(|deadline| phase_instant < deadline);
+            let entries = state.members[1]
+                .endpoints
+                .iter()
+                .zip(&previous)
+                .map(|(endpoint, record)| {
+                    sinomo_core::network::ClusterConnectivityProbeBatchEntry {
+                        key: cluster_connectivity_probe_key(&state.local_node_id, endpoint),
+                        endpoint: endpoint.clone(),
+                        previous: Some(record.clone()),
+                    }
+                })
+                .collect();
+            let probed = runtime.block_on(probe_connectivity_batch_with_fetch_async(
+                state.clone(),
+                entries,
+                at.format(&Rfc3339).unwrap(),
+                at,
+                active,
+                Duration::from_secs(1),
+                |endpoint, _| async move {
+                    Err(DaemonError::Network {
+                        address: endpoint.address,
+                        detail: "isolated stable transport failure".into(),
+                    })
+                },
+            ));
+            let observed: Vec<_> = probed.into_iter().map(|(_, record)| record).collect();
+            let source_snapshot = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            let local = runtime.block_on(sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_observations_if_snapshot_async(
+                runtime.handle(), &paths, &state, &state.local_node_id, &observed, &source_snapshot,
+            )).unwrap();
+            let accepted = match local {
+                sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Committed { records, .. } => records,
+                _ => panic!("isolated source set cannot be superseded"),
+            };
+            let before = std::fs::read(&snapshot_path).unwrap();
+            let wal_before = std::fs::metadata(&wal_path).unwrap().len();
+            let mut host = DaemonClusterControlPlaneTransport::new(runtime.handle().clone());
+            let committed = runtime.block_on(sinomo_core::cluster::publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host(
+                runtime.handle(), &paths, &state.local_node_id, state.clone(), &mut host,
+            )).unwrap();
+            let after = std::fs::read(&snapshot_path).unwrap();
+            let cold: KvSnapshot = sinomo_core::object::serde_ext::from_bytes(&after).unwrap();
+            for record in &accepted {
+                if committed.is_some() {
+                    assert_eq!(
+                        cold.get(&key_for(record))
+                            .unwrap()
+                            .decode::<ClusterConnectivityRecord>()
+                            .unwrap(),
+                        *record
+                    );
+                } else {
+                    assert_eq!(
+                        before, after,
+                        "a semantic no-op must not fake persisted freshness"
+                    );
+                }
+            }
+            assert_eq!(
+                cold.prefix_entries("/test/unrelated-control/").count(),
+                unrelated_keys
+            );
+            let put_value_bytes: usize = accepted
+                .iter()
+                .map(|r| cold.get(&key_for(r)).unwrap().value.len())
+                .sum();
+            if let Some(committed) = committed.as_ref() {
+                assert!(
+                    !paths
+                        .kv_paths()
+                        .write_raft_snapshot_if_changed(committed)
+                        .unwrap(),
+                    "duplicate native projection publication is already idempotent"
+                );
+                assert_eq!(std::fs::read(&snapshot_path).unwrap(), after);
+            }
+            let live = sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths,
+                &state.local_node_id,
+            )
+            .unwrap();
+            for record in &accepted {
+                assert!(
+                    live.iter().any(|candidate| candidate == record),
+                    "accepted observations remain available in memory"
+                );
+            }
+            let disk_record = cold
+                .get(&key_for(&accepted[0]))
+                .unwrap()
+                .decode::<ClusterConnectivityRecord>()
+                .unwrap();
+            let after_disk_expiry = disk_record.expires_at + time::Duration::seconds(1);
+            assert!(!sinomo_core::network::cluster_network_record_live(
+                disk_record.expires_at,
+                after_disk_expiry
+            ));
+            let live_after_disk_expiry = sinomo_core::network::cluster_network_record_live(
+                accepted[0].expires_at,
+                after_disk_expiry,
+            );
+            phases.push(
+                serde_json::json!({"phase":phase,"startup_settle_active":active,
+                "state":accepted[0].state,"failures":accepted[0].consecutive_failures,
+                "ttl_seconds":(accepted[0].expires_at-accepted[0].observed_at).whole_seconds(),
+                "live_after_persisted_expiry":live_after_disk_expiry,"quorum_mutation":committed.is_some(),"projection_contents_changed":before!=after,
+                "projection_file_bytes":after.len(),"connectivity_value_bytes":put_value_bytes,
+                "wal_append_bytes":std::fs::metadata(&wal_path).unwrap().len()-wal_before}),
+            );
+            previous = accepted;
+        }
+        let result = serde_json::json!({"explicit_environment":explicit_environment,"initial_settle_active":initial_settle_active,"endpoints":count,"published_remaining_seconds":published_remaining_seconds,
+            "unrelated_control_keys":unrelated_keys,"phases":phases,
+            "qualification":"Isolated scripted failures through native observation/local-store/quorum/projection paths; serialized file and WAL lengths, not physical bytes or an R17 replay."});
+        eprintln!("R17_PAIR_CONTROL {result}");
+        result
+    }
+
+    #[test]
+    fn r17_pair_ordinary_reconvergence_preserves_failed_evidence_without_projection_writes() {
+        for count in [16, 10] {
+            let result = r17_pair_projection_control(false, count, 0, 7020);
+            for phase in result["phases"].as_array().unwrap() {
+                assert_eq!(phase["state"], "unreachable");
+                assert_eq!(phase["failures"], 3);
+                assert_eq!(phase["ttl_seconds"], 7200);
+                assert_eq!(phase["quorum_mutation"], false);
+                assert_eq!(phase["projection_contents_changed"], false);
+                assert_eq!(phase["wal_append_bytes"], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn r17_pair_genuine_environment_grace_keeps_semantics_and_full_projection_cost() {
+        let small = r17_pair_projection_control(true, 16, 0, 7020);
+        let large = r17_pair_projection_control(true, 16, 64, 7020);
+        for result in [&small, &large] {
+            assert_eq!(result["phases"][0]["state"], "degraded");
+            assert_eq!(result["phases"][0]["failures"], 2);
+            assert_eq!(result["phases"][0]["ttl_seconds"], 900);
+            assert_eq!(result["phases"][1]["state"], "unreachable");
+            assert_eq!(result["phases"][1]["failures"], 3);
+            assert_eq!(result["phases"][1]["ttl_seconds"], 7200);
+            for phase in result["phases"].as_array().unwrap() {
+                assert_eq!(phase["quorum_mutation"], true);
+                assert_eq!(phase["projection_contents_changed"], true);
+                assert!(
+                    phase["projection_file_bytes"].as_u64().unwrap()
+                        > phase["connectivity_value_bytes"].as_u64().unwrap()
+                );
+            }
+        }
+        assert!(
+            large["phases"][0]["projection_file_bytes"]
+                .as_u64()
+                .unwrap()
+                > small["phases"][0]["projection_file_bytes"]
+                    .as_u64()
+                    .unwrap(),
+            "untouched control-plane state contributes to the complete projection write"
+        );
+    }
+
+    #[test]
+    fn r17_pair_time_only_refresh_keeps_live_evidence_without_durable_writes() {
+        let result = r17_pair_projection_control(false, 16, 0, 90);
+        for phase in result["phases"].as_array().unwrap() {
+            assert_eq!(phase["state"], "unreachable");
+            assert_eq!(phase["failures"], 3);
+            assert_eq!(phase["ttl_seconds"], 7200);
+            assert_eq!(phase["quorum_mutation"], false);
+            assert_eq!(phase["projection_contents_changed"], false);
+            assert_eq!(phase["wal_append_bytes"], 0);
+            assert_eq!(phase["live_after_persisted_expiry"], true);
+        }
+    }
+
     #[test]
     fn successful_connectivity_convergence_terminalizes_startup_settle_schedule() {
         let now = Instant::now();
@@ -13403,14 +13699,17 @@ mod tests {
         );
 
         maintenance.finish_connectivity_convergence();
+        let completed_at = Instant::now();
 
         assert!(maintenance.connectivity_converged);
-        assert_eq!(
-            maintenance.startup_settle_until, None,
-            "successful convergence must consume the startup settle deadline"
+        assert!(
+            maintenance
+                .startup_settle_until
+                .is_some_and(|deadline| deadline <= completed_at),
+            "successful convergence must retain a consumed, inactive startup marker"
         );
         assert!(
-            maintenance.next_due_duration(now) > DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
+            maintenance.next_due_duration(completed_at) > DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
             "a completed convergence must return to the role-aware steady-state schedule"
         );
     }

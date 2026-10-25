@@ -509,9 +509,14 @@ impl ClusterNetworkMaintenanceCadence {
         }
     }
 
-    pub fn finish_connectivity_convergence(&mut self, superseded: bool) {
+    pub fn finish_connectivity_convergence(&mut self, superseded: bool, now: Instant) {
         self.connectivity_converged = true;
-        self.startup_settle_until = None;
+        // Close an initialized window without making it look uninitialized.
+        // Ordinary retries/reconvergence must not soften established failures
+        // again. A real environment refresh explicitly installs a new window.
+        self.startup_settle_until = self
+            .startup_settle_until
+            .map(|deadline| deadline.min(now));
         self.record_connectivity_publish_success(superseded);
     }
 
@@ -561,6 +566,55 @@ pub fn cluster_network_due_class_failure_backoff(failure_streak: u32) -> Duratio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_settle_does_not_restart_for_ordinary_reconvergence() {
+        for reason in 0..3 {
+            let start = Instant::now();
+            let mut cadence =
+                ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Workstation);
+            cadence.ensure_connectivity_settle_deadline(start, false);
+            assert!(cadence.startup_settle_until.is_some_and(|at| at > start));
+            cadence.finish_connectivity_convergence(false, start);
+            let later = Instant::now() + Duration::from_secs(1);
+            match reason {
+                0 => cadence.request_connectivity_refresh(later),
+                1 => cadence.record_connectivity_topology_superseded(),
+                _ => cadence.retain_superseding_connectivity_source_generation(later),
+            }
+            cadence.ensure_connectivity_settle_deadline(later, false);
+            assert!(
+                cadence.startup_settle_until.is_none_or(|at| at <= later),
+                "ordinary follow-up {reason} must not create a new startup failure-grace window"
+            );
+            assert!(!cadence.connectivity_converged);
+        }
+    }
+
+    #[test]
+    fn completed_settle_still_allows_initial_and_explicit_environment_grace() {
+        let start = Instant::now();
+        let mut cadence =
+            ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Sensor);
+        cadence.ensure_connectivity_settle_deadline(start, true);
+        assert!(cadence.startup_settle_until.is_none());
+        cadence.ensure_connectivity_settle_deadline(start, false);
+        assert_eq!(
+            cadence.startup_settle_until,
+            Some(start + CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION)
+        );
+        cadence.finish_connectivity_convergence(false, start);
+        let changed = Instant::now() + Duration::from_secs(1);
+        cadence.request_network_environment_refresh(changed);
+        let expected = changed + CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION;
+        assert_eq!(cadence.startup_settle_until, Some(expected));
+        cadence.ensure_connectivity_settle_deadline(expected + Duration::from_secs(1), false);
+        assert_eq!(
+            cadence.startup_settle_until,
+            Some(expected),
+            "an expired active window remains a consumed marker"
+        );
+    }
 
     #[test]
     fn confirmed_expiry_wakes_at_existing_margin_across_roles_and_clock_phases() {
@@ -696,7 +750,7 @@ mod tests {
         cadence.claim_due_classes(now, false, true, false, true);
         cadence.take_probe_claim();
         cadence.take_connectivity_publish_claim();
-        cadence.finish_connectivity_convergence(false);
+        cadence.finish_connectivity_convergence(false, now);
         for elapsed in [0, 1, 5, 30] {
             let at = now + Duration::from_secs(elapsed);
             cadence.observe_published_connectivity_expiries(
@@ -787,7 +841,7 @@ mod tests {
         cadence.claim_due_classes(now, false, true, false, true);
         cadence.take_probe_claim();
         cadence.take_connectivity_publish_claim();
-        cadence.finish_connectivity_convergence(false);
+        cadence.finish_connectivity_convergence(false, now);
         cadence.observe_published_connectivity_expiries([overdue, later], wall, now);
         assert_eq!(
             cadence.next_due_duration(now, false),
