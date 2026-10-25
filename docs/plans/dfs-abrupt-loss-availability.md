@@ -1,6 +1,45 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R32
+## Current development checkpoint — 2026-10-25 R33
+
+Local merge `ee68eeb7612b0aaff1e9a85076061452c59e5d52` integrates reviewed
+observation correction `64e4b86f` without conflicts. Source `b4c7e691` contains
+4,904 inputs; sealed executable `13d3b288`. Fresh check/build/seal passed. Two
+disjoint panels executed **152 unique controls once: 152 PASS, zero failed,
+incomplete or unrun**. The current full DFS/KV boundary passed its own lint
+library, all 11 UI controls and DFS/history/attachments analysis. Unconditional
+archives, case isolation and owned process/group/scope/root cleanup are verified.
+
+The same-C control now proves genuine delayed-response application, exact-subject
+closure denial through native recovery, authenticated observed-original handoff,
+then current-B withdrawal. Exact historical query/replay preserves C's absence,
+desired repair deficit and open custody. The retiring-B control joins exact C
+completion to the same authenticated call before accepting the existing precise
+B admission refusal. Only test observations/assertions and failure capture changed;
+no production authority, participant requirement or deadline was relaxed.
+
+The V7 stored-frame retry/reopen/timestamp-negative case also passed in this full
+panel. Historical Terminal remains DATA, not current-holder/application authority,
+a B mutation permit or root-release evidence. Prepare-only survivors cannot
+reconstruct an unseen old-primary commit. Component stop/reopen and file-writer
+tests do not establish OS-process/partition acceptance.
+
+Evidence is `R33-REPORT.md` and `R33-COMBINED-RESULT.json` under the operation
+directory: I87 build `f26954ad`, I88 focused `a2a55fbd`, I89 remainder `25722f39`,
+I90 boundary `137e9651`. The report includes standard performance/coverage tables
+with unavailable measurements explicit. R32 and all earlier failures remain
+immutable; missing historical RPC observations are not reconstructed.
+
+Next independent work closes the smallest actual checked-successor record/caller
+contract and the existing owned non-Docker process-failure test path. Complete
+custody coverage, C1/current B effects, causal settlement/root retirement,
+metadata majority history and real abrupt-loss/partition/reconnect/Sinomo-only
+quietness remain open. This lane uses its own local lock and limits, with no peer
+permission workflow, Docker, production activation, push or cross-lane merge.
+
+## Historical checkpoints
+
+### Preserved R32 checkpoint
 
 Local merge `7242584e4a6a669ed332aa1dd615d08d07a160e1` adds the reviewed native
 same-C withdrawal control from `56839fed`. Source `3c6430bf` has 4,904 inputs;
@@ -33,8 +72,6 @@ majority metadata history and real abrupt-process/partition/reconnect/quietness
 remain open. This lane remains independent and nonblocking, using only its local
 lock and owned limits. No peer permission workflow, Docker, production, push or
 cross-lane merge is part of this work.
-
-## Historical checkpoints
 
 ### Preserved R30 checkpoint
 
