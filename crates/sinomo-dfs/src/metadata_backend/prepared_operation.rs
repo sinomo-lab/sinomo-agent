@@ -1041,10 +1041,7 @@ fn require_recorded_content_w(
             };
             receipt.is_some_and(|receipt| {
                 receipt.replica_node_id == **node
-                    && receipt.receipt.file_system_id == version.file_system_id
-                    && receipt.receipt.object_id == version.object_id
-                    && receipt.receipt.committed_version == plan.source_version
-                    && receipt.content_hash == version.content_hash
+                    && crate::metadata_receipt::recorded_receipt_matches_version(receipt, version)
             })
         })
         .count();

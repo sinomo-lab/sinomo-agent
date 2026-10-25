@@ -309,11 +309,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let copies = receipts
             .iter()
             .filter(|receipt| {
-                receipt.receipt.file_system_id == version.file_system_id
-                    && receipt.receipt.object_id == version.object_id
-                    && receipt.receipt.committed_version == durability.source_version
-                    && receipt.receipt.owner_node_id == durability.coordinator_node_id
-                    && receipt.content_hash == version.content_hash
+                crate::metadata_receipt::recorded_receipt_matches_version(receipt, version)
                     && durability
                         .desired_replica_node_ids
                         .contains(&receipt.replica_node_id)
@@ -5593,5 +5589,135 @@ mod receipt_projection_tests {
         drop(retained);
         drop(background);
         runtime.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retained_receipt_publisher_tests {
+    use super::*;
+
+    #[test]
+    fn native_retained_receipts_allow_primary_publisher_distinct_from_write_coordinator() {
+        let path = "/services/retained-publisher-role.bin";
+        let (runtime, browser, config) = crate::test_support::current_native_metadata_service(
+            "native-retained-publisher-role",
+            3,
+            path,
+        )
+        .unwrap();
+        drop(browser);
+        let primary = config.primary_node_id.clone();
+        let caller = config.replica_node_ids[0].clone();
+        assert_ne!(caller, primary);
+        let mut writer = runtime.client(&caller).unwrap();
+        let stat = writer
+            .posix_write_file(
+                path,
+                b"actual routed W2 retained content",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(2, 2).unwrap(),
+                    replica_candidates: vec![primary.clone(), caller.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        let primary_service = runtime.metadata_primary_service(path).unwrap();
+        let original = primary_service
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        let plan = original.content_durability.as_ref().unwrap();
+        assert_eq!(plan.coordinator_node_id, caller);
+        assert_eq!(plan.policy.min_commit_replicas, 2);
+        assert_eq!(plan.policy.desired_replicas, 2);
+        let receipts = primary_service
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &plan.source_version)
+            .unwrap();
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|r| &r.replica_node_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert!(receipts.iter().all(|r| r.receipt.owner_node_id == primary));
+        drop(primary_service);
+
+        let capture_request = crate::DfsContentReferenceRequest {
+            namespace: "vendor.semantic".into(),
+            path: path.into(),
+            identity: crate::DfsRevisionReference {
+                file_system_id: stat.file_system_id.clone(),
+                object_id: stat.object_id.clone(),
+                version: stat.version.clone(),
+            },
+            operation: crate::DfsContentReferenceOperation::CaptureCurrent {
+                reference_id: "primary-publisher".into(),
+                metadata: None,
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        };
+        let capture = writer.retain_content_revision(capture_request.clone());
+        let reader = runtime.metadata_primary_service(path).unwrap();
+        let retained = reader
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained.has_retention_grant(),
+            "normal capture must publish actual retained provenance"
+        );
+        let owner = reader.recorded_retained_repair_owner(&retained);
+        eprintln!(
+            "RETAINED_RECEIPT_ROLE {}",
+            serde_json::json!({
+                "primary": primary, "coordinator": caller,
+                "object": stat.object_id, "version": stat.version,
+                "capture_operation": capture_request.operation_id,
+                "capture_result": format!("{capture:?}"),
+                "owner_result": format!("{owner:?}"),
+                "receipts": receipts,
+            })
+        );
+        if owner.is_ok() {
+            // These are invalid requested views of real recorded receipts, not
+            // supplied acknowledgements or mutations of the actual metadata.
+            let mut wrong = retained.clone();
+            wrong.content_hash = Some("blake3:wrong".into());
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong.content_durability.as_mut().unwrap().source_version = DfsVersion::generate();
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong.object_id = DfsObjectId::generate();
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong.file_system_id = DfsFileSystemId::generate();
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong
+                .content_durability
+                .as_mut()
+                .unwrap()
+                .desired_replica_node_ids = vec![primary.clone(), primary.clone()];
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+        }
+        drop(reader);
+        drop(writer);
+        runtime.close().unwrap();
+        capture.expect(
+            "normal retained capture keeps actual W2 evidence across publisher/coordinator roles",
+        );
+        let owner = owner.expect("recorded actual primary receipts satisfy retained W2");
+        assert_eq!(owner.coordinator_node_id, caller);
+        assert_eq!(owner.policy.min_commit_replicas, 2);
     }
 }
