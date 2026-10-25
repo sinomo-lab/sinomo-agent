@@ -83,7 +83,8 @@ pub struct DesktopTargetInfo {
     pub target: DesktopTarget,
     pub resource_id: String,
     pub title: String,
-    /// Physical screen coordinates; app mouse input uses client coordinates.
+    /// Target coordinates: physical screen pixels on Windows/X11, stream-local
+    /// portal coordinates on Wayland. App input uses client pixels.
     pub bounds: [i32; 4],
     /// Physical screen rectangle of the client area, for mapping captured
     /// whole-window pixels to app input coordinates. Absent for monitors.
@@ -153,7 +154,8 @@ pub enum DesktopInput {
     Text {
         text: String,
     },
-    /// Physical virtual-desktop pixels for raw mode; client pixels for background mode.
+    /// Raw coordinates are physical desktop pixels, or portal-advertised stream
+    /// coordinates on Wayland. Background mode uses client pixels.
     Move {
         x: i32,
         y: i32,

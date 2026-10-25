@@ -10,8 +10,12 @@ Query `{"action":"capabilities"}` first. The native App Use OS provider must be
 installed. Unsupported platforms and unavailable capabilities are explicit;
 installation and discovery never grant local capture/input consent.
 
-Linux support requires a local X11 session; native Wayland/Xwayland are
-unsupported. Android supports explicit raw mode only, after the user enables
+Linux X11 supports background and raw control. Wayland uses explicit raw mode
+through desktop portals, including when Xwayland is present. The first raw
+target request starts a local chooser and returns an empty list; repeat discovery
+after user approval, then request local grants for that exact target. A
+ScreenCast-only portal offers capture without input. Android supports explicit
+raw mode only, after the user enables
 accessibility, screen sharing and exact-display grants locally. Query raw
 targets directly when capabilities report no background input. Never request
 or infer a silent mode change from a failed input batch.
@@ -86,8 +90,13 @@ gesture. Wheel events submit swipes. Text requires a focused accessible
 non-password editor. Only raw key codes 1 (Escape/Back), 14 (Backspace) and 28
 (Enter) are supported; gamepads and other keys are unavailable. Screen-share
 stop or rotation invalidates the target and requires fresh local consent.
-On Linux, text is limited to the current X11 keyboard map and wheel deltas must
-be multiples of 120. Observe the visual result before continuing.
+On X11, text is limited to the current keyboard map and wheel deltas must
+be multiples of 120. Wayland text uses Unicode keysyms, and its
+wheel deltas must also be multiples of 120. Wayland `move` coordinates are
+portal-advertised stream coordinates: scale source-frame pixels to the target's
+bounds, without adding a global desktop origin. Its portal session uses a hidden
+cursor and ends when its final input/capture lease closes. Observe the visual
+result before continuing.
 
 Always close using `{"action":"close","session_id":ID}`, including after failure.
 Input leases expire after 30 seconds idle; all sessions have bounded lifetimes

@@ -40,8 +40,9 @@ The probe reads one JSON object per stdin line. `command` contains the ordinary
 `DesktopProviderCommand`, such as `{"command":{"action":"capabilities"}}`.
 It loads the independent dylib, uses the real SOBJ ABI and permission store, and
 validates native BGRA frames. `save_frame:true` saves `frame.bgra` and metadata
-for visual comparison. Local probe controls inspect permissions, change broader
-test consent, revoke an exact grant, and unload/reload the provider; none are
+for visual comparison. The probe also builds for Linux compositor tests. Local
+probe controls inspect permissions, change broader test consent, expose/revoke
+an exact grant, and unload/reload the provider; none are
 part of the shipped app or its remote tool surface.
 
 Exercise denial before grants, capture-only versus input grants, native clicks,

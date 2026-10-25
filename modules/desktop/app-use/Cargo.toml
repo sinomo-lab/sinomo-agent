@@ -5,7 +5,7 @@ description = "Native OS capture and input provider for unified App Use"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "android/**", "Cargo.toml", "README.md"]
+include = ["**/*.rs", "android/**", "tests/*.py", "tests/*.conf", "tests/compositor/*.py", "tests/compositor/*.sh", "tests/compositor/*.md", "tests/compositor/Dockerfile", "Cargo.toml", "README.md"]
 
 [package.metadata.sinomo]
 ring = "r1"
@@ -27,8 +27,16 @@ sinomo-module-api.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb.workspace = true
+zbus.workspace = true
+pipewire.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
+libc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
 libc.workspace = true
 serde_json.workspace = true
 

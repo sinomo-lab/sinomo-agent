@@ -307,6 +307,7 @@ pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
     }
     // Drop all OS handles and join workers before releasing callback code.
     *state().lock().unwrap_or_else(|e| e.into_inner()) = State::default();
+    device::shutdown();
     *HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
     SINOMO_MODULE_STATUS_OK
 }

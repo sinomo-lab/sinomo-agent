@@ -7,7 +7,8 @@ the typed `sinomo.app-use.os` service interface version `1.0.0`.
 The module owns native target enumeration, identity checks, capture and input.
 Windows uses WGC/D3D11, background window messages, SendInput and conditional
 gamepad injection. Linux uses local X11 with XRes, Composite, Damage, XFixes and
-XTest. Android uses a same-UID local OS adapter with MediaProjection and a
+XTest, or Wayland portals with PipeWire capture and approved raw input. Android
+uses a same-UID local OS adapter with MediaProjection and a
 user-enabled AccessibilityService. Other platforms report unsupported capabilities.
 It does not own an encoder, network stack, agent runtime or alternate toolset.
 
@@ -50,7 +51,12 @@ specific built DLL; test installation is confined to temporary data directories.
 See the [desktop agent harness](../../../docs/developer/testing.md#live-desktop-agent-verification-windows)
 for recorded real-agent tests of both modes through the same tools.
 
-## Linux
+## Linux X11
+
+Building the Linux provider requires PipeWire development headers, pkg-config
+and libclang (for the native bindings). The resulting `.so` requires
+`libpipewire-0.3.so.0` at runtime on both X11 and Wayland. These dependencies stay
+in the external provider package, outside the daemon's linked implementation.
 
 Run the daemon in the user's local X11 session with its `DISPLAY` and
 `XAUTHORITY`. The target monitor is the X screen's complete virtual desktop.
@@ -60,8 +66,8 @@ client area, including when another window occludes it. Background input uses
 synthetic X events; applications may ignore them. Raw input uses XTest and may
 affect the user's focus and pointer. Text must exist in the current keyboard
 map; the provider never rewrites that map. Raw Set-1 keys assume Xorg's evdev
-keycode mapping. Gamepads, remote X servers, native Wayland and Xwayland sessions
-are explicitly unsupported.
+keycode mapping. Gamepads and remote X servers are unsupported. Wayland sessions,
+including those with an Xwayland `DISPLAY`, select the portal backend below.
 
 ```sh
 cargo build -p sinomo-app-use-module
@@ -72,6 +78,62 @@ xvfb-run cargo test -p sinomo-app-use-module x11_background_pixels_input_revocat
 
 Use an isolated X server for the native test. It creates and destroys its own
 window, checks pixels and input delivery, and checks revocation and cleanup.
+
+## Linux Wayland
+
+Run the provider in the desktop user's session with its `WAYLAND_DISPLAY` (or
+`XDG_SESSION_TYPE=wayland`), session D-Bus and `XDG_RUNTIME_DIR`. Install
+`xdg-desktop-portal` and the desktop's ScreenCast/RemoteDesktop portal backend.
+Capture uses native PipeWire buffers from the [ScreenCast portal's restricted
+descriptor](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html);
+input uses the [RemoteDesktop portal's keyboard/pointer notification
+methods](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html).
+There is no Xwayland, direct compositor-protocol or privileged-device fallback.
+Backends providing only ScreenCast can capture but cannot inject input.
+
+Wayland supports **explicit raw mode**. After node-local Remote Management
+consent, `targets` with `mode:raw` starts the local portal chooser asynchronously
+and initially returns an empty list. The user approves a single monitor and
+available input devices. Repeat target discovery after approval, then expose
+that exact returned resource for `capture` and/or `input` using the normal local
+permission controls. Portal approval never writes those grants. Background
+requests fail explicitly and never open a raw session automatically.
+
+The chooser and unclaimed approved target expire after 120 seconds. Existing
+input/capture leases share one portal session; closing the final lease, revoking
+host consent, stopping sharing, losing the portal owner, resizing a captured
+stream or unloading the provider invalidates the target. Re-enumerate and grant
+the new resource after approval. The provider does not persist portal restore
+tokens. ScreenCast v6 sessions require a stable PipeWire serial; older sessions
+use their restricted session node ID and never reconnect a removed stream.
+
+Target bounds are **portal-advertised stream coordinates**, with origin `(0,0)`.
+Scale raw video coordinates by `target_width / frame_width` and
+`target_height / frame_height` before sending `move`; this handles compositor
+scaling without assuming desktop logical or physical pixel units. Do not blindly
+divide coordinates by the display scale: use the returned bounds. Relative motion
+uses the portal's relative units. Raw Set-1 keys are translated to evdev codes; text uses Unicode keysyms.
+Discrete wheel deltas must be multiples of 120. Background window messages,
+`move_in_frame`, gamepads and cursor overlays are unsupported; capture uses a
+hidden cursor for the complete portal session. A failed/uncertain input is never
+replayed; a failed D-Bus input acknowledgement retires the session.
+
+Run isolated protocol and native-buffer checks with PipeWire tools/plugins
+installed:
+
+```sh
+python3 modules/desktop/app-use/tests/run_wayland.py
+```
+
+The runner creates a private D-Bus portal fixture and real PipeWire video source,
+without contacting the user's desktop or discovering hardware. It checks fast
+portal replies, approval/denial, device grants, input mapping, held-input
+cleanup, owner loss, pending-request cancellation, real native pixels and
+capture revocation. Live compositor validation additionally needs the actual
+desktop chooser, a disposable application, scaled monitors, OS stop/resize, and
+observed input effects; the fixture does not establish compositor compatibility.
+The [Docker compositor lane](tests/compositor/README.md) exercises a real KWin
+session, KDE portals, PipeWire, and a native Wayland app without a host GUI stack.
 
 ## Android
 

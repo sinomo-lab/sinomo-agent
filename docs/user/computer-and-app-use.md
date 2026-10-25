@@ -19,8 +19,9 @@ Native capture and input are implemented in the independently built
 |---|---|
 | Windows | Background and raw modes using Windows Graphics Capture/D3D11, PostMessageW, SendInput and conditional InputInjector |
 | Linux X11 | Background client-window capture and synthetic events; raw virtual-desktop capture and XTest input; no gamepads |
+| Linux Wayland | Explicit raw mode with locally approved portal capture/input; ScreenCast-only backends provide capture without input |
 | Android | Explicit raw display mode, MediaProjection capture, accessibility touch/text input; no background mode or gamepads |
-| Native Wayland / Xwayland / other systems | Explicitly unsupported |
+| Other systems | Explicitly unsupported |
 
 Common actions, events, media encoding and transmission remain in the host
 runtime. Main and embedded/mobile profiles expose App Use; shadow profiles omit it.
@@ -35,7 +36,10 @@ sinomo module native-dylib activate --module module.app-use.os --interface sinom
 ```
 
 On Linux the artifact is `target/debug/libsinomo_app_use_module.so`. The daemon
-needs access to the user's local X11 session (`DISPLAY` and `XAUTHORITY`).
+needs access to the user's desktop session. X11 uses `DISPLAY` and `XAUTHORITY`;
+Wayland uses the session bus and desktop portals. The Linux provider requires
+the PipeWire runtime library. See [Wayland setup](../../modules/desktop/app-use/README.md#linux-wayland)
+for build dependencies and portal prerequisites.
 See the provider's [Android setup](../../modules/desktop/app-use/README.md#android)
 for APK packaging and native artifact activation. On Android, open Sinomo and
 enable Remote Management locally, then use the **Sinomo App Use** launcher entry
@@ -73,6 +77,10 @@ creation time; re-enumerate after recreation.
 Linux identities use the X11 window ID, the server-reported local owner PID and
 process start time. Android display identities change on each screen share;
 rotation ends the old share to prevent input using stale coordinates.
+Wayland identities belong to one approved portal session. Request raw targets,
+approve the local chooser, then repeat discovery to obtain the exact resource
+to expose. Discovery initially returns an empty list while approval is pending.
+Closing the final lease or stopping sharing invalidates the target.
 
 ## Unified agent tools
 
@@ -102,7 +110,9 @@ On Android, left-button down/move/up becomes a finite touch gesture on release,
 and wheel events become swipes. Closing or releasing the lease discards an
 unfinished gesture. There is no held hardware keyboard or gamepad endpoint.
 Background `move` uses physical client pixels; raw uses physical virtual-desktop
-pixels. Prefer background `move_in_frame` for image grounding: provide normalized
+pixels on Windows/X11. Wayland raw input instead uses the portal target's
+advertised stream-local bounds; scale source video pixels to those bounds before
+input. Prefer background `move_in_frame` for image grounding: provide normalized
 fractions of the full image plus its current source dimensions. The provider
 handles chrome and DPI; stale sizes after a resize are rejected. Resize in one
 batch and observe a fresh frame before subsequent input. Optional coordinate

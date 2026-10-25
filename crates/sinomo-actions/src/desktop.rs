@@ -676,7 +676,7 @@ fn control_request_schema(_kind: DesktopModule) -> serde_json::Value {
             &["action", "target"],
         ));
     }
-    json!({"oneOf":actions,"description":"Unified App Use control request. Background window messages are preferred; raw desktop input requires an explicit raw session. For background video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels in background mode, virtual-desktop pixels in raw mode. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
+    json!({"oneOf":actions,"description":"Unified App Use control request. Background window messages are preferred; raw desktop input requires an explicit raw session. For background video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels in background mode and virtual-desktop pixels in raw mode, except Wayland portal targets use portal-advertised stream-local bounds: scale video pixels to those target bounds. On Wayland, raw target discovery starts a local chooser; repeat discovery after user approval. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
 }
 
 pub fn module_registration(kind: DesktopModule) -> ModuleRegistration {

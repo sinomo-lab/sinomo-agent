@@ -27,7 +27,15 @@ pub fn enumerate_targets(
     windows: bool,
 ) -> DesktopResult<Vec<DesktopTargetInfo>> {
     authorize_host(permissions)?;
+    #[cfg(target_os = "linux")]
+    return platform::enumerate_targets(permissions, windows);
+    #[cfg(not(target_os = "linux"))]
     platform::enumerate_targets(windows)
+}
+
+pub fn shutdown() {
+    #[cfg(target_os = "linux")]
+    platform::shutdown();
 }
 pub fn enumerate_child_windows(
     permissions: &LocalNodePermissionStore,
@@ -57,8 +65,12 @@ impl InputState {
     ) -> DesktopResult<Self> {
         authorize(&permissions, &target, "input")?;
         platform::validate_target(&target)?;
+        #[cfg(target_os = "linux")]
+        let input = platform::Input::new(&target, &permissions)?;
+        #[cfg(not(target_os = "linux"))]
+        let input = platform::Input::new(&target)?;
         Ok(Self {
-            input: platform::Input::new(&target)?,
+            input,
             target,
             permissions,
             keys: BTreeSet::new(),
@@ -339,6 +351,8 @@ impl DesktopCapture {
         timeout: Duration,
     ) -> DesktopResult<Option<NativeVideoSample>> {
         authorize(&self.permissions, &self.target, "capture")?;
+        #[cfg(target_os = "linux")]
+        platform::validate_capture_target(&self.target)?;
         let state = self.mailbox.state.lock().unwrap_or_else(|e| e.into_inner());
         let (state, _) = self
             .mailbox
@@ -352,6 +366,8 @@ impl DesktopCapture {
             .unwrap_or_else(|e| e.into_inner());
         // Do not return a cached frame across permission revocation.
         authorize(&self.permissions, &self.target, "capture")?;
+        #[cfg(target_os = "linux")]
+        platform::validate_capture_target(&self.target)?;
         if let Some(error) = &state.error {
             return Err(error.clone());
         }

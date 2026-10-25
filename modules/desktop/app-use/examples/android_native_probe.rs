@@ -1,16 +1,16 @@
-//! On-device ABI probe for an explicitly authorized development phone. Run as
-//! the debuggable app UID. OS effects always cross the actual provider dylib.
-#[cfg(not(target_os = "android"))]
+//! Native ABI probe for an explicitly authorized Android/Linux test session.
+//! OS effects always cross the actual independently loaded provider dylib.
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 fn main() {
-    eprintln!("build this example for aarch64-linux-android");
+    eprintln!("build this example for Linux or Android");
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     android::run()
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 mod android {
     use serde_json::{Value, json};
     use sinomo_core::node::LocalNodePermissionStore;
@@ -191,6 +191,12 @@ mod android {
                         let operation = value["operation"].as_str().ok_or("missing operation")?;
                         store.mutate(|p| p.hide_resource_operation(resource, operation))?;
                         return Ok(json!({"revoked":true}));
+                    }
+                    Some("expose") => {
+                        let resource = value["resource"].as_str().ok_or("missing resource")?;
+                        let operation = value["operation"].as_str().ok_or("missing operation")?;
+                        store.mutate(|p| p.expose_resource_operation(resource, operation))?;
+                        return Ok(json!({"exposed":true}));
                     }
                     Some(other) => return Err(format!("unknown probe control {other}").into()),
                     None => {}
