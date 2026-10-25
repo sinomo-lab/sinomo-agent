@@ -5856,7 +5856,7 @@ mod tests {
             match field {
                 0 => reply.request_id.push_str("-other"),
                 1 => reply.intent_id.push_str("-other"),
-                2 => reply.file_system_id = crate::DfsFileSystemId::new("another-filesystem"),
+                2 => reply.file_system_id = crate::DfsFileSystemId::generate(),
                 3 => reply.object_id = crate::DfsObjectId::generate(),
                 4 => reply.version = crate::DfsVersion::generate(),
                 5 => reply.replica_node_id = expected.routed_message.source_node_id.clone(),
