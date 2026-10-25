@@ -992,12 +992,24 @@ impl HostedChatService {
             },
         );
         match result {
-            Ok(response) if response.not_owner => Ok(false),
-            Ok(_) => {
+            Ok(response) if response.not_owner && !response.accepted => {
+                if let Some((journal, id)) = journal {
+                    journal.retry_after_not_owner(id)?;
+                }
+                Ok(false)
+            }
+            Ok(response) if response.accepted && !response.not_owner => {
                 if let Some((journal, id)) = journal {
                     journal.complete(id, recovery::resume_command(command, chat_id.to_string()))?;
                 }
                 Ok(true)
+            }
+            Ok(_) => {
+                let error = "peer returned no unambiguous command admission".to_string();
+                if let Some((journal, id)) = journal {
+                    journal.reject(id, error.clone())?;
+                }
+                Err(error)
             }
             Err(error) => {
                 if let Some((journal, id)) = journal {
@@ -3882,6 +3894,130 @@ mod tests {
                 text: "owned command".into(),
                 attachments: vec![],
             },
+        }
+    }
+
+    struct DecliningPeer {
+        calls: Arc<Mutex<Vec<String>>>,
+        uncertain: bool,
+        contradictory: bool,
+    }
+
+    impl cluster::ChatPeers for DecliningPeer {
+        fn command(
+            &self,
+            _: &NodeId,
+            request: wire::ChatPeerCommandRequest,
+        ) -> Result<wire::ChatPeerCommandResponse, String> {
+            self.calls.lock().unwrap().push(request.request_id);
+            if self.uncertain {
+                Err("original delivery outcome unknown".into())
+            } else {
+                Ok(wire::ChatPeerCommandResponse {
+                    accepted: self.contradictory,
+                    not_owner: true,
+                })
+            }
+        }
+        fn events(
+            &self,
+            _: &NodeId,
+            _: wire::ChatPeerEventsRequest,
+        ) -> Result<wire::ChatPeerEventsResponse, String> {
+            Err("no event forwarding in this control".into())
+        }
+        fn delete(&self, _: &NodeId, _: wire::ChatPeerDeleteRequest) -> Result<(), String> {
+            Err("no deletion in this control".into())
+        }
+    }
+
+    #[test]
+    fn peer_dispatch_reroutes_only_explicit_non_admission_with_the_original_journal_id() {
+        for (uncertain, contradictory) in [(false, false), (true, false), (false, true)] {
+            let root = sinomo_testdir::TestDir::new("peer-dispatch-original-request");
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut service =
+                HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            service
+                .environment
+                .set(HostEnvironment {
+                    data_dir: sinomo_runtime::local::SinomoDataDir::new(&root),
+                    runtime: runtime.handle().clone(),
+                    cluster: ChatCluster {
+                        peers: Arc::new(DecliningPeer {
+                            calls: calls.clone(),
+                            uncertain,
+                            contradictory,
+                        }),
+                        ..ChatCluster::standalone()
+                    },
+                })
+                .ok()
+                .unwrap();
+            let receivers = Arc::new(Mutex::new(Vec::new()));
+            let collected = receivers.clone();
+            service.host_factory = Some(Arc::new(move |_| {
+                let (host, receiver) = fake_host(Duration::ZERO);
+                collected.lock().unwrap().push(receiver);
+                host
+            }));
+            service.hosts.lock().unwrap().insert(
+                "chat".into(),
+                ChatRoute::Remote(RemoteChat {
+                    owner: NodeId::from_legacy_named("declining-owner").unwrap(),
+                    fanout: ChatFanout::default(),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    last_active: Mutex::new(Instant::now()),
+                }),
+            );
+            let journal = CommandJournal::open(&root, "origin").unwrap();
+            let command = peer_send("chat", "original-request").command;
+            journal.admit("original-request", &command).unwrap();
+            let result = service.dispatch(
+                "view",
+                "chat",
+                Some((journal.clone(), "original-request".into())),
+                command.clone(),
+            );
+            assert_eq!(calls.lock().unwrap().as_slice(), ["original-request"]);
+            if uncertain || contradictory {
+                let error = if uncertain {
+                    "original delivery outcome unknown"
+                } else {
+                    "peer returned no unambiguous command admission"
+                };
+                assert!(result.unwrap_err().contains(error));
+                assert!(
+                    receivers.lock().unwrap().is_empty(),
+                    "uncertain effects must not reroute"
+                );
+                assert_eq!(
+                    journal.admit("original-request", &command).unwrap_err(),
+                    error
+                );
+            } else {
+                result.unwrap();
+                let receivers = receivers.lock().unwrap();
+                assert_eq!(receivers.len(), 1);
+                let HostCommand::Run {
+                    journal: Some((owned, id)),
+                    command: received,
+                    ..
+                } = receivers[0].try_recv().unwrap()
+                else {
+                    panic!("missing bound handoff");
+                };
+                assert_eq!(id, "original-request");
+                assert_eq!(received, command);
+                // This is the real worker's durable start boundary. It must
+                // still own the original Pending entry after non-admission.
+                owned
+                    .start(&id)
+                    .expect("known non-admission remains retryable with the same ID");
+                owned.complete(&id, None).unwrap();
+                assert!(!journal.admit(&id, &command).unwrap());
+            }
         }
     }
 

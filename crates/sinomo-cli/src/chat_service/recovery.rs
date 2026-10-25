@@ -169,6 +169,24 @@ impl CommandJournal {
         })
     }
 
+    /// The selected peer explicitly declined ownership before admission. Keep
+    /// the original payload/identity pending for the caller's existing reroute.
+    /// Never use this transition for a timeout or uncertain delivery result.
+    pub(super) fn retry_after_not_owner(&self, id: &str) -> Result<(), String> {
+        self.change(|state| {
+            let entry = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or("missing command receipt")?;
+            if entry.state != CommandState::Running {
+                return Err("only a running forward can be declined before admission".into());
+            }
+            entry.state = CommandState::Pending;
+            Ok(())
+        })
+    }
+
     pub(super) fn reject(&self, id: &str, error: String) -> Result<(), String> {
         self.change(|state| {
             state
@@ -277,6 +295,40 @@ pub(super) fn resume_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_explicit_non_admission_remains_pending_after_reopen() {
+        let dir = sinomo_testdir::TestDir::new("chat-not-owner-recovery");
+        let journal = CommandJournal::open(&dir, "origin").unwrap();
+        let command = wire::ChatSessionCommand::Send {
+            session_id: "chat".into(),
+            text: "original payload".into(),
+            attachments: vec![],
+        };
+        for id in ["declined", "uncertain", "complete"] {
+            journal.admit(id, &command).unwrap();
+            journal.start(id).unwrap();
+        }
+        journal.retry_after_not_owner("declined").unwrap();
+        journal.complete("complete", None).unwrap();
+        assert!(journal.retry_after_not_owner("complete").is_err());
+        drop(journal);
+
+        let reopened = CommandJournal::open(&dir, "origin").unwrap();
+        let (_, pending, interrupted) = reopened.recovery().unwrap();
+        assert_eq!(pending, vec![("declined".into(), command.clone())]);
+        assert!(interrupted, "the uncertain original remains unreplayed");
+        assert!(reopened.admit("uncertain", &command).is_err());
+        assert!(reopened.retry_after_not_owner("uncertain").is_err());
+        assert!(
+            reopened
+                .admit("declined", &wire::ChatSessionCommand::FetchAgents)
+                .is_err()
+        );
+        reopened.start("declined").unwrap();
+        reopened.complete("declined", None).unwrap();
+        assert!(!reopened.admit("declined", &command).unwrap());
+    }
+
     #[test]
     fn workspace_management_recovery_resumes_without_replaying_completed_grants() {
         let dir = sinomo_testdir::TestDir::new("multi-workspace-recovery");
