@@ -2767,6 +2767,171 @@ mod observed_snapshot_writer_tests {
         connectivity_projection_visibility_control(true);
     }
 
+    fn compact_connectivity_projection_control(follower: bool) {
+        let root = sinomo_testdir::TestDir::new("compact-connectivity-projection");
+        let writer = ClusterKvPaths::new(root.join("writer"));
+        let reader = if follower {
+            ClusterKvPaths::new(root.join("follower"))
+        } else {
+            writer.clone()
+        };
+        let leader = NodeId::from_legacy_named("compact-connectivity-leader").unwrap();
+        let peer = NodeId::from_legacy_named("compact-connectivity-follower").unwrap();
+        let store = writer.raft_store();
+        store.set_leader_compact(&leader, 1).unwrap();
+        let connectivity = "/cluster/network/connectivity/source/target/endpoint";
+        let telemetry = "/cluster/node-status/source";
+        let put = |key: &str, value: &[u8]| KvCommand::Op(KvOp::Put {
+            key: key.into(),
+            value: value.to_vec(),
+            lease_id: None,
+        });
+        let seed = store
+            .append_command_with_response_and_publish(
+                &leader,
+                put(connectivity, b"old"),
+                cluster_kv_key_can_defer_materialized_snapshot,
+            )
+            .unwrap();
+        let append = |entry: KvLogEntry| RaftAppendEntriesRequest {
+            term: entry.term,
+            leader_id: leader.clone(),
+            prev_log_index: entry.index - 1,
+            prev_log_term: if entry.index == 1 { 0 } else { 1 },
+            leader_commit: entry.index,
+            entries: vec![entry],
+        };
+        if follower {
+            let entry = store
+                .open_node(&leader)
+                .unwrap()
+                .log_entry_at(seed.committed_request.log_index)
+                .unwrap()
+                .clone();
+            reader
+                .raft_store()
+                .apply_append_entries_with_optional_snapshot_and_publish(
+                    &peer,
+                    None,
+                    append(entry),
+                    cluster_kv_key_can_defer_materialized_snapshot,
+                )
+                .unwrap();
+        }
+        let read_file = || decode_kv_value::<KvSnapshot>(&fs::read(&reader.snapshot).unwrap()).unwrap();
+        assert_eq!(read_file().get(connectivity).unwrap().value, b"old");
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(
+            store,
+            leader.clone(),
+            cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+        );
+        let mut commit = |command| {
+            let request = KvCommandRequest::generated(command);
+            let entry = storage.append_uncommitted(request.clone()).unwrap();
+            storage.release_session_for_quorum();
+            let committed = storage.commit_index_compact(entry.index).unwrap();
+            assert_eq!(committed.committed_request.request_id, request.request_id);
+            assert_eq!(committed.committed_request.log_index, entry.index);
+            assert_eq!(committed.read_state.applied_index, entry.index);
+            storage.release_session_after_commit();
+            ClusterKvRaftCommandStorage::publish_cluster_raft_post_commit_observations(
+                &mut storage,
+                Some(&committed),
+            )
+            .unwrap();
+            if follower {
+                let (applied, _) = reader
+                    .raft_store()
+                    .apply_append_entries_with_optional_snapshot_compact_and_publish(
+                        &peer,
+                        None,
+                        append(entry),
+                    )
+                    .unwrap();
+                assert!(applied.response.success);
+                assert_eq!(applied.read_state, committed.read_state);
+            }
+            committed.read_state.revision
+        };
+        let initial = fs::read(&reader.snapshot).unwrap();
+        commit(put(telemetry, b"ordinary telemetry"));
+        assert_eq!(fs::read(&reader.snapshot).unwrap(), initial);
+        let revision = commit(put(connectivity, b"renewed"));
+        let renewed = read_file();
+        assert_eq!(
+            renewed.get(connectivity).unwrap().value,
+            b"renewed",
+            "the production compact publication path must expose the committed renewal"
+        );
+        assert_eq!(renewed.revision, revision);
+        let bytes = fs::read(&reader.snapshot).unwrap();
+        commit(put(telemetry, b"later telemetry"));
+        assert_eq!(fs::read(&reader.snapshot).unwrap(), bytes);
+        commit(KvCommand::Op(KvOp::Delete {
+            key: connectivity.into(),
+        }));
+        assert!(read_file().get(connectivity).is_none());
+    }
+
+    #[test]
+    fn compact_connectivity_renewal_is_visible_after_leader_commit() {
+        compact_connectivity_projection_control(false);
+    }
+
+    #[test]
+    fn compact_connectivity_renewal_is_visible_after_follower_apply() {
+        compact_connectivity_projection_control(true);
+    }
+
+    #[test]
+    fn compact_connectivity_renewal_after_restore_preserves_installed_snapshot_identity() {
+        let root = sinomo_testdir::TestDir::new("compact-connectivity-restore");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let leader = NodeId::from_legacy_named("compact-connectivity-restore-leader").unwrap();
+        let follower = NodeId::from_legacy_named("compact-connectivity-restore-follower").unwrap();
+        let key = "/cluster/network/connectivity/source/target/endpoint";
+        let mut seed = InProcessKvStore::new();
+        seed.put(key, b"old".to_vec(), None).unwrap();
+        let installed = Arc::new(seed.try_snapshot().unwrap());
+        let request = KvCommandRequest::generated(KvCommand::Op(KvOp::Put {
+            key: key.into(),
+            value: b"renewed".to_vec(),
+            lease_id: None,
+        }));
+        let (applied, wrote) = paths
+            .raft_store()
+            .apply_append_entries_with_optional_snapshot_compact_and_publish(
+                &follower,
+                Some(RaftSnapshot {
+                    last_included_index: 7,
+                    last_included_term: 1,
+                    kv: Arc::clone(&installed),
+                }),
+                RaftAppendEntriesRequest {
+                    term: 1,
+                    leader_id: leader,
+                    prev_log_index: 7,
+                    prev_log_term: 1,
+                    entries: vec![KvLogEntry {
+                        index: 8,
+                        term: 1,
+                        request_id: request.request_id,
+                        command: request.command,
+                        revision: installed.revision,
+                    }],
+                    leader_commit: 8,
+                },
+            )
+            .unwrap();
+        assert!(applied.response.success && wrote);
+        assert_eq!(applied.restored_snapshot.as_ref(), Some(&installed));
+        assert_eq!(applied.restored_snapshot_applied_index, Some(7));
+        assert_eq!(applied.read_state.applied_index, 8);
+        let cold = decode_kv_value::<KvSnapshot>(&fs::read(&paths.snapshot).unwrap()).unwrap();
+        assert_eq!(cold.get(key).unwrap().value, b"renewed");
+        assert_eq!(cold.revision, applied.read_state.revision);
+    }
+
     fn require_writer_released(path: &Path) {
         let lock_path = KvMaterializedCache::new(path).write_lock_path();
         let file = OpenOptions::new()

@@ -42,7 +42,7 @@ pub fn cluster_kv_keyspace_class(key: &str) -> ClusterKvKeyspaceClass {
         return ClusterKvKeyspaceClass::Operational;
     }
     if key.starts_with("/cluster/node-status/")
-        || key.starts_with("/cluster/network/connectivity/")
+        || is_cluster_kv_connectivity_key(key)
         || key.starts_with("/cluster/network/info/")
         || key.starts_with("/cluster/health/")
         || key.starts_with("/cluster/health-probes/")
@@ -75,12 +75,16 @@ pub fn cluster_kv_default_read_authority_for_key(key: &str) -> KvReadAuthority {
     cluster_kv_keyspace_class(key).default_read_authority()
 }
 
+pub(crate) fn is_cluster_kv_connectivity_key(key: &str) -> bool {
+    key.starts_with("/cluster/network/connectivity/")
+}
+
 pub fn cluster_kv_key_may_defer_materialized_projection(key: &str) -> bool {
     // Independent shadow/client routing consumes committed connectivity from
     // this projection. Deferring a renewal can leave those readers with only
     // expired observations even though the applied Raft view is current.
     // Keep local read authority and ordinary telemetry deferral unchanged.
-    !key.starts_with("/cluster/network/connectivity/")
+    !is_cluster_kv_connectivity_key(key)
         && cluster_kv_keyspace_class(key).may_defer_materialized_projection()
 }
 
