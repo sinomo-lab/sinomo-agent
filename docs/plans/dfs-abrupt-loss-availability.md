@@ -15,7 +15,65 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-25 R48
+## Current development checkpoint — 2026-10-25 R50
+
+The test-only native local-fence RPC observation is integrated. Receiver/wire
+`87794b51`, sender `37982842` and native controls `fb9a004c` merged normally;
+exact test-path correction `563a255a` reached code `51a0ecce`. Source `09baa97c`
+contains 4,921 inputs; own sealed ELF is `72bd8cc1`. I149 fresh check/build/seal
+passed in 33.425440/619.710806/3.263074 seconds. I150 executed **9 PASS**: six
+new native controls and three affected local-fence/cooperative regressions.
+I151 full boundary passed 11 UI controls and three libraries. Other **213 of
+222 inventory IDs remain UNRUN on R50**; prior results do not transfer.
+
+The actual registered candidate B sends the full current R42 reservation and
+expected target to eligible metadata replica C. Only the authenticated service
+branch can construct sealed ingress. The receiver verifies its actual owner and
+current pending request before the existing local writer. The sender makes one
+native invocation, checks exact outer/carrier/reservation/acceptor correlation,
+then revalidates its local physical owner, pending request and original accepted-
+result deadline. Remote physical paths, device/inode values and marker digest/
+length remain reported DATA and are never opened locally.
+
+The private nonserialized return has no raw constructor or effect consumer.
+It is not a PromiseAck, ChosenFrame certificate, custody/residency proof,
+executor or serving permission. Explicit recalls preserve the same full logical
+reservation/target body and renew only transport IDs. No per-call KV ledger,
+generic sender/inbox fallback, application retry, periodic renewal or durable
+clock was added. Ordinary/default production activation stays unchanged.
+
+Actual native controls cover B-to-C return/duplicate, authenticated wrong source/
+target/request refusals, lost real reply and same-subject recall, expired or
+cancelled return with no owned observation, generic/direct/reply-as-request
+refusal and DATA correlation probes, plus default/cooperative refusal with
+ordinary Main continuation. The deliberate late-return case exceeds five seconds
+and proves absence of an accepted owned result; it is not a successful five-second
+RPC latency sample. All original case caps and participant/authority guards remain.
+
+R49/I146 is a preserved **FAILED101** typecheck at 42.315433 seconds, with no
+codegen or native execution. Two test references used a private module path.
+The correction uses the existing public re-export only; reverse replacement
+reconstructs the failed file byte-for-byte, with all 4,920 other source hashes,
+IDs, assertions and caps unchanged. No visibility or production fix was needed.
+
+`R50-REPORT.md` and `R50-COMBINED-RESULT.json` retain exact source/artifact/results,
+failure and standard acceptance/stage-I/O/node-window/coverage tables. Receipts
+are I149 `b29aa00f`, I150 `d1b8582b` and I151 `c6da934f`. I150 preserved 1,894
+regular files with archive/hash/compare PASS. All recorded processes, groups,
+sessions, own scopes/cgroups and private roots drained; no resource blocker remains.
+
+Quiet windows still require **absolute zero writes**. Explicit RPCs and duplicate
+recertification are operation activity, not quietness or writeback evidence.
+Physical replacement during RPC, cold Main restart, older-binary interoperability
+and attachments remain unrun at this new boundary. All-writer/old-decision fencing,
+immutable promise-cut/current accepted state, exact ChosenFrame evidence, complete
+custody/settlement/residency, serving transition, real survivor availability,
+reconnect/no-failback and quietness remain open. No peer review, Docker,
+production activation or push occurred. The original availability goal continues.
+
+## Historical checkpoints
+
+### Preserved R48 checkpoint
 
 Three bounded local-fence failure-cut controls are integrated through normal
 local merges: writer hooks `96ead4dd`, in-flight control `90f18926` and owned-process
@@ -62,7 +120,6 @@ remain separate requirements. Actual survivor operation, abrupt loss, partition,
 reconnect/no-failback and Sinomo-only quietness remain open. No peer review,
 Docker, production activation or push occurred.
 
-## Historical checkpoints
 
 ### Preserved R47 checkpoint
 
