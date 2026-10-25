@@ -50,6 +50,78 @@ use crate::{
 
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
 
+/// Pure DATA correlation only. Remote paths and physical identifiers are
+/// claims; this validator never opens them or mints an authenticated return.
+#[cfg(test)]
+pub(crate) fn validate_selected_local_recovery_fence_rpc_return(
+    expected: &DfsMessageCommand,
+    response: DfsMessageResponse,
+) -> Result<crate::DfsSelectedLocalRecoveryFenceRpcData, NetworkError> {
+    let invalid = |detail: &str| NetworkError::Serialization {
+        detail: format!("selected local-fence return: {detail}"),
+    };
+    let carrier = &expected.routed_message;
+    let DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(request) = &carrier.message else {
+        return Err(invalid("not the selected request family"));
+    };
+    let canonical = crate::control_plane::DfsMetadataShardRecoveryBallotRequest::prepare(
+        &request.reservation.serving_shard,
+        &request.reservation.ballot.candidate_node_id,
+        request.reservation.expected_attempt_floor,
+    )
+    .map_err(|_| invalid("invalid full reservation"))?;
+    if canonical != request.reservation {
+        return Err(invalid("full reservation differs from canonical request"));
+    }
+    if carrier.source_node_id != request.reservation.ballot.candidate_node_id
+        || carrier.target_node_id != request.expected_target
+        || carrier.source_node_id == carrier.target_node_id
+        || expected.request_id.is_empty()
+        || response.request_id != expected.request_id
+        || response.outbound_messages.len() != 1
+    {
+        return Err(invalid("carrier or outer request/count differs"));
+    }
+    let returned = response
+        .outbound_messages
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid("missing returned frame"))?;
+    if returned.source_node_id != carrier.target_node_id
+        || returned.target_node_id != carrier.source_node_id
+        || returned.frame_id != carrier.frame_id
+        || returned.message_id != carrier.message_id
+    {
+        return Err(invalid("returned route or carrier identity differs"));
+    }
+    let DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(reply) = returned.message else {
+        return Err(invalid("unrelated reply family"));
+    };
+    if reply.reservation != request.reservation || reply.acceptor_node_id != request.expected_target
+    {
+        return Err(invalid("full reservation or acceptor differs"));
+    }
+    let crate::DfsSelectedLocalRecoveryFenceRpcOutcome::Fenced { data } = reply.outcome else {
+        return Err(invalid("remote result is not verified Fenced DATA"));
+    };
+    data.fence
+        .validate()
+        .map_err(|_| invalid("malformed reported fence/inventory"))?;
+    if data.fence.reservation != request.reservation
+        || data.fence.acceptor_node_id != request.expected_target
+        || data.marker_bytes == 0
+        || data.marker_bytes > 1024 * 1024
+        || data.marker_digest.len() != 64
+        || !data
+            .marker_digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("reported fence or BLAKE3 marker bound differs"));
+    }
+    Ok(data)
+}
+
 /// Pure correlation validation returns DATA, not an authenticated capability.
 /// Only the actual native RPC owner wraps its successful output.
 pub(crate) fn validate_original_history_rpc_return(command: &DfsMessageCommand, response: DfsMessageResponse) -> Result<DfsRoutedMessage, NetworkError> {

@@ -3258,6 +3258,12 @@ pub(crate) use control_plane::{
 };
 
 mod data_plane;
+#[cfg(test)]
+mod selected_recovery_fence_call;
+#[cfg(test)]
+pub(crate) use selected_recovery_fence_call::{
+    OwnedSelectedLocalRecoveryFenceReturn, call_native_selected_local_recovery_fence,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod materialization_test;
 #[cfg(any(test, feature = "test-support"))]
