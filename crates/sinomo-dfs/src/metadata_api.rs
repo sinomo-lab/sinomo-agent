@@ -36,7 +36,7 @@ use crate::{
 };
 
 #[cfg(test)]
-mod selected_local_recovery;
+pub(crate) mod selected_local_recovery;
 #[cfg(test)]
 pub(crate) use selected_local_recovery::{
     DfsLocalRecoveryInventoryKind, DfsSelectedLocalRecoveryContext,
