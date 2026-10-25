@@ -3,6 +3,114 @@
 use super::*;
 
 #[test]
+fn outsider_fixture_observes_completed_assignment_after_a_withheld_native_delta() {
+    let mut cluster = sifs_posix_cluster("outsider-completed-configuration", "/users");
+    let fs = sifs_file_system_id();
+    let configs = cluster._runtime.metadata_shards().unwrap();
+    let current = configs
+        .iter()
+        .find(|config| config.shard_id == "users")
+        .unwrap();
+    assert_eq!(current.primary_node_id, cluster.primary_node);
+    let mut desired = current.clone();
+    desired.replica_node_ids = vec![cluster.writer_node.clone()];
+    desired.epoch = current.epoch.checked_add(1).unwrap();
+    let fault = cluster
+        ._runtime
+        .lose_configuration_delta_and_pause_rebuild(
+            &cluster.writer_node,
+            crate::metadata_shard_key(&fs, "users"),
+        )
+        .unwrap();
+    // Retain the already-open native primary while injecting this loss.
+    // The general runtime.client() fixture opener waits for every node's
+    // configuration readiness, including the rebuild deliberately paused here.
+    let observation_deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    DfsControlPlaneStore::new(cluster.primary.control_plane.as_mut().unwrap().as_mut())
+        .begin_metadata_shard_membership_handoff(current, &desired)
+        .expect("submit the actual native outsider handoff")
+        .expect("the source assignment is unchanged");
+    cluster
+        .primary
+        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5))
+        .expect("complete the actual native outsider handoff");
+    let active = cluster
+        ._runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.shard_id == "users")
+        .unwrap();
+    assert_eq!(
+        active, desired,
+        "the requested native handoff really activated"
+    );
+    // Owner activation does not imply delivery to this replica's observer.
+    // Observe the actual negative hook under the existing fixture bound;
+    // do not drive maintenance or release it before the delta was withheld.
+    let dropped = loop {
+        if let Some(delta) = fault.dropped_delta() {
+            break delta;
+        }
+        assert!(
+            Instant::now() < observation_deadline,
+            "control did not observe the actual committed users assignment"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    fault.release();
+    drop(fault);
+
+    sifs_cluster_observe_completed_assignments(&mut cluster, &[active.clone()]);
+    let capture = cluster
+        ._runtime
+        .capture_namespace_requests(&cluster.primary_node, 32)
+        .unwrap();
+    let result = cluster.writer.posix_write_file(
+        "/users/observed-completed-assignment",
+        b"first",
+        DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+    );
+    let requests = capture.records();
+    std::fs::write(
+        cluster.root.join("boundary-diagnostic-outsider-configuration.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "actual_withheld_delta": dropped,
+            "installed": active,
+            "requests": requests,
+            "result": format!("{result:?}"),
+            "qualification": "One fresh write after real handoff and exact native authority observation. No supplied positive reply or historical write replay."
+        })).unwrap(),
+    ).unwrap();
+    let stat = result.expect("first write uses the observed completed configuration");
+    assert_eq!(stat.size_bytes, Some(5));
+    let stamped = requests
+        .iter()
+        .filter_map(|message| {
+            let DfsNetworkMessage::NamespaceRequest(request) = &message.message else {
+                return None;
+            };
+            request
+                .authority_shards
+                .iter()
+                .find(|shard| shard.shard_id == "users")
+        })
+        .collect::<Vec<_>>();
+    assert!(!stamped.is_empty(), "actual native request was captured");
+    assert!(stamped.iter().all(|shard| **shard == active));
+    drop(capture);
+    let SifsPosixCluster {
+        primary,
+        writer,
+        observer,
+        _runtime,
+        ..
+    } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().expect("normal native fixture drain");
+}
+
+#[test]
 fn routed_mkdir_all_uses_applied_result_without_a_discarded_stat_projection() {
     use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
     let mut cluster = sifs_outsider_cluster("mkdir-applied-without-stat");
