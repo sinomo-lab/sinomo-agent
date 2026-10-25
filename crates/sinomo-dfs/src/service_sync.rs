@@ -7426,6 +7426,23 @@ mod native_selected_data_tests {
     mod imported_history_query_tests {
         use super::*;
 
+        // Failure DATA only. The maintained helper owns the create-new
+        // rpc-observations-NNNNNN.json path and retains its normal drop policy.
+        // Neither capture nor reporting may replace the original assertion.
+        fn checkpoint_failed_history_rpc(runtime: &DfsTestRuntime, phase: &'static str) {
+            let checkpoint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.checkpoint_rpc_observation_window()
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match checkpoint {
+                    Ok(Ok(0)) => eprintln!("HISTORY_NATIVE_FAILURE_RPC status=EMPTY_CURRENT_WINDOW phase={phase} records=0 file=NONE"),
+                    Ok(Ok(count)) => eprintln!("HISTORY_NATIVE_FAILURE_RPC status=CHECKPOINTED phase={phase} records={count} path_family=rpc-observations-NNNNNN.json dropped={}", runtime.observation_dropped_count()),
+                    Ok(Err(error)) => eprintln!("HISTORY_NATIVE_FAILURE_RPC status=UNAVAILABLE phase={phase} error={error}"),
+                    Err(_) => eprintln!("HISTORY_NATIVE_FAILURE_RPC status=UNAVAILABLE phase={phase} error=checkpoint-panicked"),
+                }
+            }));
+        }
+
         fn with_query_fixture(
             name: &str, prospective_receiver: bool,
             check: impl FnOnce(&mut GenuineNativeOriginal, &DfsMetadataShardConfig,
@@ -7494,6 +7511,9 @@ mod native_selected_data_tests {
             }));
             crate::service_repair::HISTORY_QUERY_AFTER_ATTEMPT.with(|slot| { slot.borrow_mut().take(); });
             crate::service_repair::HISTORY_QUERY_AFTER_OBSERVATION.with(|slot| { slot.borrow_mut().take(); });
+            if outcome.is_err() {
+                checkpoint_failed_history_rpc(&fixture.runtime, "query-fixture");
+            }
             drop(fixture.held.take());
             drop(fixture.held_promoted.take());
             let closed = fixture.runtime.close();
@@ -7857,6 +7877,10 @@ mod native_selected_data_tests {
                     let mut retirement = None;
                     let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         reached.recv_timeout(deadline.saturating_duration_since(Instant::now())).expect("real C history result reached the native post-execution edge");
+                        let pending_query = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                        assert!(pending_query.response().is_none());
+                        let history_request = pending_query.request().clone();
+                        assert_eq!(history_request.current_assignment, *assignment);
                         // Explicit ordinary metadata retirement, not automatic
                         // failback and not a new selected-original protocol.
                         let pending = control.with_client(|kv| DfsControlPlaneStore::new(kv.as_mut())
@@ -7875,15 +7899,30 @@ mod native_selected_data_tests {
                         let result = caller.take().unwrap().join().expect("owned in-flight query caller drained");
                         let error = result.expect_err("B retirement fences durable observation of an already prepared C result");
                         assert!(Instant::now() <= deadline, "retirement must reject under the same original 5s call, not a timeout");
+                        let calls = fixture.runtime.rpc_observations();
+                        let original = &history_request.original_material.original.command;
+                        assert!(calls.iter().any(|decoded| decoded.source == fixture.promoted && decoded.target == fixture.holder
+                            && decoded.route == DFS_DATA_READ_ROUTE && decoded.phase == RpcPhase::Decoded
+                            && decoded.dfs_frame_id == Some(history_request.carrier.frame_id)
+                            && decoded.dfs_request_id.as_deref() == Some(original.request_id.as_str())
+                            && decoded.dfs_intent_id.as_deref() == Some(original.intent_id.as_str())
+                            && decoded.dfs_file_system_id.as_ref() == Some(&original.file_system_id)
+                            && decoded.dfs_object_id.as_ref() == Some(&original.object_id)
+                            && decoded.dfs_version.as_ref() == Some(&original.version)
+                            && matches!(decoded.signer.as_ref(), Some(sinomo_core::service::ServiceSigner::Remote { node_id, .. }) if node_id == fixture.promoted.as_str())
+                            && calls.iter().any(|terminal| terminal.call_id == decoded.call_id && terminal.source == decoded.source
+                                && terminal.target == decoded.target && terminal.route == decoded.route && terminal.origin == decoded.origin
+                                && terminal.phase == RpcPhase::Completed && terminal.outcome_error.is_none()
+                                && matches!(terminal.signer.as_ref(), Some(sinomo_core::service::ServiceSigner::Remote { node_id, .. }) if node_id == fixture.promoted.as_str()))),
+                            "THIS persisted query carrier/original must complete its authenticated native C RPC before a B rejection is accepted");
                         let current_b_rejection = matches!(&error, DfsError::StaleOwnerEpoch { local_node_id, .. } if local_node_id == &fixture.promoted)
                             || matches!(&error, DfsError::Metadata { message } if message == "history query has no exact current native B owner/import"
-                                || message == "publication configuration is not current" || message.contains("publication configuration advanced"));
+                                || message == "publication configuration is not current" || message.contains("publication configuration advanced")
+                                || message == "content-only Repair lacks its current native owner/admission/storage generation");
                         assert!(current_b_rejection, "the NEW B phase, not a C/network/timeout refusal, must fence observation: {error}");
-                        assert!(fixture.runtime.rpc_observations().iter().any(|call| call.source == fixture.promoted
-                            && call.target == fixture.holder && call.route == DFS_DATA_READ_ROUTE
-                            && call.phase == RpcPhase::Completed && call.outcome_error.is_none()),
-                            "the actual native C RPC returned before the B observation was refused");
-                        assert!(queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap().response().is_none());
+                        let pending_query = queue.imported_history_query_for_test(&producer, &id).unwrap().unwrap();
+                        assert_eq!(pending_query.request(), &history_request);
+                        assert!(pending_query.response().is_none());
                     }));
                     // Gates and both actual children drain on every verdict.
                     release_history_gate(&gate);
@@ -7955,10 +7994,22 @@ mod native_selected_data_tests {
                 let error = delivered.expect_err("normal A publication must reach the negative common Close boundary");
                 assert!(error.to_string().contains("injected original Repair close denial after actual application"), "{error}");
                 assert!(denial.hits() > 0);
-                assert!(fixture.runtime.rpc_observations().iter().any(|call| call.source == fixture.holder && call.target == producer
-                    && call.route == DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE
-                    && call.dfs_request_id.as_deref() == Some(command.request_id.as_str())
-                    && call.dfs_frame_id == Some(delayed.frame_id)));
+                let calls = fixture.runtime.rpc_observations();
+                assert!(calls.iter().any(|decoded| decoded.source == fixture.holder && decoded.target == producer
+                    && decoded.route == DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE && decoded.phase == RpcPhase::Decoded
+                    && decoded.dfs_frame_id == Some(delayed.frame_id)
+                    && decoded.dfs_request_id.as_deref() == Some(command.request_id.as_str())
+                    && decoded.dfs_intent_id.as_deref() == Some(command.intent_id.as_str())
+                    && decoded.dfs_file_system_id.as_ref() == Some(&command.file_system_id)
+                    && decoded.dfs_object_id.as_ref() == Some(&command.object_id)
+                    && decoded.dfs_version.as_ref() == Some(&command.version)
+                    && matches!(decoded.signer.as_ref(), Some(sinomo_core::service::ServiceSigner::Remote { node_id, .. }) if node_id == fixture.holder.as_str())
+                    && calls.iter().any(|terminal| terminal.call_id == decoded.call_id && terminal.source == decoded.source
+                        && terminal.target == decoded.target && terminal.route == decoded.route && terminal.origin == decoded.origin
+                        && terminal.phase == RpcPhase::EndedWithoutResponse
+                        && terminal.outcome_error.as_deref().is_some_and(|error| error.contains("injected original Repair close denial after actual application"))
+                        && matches!(terminal.signer.as_ref(), Some(sinomo_core::service::ServiceSigner::Remote { node_id, .. }) if node_id == fixture.holder.as_str()))),
+                    "the actual authenticated C response identity must join its SAME call's owning Close error");
                 let applied = fixture.runtime.metadata_primary_service(path).unwrap();
                 let receipts = applied.metadata_backend().unwrap().receipts_for_version(&command.object_id, &command.version).unwrap();
                 let c_receipt = receipts.iter().find(|receipt| receipt.replica_node_id == fixture.holder).unwrap().clone();
@@ -8007,6 +8058,7 @@ mod native_selected_data_tests {
                 Ok(value) => value,
                 Err(error) => {
                     // The setup's local denial/senders have already dropped.
+                    checkpoint_failed_history_rpc(&fixture.runtime, "same-c-setup");
                     drop(fixture.held.take());
                     drop(fixture.held_promoted.take());
                     if let Err(close_error) = fixture.runtime.close() {
