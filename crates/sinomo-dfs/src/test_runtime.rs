@@ -138,7 +138,35 @@ pub struct RpcObservation {
 struct NativeRpcCallContext {
     fabric: std::sync::Weak<Fabric>,
     observation: RpcObservation,
+    write_reply_capture: Option<Arc<Mutex<DecodedWriteReplyCapture>>>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturedWriteReplyKind {
+    Write,
+    Distributed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedWriteReplyIdentity {
+    call_id: u64,
+    source: NodeId,
+    target: NodeId,
+    route: String,
+    outer_request_id: String,
+    frame_id: u64,
+    message_id: u64,
+    request_id: String,
+    object_id: DfsObjectId,
+    kind: CapturedWriteReplyKind,
+}
+
+#[derive(Default)]
+struct DecodedWriteReplyCapture {
+    identity: Option<DecodedWriteReplyIdentity>,
+    invalid: bool,
+}
+
 tokio::task_local! {
     static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
 }
@@ -153,6 +181,68 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
             || context.observation.target != head.target_node_id
         {
             return;
+        }
+        if let Some(capture) = &context.write_reply_capture {
+            // Only the normal authenticated decoder sees the request. Copy
+            // scalar identity here; never poll/clone the request body again.
+            let identity = match &head.message {
+                DfsNetworkMessage::WriteRequest(write)
+                    if context.observation.route == DFS_DATA_WRITE_ROUTE =>
+                {
+                    Some((
+                        &write.request_id,
+                        &write.request.object_id,
+                        CapturedWriteReplyKind::Write,
+                    ))
+                }
+                DfsNetworkMessage::DistributedWriteRequest(write)
+                    if context.observation.route == DFS_DATA_DISTRIBUTED_WRITE_ROUTE =>
+                {
+                    Some((
+                        &write.request_id,
+                        &write.request.object_id,
+                        CapturedWriteReplyKind::Distributed,
+                    ))
+                }
+                _ => None,
+            };
+            if let Ok(mut capture) = capture.lock() {
+                if let Some((request_id, object_id, kind)) = identity {
+                    let identity = DecodedWriteReplyIdentity {
+                        call_id: context.observation.call_id,
+                        source: head.source_node_id.clone(),
+                        target: head.target_node_id.clone(),
+                        route: context.observation.route.clone(),
+                        outer_request_id: command.request_id.clone(),
+                        frame_id: head.frame_id,
+                        message_id: head.message_id,
+                        request_id: request_id.clone(),
+                        object_id: object_id.clone(),
+                        kind,
+                    };
+                    if capture
+                        .identity
+                        .as_ref()
+                        .is_some_and(|previous| previous != &identity)
+                    {
+                        capture.invalid = true;
+                    } else {
+                        if capture.identity.is_none()
+                            && let Some(fabric) = context.fabric.upgrade()
+                        {
+                            let mut observation = context.observation.clone();
+                            observation.phase = RpcPhase::Decoded;
+                            observation.dfs_frame_id = Some(identity.frame_id);
+                            observation.dfs_request_id = Some(identity.request_id.clone());
+                            observation.dfs_object_id = Some(identity.object_id.clone());
+                            fabric.record(observation);
+                        }
+                        capture.identity = Some(identity);
+                    }
+                } else {
+                    capture.invalid = true;
+                }
+            }
         }
         let Some(fabric) = context.fabric.upgrade() else {
             return;
@@ -210,6 +300,61 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
     });
 }
 
+/// Validate only correlation of a supplied completed response. This utility
+/// creates no receiver result or authority; the caller owns actual dispatch.
+fn captured_write_reply(
+    expected: &DecodedWriteReplyIdentity,
+    observation: &RpcObservation,
+    response: DfsMessageResponse,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let invalid = || NetworkError::Serialization {
+        detail: "completed write capture differs from its actual decoded call".into(),
+    };
+    if expected.call_id != observation.call_id
+        || expected.source != observation.source
+        || expected.target != observation.target
+        || expected.route != observation.route
+        || !observation
+            .signer
+            .as_ref()
+            .and_then(ServiceSigner::cluster_identity)
+            .is_some_and(|(node, _)| node == expected.source.as_str())
+        || response.request_id != expected.outer_request_id
+        || expected.outer_request_id != format!("dfs_message_{}", expected.frame_id)
+        || response.outbound_messages.len() != 1
+    {
+        return Err(invalid());
+    }
+    let routed = response
+        .outbound_messages
+        .into_iter()
+        .next()
+        .ok_or_else(invalid)?;
+    if routed.source_node_id != expected.target || routed.target_node_id != expected.source {
+        return Err(invalid());
+    }
+    let matched = match (&routed.message, expected.kind) {
+        (DfsNetworkMessage::WriteResponse(reply), CapturedWriteReplyKind::Write) => {
+            expected.route == DFS_DATA_WRITE_ROUTE
+                && reply.request_id == expected.request_id
+                && reply.object_id == expected.object_id
+        }
+        (
+            DfsNetworkMessage::DistributedWriteResponse(reply),
+            CapturedWriteReplyKind::Distributed,
+        ) => {
+            expected.route == DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                && reply.request_id == expected.request_id
+                && reply.object_id == expected.object_id
+        }
+        _ => false,
+    };
+    if !matched {
+        return Err(invalid());
+    }
+    Ok(routed)
+}
+
 /// Observe the normal decoded command after source authentication. No stream
 /// is consumed twice, no body is reconstructed, and no reply is substituted.
 pub(crate) async fn pause_decoded_write_commit_publication(
@@ -220,7 +365,17 @@ pub(crate) async fn pause_decoded_write_commit_publication(
         let observation = &context.observation;
         let mut rules = fabric.faults.lock().unwrap();
         let Some(rule) = rules.iter_mut().find(|rule| {
-            matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+            (matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+                || matches!(&rule.action, FaultAction::PauseExactWriteCommitPublication { operation_id, .. }
+                    if operation_id.starts_with("write:")
+                        && observation.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                        && observation.signer.as_ref().and_then(ServiceSigner::cluster_identity)
+                            .is_some_and(|(node, _)| node == observation.source.as_str())
+                        && command.source_node_id.as_ref() == Some(&observation.source)
+                        && command.durable_replication.as_ref().is_some_and(|purpose| purpose.background_publication)
+                        && command.batch.decoded().is_ok_and(|batch| batch.entries.iter().any(|entry|
+                            matches!(&entry.mutation, crate::DfsMetadataMutation::CommitPreparedOperationV7 { operation_id: actual, digest, .. }
+                                if actual == operation_id && &digest.operation_id == operation_id)))))
                 && rule.source.as_ref().is_none_or(|id| id == &observation.source)
                 && rule.target.as_ref().is_none_or(|id| id == &observation.target)
                 && rule.route.as_ref().is_none_or(|route| route == &observation.route)
@@ -237,7 +392,14 @@ pub(crate) async fn pause_decoded_write_commit_publication(
             return Err(ServiceError::Service("bounded native publication pause exhausted".into()));
         }
         rule.remaining_hits -= 1;
-        let FaultAction::PauseWriteCommitPublication { gate, captured } = &rule.action else { unreachable!() };
+        let (gate, captured) = match &rule.action {
+            FaultAction::PauseWriteCommitPublication { gate, captured } => (gate, captured),
+            FaultAction::PauseExactWriteCommitPublication { gate, captured, .. } => {
+                if captured.lock().unwrap().len() >= 32 { return Err(ServiceError::Service("bounded exact write publication capture exhausted".into())); }
+                (gate, captured)
+            }
+            _ => unreachable!(),
+        };
         captured.lock().unwrap().push(command.clone());
         Ok(Some(Arc::clone(gate)))
     }).unwrap_or(Ok(None))?;
@@ -392,6 +554,13 @@ pub enum FaultAction {
         gate: Arc<Semaphore>,
         captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
     },
+    /// Negative-only hold of an actual decoded background write commit for
+    /// exactly this V7 operation. Unrelated writes/prepares spend no hits.
+    PauseExactWriteCommitPublication {
+        operation_id: String,
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
     /// Pause only an already decoded selected-v2 custody prefix page for this
     /// handoff. Ordinary journal/topology traffic consumes no fault hits.
     PauseSelectedOriginalCustody {
@@ -430,6 +599,9 @@ pub enum FaultAction {
         intent_id: Option<String>,
         captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
     },
+    /// Capture the real completed client-facing write response, then lose its
+    /// delivery. The actual post-auth decoded request supplies correlation.
+    CaptureWriteReplyAndLoseAfterDispatch(Arc<Mutex<Vec<crate::DfsRoutedMessage>>>),
     /// Observe the real Stage head/reply and lose only its completed delivery.
     CaptureStageExchangeAndLoseAfterDispatch(Arc<Mutex<StageExchangeCapture>>),
     /// Observe the actual completed CommitVersion reply without changing it.
@@ -510,6 +682,7 @@ impl Fabric {
             {
                 if let FaultAction::PauseBeforeDispatch(gate)
                 | FaultAction::PauseWriteCommitPublication { gate, .. }
+                | FaultAction::PauseExactWriteCommitPublication { gate, .. }
                 | FaultAction::PauseSelectedOriginalCustody { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
@@ -576,6 +749,7 @@ impl Fabric {
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
                     FaultAction::PauseWriteCommitPublication { .. }
+                    | FaultAction::PauseExactWriteCommitPublication { .. }
                     | FaultAction::PauseSelectedOriginalCustody { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
@@ -794,6 +968,14 @@ impl Carrier {
         self.fabric.record(observation.clone());
         let fault = self.fabric.fault(&observation, &call.request);
         match &fault {
+            Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(_))
+                if observation.route != DFS_DATA_WRITE_ROUTE && observation.route != DFS_DATA_DISTRIBUTED_WRITE_ROUTE =>
+            {
+                return Err(NetworkError::delivery_failed(
+                    "shared DFS write capture scope", NetworkDeliveryState::DefinitelyNotSent,
+                    "write reply capture requires an actual write request route",
+                ));
+            }
             Some(FaultAction::BudgetExhausted) => {
                 return Err(NetworkError::delivery_failed(
                     "shared DFS test before-dispatch fault",
@@ -929,9 +1111,12 @@ impl Carrier {
             Box::new(ReplySink(response_tx)),
         );
         dispatch_started.store(true, Ordering::Release);
+        let write_reply_capture = matches!(&fault, Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(_)))
+            .then(|| Arc::new(Mutex::new(DecodedWriteReplyCapture::default())));
         let native_call = NativeRpcCallContext {
             fabric: Arc::downgrade(&self.fabric),
             observation: observation.clone(),
+            write_reply_capture: write_reply_capture.clone(),
         };
         NATIVE_RPC_CALL_CONTEXT
             .scope(
@@ -1118,6 +1303,37 @@ impl Carrier {
                 "shared DFS test lost captured Stage exchange response",
                 NetworkDeliveryState::PossiblyApplied,
                 "native Stage receiver completed before its original response delivery was discarded",
+            ));
+        }
+        if let Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(captured)) = &fault {
+            if outgoing.response.route != observation.route
+                || (!outgoing.response.body.is_empty() && !outgoing.body.is_empty())
+            {
+                return Err(NetworkError::Serialization { detail: "write capture requires its exact completed value response route, without a semantic attachment".into() });
+            }
+            let expected = {
+                let state = write_reply_capture.as_ref().expect("selected write capture")
+                    .lock().map_err(|_| NetworkError::Serialization { detail: "decoded write capture poisoned".into() })?;
+                if state.invalid { return Err(NetworkError::Serialization { detail: "write capture has conflicting or unsupported decoded request".into() }); }
+                state.identity.clone().ok_or_else(|| NetworkError::Serialization { detail: "write capture has no actual authenticated decoded request".into() })?
+            };
+            // The completed output is consumed exactly once and deliberately
+            // never forwarded or re-encoded: the selected fault loses it.
+            let value = if outgoing.response.body.is_empty() {
+                outgoing.body.collect_to_vec(64 * 1024).await?
+            } else {
+                if outgoing.response.body.len() > 64 * 1024 { return Err(NetworkError::Serialization { detail: "bounded completed write capture exceeded".into() }); }
+                outgoing.response.body.clone()
+            };
+            let response: DfsMessageResponse = sinomo_object_serde::from_bytes(&value)
+                .map_err(|error| NetworkError::Serialization { detail: error.to_string() })?;
+            let routed = captured_write_reply(&expected, &observation, response)?;
+            let mut records = captured.lock().map_err(|_| NetworkError::Serialization { detail: "completed write capture poisoned".into() })?;
+            if records.len() >= 32 { return Err(NetworkError::Serialization { detail: "bounded completed write capture count exceeded".into() }); }
+            records.push(routed);
+            return Err(NetworkError::delivery_failed(
+                "shared DFS test lost captured write response", NetworkDeliveryState::PossiblyApplied,
+                "native write receiver completed before its original response delivery was discarded",
             ));
         }
         if let Some(FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
@@ -5552,7 +5768,7 @@ mod selected_custody_pause_tests {
         let observation = carrier.observation(&target, &call, ClusterObjectRpcOptions::default(), true);
         assert!(fabric.fault(&observation, &call.request).is_none(),
             "the generic predecode fault path cannot consume this subtype rule");
-        let context = NativeRpcCallContext { fabric: Arc::downgrade(&fabric), observation };
+        let context = NativeRpcCallContext { fabric: Arc::downgrade(&fabric), observation, write_reply_capture: None };
         FilterFixture { fabric, context, command, gate, captured }
     }
 
@@ -5643,6 +5859,206 @@ mod selected_custody_pause_tests {
         assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
         assert_eq!(fixture.captured.lock().unwrap().len(), 1);
     }
+
+    #[test]
+    fn exact_write_publication_pause_filters_operation_and_stops_without_spending_other_hits() {
+        // Codec/filter inputs only: these synthetic entries are never applied
+        // and establish no native commit, acknowledgement or authority.
+        let mut fixture = filter_fixture();
+        fixture.context.observation.signer = Some(ServiceSigner::Remote {
+            node_id: fixture.context.observation.source.to_string(),
+            public_key: "filter-input-only".into(),
+        });
+        let operation_id = "write:exact-filter-operation".to_owned();
+        fixture.fabric.faults.lock().unwrap()[0].action =
+            FaultAction::PauseExactWriteCommitPublication {
+                operation_id: operation_id.clone(),
+                gate: Arc::clone(&fixture.gate),
+                captured: Arc::clone(&fixture.captured),
+            };
+        fixture.command.verify_prefix_only = false;
+        fixture.command.prefix_probe = None;
+        fixture.command.durable_replication = Some(DfsMetadataDurableReplication {
+            confirmation_id: "filter-confirmation".into(),
+            background_publication: true,
+        });
+        let shard_id = fixture.command.batch.shard_id.clone();
+        let make_frame = |operation: &str| {
+            let digest = DfsPreparedOperationDigest {
+                protocol_version: 7,
+                file_system_id: crate::sifs_file_system_id(),
+                shard_id: shard_id.clone(),
+                owner_epoch: 1,
+                operation_id: operation.into(),
+                payload_digest: "0".repeat(64),
+                prepare_sequence: 1,
+            };
+            crate::metadata_journal::encode_metadata_journal_frame_record(
+                &DfsMetadataJournalEntry {
+                    shard_id: digest.shard_id.clone(),
+                    sequence: 2,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    mutation: DfsMetadataMutation::CommitPreparedOperationV7 {
+                        file_system_id: digest.file_system_id.clone(),
+                        operation_id: operation.into(),
+                        digest,
+                    },
+                },
+            )
+            .unwrap()
+        };
+        fixture.command.batch.journal_frames = vec![make_frame(&operation_id)];
+        fixture.command.batch.next_after_sequence = 2;
+        let mut other = fixture.command.clone();
+        other.batch.journal_frames = vec![make_frame("write:unrelated")];
+        let mut foreground = fixture.command.clone();
+        foreground
+            .durable_replication
+            .as_mut()
+            .unwrap()
+            .background_publication = false;
+        let mut source = fixture.command.clone();
+        source.source_node_id = Some(fixture.context.observation.target.clone());
+        let mut no_commit = fixture.command.clone();
+        no_commit.batch.journal_frames.clear();
+        let mut context = Context::from_waker(Waker::noop());
+        for command in [&other, &foreground, &source, &no_commit] {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
+                fixture.context.clone(),
+                pause_decoded_write_commit_publication(command),
+            ));
+            assert!(matches!(
+                pause.as_mut().poll(&mut context),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 1);
+        assert!(fixture.captured.lock().unwrap().is_empty());
+        let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
+            fixture.context.clone(),
+            pause_decoded_write_commit_publication(&fixture.command),
+        ));
+        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 0);
+        assert_eq!(
+            *fixture.captured.lock().unwrap(),
+            vec![fixture.command.clone()]
+        );
+        fixture
+            .fabric
+            .close_paused_faults_for_node(&NodeId::generate());
+        assert!(!fixture.gate.is_closed());
+        fixture
+            .fabric
+            .close_paused_faults_for_node(&fixture.context.observation.target);
+        assert!(matches!(
+            pause.as_mut().poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn write_reply_capture_correlates_only_exact_completed_response_data() {
+        // Rejected response DATA exercises the negative helper's correlation;
+        // no actual committed result or native receiver is manufactured.
+        let fixture = filter_fixture();
+        for kind in [
+            CapturedWriteReplyKind::Write,
+            CapturedWriteReplyKind::Distributed,
+        ] {
+            let route = match kind {
+                CapturedWriteReplyKind::Write => DFS_DATA_WRITE_ROUTE,
+                CapturedWriteReplyKind::Distributed => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+            };
+            let object_id = DfsObjectId::generate();
+            let expected = DecodedWriteReplyIdentity {
+                call_id: fixture.context.observation.call_id,
+                source: fixture.context.observation.source.clone(),
+                target: fixture.context.observation.target.clone(),
+                route: route.into(),
+                outer_request_id: "dfs_message_11".into(),
+                frame_id: 11,
+                message_id: 22,
+                request_id: "actual-decoded-write-request".into(),
+                object_id: object_id.clone(),
+                kind,
+            };
+            let mut observation = fixture.context.observation.clone();
+            observation.route = route.into();
+            observation.signer = Some(ServiceSigner::Remote {
+                node_id: expected.source.to_string(),
+                public_key: "correlation-only".into(),
+            });
+            let message = match kind {
+                CapturedWriteReplyKind::Write => {
+                    DfsNetworkMessage::WriteResponse(DfsWriteResponse {
+                        request_id: expected.request_id.clone(),
+                        object_id: object_id.clone(),
+                        result: DfsWriteResult::Rejected {
+                            reason: "correlation-only".into(),
+                        },
+                    })
+                }
+                CapturedWriteReplyKind::Distributed => {
+                    DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                        request_id: expected.request_id.clone(),
+                        object_id: object_id.clone(),
+                        result: DfsDistributedWriteResult::Rejected {
+                            reason: "correlation-only".into(),
+                            current_primary_node_id: None,
+                        },
+                        metadata_journal_batches: Vec::new(),
+                    })
+                }
+            };
+            let routed = DfsRoutedMessage {
+                source_node_id: expected.target.clone(),
+                target_node_id: expected.source.clone(),
+                frame_id: 901,
+                message_id: 902,
+                message,
+            };
+            let response = DfsMessageResponse {
+                request_id: expected.outer_request_id.clone(),
+                outbound_messages: vec![routed.clone()],
+            };
+            assert_eq!(
+                captured_write_reply(&expected, &observation, response.clone()).unwrap(),
+                routed
+            );
+            let mut wrong = response.clone();
+            wrong.request_id.push_str("-other");
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut wrong = response.clone();
+            wrong.outbound_messages.push(routed.clone());
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut wrong = response.clone();
+            wrong.outbound_messages[0].source_node_id = expected.source.clone();
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut wrong = response.clone();
+            wrong.outbound_messages[0].message =
+                DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
+                    request_id: expected.request_id.clone(),
+                    intent_id: "not-a-write-result".into(),
+                    file_system_id: crate::sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    version: DfsVersion::generate(),
+                    replica_node_id: expected.target.clone(),
+                    result: DfsBlobTransferResult::Rejected {
+                        reason: "wrong-family".into(),
+                    },
+                });
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut foreign_call = observation.clone();
+            foreign_call.call_id += 1;
+            assert!(captured_write_reply(&expected, &foreign_call, response.clone()).is_err());
+            let mut foreign_request = expected.clone();
+            foreign_request.request_id.push_str("-other");
+            assert!(captured_write_reply(&foreign_request, &observation, response).is_err());
+        }
+    }
+
 }
 
 #[cfg(test)]
