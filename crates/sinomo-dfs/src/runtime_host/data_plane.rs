@@ -750,7 +750,237 @@ pub(super) async fn handle_daemon_dfs_status_async(
     })?
 }
 
+/// One explicitly requested local-fence effect, never a maintenance caller.
+/// No native metadata/namespace mutation permit spans an authoritative read.
+#[cfg(test)]
+fn install_selected_local_recovery_rpc_owned(
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    owner: &Arc<DaemonDataOwnerLock>,
+    expected_host: &Weak<DfsRuntimeHost>,
+    command: crate::DfsMessageCommand,
+    authenticated_source: NodeId,
+    deadline: std::time::Instant,
+) -> Result<crate::DfsMessageResponse, DfsDataPlaneHostError> {
+    use crate::{
+        DfsSelectedLocalRecoveryFenceRpcData as Data,
+        DfsSelectedLocalRecoveryFenceRpcOutcome as Outcome,
+        DfsSelectedLocalRecoveryFenceRpcResponse as Reply,
+    };
+    let crate::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(request) =
+        &command.routed_message.message
+    else {
+        return Err(DfsDataPlaneHostError::new(
+            "selected recovery ingress has no request",
+        ));
+    };
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir))
+        .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+    let local = state.local_node_id;
+    let response = |outcome| crate::DfsMessageResponse {
+        request_id: command.request_id.clone(),
+        outbound_messages: vec![crate::DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: command.routed_message.source_node_id.clone(),
+            frame_id: command.routed_message.frame_id,
+            message_id: command.routed_message.message_id,
+            message: crate::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(Reply {
+                reservation: request.reservation.clone(),
+                acceptor_node_id: local.clone(),
+                outcome,
+            }),
+        }],
+    };
+    let refused = |reason: String| response(Outcome::Refused { reason });
+    if std::time::Instant::now() >= deadline {
+        return Ok(refused(
+            "selected recovery receiver deadline expired before publication".into(),
+        ));
+    }
+    if command.request_id.is_empty()
+        || command.routed_message.source_node_id != authenticated_source
+        || authenticated_source != request.reservation.ballot.candidate_node_id
+        || authenticated_source == local
+        || command.routed_message.target_node_id != local
+        || request.expected_target != local
+    {
+        return Ok(refused("selected recovery authenticated candidate/carrier/expected target differs from actual local owner".into()));
+    }
+    let check_host = || -> Result<(), DfsDataPlaneHostError> {
+        let expected = expected_host.upgrade().ok_or_else(|| {
+            DfsDataPlaneHostError::new("selected recovery original host disappeared")
+        })?;
+        let current = registered_dfs_runtime_host(data_dir)
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?
+            .ok_or_else(|| {
+                DfsDataPlaneHostError::new("selected recovery registered host disappeared")
+            })?;
+        if !Arc::ptr_eq(&current, &expected) || current.shutting_down.is_cancelled() {
+            return Err(DfsDataPlaneHostError::new(
+                "selected recovery registered host changed or stopped",
+            ));
+        }
+        let held = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+        if !Arc::ptr_eq(&held, owner) {
+            return Err(DfsDataPlaneHostError::new(
+                "selected recovery actual DATA owner changed",
+            ));
+        }
+        Ok(())
+    };
+    if let Err(error) = check_host() {
+        return Ok(refused(error.to_string()));
+    }
+    let layout = match owner.selected_original_data_layout() {
+        Ok(Some(layout)) => layout,
+        Ok(None) => {
+            return Ok(refused(
+                "default owner refuses selected local recovery fence RPC".into(),
+            ));
+        }
+        Err(error) => return Ok(refused(error.to_string())),
+    };
+    if let Err(error) = layout.check_owner(owner) {
+        return Ok(refused(error.to_string()));
+    }
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let Some(mut control) =
+        daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime))
+    else {
+        return Ok(refused(
+            "selected recovery receiver has no authoritative control owner".into(),
+        ));
+    };
+    // Use the independently verified stored request, not a substituted wire
+    // body. R42 validates the full deterministic request and fixed member set.
+    let authoritative = match crate::DfsControlPlaneStore::new(control.as_mut())
+        .verify_metadata_shard_recovery_ballot_before(&request.reservation, &local, deadline)
+    {
+        Ok(crate::control_plane::DfsRecoveryBallotVerify::Verified(actual)) => actual,
+        Ok(crate::control_plane::DfsRecoveryBallotVerify::Refused(reason)) => {
+            return Ok(refused(format!(
+                "selected recovery reservation refused: {reason:?}"
+            )));
+        }
+        Err(error) => return Ok(refused(error.to_string())),
+    };
+    drop(control);
+    let mut service = match open_dfs_runtime_service(data_dir, Some(runtime)) {
+        Ok(service) => service,
+        Err(error) => return Ok(refused(error.to_string())),
+    };
+    if service.node_id() != &local || std::time::Instant::now() >= deadline {
+        return Ok(refused("selected recovery actual service identity or original deadline changed before publication".into()));
+    }
+    let Some((_, service_owner)) = service.native_publication_owner_for_observation() else {
+        return Ok(refused(
+            "selected recovery service lost its actual DATA owner".into(),
+        ));
+    };
+    if !Arc::ptr_eq(&service_owner, owner) {
+        return Ok(refused(
+            "selected recovery service belongs to another DATA owner".into(),
+        ));
+    }
+    if let Err(error) = check_host().and_then(|_| {
+        layout
+            .check_owner(owner)
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))
+    }) {
+        return Ok(refused(error.to_string()));
+    }
+    // From this invocation onward every error is conservative uncertainty:
+    // the atomic publisher may have made bytes visible before a later failure.
+    let installed = match service.install_selected_local_recovery_fence(&authoritative, deadline) {
+        Ok(installed) => installed,
+        Err(error) => {
+            return Ok(response(Outcome::Uncertain {
+                reason: error.to_string(),
+            }));
+        }
+    };
+    let data = Data {
+        fence: installed.data.fence,
+        marker_digest: blake3::hash(&installed.data.marker_bytes)
+            .to_hex()
+            .to_string(),
+        marker_bytes: installed.data.marker_bytes.len() as u64,
+    };
+    let post = check_host().and_then(|_| {
+        layout
+            .check_owner(owner)
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))
+    });
+    let reason = if !installed.reservation_current {
+        Some(
+            installed
+                .post_verification_error
+                .unwrap_or_else(|| "post-publication reservation unavailable".into()),
+        )
+    } else if std::time::Instant::now() >= deadline {
+        Some("selected recovery receiver deadline expired after publication; stored DATA is not a Fenced response".into())
+    } else {
+        post.err().map(|error| error.to_string())
+    };
+    Ok(response(match reason {
+        Some(reason) => Outcome::StoredButUnverified { data, reason },
+        None => Outcome::Fenced { data },
+    }))
+}
+
 impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
+    #[cfg(test)]
+    fn install_selected_local_recovery_fence_rpc<'a>(
+        &'a self,
+        data_dir: Arc<SinomoDataDir>,
+        ingress: crate::service::AuthenticatedSelectedLocalRecoveryFenceIngress,
+    ) -> DfsDataPlaneHostFuture<'a, crate::DfsMessageResponse> {
+        let validation = self.validate_data_dir(&data_dir);
+        let data_owner = self.require_data_owner();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            validation?;
+            let owner = data_owner?;
+            let task_owner = registered_dfs_runtime_host(&data_dir)
+                .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?
+                .ok_or_else(|| {
+                    DfsDataPlaneHostError::new(
+                        "selected recovery receiver has no registered task owner",
+                    )
+                })?;
+            if task_owner.shutting_down.is_cancelled() {
+                return Err(DfsDataPlaneHostError::new(
+                    "selected recovery receiver is shutting down",
+                ));
+            }
+            let expected_host = Arc::downgrade(&task_owner);
+            let (command, source, deadline) = ingress.into_parts();
+            let process_runtime = runtime.clone();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let task = runtime.spawn_blocking(move || {
+                // Actual DATA ownership remains inside the registered host's
+                // task even if the calling RPC future is cancelled.
+                let response = install_selected_local_recovery_rpc_owned(
+                    &data_dir,
+                    &process_runtime,
+                    &owner,
+                    &expected_host,
+                    command,
+                    source,
+                    deadline,
+                );
+                let _ = send.send(response);
+            });
+            task_owner.own_task(task);
+            receive.await.map_err(|error| {
+                DfsDataPlaneHostError::new(format!(
+                    "selected recovery owned receiver ended without a result (uncertain): {error}"
+                ))
+            })?
+        })
+    }
+
     fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsOperatorStatus> {
         let data_owner = self.require_data_owner();
         let paths = self.paths.clone();

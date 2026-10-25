@@ -295,6 +295,10 @@ fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
         DfsNetworkMessage::SelectedOriginalRepair(_) => "selected-original-repair".to_string(),
         DfsNetworkMessage::OriginalRepairHistoryRequest(_) => "original-repair-history-request".to_string(),
         DfsNetworkMessage::OriginalRepairHistoryResponse(_) => "original-repair-history-response".to_string(),
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => "selected-local-recovery-fence-request".to_string(),
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => "selected-local-recovery-fence-response".to_string(),
         DfsNetworkMessage::RepairReplicaResponse(_) => "repair-replica-response".to_string(),
         DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch".to_string(),
         DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
