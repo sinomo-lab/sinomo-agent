@@ -13890,7 +13890,7 @@ fn telemetry_kv_read_views_keep_current_raft_over_stale_materialized_snapshot() 
 }
 
 #[test]
-fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
+fn telemetry_defers_but_connectivity_commits_materialize_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-volatile-deferred-materialized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -13984,15 +13984,24 @@ fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
         read_cluster_kv_snapshot(&paths)
             .expect("materialized after connectivity")
             .revision,
-        materialized_baseline.revision,
-        "multiple volatile updates should coalesce behind the materialized cache"
+        connectivity_snapshot.revision,
+        "committed connectivity must reach independent process projections"
     );
     assert!(
         read_cluster_kv_current_snapshot(&paths)
             .expect("current after connectivity")
             .get(&connectivity_key)
             .is_some(),
-        "deferred connectivity should still be visible through the raft view"
+        "committed connectivity must also remain visible through the raft view"
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("materialized connectivity")
+            .get(&connectivity_key)
+            .expect("connectivity record")
+            .decode::<ClusterConnectivityRecord>()
+            .expect("decode connectivity"),
+        connectivity
     );
 
     let mut renamed_local = state.members[0].clone();
@@ -14021,7 +14030,7 @@ fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
     );
     assert!(
         materialized.get(&connectivity_key).is_some(),
-        "structural flush should include the deferred connectivity record"
+        "structural flush must retain the published connectivity record"
     );
     assert_eq!(
         materialized
@@ -14118,7 +14127,7 @@ fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structura
 }
 
 #[test]
-fn imported_connectivity_route_change_materializes_snapshot() {
+fn imported_connectivity_route_change_and_renewal_materialize_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-imported-connectivity-route");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -14198,7 +14207,6 @@ fn imported_connectivity_route_change_materializes_snapshot() {
         "route read models must see imported connectivity without waiting for a structural import"
     );
 
-    let connectivity_revision = connectivity_snapshot.revision;
     let mut stable_refresh_store =
         InProcessKvStore::restore(connectivity_snapshot).expect("restore connectivity");
     let mut refreshed_connectivity = connectivity;
@@ -14207,20 +14215,29 @@ fn imported_connectivity_route_change_materializes_snapshot() {
     refreshed_connectivity.observed_at = now + time::Duration::seconds(5);
     refreshed_connectivity.expires_at = now + time::Duration::seconds(605);
     stable_refresh_store
-        .put_serde(connectivity_key, &refreshed_connectivity, None)
+        .put_serde(connectivity_key.clone(), &refreshed_connectivity, None)
         .expect("refreshed connectivity");
     let stable_refresh_snapshot = stable_refresh_store.snapshot().expect("snapshot");
 
     assert!(
-        !write_imported_cluster_kv_snapshot_if_changed(&paths, &stable_refresh_snapshot)
+        write_imported_cluster_kv_snapshot_if_changed(&paths, &stable_refresh_snapshot)
             .expect("import stable connectivity refresh"),
-        "stable imported connectivity refreshes should remain deferred while far from expiry"
+        "committed renewals must reach independent readers even without a route change"
     );
     assert_eq!(
         read_cluster_kv_snapshot(&paths)
             .expect("materialized after stable connectivity refresh")
             .revision,
-        connectivity_revision
+        stable_refresh_snapshot.revision
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("renewed materialized connectivity")
+            .get(&connectivity_key)
+            .expect("renewed connectivity record")
+            .decode::<ClusterConnectivityRecord>()
+            .expect("decode renewed connectivity"),
+        refreshed_connectivity
     );
 }
 

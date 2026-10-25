@@ -2665,6 +2665,108 @@ mod observed_snapshot_writer_tests {
         store.try_snapshot().unwrap()
     }
 
+    fn connectivity_projection_visibility_control(imported: bool) {
+        let root = sinomo_testdir::TestDir::new("connectivity-projection-visibility");
+        let writer = ClusterKvPaths::new(root.join("writer"));
+        let reader = if imported {
+            ClusterKvPaths::new(root.join("receiver"))
+        } else {
+            writer.clone()
+        };
+        let node = NodeId::from_legacy_named("connectivity-projection-writer").unwrap();
+        let store = writer.raft_store();
+        store.set_leader_compact(&node, 1).unwrap();
+        let connectivity = "/cluster/network/connectivity/source/target/endpoint";
+        let telemetry = "/cluster/node-status/source";
+        let put = |key: &str, value: &[u8]| KvOp::Put {
+            key: key.into(),
+            value: value.to_vec(),
+            lease_id: None,
+        };
+        let commit = |command| {
+            let result = store
+                .append_command_with_response_and_publish(
+                    &node,
+                    command,
+                    cluster_kv_key_can_defer_materialized_snapshot,
+                )
+                .unwrap();
+            assert!(result.committed_request.log_index > 0);
+            assert_eq!(result.committed_request.term, 1);
+            assert_eq!(result.committed_request.revision, result.snapshot.revision);
+            if imported {
+                write_imported_cluster_kv_snapshot_if_changed_with_observation_report(
+                    &reader,
+                    &result.snapshot,
+                    cluster_kv_key_can_defer_materialized_snapshot,
+                )
+                .unwrap();
+            }
+            result
+        };
+        // Opaque domain values keep KV independent of networking. The actual
+        // publication paths, durable log, and physical projection writer run.
+        commit(KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                put("projection/bootstrap", b"ready"),
+                put(connectivity, b"old"),
+            ],
+            failure: Vec::new(),
+        }));
+        let read_file = || decode_kv_value::<KvSnapshot>(&fs::read(&reader.snapshot).unwrap()).unwrap();
+        assert_eq!(read_file().get(connectivity).unwrap().value, b"old");
+        let initial = fs::read(&reader.snapshot).unwrap();
+        commit(KvCommand::Op(put(telemetry, b"first telemetry")));
+        assert_eq!(
+            fs::read(&reader.snapshot).unwrap(),
+            initial,
+            "ordinary telemetry must retain its existing deferral"
+        );
+
+        let renewal = commit(KvCommand::Op(put(connectivity, b"renewed")));
+        let projected = read_file();
+        assert_eq!(
+            projected.get(connectivity).unwrap().value,
+            b"renewed",
+            "a cold reader must see the committed renewal without a resident Main or another write"
+        );
+        assert_eq!(projected.revision, renewal.snapshot.revision);
+        assert_eq!(
+            cluster_kv_default_read_authority_for_key(connectivity),
+            KvReadAuthority::Local
+        );
+        assert_eq!(
+            cluster_kv_keyspace_class(connectivity),
+            ClusterKvKeyspaceClass::Telemetry
+        );
+
+        let renewed = fs::read(&reader.snapshot).unwrap();
+        commit(KvCommand::Op(put(telemetry, b"second telemetry")));
+        assert_eq!(
+            fs::read(&reader.snapshot).unwrap(),
+            renewed,
+            "the routing exception must not disable subsequent telemetry deferral"
+        );
+        commit(KvCommand::Op(KvOp::Delete {
+            key: connectivity.into(),
+        }));
+        assert!(
+            read_file().get(connectivity).is_none(),
+            "the same writer boundary must expose a committed connectivity withdrawal"
+        );
+    }
+
+    #[test]
+    fn connectivity_renewal_is_visible_in_the_native_writer_projection() {
+        connectivity_projection_visibility_control(false);
+    }
+
+    #[test]
+    fn connectivity_renewal_is_visible_in_the_imported_projection() {
+        connectivity_projection_visibility_control(true);
+    }
+
     fn require_writer_released(path: &Path) {
         let lock_path = KvMaterializedCache::new(path).write_lock_path();
         let file = OpenOptions::new()

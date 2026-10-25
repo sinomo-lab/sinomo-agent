@@ -2360,7 +2360,7 @@ mod tests {
 
     #[test]
     fn cluster_kv_materialized_snapshot_default_defer_policy_covers_high_churn_status_keys() {
-        assert!(cluster_kv_key_can_defer_materialized_snapshot(
+        assert!(!cluster_kv_key_can_defer_materialized_snapshot(
             "/cluster/network/connectivity/node-a/node-b"
         ));
         assert!(cluster_kv_key_can_defer_materialized_snapshot(

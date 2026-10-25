@@ -76,7 +76,12 @@ pub fn cluster_kv_default_read_authority_for_key(key: &str) -> KvReadAuthority {
 }
 
 pub fn cluster_kv_key_may_defer_materialized_projection(key: &str) -> bool {
-    cluster_kv_keyspace_class(key).may_defer_materialized_projection()
+    // Independent shadow/client routing consumes committed connectivity from
+    // this projection. Deferring a renewal can leave those readers with only
+    // expired observations even though the applied Raft view is current.
+    // Keep local read authority and ordinary telemetry deferral unchanged.
+    !key.starts_with("/cluster/network/connectivity/")
+        && cluster_kv_keyspace_class(key).may_defer_materialized_projection()
 }
 
 #[cfg(test)]
