@@ -1,6 +1,50 @@
 # DFS abrupt-node-loss and reconnection availability
 
-## Current development checkpoint — 2026-10-25 R34
+## Current development checkpoint — 2026-10-25 R35
+
+Local commit `50959901897351c9fe75aabc750f27c5b9b6521c` was merged into
+`dev/dfs` at `dbc468316f40208f30036d242543466c4ecc3787` without conflicts.
+The existing selected-private Repair queue now retains completion candidate DATA
+against an existing persisted original and carrier attempt. Its caller remains
+disabled outside test/test-support. This is a bounded persistence primitive,
+not authenticated completion or successor execution.
+
+| Contract | Behavior |
+|---|---|
+| Accepted inputs | Queue incarnation, immutable original digest, exact persisted attempt sequence/carrier, full supplied response and explicit `FixtureUnverifiedTransportMaterial`. Original identity/body digest and response scope must correlate. |
+| Durable output | One immutable candidate per original subject and attempt, with its actual queue append sequence and material digest. The existing framed writer and selected-file/namespace synchronization own persistence. The returned reference grants no effect authority. |
+| Duplicate / conflict | Exact duplicate recertifies the existing record and returns the same reference without append. Changed same-attempt material, missing or foreign birth/attempt, wrong scope and replaced physical owner refuse. |
+| Default compatibility | Ordinary/default APIs and readers reject selected candidate records. Empty snapshot fields remain omitted and existing enum ordinals are preserved. No V1 migration or quarantine is activated. |
+| Reopen / failure | Cold replay and compaction preserve exact DATA and identity. Malformed prefix, duplicates and mixed frames reject before publishing derived state. A namespace-sync failure after append withholds success; retry recertifies the same retained record. This does not prove OS-crash or power-loss behavior. |
+| Disabled effects | No runtime caller, authenticated peer proof, delivery observation, receipt application, Terminal, current B permission, Close or root retirement is added. Candidate records are local; handoff capture does not automatically transfer or certify them. |
+
+Merged source `eaaad7c0` contains 4,905 inputs; sealed executable `b5e06e2d`.
+Fresh check/build/seal passed. All **14 focused file-backed controls passed**:
+eight new candidate controls and six existing queue/history/default/compaction
+controls, each discovered and executed once with its original 30-second cap.
+Current-source DFS/KV lint passed all 11 UI controls and three library analyses.
+Unconditional archives, case checkpoints and owned lifetime cleanup passed.
+Of the 161-ID source inventory, 147 were not rerun; older passes remain separate.
+
+`R35-REPORT.md` and `R35-COMBINED-RESULT.json` under the operation directory
+bind build receipt `3a3ac4e0`, execution `938773df` and boundary `cded7bcb`.
+I98's stale tooling count failed before Cargo. I101 passed typecheck but a tooling
+edit around dispatch caused postcheck hash refusal; no codegen or tests ran in
+that attempt. Both failures, revisions, archives and the corrected loaded-plan
+attribution remain preserved. I102 used frozen tooling and a fresh check.
+
+The next runtime dependency is a distinct, actual transport-owned immutable
+completion/attempt input and custody-only admission under the retired producer's
+physical owner, before current-authority rejection in
+`runtime_host::message_host::owned_repair_completion_scope`. That path must
+return a typed deferred outcome before application. Existing unverified candidate
+records cannot be relabeled as native evidence. Full coverage, C1/current B
+effects, causal withdrawal/settlement, root retirement, metadata majority history
+and abrupt-loss/partition/reconnect/quietness acceptance remain open.
+
+## Historical checkpoints
+
+### Preserved R34 checkpoint
 
 Local merge `1dadb5122963b865f0cb62f5c22141b0457bf0e0` integrates reviewed
 process-storage controls `e17be2cf` without conflicts. Source `32ae5330` has
@@ -42,8 +86,6 @@ custody, current B effects, causal settlement/root retirement, metadata majority
 history and full abrupt-loss/partition/reconnect/quietness acceptance remain open.
 Independent DFS-local ownership continues; no Docker, peer permission workflow,
 production activation, push or cross-lane merge is part of this work.
-
-## Historical checkpoints
 
 ### Preserved R33 checkpoint
 
