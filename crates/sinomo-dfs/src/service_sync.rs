@@ -18,6 +18,11 @@ use sinomo_core::node::NodeId;
 
 use crate::metadata_journal::metadata_prefix_proof_after_exact_frame;
 use crate::metadata_records::DfsMetadataPrefixProof;
+
+#[cfg(test)]
+mod recovery_fence;
+#[cfg(test)]
+pub(crate) use recovery_fence::DfsSelectedLocalRecoveryFenceResult;
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
