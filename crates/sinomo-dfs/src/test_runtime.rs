@@ -771,7 +771,11 @@ impl Fabric {
             self.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
             return Some(FaultAction::BudgetExhausted);
         }
-        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall) {
+        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall
+            | FaultAction::CaptureWriteReplyAndLoseAfterDispatch(_))
+        {
+            // Bind this completed-reply loss to one actual carrier. An exact
+            // operation retry on a distinct call must not consume this rule.
             rule.call_id.get_or_insert(observation.call_id);
         }
         rule.remaining_hits -= 1;
@@ -6057,6 +6061,72 @@ mod selected_custody_pause_tests {
             foreign_request.request_id.push_str("-other");
             assert!(captured_write_reply(&foreign_request, &observation, response).is_err());
         }
+    }
+
+    #[test]
+    fn write_reply_loss_binds_first_call_without_waiving_same_call_budget() {
+        // Selector/lifetime DATA only: no receiver or completed reply is
+        // manufactured, and the deliberate exhausted hit is asserted below.
+        let fixture = filter_fixture();
+        let captured = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+        let mut observation = fixture.context.observation.clone();
+        observation.route = DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into();
+        observation.call_id = 41;
+        let request = ObjectRpcRequest::encode_body(
+            DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+            crate::DFS_RPC_CATEGORY,
+            &"selector-only",
+        )
+        .unwrap();
+        *fixture.fabric.faults.lock().unwrap() = vec![FaultRule {
+            source: Some(observation.source.clone()),
+            target: Some(observation.target.clone()),
+            route: Some(observation.route.clone()),
+            call_id: None,
+            origin: Some(observation.origin),
+            remaining_hits: 1,
+            action: FaultAction::CaptureWriteReplyAndLoseAfterDispatch(Arc::clone(&captured)),
+        }];
+        let mut unrelated = observation.clone();
+        unrelated.route = DFS_DATA_READ_ROUTE.into();
+        assert!(fixture.fabric.fault(&unrelated, &request).is_none());
+        {
+            let rules = fixture.fabric.faults.lock().unwrap();
+            assert_eq!(rules[0].call_id, None);
+            assert_eq!(rules[0].remaining_hits, 1);
+        }
+        assert!(matches!(fixture.fabric.fault(&observation, &request),
+            Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(actual)) if Arc::ptr_eq(&actual, &captured)));
+        {
+            let rules = fixture.fabric.faults.lock().unwrap();
+            assert_eq!(rules[0].call_id, Some(41));
+            assert_eq!(rules[0].remaining_hits, 0);
+        }
+        let mut retry = observation.clone();
+        retry.call_id = 42;
+        assert!(fixture.fabric.fault(&retry, &request).is_none());
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            fixture.fabric.fault(&observation, &request),
+            Some(FaultAction::BudgetExhausted)
+        ));
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
+        retry.call_id = 43;
+        assert!(fixture.fabric.fault(&retry, &request).is_none());
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "selection cannot manufacture a completed reply"
+        );
+        fixture.fabric.faults.lock().unwrap().retain(|rule| !matches!(
+            &rule.action, FaultAction::CaptureWriteReplyAndLoseAfterDispatch(actual) if Arc::ptr_eq(actual, &captured)
+        ));
+        assert!(fixture.fabric.faults.lock().unwrap().is_empty());
+        assert_eq!(
+            Arc::strong_count(&captured),
+            1,
+            "removing the exact rule releases its capture owner"
+        );
     }
 
 }
