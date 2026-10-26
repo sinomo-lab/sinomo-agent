@@ -416,7 +416,7 @@ fn wait_for_native_ping(
         nodes[source].alive_identity()?;
         nodes[target].alive_identity()?;
         std::thread::sleep(
-            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())),
         );
     }
 }
@@ -512,6 +512,49 @@ fn normal_drain(nodes: &mut [NativeNode], report: &mut serde_json::Value) -> Tes
     } else {
         Err(failures.join("; ").into())
     }
+}
+
+fn preserve_native_failure_diagnostics(nodes: &mut [NativeNode], root: &Path) -> serde_json::Value {
+    let mut observations = Vec::new();
+    for (index, node) in nodes.iter_mut().enumerate() {
+        if !node.released || node.alive_identity().is_err() {
+            continue;
+        }
+        for (label, route, category) in [
+            (
+                "status",
+                sinomo_daemon::DAEMON_STATUS_ROUTE,
+                sinomo_daemon::DAEMON_RPC_CATEGORY,
+            ),
+            (
+                "connectivity",
+                sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+                sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
+            ),
+        ] {
+            let result = (|| -> TestResult<serde_json::Value> {
+                let request = ObjectRpcRequest::encode_body(route, category, &())?;
+                let response = local_rpc(node, request, OP_CAP)?;
+                response.error_detail()?;
+                let path = root.join(format!("failure-node-{index}-{label}.sobj"));
+                write_data(&path, &response)?;
+                let value = if label == "status" {
+                    serde_json::to_value(response.decode_body::<sinomo_daemon::DaemonStatus>()?)?
+                } else {
+                    serde_json::to_value(
+                        response
+                            .decode_body::<Vec<sinomo_core::network::ClusterConnectivityRecord>>(
+                            )?,
+                    )?
+                };
+                Ok(serde_json::json!({"actual_response":value,"raw":path}))
+            })();
+            observations.push(serde_json::json!({"node":node.input.node_id,"kind":label,
+                "result":result.as_ref().map(|value|value).map_err(|error|error.to_string()),
+                "qualification":"actual read-only native diagnostics, not a routing/authority certificate"}));
+        }
+    }
+    serde_json::json!(observations)
 }
 
 #[test]
@@ -648,6 +691,10 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
         Ok(Err(e)) => serde_json::json!(e.to_string()),
         Err(_) => serde_json::json!("panic; original assertion retained"),
     };
+    if !matches!(&tested, Ok(Ok(()))) {
+        report["native_failure_diagnostics"] =
+            preserve_native_failure_diagnostics(&mut nodes, &root);
+    }
     let drain = normal_drain(&mut nodes, &mut report);
     report["normal_drain_result"] = serde_json::json!(
         drain
