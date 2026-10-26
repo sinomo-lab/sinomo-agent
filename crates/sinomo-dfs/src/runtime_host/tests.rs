@@ -17549,3 +17549,6 @@ fn actual_runtime_shutdown_cancels_running_maintenance_with_open_component_watch
 }
 
 mod exact_prefix_sync;
+
+#[cfg(unix)]
+mod native_prefix_return;
