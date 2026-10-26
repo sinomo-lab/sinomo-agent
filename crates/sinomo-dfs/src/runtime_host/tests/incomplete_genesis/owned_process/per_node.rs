@@ -73,6 +73,7 @@ enum ProbeKind {
     EndpointDfsStatus,
     EndpointWrongPeer,
     RegisteredEndpointPing,
+    FormationEndpointPing,
     RegisteredEndpointWrongPeer,
     PrefixRound,
 }
@@ -87,9 +88,9 @@ impl ProbeKind {
     fn path(self) -> ProbePath {
         match self {
             Self::Ping | Self::DfsStatus => ProbePath::NodeRouting,
-            Self::RegisteredEndpointPing | Self::RegisteredEndpointWrongPeer => {
-                ProbePath::RegisteredNativeEndpoint
-            }
+            Self::RegisteredEndpointPing
+            | Self::FormationEndpointPing
+            | Self::RegisteredEndpointWrongPeer => ProbePath::RegisteredNativeEndpoint,
             Self::PrefixRound => ProbePath::NativePrefixOwner,
             _ => ProbePath::AuthenticatedEndpoint,
         }
@@ -608,6 +609,7 @@ fn probe(
             | ProbeKind::EndpointPing
             | ProbeKind::EndpointWrongPeer
             | ProbeKind::RegisteredEndpointPing
+            | ProbeKind::FormationEndpointPing
             | ProbeKind::RegisteredEndpointWrongPeer => {
                 assert_eq!(
                     reply.route,
@@ -908,7 +910,7 @@ fn run_native_process_case(
     } else {
         ProbeKind::DfsStatus
     };
-    let mut report = serde_json::json!({"scope":"independent real daemon processes and native authenticated TCP/routed stream calls; no Fabric","explicit_endpoint_diagnostic":endpoint_mode,
+    let mut report = serde_json::json!({"scope":"independent real daemon processes and native authenticated TCP/routed stream calls; no Fabric","explicit_endpoint_diagnostic":endpoint_mode,"formation_native_observation_requested":prefix_round,
         "limits":"initial control voter A, nonvoters B/C; no control-quorum f1/metadata serving/quietness acceptance or private provenance reconstructed",
         "caps":{"startup_seconds":60,"rpc_seconds":5,"owned_reap_seconds":5,"normal_drain_seconds":60},"probes":[]});
     let tested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> TestResult<()> {
@@ -935,7 +937,11 @@ fn run_native_process_case(
                 &mut nodes,
                 source,
                 target,
-                ping_kind,
+                if prefix_round {
+                    ProbeKind::FormationEndpointPing
+                } else {
+                    ping_kind
+                },
                 deadline,
                 &root,
                 &mut report,

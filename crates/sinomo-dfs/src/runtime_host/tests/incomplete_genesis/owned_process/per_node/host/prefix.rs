@@ -98,13 +98,12 @@ fn select(
     let projection = authority
         .retained_complete_prefix_for_generation(generation)
         .ok_or_else(|| refuse("no existing complete current authority projection"))?;
-    let shard = crate::metadata_shards_from_authority_projection(
+    let retained_shards = crate::metadata_shards_from_authority_projection(
         &projection,
         &crate::sifs_file_system_id(),
     )
-    .map_err(refuse)?
-    .into_iter()
-    .find(|shard| {
+    .map_err(refuse)?;
+    let shard = retained_shards.iter().find(|shard| {
         shard.primary_node_id == *source
             && shard.epoch > 0
             && shard.replica_node_ids.len() == 2
@@ -113,9 +112,8 @@ fn select(
                 .collect::<BTreeSet<_>>()
                 == *peers
             && peers.len() == 3
-    })
-    .ok_or_else(|| {
-        refuse("no retained local-primary full-three SIFS assignment for this exact fixture")
+    }).cloned().ok_or_else(|| {
+        refuse(format!("no retained local-primary full-three SIFS assignment for this exact fixture; actual retained assignment DATA: {retained_shards:?}"))
     })?;
     let id = DfsMetadataShardId::new(&shard.shard_id);
     let pending_key =

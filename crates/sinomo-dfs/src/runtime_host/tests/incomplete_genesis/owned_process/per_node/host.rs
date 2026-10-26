@@ -142,6 +142,7 @@ async fn probe(
         | ProbeKind::EndpointPing
         | ProbeKind::EndpointWrongPeer
         | ProbeKind::RegisteredEndpointPing
+        | ProbeKind::FormationEndpointPing
         | ProbeKind::RegisteredEndpointWrongPeer => {
             sinomo_core::cluster::cluster_network_ping_rpc_request(&request.nonce, 0)?
         }
@@ -163,7 +164,9 @@ async fn probe(
         })?;
     let registered_endpoint = matches!(
         request.kind,
-        ProbeKind::RegisteredEndpointPing | ProbeKind::RegisteredEndpointWrongPeer
+        ProbeKind::RegisteredEndpointPing
+            | ProbeKind::FormationEndpointPing
+            | ProbeKind::RegisteredEndpointWrongPeer
     );
     let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint || registered_endpoint {
         let data = SinomoDataDir::new(root);
@@ -237,7 +240,7 @@ async fn probe(
                 &endpoint,
                 ObjectRpcCall::value(wire),
                 ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
-                false,
+                matches!(request.kind, ProbeKind::FormationEndpointPing),
             )?
         } else {
             let mut host = sinomo_daemon::DaemonObjectRpcAsyncHost::direct_only(runtime)
