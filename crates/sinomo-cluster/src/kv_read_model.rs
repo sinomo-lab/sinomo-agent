@@ -659,6 +659,20 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
         read_cluster_connectivity_graph_from_kv(&self.paths)
     }
 
+    fn connectivity_freshness_baseline(&self) -> Result<sinomo_network::DirectoryConnectivityBaseline, NetworkError> {
+        let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.paths)? else {
+            return Ok(sinomo_network::DirectoryConnectivityBaseline {
+                version: sinomo_network::DirectoryVersion(0), records: Vec::new(),
+            });
+        };
+        let projection = read_cluster_directory_projection(&self.paths, snapshot)?;
+        Ok(sinomo_network::DirectoryConnectivityBaseline {
+            version: projection.routing_version,
+            records: projection.connectivity_records.clone(),
+        })
+    }
+
+
     fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
         // Same source as the read methods above (max of the local raft view
         // and the imported snapshot cache): a version computed from a
@@ -1655,3 +1669,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "kv_read_model/live_freshness_tests.rs"]
+mod live_freshness_tests;

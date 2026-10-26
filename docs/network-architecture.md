@@ -145,6 +145,34 @@ cross-process snapshot fence and writer. Publication retries re-read stored
 source data, so a newer source generation wins without replacing its evidence
 with a clock-filtered omission.
 
+Routine liveness refreshes stay in the observing process's memory. The existing
+maintenance owner keeps the 900-second healthy/degraded TTL, 7200-second
+unreachable TTL and 120-second refresh margin. Its deadline follows accepted
+observations; Main binds those observations to confirmed semantic records.
+Uncommitted probe results cannot postpone that deadline. Semantic source changes
+still use the existing source writer and quorum publication. A passive shadow
+accepts only its own observations in RAM, fenced by the shared source snapshot;
+it gains neither publication ownership nor a local Raft dependency.
+
+A cold routed caller can recover live evidence during carrier establishment
+through the existing authenticated `/cluster/network/connectivity` read. It
+accepts remote rows only from their authenticated source, against the exact
+canonical semantic baseline and current member/endpoint bindings, and rechecks
+the directory cut after the reads. A successful direct read also supplies an
+actual local edge observation. Third-party rows cannot renew another source's
+evidence. Reads share the existing establishment deadline, have bounded
+concurrency, and are dropped on completion or cancellation. A pooled live carrier
+needs no such refresh. The original operation is dispatched only after carrier
+establishment, retaining its identity and body.
+
+These observations are lost on process restart. Stored expired rows remain
+expired and serve only as semantic baselines or endpoint hints. Cold startup,
+bootstrap and rejoin are genuine activity and may persist necessary changes;
+time-only refreshes after stabilization do not write. Older peers without usable
+live source evidence cannot make an expired route valid. Neither live evidence
+nor the raw baseline changes the existing read-authority classification,
+semantic routing generation or effect-authority checks.
+
 Routed edge feedback preserves a typed distinction between transport failure and
 identity mismatch. A refused connection, timeout, or expired handshake during
 restart remains eligible for transport recovery; it must not be persisted as a

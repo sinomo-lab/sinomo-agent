@@ -26302,7 +26302,7 @@ fn connectivity_full_sync_batches_large_stale_deletions() {
 }
 
 #[test]
-fn connectivity_sync_refreshes_stable_records_near_expiry() {
+fn connectivity_sync_does_not_persist_time_only_freshness() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-refresh");
     let data_dir = sinomo_local::SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -26331,10 +26331,8 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         last_failure_at: None,
         failure_reason: None,
         observed_at: now - time::Duration::seconds(300),
-        // Inside the connectivity probe margin but outside the generic
-        // network-info margin. Local renewal and KV renewal must stay one
-        // generation so low-frequency node roles cannot let the older KV row
-        // lapse before their next scheduled tick.
+        // Inside the existing probe margin: the live observation may refresh,
+        // but time alone must not author a durable source generation.
         expires_at: now + time::Duration::seconds(90),
     };
     let mut incoming = stored.clone();
@@ -26366,8 +26364,8 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
     .expect("connectivity sync ops");
     assert_eq!(
         ops.len(),
-        1,
-        "stable connectivity records near expiry must refresh their KV TTL"
+        0,
+        "time-only freshness inside the margin must not mutate KV"
     );
 
     stored.expires_at = now + time::Duration::seconds(300);
@@ -26387,7 +26385,7 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
     let ops = cluster_connectivity_full_sync_batch_ops(
         &paths,
         &source_node_id,
-        &[incoming],
+        &[incoming.clone()],
         sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
     )
     .expect("fresh ops");
@@ -26395,6 +26393,19 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         ops.is_empty(),
         "fresh stable connectivity records should not be rewritten just to update timestamps"
     );
+    stored.expires_at = now - time::Duration::seconds(1);
+    let key = cluster_connectivity_key(&stored.source_node_id, &stored.target_node_id, &stored.endpoint_id);
+    store.put_serde(key, &stored, None).unwrap();
+    write_cluster_kv_snapshot(&paths, &store.snapshot().unwrap()).unwrap();
+    assert!(cluster_connectivity_full_sync_batch_ops(
+        &paths, &source_node_id, &[incoming.clone()], sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    ).unwrap().is_empty(), "raw expired canonical rows remain semantic baselines, never live routes");
+    incoming.state = ClusterConnectivityState::Unreachable;
+    incoming.consecutive_failures = 3;
+    assert_eq!(cluster_connectivity_full_sync_batch_ops(
+        &paths, &source_node_id, &[incoming], sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    ).unwrap().len(), 1, "a genuine health transition still requires publication");
+
 }
 
 #[test]

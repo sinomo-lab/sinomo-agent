@@ -72,6 +72,7 @@ pub mod __connectivity_store {
         capture_local_cluster_connectivity_store_snapshot, cluster_connectivity_routing_projection,
         commit_local_cluster_connectivity_observations_if_snapshot,
         commit_local_cluster_connectivity_observations_if_snapshot_async,
+        commit_local_cluster_connectivity_observations_in_memory_if_snapshot_async,
         commit_local_cluster_connectivity_source_set_if_snapshot,
         commit_local_cluster_connectivity_source_set_if_snapshot_async,
         local_cluster_connectivity_content_generation,
@@ -142,6 +143,7 @@ pub use direct_link::{
     write_authenticated_transport_prelude,
 };
 pub use directory::{
+    DirectoryConnectivityBaseline,
     ClusterDirectory, ClusterDirectoryFactory, DirectoryNode, DirectoryRecordsSnapshot,
     DirectoryRoutingRecordsSnapshot, DirectorySnapshot, DirectoryVersion, EmptyClusterDirectory,
     cluster_directory_for, cluster_directory_with_bootstrap_state, set_cluster_directory_provider,

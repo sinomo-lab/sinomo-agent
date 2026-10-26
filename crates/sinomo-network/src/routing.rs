@@ -236,7 +236,7 @@ pub fn plan_routes(
     )
 }
 
-fn plan_routes_with_destination_process_affinity(
+pub(crate) fn plan_routes_with_destination_process_affinity(
     directory: &DirectorySnapshot,
     connectivity: &ConnectivitySnapshot,
     source_node_id: &NodeId,
@@ -3033,6 +3033,23 @@ pub struct MultiHopRoutedConnector {
 }
 
 impl MultiHopRoutedConnector {
+    pub(crate) fn has_live_observed_route(
+        &self, target: &NodeId, affinity: DestinationProcessAffinity,
+    ) -> bool {
+        let connectivity = self.connectivity.snapshot();
+        let now = time::OffsetDateTime::now_utc();
+        plan_routes_with_destination_process_affinity(
+            &self.directory, &connectivity, &self.local_node_id, target,
+            RouteConstraints::default(), affinity,
+        ).iter().any(|path| !path.hops.is_empty() && path.hops.iter().all(|hop| {
+            connectivity.edges().iter().any(|edge| {
+                edge.source_node_id == hop.source_node_id && edge.target_node_id == hop.target_node_id
+                    && edge.endpoint.endpoint_id == hop.endpoint.endpoint_id && edge.expires_at > now
+                    && edge.state != DirectConnectivityState::Unreachable
+            })
+        }))
+    }
+
     pub fn new(
         local_node_id: NodeId,
         directory: Arc<dyn ClusterDirectory>,

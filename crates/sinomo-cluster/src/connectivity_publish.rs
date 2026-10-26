@@ -545,7 +545,7 @@ pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
     snapshot: &KvSnapshot,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
-    now: OffsetDateTime,
+    _now: OffsetDateTime,
     max_ops: usize,
 ) -> Result<Vec<KvOp>, NetworkError> {
     let max_ops = max_ops
@@ -572,12 +572,10 @@ pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
             entry
                 .decode::<ClusterConnectivityRecord>()
                 .is_ok_and(|existing| {
-                    existing == **record
-                        || (cluster_connectivity_stable_eq(&existing, record)
-                            && !cluster_connectivity_record_should_refresh(
-                                existing.expires_at,
-                                now,
-                            ))
+                    // The raw canonical row is the semantic baseline even
+                    // after its timestamp expires. Freshness belongs to the
+                    // accepted live view; time alone cannot create a KV write.
+                    cluster_connectivity_stable_eq(&existing, record)
                 })
         });
         if stable {

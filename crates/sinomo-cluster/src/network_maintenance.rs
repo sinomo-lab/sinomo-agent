@@ -90,9 +90,10 @@ pub struct ClusterNetworkMaintenanceCadence {
     pub connectivity_publish_retry_at: Option<Instant>,
     pub connectivity_input_generation: u64,
     pub connectivity_force_probe: bool,
-    /// Earliest expiry in the last confirmed published source set. Local
-    /// observations and in-flight proposals cannot advance this boundary.
-    pub published_connectivity_expiry: Option<OffsetDateTime>,
+    /// Earliest expiry in the accepted source observation set. Main callers
+    /// bind live freshness to confirmed semantics; passive observers retain
+    /// their own accepted local view. Speculative probes cannot advance it.
+    pub accepted_connectivity_expiry: Option<OffsetDateTime>,
     /// One expiry-derived wake, consumed when its existing due classes claim
     /// work. Retries and bounded convergence retain their existing owners.
     pub connectivity_renewal_at: Option<Instant>,
@@ -136,7 +137,7 @@ impl ClusterNetworkMaintenanceCadence {
             connectivity_publish_retry_at: None,
             connectivity_input_generation: 0,
             connectivity_force_probe: false,
-            published_connectivity_expiry: None,
+            accepted_connectivity_expiry: None,
             connectivity_renewal_at: None,
             connectivity_overdue_claimed: false,
             last_publish,
@@ -221,7 +222,7 @@ impl ClusterNetworkMaintenanceCadence {
         publish_due.min(probe_due).min(discovery_due)
     }
 
-    pub fn observe_published_connectivity_expiries(
+    pub fn observe_accepted_connectivity_expiries(
         &mut self,
         expiries: impl IntoIterator<Item = OffsetDateTime>,
         wall_now: OffsetDateTime,
@@ -237,7 +238,7 @@ impl ClusterNetworkMaintenanceCadence {
                 future = Some(future.map_or(value, |old: OffsetDateTime| old.min(value)));
             }
         }
-        if self.published_connectivity_expiry != expiry
+        if self.accepted_connectivity_expiry != expiry
             || expiry.is_some_and(|value| value > wall_now + margin)
         {
             self.connectivity_overdue_claimed = false;
@@ -261,7 +262,7 @@ impl ClusterNetworkMaintenanceCadence {
                 .ok()
                 .and_then(|delay| now.checked_add(delay))
         });
-        if self.published_connectivity_expiry != expiry || selected.is_none() {
+        if self.accepted_connectivity_expiry != expiry || selected.is_none() {
             self.connectivity_renewal_at = renewal_at;
         } else if let Some(at) = renewal_at {
             self.connectivity_renewal_at = match self.connectivity_renewal_at {
@@ -275,7 +276,7 @@ impl ClusterNetworkMaintenanceCadence {
                 None => None,
             };
         }
-        self.published_connectivity_expiry = expiry;
+        self.accepted_connectivity_expiry = expiry;
     }
 
     pub fn connectivity_renewal_due(&self, now: Instant) -> bool {
@@ -309,7 +310,7 @@ impl ClusterNetworkMaintenanceCadence {
         if (probe || connectivity_publish)
             && self.connectivity_renewal_at.is_some_and(|at| at <= now)
         {
-            // Consume only the wake, never the published expiry. Failed or
+            // Consume only the wake, never the accepted expiry. Failed or
             // cancelled work keeps the existing due-class retry ownership;
             // bounded unfinished probe batches keep convergence ownership.
             self.connectivity_renewal_at = None;
@@ -634,7 +635,7 @@ mod tests {
                     cadence.last_publish = now;
                     cadence.last_probe = now;
                     cadence.last_discovery = now;
-                    cadence.observe_published_connectivity_expiries(
+                    cadence.observe_accepted_connectivity_expiries(
                         Some(wall + time::Duration::seconds(ttl)),
                         wall + time::Duration::seconds(phase),
                         now,
@@ -667,10 +668,10 @@ mod tests {
         let wall = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
         let expiry = wall + time::Duration::seconds(120);
         let mut cadence = renewal_cadence(now);
-        cadence.observe_published_connectivity_expiries(Some(expiry), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(expiry), wall, now);
         assert!(cadence.connectivity_renewal_due(now));
         cadence.claim_due_classes(now, false, true, false, true);
-        assert_eq!(cadence.published_connectivity_expiry, Some(expiry));
+        assert_eq!(cadence.accepted_connectivity_expiry, Some(expiry));
         assert!(cadence.connectivity_renewal_at.is_none());
         // The reactor reports cancellation/timeout of a claimed planning turn
         // through this existing owner boundary, once for each due class.
@@ -693,7 +694,7 @@ mod tests {
             cadence.next_due_duration(retry, false),
             Duration::from_secs(2)
         );
-        assert_eq!(cadence.published_connectivity_expiry, Some(expiry));
+        assert_eq!(cadence.accepted_connectivity_expiry, Some(expiry));
         let completed_retry = retry + Duration::from_secs(2);
         cadence.claim_due_classes(completed_retry, false, true, false, true);
         cadence.take_probe_claim();
@@ -701,7 +702,7 @@ mod tests {
         cadence.record_probe_success();
         cadence.record_connectivity_publish_success(false);
         cadence.connectivity_converged = true;
-        cadence.observe_published_connectivity_expiries(
+        cadence.observe_accepted_connectivity_expiries(
             Some(wall + time::Duration::seconds(900)),
             wall + time::Duration::seconds(3),
             completed_retry,
@@ -717,7 +718,7 @@ mod tests {
         let now = Instant::now();
         let wall = OffsetDateTime::UNIX_EPOCH;
         let mut cadence = renewal_cadence(now);
-        cadence.observe_published_connectivity_expiries(Some(wall), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(wall), wall, now);
         cadence.probe_retry_at = Some(now + Duration::from_secs(8));
         assert!(!cadence.connectivity_renewal_due(now));
         assert_eq!(
@@ -745,7 +746,7 @@ mod tests {
         let wall = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
         let expiry = wall - time::Duration::seconds(1);
         let mut cadence = renewal_cadence(now);
-        cadence.observe_published_connectivity_expiries(Some(expiry), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(expiry), wall, now);
         assert_eq!(cadence.next_due_duration(now, false), Duration::ZERO);
         cadence.claim_due_classes(now, false, true, false, true);
         cadence.take_probe_claim();
@@ -753,7 +754,7 @@ mod tests {
         cadence.finish_connectivity_convergence(false, now);
         for elapsed in [0, 1, 5, 30] {
             let at = now + Duration::from_secs(elapsed);
-            cadence.observe_published_connectivity_expiries(
+            cadence.observe_accepted_connectivity_expiries(
                 Some(expiry),
                 wall + time::Duration::seconds(elapsed as i64),
                 at,
@@ -767,8 +768,8 @@ mod tests {
         // Inactive retained records keep their actual expiry; consuming the
         // scheduler edge never makes them live or invents a renewed value.
         assert!(!sinomo_network::cluster_network_record_live(expiry, wall));
-        cadence.observe_published_connectivity_expiries(None, wall, now);
-        assert!(cadence.published_connectivity_expiry.is_none());
+        cadence.observe_accepted_connectivity_expiries(None, wall, now);
+        assert!(cadence.accepted_connectivity_expiry.is_none());
         assert!(cadence.connectivity_renewal_at.is_none());
     }
 
@@ -778,28 +779,28 @@ mod tests {
         let wall = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
         let expiry = wall + time::Duration::seconds(180);
         let mut cadence = renewal_cadence(now);
-        cadence.observe_published_connectivity_expiries(Some(expiry), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(expiry), wall, now);
         let deadline = cadence.connectivity_renewal_at;
-        cadence.observe_published_connectivity_expiries(
+        cadence.observe_accepted_connectivity_expiries(
             Some(expiry),
             wall - time::Duration::seconds(30),
             now,
         );
         assert_eq!(cadence.connectivity_renewal_at, deadline);
-        cadence.observe_published_connectivity_expiries(
+        cadence.observe_accepted_connectivity_expiries(
             Some(expiry),
             wall + time::Duration::seconds(60),
             now,
         );
         assert!(cadence.connectivity_renewal_due(now));
         cadence.claim_due_classes(now, false, true, false, true);
-        cadence.observe_published_connectivity_expiries(
+        cadence.observe_accepted_connectivity_expiries(
             Some(expiry),
             wall + time::Duration::seconds(61),
             now,
         );
         assert!(cadence.connectivity_renewal_at.is_none());
-        cadence.observe_published_connectivity_expiries(Some(expiry), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(expiry), wall, now);
         assert_eq!(
             cadence.connectivity_renewal_at,
             Some(now + Duration::from_secs(60))
@@ -811,14 +812,14 @@ mod tests {
         let now = Instant::now();
         let wall = OffsetDateTime::UNIX_EPOCH;
         let mut cadence = renewal_cadence(now);
-        cadence.observe_published_connectivity_expiries(Some(wall), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(wall), wall, now);
         cadence.claim_due_classes(now, false, true, false, true);
         cadence.take_probe_claim();
         cadence.take_connectivity_publish_claim();
         cadence.connectivity_converged =
             !cluster_connectivity_probe_result_needs_followup(31, false, false);
         cadence.record_connectivity_publish_success(false);
-        cadence.observe_published_connectivity_expiries(Some(wall), wall, now);
+        cadence.observe_accepted_connectivity_expiries(Some(wall), wall, now);
         assert_eq!(
             cadence.next_due_duration(now, false),
             CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL
@@ -836,13 +837,13 @@ mod tests {
         let overdue = wall - time::Duration::seconds(10);
         let later = wall + time::Duration::seconds(180);
         let mut cadence = renewal_cadence(now);
-        cadence.observe_published_connectivity_expiries([overdue, later], wall, now);
+        cadence.observe_accepted_connectivity_expiries([overdue, later], wall, now);
         assert!(cadence.connectivity_renewal_due(now));
         cadence.claim_due_classes(now, false, true, false, true);
         cadence.take_probe_claim();
         cadence.take_connectivity_publish_claim();
         cadence.finish_connectivity_convergence(false, now);
-        cadence.observe_published_connectivity_expiries([overdue, later], wall, now);
+        cadence.observe_accepted_connectivity_expiries([overdue, later], wall, now);
         assert_eq!(
             cadence.next_due_duration(now, false),
             Duration::from_secs(60)
@@ -850,7 +851,7 @@ mod tests {
         let due = now + Duration::from_secs(60);
         assert!(cadence.connectivity_renewal_due(due));
         cadence.claim_due_classes(due, false, true, false, true);
-        cadence.observe_published_connectivity_expiries(
+        cadence.observe_accepted_connectivity_expiries(
             [overdue, later],
             wall + time::Duration::seconds(60),
             due,
@@ -859,7 +860,7 @@ mod tests {
             cadence.connectivity_renewal_at.is_none(),
             "unchanged overdue rows do not rearm a loop"
         );
-        cadence.observe_published_connectivity_expiries(
+        cadence.observe_accepted_connectivity_expiries(
             [overdue, wall + time::Duration::seconds(960)],
             wall + time::Duration::seconds(60),
             due,
