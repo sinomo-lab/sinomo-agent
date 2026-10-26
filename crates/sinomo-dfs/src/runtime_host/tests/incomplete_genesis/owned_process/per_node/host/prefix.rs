@@ -103,18 +103,76 @@ fn select(
         &crate::sifs_file_system_id(),
     )
     .map_err(refuse)?;
-    let shard = retained_shards.iter().find(|shard| {
-        shard.primary_node_id == *source
-            && shard.epoch > 0
-            && shard.replica_node_ids.len() == 2
-            && std::iter::once(shard.primary_node_id.clone())
-                .chain(shard.replica_node_ids.iter().cloned())
-                .collect::<BTreeSet<_>>()
-                == *peers
-            && peers.len() == 3
-    }).cloned().ok_or_else(|| {
-        refuse(format!("no retained local-primary full-three SIFS assignment for this exact fixture; actual retained assignment DATA: {retained_shards:?}"))
-    })?;
+    let shard = retained_shards
+        .iter()
+        .find(|shard| {
+            shard.primary_node_id == *source
+                && shard.epoch > 0
+                && shard.replica_node_ids.len() == 2
+                && std::iter::once(shard.primary_node_id.clone())
+                    .chain(shard.replica_node_ids.iter().cloned())
+                    .collect::<BTreeSet<_>>()
+                    == *peers
+                && peers.len() == 3
+        })
+        .cloned();
+    let Some(shard) = shard else {
+        let mut genesis = Vec::new();
+        for shard in retained_shards
+            .iter()
+            .filter(|s| {
+                s.primary_node_id == *source && s.epoch == 1 && s.replica_node_ids.is_empty()
+            })
+            .take(3)
+        {
+            check_deadline(deadline)?;
+            let id = DfsMetadataShardId::new(&shard.shard_id);
+            let path = crate::local_dfs_metadata_shard_path(data, &id);
+            if !owner.owns_backend_root(&path) {
+                return Err(refuse(
+                    "genesis observation scope differs from actual DATA owner",
+                ));
+            }
+            let operation = crate::default_cluster::genesis::genesis_operation_id(shard);
+            let observation = crate::local_state::with_current_owned_dfs_shard_inspection(
+                data,
+                &id,
+                |backend| {
+                    let record = backend.prepared_operation_record(&operation)?;
+                    if let Some(record) = &record {
+                        record.validate()?;
+                    }
+                    let digest = backend.prepared_operation_digest(&operation)?;
+                    let matches = digest.as_ref().map(|d| {
+                        d.operation_id == operation
+                            && d.file_system_id == shard.file_system_id
+                            && d.shard_id == id
+                            && d.owner_epoch == shard.epoch
+                    });
+                    let commit = match (&digest, matches) {
+                        (Some(digest), Some(true)) => {
+                            backend.committed_prepared_operation(digest)?
+                        }
+                        _ => None,
+                    };
+                    Ok(
+                        json!({"operation_id":operation,"record_status":record.as_ref().map(|r|r.status),
+                    "original_body_retained":record.is_some(),"digest":digest,"scope_matches":matches,
+                    "exact_commit_sequence":commit.as_ref().map(|entry|entry.sequence),
+                    "exact_commit_created_at":commit.as_ref().map(|entry|entry.created_at),
+                    "qualification":"separate owned inspection DATA only; no current authority or renewed ACK"}),
+                    )
+                },
+            );
+            genesis.push(json!({"shard":id,"inspection":observation.as_ref()
+                .map(|value|value).map_err(|error|error.to_string()),
+                "none_means":"existing owner busy/absent/inconsistent, not missing original proof"}));
+        }
+        check_deadline(deadline)?;
+        return Err(refuse(format!(
+            "no retained local-primary full-three SIFS assignment for this exact fixture; actual retained assignment DATA: {retained_shards:?}; separate current-owned genesis observations: {genesis:?}"
+        )));
+    };
     let id = DfsMetadataShardId::new(&shard.shard_id);
     let pending_key =
         crate::metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id);
