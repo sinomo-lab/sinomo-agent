@@ -11,6 +11,36 @@ pub(crate) const NATIVE_PREFIX_HISTORY_FILE: &str = "native-prefix-history-v1.so
 const MAX_BYTES: u64 = 1024 * 1024;
 const CLASSIFICATION: &str = "historical-native-prefix-round-data-only-v1";
 
+// This whole owner is cfg(test). The cut belongs only to the invoking thread,
+// and observes a real successful storage return; it cannot replace that return.
+type AfterPublicationCut = Box<dyn FnOnce(&Path, Instant)>;
+thread_local! {
+    static AFTER_PUBLICATION_CUT: std::cell::RefCell<Option<AfterPublicationCut>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_after_publication_cut_for_test<T>(
+    action: impl FnOnce(&Path, Instant) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<AfterPublicationCut>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AFTER_PUBLICATION_CUT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(AFTER_PUBLICATION_CUT.with(|slot| {
+        slot.borrow_mut().replace(Box::new(action))
+    }));
+    run()
+}
+
+fn after_real_publication_for_test(path: &Path, deadline: Instant) {
+    let action = AFTER_PUBLICATION_CUT.with(|slot| slot.borrow_mut().take());
+    if let Some(action) = action {
+        action(path, deadline);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum NativePrefixHistoryDeadlineQualification {
@@ -420,6 +450,7 @@ impl LocalSobjMetadataBackend {
                     .sync_all(),
             )
             .map_err(crate::metadata_io::metadata_durable_file_error)?;
+            after_real_publication_for_test(&path, deadline);
             provider
                 .validate_prefix_history_writer(execution, &scope, expected, local, deadline)?;
             if self.read_native_prefix_history_owned()?.as_ref() != Some(&candidate) {

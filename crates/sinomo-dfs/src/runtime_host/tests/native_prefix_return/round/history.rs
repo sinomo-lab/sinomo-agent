@@ -412,3 +412,147 @@ fn native_prefix_history_reopen_after_physical_owner_replacement_refuses_rebindi
         Ok(vec![round])
     });
 }
+
+#[test]
+fn native_prefix_history_post_sync_deadline_retains_uncertainty_without_recertification() {
+    use crate::metadata_backend::native_prefix_history::{
+        NativePrefixHistoryRecord, with_after_publication_cut_for_test,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    run_round(
+        "native-prefix-history-post-sync-expiry",
+        |fixture, report| {
+            report["scope"] = serde_json::json!(
+                "actual native round and actual owning storage success, cut before final validation/return"
+            );
+            report["limits"] = serde_json::json!(
+                "post-sync caller expiry, not fsync failure/SIGKILL/power loss/current authority or kernel quietness acceptance"
+            );
+            let markers = fixture.markers()?;
+            let round = capture(fixture, &target(fixture))?;
+            let original_round_deadline = round.deadline();
+            let path = slot(fixture);
+            assert!(!path.exists());
+            let published = Rc::new(RefCell::new(None));
+            let cut_count = Rc::new(Cell::new(0usize));
+            let at_cut = Rc::clone(&published);
+            let hits = Rc::clone(&cut_count);
+            let expected_path = path.clone();
+            let mut service = fixture.native.metadata_primary_service(SEED)?;
+            let intake_deadline = Instant::now() + CAP;
+            let result = with_after_publication_cut_for_test(
+                move |actual_path, actual_deadline| {
+                    assert_eq!(actual_path, expected_path);
+                    assert_eq!(actual_deadline, intake_deadline);
+                    assert!(
+                        Instant::now() < actual_deadline,
+                        "real storage success must reach the cut before original deadline"
+                    );
+                    hits.set(hits.get() + 1);
+                    *at_cut.borrow_mut() = Some(
+                        file_observation(actual_path).expect("actual published historical bytes"),
+                    );
+                    // No fake storage result or altered Instant: delay this exact
+                    // caller until its already-installed intake budget expires.
+                    loop {
+                        let left = actual_deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left);
+                    }
+                },
+                || service.retain_native_prefix_history(&round, intake_deadline),
+            );
+            report["initial_outcome"] = serde_json::json!({"error":result.as_ref().err().map(ToString::to_string()),
+            "cut_count":cut_count.get(),"intake_deadline_expired":Instant::now() >= intake_deadline,
+            "original_round_deadline_unchanged":round.deadline() == original_round_deadline});
+            let error = result
+                .err()
+                .ok_or("expired post-sync intake incorrectly acknowledged completion")?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("publication/durability uncertain")
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("retained slot is not rolled back")
+            );
+            assert_eq!(cut_count.get(), 1);
+            assert!(Instant::now() >= intake_deadline);
+            assert_eq!(round.deadline(), original_round_deadline);
+            let first = published
+                .borrow_mut()
+                .take()
+                .ok_or("real publication cut was not reached")?;
+            assert_eq!(file_observation(&path)?, first);
+            // Readable, canonical historical DATA is explicitly not a fresh ACK.
+            let record: NativePrefixHistoryRecord =
+                sinomo_core::object::serde_ext::from_bytes(&first.bytes)?;
+            assert_eq!(record.round_id(), round.round_id());
+            assert_eq!(record.target(), round.target());
+            assert_eq!(record.deadline_qualification(), &NativePrefixHistoryDeadlineQualification::OriginalProcessLocalDeadlineEnforcedNotReconstructible);
+            for (old, observed) in record.peers().iter().zip(round.peer_outcomes()) {
+                assert_eq!(old.peer(), observed.peer());
+                assert_eq!(old.command(), observed.command());
+                assert_eq!(
+                    old.attempt_id(),
+                    observed.native_return().unwrap().attempt_id()
+                );
+                assert_eq!(Some(old.response()), observed.response());
+            }
+            assert!(
+                service
+                    .retain_native_prefix_history(&round, intake_deadline)
+                    .is_err()
+            );
+            assert_eq!(file_observation(&path)?, first);
+            drop(service);
+            let primary = fixture.shard.primary_node_id.clone();
+            fixture.native.stop_node(&primary)?;
+            fixture.native.reopen_node(primary)?;
+            let service = fixture.native.metadata_primary_service(SEED)?;
+            let cold = service
+                .read_native_prefix_history(&DfsMetadataShardId::new(&fixture.shard.shard_id))?
+                .unwrap();
+            assert_eq!(cold, record);
+            assert_eq!(file_observation(&path)?, first);
+            drop(service); // no owner lease across the new actual native RPCs
+            let fresh = capture(fixture, round.target())?;
+            assert_ne!(fresh.round_id(), round.round_id());
+            let mut service = fixture.native.metadata_primary_service(SEED)?;
+            let duplicate_cut_count = Rc::new(Cell::new(0usize));
+            let duplicates = Rc::clone(&duplicate_cut_count);
+            let duplicate = with_after_publication_cut_for_test(
+                move |_, _| duplicates.set(duplicates.get() + 1),
+                || service.retain_native_prefix_history(&fresh, Instant::now() + CAP),
+            )?;
+            assert_eq!(
+                duplicate.disposition(),
+                NativePrefixHistoryDisposition::ExistingHistoricalData
+            );
+            assert_eq!(duplicate.record(), &record);
+            assert_eq!(
+                duplicate_cut_count.get(),
+                0,
+                "existing historical DATA cannot call publication/sync again"
+            );
+            assert_eq!(file_observation(&path)?, first);
+            assert_eq!(fixture.markers()?, markers);
+            assert_eq!(round.deadline(), original_round_deadline);
+            report["historical_record"] = serde_json::json!(record);
+            report["original_round"] = observed(&round);
+            report["fresh_round"] = observed(&fresh);
+            report["reopen_and_duplicate"] = serde_json::json!({"disposition":format!("{:?}", duplicate.disposition()),
+            "cold_data_equal":true,"original_record_retained":true,"publication_cut_count":duplicate_cut_count.get(),
+            "file_bytes_identity_mtime_ctime_unchanged":true,"authority_markers_unchanged":true,
+            "file_dev":first.dev,"file_ino":first.ino,"file_mtime":first.mtime,"file_ctime":first.ctime,
+            "first_error_remains_uncertain":error.to_string()});
+            Ok(vec![round, fresh])
+        },
+    );
+}
