@@ -153,6 +153,11 @@ Uncommitted probe results cannot postpone that deadline. Semantic source changes
 still use the existing source writer and quorum publication. A passive shadow
 accepts only its own observations in RAM, fenced by the shared source snapshot;
 it gains neither publication ownership nor a local Raft dependency.
+Peer imports reconcile the actual persisted cut under the same writer lock before
+merging accepted RAM observations. They retain newer freshness only when it still
+matches the persisted semantic record; an unrelated import cannot roll it back
+to the old disk timestamp or persist a passive shadow's uncommitted health change.
+Newer external records and explicit source clears still supersede that cache.
 
 A cold routed caller can recover live evidence during carrier establishment
 through the existing authenticated `/cluster/network/connectivity` read. It
