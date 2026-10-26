@@ -20,19 +20,29 @@ from owned_container_io import IncompleteObservation, OwnedCgroup
 
 SNAPSHOT = r'''
 set -eu
-for pid in $(pgrep -x sinomo); do
+for comm in /proc/[0-9]*/comm; do
+  IFS= read -r name < "$comm" || continue
+  [ "$name" = sinomo ] || continue
+  directory=${comm%/comm}
+  pid=${directory##*/}
   cmd=$(tr '\000' ' ' </proc/$pid/cmdline) || exit 1
   case "$cmd" in
     *" daemon shadow run "*) role=shadow ;;
     *" daemon run "*) role=main ;;
     *) continue ;;
   esac
-  start=$(awk '{print $22}' /proc/$pid/stat)
+  IFS= read -r process_stat < /proc/$pid/stat
+  stat_fields=${process_stat##*) }
+  set -- $stat_fields
+  [ "$#" -ge 20 ] || exit 1
+  shift 19
+  start=$1
+  case "$start" in ''|*[!0-9]*) exit 1 ;; esac
   exe=$(stat -Lc '%d:%i:%s:%Y:%Z' /proc/$pid/exe)
   printf '%s %s %s %s\n' "$role" "$pid" "$start" "$exe"
   printf 'stdout %s %s\n' "$(readlink /proc/$pid/fd/1)" "$(stat -Lc '%f:%d:%i' /proc/$pid/fd/1)"
   printf 'stderr %s %s\n' "$(readlink /proc/$pid/fd/2)" "$(stat -Lc '%f:%d:%i' /proc/$pid/fd/2)"
-  cat /proc/$pid/io
+  while IFS= read -r line; do printf '%s\n' "$line"; done < /proc/$pid/io
 done
 '''
 
