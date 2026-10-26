@@ -21,6 +21,7 @@ fn native_call(
     native: &DfsTestRuntime,
     source: &NodeId,
     command: &DfsMessageCommand,
+    payload: Option<&[u8]>,
 ) -> NativeCall {
     let started = Instant::now();
     let deadline = started + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
@@ -29,9 +30,42 @@ fn native_call(
     let host = registered_dfs_runtime_host(native.data_dir(source))
         .unwrap()
         .unwrap();
+    let rpc = if let Some(bytes) = payload {
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &command.routed_message.message
+        else {
+            panic!("write attachment requires its actual write head")
+        };
+        assert!(write.bytes.is_empty());
+        assert_eq!(
+            write.content_hash.as_deref(),
+            Some(crate::content_hash(bytes).as_str())
+        );
+        assert_eq!(write.content_size_bytes, Some(bytes.len() as u64));
+        let (actual, rpc) = crate::dfs_routed_call_rpc_call(crate::DfsRoutedCall::with_attachment(
+            command.routed_message.clone(),
+            crate::DfsOutboundAttachment {
+                descriptor: crate::DfsRpcAttachmentDescriptor {
+                    total_size_bytes: bytes.len() as u64,
+                    content_hash: write.content_hash.clone(),
+                },
+                source: sinomo_core::network::ObjectRpcBodySource::from_reader(
+                    std::io::Cursor::new(bytes.to_vec()),
+                    Some(bytes.len() as u64),
+                ),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            &actual, command,
+            "canonical transport identity is fixed for both original calls"
+        );
+        rpc
+    } else {
+        crate::dfs_message_rpc_call(command).unwrap()
+    };
     let pending = host.object_rpc.call_async(
         &command.routed_message.target_node_id,
-        crate::dfs_message_rpc_call(command).unwrap(),
+        rpc,
         crate::DfsObjectRpcSendOptions::default()
             .with_overall_timeout(deadline.saturating_duration_since(Instant::now()))
             .cluster_rpc_options(),
@@ -154,6 +188,76 @@ fn legacy_markers(
     result
 }
 
+fn attribute_setup_rebinds(
+    before: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+    after: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) -> serde_json::Value {
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    let mut changes = Vec::new();
+    for (path, old) in before {
+        let new = &after[path];
+        if old == new {
+            continue;
+        }
+        let old: crate::DfsMetadataShardWriteFreeze = sinomo_core::object::serde_ext::from_bytes(
+            old.as_ref()
+                .expect("setup cannot introduce a cooperative marker"),
+        )
+        .unwrap();
+        let mut new: crate::DfsMetadataShardWriteFreeze =
+            sinomo_core::object::serde_ext::from_bytes(
+                new.as_ref()
+                    .expect("setup cannot remove a cooperative marker"),
+            )
+            .unwrap();
+        let observed = new.clone();
+        assert!(
+            old.activated_epoch.is_some(),
+            "only an actual activated setup checkpoint may advance"
+        );
+        assert!(
+            new.rebind_prefix_proof.journal_sequence >= old.rebind_prefix_proof.journal_sequence
+        );
+        let root = path.parent().unwrap().parent().unwrap();
+        let id = DfsMetadataShardId::new(root.file_name().unwrap().to_str().unwrap());
+        let cut = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let current = loop {
+            if let Some(_guard) = crate::metadata_lock::try_metadata_inspection_lock(
+                root.to_owned(),
+                crate::metadata_cursor::journal_write_lock_path(root),
+            )
+            .unwrap()
+            {
+                break crate::metadata_journal::admission::current_owned_materialized_prefix(
+                    root, &id,
+                )
+                .unwrap()
+                .expect("actual setup owner prefix must remain observable");
+            }
+            assert!(
+                Instant::now() < cut,
+                "setup checkpoint inspection keeps its5s bound"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            new.rebind_prefix_proof, current,
+            "setup change must name the actual owned materialized prefix"
+        );
+        new.rebind_prefix_proof = old.rebind_prefix_proof.clone();
+        assert_eq!(
+            new, old,
+            "setup may not rewrite original cooperative identity/cut/custody"
+        );
+        changes.push(serde_json::json!({"path":path,"before":old,"after":observed,"actual_owned_prefix":current,
+            "attribution":"setup catch-up checkpoint, not a probe effect or authority certificate"}));
+    }
+    serde_json::Value::Array(changes)
+}
+
 fn wire_facts(observations: &[RpcObservation]) -> serde_json::Value {
     serde_json::Value::Array(observations.iter().map(|item|serde_json::json!({
         "call_id":item.call_id,"source":item.source,"target":item.target,"route":item.route,
@@ -263,7 +367,7 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         assert!(Instant::now() <= setup_cut);
         drop(setup);
         let legacy = native.metadata_shards().unwrap();
-        let markers = legacy_markers(&native, &nodes, &legacy);
+        let setup_markers = legacy_markers(&native, &nodes, &legacy);
         let host = registered_dfs_runtime_host(native.data_dir(&primary))
             .unwrap()
             .unwrap();
@@ -286,6 +390,8 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         assert!(shard.replica_node_ids.is_empty());
         assert_eq!(shard.epoch, 1);
         let original = phase.original_record().clone();
+        let prepared_markers = legacy_markers(&native, &nodes, &legacy);
+        let setup_rebinds = attribute_setup_rebinds(&setup_markers, &prepared_markers);
         assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
         assert!(original.committed_entry.is_none());
         assert!(phase.deferral_hits() > 0);
@@ -316,7 +422,7 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
             requesting_node_id: primary.clone(),
         };
         write.expected_base_version = None;
-        write.bytes = bytes.clone();
+        write.bytes.clear();
         write.content_hash = Some(hash.clone());
         write.content_size_bytes = Some(bytes.len() as u64);
         write.requester_blob_pre_staged = false;
@@ -335,12 +441,12 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         metadata.current_locations.clear();
         metadata.policy = DfsObjectPolicy::ReplicatedEventual;
         let write_body = write.clone();
-        let write_command = test_dfs_message_command("incomplete-genesis-write-outer", routed);
+        let write_command = test_dfs_message_command("dfs_message_90", routed);
         assert!(matches!(
             dfs_message_execution_scope(&write_command),
             DfsMessageExecutionScope::ExactShard { .. }
         ));
-        let rename = DfsNamespaceCommand {
+        let mut rename = DfsNamespaceCommand {
             request_id: format!("incomplete-rename-{}", sinomo_core::Id::generate()),
             file_system_id: shard.file_system_id.clone(),
             requesting_node_id: primary.clone(),
@@ -352,6 +458,9 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
                 to: rename_target.clone(),
             },
         };
+        rename.authority_shards=crate::NetworkedDfsService::<crate::DfsNodeTransport>::affected_namespace_shards_from_snapshot(
+            &shard.file_system_id,&rename.operation,&native.metadata_shards().unwrap()).unwrap();
+        assert!(!rename.authority_shards.is_empty());
         let rename_command = command(
             &primary,
             DfsNetworkMessage::NamespaceRequest(rename.clone()),
@@ -378,13 +487,15 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let markers = legacy_markers(&native, &nodes, &legacy);
+        let prepared_rebinds = attribute_setup_rebinds(&prepared_markers, &markers);
         let prior = native
             .rpc_observations()
             .into_iter()
             .map(|event| event.call_id)
             .collect::<BTreeSet<_>>();
-        let first_write = native_call(&native, &primary, &write_command);
-        let first_rename = native_call(&native, &primary, &rename_command);
+        let first_write = native_call(&native, &primary, &write_command, Some(&bytes));
+        let first_rename = native_call(&native, &primary, &rename_command, None);
         let before_completion = native
             .rpc_observations()
             .into_iter()
@@ -408,6 +519,10 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         report["original"] = serde_json::to_value(&original).unwrap();
         report["write_command"] = serde_json::to_value(&write_command).unwrap();
         report["rename_command"] = serde_json::to_value(&rename_command).unwrap();
+        report["write_payload"] = serde_json::json!({"bytes":bytes,"hash":hash,"size":bytes.len(),"transport":"canonical owned-reader attachment; inline head empty"});
+        report["legacy_marker_boundaries"] = serde_json::json!({"after_setup":setup_markers,"after_retained_handles_and_phase":prepared_markers,
+            "immediately_before_probes":markers,"immediately_after_probes":markers_after,
+            "setup_rebinds":setup_rebinds,"prepared_rebinds":prepared_rebinds});
         report["before_completion"] = serde_json::json!({"write":first_write.response,"write_elapsed":format!("{:?}",first_write.elapsed),
             "rename":first_rename.response,"rename_elapsed":format!("{:?}",first_rename.elapsed),
             "write_expired":first_write.expired,"rename_expired":first_rename.expired,
@@ -435,8 +550,14 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
                     .into_iter()
                     .map(|event| event.call_id)
                     .collect();
-                valid_write = Some(native_call(&native, &primary, &write_command));
-                valid_rename = Some(native_call(&native, &primary, &rename_command));
+                let current_stamps=crate::NetworkedDfsService::<crate::DfsNodeTransport>::affected_namespace_shards_from_snapshot(
+                    &shard.file_system_id,&rename.operation,&native.metadata_shards().unwrap()).unwrap();
+                assert_eq!(
+                    current_stamps, rename.authority_shards,
+                    "the same request body retains its actual authority assignment"
+                );
+                valid_write = Some(native_call(&native, &primary, &write_command, Some(&bytes)));
+                valid_rename = Some(native_call(&native, &primary, &rename_command, None));
             }
             sync = Some(synced);
         }
@@ -474,6 +595,44 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         file.sync_all().unwrap();
         eprintln!("INCOMPLETE_GENESIS_NATIVE_REPORT {}", path.display());
         assert_eq!(native.observation_dropped_count(), 0);
+        let committed = completed.as_ref().unwrap();
+        assert_eq!(committed.digest, original.digest);
+        assert_eq!(committed.payload, original.payload);
+        assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+        assert!(committed.committed_entry.is_some());
+        let committed_frame = completion_frames
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|frame| {
+                frame.entry.sequence == committed.committed_entry.as_ref().unwrap().sequence
+            })
+            .unwrap();
+        assert_eq!(
+            crate::DfsPreparedOperationCommitReference::from_journal_entry(&committed_frame.entry)
+                .unwrap(),
+            **committed.committed_entry.as_ref().unwrap()
+        );
+        let certificate = sync.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(certificate.acknowledged_node_ids, vec![primary.clone()]);
+        assert_eq!(certificate.target.expected_shard.as_ref(), Some(&shard));
+        assert_eq!(
+            certificate.quorum_size, 1,
+            "full assigned set is singleton, not a fixed3 proof"
+        );
+        assert!(
+            write_committed(valid_write.as_ref().unwrap(), &write_body),
+            "same original write shape must be valid after exact owner completion"
+        );
+        let rename_call = valid_rename.as_ref().unwrap();
+        assert!(!rename_call.expired);
+        assert!(rename_call.response.as_ref().unwrap().outbound_messages.iter().any(|frame|
+            matches!(&frame.message,DfsNetworkMessage::NamespaceResponse(reply) if reply.request_id==rename.request_id && matches!(reply.result,DfsNamespaceResult::Applied))));
+        assert!(
+            !effect_routes(&post_control, &primary).is_empty(),
+            "valid post-completion control must use the real remote content path"
+        );
+        // Only valid post-completion inputs can support a gate conclusion.
         assert_eq!(
             current_original.as_ref().unwrap(),
             &original,
@@ -511,43 +670,6 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         assert!(
             effect_routes(&before_completion, &primary).is_empty(),
             "incomplete scope emitted actual content-effect RPCs; retained evidence distinguishes delivery/effect"
-        );
-        let committed = completed.as_ref().unwrap();
-        assert_eq!(committed.digest, original.digest);
-        assert_eq!(committed.payload, original.payload);
-        assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
-        assert!(committed.committed_entry.is_some());
-        let committed_frame = completion_frames
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|frame| {
-                frame.entry.sequence == committed.committed_entry.as_ref().unwrap().sequence
-            })
-            .unwrap();
-        assert_eq!(
-            crate::DfsPreparedOperationCommitReference::from_journal_entry(&committed_frame.entry)
-                .unwrap(),
-            **committed.committed_entry.as_ref().unwrap()
-        );
-        let certificate = sync.as_ref().unwrap().as_ref().unwrap();
-        assert_eq!(certificate.acknowledged_node_ids, vec![primary.clone()]);
-        assert_eq!(certificate.target.expected_shard.as_ref(), Some(&shard));
-        assert_eq!(
-            certificate.quorum_size, 1,
-            "full assigned set is singleton, not a fixed3 proof"
-        );
-        assert!(
-            write_committed(valid_write.as_ref().unwrap(), &write_body),
-            "same original write shape must be valid after exact owner completion"
-        );
-        let rename_call = valid_rename.as_ref().unwrap();
-        assert!(!rename_call.expired);
-        assert!(rename_call.response.as_ref().unwrap().outbound_messages.iter().any(|frame|
-            matches!(&frame.message,DfsNetworkMessage::NamespaceResponse(reply) if reply.request_id==rename.request_id && matches!(reply.result,DfsNamespaceResult::Applied))));
-        assert!(
-            !effect_routes(&post_control, &primary).is_empty(),
-            "valid post-completion control must use the real remote content path"
         );
         drop(phase);
         drop(stores);
