@@ -20,6 +20,7 @@
 #   SINOMO_GATE_QUIESCE_WAIT    initial settle delay after readiness
 #   SINOMO_GATE_QUIESCE_WINDOW  zero-write window required after the settle deadline
 #   SINOMO_GATE_QUIESCE_TIMEOUT maximum seconds to find a full zero-write window
+#   SINOMO_GATE_NO_QUIET_RETRY=1 fail after the first fixed quiet window
 #   SINOMO_GATE_OWNED_IO_ARTIFACTS opt into complete stable-container I/O evidence
 
 # These helpers target the dev cluster compose file regardless of the caller's
@@ -44,7 +45,13 @@ CYCLES="${SINOMO_GATE_CYCLES:-1}"
 QUIESCE_WAIT="${SINOMO_GATE_QUIESCE_WAIT:-10}"
 QUIESCE_WINDOW="${SINOMO_GATE_QUIESCE_WINDOW:-135}"
 QUIESCE_TIMEOUT="${SINOMO_GATE_QUIESCE_TIMEOUT:-600}"
+NO_QUIET_RETRY="${SINOMO_GATE_NO_QUIET_RETRY:-0}"
 MEASURE_NODES="${SINOMO_GATE_IDLE_NODES:-node1 node2 node3 node4 node5 node6}"
+
+case "$NO_QUIET_RETRY" in
+  0|1) ;;
+  *) echo "SINOMO_GATE_NO_QUIET_RETRY must be 0 or 1"; exit 2 ;;
+esac
 
 case "$IDLE_WINDOW:$BRIDGE_RECOVERY_WAIT:$FORMATION_WAIT:$POLL_INTERVAL:$COMMAND_TIMEOUT:$EXPECTED_MAINS:$CYCLES:$QUIESCE_WAIT:$QUIESCE_WINDOW:$QUIESCE_TIMEOUT" in
   *[!0-9:]*)
@@ -217,6 +224,10 @@ enforce_idle_write_stability() {
         echo "owned I/O observation incomplete; preserving failed coverage, no reset/stitching"
         exit "$owned_status"
       fi
+      if [ "$NO_QUIET_RETRY" = 1 ]; then
+        echo "first fixed owned quiet window failed; retaining evidence without phase search"
+        exit 1
+      fi
       now="$(date +%s)"
       if [ $(( now + QUIESCE_WINDOW )) -gt "$deadline" ]; then
         break
@@ -270,6 +281,10 @@ enforce_idle_write_stability() {
 
     echo "daemon block writes still settling on attempt ${attempt}; delta=${total_delta}B over ${QUIESCE_WINDOW}s"
     echo "nonzero node deltas: $delta_details"
+    if [ "$NO_QUIET_RETRY" = 1 ]; then
+      echo "first fixed quiet window failed; retaining evidence without phase search"
+      exit 1
+    fi
     now="$(date +%s)"
     if [ $(( now + QUIESCE_WINDOW )) -gt "$deadline" ]; then
       break
