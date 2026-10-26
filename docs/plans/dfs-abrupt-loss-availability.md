@@ -15,7 +15,44 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R83 / bounded R84 continuation
+## Current development checkpoint — 2026-10-26 R85 / native formation observation
+
+R84 source `67936e50` actually exercised the unchanged60s window: **0PASS/1FAIL,
+257 other inventory controlsUNRUN**. Thirty rounds retained90 source refusals;
+readiness advanced naturally, then87 observations found no qualifying full3
+local-primary SIFS assignment. No PREFIX peer send or A kill occurred. The
+original NonVoting fixture excludes B/C from DFS service eligibility by the
+existing `dfs_service_members` rule; actual native status confirmed those roles.
+R84's raw lint execution passed, but final aggregation refused after a later
+parent-test edit advanced current source; partial receipt and all raw outputs
+remain preserved, with no completed gate or pass transferred.
+
+R85 `253de9b3`/`dc574227`, merged at `dc55152d`, adds only an explicit fresh fixture
+mode: A remains sole voter; B/C use native Learner role/state/capabilities before
+configuration reaches any daemon. Defaults retain NonVoting. No retained role,
+WAL, assignment, catch-up proof or control vote is rewritten. Source `50236735`
+/4,934 inputs passed fresh check/build/seal and its own full boundary gate.
+I268 actually **1PASS/1FAIL/256 other inventory controlsUNRUN**: the default
+registered-endpoint A-loss regression passed; the learner PREFIX case still
+failed after30 rounds/90 source observations without any PREFIX peer send or
+A kill. Native status confirmed learner roles, but all three saved native
+connectivity views remained empty. Eligibility alone did not complete formation.
+R85 combined receipt `9b8b4901` retains391-file verified archives and35 known
+identity/group/scope/cgroup/root drains; R84 combined receipt `53f4386b` retains
+its separate failure and partial lint qualification. No old pass transfers.
+
+The next finite test-only change `d9ce73ca` requests the existing native endpoint
+observation path for the six fresh formation pings. Observations come from actual
+authenticated endpoint returns through the real daemon adapter, never inserted
+edges or parent-supplied frames. Ordinary diagnostics, wrong-peer/dead-A calls,
+PREFIX source guards, endpoint privacy, physical/current authority and full
+participant checks stay unchanged. Actual retained assignment DATA is included
+on selection refusal. Original60s/5s/600s bounds remain fixed. This successor is
+uncompiled/unrun at this checkpoint; native formation must actually succeed, or
+its exact refusal stays failed. No new serving/genesis/C1 activation, synthetic
+quorum, quietness pass, Docker/production or rollout dependency is introduced.
+
+## Historical development checkpoint — 2026-10-26 R83 / bounded R84 continuation
 
 R83 integrated `8a100330`/`11524c55`/`768acb85`/`96e924bb` at `545815e0`
 without conflicts. The actual registered component carrier now exposes one
