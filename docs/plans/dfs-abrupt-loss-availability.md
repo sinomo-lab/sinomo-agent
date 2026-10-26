@@ -15,7 +15,68 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R71
+## Current development checkpoint — 2026-10-26 R74
+
+The finite healthy-full3 retained constructor is implemented in `cb566cd4`,
+integrated with native process controls `40f16fac`/`97284d3f` at `7e73a420`.
+Only existing test-runtime physical/roster/Raft reconstruction is shared with
+the singleton path. Old Prepared original/frame/no-marker validation and
+negative-deferral-before-mount ordering remain separate. Healthy capture uses
+an actual complete private native round, actual full3 roots, committed native
+genesis outcome or validated eviction/commit reference, exact prefixes/fences,
+and bounded authoritative assignment/proof reads with no pending handoff.
+Reopen uses existing WAL owners/pins/bridge and ordinary readiness; manifests
+and historical DATA never reconstruct private provenance or serving permission.
+
+R72/I215 remains FAILED101 on one E0283 test collection annotation, all251UNRUN.
+Correction `9ca8758f` is type-only. R73/I220 actually passed the existing
+singleton process regression but failed the healthy helper before Ready:
+**1PASS/1FAIL/249otherUNRUN**, no healthy kill/reopen. Saved head hints1/7/7
+exposed the new helper's incorrect literal equality test for a derived hint.
+Correction `bcbee0f1` uses the existing inspection owner's max(hint,prefix+1)
+rule while retaining exact prefix equality, ahead-hint refusal and independent
+later-frame rejection. Corrected live observations show prefix6, hint1,
+logical-next7 and no later frame. No authority, participant or deadline check
+was weakened; failed evidence remains unchanged.
+
+Current R74 code `bcbee0f1`, source `b3f2c5c1` /4,931 inputs, passed fresh
+check/build/seal. I224 healthy returned-intake SIGKILL/reopen passed; development
+then continued to I225 actual post-sync-before-return SIGKILL on the SAME sealed
+source/ELF, also passed. **2PASS/249 other inventory controlsUNRUN** on R74.
+The old singleton pass remains qualified only to R73; its shared/source blocks
+were unchanged by the healthy-only correction. I226 full DFS/KV boundary passed
+11UI controls and three library analyses. No earlier pass is transferred.
+
+Each healthy control pins live roots, verifies exact PID/start/group/UID, kills
+and reaps that child with SIGKILL, and saves raw files BEFORE any native
+validation/open. Six negative preflights leave every raw byte unchanged. Exact
+preflight is also non-mutating. Reopened native owners retain physical identity,
+satisfy actual readiness/ReadIndex, and produce NEW authenticated full-set
+PREFIX evidence; no DATA reconstruction of capability occurs. The first
+historical record stays unchanged as ExistingHistoricalData. In I225 the parent
+kills before the unchanged5s intake deadline and before its return; its original
+outcome remains unknown, with no renewed ACK. Raw captures are158files/601720B
+and158files/593143B; these are preservation volume, not activity I/O budgets.
+
+R74-REPORT.md / combined receipt `fded72df` retains exact source/ELF, source-specific
+outcomes, failed helper evidence, standard measurement/coverage tables and
+56-identity/group/scope/cgroup/root drain. Source/artifact R70/R71 and all prior
+failures remain immutable. Healthy process restart uses existing OS file cache;
+no disk power-loss or absolute-zero quietness result is inferred.
+
+The next acceptance boundary is specific: test_runtime::Node reconcilers and
+Fabric run in one OS process. `stop_node` cooperatively drains. Whole-fixture
+SIGKILL cannot prove single-A loss while B/C survive. A separately owned
+per-node process lifecycle plus actual native cross-process transport is needed
+before that claim; component stop, synthetic decoded returns or a manifest
+cannot substitute. Metadata surviving-W/N publication also still lacks the
+complete reviewed durable promise/history/decision/custody authority protocol;
+full configured-participant checks remain unchanged. No new serving/genesis/C1
+protocol activation, effect/receipt/Close/root-release permission, Docker or
+production action, model/account switch, peer arbitration or main-rollout
+dependency was introduced.
+
+## Historical development checkpoint — 2026-10-26 R71
 
 After completing the requested R70 post-sync deadline cut, development continued
 to canonical historical-record refusal. Test-only `912300b4`, source `75d4836a`
