@@ -431,7 +431,9 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
             .filter(|node| **node != primary)
             .cloned()
             .collect();
-        write.policy = DfsReplicationPolicy::new(1, 2).unwrap();
+        // Require a remote receipt in this SAME pre/post request: W1 may
+        // acknowledge local commit and defer the desired N2 repair.
+        write.policy = DfsReplicationPolicy::new(2, 2).unwrap();
         write.authority_shard = Some(shard.clone());
         write.touch_parent_on_create = true;
         write.foreground_replica_repair = true;
@@ -911,6 +913,252 @@ fn native_held_genesis_preserves_unrelated_ready_scope_mutation_and_owner_comple
         assert_eq!(synced.quorum_size, 1);
         assert_eq!(native.observation_dropped_count(), 0);
         drop(phase);
+    }));
+    let closed = native.close();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    closed.unwrap();
+}
+
+#[test]
+fn native_cold_owner_preserves_held_genesis_before_stamped_write_effects() {
+    let (native, nodes) = DfsTestRuntime::start_cluster("native-cold-held-genesis", 3).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let primary = native.root_shard().unwrap().primary_node_id;
+        let prefix = crate::sifs_node_path(&primary);
+        let path = format!("{prefix}/cold-held-write.bin");
+        // Retain only real content readers before the held phase/cache cut.
+        // Opening a Core service after eviction would change the cold premise.
+        let stores = nodes
+            .iter()
+            .map(|node| {
+                let client = native.client(node).unwrap();
+                (node.clone(), client.content().clone())
+            })
+            .collect::<Vec<_>>();
+        let legacy = native.metadata_shards().unwrap();
+        let setup_markers = legacy_markers(&native, &nodes, &legacy);
+        let phase = native
+            .begin_deferred_native_genesis("cold-held-native-node-scope", &prefix)
+            .unwrap();
+        let shard = phase.shard().clone();
+        let original = phase.original_record().clone();
+        assert_eq!(shard.primary_node_id, primary);
+        assert!(shard.replica_node_ids.is_empty());
+        assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+        assert!(original.committed_entry.is_none());
+        assert!(phase.deferral_hits() > 0);
+        let prepared_markers = legacy_markers(&native, &nodes, &legacy);
+        let setup_rebinds = attribute_setup_rebinds(&setup_markers, &prepared_markers);
+        let root = crate::local_dfs_metadata_shard_path(
+            native.data_dir(&primary),
+            &DfsMetadataShardId::new(&shard.shard_id),
+        );
+        let bytes = vec![0x6b; 4096];
+        let hash = crate::content_hash(&bytes);
+        let object = DfsObjectId::generate();
+        let version = DfsVersion::generate();
+        let mut routed = test_dfs_write_routed_message(&primary, &primary, 293, &path);
+        let DfsNetworkMessage::DistributedWriteRequest(write) = &mut routed.message else {
+            unreachable!()
+        };
+        write.request_id = format!("cold-held-write-{}", sinomo_core::Id::generate());
+        write.request = sinomo_core::DfsWriteRequest {
+            file_system_id: shard.file_system_id.clone(),
+            object_id: object.clone(),
+            target_version: version.clone(),
+            requesting_node_id: primary.clone(),
+        };
+        write.expected_base_version = None;
+        write.bytes.clear();
+        write.content_hash = Some(hash.clone());
+        write.content_size_bytes = Some(bytes.len() as u64);
+        write.requester_blob_pre_staged = false;
+        write.desired_replica_nodes = nodes
+            .iter()
+            .filter(|node| **node != primary)
+            .cloned()
+            .collect();
+        write.policy = DfsReplicationPolicy::new(1, 2).unwrap();
+        write.authority_shard = Some(shard.clone());
+        write.touch_parent_on_create = true;
+        write.foreground_replica_repair = true;
+        write.exclusive_create = false;
+        let metadata = write.object_metadata.as_mut().unwrap();
+        metadata.object_id = object.clone();
+        metadata.current_locations.clear();
+        metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+        let body = write.clone();
+        let request = test_dfs_message_command("dfs_message_293", routed);
+        assert!(matches!(
+            dfs_message_execution_scope(&request),
+            DfsMessageExecutionScope::ExactShard { .. }
+        ));
+        let before_frames = actual_frames(&root);
+        let before_content = content_facts(&stores, &object, &version, &hash);
+        let candidates = || {
+            stores
+                .iter()
+                .map(|(node, store)| {
+                    (
+                        node.clone(),
+                        store
+                            .blob_storage_candidate_exists(&hash)
+                            .map_err(|error| error.to_string()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before_candidates = candidates();
+        let markers = legacy_markers(&native, &nodes, &legacy);
+        let prepared_rebinds = attribute_setup_rebinds(&prepared_markers, &markers);
+        let cold_opens = Arc::new(AtomicUsize::new(0));
+        let observed_opens = Arc::clone(&cold_opens);
+        let hook = super::super::message_host::install_daemon_dfs_pre_dispatch_test_hook(
+            native.data_dir(&primary),
+            Arc::new(move |point, _, _| {
+                if point
+                    == super::super::message_host::DaemonDfsPreDispatchTestPoint::BeforeResidentBackendOpen
+                {
+                    observed_opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(())
+            }),
+        );
+        let scheduler = daemon_dfs_mutation_scheduler(native.data_dir(&primary)).unwrap();
+        let eviction_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let admission = native.runtime_handle().block_on(async {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(eviction_deadline),
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+            )
+            .await
+            .expect("cache eviction admission keeps its original5s")
+            .unwrap()
+        });
+        let evicted = evict_daemon_dfs_message_service_cache(native.data_dir(&primary)).unwrap();
+        drop(admission);
+        assert!(evicted, "evict the actual mounted owner's warm cache");
+        assert!(Instant::now() <= eviction_deadline);
+        let prior = native
+            .rpc_observations()
+            .into_iter()
+            .map(|event| event.call_id)
+            .collect::<BTreeSet<_>>();
+        // This registry-only caller neither opens Core nor recovers Prepared.
+        let held = native_call(&native, &primary, &request, Some(&bytes));
+        let held_cold_opens = cold_opens.load(std::sync::atomic::Ordering::SeqCst);
+        drop(hook);
+        let while_held = native.read_deferred_native_genesis(&phase);
+        let after_frames = actual_frames(&root);
+        let after_content = content_facts(&stores, &object, &version, &hash);
+        let after_candidates = candidates();
+        let markers_after = legacy_markers(&native, &nodes, &legacy);
+        let current_assignment = native.metadata_shards().map(|shards| {
+            shards
+                .into_iter()
+                .find(|current| current.shard_id == shard.shard_id)
+        });
+        let held_wire = native
+            .rpc_observations()
+            .into_iter()
+            .filter(|event| !prior.contains(&event.call_id))
+            .collect::<Vec<_>>();
+        // Preserve the valid post-control even if the held request was unsafe.
+        // Only this explicit normal owner may complete the SAME genesis.
+        let completed = native.complete_deferred_native_genesis(&phase);
+        let synced = completed
+            .as_ref()
+            .ok()
+            .map(|_| native.sync_completed_native_genesis(&phase, &prefix));
+        let post = synced
+            .as_ref()
+            .filter(|sync| sync.is_ok())
+            .map(|_| native_call(&native, &primary, &request, Some(&bytes)));
+        let report = serde_json::json!({
+            "scope":"actual three-node fixture; held scope assigned{A}; cache eviction is not an OS crash/reopen",
+            "request":request,"body":body,"payload":bytes,"payload_hash":hash,
+            "original":original,"while_held":while_held,"current_assignment_while_held":current_assignment,
+            "evicted":evicted,"cold_open_observations_while_held":held_cold_opens,
+            "cold_observer_scope":"actual root cold-open boundary, not a fabricated per-call authority witness",
+            "held_result":held.response,"held_elapsed":format!("{:?}",held.elapsed),"held_expired":held.expired,
+            "frames_before":before_frames,"frames_after":after_frames,
+            "content_before":before_content,"content_after":after_content,
+            "candidates_before":before_candidates,"candidates_after":after_candidates,
+            "legacy_markers":{"setup":setup_markers,"prepared":prepared_markers,
+                "before_probe":markers,"after_probe":markers_after,
+                "setup_rebinds":setup_rebinds,"prepared_rebinds":prepared_rebinds},
+            "held_rpc":wire_facts(&held_wire),"same_genesis_completion":completed,"assigned_sync":synced,
+            "same_request_after_sync":post.as_ref().map(|call|&call.response),
+            "post_elapsed":post.as_ref().map(|call|format!("{:?}",call.elapsed)),
+            "quietness":"explicit operation activity; no quiet-window or writeback claim",
+        });
+        let encoded = serde_json::to_vec_pretty(&report).unwrap();
+        assert!(encoded.len() <= 4 * 1024 * 1024);
+        let evidence = native
+            .data_dir(&primary)
+            .root()
+            .parent()
+            .unwrap()
+            .join("incomplete-genesis-cold-held-native-control.json");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&evidence)
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.sync_all().unwrap();
+        eprintln!("INCOMPLETE_GENESIS_COLD_HELD_REPORT {}", evidence.display());
+        let committed = completed.as_ref().unwrap();
+        assert_eq!(committed.digest, original.digest);
+        assert_eq!(committed.payload, original.payload);
+        assert_eq!(committed.status, DfsPreparedOperationStatus::Committed);
+        assert!(committed.committed_entry.is_some());
+        let certificate = synced.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(certificate.target.expected_shard.as_ref(), Some(&shard));
+        assert_eq!(certificate.acknowledged_node_ids, vec![primary]);
+        assert_eq!(certificate.quorum_size, 1);
+        assert!(
+            write_committed(post.as_ref().unwrap(), &body),
+            "the SAME stamped request/body must succeed after explicit owner completion and sync"
+        );
+        assert!(
+            held_cold_opens > 0,
+            "actual evicted root must cold-open while genesis is held"
+        );
+        assert!(refused(&held), "held cold-owner request: {held:?}");
+        assert!(
+            held.response.as_ref().err().is_some_and(|error| error
+                .contains(&original.digest.operation_id)
+                && error.contains(
+                    "remains prepared; mutation deferred before content or request binding"
+                )),
+            "a cold/unavailable/authentication error is not the known-Prepared refusal: {held:?}"
+        );
+        assert_eq!(while_held.as_ref().unwrap(), &original);
+        assert_eq!(current_assignment.as_ref().unwrap().as_ref(), Some(&shard));
+        assert_eq!(
+            before_frames.as_ref().unwrap(),
+            after_frames.as_ref().unwrap()
+        );
+        assert_eq!(markers_after, markers);
+        assert!(
+            before_candidates
+                .values()
+                .all(|value| matches!(value, Ok(false)))
+        );
+        assert!(
+            after_candidates
+                .values()
+                .all(|value| matches!(value, Ok(false))),
+            "cold/error inspection cannot count as absence or pre-effect refusal"
+        );
+        assert_eq!(before_content, after_content);
+        assert!(effect_routes(&held_wire, &shard.primary_node_id).is_empty());
+        assert_eq!(native.observation_dropped_count(), 0);
+        drop(phase);
+        drop(stores);
     }));
     let closed = native.close();
     if let Err(panic) = result {
