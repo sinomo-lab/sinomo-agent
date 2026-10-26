@@ -252,7 +252,7 @@ pub(crate) fn defer_native_genesis_commit_at_writer(
     defer_native_genesis_completion(&SinomoDataDir::new(&state.data_root), &state.shard, record)
 }
 
-pub(super) fn genesis_operation_id(shard: &DfsMetadataShardConfig) -> String {
+pub(crate) fn genesis_operation_id(shard: &DfsMetadataShardConfig) -> String {
     format!("genesis:{}:{}:1", shard.file_system_id, shard.shard_id)
 }
 
