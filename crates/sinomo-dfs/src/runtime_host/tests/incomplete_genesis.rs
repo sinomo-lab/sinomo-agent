@@ -722,3 +722,199 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
         .unwrap();
     closed.unwrap();
 }
+
+#[test]
+fn native_held_genesis_preserves_unrelated_ready_scope_mutation_and_owner_completion() {
+    let (native, nodes) =
+        DfsTestRuntime::start_cluster("native-incomplete-genesis-unrelated", 3).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let primary = native.root_shard().unwrap().primary_node_id;
+        let prefix = crate::sifs_node_path(&primary);
+        let phase = native
+            .begin_deferred_native_genesis("held-unrelated-target", &prefix)
+            .unwrap();
+        let target = phase.shard().clone();
+        let original = phase.original_record().clone();
+        assert_eq!(target.primary_node_id, primary);
+        assert!(target.replica_node_ids.is_empty());
+        assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+        assert!(original.committed_entry.is_none());
+        let target_root = crate::local_dfs_metadata_shard_path(
+            native.data_dir(&primary),
+            &DfsMetadataShardId::new(&target.shard_id),
+        );
+        let target_before = actual_frames(&target_root);
+        let configurations = native.metadata_shards().unwrap();
+        let path = "/services/ready-mutation-during-held-genesis";
+        let operation = DfsNamespaceOperation::Mkdir { path: path.into() };
+        let stamps = crate::NetworkedDfsService::<crate::DfsNodeTransport>::affected_namespace_shards_from_snapshot(
+            &target.file_system_id, &operation, &configurations,
+        ).unwrap();
+        assert_eq!(
+            stamps.len(),
+            1,
+            "valid mutation is confined to one existing ready scope"
+        );
+        let ready = stamps[0].clone();
+        assert_ne!(ready.shard_id, target.shard_id);
+        assert_eq!(ready.primary_node_id, primary);
+        assert_eq!(
+            ready.replica_node_ids.len(),
+            nodes.len() - 1,
+            "ready legacy scope keeps its full assigned set"
+        );
+        let ready_id = DfsMetadataShardId::new(&ready.shard_id);
+        let ready_root = crate::local_dfs_metadata_shard_path(native.data_dir(&primary), &ready_id);
+        let ready_before = actual_frames(&ready_root);
+        let request = DfsNamespaceCommand {
+            request_id: format!("unrelated-ready-{}", sinomo_core::Id::generate()),
+            file_system_id: target.file_system_id.clone(),
+            requesting_node_id: primary.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: stamps,
+            operation,
+        };
+        let request = command(&primary, DfsNetworkMessage::NamespaceRequest(request), 192);
+        assert!(matches!(
+            dfs_message_execution_scope(&request),
+            DfsMessageExecutionScope::ExactShard { .. }
+        ));
+        let prior = native
+            .rpc_observations()
+            .into_iter()
+            .map(|event| event.call_id)
+            .collect::<BTreeSet<_>>();
+        let applied = native_call(&native, &primary, &request, None);
+        let read_cut = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let actual_object = loop {
+            let observed = crate::local_state::with_current_owned_dfs_shard_inspection(
+                native.data_dir(&primary),
+                &ready_id,
+                |backend| {
+                    backend
+                        .get_object_by_path(&ready.file_system_id, path)
+                        .map_err(crate::DfsError::from)
+                },
+            );
+            match observed {
+                Ok(Some(Some(object))) => break Ok(object),
+                Err(error) => break Err(error.to_string()),
+                Ok(_) => {}
+            }
+            if Instant::now() >= read_cut {
+                break Err("actual ready-scope object unavailable within its5s read window".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let ready_after = actual_frames(&ready_root);
+        let target_after = actual_frames(&target_root);
+        let still_prepared = native.read_deferred_native_genesis(&phase);
+        let target_config_after = native.metadata_shards().map(|shards| {
+            shards
+                .into_iter()
+                .find(|shard| shard.shard_id == target.shard_id)
+        });
+        let wire = native
+            .rpc_observations()
+            .into_iter()
+            .filter(|event| !prior.contains(&event.call_id))
+            .collect::<Vec<_>>();
+        // Ready-scope semantic progress is intentional and outside the other
+        // reproduction's fixture, marker baseline and target-effect window.
+        // Completion remains the SAME explicit owner operation, not a write
+        // offered as a target-readiness probe.
+        let completed = native.complete_deferred_native_genesis(&phase);
+        let synced = completed
+            .as_ref()
+            .ok()
+            .map(|_| native.sync_completed_native_genesis(&phase, &prefix));
+        let facts = serde_json::json!({
+            "scope":"three native nodes; held target assigned{A}; unrelated ready legacy scope unchanged",
+            "target":target,"ready_scope":ready,"request":request,"actual_result":applied.response,
+            "elapsed":format!("{:?}",applied.elapsed),"expired":applied.expired,"actual_object":actual_object,
+            "ready_frames_before":ready_before,"ready_frames_after":ready_after,
+            "target_original":original,"target_readback_while_held":still_prepared,
+            "target_frames_before":target_before,"target_frames_after":target_after,
+            "target_cfg_while_held":target_config_after,"rpc":wire_facts(&wire),
+            "same_genesis_completion":completed,"ordinary_assigned_sync":synced,
+            "quietness":"explicit semantic progress, not a quiet window",
+        });
+        let bytes = serde_json::to_vec_pretty(&facts).unwrap();
+        assert!(
+            bytes.len() <= 4 * 1024 * 1024,
+            "bounded native evidence overflow"
+        );
+        let evidence = native
+            .data_dir(&primary)
+            .root()
+            .parent()
+            .unwrap()
+            .join("incomplete-genesis-unrelated-ready-scope.json");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&evidence)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        eprintln!("INCOMPLETE_GENESIS_UNRELATED_REPORT {}", evidence.display());
+        assert!(
+            !applied.expired,
+            "unrelated ready mutation retains original5s bound"
+        );
+        let DfsNetworkMessage::NamespaceRequest(expected) = &request.routed_message.message else {
+            unreachable!()
+        };
+        assert!(applied.response.as_ref().unwrap().outbound_messages.iter().any(|frame|
+            matches!(&frame.message,DfsNetworkMessage::NamespaceResponse(reply)
+                if reply.request_id==expected.request_id && matches!(reply.result,DfsNamespaceResult::Applied))),
+            "held target must not impose a blanket global mutation block");
+        let object = actual_object.as_ref().unwrap();
+        assert_eq!(object.path, path);
+        assert_eq!(object.kind, DfsObjectKind::Directory);
+        assert_eq!(object.file_system_id, ready.file_system_id);
+        let ready_before = ready_before.as_ref().unwrap();
+        let ready_after = ready_after.as_ref().unwrap();
+        let old_head = ready_before.last().map_or(0, |frame| frame.entry.sequence);
+        assert!(
+            ready_after
+                .iter()
+                .any(|frame| frame.entry.sequence > old_head
+                    && matches!(
+                        frame.entry.mutation,
+                        crate::DfsMetadataMutation::CommitPreparedOperationV7 { .. }
+                    )),
+            "actual Applied result must have a new canonical ready-scope commit"
+        );
+        assert_eq!(still_prepared.as_ref().unwrap(), &original);
+        assert_eq!(
+            still_prepared.as_ref().unwrap().status,
+            DfsPreparedOperationStatus::Prepared
+        );
+        assert_eq!(
+            target_before.as_ref().unwrap(),
+            target_after.as_ref().unwrap()
+        );
+        assert_eq!(
+            target_config_after.as_ref().unwrap().as_ref(),
+            Some(&target)
+        );
+        let completed = completed.as_ref().unwrap();
+        assert_eq!(completed.digest, original.digest);
+        assert_eq!(completed.payload, original.payload);
+        assert_eq!(completed.status, DfsPreparedOperationStatus::Committed);
+        assert!(completed.committed_entry.is_some());
+        let synced = synced.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(synced.target.expected_shard.as_ref(), Some(&target));
+        assert_eq!(synced.acknowledged_node_ids, vec![primary]);
+        assert_eq!(synced.quorum_size, 1);
+        assert_eq!(native.observation_dropped_count(), 0);
+        drop(phase);
+    }));
+    let closed = native.close();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    closed.unwrap();
+}
