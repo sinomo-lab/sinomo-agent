@@ -62,6 +62,8 @@ struct NodeHello {
 struct NodeConfiguration {
     state: sinomo_core::ClusterBootstrapState,
     bootstrap_initial_voter: bool,
+    #[serde(default)]
+    dfs_learners: bool,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 enum ProbeKind {
@@ -402,7 +404,7 @@ fn wait_for_retained_refusal(node: &mut NativeNode, deadline: Instant) -> TestRe
     }
 }
 
-fn configure_nodes(nodes: &mut [NativeNode]) -> TestResult<()> {
+fn configure_nodes(nodes: &mut [NativeNode], dfs_learners: bool) -> TestResult<()> {
     let contacts = nodes
         .iter()
         .map(|node| {
@@ -433,6 +435,20 @@ fn configure_nodes(nodes: &mut [NativeNode]) -> TestResult<()> {
                 now,
             ));
     }
+    if dfs_learners {
+        // Fresh fixture input only, before any daemon receives configuration.
+        // Native Learner semantics permit DFS service eligibility but not a
+        // control vote/admin capability. No retained membership is rewritten.
+        for member in &mut state.members {
+            if member.node_id != a.node_id {
+                sinomo_core::node::apply_cluster_raft_role(
+                    member,
+                    sinomo_core::ClusterMemberRole::Learner,
+                    now,
+                );
+            }
+        }
+    }
     for member in &mut state.members {
         let hello = nodes
             .iter()
@@ -456,6 +472,7 @@ fn configure_nodes(nodes: &mut [NativeNode]) -> TestResult<()> {
             &NodeConfiguration {
                 state: local,
                 bootstrap_initial_voter: index == 0,
+                dfs_learners,
             },
         )?;
     }
@@ -911,7 +928,7 @@ fn run_native_process_case(
                 .len(),
             3
         );
-        configure_nodes(&mut nodes)?;
+        configure_nodes(&mut nodes, prefix_round)?;
         report["nodes"]=serde_json::json!(nodes.iter().map(|n|serde_json::json!({"identity":n.owned.identity,"node":n.input.node_id,"data_root":n.input.data_root,"hello":n.hello})).collect::<Vec<_>>());
         for (source, target) in [(0, 1), (1, 2), (2, 0), (0, 2), (2, 1), (1, 0)] {
             wait_for_native_ping(
