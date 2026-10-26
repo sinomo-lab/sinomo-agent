@@ -49,6 +49,9 @@ const DFS_METADATA_SYNC_ROUTED_FANOUT_CAP: usize = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum MetadataQuorumSyncPurpose {
     OrdinaryDurability,
+    /// Fixed source prefix, every assigned participant, no snapshot repair.
+    /// Its result is live barrier DATA, not a serving or recovery capability.
+    ExactPrefixFullAssignment,
     MembershipHandoff {
         /// Only the replica becoming primary receives a proof-bound marker
         /// request. Every other union member returns an ordinary exact-prefix
@@ -1692,6 +1695,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    /// Gather fresh full-assignment proof for exactly this locally captured
+    /// target. Refuse source advancement/history loss instead of upgrading it.
+    /// The returned existing certificate is DATA, never new serving authority.
+    pub(crate) fn sync_metadata_shard_exact_prefix_full_assignment(
+        &mut self,
+        target: &DfsMetadataQuorumSyncTarget,
+        timeout: Duration,
+    ) -> Result<DfsMetadataQuorumSyncCertificate, DfsError> {
+        if timeout.is_zero()
+            || target.authority_epoch.is_none()
+            || target.expected_shard.is_none()
+            || target.barrier_id.is_empty()
+            || target.state_fingerprint.is_empty()
+            || target.checkpoint_snapshot.is_some()
+        {
+            return Err(DfsError::Metadata {
+                message: "exact-prefix full-assignment sync requires a bounded current assignment and native prefix target without a snapshot".into(),
+            });
+        }
+        self.sync_metadata_shard_to_quorum_with_required_intersection(
+            target,
+            &BTreeSet::new(),
+            MetadataQuorumSyncPurpose::ExactPrefixFullAssignment,
+            timeout,
+        )
+    }
+
     /// Replicate a frozen metadata prefix to quorum while also requiring at
     /// least one acknowledgement from the supplied recovery set.
     ///
@@ -1869,12 +1899,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // before the requested historical prefix is delivered.
             let mut rejected_nodes = BTreeSet::new();
             let mut source_history_gap_node_ids = BTreeSet::new();
-            if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability) {
+            if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability | MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
                 rejected_nodes.extend(self.send_metadata_sync_catchup_batches(
                     &target,
                     probe_barrier_id,
                     &mut pending_catchup_batches,
                     &mut source_history_gap_node_ids,
+                    purpose,
                     &mut send_diagnostics,
                 )?);
             }
@@ -1895,6 +1926,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut pending_catchup_batches,
                 &mut freshly_acknowledged,
             ));
+            if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment)
+                && !rejected_nodes.is_empty()
+            {
+                return Err(DfsError::Metadata { message: format!(
+                    "exact-prefix sync participant rejected the fixed prefix: shard {} sequence {}; rejected={rejected_nodes:?}; no snapshot repair or target advance",
+                    target.shard_id.0, target.journal_sequence,
+                ) });
+            }
             if !rejected_nodes.is_empty()
                 && self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?
             {
@@ -1930,6 +1969,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 probe_barrier_id,
                 &mut pending_catchup_batches,
                 &mut source_history_gap_node_ids,
+                purpose,
                 &mut send_diagnostics,
             )?;
             rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
@@ -1948,6 +1988,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut pending_catchup_batches,
                 &mut freshly_acknowledged,
             ));
+            if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment)
+                && !rejected_nodes.is_empty()
+            {
+                return Err(DfsError::Metadata { message: format!(
+                    "exact-prefix sync participant rejected the fixed prefix: shard {} sequence {}; rejected={rejected_nodes:?}; no snapshot repair or target advance",
+                    target.shard_id.0, target.journal_sequence,
+                ) });
+            }
             if !rejected_nodes.is_empty()
                 && self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?
             {
@@ -1988,6 +2036,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 probe_barrier_id,
                 &mut pending_catchup_batches,
                 &mut source_history_gap_node_ids,
+                purpose,
                 &mut send_diagnostics,
             )?;
             rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
@@ -2006,6 +2055,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut pending_catchup_batches,
                 &mut freshly_acknowledged,
             ));
+            if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment)
+                && !rejected_nodes.is_empty()
+            {
+                return Err(DfsError::Metadata { message: format!(
+                    "exact-prefix sync participant rejected the fixed prefix: shard {} sequence {}; rejected={rejected_nodes:?}; no snapshot repair or target advance",
+                    target.shard_id.0, target.journal_sequence,
+                ) });
+            }
             if !rejected_nodes.is_empty()
                 && self.refresh_metadata_sync_target_to_current_head(&mut target, purpose)?
             {
@@ -2119,12 +2176,70 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    fn revalidate_exact_metadata_sync_prefix(
+        &mut self,
+        target: &DfsMetadataQuorumSyncTarget,
+    ) -> Result<(), DfsError> {
+        self.check_cancelled("exact-prefix full-assignment sync")?;
+        let deadline = self
+            .transport
+            .operation_deadline()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "exact-prefix sync requires its existing bounded transport owner".into(),
+            })?;
+        if Instant::now() >= deadline {
+            return Err(DfsError::Network {
+                message: "exact-prefix sync reached its original operation deadline".into(),
+            });
+        }
+        let backend = self
+            .metadata_backend
+            .as_deref_mut()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "exact-prefix sync has no actual durable source backend".into(),
+            })?;
+        backend.refresh_metadata_shard_attestation_view(&target.shard_id)?;
+        let current_sequence = backend
+            .metadata_shard_statuses()?
+            .into_iter()
+            .find(|status| status.shard_id == target.shard_id)
+            .map(|status| status.journal_last_sequence)
+            .ok_or_else(|| DfsError::Metadata {
+                message: "exact-prefix sync source shard disappeared".into(),
+            })?;
+        let fingerprint =
+            metadata_shard_state_fingerprint_at(backend, &target.shard_id, current_sequence)?;
+        if current_sequence != target.journal_sequence || fingerprint != target.state_fingerprint {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "exact-prefix sync source changed: shard {} requested sequence {} fingerprint {}, current sequence {} fingerprint {}; target remains unchanged",
+                    target.shard_id.0,
+                    target.journal_sequence,
+                    target.state_fingerprint,
+                    current_sequence,
+                    fingerprint,
+                ),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(DfsError::Network {
+                message:
+                    "exact-prefix sync source validation exceeded its original operation deadline"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+
     fn refresh_metadata_sync_target_to_current_head(
         &mut self,
         target: &mut DfsMetadataQuorumSyncTarget,
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<bool, DfsError> {
         self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
+        if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            return Ok(false); // revalidation checked the immutable head/digest
+        }
         let backend = self
             .metadata_backend
             .as_deref_mut()
@@ -2199,11 +2314,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         probe_barrier_id: &str,
         pending_catchup_batches: &mut BTreeMap<String, NodeId>,
         source_history_gap_node_ids: &mut BTreeSet<NodeId>,
+        purpose: &MetadataQuorumSyncPurpose,
         diagnostics: &mut MetadataSyncAttemptDiagnostics,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
-        self.replication
-            .pending_metadata_replications
-            .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
+        if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
+        } else {
+            self.replication
+                .pending_metadata_replications
+                .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
+        }
         let Some(backend) = self.metadata_backend.as_deref() else {
             return Ok(BTreeSet::new());
         };
@@ -2282,6 +2402,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     prepared
                 };
             let Some(batch) = prepared_batch else {
+                if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+                    return Err(DfsError::Metadata { message: format!(
+                        "exact-prefix sync source history unavailable for shard {} target {} peer {}; snapshot repair is forbidden",
+                        target.shard_id.0, target.journal_sequence, target_node_id,
+                    ) });
+                }
                 // A retained native checkpoint can outlive its journal frames.
                 // This is local source availability, not a receiver rejection
                 // or an acknowledgement. Repair through the existing verified
@@ -2352,6 +2478,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ));
         }
 
+        if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
+        }
         let direct_requests = prepared_catchups
             .iter()
             .map(|(node_id, command, _)| (node_id.clone(), command.clone()))
@@ -2532,6 +2661,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         purpose: &MetadataQuorumSyncPurpose,
         diagnostics: &mut MetadataSyncAttemptDiagnostics,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
+        if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
+        }
         if target.replica_node_ids.is_empty() {
             return Ok(BTreeSet::new());
         }
@@ -2618,6 +2750,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // lookup is independent of the long-lived routed message lane, which
         // can lag a just-committed handoff generation. Routed delivery uses the
         // same current request when the direct transport is unavailable.
+        if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            self.revalidate_metadata_quorum_sync_authority(target, purpose)?;
+        }
         let direct_requests = candidates
             .iter()
             .map(|(node_id, command, _)| (node_id.clone(), command.clone()))
@@ -2867,6 +3002,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<(), DfsError> {
+        if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+            return if rejected_node_ids.is_empty() && source_history_gap_node_ids.is_empty() {
+                Ok(())
+            } else {
+                Err(DfsError::Metadata { message: format!(
+                    "exact-prefix sync cannot repair incompatible or unavailable prefix for shard {} at {}; rejected={rejected_node_ids:?}; missing_history={source_history_gap_node_ids:?}; snapshot repair is forbidden",
+                    target.shard_id.0, target.journal_sequence,
+                ) })
+            };
+        }
         let attempts = rejected_node_ids
             .union(source_history_gap_node_ids)
             .map(|target_node_id| {
@@ -3033,7 +3178,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsMetadataQuorumSyncTarget,
         purpose: &MetadataQuorumSyncPurpose,
     ) -> Result<(), DfsError> {
-        if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability) {
+        if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability | MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
             let backend = self
                 .metadata_backend
                 .as_deref()
@@ -3089,6 +3234,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     primary_node_id: context.shard.primary_node_id,
                     epoch: context.shard.epoch,
                 });
+            }
+            if matches!(purpose, MetadataQuorumSyncPurpose::ExactPrefixFullAssignment) {
+                self.revalidate_exact_metadata_sync_prefix(target)?;
             }
             return Ok(());
         }
