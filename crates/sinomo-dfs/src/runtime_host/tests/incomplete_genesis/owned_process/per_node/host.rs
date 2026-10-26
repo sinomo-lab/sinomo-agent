@@ -58,12 +58,19 @@ fn validate_configuration(
     }
     let mut endpoints = BTreeSet::new();
     for member in &state.members {
+        // The fresh PREFIX fixture may use real DFS-eligible Raft learners.
+        // This flag only validates initial DATA; it never changes live roles.
+        let expected_replica_role = if configuration.dfs_learners {
+            member.role == sinomo_core::ClusterMemberRole::Learner
+                && member.state == sinomo_core::ClusterMemberState::Learner
+        } else {
+            member.role == sinomo_core::ClusterMemberRole::NonVoting
+        };
         if member.cluster_id != state.cluster_id
             || member.node_public_key.is_empty()
             || !member.state.is_authorized()
             || member.endpoints.len() != 1
-            || (member.role != sinomo_core::ClusterMemberRole::Voter
-                && member.role != sinomo_core::ClusterMemberRole::NonVoting)
+            || (member.role != sinomo_core::ClusterMemberRole::Voter && !expected_replica_role)
         {
             return Err(
                 "fresh native roster contains a foreign, pending or unsupported member".into(),
