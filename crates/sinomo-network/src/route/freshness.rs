@@ -73,6 +73,84 @@ fn merge_observations(
     }
 }
 
+enum SourceRead {
+    Direct(ClusterEndpointRecord),
+    Routed(NodeId, Arc<crate::MultiHopRoutedConnector>),
+}
+impl SourceRead {
+    fn source(&self) -> &NodeId {
+        match self {
+            Self::Direct(endpoint) => &endpoint.node_id,
+            Self::Routed(node, _) => node,
+        }
+    }
+}
+
+async fn read_source(
+    origin: SourceRead,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterObjectRpcOptions,
+    deadline: tokio::time::Instant,
+    route_context: (RouteDirectoryCacheIdentity, u64, u64),
+) -> (SourceRead, Option<Vec<ClusterConnectivityRecord>>) {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return (origin, None);
+    }
+    let read = async {
+        let call = ObjectRpcCall::encode_value(
+            crate::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+            crate::CLUSTER_NETWORK_RPC_CATEGORY,
+            (),
+        )?;
+        let response = match &origin {
+            SourceRead::Direct(endpoint) => {
+                let mut host = SourceReadHost;
+                ClusterObjectRpcClient::routed(&mut host, paths)
+                    .call_endpoint(
+                        state,
+                        endpoint,
+                        call,
+                        options.with_overall_timeout(remaining),
+                    )
+                    .await?
+            }
+            SourceRead::Routed(source, connector) => {
+                // Reuse the ordinary authenticated carrier and exact request
+                // authority scope. Never recurse into freshness collection.
+                let constraints = stream_native_service_route_constraints();
+                let affinity = crate::DestinationProcessAffinity::Any;
+                let (identity, module_generation, directory_generation) = route_context;
+                let stream = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_destination_affinity_and_route_compatibility(
+                    identity.routed_stream_scope(&state.cluster_id), module_generation, directory_generation,
+                    constraints, affinity, state.local_node_id.clone(), source.clone(), options.protection, remaining,
+                    connector.connect_with_destination_process_affinity(source.clone(), crate::ConnectOptions {
+                        constraints, timeout: remaining, protection: options.protection,
+                    }, affinity),
+                ).await?;
+                crate::service_rpc_stream::call_service_rpc_peer_stream(
+                    stream,
+                    call,
+                    crate::ObjectFrameIoOptions::idle_timeout(
+                        options.call_policy().health.no_progress_timeout,
+                    ),
+                )
+                .await?
+            }
+        };
+        response.response.error_detail()?;
+        response
+            .decode_body::<Vec<ClusterConnectivityRecord>>()
+            .await
+    };
+    let response = tokio::time::timeout_at(deadline, read)
+        .await
+        .ok()
+        .and_then(Result::ok);
+    (origin, response)
+}
+
 pub(super) async fn refresh_connector(
     paths: &ClusterPaths,
     directory: &Arc<dyn crate::ClusterDirectory>,
@@ -80,6 +158,7 @@ pub(super) async fn refresh_connector(
     target: &NodeId,
     options: ClusterObjectRpcOptions,
     deadline: tokio::time::Instant,
+    route_context: (RouteDirectoryCacheIdentity, u64, u64),
 ) -> Result<Option<Arc<crate::MultiHopRoutedConnector>>, NetworkError> {
     let baseline = directory.connectivity_freshness_baseline()?;
     let (version, members, endpoints, ordinary_records) =
@@ -128,66 +207,101 @@ pub(super) async fn refresh_connector(
             max_records: crate::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
         });
     }
-    let mut reads = futures_util::stream::iter(candidates.into_iter().map(|endpoint| async move {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return (endpoint, None);
-        }
-        let mut host = SourceReadHost;
-        let mut client = ClusterObjectRpcClient::routed(&mut host, paths);
-        let read = async {
-            let response = client
-                .call_endpoint(
-                    state,
-                    &endpoint,
-                    ObjectRpcCall::encode_value(
-                        crate::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-                        crate::CLUSTER_NETWORK_RPC_CATEGORY,
-                        (),
-                    )?,
-                    options.with_overall_timeout(remaining),
-                )
-                .await?;
-            response
-                .decode_body::<Vec<ClusterConnectivityRecord>>()
-                .await
-        };
-        let response = tokio::time::timeout_at(deadline, read)
-            .await
-            .ok()
-            .and_then(Result::ok);
-        (endpoint, response)
-    }))
-    .buffer_unordered(MAX_SOURCE_READS_IN_FLIGHT);
+    let mut direct = std::collections::VecDeque::from(candidates);
+    let mut reads = futures_util::stream::FuturesUnordered::new();
+    let mut attempted_sources = std::collections::BTreeSet::new();
     let mut refreshed = false;
     let mut authenticated = std::collections::BTreeSet::new();
-    while let Some((endpoint, response)) = reads.next().await {
+    let mut connector = connector_from_observed_records(
+        paths,
+        state,
+        snapshot.clone(),
+        records.clone(),
+        options.call_policy().health,
+        None,
+    )?;
+    loop {
+        if connector.has_live_observed_route(target, options.destination_process_affinity) {
+            break;
+        }
+        // Prioritize newly reachable sources over more direct hints. A pending
+        // unreachable endpoint cannot consume the entire original deadline
+        // before a second bridge's actual source can be queried.
+        for node in snapshot.nodes().values() {
+            if reads.len() == MAX_SOURCE_READS_IN_FLIGHT {
+                break;
+            }
+            if node.node_id == state.local_node_id
+                || &node.node_id == target
+                || attempted_sources.contains(&node.node_id)
+                || !state.members.iter().any(|member| {
+                    member.node_id == node.node_id
+                        && member.node_public_key == node.public_key
+                        && member.state.is_authorized()
+                })
+                || !connector
+                    .has_live_observed_route(&node.node_id, crate::DestinationProcessAffinity::Any)
+            {
+                continue;
+            }
+            attempted_sources.insert(node.node_id.clone());
+            reads.push(read_source(
+                SourceRead::Routed(node.node_id.clone(), connector.clone()),
+                paths,
+                state,
+                options,
+                deadline,
+                route_context,
+            ));
+        }
+        while reads.len() < MAX_SOURCE_READS_IN_FLIGHT {
+            let Some(endpoint) = direct.pop_front() else {
+                break;
+            };
+            if attempted_sources.contains(&endpoint.node_id) {
+                continue;
+            }
+            reads.push(read_source(
+                SourceRead::Direct(endpoint),
+                paths,
+                state,
+                options,
+                deadline,
+                route_context,
+            ));
+        }
+        let Some((origin, response)) = reads.next().await else {
+            break;
+        };
         let Some(response) = response else {
             continue;
         };
         let now = OffsetDateTime::now_utc();
-        let owned = matching_source_records(
+        let mut owned = matching_source_records(
             &snapshot,
             state,
-            &endpoint.node_id,
+            origin.source(),
             &baseline.records,
             response,
             now,
         )?;
-        // The direct endpoint RPC authenticated this exact peer. This is a new
-        // local observation, not a reverse edge inferred from a peer's claim.
-        let observed = crate::connectivity::cluster_connectivity_record(
-            state,
-            &endpoint,
-            ClusterConnectivityState::Healthy,
-            None,
-            0,
-            None,
-            None,
-            now,
-            crate::CLUSTER_CONNECTIVITY_TTL_SECONDS,
-        );
-        for record in owned.iter().chain(std::iter::once(&observed)) {
+        attempted_sources.insert(origin.source().clone());
+        if let SourceRead::Direct(endpoint) = origin {
+            // Only a successful direct RPC supplies a local adjacent edge.
+            // A routed reply never fabricates local-to-source connectivity.
+            owned.push(crate::connectivity::cluster_connectivity_record(
+                state,
+                &endpoint,
+                ClusterConnectivityState::Healthy,
+                None,
+                0,
+                None,
+                None,
+                now,
+                crate::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            ));
+        }
+        for record in &owned {
             authenticated.insert((
                 record.source_node_id.clone(),
                 record.target_node_id.clone(),
@@ -195,9 +309,8 @@ pub(super) async fn refresh_connector(
             ));
         }
         merge_observations(&mut records, owned);
-        merge_observations(&mut records, vec![observed]);
         refreshed = true;
-        let connector = connector_from_observed_records(
+        connector = connector_from_observed_records(
             paths,
             state,
             snapshot.clone(),
@@ -205,9 +318,6 @@ pub(super) async fn refresh_connector(
             options.call_policy().health,
             Some(&authenticated),
         )?;
-        if connector.has_live_observed_route(target, options.destination_process_affinity) {
-            break;
-        }
     }
     // Drop outstanding read futures on success, cancellation or deadline. No
     // detached helper survives this request-owned establishment phase.
@@ -215,7 +325,8 @@ pub(super) async fn refresh_connector(
     if !refreshed {
         return Ok(None);
     }
-    if directory.routing_version()? != version
+    if crate::network_module_routing_generation() != route_context.1
+        || directory.routing_version()? != version
         || directory.connectivity_freshness_baseline()? != baseline
     {
         return Err(NetworkError::Directory {

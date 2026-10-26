@@ -1673,3 +1673,7 @@ mod tests {
 #[cfg(test)]
 #[path = "kv_read_model/live_freshness_tests.rs"]
 mod live_freshness_tests;
+
+#[cfg(test)]
+#[path = "kv_read_model/multihop_freshness_tests.rs"]
+mod multihop_freshness_tests;

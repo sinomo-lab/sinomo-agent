@@ -165,6 +165,13 @@ concurrency, and are dropped on completion or cancellation. A pooled live carrie
 needs no such refresh. The original operation is dispatched only after carrier
 establishment, retaining its identity and body.
 
+When a source reply makes the next bridge reachable, the same request can read
+that bridge through the ordinary authenticated carrier. Each source is queried
+at most once through this routed step, sharing the direct-read concurrency cap
+and original deadline. A routed reply supplies only its source-owned rows; it
+never invents a direct edge from the caller to that source. The collector does
+not recursively invoke freshness discovery or trust relayed third-party rows.
+
 These observations are lost on process restart. Stored expired rows remain
 expired and serve only as semantic baselines or endpoint hints. Cold startup,
 bootstrap and rejoin are genuine activity and may persist necessary changes;

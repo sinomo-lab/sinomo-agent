@@ -1827,6 +1827,7 @@ where
                 } else {
                     freshness::refresh_connector(
                         paths, &directory, state, target_node_id, options, establishment_deadline,
+                        (directory_identity, module_generation, directory_generation),
                     ).await?.unwrap_or(connector)
                 };
                 let remaining = establishment_deadline.saturating_duration_since(tokio::time::Instant::now());
