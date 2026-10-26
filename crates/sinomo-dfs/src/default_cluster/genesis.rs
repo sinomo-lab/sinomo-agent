@@ -215,6 +215,43 @@ fn defer_native_genesis_completion(
     })
 }
 
+/// The same negative selection at the shared first-commit kernel. Hydration
+/// and ordinary recovery can reach that kernel without bootstrap completion.
+/// The caller already owns its real writer/guard; do not acquire another one.
+#[cfg(test)]
+pub(crate) fn defer_native_genesis_commit_at_writer(
+    backend_root: &Path,
+    record: &crate::DfsPreparedOperationRecord,
+) -> Result<(), DfsError> {
+    let Some(registry) = NATIVE_GENESIS_DEFERRALS.get() else {
+        return Ok(());
+    };
+    let state = registry
+        .lock()
+        .map_err(|_| DfsError::Metadata {
+            message: "native genesis deferral registry poisoned".into(),
+        })?
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+        .find(|state| {
+            state.shard.file_system_id == record.digest.file_system_id
+                && state.shard.shard_id == record.digest.shard_id.0
+                && genesis_operation_id(&state.shard) == record.digest.operation_id
+                && crate::local_dfs_metadata_shard_path(
+                    &SinomoDataDir::new(&state.data_root),
+                    &record.digest.shard_id,
+                )
+                .as_path()
+                    == backend_root
+        });
+    let Some(state) = state else {
+        return Ok(());
+    };
+    // Release the registry before physical-owner and full-record validation.
+    // These are the SAME checks/record capture used by the bootstrap hook.
+    defer_native_genesis_completion(&SinomoDataDir::new(&state.data_root), &state.shard, record)
+}
+
 pub(super) fn genesis_operation_id(shard: &DfsMetadataShardConfig) -> String {
     format!("genesis:{}:{}:1", shard.file_system_id, shard.shard_id)
 }
