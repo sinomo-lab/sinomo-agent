@@ -2381,12 +2381,9 @@ pub(super) fn try_daemon_dfs_resident_metadata_backend_after_preflight(
     let mut timing = crate::service_trace::DfsPhaseTimer::new(&operation);
     timing.mark("resident-cache-wait-started");
     let slot = daemon_dfs_message_service_cache().root(&data_dir.root())?;
-    let mut cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
-    timing.mark("resident-cache-acquired");
-    let result: Result<
-        Option<ResidentLocalShardedMetadataBackend>,
-        DaemonDfsAuthorityPreExecutionError,
-    > = (|| {
+    let (signature, retained_backend) = {
+        let mut cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+        timing.mark("resident-cache-acquired");
         let entry = daemon_dfs_message_cache_entry(
             &mut cache,
             data_dir,
@@ -2395,7 +2392,6 @@ pub(super) fn try_daemon_dfs_resident_metadata_backend_after_preflight(
             runtime,
             true,
         )?;
-        timing.mark("resident-cache-entry-selected");
         if entry.signature.metadata_authority_generation != expected_generation
             || preflight.authority.generation() != expected_generation
             || !Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority)
@@ -2405,36 +2401,50 @@ pub(super) fn try_daemon_dfs_resident_metadata_backend_after_preflight(
                 expected_generation,
             ));
         }
-        if !entry.resident_metadata_initialized {
-            timing.mark("resident-backend-open-started");
-            // Materialize the bounded retained prefix only when this generation
-            // actually needs a resident backend. Warm callers which merely prove
-            // that the already-open generation is still current stay certificate-
-            // only and do not clone the complete authority vector.
-            let projection = preflight
-                .authority
-                .retained_complete_prefix_for_generation(expected_generation)
-                .ok_or_else(|| {
-                    daemon_dfs_stale_authority(&preflight.authority, expected_generation)
-                })?;
-            entry.resident_metadata_backend =
-                try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
-                    data_dir,
-                    &entry.signature.local_node_id,
-                    &entry.metadata_authority_generation,
-                    expected_generation,
-                    &projection,
-                    entry.resident_metadata_backend.take(),
-                )?;
-            entry.resident_metadata_initialized = true;
-            timing.mark("resident-backend-open-completed");
+        if entry.resident_metadata_initialized {
+            daemon_dfs_require_retained_authority(&preflight.authority, expected_generation)?;
+            return Ok(entry.resident_metadata_backend.clone());
         }
-        daemon_dfs_require_retained_authority(&preflight.authority, expected_generation)?;
-        Ok(entry.resident_metadata_backend.clone())
-    })();
-    drop(cache);
+        (
+            entry.signature.clone(),
+            entry.resident_metadata_backend.clone(),
+        )
+    };
     timing.mark("resident-cache-released");
-    result
+    // The caller owns the existing global initialization admission. Keep the
+    // predecessor published while opening/reconfiguring its SAME owner; no
+    // root-cache mutex is held across physical opens or their writer waits.
+    let projection = preflight
+        .authority
+        .retained_complete_prefix_for_generation(expected_generation)
+        .ok_or_else(|| daemon_dfs_stale_authority(&preflight.authority, expected_generation))?;
+    timing.mark("resident-backend-open-started");
+    let prepared = try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
+        data_dir,
+        &signature.local_node_id,
+        &preflight.authority,
+        expected_generation,
+        &projection,
+        retained_backend,
+    )?;
+    timing.mark("resident-backend-open-completed");
+    daemon_dfs_require_retained_authority(&preflight.authority, expected_generation)?;
+    let mut cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    let entry = cache
+        .as_mut()
+        .ok_or_else(|| daemon_dfs_stale_authority(&preflight.authority, expected_generation))?;
+    if entry.signature != signature
+        || entry.resident_metadata_initialized
+        || !Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority)
+    {
+        return Err(daemon_dfs_stale_authority(
+            &preflight.authority,
+            expected_generation,
+        ));
+    }
+    entry.resident_metadata_backend = prepared;
+    entry.resident_metadata_initialized = true;
+    Ok(entry.resident_metadata_backend.clone())
 }
 
 /// Only retained-proof rejection before service execution carries this type.
@@ -3789,16 +3799,13 @@ pub(super) async fn dispatch_daemon_dfs_remote_namespace_phase(
         .map_err(Into::into)
 }
 
-/// A negative check on the exact local scopes before persistent content ingest
-/// or Core/request planning. It grants no authority or "genesis absent" proof.
-/// Normal host preparation owns resident initialization; this path never opens,
-/// recovers, hydrates or queries KV to manufacture an available record.
-fn reject_daemon_dfs_incomplete_genesis_before_effects(
-    data_dir: &SinomoDataDir,
+/// Resolve only the incoming mutation's affected local scopes from the retained
+/// configuration. No wire stamp, missing genesis or preparation is authority.
+fn daemon_dfs_genesis_ingress_scopes(
     peer_snapshot: &DaemonDfsMessagePeerSnapshot,
     command: &DfsMessageCommand,
     preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
-) -> Result<(), sinomo_dfs::DfsError> {
+) -> Result<Vec<sinomo_dfs::DfsMetadataShardConfig>, sinomo_dfs::DfsError> {
     use sinomo_dfs::{DfsNamespaceOperation as Op, DfsNetworkMessage as Message};
     let (file_system_id, paths) = match &command.routed_message.message {
         Message::DistributedWriteRequest(write)
@@ -3848,10 +3855,10 @@ fn reject_daemon_dfs_incomplete_genesis_before_effects(
         }
         // Reads, history, replies, existing custody/recovery and the genesis
         // owner's commit/sync are not new mutation admission through this gate.
-        _ => return Ok(()),
+        _ => return Ok(Vec::new()),
     };
     if paths.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let unavailable = |message: &str| sinomo_dfs::DfsError::Metadata {
         message: format!("native mutation genesis observation unavailable: {message}"),
@@ -3870,9 +3877,55 @@ fn reject_daemon_dfs_incomplete_genesis_before_effects(
     let affected = sinomo_dfs::NetworkedDfsService::<sinomo_dfs::DfsNodeTransport>::namespace_shards_for_normalized_paths_from_snapshot(
         file_system_id, &shards, normalized.iter().map(String::as_str),
     )?.into_iter().filter(|shard| shard.primary_node_id == peer_snapshot.local_node_id).collect::<Vec<_>>();
+    Ok(affected)
+}
+
+fn reject_known_native_genesis_record(
+    current: &sinomo_dfs::DfsMetadataShardConfig,
+    record: Option<sinomo_dfs::DfsPreparedOperationRecord>,
+) -> Result<(), sinomo_dfs::DfsError> {
+    let Some(record) = record else {
+        // Existing P0/legacy scopes need not have this native record. Absence
+        // supplies no new readiness certificate; every later guard remains.
+        return Ok(());
+    };
+    record.validate()?;
+    let id = crate::default_cluster::genesis::genesis_operation_id(current);
+    if record.digest.file_system_id != current.file_system_id
+        || record.digest.shard_id.0 != current.shard_id
+        || record.digest.operation_id != id
+        || record.digest.owner_epoch != 1
+    {
+        return Err(sinomo_dfs::DfsError::Metadata {
+            message: "native mutation genesis observation unavailable: retained genesis record has a foreign original scope".into(),
+        });
+    }
+    if record.status == sinomo_dfs::DfsPreparedOperationStatus::Prepared {
+        return Err(sinomo_dfs::DfsError::Metadata {
+            message: format!(
+                "native metadata genesis {id} remains prepared; mutation deferred before content or request binding"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Final nonopening check after preparation and immediately before effects.
+/// Unknown state remains unavailable; no Core recovery runs through this gate.
+fn reject_daemon_dfs_incomplete_genesis_before_effects(
+    data_dir: &SinomoDataDir,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    command: &DfsMessageCommand,
+    preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+) -> Result<(), sinomo_dfs::DfsError> {
+    let affected = daemon_dfs_genesis_ingress_scopes(peer_snapshot, command, preflight)?;
     if affected.is_empty() {
         return Ok(());
     }
+    let unavailable = |message: &str| sinomo_dfs::DfsError::Metadata {
+        message: format!("native mutation genesis observation unavailable: {message}"),
+    };
+    let preflight = preflight.ok_or_else(|| unavailable("no retained authority preflight"))?;
     let slot = daemon_dfs_message_service_cache()
         .try_existing_root(&data_dir.root())?
         .ok_or_else(|| unavailable("no resident metadata owner"))?;
@@ -3892,8 +3945,9 @@ fn reject_daemon_dfs_incomplete_genesis_before_effects(
     }
     let resident = entry
         .resident_metadata_backend
-        .as_ref()
+        .clone()
         .ok_or_else(|| unavailable("native initialization has not supplied resident metadata"))?;
+    drop(cache);
     for current in affected {
         let shard = sinomo_dfs::DfsMetadataShardId::new(&current.shard_id);
         if resident.shard_config(&shard)? != current {
@@ -3901,31 +3955,178 @@ fn reject_daemon_dfs_incomplete_genesis_before_effects(
                 "resident shard differs from the retained current assignment",
             ));
         }
-        let handle = resident.scope_shard(file_system_id, &shard)?;
+        let handle = resident.scope_shard(&current.file_system_id, &shard)?;
         let id = crate::default_cluster::genesis::genesis_operation_id(&current);
         let record = handle
             .try_read_prepared_operation_record_without_open(&id)?
             .ok_or_else(|| unavailable("affected resident shard is busy or unopened"))?;
-        let Some(record) = record else {
-            // Existing P0/legacy scopes need not have this native record. A
-            // missing record is not a new certificate; all later guards stay.
-            continue;
-        };
-        record.validate()?;
-        if record.digest.file_system_id != *file_system_id
-            || record.digest.shard_id != shard
-            || record.digest.operation_id != id
-            || record.digest.owner_epoch != 1
-        {
-            return Err(unavailable(
-                "retained genesis record has a foreign original scope",
-            ));
-        }
-        if record.status == sinomo_dfs::DfsPreparedOperationStatus::Prepared {
-            return Err(sinomo_dfs::DfsError::Metadata {
+        reject_known_native_genesis_record(&current, record)?;
+    }
+    daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
+        .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)
+}
+
+/// Prepare only the existing strict resident owners, before the request owns
+/// content or a mutation lane. Storage replay cannot logically finish genesis.
+async fn prepare_daemon_dfs_genesis_ingress(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
+    command: &DfsMessageCommand,
+    preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
+    runtime: &tokio::runtime::Handle,
+    data_owner: &Arc<DaemonDataOwnerLock>,
+) -> Result<(), sinomo_dfs::DfsError> {
+    let affected = daemon_dfs_genesis_ingress_scopes(peer_snapshot, command, preflight)?;
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let preflight = preflight.expect("affected scopes require retained preflight");
+    let task_owner = registered_dfs_runtime_host(data_dir)
+        .map_err(|error| sinomo_dfs::DfsError::Metadata {
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+            message: "genesis ingress preparation has no native task owner".into(),
+        })?;
+    let lookup_data = data_dir.clone();
+    let lookup_preflight = preflight.clone();
+    let lookup_peer = peer_snapshot.clone();
+    let lookup_owner = Arc::clone(data_owner);
+    let (send, receive) = tokio::sync::oneshot::channel();
+    task_owner.own_task(runtime.spawn_blocking(move || {
+        let _owner = lookup_owner;
+        let result = (|| -> Result<_, sinomo_dfs::DfsError> {
+            let Some(slot) =
+                daemon_dfs_message_service_cache().existing_root(&lookup_data.root())?
+            else {
+                return Ok(None);
+            };
+            let cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+            let resident = cache
+                .as_ref()
+                .filter(|entry| {
+                    entry.resident_metadata_initialized
+                        && entry.signature.local_node_id == lookup_peer.local_node_id
+                        && entry.signature.cluster_id == lookup_peer.cluster_id
+                        && entry.signature.metadata_authority_generation
+                            == lookup_preflight.generation
+                        && Arc::ptr_eq(
+                            &entry.metadata_authority_generation,
+                            &lookup_preflight.authority,
+                        )
+                })
+                .and_then(|entry| entry.resident_metadata_backend.clone());
+            Ok(resident)
+        })();
+        let _ = send.send(result);
+    }));
+    let resident = receive
+        .await
+        .map_err(|error| sinomo_dfs::DfsError::Metadata {
+            message: format!("genesis ingress resident lookup ended without a result: {error}"),
+        })??;
+    let resident = if let Some(resident) = resident {
+        resident
+    } else {
+        // Only generation preparation uses the existing global owner. It is
+        // released by the worker before any scoped lease wait below.
+        let scheduler = daemon_dfs_mutation_scheduler(data_dir).map_err(|error| {
+            sinomo_dfs::DfsError::Metadata {
+                message: error.to_string(),
+            }
+        })?;
+        let admission = admit_daemon_dfs_foreground_message(
+            &scheduler,
+            &DfsMessageExecutionScope::GlobalExclusive,
+        )
+        .await
+        .map_err(|error| sinomo_dfs::DfsError::Metadata {
+            message: error.to_string(),
+        })?;
+        let cold_data = data_dir.clone();
+        let cold_paths = cluster_paths.clone();
+        let cold_peer = peer_snapshot.clone();
+        let cold_preflight = preflight.for_admission(&admission);
+        let cold_runtime = runtime.clone();
+        let cold_owner = Arc::clone(data_owner);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        task_owner.own_task(runtime.spawn_blocking(move || {
+            let _owner = cold_owner;
+            let result = try_daemon_dfs_resident_metadata_backend_after_preflight(
+                &cold_data,
+                &cold_paths,
+                &cold_peer,
+                &cold_preflight,
+                &cold_runtime,
+            )
+            .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error);
+            drop(admission);
+            let _ = send.send(result);
+        }));
+        receive
+            .await
+            .map_err(|error| sinomo_dfs::DfsError::Metadata {
                 message: format!(
-                    "native metadata genesis {id} remains prepared; mutation deferred before content or request binding"
+                    "genesis ingress strict owner preparation ended without a result: {error}"
                 ),
+            })??
+            .ok_or_else(|| sinomo_dfs::DfsError::Metadata {
+                message: "genesis ingress strict owner remains unavailable".into(),
+            })?
+    };
+    for current in &affected {
+        let shard = sinomo_dfs::DfsMetadataShardId::new(&current.shard_id);
+        if resident.shard_config(&shard)? != *current {
+            return Err(sinomo_dfs::DfsError::Metadata {
+                message: "genesis ingress resident assignment changed before preparation".into(),
+            });
+        }
+        let handle = resident.scope_shard(&current.file_system_id, &shard)?;
+        loop {
+            daemon_dfs_require_retained_authority(&preflight.authority, preflight.generation)
+                .map_err(DaemonDfsAuthorityPreExecutionError::into_dfs_error)?;
+            let worker_handle = handle.clone();
+            let expected = (*current).clone();
+            let id = crate::default_cluster::genesis::genesis_operation_id(current);
+            let worker_owner = Arc::clone(data_owner);
+            let (send, receive) = tokio::sync::oneshot::channel();
+            task_owner.own_task(runtime.spawn_blocking(move || {
+                let _owner = worker_owner;
+                let result = worker_handle.try_prepare_genesis_record_for_ingress(&expected, &id);
+                let _ = send.send(result);
+            }));
+            let prepared = receive
+                .await
+                .map_err(|error| sinomo_dfs::DfsError::Metadata {
+                    message: format!(
+                        "genesis ingress scoped storage preparation ended without a result: {error}"
+                    ),
+                })??;
+            if let Some(record) = prepared {
+                reject_known_native_genesis_record(current, record)?;
+                break;
+            }
+            // No root-cache mutex, shard lease or mutation admission survives
+            // this existing async owner wait. Caller cancellation stops waiting.
+            handle.wait_until_checkout_available().await?;
+        }
+    }
+    // Each read was certified before releasing its owning lease. Re-resolve
+    // the retained assignment after all preparation, without mistaking a new
+    // concurrent lease for an absent genesis or a changed published topology.
+    if daemon_dfs_genesis_ingress_scopes(peer_snapshot, command, Some(preflight))? != affected {
+        return Err(sinomo_dfs::DfsError::Metadata {
+            message: "native genesis affected assignment changed during storage preparation".into(),
+        });
+    }
+    for current in affected {
+        if resident.shard_config(&sinomo_dfs::DfsMetadataShardId::new(&current.shard_id))?
+            != current
+        {
+            return Err(sinomo_dfs::DfsError::Metadata {
+                message: "native genesis resident assignment changed during storage preparation"
+                    .into(),
             });
         }
     }
@@ -4040,27 +4241,10 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
     } else {
         None
     };
-    if matches!(&command.routed_message.message,
-        sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(_)
-        | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(_)
-        | sinomo_dfs::DfsNetworkMessage::RetainedWriteRequest(_)
-        | sinomo_dfs::DfsNetworkMessage::NamespaceRequest(_))
-        && !dfs_message_is_read_only_request(&command)
-    {
-        let observe_data_dir = data_dir.clone();
-        let observe_peer = peer_snapshot.clone();
-        let observe_command = command.clone();
-        let observe_preflight = metadata_authority_preflight.clone();
-        let observe_owner = Arc::clone(&data_owner_lock);
-        tokio::task::spawn_blocking(move || {
-            let _owner = observe_owner;
-            reject_daemon_dfs_incomplete_genesis_before_effects(
-                &observe_data_dir, &observe_peer, &observe_command, observe_preflight.as_ref(),
-            )
-        }).await.map_err(|error| DaemonError::Network {
-            address: "native genesis pre-effect check".into(), detail: error.to_string(),
-        })??;
-    }
+    prepare_daemon_dfs_genesis_ingress(
+        &data_dir, &cluster_paths, &peer_snapshot, &command,
+        metadata_authority_preflight.as_ref(), runtime, &data_owner_lock,
+    ).await?;
     let content = if attachment.is_some() {
         let content_data_dir = data_dir.clone();
         let content_cluster_paths = cluster_paths.clone();
@@ -4703,6 +4887,15 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
             ))?,
         )
     };
+    if !daemon_dfs_genesis_ingress_scopes(
+        &peer_snapshot, &command, metadata_authority_preflight.as_ref(),
+    )?.is_empty() {
+        let ingress_owner = require_daemon_dfs_data_owner_lock(paths)?;
+        runtime.block_on(prepare_daemon_dfs_genesis_ingress(
+            &data_dir, &cluster_paths, &peer_snapshot, &command,
+            metadata_authority_preflight.as_ref(), runtime, &ingress_owner,
+        ))?;
+    }
     if let Some(original) = original_repair {
         let preflight = metadata_authority_preflight.as_ref().ok_or_else(|| {
             sinomo_dfs::DfsError::Metadata {
