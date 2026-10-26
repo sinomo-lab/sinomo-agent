@@ -15,7 +15,46 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R81
+## Current development checkpoint — 2026-10-26 R82
+
+The finite retained per-node constructor is implemented in `78fa3417` with parent
+ownership controls `12c4fb95`, merged at `19a61d44` without conflicts. It consumes
+only post-reap expected DATA and independently validates existing root/owner/key/
+WAL/hard-state/snapshot physical identities and bytes. Original cluster/member
+keys and exact listener are retained. No key creation, bootstrap, leader reset,
+state rewrite or port fallback occurs. The existing native daemon acquires its
+own actual lifetime/authority after the read-only preflight releases its locks;
+expectations never mint a private return or grant serving authority.
+
+R82 source `369f39f5` /4,933 inputs: I255 check/build/seal passed
+39.935937/385.004785/3.630071s. I256 executed **2PASS/253 other inventory
+controlsUNRUN**. The positive actually killed/reaped A2888705, then reopened the
+same root/key/port as new A2888819 while B2888706/C2888707 retained their original
+PID/start identities. Four fresh native endpoint calls passed after reopen;
+all three normal lifecycle exits were0. The negative changed only a supplied
+expected root inode; the real child refused before Hello with exit101, retained
+DATA unchanged, and B/C stayed alive. That parent negative control passed; no
+failed positive was relabeled. Both runs retain raw files before any reopen,
+exact process identities, original deadlines and every selected native contact.
+
+I257 full DFS/KV boundary passed11UI/three libraries. R81's ring18 result remains
+qualified to that earlier source; dependency/trust edges did not change. R82
+combined receipt `ab05d6f2` and report retain exact ELF/source/commands/runtime,
+264-file equal archives, standard resource/coverage tables and35 known/reported
+identities plus owned scope/group/cgroup/root drain. Quietness/activity bytes,
+disk power-loss, general node routing, three-voter control and current serving
+remain unqualified. All earlier failures and R74/R81 evidence are preserved.
+
+The next concrete prerequisite is to connect the EXISTING registered DFS owner
+and private PREFIX capture to these independent native processes, using only an
+already certified local assignment/prefix and original full participant set.
+No generic driver response, decoded status or retained DATA may reconstruct that
+capability. Missing current owner/readiness/topology must remain a refusal; no
+initializer, store recovery or serving activation may be added to obtain a pass.
+A prospective test must distinguish actual complete native baseline capture from
+post-A-loss partial/refused evidence before any survivor-availability claim.
+
+## Historical development checkpoint — 2026-10-26 R81
 
 Code `5a0def5f` uses three separately owned native daemon processes, their real
 prepared TCP listeners, native identity/link/routed-session stack and existing
