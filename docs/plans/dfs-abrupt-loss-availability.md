@@ -15,7 +15,48 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R70
+## Current development checkpoint — 2026-10-26 R71
+
+After completing the requested R70 post-sync deadline cut, development continued
+to canonical historical-record refusal. Test-only `912300b4`, source `75d4836a`
+/4,929 inputs, appends one native control while preserving the entire R70 test
+prefix and every implementation input. I212 fresh check/build/seal passed;
+I213 executed **1 PASS with four fault subarms,248 other inventory controls
+UNRUN**; I214 full boundary passed11UI controls and three library analyses.
+The exact report/combined receipt is R71-REPORT.md / `9d676118`.
+
+The valid baseline is an actual private full-set native round persisted/read by
+the current owner. Four deliberately supplied canonical SOBJ images then remove
+a required peer, duplicate an attempt, change response sequence, or change the
+command/probe epoch while retaining the original target. Each decodes/encodes
+successfully but actual reader/intake refuses the specific structural mismatch,
+with no publication, overwrite or marker change. Original and fault images remain
+separately preserved. Normal owner reopen still refuses the final contradictory
+record without absence fallback or repair. These images are DATA, never native
+provenance or dispatched effects; no cryptographic-authenticity claim is made.
+
+All27 current attempt identities/groups and scopes/cgroups/private roots are
+drained;164 archived regular files compare/hash. R70 remains1PASS/247otherUNRUN
+on its own source; R67/R68 and all failures remain unchanged. No pass transfers.
+
+The next process-loss prerequisite has an exact owner dependency:
+`DfsTestRuntime::capture_retained_genesis_fixture` and
+`reopen_retained_genesis_fixture` require a genuine deferred-genesis original and
+singleton metadata phase. They cannot reopen this healthy full3 fixture by
+inventing or relabeling that original. The finite recommended step is to separate
+the existing physical-root/Raft-owner reconstruction from genesis-only
+expectations, preserve those old controls, and qualify a healthy retained owner
+through actual native readiness. Reap the exact killed process and preserve raw
+DATA before any reopen; no bootstrap fallback, authority reconstructed from
+serialized history, or claim that whole-fixture death proves one-A/survivor
+availability. This constructor change remains unimplemented.
+
+Serving/genesis/C1, effects/receipts/root release, metadata quorum, full abrupt
+loss/rejoin and absolute-zero stabilized-maintenance acceptance remain open.
+No account/model change, peer arbitration, competing owner, Docker/production or
+main-rollout dependency was introduced.
+
+## Historical development checkpoint — 2026-10-26 R70
 
 The recorded post-publication cut is implemented in `fbd8588d` and qualified
 at `3c07cce6`, source `29255ab5` /4,929 inputs. The scoped one-use callback runs
