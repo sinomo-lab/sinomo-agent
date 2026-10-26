@@ -482,6 +482,12 @@ impl LocalSobjMetadataBackend {
                 published: false,
             });
         }
+        #[cfg(test)]
+        crate::default_cluster::genesis::defer_native_genesis_commit_at_writer(
+            &self.root,
+            &record,
+        )
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
         let source_family = commit_owner
             .source_witness()
             .map(|source| source.validate_for(&record.payload, digest))
