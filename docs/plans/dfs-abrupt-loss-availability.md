@@ -15,7 +15,45 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R68
+## Current development checkpoint — 2026-10-26 R70
+
+The recorded post-publication cut is implemented in `fbd8588d` and qualified
+at `3c07cce6`, source `29255ab5` /4,929 inputs. The scoped one-use callback runs
+only after the ACTUAL create-new atomic storage operation and sync returns,
+before final current-provider/record/deadline validation. It alters no storage
+result or authority gate, and restores its thread-local state on unwind/return.
+
+I206/R69 remains FAILED101 with two diagnostics from one reporting typo;
+all248 controls were unrun. The sole correction removes mistaken call
+parentheses. I209 fresh check/build/seal passed; I210 executed the new control:
+**1 PASS,247 other inventory controls UNRUN**. I211 full DFS/KV boundary passed
+11UI controls and three library analyses. Exact reports/archives/source/ELF and
+35-identity owned drain are in R70-REPORT.md and combined receipt `25a3543b`.
+
+The actual cut observes the published file once and waits until the SAME
+installed5s intake deadline expires. The existing final check reports
+publication/durability uncertainty, leaving the bytes intact. SAME-expired-budget
+retry still refuses. Normal reopen preserves original round, commands, attempts,
+peer responses and non-reconstructible original deadline DATA. A new actual
+complete native round returns the FIRST record as ExistingHistoricalData; no
+second publication callback, write, renewal or ACK occurs. The first outcome
+remains uncertain. File identity/bytes/mtime/ctime and authority markers stay
+unchanged. This is not a claim of fsync failure, SIGKILL or power-loss acceptance.
+
+Continue with one bounded canonical-record refusal control: structural decoding
+must not make incomplete participants, duplicate attempts, mismatched replies or
+foreign command epochs acceptable historical DATA. Use actual owner/read/reopen,
+preserve the original and each deliberately supplied fault image, and never send
+or relabel those images as native provenance. This requires no activation or new
+owner. A later healthy-full3 process-reopen helper cannot borrow the existing
+deferred-genesis constructor by fabricating its required original.
+
+R67/R68 counts and every failure remain unchanged. Serving/genesis/C1, quorum,
+survivor execution, abrupt-loss/rejoin and absolute-zero quietness acceptance
+remain open. No production/Docker, peer arbitration, account/model switch or
+main-rollout dependency.
+
+## Historical development checkpoint — 2026-10-26 R68
 
 R65 completed both requested deadline/mixed-native-source controls. Development
 then continued to an integrated, dormant historical-DATA intake using the real
