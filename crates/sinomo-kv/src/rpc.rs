@@ -748,6 +748,32 @@ pub fn validate_cluster_kv_authoritative_watch_start_response(
     Ok(())
 }
 
+/// Validate the authority coordinates of a transaction result, not a read.
+/// Callers must separately bind the response to the original request ID and
+/// submitted command digest. Exact committed receipts authorize only that
+/// original result; subsequent reads still require current-term quorum proof.
+/// Membership-aware forwarding additionally validates the voter configuration.
+pub fn validate_cluster_kv_txn_authority_proof(
+    proof: &KvAuthorityProof,
+    replayed_committed_request: bool,
+    result_revision: KvRevision,
+) -> Result<(), KvError> {
+    if proof.term == 0 || proof.commit_index == 0 || proof.revision != result_revision {
+        return Err(KvError::AuthorityUnavailable {
+            detail: "transaction response carries invalid authority coordinates".into(),
+        });
+    }
+    match (&proof.basis, replayed_committed_request) {
+        (KvAuthorityBasis::ExactCommittedRequest, true) => Ok(()),
+        (KvAuthorityBasis::CurrentTermQuorum { .. }, false) => {
+            validate_cluster_kv_current_term_authority_proof(proof)
+        }
+        _ => Err(KvError::AuthorityUnavailable {
+            detail: "transaction authority basis disagrees with committed replay status".into(),
+        }),
+    }
+}
+
 pub fn validate_cluster_kv_current_term_authority_proof(
     proof: &KvAuthorityProof,
 ) -> Result<(), KvError> {

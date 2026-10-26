@@ -637,6 +637,7 @@ mod tests {
         None,
         MismatchedRequestId,
         MismatchedDigest,
+        MissingSubmittedDigest,
         InvalidAuthority,
         StaleAuthorityRevision,
         StalePostCommitRead,
@@ -650,6 +651,7 @@ mod tests {
 
     #[derive(Debug)]
     struct ScriptedMountedKvTransport {
+        exact_receipt: bool,
         local_node_id: NodeId,
         succeeded: bool,
         fault: MountedTxnResponseFault,
@@ -661,6 +663,7 @@ mod tests {
     impl ScriptedMountedKvTransport {
         fn new(local_node_id: NodeId, succeeded: bool, fault: MountedTxnResponseFault) -> Self {
             Self {
+                exact_receipt: false,
                 local_node_id,
                 succeeded,
                 fault,
@@ -714,7 +717,7 @@ mod tests {
                     .saturating_add(1024 * 1024),
             )
             .expect("materialize mounted KV request");
-            let payload = match route.as_str() {
+            let mut payload = match route.as_str() {
                 sinomo_core::kv::CLUSTER_KV_TXN_ROUTE => {
                     let submitted =
                         sinomo_core::kv::decode_cluster_kv_txn_rpc_request_body(&request.body)
@@ -753,8 +756,15 @@ mod tests {
                                 revision: result_revision,
                                 responses: Vec::new(),
                             }),
-                            authority: self.authority(authority_revision),
-                            replayed_committed_request: false,
+                            authority: sinomo_core::kv::KvAuthorityProof {
+                                basis: if self.exact_receipt {
+                                    sinomo_core::kv::KvAuthorityBasis::ExactCommittedRequest
+                                } else {
+                                    self.authority(authority_revision).basis
+                                },
+                                ..self.authority(authority_revision)
+                            },
+                            replayed_committed_request: self.exact_receipt,
                         },
                     )
                     .expect("encode mounted transaction response")
@@ -886,6 +896,16 @@ mod tests {
                 }
                 other => panic!("unexpected mounted KV route {other}"),
             };
+            if route == sinomo_core::kv::CLUSTER_KV_TXN_ROUTE
+                && matches!(self.fault, MountedTxnResponseFault::MissingSubmittedDigest)
+            {
+                let mut response = sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&payload.body)
+                    .expect("decode legacy fixture response");
+                response.submitted_command_digest = None;
+                payload.body = ObjectRpcResponse::encode_body(route.clone(), &response)
+                    .expect("encode legacy fixture response")
+                    .body;
+            }
             assert!(
                 payload.body.len()
                     <= sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES
@@ -2190,6 +2210,15 @@ mod tests {
 
     #[test]
     fn mounted_txn_revalidates_only_mutated_scopes_in_the_current_generation() {
+        mounted_txn_scope_case(false);
+    }
+
+    #[test]
+    fn mounted_txn_exact_receipt_revalidates_mutated_scopes() {
+        mounted_txn_scope_case(true);
+    }
+
+    fn mounted_txn_scope_case(exact_receipt: bool) {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-txn-scope-invalidation");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -2212,11 +2241,10 @@ mod tests {
             .expect("cluster KV state");
         let snapshot = mounted_sifs_required_materialized_snapshot(&cluster_paths)
             .expect("materialized projection");
-        let transport = Arc::new(ScriptedMountedKvTransport::new(
-            local_node,
-            true,
-            MountedTxnResponseFault::None,
-        ));
+        let mut transport =
+            ScriptedMountedKvTransport::new(local_node, true, MountedTxnResponseFault::None);
+        transport.exact_receipt = exact_receipt;
+        let transport = Arc::new(transport);
         let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
         let mut client =
             MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, snapshot);
@@ -2286,6 +2314,15 @@ mod tests {
 
     #[test]
     fn mounted_txn_failure_mid_revalidation_retires_every_committed_scope() {
+        mounted_txn_mid_revalidation_case(false);
+    }
+
+    #[test]
+    fn mounted_txn_exact_receipt_failure_retires_every_committed_scope() {
+        mounted_txn_mid_revalidation_case(true);
+    }
+
+    fn mounted_txn_mid_revalidation_case(exact_receipt: bool) {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-txn-middle-read-failure");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -2323,11 +2360,13 @@ mod tests {
             })
             .collect();
         snapshot.canonicalize();
-        let transport = Arc::new(ScriptedMountedKvTransport::new(
+        let mut transport = ScriptedMountedKvTransport::new(
             local_node,
             true,
             MountedTxnResponseFault::FailSecondPostCommitRead,
-        ));
+        );
+        transport.exact_receipt = exact_receipt;
+        let transport = Arc::new(transport);
         let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
         let mut client =
             MountedSifsControlPlaneKvClient::new(cluster_paths, peer_transport, Arc::new(snapshot));
@@ -2389,6 +2428,15 @@ mod tests {
 
     #[test]
     fn mounted_control_plane_rejects_unbound_or_stale_txn_proofs() {
+        mounted_txn_rejected_proof_case(false);
+    }
+
+    #[test]
+    fn mounted_control_plane_rejects_unbound_or_stale_exact_receipts() {
+        mounted_txn_rejected_proof_case(true);
+    }
+
+    fn mounted_txn_rejected_proof_case(exact_receipt: bool) {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-control-plane-proof");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -2415,32 +2463,34 @@ mod tests {
         for fault in [
             MountedTxnResponseFault::MismatchedRequestId,
             MountedTxnResponseFault::MismatchedDigest,
+            MountedTxnResponseFault::MissingSubmittedDigest,
             MountedTxnResponseFault::InvalidAuthority,
             MountedTxnResponseFault::StaleAuthorityRevision,
             MountedTxnResponseFault::StalePostCommitRead,
         ] {
-            let transport = Arc::new(ScriptedMountedKvTransport::new(
-                local_node.clone(),
-                true,
-                fault,
-            ));
+            let mut transport = ScriptedMountedKvTransport::new(local_node.clone(), true, fault);
+            transport.exact_receipt = exact_receipt;
+            let transport = Arc::new(transport);
             let peer_transport: Arc<dyn DfsPeerTransport> = transport;
             let mut client = MountedSifsControlPlaneKvClient::new(
                 cluster_paths.clone(),
                 peer_transport,
                 Arc::clone(&snapshot),
             );
-            let error = client
-                .txn(KvTxn {
-                    compares: Vec::new(),
-                    success: vec![KvOp::Put {
-                        key: "/dfs/test/rejected".to_string(),
-                        value: Vec::new(),
-                        lease_id: None,
-                    }],
-                    failure: Vec::new(),
-                })
-                .expect_err("unbound or stale mounted transaction proof");
+            let result = client.txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/dfs/test/rejected".to_string(),
+                    value: Vec::new(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            });
+            if matches!(fault, MountedTxnResponseFault::MissingSubmittedDigest) && !exact_receipt {
+                result.expect("retain legacy fresh-quorum compatibility");
+                continue;
+            }
+            let error = result.expect_err("unbound or stale mounted transaction proof");
             assert!(
                 matches!(
                     error,
@@ -3868,7 +3918,6 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         let response =
             self.call_local_kv_rpc(call, sinomo_core::kv::CLUSTER_KV_TXN_ROUTE, 1024 * 1024)?;
         let result = sinomo_core::kv::decode_cluster_kv_txn_rpc_body(&response.body)?;
-        sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(&result.authority)?;
         if result.request_id != request.request_id {
             return Err(KvError::Serialization {
                 detail: format!(
@@ -3880,6 +3929,10 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         if result
             .submitted_command_digest
             .is_some_and(|digest| digest != submitted_digest)
+            || (matches!(
+                result.authority.basis,
+                sinomo_core::kv::KvAuthorityBasis::ExactCommittedRequest
+            ) && result.submitted_command_digest != Some(submitted_digest))
         {
             return Err(KvError::Serialization {
                 detail:
@@ -3891,14 +3944,11 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
             detail: "cluster KV returned a barrier result for a mounted SIFS transaction"
                 .to_string(),
         })?;
-        if result.authority.revision < response.revision {
-            return Err(KvError::AuthorityUnavailable {
-                detail: format!(
-                    "mounted SIFS cluster KV transaction proof revision {} predates result revision {}",
-                    result.authority.revision.0, response.revision.0,
-                ),
-            });
-        }
+        sinomo_core::kv::validate_cluster_kv_txn_authority_proof(
+            &result.authority,
+            result.replayed_committed_request,
+            response.revision,
+        )?;
 
         let generation = self.ensure_authoritative_projection()?;
         let executed = if response.succeeded {

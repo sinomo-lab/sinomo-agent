@@ -6875,14 +6875,11 @@ pub(crate) fn validate_cluster_kv_txn_compact_commit_response(
             "compact cluster KV transaction response omitted its transaction result",
         )
     })?;
-    if response.authority.term == 0
-        || response.authority.commit_index == 0
-        || txn_response.revision != response.authority.revision
-    {
-        return Err(invalid_forwarded_cluster_kv_commit(
-            "compact cluster KV transaction response carries an invalid authority proof",
-        ));
-    }
+    crate::validate_cluster_kv_txn_authority_proof(
+        &response.authority,
+        response.replayed_committed_request,
+        txn_response.revision,
+    )?;
     match response.authority.basis {
         KvAuthorityBasis::CurrentTermQuorum {
             voter_acks,
@@ -6890,8 +6887,7 @@ pub(crate) fn validate_cluster_kv_txn_compact_commit_response(
         } => {
             let voter_count = cluster_kv_raft_voter_ids(state)?.len();
             let expected_quorum = cluster_kv_raft_quorum_size(voter_count);
-            if response.replayed_committed_request
-                || response.authority.term < state.term
+            if response.authority.term < state.term
                 || required_quorum != expected_quorum
                 || voter_acks < expected_quorum
                 || voter_acks > voter_count
@@ -6901,13 +6897,7 @@ pub(crate) fn validate_cluster_kv_txn_compact_commit_response(
                 ));
             }
         }
-        KvAuthorityBasis::ExactCommittedRequest => {
-            if !response.replayed_committed_request {
-                return Err(invalid_forwarded_cluster_kv_commit(
-                    "compact exact-request proof was not marked as a replay",
-                ));
-            }
-        }
+        KvAuthorityBasis::ExactCommittedRequest => {}
     }
     Ok(())
 }

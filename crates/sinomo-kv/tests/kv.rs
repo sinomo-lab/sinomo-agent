@@ -11786,6 +11786,165 @@ mod tests {
     }
 
     #[test]
+    fn transaction_receipt_authority_rejects_inconsistent_coordinates_and_read_use() {
+        let exact = KvAuthorityProof {
+            term: 3,
+            commit_index: 17,
+            revision: KvRevision(9),
+            basis: KvAuthorityBasis::ExactCommittedRequest,
+        };
+        let quorum = KvAuthorityProof {
+            basis: KvAuthorityBasis::CurrentTermQuorum {
+                voter_acks: 2,
+                required_quorum: 2,
+            },
+            ..exact
+        };
+        validate_cluster_kv_txn_authority_proof(&exact, true, KvRevision(9)).unwrap();
+        validate_cluster_kv_txn_authority_proof(&quorum, false, KvRevision(9)).unwrap();
+        assert!(validate_cluster_kv_current_term_authority_proof(&exact).is_err());
+        for (proof, replayed, revision) in [
+            (exact, false, KvRevision(9)),
+            (quorum, true, KvRevision(9)),
+            (KvAuthorityProof { term: 0, ..exact }, true, KvRevision(9)),
+            (
+                KvAuthorityProof {
+                    commit_index: 0,
+                    ..exact
+                },
+                true,
+                KvRevision(9),
+            ),
+            (exact, true, KvRevision(8)),
+            (exact, true, KvRevision(10)),
+            (
+                KvAuthorityProof {
+                    basis: KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 1,
+                        required_quorum: 2,
+                    },
+                    ..quorum
+                },
+                false,
+                KvRevision(9),
+            ),
+            (
+                KvAuthorityProof {
+                    basis: KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 0,
+                        required_quorum: 0,
+                    },
+                    ..quorum
+                },
+                false,
+                KvRevision(9),
+            ),
+        ] {
+            assert!(
+                validate_cluster_kv_txn_authority_proof(&proof, replayed, revision).is_err(),
+                "invalid transaction proof: {proof:?}, replayed={replayed}, revision={revision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_receipt_authority_accepts_native_durable_exact_replay_without_new_append() {
+        // Actual single-voter quorum driver and on-disk WAL/receipt storage.
+        // No remote-voter, transport-authentication or multi-node claim is made here.
+        let root = temp_raft_root("sinomo-kv-txn-receipt-authority");
+        let paths = ClusterKvPaths::new(&root);
+        let local = NodeId::from_legacy_named("node_txn_receipt_authority").unwrap();
+        let remote = NodeId::from_legacy_named("node_txn_receipt_unused").unwrap();
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members.truncate(1);
+        let request = KvTxnRequest::generated(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/txn-receipt/committed".into(),
+                value: b"value".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        });
+        let command = request.clone().into_command_request();
+        let mut host = RacingCommitTestHost {
+            kv_paths: paths.clone(),
+            node_id: local.clone(),
+            remote_targets: Vec::new(),
+            storage: None,
+            replication_entered: None,
+            replication_release: None,
+            session_released_before_fanout: false,
+            status_lock_acquired: false,
+            fanout_lock_acquired: false,
+        };
+        let options = ClusterKvRaftQuorumCommitOptions {
+            timeout: Duration::from_secs(1),
+        };
+        let first = commit_cluster_kv_raft_command_compact_with_quorum(
+            &mut state,
+            command.clone(),
+            options,
+            &mut host,
+        )
+        .unwrap();
+        let before = paths
+            .raft_wal_paths(&local)
+            .read_persisted_hard_state()
+            .unwrap();
+        let replay = commit_cluster_kv_raft_command_compact_with_quorum(
+            &mut state,
+            command.clone(),
+            options,
+            &mut host,
+        )
+        .unwrap();
+        assert!(!first.replayed_committed_request);
+        assert!(replay.replayed_committed_request);
+        assert_eq!(replay.txn_response, first.txn_response);
+        assert_eq!(
+            replay.authority.basis,
+            KvAuthorityBasis::ExactCommittedRequest
+        );
+        assert_eq!(replay.authority.commit_index, first.authority.commit_index);
+        assert_eq!(
+            paths
+                .raft_wal_paths(&local)
+                .read_persisted_hard_state()
+                .unwrap(),
+            before
+        );
+        let compact = ClusterKvTxnCompactCommitResult {
+            request_id: request.request_id.clone(),
+            submitted_command_digest: Some(command.digest().unwrap()),
+            command_digest: command.digest().unwrap(),
+            txn_response: replay.txn_response,
+            authority: replay.authority,
+            replayed_committed_request: replay.replayed_committed_request,
+        };
+        validate_cluster_kv_txn_compact_commit_response(&state, &request, &compact).unwrap();
+        validate_cluster_kv_txn_authority_proof(
+            &compact.authority,
+            true,
+            compact.txn_response.as_ref().unwrap().revision,
+        )
+        .unwrap();
+        assert!(validate_cluster_kv_current_term_authority_proof(&compact.authority).is_err());
+        let mut wrong_identity = compact.clone();
+        wrong_identity.request_id = KvRequestId::generate();
+        assert!(
+            validate_cluster_kv_txn_compact_commit_response(&state, &request, &wrong_identity)
+                .is_err()
+        );
+        let mut wrong_digest = compact;
+        wrong_digest.submitted_command_digest = Some(KvCommandDigest([99; 32]));
+        assert!(
+            validate_cluster_kv_txn_compact_commit_response(&state, &request, &wrong_digest)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn exact_committed_retry_replays_without_verified_leadership_or_new_log() {
         let local = NodeId::from_legacy_named("node_kv_retry_local").expect("local");
         let remote = NodeId::from_legacy_named("node_kv_retry_remote").expect("remote");

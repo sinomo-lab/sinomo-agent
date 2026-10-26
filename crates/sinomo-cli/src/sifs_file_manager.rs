@@ -4672,7 +4672,6 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
         let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&request)?;
         let response = self.call_local_daemon_kv_rpc(payload, 1024 * 1024)?;
         let result = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)?;
-        sinomo_runtime::kv::validate_cluster_kv_current_term_authority_proof(&result.authority)?;
         if result.request_id != request.request_id {
             return Err(KvError::Serialization {
                 detail: format!(
@@ -4694,14 +4693,12 @@ impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
                 detail: "cluster KV returned a barrier result for a SIFS control-plane transaction"
                     .to_string(),
             })?;
-        if result.authority.revision < response.revision {
-            return Err(KvError::AuthorityUnavailable {
-                detail: format!(
-                    "SIFS cluster KV transaction proof revision {} predates result revision {}",
-                    result.authority.revision.0, response.revision.0,
-                ),
-            });
-        }
+        sinomo_runtime::kv::validate_cluster_kv_txn_authority_proof(
+            &result.authority,
+            result.replayed_committed_request,
+            response.revision,
+        )?;
+
         let generation = self.ensure_authoritative_projection()?;
         let executed = if response.succeeded {
             &request.txn.success
@@ -6437,6 +6434,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingSifsKvDaemonTransport {
+        exact_receipt: bool,
         local_node_id: NodeId,
         routes: Mutex<Vec<String>>,
         committed: AtomicBool,
@@ -6453,6 +6451,7 @@ mod tests {
     impl RecordingSifsKvDaemonTransport {
         fn new(local_node_id: NodeId) -> Self {
             Self {
+                exact_receipt: false,
                 local_node_id,
                 routes: Mutex::new(Vec::new()),
                 committed: AtomicBool::new(false),
@@ -6848,8 +6847,15 @@ mod tests {
                                 revision: KvRevision(8),
                                 responses: Vec::new(),
                             }),
-                            authority: Self::authority(KvRevision(8)),
-                            replayed_committed_request: false,
+                            authority: sinomo_runtime::kv::KvAuthorityProof {
+                                basis: if self.exact_receipt {
+                                    sinomo_runtime::kv::KvAuthorityBasis::ExactCommittedRequest
+                                } else {
+                                    Self::authority(KvRevision(8)).basis
+                                },
+                                ..Self::authority(KvRevision(8))
+                            },
+                            replayed_committed_request: self.exact_receipt,
                         },
                     )
                     .expect("encode compact SIFS transaction response")
@@ -7654,16 +7660,77 @@ mod tests {
     }
 
     #[test]
+    fn sifs_txn_exact_receipt_preserves_native_commit_and_fresh_reads() {
+        let root = temp_sifs_data_dir("control-plane-exact-receipt");
+        let data_dir = SinomoDataDir::new(&root);
+        seed_observation_cluster(&data_dir);
+        let paths = ClusterPaths::new(&data_dir);
+        let state = cluster::read_cluster_state_without_kv(&paths).expect("cluster state");
+        let mut transport = RecordingSifsKvDaemonTransport::new(state.local_node_id);
+        transport.exact_receipt = true;
+        let transport = Arc::new(transport);
+        let mut client =
+            SifsControlPlaneKvClient::new(&data_dir, &paths).with_peer_transport(transport.clone());
+        let (response, native) = client
+            .txn_with_native_authority(KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/dfs/test/committed".into(),
+                    value: b"value".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            })
+            .expect("bound exact receipt is a transaction result");
+        let native = native.expect("original native receipt");
+        assert_eq!(native.request.request_id, native.result.request_id);
+        assert_eq!(native.result.txn_response.as_ref(), Some(&response));
+        assert!(native.result.replayed_committed_request);
+        assert_eq!(
+            native.result.authority.basis,
+            sinomo_runtime::kv::KvAuthorityBasis::ExactCommittedRequest
+        );
+        assert!(
+            sinomo_runtime::kv::validate_cluster_kv_current_term_authority_proof(
+                &native.result.authority
+            )
+            .is_err(),
+            "receipt is not read authority"
+        );
+        assert_eq!(
+            client.get("/dfs/test/committed").unwrap().unwrap().value,
+            b"value"
+        );
+        assert_eq!(
+            transport.routes(),
+            vec![
+                sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE.to_string(),
+                sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE.to_string(),
+            ],
+            "post-commit data still crosses a fresh authority read"
+        );
+    }
+
+    #[test]
     fn sifs_txn_failure_mid_revalidation_retires_every_committed_scope() {
+        sifs_txn_mid_revalidation_case(false);
+    }
+
+    #[test]
+    fn sifs_txn_exact_receipt_failure_retires_every_committed_scope() {
+        sifs_txn_mid_revalidation_case(true);
+    }
+
+    fn sifs_txn_mid_revalidation_case(exact_receipt: bool) {
         let root = temp_sifs_data_dir("control-plane-txn-middle-read-failure");
         let data_dir = SinomoDataDir::new(&root);
         seed_observation_cluster(&data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
-        ));
+        let mut transport = RecordingSifsKvDaemonTransport::new(state.local_node_id.clone());
+        transport.exact_receipt = exact_receipt;
+        let transport = Arc::new(transport);
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
         client
