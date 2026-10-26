@@ -2417,7 +2417,22 @@ pub struct DfsMaintenanceTickObservations {
     pub repair_attempt_in_flight_count: usize,
     pub repair_attempt_backoff_count: usize,
     pub repair_attempt_suppressed_count: usize,
+    /// Informational repair summaries retained by the ordinary in-memory log sink.
+    pub routine_notice_lines: Vec<String>,
     pub notice_lines: Vec<String>,
+}
+
+impl DfsMaintenanceTickObservations {
+    /// Emit the daemon notices while retaining the caller's trace context.
+    #[doc(hidden)]
+    pub fn emit_daemon_notice_logs(&self) {
+        for line in &self.routine_notice_lines {
+            tracing::info!(target: "sinomo_dfs::runtime_host::maintenance_runtime", "sinomo daemon {line}");
+        }
+        for line in &self.notice_lines {
+            tracing::warn!(target: "sinomo_dfs::runtime_host::maintenance_runtime", "sinomo daemon {line}");
+        }
+    }
 }
 
 pub fn dfs_maintenance_tick_observations(
@@ -2430,11 +2445,12 @@ pub fn dfs_maintenance_tick_observations(
     notice_lines.extend(dfs_lifecycle_maintenance_notice_lines(
         &report.lifecycle_reports,
     ));
-    notice_lines.extend(dfs_repair_maintenance_notice_lines(
+    let (routine_notice_lines, repair_notices) = dfs_repair_maintenance_observation_lines(
         &report.scheduled_repairs,
         &report.followup_events,
         &report.repair_attempts_after,
-    ));
+    );
+    notice_lines.extend(repair_notices);
     notice_lines.extend(dfs_metadata_replication_notice_lines(
         &report.metadata_replication,
     ));
@@ -2449,6 +2465,7 @@ pub fn dfs_maintenance_tick_observations(
         repair_attempt_in_flight_count: repair_attempt_summary.in_flight,
         repair_attempt_backoff_count: repair_attempt_summary.backoff,
         repair_attempt_suppressed_count: repair_attempt_summary.suppressed,
+        routine_notice_lines,
         notice_lines,
     }
 }
@@ -2640,6 +2657,18 @@ pub fn dfs_repair_maintenance_notice_lines(
     followup_events: &[NetworkedDfsServiceEvent],
     repair_attempts: &[DfsRepairAttemptRecord],
 ) -> Vec<String> {
+    let (mut lines, events) = dfs_repair_maintenance_observation_lines(
+        scheduled_repairs, followup_events, repair_attempts,
+    );
+    lines.extend(events);
+    lines
+}
+
+fn dfs_repair_maintenance_observation_lines(
+    scheduled_repairs: &[DistributedRepairJob],
+    followup_events: &[NetworkedDfsServiceEvent],
+    repair_attempts: &[DfsRepairAttemptRecord],
+) -> (Vec<String>, Vec<String>) {
     let repair_followups = followup_events
         .iter()
         .filter(|event| {
@@ -2654,7 +2683,7 @@ pub fn dfs_repair_maintenance_notice_lines(
         })
         .count();
     if scheduled_repairs.is_empty() && repair_followups == 0 && repair_attempts.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let mut lines = vec![format!(
@@ -2678,6 +2707,8 @@ pub fn dfs_repair_maintenance_notice_lines(
             next_retry
         ));
     }
+    let routine_lines = lines;
+    let mut lines = Vec::new();
     lines.extend(scheduled_repairs.iter().map(|job| {
         format!(
             "DFS repair scheduled {} {} {} -> {}",
@@ -2724,7 +2755,7 @@ pub fn dfs_repair_maintenance_notice_lines(
         )),
         _ => None,
     }));
-    lines
+    (routine_lines, lines)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

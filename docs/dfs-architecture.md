@@ -1877,6 +1877,13 @@ extends old capacity evidence or manufactures a startup event. Stabilized idle
 windows include maintenance and require zero physical writes across daemon,
 shadow, helper and attributable writeback scopes.
 
+Periodic repair counts and the retained-attempt summary are informational
+observations. They remain available in the bounded memory logs and traces without
+forcing formatted log writes; explicit live logging can still emit them. Actual
+repair failures retain warning severity and the existing persistence policy.
+Reporting an unchanged in-flight attempt neither completes it nor changes its
+retry, receipt, authority or durability requirements.
+
 ## Roaming and Failure Behavior
 
 Roaming nodes are ordinary trusted members but should not normally be required

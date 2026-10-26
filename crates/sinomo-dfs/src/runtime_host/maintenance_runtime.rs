@@ -1155,9 +1155,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             observations.metadata_replications_sent as u64,
         );
     }
-    for line in observations.notice_lines {
-        tracing::warn!("sinomo daemon {line}");
-    }
+    observations.emit_daemon_notice_logs();
     Ok(DaemonDfsMaintenancePreExecution::Finished(Some(
         reached_limit,
     )))

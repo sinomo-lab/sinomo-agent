@@ -3202,6 +3202,64 @@ mod tests {
     }
 
     #[test]
+    fn dfs_routine_repair_observations_stay_in_ram_and_failures_persist() {
+        let root = sinomo_testdir::TestDir::new("observe-dfs-repair-summary");
+        let path = root.path().join("formatted.log");
+        let file = Arc::new(std::fs::File::create(&path).unwrap());
+        let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
+        let traces = Arc::new(Mutex::new(VecDeque::new()));
+        let live = Arc::new(AtomicBool::new(false));
+        let subscriber = Registry::default().with(EnvFilter::new("debug,sinomo.perf=trace"))
+            .with(ObserveTraceLayer {
+                trace_capacity: TRACE_BUFFER_LIMIT, logs: logs.clone(), traces: traces.clone(),
+                dropped_traces: Arc::new(AtomicU64::new(0)), capture: Arc::new(Mutex::new(None)),
+            }).with(fmt::layer().with_ansi(false).with_writer(file)
+                .with_filter(formatted_log_filter(live.clone())));
+        let attempt = sinomo_dfs::DfsRepairAttemptRecord {
+            intent_id: "original-unfinished-repair".into(),
+            object_id: sinomo_dfs::DfsObjectId::generate(), version: sinomo_dfs::DfsVersion::generate(),
+            content_hash: "retained-content".into(), missing_replica_node_id: sinomo_core::node::NodeId::generate(),
+            attempts: 1, in_flight: true, last_attempt_unix_nanos: 1, next_retry_unix_nanos: 0,
+            transfer_request_id: Some("original-transfer".into()), last_error: None,
+            transfer_delivery_state: None, completed_transfer_request_id: None, transfer_kind: None,
+        };
+        let report = sinomo_dfs::DfsMaintenanceTickReport {
+            namespace_jobs: Default::default(), write_intents: Default::default(), placement_reconciliation: None,
+            lifecycle_reports: Vec::new(), scheduled_repairs: Vec::new(), followup_events: Vec::new(),
+            repair_attempts_before: vec![attempt.clone()], repair_attempts_after: vec![attempt],
+            repair_budget_exhausted: false, repair_page_checkpoint: Default::default(), metadata_replication: sinomo_dfs::DfsMetadataJournalReplicationReport { outcomes: Vec::new() },
+        };
+        let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
+        assert_eq!(observations.repair_attempt_in_flight_count, 1);
+        tracing::subscriber::with_default(subscriber, || {
+            observations.emit_daemon_notice_logs();
+            observations.emit_daemon_notice_logs();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0,
+                "unchanged routine repair summaries must not append formatted disk logs");
+            let mut failed = report.clone();
+            failed.followup_events.push(sinomo_dfs::NetworkedDfsServiceEvent::RepairRetryFailed { reason: "controlled failure".into() });
+            sinomo_dfs::dfs_maintenance_tick_observations(&failed).emit_daemon_notice_logs();
+            let warning = std::fs::read_to_string(&path).unwrap();
+            assert!(warning.contains("DFS repair retry failed: controlled failure"));
+            assert!(!warning.contains("DFS repairs: scheduled="));
+            live.store(true, Ordering::Release);
+            observations.emit_daemon_notice_logs();
+            let explicit = std::fs::read_to_string(&path).unwrap();
+            assert!(explicit.contains("DFS repairs: scheduled=0, followups=0"));
+            assert!(explicit.contains("active=1, in_flight=1"));
+            live.store(false, Ordering::Release);
+            observations.emit_daemon_notice_logs();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), explicit);
+        });
+        let (records, _, _) = logs.lock().unwrap().snapshot(&crate::ObserveLogsRequest::default());
+        let routine = records.iter().filter(|r| r.message.contains("DFS repairs:") || r.message.contains("DFS repair attempts:")).collect::<Vec<_>>();
+        assert_eq!(routine.len(), 10, "all routine summaries remain observable in RAM");
+        assert!(routine.iter().all(|r| r.severity == crate::OperationalSeverity::Info));
+        assert!(records.iter().any(|r| r.message.contains("controlled failure")));
+        assert_eq!(report.repair_attempts_before, report.repair_attempts_after, "observation cannot complete or mutate retained repair work");
+    }
+
+    #[test]
     fn routine_logs_stay_in_memory_and_live_writing_has_no_backlog() {
         let root = sinomo_testdir::TestDir::new("observe-live-log-writing");
         let path = root.path().join("formatted.log");
