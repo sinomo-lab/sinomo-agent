@@ -15,7 +15,62 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R65
+## Current development checkpoint — 2026-10-26 R68
+
+R65 completed both requested deadline/mixed-native-source controls. Development
+then continued to an integrated, dormant historical-DATA intake using the real
+metadata owner. Implementation `ebc5483a` and native controls `fa68de0f` merged
+without conflicts at `9a6a56d4`. The complete private native round remains input
+DATA, distinct from separately checked current provider, exact-shard admission,
+metadata writer/epoch/freeze and physical-root ownership. APIs and schema remain
+`cfg(test)` with no automatic runtime caller or production format activation.
+
+The existing create-new atomic storage path syncs the first immutable SOBJ slot.
+Exact or fresh-semantic duplicates return the FIRST record without write, rename,
+fsync, identity/deadline renewal or another durable ACK. Conflicting, malformed,
+partial, expired, foreign-writer and physically rebound input refuses. Cold DATA
+cannot reconstruct native provenance. Ordinary table checkpoint and normal
+component reopen preserve this historical file; same-directory table generation
+replacement is not certified by its physical root identities.
+
+R66/I197 FAILED typecheck with two E0624 private-method accesses; all247 controls
+were unrun. Correction `00d09a99` uses a test-only boolean query under the existing
+context mutex without exposing offer/witness capabilities or weakening refusal.
+R67 source `f32c2893` passed build and executed **3 PASS / 1 FAIL**, with243 other
+controls unrun. The positive case reached its final marker assertion after
+successful history persistence, duplicate, checkpoint and reopen checks. Its
+assertion wrongly required identical marker bytes across deliberate Main
+namespace activity: actual rebind prefix advanced6->10 while original handoff,
+epochs and cut remained unchanged. The failure and all exact evidence remain.
+
+Fixture-only correction `66d14f4f` requires marker bytes unchanged at the actual
+intake/duplicate no-effect boundary, then permits only the EXACT genuine semantic
+descendant after explicit activity/checkpoint/reopen. No production code, original
+identity, authority gate, deadline or native case cap changed. Current R68 source
+`b199ea4f` /4,929 inputs passed fresh check/build/seal and the affected native
+positive: **1 PASS;246 other controls UNRUN on R68**. The three negative bodies
+and production inputs are byte-exact to R67, but their older passes are not
+transferred. Full current-source DFS/KV lint passed11 UI controls and three
+library analyses. See R68-REPORT.md and combined receipt `8b687f8b` for exact
+source/ELF/commands, all failures,637-file failed-panel and159-file successor
+archives, standard measurement/coverage tables and actual complete owned drain.
+
+The next finite test boundary is interruption after the actual no-replace
+publication/fsync returns but before intake final validation/return in
+`LocalSobjMetadataBackend::retain_native_prefix_history_owned`. An owned test-only
+cut at that exact caller boundary can expire the existing intake deadline, then
+check retained uncertainty, unchanged original record, normal reopen and
+ExistingHistoricalData without recertification. It must not replace the storage
+writer, simulate an ACK, widen deadlines or reconstruct native capability from
+bytes. Power-loss/storage-fsync cuts remain a separate unexecuted requirement.
+
+This adds no serving/genesis/C1/floor activation, effect authority, receipt/W
+application, Terminal/Close/root retirement, participant weakening or periodic
+writes. Quorum, survivor execution, abrupt-loss/partition/rejoin and absolute-zero
+quietness acceptance remain open. No Docker/production operation, account/model
+switch, peer arbitration, push or rollout dependency was introduced.
+
+## Historical development checkpoint — 2026-10-26 R65
 
 The two recorded R64 edge controls are now executed. Test-only `ea77bcd1`, source
 `414da787` with 4,927 inputs, appends them without changing production code or the
