@@ -15,7 +15,51 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R74
+## Current development checkpoint — 2026-10-26 R81
+
+Code `5a0def5f` uses three separately owned native daemon processes, their real
+prepared TCP listeners, native identity/link/routed-session stack and existing
+concrete-endpoint RPC API. Only test code and a dev-only daemon dependency changed;
+no `Fabric`, custom signer or decoded-to-private-capability conversion is used.
+The fixed driver admits read-only Ping/DFS-status calls for the three actual
+owned fixture contacts. Native member authorization, published endpoint descriptor
+identity and physical listener address are independently checked. Parent driver
+DATA is not private PREFIX provenance or serving authority.
+
+Source `b3f07e1e` /4,933 inputs: I251 fresh check/build/seal PASS;
+I252 **1PASS/252 other inventory controlsUNRUN**; I253 ring18/18 PASS;
+I254 full DFS/KV boundary11UI/three libraries PASS. All six baseline directions
+returned fresh exact nonces/responder IDs. A alone was SIGKILLed/reaped; B/C kept
+the same PID/start identities and made fresh reciprocal native calls. The
+wrong-live-peer contact refused, and dead-A contact named A's exact owned port.
+Raw A files were captured before any reopen and stayed unchanged through survivor
+observations. B/C then exited normally; exact owned scopes/groups/roots drained.
+The operation-local R81 report/combined receipt retains all seals, raw outcomes,
+standard resource tables, unavailable counters and explicit sampled coverage gaps.
+
+Earlier R75 compiler failure, R76 fresh-default fixture failure, R77 evidence-cap
+failure, R78 ordinary-routing failure and R80 descriptor failure remain unchanged.
+R79 raw libtest PASS is retained but its strict contact qualification is WITHHELD:
+its dead-A probe selected a default address. R81 pins the actual owned address
+while retaining the native published descriptor; it changes no authentication,
+participant or deadline gate. No earlier pass transfers.
+
+This establishes concrete-endpoint process/transport survival, not general
+node-routing or DFS availability. Initial control topology is A-only voter with
+B/C nonvoters; no surviving control/metadata quorum, W/N write, exact-version read,
+private PREFIX authority or stabilized quietness acceptance is claimed. No
+host-network/security configuration, existing credential, Docker or production
+operation occurred. Startup/explicit probes are semantic activity; absolute-zero
+maintenance remains unqualified.
+
+The next finite slice reopens A's retained root/key/WAL and exact listener using
+the normal native daemon owner, with B/C still alive. Missing/replaced state
+must refuse before native startup; there is no fresh bootstrap, key generation,
+state rewrite, promotion or authority derived from a manifest. This retained
+reconnection slice is currently unrun. Full survivor read/write, complete durable
+metadata promise/decision/custody protocol and reconnection policy remain open.
+
+## Historical development checkpoint — 2026-10-26 R74
 
 The finite healthy-full3 retained constructor is implemented in `cb566cd4`,
 integrated with native process controls `40f16fac`/`97284d3f` at `7e73a420`.
