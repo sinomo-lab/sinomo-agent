@@ -17,6 +17,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod prefix;
+
 const COMPONENT: &str = "module.fixture.dfs_native_peer";
 const MAX_DRIVER_INPUT: usize = 4096;
 const MAX_NONCE: usize = 192;
@@ -123,13 +125,23 @@ async fn probe(
     contacts: &OwnedContacts,
     selected: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
 ) -> Result<ProbeReply, NetworkError> {
+    if matches!(request.kind, ProbeKind::PrefixRound) {
+        return prefix::probe(
+            request, deadline, root, runtime, source, cluster, peers, contacts,
+        );
+    }
     let wire = match request.kind {
-        ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
+        ProbeKind::Ping
+        | ProbeKind::EndpointPing
+        | ProbeKind::EndpointWrongPeer
+        | ProbeKind::RegisteredEndpointPing
+        | ProbeKind::RegisteredEndpointWrongPeer => {
             sinomo_core::cluster::cluster_network_ping_rpc_request(&request.nonce, 0)?
         }
         ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
             ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())?
         }
+        ProbeKind::PrefixRound => unreachable!("PREFIX observation dispatched above"),
     };
     let route = wire.route.clone();
     let remaining = deadline
@@ -142,7 +154,11 @@ async fn probe(
                 NetworkDeliveryState::DefinitelyNotSent,
             )
         })?;
-    let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint {
+    let registered_endpoint = matches!(
+        request.kind,
+        ProbeKind::RegisteredEndpointPing | ProbeKind::RegisteredEndpointWrongPeer
+    );
+    let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint || registered_endpoint {
         let data = SinomoDataDir::new(root);
         let paths = ClusterPaths::new(&data);
         // Endpoint contacts use the actual native-written member view, never
@@ -192,7 +208,10 @@ async fn probe(
                 })
         };
         let mut endpoint = contact(&request.target)?;
-        if matches!(request.kind, ProbeKind::EndpointWrongPeer) {
+        if matches!(
+            request.kind,
+            ProbeKind::EndpointWrongPeer | ProbeKind::RegisteredEndpointWrongPeer
+        ) {
             let other = peers
                 .iter()
                 .find(|node| *node != source && **node != request.target)
@@ -206,16 +225,25 @@ async fn probe(
             "NATIVE_ENDPOINT_PROBE source={source} target={} nonce={} endpoint={endpoint:?}",
             request.target, request.nonce
         );
-        let mut host = sinomo_daemon::DaemonObjectRpcAsyncHost::direct_only(runtime)
-            .with_paths(&sinomo_daemon::DaemonPaths::new(&data));
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths)
-            .call_endpoint(
-                &state,
+        if registered_endpoint {
+            transport.call_endpoint(
                 &endpoint,
                 ObjectRpcCall::value(wire),
                 ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
-            )
-            .await?
+                false,
+            )?
+        } else {
+            let mut host = sinomo_daemon::DaemonObjectRpcAsyncHost::direct_only(runtime)
+                .with_paths(&sinomo_daemon::DaemonPaths::new(&data));
+            sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths)
+                .call_endpoint(
+                    &state,
+                    &endpoint,
+                    ObjectRpcCall::value(wire),
+                    ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
+                )
+                .await?
+        }
     } else {
         transport
             .call_async(
@@ -242,7 +270,11 @@ async fn probe(
         return Err(invalid("native driver reply names another responder"));
     }
     let responder_node_id = match request.kind {
-        ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
+        ProbeKind::Ping
+        | ProbeKind::EndpointPing
+        | ProbeKind::EndpointWrongPeer
+        | ProbeKind::RegisteredEndpointPing
+        | ProbeKind::RegisteredEndpointWrongPeer => {
             let ping: sinomo_core::cluster::ClusterNetworkPingResponse = response.decode_body()?;
             if ping.responder_node_id != request.target
                 || ping.nonce != request.nonce
@@ -265,6 +297,7 @@ async fn probe(
             // Preserve only an actual native header, never copy the target.
             header_responder
         }
+        ProbeKind::PrefixRound => unreachable!("PREFIX observation dispatched above"),
     };
     if Instant::now() >= deadline {
         return Err(NetworkError::timeout(
