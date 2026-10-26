@@ -1059,6 +1059,12 @@ pub(crate) struct DfsSourceAdoptionContextRestore {
     previous: Option<SourceAdoptionContext>,
 }
 impl DfsSourceAdoptionContextSlot {
+    #[cfg(test)]
+    pub(crate) fn has_retained_custody_for_prefix_history(&self) -> bool {
+        let current = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        current.offer.is_some() || current.witness.is_some()
+    }
+
     pub(crate) fn install(
         &self,
         offer: crate::DfsSourceAdoptionOffer,

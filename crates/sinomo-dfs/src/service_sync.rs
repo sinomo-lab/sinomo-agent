@@ -1705,8 +1705,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.check_cancelled("native prefix historical intake")?;
         if !round.is_complete()
             || Instant::now() >= deadline
-            || self.source_adoption.offer().is_some()
-            || self.source_adoption.witness().is_some()
+            || self.source_adoption.has_retained_custody_for_prefix_history()
         {
             return Err(DfsError::Metadata {message:"historical intake requires a complete private round, live intake budget and no retained source writer".into()});
         }
