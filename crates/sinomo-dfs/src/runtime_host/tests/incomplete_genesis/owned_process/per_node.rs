@@ -830,6 +830,7 @@ fn observe_native_prefix(
     root: &Path,
     report: &mut serde_json::Value,
     phase: &str,
+    budget: Duration,
 ) -> TestResult<Option<serde_json::Value>> {
     let local = node.input.node_id.clone();
     let result = probe(
@@ -837,7 +838,7 @@ fn observe_native_prefix(
         &local,
         ProbeKind::PrefixRound,
         format!("owned-prefix-{}", sinomo_core::Id::generate()),
-        OP_CAP,
+        budget,
     );
     record_probe(root, report, phase, &result)?;
     let Ok(response) = result else {
@@ -971,21 +972,46 @@ fn run_native_process_case(
         if prefix_round {
             let mut complete = 0;
             let mut observations = Vec::new();
-            for node in &mut nodes {
-                let data = observe_native_prefix(
-                    node,
-                    &root,
-                    &mut report,
-                    "baseline-owned-native-prefix",
-                )?;
-                complete += usize::from(data.as_ref().is_some_and(|v| v["complete"] == true));
-                observations.push(data);
+            let mut rounds = 0;
+            // Listener/ping readiness is not DFS-owner readiness. Observe the
+            // existing owner within the ORIGINAL startup deadline, without
+            // warming/reopening it or replacing an expected generation.
+            while complete == 0 && Instant::now() < deadline {
+                rounds += 1;
+                for node in &mut nodes {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let data = observe_native_prefix(
+                        node,
+                        &root,
+                        &mut report,
+                        "baseline-owned-native-prefix",
+                        OP_CAP.min(left),
+                    )?;
+                    complete += usize::from(data.as_ref().is_some_and(|v| v["complete"] == true));
+                    observations.push(data);
+                    if complete > 0 {
+                        break;
+                    }
+                }
+                if complete == 0 {
+                    // At most30 three-node rounds fit60s: retain all refusals
+                    // without exhausting the unchanged128-record evidence cap.
+                    std::thread::sleep(
+                        Duration::from_secs(2)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
             }
-            report["prefix_baseline"] =
-                serde_json::json!({"complete_rounds":complete,"observations":observations});
+            let expired = Instant::now() >= deadline;
+            report["prefix_baseline"] = serde_json::json!({"complete_rounds":complete,
+                "observation_rounds":rounds,"original_startup_deadline_expired":expired,
+                "observations":observations});
             assert!(
-                complete > 0,
-                "native positive prerequisite has no actual complete full3 PREFIX round"
+                complete > 0 && !expired,
+                "native positive prerequisite has no actual complete full3 PREFIX round within original startup60s"
             );
         }
         let b = nodes[1].alive_identity()?;
@@ -1078,6 +1104,7 @@ fn run_native_process_case(
                     &root,
                     &mut report,
                     "after-A-death-owned-native-prefix",
+                    OP_CAP,
                 )?;
                 assert!(
                     !data.as_ref().is_some_and(|value| value["complete"] == true),
