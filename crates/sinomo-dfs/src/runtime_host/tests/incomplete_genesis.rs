@@ -1166,3 +1166,287 @@ fn native_cold_owner_preserves_held_genesis_before_stamped_write_effects() {
     }
     closed.unwrap();
 }
+
+#[test]
+fn native_component_reopen_preserves_held_genesis_until_same_owner_completion() {
+    use sinomo_core::network::RoutedAvailability;
+    let (mut native, nodes) =
+        DfsTestRuntime::start_cluster("native-held-genesis-component-reopen", 3).unwrap();
+    let evidence = native
+        .data_dir(&nodes[0])
+        .root()
+        .parent()
+        .unwrap()
+        .join("incomplete-genesis-component-reopen.json");
+    let mut report = serde_json::json!({
+        "scope":"normal component stop/drain/remount; three native nodes; new scope assigned{A}",
+        "limits":"not SIGKILL, power loss, abrupt-node availability, or quietness evidence",
+        "requests":"no caller invocation while endpoint is not actually ready/accepting",
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<(), String> {
+            let primary = native.root_shard()?.primary_node_id;
+            let peer = nodes.iter().find(|node| **node != primary).unwrap().clone();
+            // This live B transport reports actual endpoint acceptance; it owns no
+            // A service, admission or DATA lock that could pin the stopped owner.
+            let peer_transport = native
+                .component_context(&peer)?
+                .object_rpc_transport()
+                .ok_or("live peer has no native object RPC transport")?;
+            assert_eq!(
+                peer_transport.availability(&primary),
+                RoutedAvailability::Candidate
+            );
+            let prefix = crate::sifs_node_path(&primary);
+            let path = format!("{prefix}/held-genesis-after-component-reopen");
+            let legacy = native.metadata_shards()?;
+            let setup_markers = legacy_markers(&native, &nodes, &legacy);
+            let phase =
+                native.begin_deferred_native_genesis("reopened-held-native-node-scope", &prefix)?;
+            let shard = phase.shard().clone();
+            let original = phase.original_record().clone();
+            assert_eq!(shard.primary_node_id, primary);
+            assert!(shard.replica_node_ids.is_empty());
+            assert_eq!(original.status, DfsPreparedOperationStatus::Prepared);
+            assert!(original.committed_entry.is_none());
+            let root = crate::local_dfs_metadata_shard_path(
+                native.data_dir(&primary),
+                &DfsMetadataShardId::new(&shard.shard_id),
+            );
+            let frames = actual_frames(&root)?;
+            let before_stop_markers = legacy_markers(&native, &nodes, &legacy);
+            let setup_rebinds = attribute_setup_rebinds(&setup_markers, &before_stop_markers);
+            let operation = DfsNamespaceOperation::Mkdir { path: path.clone() };
+            let stamps = crate::NetworkedDfsService::<crate::DfsNodeTransport>::affected_namespace_shards_from_snapshot(
+            &shard.file_system_id, &operation, &native.metadata_shards()?,
+        ).map_err(|error|error.to_string())?;
+            assert_eq!(stamps, vec![shard.clone()]);
+            let body = DfsNamespaceCommand {
+                request_id: format!("held-reopen-mkdir-{}", sinomo_core::Id::generate()),
+                file_system_id: shard.file_system_id.clone(),
+                requesting_node_id: primary.clone(),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards: stamps,
+                operation,
+            };
+            let request = command(
+                &primary,
+                DfsNetworkMessage::NamespaceRequest(body.clone()),
+                394,
+            );
+            report["original"] = serde_json::to_value(&original).unwrap();
+            report["request"] = serde_json::to_value(&request).unwrap();
+            report["frames_before_stop"] = serde_json::to_value(&frames).unwrap();
+            report["markers_setup"] =
+                serde_json::json!({"bytes":setup_markers,"rebind_attribution":setup_rebinds});
+            report["markers_before_stop"] = serde_json::to_value(&before_stop_markers).unwrap();
+            let owner = require_daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(
+                native.data_dir(&primary),
+            ))
+            .map_err(|error| error.to_string())?;
+            let old_owner = Arc::downgrade(&owner);
+            let owner_file_identity = owner
+                .storage_owner_file_identity()
+                .map_err(|error| error.to_string())?;
+            drop(owner);
+            // DeferredNativeGenesis retains original DATA and negative selection,
+            // never the owner Arc. Only the normal lifecycle drains mounted work.
+            let stopped = native.stop_node(&primary);
+            report["first_stop"] = serde_json::to_value(&stopped).unwrap();
+            stopped?;
+            let stopped_route = peer_transport.availability(&primary);
+            report["stopped_route"] = serde_json::json!(format!("{stopped_route:?}"));
+            let stopped_frames = actual_frames(&root)?;
+            let stopped_markers = legacy_markers(&native, &nodes, &legacy);
+            report["frames_after_stop"] = serde_json::to_value(&stopped_frames).unwrap();
+            report["markers_after_stop"] = serde_json::to_value(&stopped_markers).unwrap();
+            report["old_owner_released"] = serde_json::json!(old_owner.upgrade().is_none());
+            assert!(
+                old_owner.upgrade().is_none(),
+                "phase must not pin the old Main owner"
+            );
+            assert_eq!(stopped_route, RoutedAvailability::NoPath);
+            assert_eq!(stopped_frames, frames);
+            assert_eq!(stopped_markers, before_stop_markers);
+            let before_reopen_calls = native
+                .rpc_observations()
+                .into_iter()
+                .map(|event| event.call_id)
+                .collect::<BTreeSet<_>>();
+            let reopened = native.reopen_node(primary.clone());
+            report["held_reopen"] = serde_json::to_value(&reopened).unwrap();
+            let route = peer_transport.availability(&primary);
+            report["held_reopen_route"] = serde_json::json!(format!("{route:?}"));
+            let readback = native.read_deferred_native_genesis(&phase);
+            report["held_reopen_original"] = serde_json::to_value(&readback).unwrap();
+            let reopened_frames = actual_frames(&root);
+            let reopened_markers = legacy_markers(&native, &nodes, &legacy);
+            report["frames_after_held_reopen"] = serde_json::to_value(&reopened_frames).unwrap();
+            report["markers_after_held_reopen"] = serde_json::to_value(&reopened_markers).unwrap();
+            report["held_reopen_rpc"] = wire_facts(
+                &native
+                    .rpc_observations()
+                    .into_iter()
+                    .filter(|event| !before_reopen_calls.contains(&event.call_id))
+                    .collect::<Vec<_>>(),
+            );
+            if let Err(error) = &reopened {
+                assert_eq!(
+                    route,
+                    RoutedAvailability::NoPath,
+                    "readiness refusal must not expose a callable endpoint"
+                );
+                if !error
+                    .contains(crate::default_cluster::genesis::NATIVE_GENESIS_COMPLETION_DEFERRED)
+                {
+                    return Err(format!(
+                        "reopen_node failed outside the retained exact genesis deferral: {error}"
+                    ));
+                }
+            } else {
+                assert_eq!(route, RoutedAvailability::Candidate);
+                drop(native.component_context(&primary)?);
+            }
+            let retained = readback.map_err(|error| format!(
+            "read_deferred_native_genesis cannot observe an actual mounted owner after held reopen (not absence): {error}"
+        ))?;
+            assert_eq!(retained, original);
+            assert_eq!(reopened_frames?, frames);
+            // Any normal startup checkpoint must preserve the complete original
+            // cooperative cut and match the actual owned prefix, never be erased.
+            report["held_reopen_marker_attribution"] =
+                attribute_setup_rebinds(&before_stop_markers, &reopened_markers);
+            let remounted_owner = require_daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(
+                native.data_dir(&primary),
+            ))
+            .map_err(|error| error.to_string())?;
+            assert_eq!(
+                remounted_owner
+                    .storage_owner_file_identity()
+                    .map_err(|error| error.to_string())?,
+                owner_file_identity
+            );
+            assert!(!std::sync::Weak::ptr_eq(
+                &old_owner,
+                &Arc::downgrade(&remounted_owner)
+            ));
+            drop(remounted_owner);
+            // A failed reopen gets no request. If the real lifecycle returned
+            // ready, the SAME command is allowed to reach its negative guard.
+            if reopened.is_ok() {
+                let held = native_call(&native, &primary, &request, None);
+                report["ready_held_request"] =
+                    serde_json::json!({"response":held.response,"expired":held.expired});
+                assert!(refused(&held));
+                assert_eq!(native.read_deferred_native_genesis(&phase)?, original);
+                assert_eq!(actual_frames(&root)?, frames);
+            }
+            let completion = native.complete_deferred_native_genesis(&phase);
+            report["same_owner_completion"] = serde_json::to_value(&completion).unwrap();
+            let completed = completion.map_err(|error|format!(
+            "complete_deferred_native_genesis cannot complete through the actual remounted owner: {error}"
+        ))?;
+            assert_eq!(completed.digest, original.digest);
+            assert_eq!(completed.payload, original.payload);
+            assert_eq!(completed.status, DfsPreparedOperationStatus::Committed);
+            assert!(completed.committed_entry.is_some());
+            let completed_frames = actual_frames(&root)?;
+            report["frames_after_explicit_completion"] =
+                serde_json::to_value(&completed_frames).unwrap();
+            // Drain even a partially mounted owner before the ordinary second
+            // reopen. No fabric acceptance bit or startup action is forced.
+            let stopped = native.stop_node(&primary);
+            report["second_stop"] = serde_json::to_value(&stopped).unwrap();
+            stopped?;
+            assert_eq!(
+                peer_transport.availability(&primary),
+                RoutedAvailability::NoPath
+            );
+            let ready = native.reopen_node(primary.clone());
+            report["completed_reopen"] = serde_json::to_value(&ready).unwrap();
+            ready?;
+            assert_eq!(
+                peer_transport.availability(&primary),
+                RoutedAvailability::Candidate
+            );
+            drop(native.component_context(&primary)?);
+            let after_ready = native.read_deferred_native_genesis(&phase)?;
+            report["completed_reopen_record"] = serde_json::to_value(&after_ready).unwrap();
+            assert_eq!(after_ready, completed);
+            assert_eq!(actual_frames(&root)?, completed_frames);
+            let sync = native.sync_completed_native_genesis(&phase, &prefix);
+            report["assigned_sync"] = serde_json::to_value(&sync).unwrap();
+            let certificate = sync?;
+            assert_eq!(certificate.target.expected_shard.as_ref(), Some(&shard));
+            assert_eq!(certificate.acknowledged_node_ids, vec![primary.clone()]);
+            assert_eq!(certificate.quorum_size, 1);
+            let current = crate::NetworkedDfsService::<crate::DfsNodeTransport>::affected_namespace_shards_from_snapshot(
+            &shard.file_system_id,&body.operation,&native.metadata_shards()?,
+        ).map_err(|error|error.to_string())?;
+            assert_eq!(
+                current, body.authority_shards,
+                "same original request keeps its actual stamps"
+            );
+            let applied = native_call(&native, &primary, &request, None);
+            report["same_request_after_sync"] =
+                serde_json::json!({"response":applied.response,"expired":applied.expired});
+            assert!(!applied.expired);
+            assert!(applied.response.as_ref().map_err(Clone::clone)?.outbound_messages.iter().any(|frame|
+            matches!(&frame.message,DfsNetworkMessage::NamespaceResponse(reply)
+                if reply.request_id==body.request_id && matches!(reply.result,DfsNamespaceResult::Applied))));
+            let object = crate::local_state::with_current_owned_dfs_shard_inspection(
+                native.data_dir(&primary),
+                &DfsMetadataShardId::new(&shard.shard_id),
+                |backend| {
+                    backend
+                        .get_object_by_path(&shard.file_system_id, &path)
+                        .map_err(crate::DfsError::from)
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .flatten()
+            .ok_or("actual applied directory unavailable")?;
+            assert_eq!(object.path, path);
+            assert_eq!(object.kind, DfsObjectKind::Directory);
+            report["actual_post_object"] = serde_json::to_value(&object).unwrap();
+            assert_eq!(native.observation_dropped_count(), 0);
+            drop(peer_transport);
+            drop(phase);
+            Ok(())
+        },
+    ));
+    // Persist every lifecycle refusal before normal close consumes the fixture;
+    // an unavailable mounted owner is a failed stage, never an absent record.
+    report["control_outcome"] = match &result {
+        Ok(outcome) => serde_json::to_value(outcome).unwrap(),
+        Err(_) => serde_json::json!("panic: original failure retained in libtest log"),
+    };
+    let saved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("bounded component-reopen report overflow".into());
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&evidence)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        eprintln!(
+            "INCOMPLETE_GENESIS_COMPONENT_REOPEN_REPORT {}",
+            evidence.display()
+        );
+        Ok(())
+    }));
+    let closed = native.close();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    result.unwrap().unwrap();
+    saved
+        .expect("component-reopen report writer panicked")
+        .unwrap();
+    closed.unwrap();
+}
