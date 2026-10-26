@@ -352,9 +352,12 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
         // store adoption. The owner bootstrap also checks all empty KV fields.
         let node = kv.open_raft_node(&input.node_id)?;
         let snapshot = node.store().try_snapshot()?;
-        if node.hard_state().current_term != 0
-            || node.hard_state().commit_index != 0
-            || node.hard_state().leader_id.is_some()
+        eprintln!("NATIVE_FIXTURE_INITIAL_RAFT hard_state={:?} revision={} entries={}",
+            node.hard_state(), snapshot.revision.0, snapshot.entries.len());
+        // The actual native fresh hard state starts at term1, not term0.
+        // Compare every field with that owner's exact default; never accept
+        // a retained vote/leader/commit or nonempty revision-zero snapshot.
+        if node.hard_state() != &sinomo_core::kv::RaftHardState::default()
             || snapshot.revision.0 != 0
             || !snapshot.entries.is_empty()
             || !snapshot.leases.is_empty()
