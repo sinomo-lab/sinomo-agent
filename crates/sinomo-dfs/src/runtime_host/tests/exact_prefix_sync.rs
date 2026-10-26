@@ -513,15 +513,23 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
         let target = fixture.target.clone();
         let c = target.replica_node_ids.last().unwrap().clone();
         let gate = Arc::new(Semaphore::new(0));
-        fixture.native.install_fault(FaultRule {
-            source: Some(target.primary_node_id.clone()),
-            target: Some(c.clone()),
-            route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
-            call_id: None,
-            origin: Some(RpcOrigin::RegisteredHost),
-            remaining_hits: 32,
-            action: FaultAction::PauseAfterDispatch(Arc::clone(&gate)),
-        });
+        let fault_routes = [
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        ];
+        // Cover the real direct-to-routed fallback without broadening to KV
+        // or increasing the original aggregate32 eligible-hit budget.
+        for route in fault_routes {
+            fixture.native.install_fault(FaultRule {
+                source: Some(target.primary_node_id.clone()),
+                target: Some(c.clone()),
+                route: Some(route.into()),
+                call_id: None,
+                origin: Some(RpcOrigin::RegisteredHost),
+                remaining_hits: 16,
+                action: FaultAction::PauseAfterDispatch(Arc::clone(&gate)),
+            });
+        }
         let hold = ResponseHold {
             native: &fixture.native,
             gate,
@@ -532,7 +540,48 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
         let failed = fixture
             .source
             .sync_metadata_shard_exact_prefix_full_assignment(&target, CAP);
-        report["held_actual_c_response_result"] = serde_json::json!(failed.as_ref().map_err(ToString::to_string));
+        report["held_actual_c_response_result"] =
+            serde_json::json!(failed.as_ref().map_err(ToString::to_string));
+        // Preserve the actual route/origin/receiver and source-return facts
+        // even when an unexpected successful result fails the next assertion.
+        let first = fixture.source_raw()?;
+        let first_ids = probe_ids(&first, &target);
+        let received = raw(&fixture.traces[&c])?;
+        let all = fixture.native.rpc_observations();
+        let held = &all[cursor..];
+        report["held_rpc"] = wire(held);
+        report["held_elapsed"] = serde_json::json!(format!("{:?}", started.elapsed()));
+        report["source_boundary_facts_before_negative_assert"] = first["boundary_packets"].clone();
+        report["c_boundary_facts_before_negative_assert"] = received["boundary_packets"].clone();
+        let matches_by_route = fault_routes.map(|route| {
+            let ids = |phase| {
+                held.iter()
+                    .filter(|event| {
+                        event.source == target.primary_node_id
+                            && event.target == c
+                            && event.route == route
+                            && event.origin == RpcOrigin::RegisteredHost
+                            && event.phase == phase
+                    })
+                    .map(|event| event.call_id)
+                    .collect::<BTreeSet<_>>()
+            };
+            (
+                route,
+                ids(RpcPhase::BeforeDispatch),
+                ids(RpcPhase::AfterDispatch),
+            )
+        });
+        let total_matches = matches_by_route
+            .iter()
+            .map(|(_, ids, _)| ids.len())
+            .sum::<usize>();
+        report["fault_matches_before_negative_assert"] = serde_json::json!({
+            "per_route":matches_by_route,"total_eligible_calls":total_matches,
+            "per_route_budget":16,"aggregate_budget":32,
+            "budget_status":fixture.native.assert_fault_budgets(),
+            "observation":"BeforeDispatch matches exact rule eligibility; AfterDispatch is actual receiver completion immediately before the existing gate wait; waiter count is not exposed",
+        });
         assert!(
             failed.is_err(),
             "A+B cannot create a full3 result when actual C reply is held"
@@ -544,10 +593,9 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
             ),
             "the genuine held-response failure must retain its network/deadline outcome"
         );
-        let first = fixture.source_raw()?;
-        let first_ids = probe_ids(&first, &target);
         assert!(!first_ids.is_empty());
-        let received = raw(&fixture.traces[&c])?;
+        assert!(matches_by_route.iter().all(|(_, ids, _)| ids.len() <= 16));
+        assert!(total_matches <= 32);
         assert!(
             facts(&received)
                 .iter()
@@ -558,22 +606,19 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
                         .is_some_and(|id| first_ids.contains(id))),
             "C really executed this prefix probe before its actual response was held/lost"
         );
-        let all = fixture.native.rpc_observations();
-        let held = &all[cursor..];
         no_snapshot(held);
         let calls = held
             .iter()
             .filter(|event| {
                 event.source == target.primary_node_id
                     && event.target == c
-                    && event.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                    && fault_routes.contains(&event.route.as_str())
+                    && event.origin == RpcOrigin::RegisteredHost
                     && event.phase == RpcPhase::AfterDispatch
             })
             .map(|event| event.call_id)
             .collect::<BTreeSet<_>>();
         assert!(!calls.is_empty());
-        report["held_rpc"] = wire(held);
-        report["held_elapsed"] = serde_json::json!(format!("{:?}", started.elapsed()));
         drop(hold); // Release before drain/retry; RAII also releases on earlier error/panic.
         let drain_deadline = Instant::now() + CAP;
         loop {
@@ -603,7 +648,8 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
         let fresh = fixture
             .source
             .sync_metadata_shard_exact_prefix_full_assignment(&target, CAP);
-        report["same_target_fresh_result"] = serde_json::json!(fresh.as_ref().map_err(ToString::to_string));
+        report["same_target_fresh_result"] =
+            serde_json::json!(fresh.as_ref().map_err(ToString::to_string));
         let fresh = fresh?;
         certificate(&fresh, &target, &fixture.shard);
         let after = fixture.source_raw()?;
@@ -624,7 +670,7 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
         report["first_probe_ids"] = serde_json::json!(first_ids);
         report["fresh_probe_ids"] = serde_json::json!(fresh_ids);
         report["fault_scope"] = serde_json::json!(
-            "only registered A-to-C canonical metadata RPC completed replies; actual cancelled held response may be lost, no raw late-response injection or node outage claim"
+            "only registered A-to-C canonical and routed metadata RPC completed replies; shared gate with16+16 aggregate32 budget; actual cancelled held response may be lost, no raw late-response injection or node outage claim"
         );
         assert_eq!(fixture.native.observation_dropped_count(), 0);
         Ok(())
