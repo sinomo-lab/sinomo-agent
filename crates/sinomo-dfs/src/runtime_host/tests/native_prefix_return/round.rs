@@ -397,3 +397,349 @@ fn native_prefix_round_preserves_partial_return_and_requires_fresh_complete_retr
         Ok(vec![partial, complete])
     });
 }
+
+#[test]
+fn native_prefix_round_deadline_keeps_next_peer_unattempted() {
+    run_round("native-prefix-round-before-next", |fixture, report| {
+        let target = target(fixture);
+        let first = target.replica_node_ids.iter().min().unwrap().clone();
+        let next = target.replica_node_ids.iter().max().unwrap().clone();
+        let guard = hold(fixture, &first);
+        let cursor = fixture.native.rpc_observations().len();
+        let mut producer = fixture.transport();
+        let deadline = Instant::now() + CAP;
+        producer.set_operation_deadline(Some(deadline));
+        let round = producer.capture_metadata_prefix_full_assignment_round(&target)?;
+        let events = fixture.native.rpc_observations();
+        let window = &events[cursor..];
+        report["deadline_round"] = observed(&round);
+        report["rpc_window"] = wire(window);
+        let calls = own_calls(window, &target.primary_node_id, &first);
+        // Release/drain before assertions so a failed control cannot strand a call.
+        drop(guard);
+        drain_calls(&fixture.native, &calls)?;
+        fixture.native.assert_fault_budgets()?;
+        assert!(!round.is_complete());
+        assert_eq!(round.deadline(), deadline);
+        assert_eq!(round.target(), &target);
+        assert_eq!(calls.len(), 1);
+        assert!(
+            window
+                .iter()
+                .any(|e| calls.contains(&e.call_id) && e.phase == RpcPhase::AfterDispatch)
+        );
+        let failed = round
+            .peer_outcomes()
+            .iter()
+            .find(|p| p.peer() == &first)
+            .unwrap();
+        assert!(failed.attempted());
+        assert_eq!(failed.status(), DfsNativePrefixRoundPeerStatus::Failed);
+        assert!(failed.error().is_some());
+        assert_ne!(
+            failed.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+        );
+        let skipped = round
+            .peer_outcomes()
+            .iter()
+            .find(|p| p.peer() == &next)
+            .unwrap();
+        assert_eq!(
+            skipped.status(),
+            DfsNativePrefixRoundPeerStatus::Unattempted
+        );
+        assert!(!skipped.attempted());
+        assert!(skipped.response().is_none() && skipped.native_return().is_none());
+        assert!(skipped.error().is_none() && skipped.delivery_state().is_none());
+        assert!(skipped.unattempted_reason().is_some());
+        assert!(!skipped.command().request_id.is_empty());
+        assert_eq!(
+            skipped
+                .command()
+                .prefix_probe
+                .as_ref()
+                .unwrap()
+                .journal_sequence,
+            target.journal_sequence
+        );
+        assert!(own_calls(window, &target.primary_node_id, &next).is_empty());
+        drop(producer);
+        Ok(vec![round])
+    });
+}
+
+#[derive(Default)]
+struct OwnerTransitionState {
+    first_returned: bool,
+    release: bool,
+    actual_first: Option<serde_json::Value>,
+}
+struct TransitionPeer {
+    data: SinomoDataDir,
+    runtime: tokio::runtime::Handle,
+    first: NodeId,
+    pause: Arc<(Mutex<OwnerTransitionState>, std::sync::Condvar)>,
+}
+impl DfsPeerTransport for TransitionPeer {
+    fn call_object_rpc(
+        &self,
+        _: &NodeId,
+        _: ObjectRpcCall,
+        _: crate::DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+        Err(DfsPeerTransportError::new(
+            "only the typed real native delegation is selected",
+        ))
+    }
+    fn call_metadata_prefix_probe(
+        &self,
+        attempt: &DfsMetadataPrefixProbeAttempt,
+        options: crate::DfsObjectRpcSendOptions,
+    ) -> Result<DfsMetadataPrefixProbeReturn, DfsPeerTransportError> {
+        // Each call resolves the ACTUAL currently registered native adapter.
+        // No native value is constructed, modified or deserialized here.
+        let (native, asynchronous) =
+            daemon_dfs_peer_transports_on_runtime(&self.data, &self.runtime);
+        let result = native.call_metadata_prefix_probe(attempt, options);
+        drop(native);
+        drop(asynchronous); // Do not pin the retired host through stop.
+        if attempt.peer() == &self.first {
+            let mut state = self.pause.0.lock().unwrap();
+            state.actual_first = Some(match &result {
+                Ok(value) => match &value.evidence {
+                    DfsMetadataPrefixEvidence::Native(cap) => projection(cap),
+                    DfsMetadataPrefixEvidence::NoNativeProof => {
+                        serde_json::json!({"no_native_proof":true})
+                    }
+                },
+                Err(error) => serde_json::json!({"error":error.to_string()}),
+            });
+            state.first_returned = true;
+            self.pause.1.notify_all();
+            while !state.release {
+                let remaining = attempt.deadline().saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let waited = self.pause.1.wait_timeout(state, remaining).unwrap();
+                state = waited.0;
+                if waited.1.timed_out() {
+                    break;
+                }
+            }
+        }
+        result // Original native value/response; producer still enforces its deadline.
+    }
+}
+impl AsyncDfsPeerTransport for TransitionPeer {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        _: &'a NodeId,
+        _: ObjectRpcCall,
+        _: crate::DfsObjectRpcSendOptions,
+    ) -> crate::DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+        Box::pin(async {
+            Err(DfsPeerTransportError::new(
+                "no alternate async path selected",
+            ))
+        })
+    }
+}
+struct TransitionWorker {
+    task: Option<std::thread::JoinHandle<Result<OwnedNativeMetadataPrefixRound, NetworkError>>>,
+    pause: Arc<(Mutex<OwnerTransitionState>, std::sync::Condvar)>,
+}
+impl TransitionWorker {
+    fn release(&self) {
+        self.pause.0.lock().unwrap().release = true;
+        self.pause.1.notify_all();
+    }
+    fn join(&mut self) -> TestResult<OwnedNativeMetadataPrefixRound> {
+        self.release();
+        self.task
+            .take()
+            .ok_or("owned round worker missing")?
+            .join()
+            .map_err(|_| "owned native round worker panicked")?
+            .map_err(Into::into)
+    }
+}
+impl Drop for TransitionWorker {
+    fn drop(&mut self) {
+        self.release();
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+#[test]
+fn native_prefix_round_refuses_genuine_returns_across_source_owner_replacement() {
+    // A separate wrapper checks BOTH sequential native owners after close.
+    let artifact = sinomo_testdir::TestDir::new("native-prefix-round-mixed-owner");
+    let mut fixture = Fixture::new("native-prefix-round-mixed-owner").unwrap();
+    let root = fixture.source_root();
+    let primary = fixture.shard.primary_node_id.clone();
+    let old_owner = require_daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(
+        fixture.native.data_dir(&primary),
+    ))
+    .unwrap();
+    let old_weak = Arc::downgrade(&old_owner);
+    let old_identity = old_owner.storage_owner_file_identity().unwrap();
+    drop(old_owner);
+    let mut new_weak = None;
+    let mut report = serde_json::json!({"scope":"sequential actual source owners in an owned native fixture",
+        "limits":"no competing owner or fabricated native value; finalization refusal is not serving authority"});
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> TestResult<OwnedNativeMetadataPrefixRound> {
+            let target = target(&fixture);
+            let first = target.replica_node_ids.iter().min().unwrap().clone();
+            let pause = Arc::new((
+                Mutex::new(OwnerTransitionState::default()),
+                std::sync::Condvar::new(),
+            ));
+            let peer = Arc::new(TransitionPeer {
+                data: fixture.native.data_dir(&primary).clone(),
+                runtime: fixture.native.runtime_handle(),
+                first,
+                pause: Arc::clone(&pause),
+            });
+            let mut producer = crate::DfsNodeTransport::with_peer_transports_for_nodes(
+                primary.clone(),
+                fixture.nodes.clone(),
+                CAP,
+                peer.clone(),
+                peer,
+            );
+            let deadline = Instant::now() + CAP;
+            producer.set_operation_deadline(Some(deadline));
+            let worker_target = target.clone();
+            let task = std::thread::spawn(move || {
+                producer.capture_metadata_prefix_full_assignment_round(&worker_target)
+            });
+            let mut worker = TransitionWorker {
+                task: Some(task),
+                pause: Arc::clone(&pause),
+            };
+            {
+                let mut state = pause.0.lock().unwrap();
+                while !state.first_returned {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(
+                            "first actual native return unavailable within original round budget"
+                                .into(),
+                        );
+                    }
+                    let waited = pause.1.wait_timeout(state, left).unwrap();
+                    state = waited.0;
+                    if waited.1.timed_out() && !state.first_returned {
+                        return Err("first actual native return timed out".into());
+                    }
+                }
+                report["first_actual_before_transition"] = state.actual_first.clone().unwrap();
+                if report["first_actual_before_transition"]["attempt"]
+                    .as_str()
+                    .is_none()
+                {
+                    return Err("the first delegate produced no actual private native value".into());
+                }
+            }
+            let stopped = fixture.native.stop_node(&primary);
+            report["old_stop"] = serde_json::json!(stopped);
+            stopped?;
+            report["old_owner_released_before_new"] =
+                serde_json::json!(old_weak.upgrade().is_none());
+            assert!(
+                old_weak.upgrade().is_none(),
+                "no competing source owners are allowed"
+            );
+            let path = root.join("daemon/data-owner.lock");
+            let retained = root.join("daemon/round-retired-owner.lock");
+            assert!(!retained.exists());
+            assert_eq!(identity(&path)?, old_identity);
+            fs::rename(&path, &retained)?;
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.sync_all()?;
+            let replacement = storage_file_identity(&file)?;
+            drop(file);
+            assert_ne!(replacement, old_identity);
+            report["physical_transition"] = serde_json::json!({"old":old_identity,"new":replacement,
+            "retained_original":retained,"same_metadata_root":root});
+            let reopened = fixture.native.reopen_node(primary.clone());
+            report["reopen"] = serde_json::json!(reopened);
+            reopened?;
+            let current = require_daemon_dfs_data_owner_lock(&DfsRuntimePaths::new(
+                fixture.native.data_dir(&primary),
+            ))?;
+            assert_eq!(current.storage_owner_file_identity()?, replacement);
+            new_weak = Some(Arc::downgrade(&current));
+            drop(current);
+            assert!(
+                Instant::now() < deadline,
+                "normal transition must not extend the original5s round"
+            );
+            let round = worker.join()?;
+            report["mixed_round"] = observed(&round);
+            assert!(!round.is_complete());
+            assert_eq!(round.target(), &target);
+            assert_eq!(round.deadline(), deadline);
+            assert!(round.common_source_observation().is_none());
+            assert!(round.finalization_error().is_some());
+            assert_eq!(round.peer_outcomes().len(), 2);
+            let mut values = round.peer_outcomes().iter().map(|p| {
+                assert_eq!(p.status(), DfsNativePrefixRoundPeerStatus::NativeCaptured);
+                assert!(p.error().is_none());
+                p.native_return()
+                    .expect("both values must come from actual native RPCs")
+            });
+            let a = values.next().unwrap();
+            let b = values.next().unwrap();
+            assert_eq!(a.source_assignment(), b.source_assignment());
+            assert_eq!(a.source_prefix(), b.source_prefix());
+            assert_ne!(a.local_physical_owner(), b.local_physical_owner());
+            assert_eq!(a.local_physical_owner().owner_identity, old_identity);
+            assert_eq!(b.local_physical_owner().owner_identity, replacement);
+            report["refusal_qualification"] = serde_json::json!(
+                "mixed actual physical observations retained; existing live binding check may refuse before the literal cross-source comparison"
+            );
+            Ok(round)
+        },
+    ));
+    report["all_rpc"] = wire(&fixture.native.rpc_observations());
+    let closed = fixture.native.close();
+    report["normal_close"] = serde_json::json!(closed);
+    report["old_owner_released"] = serde_json::json!(old_weak.upgrade().is_none());
+    report["new_owner_released"] =
+        serde_json::json!(new_weak.as_ref().map(|w| w.upgrade().is_none()));
+    if let Ok(Ok(round)) = &checked {
+        report["historical_after_close"] = observed(round);
+    }
+    let saved = (|| -> TestResult<()> {
+        let bytes = serde_json::to_vec_pretty(&report)?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("mixed-owner evidence overflow".into());
+        }
+        let path = artifact.join("native-prefix-round-mixed-owner-report.json");
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        eprintln!("NATIVE_PREFIX_ROUND_MIXED_REPORT {}", path.display());
+        Ok(())
+    })();
+    if let Err(panic) = checked {
+        std::panic::resume_unwind(panic);
+    }
+    checked.unwrap().unwrap();
+    saved.unwrap();
+    closed.unwrap();
+    assert!(old_weak.upgrade().is_none());
+    assert!(new_weak.unwrap().upgrade().is_none());
+}
