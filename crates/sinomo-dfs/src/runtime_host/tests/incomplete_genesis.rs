@@ -431,7 +431,9 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
             .filter(|node| **node != primary)
             .cloned()
             .collect();
-        write.policy = DfsReplicationPolicy::new(1, 2).unwrap();
+        // Require a remote receipt in this SAME pre/post request: W1 may
+        // acknowledge local commit and defer the desired N2 repair.
+        write.policy = DfsReplicationPolicy::new(2, 2).unwrap();
         write.authority_shard = Some(shard.clone());
         write.touch_parent_on_create = true;
         write.foreground_replica_repair = true;
