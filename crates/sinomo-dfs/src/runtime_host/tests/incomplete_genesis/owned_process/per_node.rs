@@ -337,7 +337,7 @@ fn probe(
             ProbeKind::Ping => {
                 assert_eq!(
                     reply.route,
-                    sinomo_core::cluster::CLUSTER_NETWORK_PING_ROUTE
+                    sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
                 );
                 let ping: sinomo_core::cluster::ClusterNetworkPingResponse =
                     sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
