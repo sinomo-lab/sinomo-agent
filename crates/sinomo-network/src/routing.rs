@@ -2359,6 +2359,11 @@ enum RoutedRelayAdjacentEdge {
 
 #[derive(Debug)]
 struct RoutedRelayCopyError {
+    // A direction-local candidate retained by the Linux pair only after both
+    // directions prove no opaque input and the reverse closes cleanly. Never
+    // inferred from byte totals
+    // that can omit a partially forwarded chunk.
+    peer_closed_before_opaque: bool,
     edge: RoutedRelayAdjacentEdge,
     operation: &'static str,
     source: std::io::Error,
@@ -2381,6 +2386,7 @@ where
             .allocate_data(BODY_CHUNK_MAX)
             .await
             .map_err(|error| RoutedRelayCopyError {
+                peer_closed_before_opaque: false,
                 edge: reader_edge,
                 operation: "allocate opaque routed-session relay slab",
                 source: std::io::Error::other(error.to_string()),
@@ -2389,6 +2395,7 @@ where
             .read(chunk.writable_payload())
             .await
             .map_err(|source| RoutedRelayCopyError {
+                peer_closed_before_opaque: false,
                 edge: reader_edge,
                 operation: "read opaque routed-session relay bytes",
                 source,
@@ -2398,6 +2405,7 @@ where
                 .shutdown()
                 .await
                 .map_err(|source| RoutedRelayCopyError {
+                    peer_closed_before_opaque: false,
                     edge: writer_edge,
                     operation: "half-close opaque routed-session relay edge",
                     source,
@@ -2407,6 +2415,7 @@ where
         chunk
             .commit_payload(read)
             .map_err(|error| RoutedRelayCopyError {
+                peer_closed_before_opaque: false,
                 edge: reader_edge,
                 operation: "commit opaque routed-session relay slab",
                 source: std::io::Error::other(error.to_string()),
@@ -2415,6 +2424,7 @@ where
             .write_all(chunk.as_slice())
             .await
             .map_err(|source| RoutedRelayCopyError {
+                peer_closed_before_opaque: false,
                 edge: writer_edge,
                 operation: "write opaque routed-session relay bytes",
                 source,
@@ -2429,11 +2439,13 @@ fn splice_routed_tcp_direction(
     reader_edge: RoutedRelayAdjacentEdge,
     writer: std::net::TcpStream,
     writer_edge: RoutedRelayAdjacentEdge,
+    observed_opaque_input: &mut bool,
 ) -> Result<u64, RoutedRelayCopyError> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     fn io_error(edge: RoutedRelayAdjacentEdge, operation: &'static str) -> RoutedRelayCopyError {
         RoutedRelayCopyError {
+            peer_closed_before_opaque: false,
             edge,
             operation,
             source: std::io::Error::last_os_error(),
@@ -2478,6 +2490,9 @@ fn splice_routed_tcp_direction(
             let _ = reader.shutdown(std::net::Shutdown::Both);
             let _ = writer.shutdown(std::net::Shutdown::Both);
             return Err(RoutedRelayCopyError {
+                peer_closed_before_opaque: reader_edge == RoutedRelayAdjacentEdge::Incoming
+                    && error.kind() == std::io::ErrorKind::ConnectionReset
+                    && !*observed_opaque_input,
                 edge: reader_edge,
                 operation: "splice opaque routed-session bytes into kernel pipe",
                 source: error,
@@ -2488,6 +2503,7 @@ fn splice_routed_tcp_direction(
                 && source.kind() != std::io::ErrorKind::NotConnected
             {
                 return Err(RoutedRelayCopyError {
+                    peer_closed_before_opaque: false,
                     edge: writer_edge,
                     operation: "half-close spliced routed-session relay edge",
                     source,
@@ -2495,6 +2511,9 @@ fn splice_routed_tcp_direction(
             }
             return Ok(copied);
         }
+        // Observe before the first socket write, including partial writes and
+        // the EPIPE retirement path whose returned count may exclude a tail.
+        *observed_opaque_input = true;
         let mut remaining = moved_to_pipe;
         while remaining != 0 {
             let moved_to_socket = loop {
@@ -2538,6 +2557,7 @@ fn splice_routed_tcp_direction(
                 let _ = reader.shutdown(std::net::Shutdown::Both);
                 let _ = writer.shutdown(std::net::Shutdown::Both);
                 return Err(RoutedRelayCopyError {
+                    peer_closed_before_opaque: false,
                     edge: writer_edge,
                     operation: "splice opaque routed-session bytes from kernel pipe",
                     source: error,
@@ -2555,11 +2575,13 @@ async fn splice_routed_tcp_pair(
     outgoing: tokio::net::TcpStream,
 ) -> Result<(u64, u64), RoutedRelayCopyError> {
     let incoming = incoming.into_std().map_err(|source| RoutedRelayCopyError {
+        peer_closed_before_opaque: false,
         edge: RoutedRelayAdjacentEdge::Incoming,
         operation: "take incoming TCP relay stream",
         source,
     })?;
     let outgoing = outgoing.into_std().map_err(|source| RoutedRelayCopyError {
+        peer_closed_before_opaque: false,
         edge: RoutedRelayAdjacentEdge::Outgoing,
         operation: "take outgoing TCP relay stream",
         source,
@@ -2567,6 +2589,7 @@ async fn splice_routed_tcp_pair(
     incoming
         .set_nonblocking(false)
         .map_err(|source| RoutedRelayCopyError {
+            peer_closed_before_opaque: false,
             edge: RoutedRelayAdjacentEdge::Incoming,
             operation: "configure incoming TCP relay stream for splice",
             source,
@@ -2574,6 +2597,7 @@ async fn splice_routed_tcp_pair(
     outgoing
         .set_nonblocking(false)
         .map_err(|source| RoutedRelayCopyError {
+            peer_closed_before_opaque: false,
             edge: RoutedRelayAdjacentEdge::Outgoing,
             operation: "configure outgoing TCP relay stream for splice",
             source,
@@ -2582,6 +2606,7 @@ async fn splice_routed_tcp_pair(
         incoming
             .try_clone()
             .map_err(|source| RoutedRelayCopyError {
+                peer_closed_before_opaque: false,
                 edge: RoutedRelayAdjacentEdge::Incoming,
                 operation: "clone incoming TCP relay stream",
                 source,
@@ -2590,38 +2615,58 @@ async fn splice_routed_tcp_pair(
         outgoing
             .try_clone()
             .map_err(|source| RoutedRelayCopyError {
+                peer_closed_before_opaque: false,
                 edge: RoutedRelayAdjacentEdge::Outgoing,
                 operation: "clone outgoing TCP relay stream",
                 source,
             })?;
     let toward_destination = tokio::task::spawn_blocking(move || {
-        splice_routed_tcp_direction(
+        let mut observed = false;
+        let result = splice_routed_tcp_direction(
             toward_destination_reader,
             RoutedRelayAdjacentEdge::Incoming,
             toward_destination_writer,
             RoutedRelayAdjacentEdge::Outgoing,
-        )
+            &mut observed,
+        );
+        (result, observed)
     });
     let toward_source = tokio::task::spawn_blocking(move || {
-        splice_routed_tcp_direction(
+        let mut observed = false;
+        let result = splice_routed_tcp_direction(
             outgoing,
             RoutedRelayAdjacentEdge::Outgoing,
             incoming,
             RoutedRelayAdjacentEdge::Incoming,
-        )
+            &mut observed,
+        );
+        (result, observed)
     });
     let (toward_destination, toward_source) = tokio::join!(toward_destination, toward_source);
-    let toward_destination = toward_destination.map_err(|source| RoutedRelayCopyError {
-        edge: RoutedRelayAdjacentEdge::Incoming,
-        operation: "join destination-bound TCP splice relay",
-        source: std::io::Error::other(source.to_string()),
-    })??;
+    let (toward_destination, destination_observed) =
+        toward_destination.map_err(|source| RoutedRelayCopyError {
+            peer_closed_before_opaque: false,
+            edge: RoutedRelayAdjacentEdge::Incoming,
+            operation: "join destination-bound TCP splice relay",
+            source: std::io::Error::other(source.to_string()),
+        })?;
     let toward_source = toward_source.map_err(|source| RoutedRelayCopyError {
+        peer_closed_before_opaque: false,
         edge: RoutedRelayAdjacentEdge::Outgoing,
         operation: "join source-bound TCP splice relay",
         source: std::io::Error::other(source.to_string()),
-    })??;
-    Ok((toward_destination, toward_source))
+    });
+    let toward_destination = toward_destination.map_err(|mut error| {
+        // Preserve the original forward-error precedence. An unknown reverse
+        // outcome cannot certify an empty connection, even if its task ended.
+        error.peer_closed_before_opaque &= !destination_observed
+            && toward_source
+                .as_ref()
+                .is_ok_and(|(result, observed)| !*observed && matches!(result, Ok(0)));
+        error
+    })?;
+    let (toward_source, _) = toward_source?;
+    Ok((toward_destination, toward_source?))
 }
 
 async fn forward_routed_relay_pair(
@@ -2689,11 +2734,18 @@ fn routed_relay_copy_error(
     relay_node_id: &NodeId,
     next_node_id: &NodeId,
     endpoint_id: &Id,
-) -> NetworkError {
+) -> RoutedHandshakeFailure {
     let edge = error.edge;
+    let detail = format!("{}: {}", error.operation, error.source);
+    if error.peer_closed_before_opaque {
+        return RoutedHandshakeFailure::PeerClosed {
+            operation: "forward encrypted routed-session stream".to_string(),
+            detail,
+        };
+    }
     let error = NetworkError::Io {
         operation: "forward encrypted routed-session stream".to_string(),
-        detail: format!("{}: {}", error.operation, error.source),
+        detail,
     };
     if edge == RoutedRelayAdjacentEdge::Outgoing {
         report_routed_edge_failure(
@@ -2704,7 +2756,7 @@ fn routed_relay_copy_error(
             &error,
         );
     }
-    error
+    error.into()
 }
 
 /// Accepts a routed-session open at either an intermediate relay or the named
@@ -3444,6 +3496,9 @@ impl RoutedConnector for MultiHopRoutedConnector {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod retirement_tests;
 
 #[cfg(test)]
 mod tests {
