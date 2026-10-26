@@ -20,6 +20,33 @@ struct NodeInput {
     data_root: PathBuf,
     node_id: NodeId,
     invocation: String,
+    retained: Option<RetainedNodeStart>,
+}
+
+/// Post-reap observation DATA only. This cannot grant runtime authority or
+/// reconstruct a signer, private transport return or current storage owner.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedNodeStart {
+    old_pid: u32,
+    old_start: u64,
+    data_identity: [u64; 2],
+    data_owner_identity: [u64; 2],
+    identity_identity: [u64; 2],
+    identity_blake3: String,
+    public_key: String,
+    cluster_id: sinomo_core::node::ClusterId,
+    address: String,
+    wal_root_identity: [u64; 2],
+    wal_lock_identity: [u64; 2],
+    wal_identity: [u64; 2],
+    wal_blake3: String,
+    hard_state_identity: [u64; 2],
+    hard_state_blake3: String,
+    wal_snapshot_identity: Option<[u64; 2]>,
+    wal_snapshot_blake3: Option<String>,
+    raft_term: u64,
+    raft_commit_index: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,12 +123,22 @@ fn native_daemon_process_child() -> TestResult<()> {
         std::env::var_os(INPUT_ENV).ok_or("explicit per-node parent input required")?,
     );
     let input: NodeInput = read_data(&input_path)?;
-    if input_path != input.owned_root.join("input.sobj")
+    let suffix = if input.retained.is_some() {
+        ":restart"
+    } else {
+        ""
+    };
+    let filename = if input.retained.is_some() {
+        "restart-input.sobj"
+    } else {
+        "input.sobj"
+    };
+    if input_path != input.owned_root.join(filename)
         || input.data_root != input.owned_root.join("data")
         || std::env::var_os("SINOMO_DATA_DIR").map(PathBuf::from) != Some(input.data_root.clone())
         || input.invocation
             != format!(
-                "{}:{}",
+                "{}:{}{suffix}",
                 input
                     .owned_root
                     .file_name()
@@ -153,6 +190,7 @@ fn launch_native_node(index: usize) -> TestResult<NativeNode> {
         data_root: root.join("data"),
         node_id: node_id.clone(),
         invocation: format!("{}:{node_id}", root.file_name().unwrap().to_string_lossy()),
+        retained: None,
     };
     let input_path = root.join("input.sobj");
     write_data(&input_path, &input)?;
@@ -183,7 +221,14 @@ fn read_hello(node: &mut NativeNode, deadline: Instant) -> TestResult<NodeHello>
         if Instant::now() >= deadline {
             return Err("native listener/key Ready exceeded original60s".into());
         }
-        let path = node.input.owned_root.join("hello.sobj");
+        let path = node
+            .input
+            .owned_root
+            .join(if node.input.retained.is_some() {
+                "restart-hello.sobj"
+            } else {
+                "hello.sobj"
+            });
         match fs::symlink_metadata(&path) {
             Ok(_) => {
                 let hello: NodeHello = read_data(&path)?;
@@ -211,6 +256,143 @@ fn read_hello(node: &mut NativeNode, deadline: Instant) -> TestResult<NodeHello>
         );
     }
 }
+fn retained_expectation(node: &NativeNode, raw: &RawTree) -> TestResult<RetainedNodeStart> {
+    use sinomo_core::cluster::ClusterKvPathsExt;
+    if node.owned.child.is_some() || raw.root != node.input.data_root {
+        return Err("retained expectation requires the exact reaped DATA root".into());
+    }
+    let old = node
+        .owned
+        .identity
+        .as_ref()
+        .ok_or("old process identity absent")?;
+    ensure_group_empty(old)?;
+    let hello = node.hello.as_ref().ok_or("old native Hello absent")?;
+    let data = SinomoDataDir::new(&node.input.data_root);
+    let paths = ClusterPaths::new(&data);
+    let wal = paths.kv_paths().raft_wal_paths(&node.input.node_id);
+    let file = |path: &Path| -> TestResult<&RawFile> {
+        let relative = path.strip_prefix(&raw.root)?;
+        raw.files
+            .iter()
+            .find(|f| f.relative == relative)
+            .ok_or_else(|| "required retained file missing from raw capture".into())
+    };
+    let dir = |path: &Path| -> TestResult<[u64; 2]> {
+        let relative = path.strip_prefix(&raw.root)?;
+        let value = raw
+            .directories
+            .iter()
+            .find(|d| d.relative == relative)
+            .ok_or("required retained directory missing")?;
+        Ok([value.physical.device, value.physical.inode])
+    };
+    let fid = |f: &RawFile| [f.physical.device, f.physical.inode];
+    let key = file(&sinomo_core::node::NodeIdentityPaths::new(&node.input.data_root).main)?;
+    let hard_file = file(&wal.hard_state)?;
+    let hard: sinomo_core::kv::RaftHardState =
+        sinomo_core::object::serde_ext::from_bytes(&hard_file.bytes)?;
+    let snapshot = raw
+        .files
+        .iter()
+        .find(|f| f.relative == wal.snapshot.strip_prefix(&raw.root).unwrap());
+    let initial: NodeConfiguration = read_data(&node.input.owned_root.join("configuration.sobj"))?;
+    // Decode only actual captured native bytes. No WAL opener, mutation, reset,
+    // key creation, current authority or success inference occurs here.
+    Ok(RetainedNodeStart {
+        old_pid: old.pid,
+        old_start: old.start,
+        data_identity: dir(&node.input.data_root)?,
+        data_owner_identity: fid(file(&node.input.data_root.join("daemon/data-owner.lock"))?),
+        identity_identity: fid(key),
+        identity_blake3: key.blake3.clone(),
+        public_key: hello.public_key.clone(),
+        cluster_id: initial.state.cluster_id,
+        address: hello.address.clone(),
+        wal_root_identity: dir(&wal.root)?,
+        wal_lock_identity: fid(file(&wal.lock)?),
+        wal_identity: fid(file(&wal.wal)?),
+        wal_blake3: file(&wal.wal)?.blake3.clone(),
+        hard_state_identity: fid(hard_file),
+        hard_state_blake3: hard_file.blake3.clone(),
+        wal_snapshot_identity: snapshot.map(fid),
+        wal_snapshot_blake3: snapshot.map(|f| f.blake3.clone()),
+        raft_term: hard.current_term,
+        raft_commit_index: hard.commit_index,
+    })
+}
+
+fn restart_retained_node(node: &mut NativeNode, expected: RetainedNodeStart) -> TestResult<()> {
+    if node.owned.child.is_some() {
+        return Err("cannot restart an unreaped native owner".into());
+    }
+    ensure_group_empty(
+        node.owned
+            .identity
+            .as_ref()
+            .ok_or("reaped identity absent")?,
+    )?;
+    let mut input = node.input.clone();
+    input.invocation.push_str(":restart");
+    input.retained = Some(expected);
+    let root = &input.owned_root;
+    let input_path = root.join("restart-input.sobj");
+    if input_path.try_exists()? {
+        return Err("retained invocation already exists".into());
+    }
+    write_data(&input_path, &input)?;
+    let temp = root.join("restart-tmp");
+    fs::create_dir(&temp)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(["--exact", CHILD, "--ignored", "--nocapture"])
+        .process_group(0)
+        .env(INPUT_ENV, &input_path)
+        .env("SINOMO_DATA_DIR", &input.data_root)
+        .env("TMPDIR", &temp)
+        .env("SINOMO_TEST_KEEP_TMP", "1")
+        .stdin(Stdio::null())
+        .stdout(File::create(root.join("restart.stdout.log"))?)
+        .stderr(File::create(root.join("restart.stderr.log"))?);
+    let fixture = node
+        .owned
+        .fixture
+        .take()
+        .ok_or("reaped native fixture ownership lost")?;
+    // Move the SAME fixture guard only after proven reap. On spawn failure the
+    // existing OwnedChild owner retains it; no unowned child is created.
+    node.owned = OwnedChild::spawn(fixture, &mut command)?;
+    node.input = input;
+    node.hello = None;
+    node.released = false;
+    Ok(())
+}
+
+fn wait_for_retained_refusal(node: &mut NativeNode, deadline: Instant) -> TestResult<ExitStatus> {
+    loop {
+        if let Some(status) = node
+            .owned
+            .child
+            .as_mut()
+            .ok_or("refusal child missing")?
+            .try_wait()?
+        {
+            node.owned.child = None;
+            ensure_group_empty(node.owned.identity.as_ref().unwrap())?;
+            if Instant::now() > deadline {
+                return Err("retained refusal exceeded original startup60s".into());
+            }
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err("retained refusal did not terminate within60s".into());
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 fn configure_nodes(nodes: &mut [NativeNode]) -> TestResult<()> {
     let contacts = nodes
         .iter()
@@ -613,7 +795,7 @@ fn preserve_native_failure_diagnostics(nodes: &mut [NativeNode], root: &Path) ->
     serde_json::json!(observations)
 }
 
-fn run_native_process_case(endpoint_mode: bool) {
+fn run_native_process_case(endpoint_mode: bool, retained_wrong_owner: Option<bool>) {
     let fixture = sinomo_testdir::TestDir::new("dfs-per-node-native-process-control");
     let root = fixture.path().to_path_buf();
     let mut nodes = Vec::new();
@@ -783,6 +965,84 @@ fn run_native_process_case(endpoint_mode: bool) {
             "A's retained files must not be rewritten by survivor observation"
         );
         report["survivors"] = serde_json::json!({"B":b,"C":c,"same_processes_alive_after_calls":true,"A_data_unchanged":true});
+        if let Some(wrong_owner) = retained_wrong_owner {
+            let old = nodes[0].owned.identity.as_ref().unwrap().clone();
+            let original_hello = nodes[0].hello.as_ref().unwrap().clone();
+            let mut expected = retained_expectation(&nodes[0], &raw)?;
+            if wrong_owner {
+                // Only supplied observation is wrong; retained bytes are never
+                // replaced, deleted or made available through a fresh root.
+                expected.data_identity[1] ^= 1;
+            }
+            report["restart_expected"] = serde_json::to_value(&expected)?;
+            let restart_deadline = Instant::now() + READY_CAP;
+            restart_retained_node(&mut nodes[0], expected)?;
+            report["restart_process"] = serde_json::to_value(&nodes[0].owned.identity)?;
+            if wrong_owner {
+                let status = wait_for_retained_refusal(&mut nodes[0], restart_deadline)?;
+                assert!(
+                    !status.success() && status.signal().is_none(),
+                    "expected explicit preflight refusal, not crash"
+                );
+                assert!(
+                    !nodes[0]
+                        .input
+                        .owned_root
+                        .join("restart-hello.sobj")
+                        .try_exists()?
+                );
+                let log = fs::read_to_string(nodes[0].input.owned_root.join("restart.stderr.log"))?;
+                assert!(
+                    log.contains("retained native physical source was replaced"),
+                    "wrong rejection: {log}"
+                );
+                assert_eq!(
+                    rawpins.capture()?,
+                    raw,
+                    "refused restart cannot mutate retained DATA"
+                );
+                report["restart_refusal"] = serde_json::json!({"exit":status.code(),"signal":status.signal(),"data_unchanged":true,"hello_absent":true});
+            } else {
+                let hello = read_hello(&mut nodes[0], restart_deadline)?;
+                assert_ne!(hello.pid, old.pid);
+                assert_eq!(hello.node_id, original_hello.node_id);
+                assert_eq!(hello.public_key, original_hello.public_key);
+                assert_eq!(hello.address, original_hello.address);
+                nodes[0].hello = Some(hello.clone());
+                nodes[0].released = true;
+                for (source, target) in [(1, 0), (0, 1), (2, 0), (0, 2)] {
+                    wait_for_native_ping(
+                        &mut nodes,
+                        source,
+                        target,
+                        ProbeKind::EndpointPing,
+                        restart_deadline,
+                        &root,
+                        &mut report,
+                    )?;
+                    assert_eq!(nodes[1].alive_identity()?, b);
+                    assert_eq!(nodes[2].alive_identity()?, c);
+                }
+                assert_eq!(DirectoryId::read(&nodes[0].input.data_root)?, a_dir);
+                // The immutable native identity file remains byte/physical equal;
+                // genuine restarted WAL activity is not required to be static.
+                let key = sinomo_core::node::NodeIdentityPaths::new(&nodes[0].input.data_root).main;
+                let captured_key = raw
+                    .files
+                    .iter()
+                    .find(|f| f.relative == key.strip_prefix(&raw.root).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    FileId::of(&fs::symlink_metadata(&key)?),
+                    captured_key.physical
+                );
+                assert_eq!(fs::read(key)?, captured_key.bytes);
+                report["reconnected"] = serde_json::json!({"new_A":nodes[0].alive_identity()?,"hello":hello,"same_data_root":true,"same_identity_file":true,
+                    "B":b,"C":c,"qualification":"fresh authenticated endpoint observations only; no private PREFIX or current serving authority"});
+            }
+            assert_eq!(nodes[1].alive_identity()?, b);
+            assert_eq!(nodes[2].alive_identity()?, c);
+        }
         Ok(())
     }));
     report["test_outcome"] = match &tested {
@@ -819,10 +1079,20 @@ fn run_native_process_case(endpoint_mode: bool) {
 
 #[test]
 fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
-    run_native_process_case(false);
+    run_native_process_case(false, None);
 }
 
 #[test]
 fn native_authenticated_endpoint_processes_survive_a_loss_without_routing_authority() {
-    run_native_process_case(true);
+    run_native_process_case(true, None);
+}
+
+#[test]
+fn native_retained_a_reconnects_same_identity_while_b_c_stay_alive() {
+    run_native_process_case(true, Some(false));
+}
+
+#[test]
+fn native_retained_a_wrong_physical_owner_refuses_without_data_mutation() {
+    run_native_process_case(true, Some(true));
 }
