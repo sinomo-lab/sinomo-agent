@@ -284,6 +284,7 @@ async fn probe(
         | ProbeKind::EndpointPing
         | ProbeKind::EndpointWrongPeer
         | ProbeKind::RegisteredEndpointPing
+        | ProbeKind::FormationEndpointPing
         | ProbeKind::RegisteredEndpointWrongPeer => {
             let ping: sinomo_core::cluster::ClusterNetworkPingResponse = response.decode_body()?;
             if ping.responder_node_id != request.target
