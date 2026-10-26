@@ -15,7 +15,46 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R64
+## Current development checkpoint — 2026-10-26 R65
+
+The two recorded R64 edge controls are now executed. Test-only `ea77bcd1`, source
+`414da787` with 4,927 inputs, appends them without changing production code or the
+complete R64 test prefix. Fresh check/build/seal (I194), both exact native cases
+(I195), and full DFS/KV boundary analysis (I196: 11 UI controls and three
+libraries) passed. **241 other inventory controls remain UNRUN on R65.** R63/R64
+and all historical failures retain their exact source qualification.
+
+The first-peer deadline control retains an actual PossiblyApplied result and
+leaves the next fixed command Unattempted, with no invented response, native
+value, error or delivery classification. The same original round deadline is
+preserved; no RPC is sent to that second peer.
+
+The mixed-source control delegates unchanged attempts to real native adapters.
+After retaining B's genuine return it releases all old host references, normally
+stops A, verifies old-owner release, retains/replaces the disposable fixture's
+lock inode, and normally reopens A from unchanged metadata. C supplies a genuine
+return under the new physical owner within the original round budget. Both
+values retain the same assignment/prefix but different actual owner identities.
+Finalization refuses at the existing first live physical-binding check, before
+the literal cross-source comparison. Both observations are retained and both
+sequential owners drain. No concurrent owner, fabricated evidence, marker
+removal, deadline extension or weakened gate is involved.
+
+The 317-file archive passed comparison/hash checks. R65-REPORT.md and its combined
+receipt retain exact source/ELF, commands, raw reports, outcomes and complete
+owned cleanup. No production, Docker, peer arbitration or model/account switch
+occurred. This remains historical observation, not current serving/effect
+permission or full abrupt-loss acceptance.
+
+Development continues with a finite immutable historical-DATA intake under the
+existing metadata storage/fsync owner. Its contract requires genuine complete
+private input plus independent current writer checks; duplicates must preserve
+the first record without time-only rewrites, conflicts must refuse, and cold
+reads must never reconstruct private provenance or serving authority. No durable
+consumer or genesis/serving activation is yet qualified. Stabilized maintenance
+remains absolute zero writes.
+
+## Historical development checkpoint — 2026-10-26 R64
 
 The next bounded prerequisite collects one in-memory native observation round
 from R63's actual private returns. Source `70e74527` and controls `0f5dca5d` /
