@@ -23,6 +23,7 @@ enum SourceCase {
     Success,
     PartiallyLiveMain,
     SaturatedHints,
+    ColdSourceProcess,
     SemanticChange,
     Deadline,
 }
@@ -53,9 +54,25 @@ async fn multihop_source_scenario(case: SourceCase) {
                 listener.local_addr_string().unwrap(),
                 0,
             ));
-            listeners.push(listener);
+            listeners.push((i, listener, false));
         }
         data.push(dir);
+    }
+    let mut extra_endpoints = Vec::new();
+    if case == SourceCase::ColdSourceProcess {
+        // Two authenticated processes advertise the same source node. The
+        // preferred endpoint has only expired in-memory source observations;
+        // the other process holds the genuine live source renewal.
+        endpoints[0].priority = 10;
+        let listener = sinomo_network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        extra_endpoints.push(sinomo_network::daemon_lan_endpoint(
+            &nodes[1],
+            listener.local_addr_string().unwrap(),
+            0,
+        ));
+        listeners.push((1, listener, true));
     }
     let now = OffsetDateTime::now_utc();
     let mut state = sinomo_base::ClusterBootstrapState::initialized_locally(
@@ -77,6 +94,7 @@ async fn multihop_source_scenario(case: SourceCase) {
         member.endpoints.push(endpoints[i - 1].clone());
         state.members.push(member);
     }
+    state.members[1].endpoints.extend(extra_endpoints.clone());
     let mut stalled_servers = tokio::task::JoinSet::new();
     let stalled_connections = Arc::new(AtomicUsize::new(0));
     if case == SourceCase::SaturatedHints {
@@ -174,6 +192,36 @@ async fn multihop_source_scenario(case: SourceCase) {
         .unwrap();
         live.push(observation);
     }
+    for endpoint in &extra_endpoints {
+        kv.put_serde(
+            cluster_endpoint_key(&endpoint.node_id, endpoint),
+            endpoint,
+            None,
+        )
+        .unwrap();
+        let observation = sinomo_network::cluster_connectivity_record(
+            &state,
+            endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            None,
+            0,
+            None,
+            None,
+            now,
+            900,
+        );
+        kv.put_serde(
+            cluster_connectivity_key(
+                &observation.source_node_id,
+                &observation.target_node_id,
+                &observation.endpoint_id,
+            ),
+            &observation,
+            None,
+        )
+        .unwrap();
+        live.push(observation);
+    }
     crate::write_cluster_kv_snapshot(&paths, &kv.snapshot().unwrap()).unwrap();
     let original_snapshot = std::fs::read(&paths.kv_paths().snapshot).unwrap();
     let mut changed = live[2].clone();
@@ -195,10 +243,13 @@ async fn multihop_source_scenario(case: SourceCase) {
     let observed = Arc::new(KvClusterDirectory::new(paths.clone()));
     assert_eq!(
         observed.connectivity_records().unwrap().len(),
-        usize::from(case == SourceCase::PartiallyLiveMain)
+        usize::from(matches!(
+            case,
+            SourceCase::PartiallyLiveMain | SourceCase::ColdSourceProcess
+        ))
     );
     let baseline = observed.connectivity_freshness_baseline().unwrap();
-    assert_eq!(baseline.records.len(), 3);
+    assert_eq!(baseline.records.len(), 3 + extra_endpoints.len());
     for record in &live {
         assert!(
             baseline
@@ -211,7 +262,7 @@ async fn multihop_source_scenario(case: SourceCase) {
     let directory = sinomo_network::DirectorySnapshot::try_from_records(
         sinomo_network::DirectoryVersion(1),
         state.members.clone(),
-        endpoints.clone(),
+        endpoints.iter().chain(&extra_endpoints).cloned(),
     )
     .unwrap();
     let live_snapshot =
@@ -232,13 +283,20 @@ async fn multihop_source_scenario(case: SourceCase) {
     let effects = Arc::new(AtomicUsize::new(0));
     let rejected_direct = Arc::new(AtomicUsize::new(0));
     let mut servers = tokio::task::JoinSet::new();
-    for (offset, listener) in listeners.into_iter().enumerate() {
-        let i = offset + 1;
+    for (i, listener, cold_source_process) in listeners {
         let node = nodes[i].clone();
         let adjacent = nodes[i - 1].clone();
         let caller = nodes[0].clone();
         let directory = directory.clone();
-        let replies = live.clone();
+        let mut replies = live.clone();
+        if cold_source_process {
+            for reply in &mut replies {
+                if reply.source_node_id == node {
+                    reply.observed_at -= time::Duration::hours(1);
+                    reply.expires_at -= time::Duration::hours(1);
+                }
+            }
+        }
         let server_paths = paths.clone();
         let replacement = replacement.clone();
 
@@ -429,12 +487,16 @@ async fn multihop_source_scenario(case: SourceCase) {
     {
         sinomo_network::retire_pooled_routed_streams(&scope).await;
     }
-    for (i, endpoint) in endpoints.iter().enumerate() {
+    for endpoint in endpoints.iter().chain(&extra_endpoints) {
+        let i = nodes
+            .iter()
+            .position(|node| node == &endpoint.node_id)
+            .unwrap();
         let mut hash = blake3::Hasher::new();
         for value in [
             endpoint.endpoint_id.as_str(),
             endpoint.address.as_str(),
-            keys[i + 1].public_key.as_str(),
+            keys[i].public_key.as_str(),
         ] {
             hash.update(&(value.len() as u64).to_be_bytes());
             hash.update(value.as_bytes());
@@ -475,7 +537,10 @@ async fn multihop_source_scenario(case: SourceCase) {
         rejected_direct.load(Ordering::SeqCst)
     );
     match case {
-        SourceCase::Success | SourceCase::PartiallyLiveMain | SourceCase::SaturatedHints => {
+        SourceCase::Success
+        | SourceCase::PartiallyLiveMain
+        | SourceCase::SaturatedHints
+        | SourceCase::ColdSourceProcess => {
             assert_eq!(response.unwrap(), "original response");
             assert_eq!(effects.load(Ordering::SeqCst), 1);
         }
@@ -534,4 +599,9 @@ async fn partially_live_graph_refreshes_remote_bridges_for_main_destination() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn earlier_stalled_hints_cannot_starve_known_adjacent_source_read() {
     multihop_source_scenario(SourceCase::SaturatedHints).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_source_process_does_not_hide_other_endpoint_live_observation() {
+    multihop_source_scenario(SourceCase::ColdSourceProcess).await;
 }

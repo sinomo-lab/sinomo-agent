@@ -305,9 +305,11 @@ pub(super) async fn refresh_connector(
             let Some(endpoint) = direct.pop_front() else {
                 break;
             };
-            if attempted_sources.contains(&endpoint.node_id) {
-                continue;
-            }
+            // An authenticated reply describes this serving process's RAM;
+            // another endpoint for the same node can hold a live renewal that
+            // a cold process has not observed. Keep the finite endpoint queue
+            // eligible until the target route is proved. The existing in-flight
+            // bound, deadline, source checks and cancellation remain unchanged.
             reads.push(read_source(
                 SourceRead::Direct(endpoint),
                 paths,
