@@ -15,7 +15,54 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R57
+## Current development checkpoint — 2026-10-26 R58
+
+R58 qualifies actual process-death reconstruction of the default-P0 native test
+fixture. Helper `02a0a794` and process control `5b1046f5` are integrated at
+`cc53f774`, source `269d725a` with 4,923 inputs. The helper is test-only: expected
+manifest values are DATA, checked against retained physical roots, native Raft
+files and the exact original prepare frame/body before native writable opening.
+Reconstruction uses existing WAL owners and real ReadIndex, without fresh
+bootstrap, leader forcing, projection copying or new assignment. It never
+adopts the external fixture root for deletion. Selected private layouts refuse.
+
+Fresh check/build/seal (I173), both selected native parents (I174), and full
+DFS/KV boundary analysis (I175: 11 UI controls and three libraries) passed.
+**227 other inventory parent controls remain UNRUN on this source.** The ignored
+same-executable helper is an actual owned child, not an additional passing test.
+
+The parent verified its child's PID/start/group/UID, actual SIGKILL signal 9,
+reap and group drain. It captured 167 raw files before any parent native open.
+Missing-root, foreign genuine-node physical identity and altered-original
+preflight controls refused without changing those retained files. Native
+reconstruction then passed actual startup/current-owner checks and refused the
+SAME stamped mutation while the original genesis stayed Prepared. Explicit
+completion of that SAME original through the current retained owner, ordinary
+reopen, full assigned-singleton sync, and SAME request produced Applied and the
+expected object. The affected normal-component-reopen regression also passed.
+
+The 350-file fixture archive passed comparison and hashing. I173/I174/I175
+receipts, `R58-REPORT.md`, the combined receipt and raw report `ca7c2d37` retain
+source/executable, commands, process identity, pre/post state and complete owned
+cleanup. R56/R57 and every earlier failed result keep their own immutable source
+qualifications.
+
+All three native fixture members died in ONE owned libtest process. This proves
+that process cut and retained-owner path; it does not prove A loss with B/C
+surviving, power-loss durability or a complete production daemon restart. The
+target metadata assignment remains singleton A. Raw retained file volume is not
+an activity-I/O or quietness measurement. Absolute-zero quietness, fixed-three
+initialization, recovery quorum, complete survivor custody, checked successor
+serving and full abrupt-loss/reconnection acceptance remain open.
+
+The next finite protocol dependency is healthy initial three-member metadata
+genesis through existing owners, preserving ALL assigned-participant proof and
+blocking effects until exact commit synchronization finishes. Its contract must
+close the live/restart admission interval after A commits but before B/C have the
+exact commit. No count-only quorum change, C1 activation, KV operation ledger or
+fixture flag as authority is authorized by this checkpoint.
+
+## Historical development checkpoint — 2026-10-26 R57
 
 R57 adds only a native normal-component-reopen control (`633a9581`, corrected
 endpoint predicate `53cd4601`), integrated at `ae250b84`. Source `24d06b0b`
