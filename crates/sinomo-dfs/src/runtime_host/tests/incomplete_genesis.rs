@@ -725,6 +725,9 @@ fn native_incomplete_singleton_genesis_refuses_stamped_write_and_global_mutation
     closed.unwrap();
 }
 
+#[cfg(target_os = "linux")]
+mod owned_process;
+
 #[test]
 fn native_held_genesis_preserves_unrelated_ready_scope_mutation_and_owner_completion() {
     let (native, nodes) =
