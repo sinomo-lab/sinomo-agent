@@ -608,10 +608,28 @@ fn routed_session_decode<T: for<'de> Deserialize<'de>>(encoded: &[u8]) -> Result
     })
 }
 
-fn routed_session_io_error(operation: &str, error: std::io::Error) -> NetworkError {
-    NetworkError::Io {
-        operation: operation.to_string(),
-        detail: error.to_string(),
+#[derive(Debug)]
+enum RoutedHandshakeFailure {
+    Network(NetworkError),
+    PeerClosed { operation: String, detail: String },
+}
+impl From<NetworkError> for RoutedHandshakeFailure {
+    fn from(error: NetworkError) -> Self { Self::Network(error) }
+}
+impl From<RoutedHandshakeFailure> for NetworkError {
+    fn from(error: RoutedHandshakeFailure) -> Self {
+        match error {
+            RoutedHandshakeFailure::Network(error) => error,
+            RoutedHandshakeFailure::PeerClosed { operation, detail } => Self::Io { operation, detail },
+        }
+    }
+}
+
+fn routed_session_io_error(operation: &str, error: std::io::Error) -> RoutedHandshakeFailure {
+    if matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof) {
+        RoutedHandshakeFailure::PeerClosed { operation: operation.into(), detail: error.to_string() }
+    } else {
+        NetworkError::Io { operation: operation.into(), detail: error.to_string() }.into()
     }
 }
 
@@ -619,7 +637,7 @@ async fn write_routed_session_frame<S>(
     stream: &mut S,
     frame_kind: u8,
     payload: &[u8],
-) -> Result<(), NetworkError>
+) -> Result<(), RoutedHandshakeFailure>
 where
     S: AsyncWrite + Unpin + ?Sized,
 {
@@ -627,7 +645,7 @@ where
         return Err(NetworkError::FrameTooLarge {
             actual_bytes: payload.len(),
             max_bytes: MAX_ROUTED_SESSION_FRAME_BYTES,
-        });
+        }.into());
     }
     let payload_len = u32::try_from(payload.len()).map_err(|_| NetworkError::FrameTooLarge {
         actual_bytes: payload.len(),
@@ -654,7 +672,7 @@ where
 async fn read_routed_session_frame<S>(
     stream: &mut S,
     expected_kind: u8,
-) -> Result<Vec<u8>, NetworkError>
+) -> Result<Vec<u8>, RoutedHandshakeFailure>
 where
     S: AsyncRead + Unpin + ?Sized,
 {
@@ -666,7 +684,7 @@ where
     if header[..4] != ROUTED_SESSION_WIRE_PREFIX || header[4] != expected_kind {
         return Err(NetworkError::Serialization {
             detail: "unexpected routed-session handshake frame".to_string(),
-        });
+        }.into());
     }
     let payload_len = usize::try_from(u32::from_be_bytes(
         header[5..]
@@ -678,7 +696,7 @@ where
         return Err(NetworkError::FrameTooLarge {
             actual_bytes: payload_len,
             max_bytes: MAX_ROUTED_SESSION_FRAME_BYTES,
-        });
+        }.into());
     }
     let mut payload = vec![0_u8; payload_len];
     stream
@@ -2082,13 +2100,13 @@ async fn accept_routed_session_destination(
     mut stream: AuthenticatedDirectStream,
     open: RoutedSessionOpen,
     descriptor_transcript: Vec<u8>,
-) -> Result<PeerStream, NetworkError> {
+) -> Result<PeerStream, RoutedHandshakeFailure> {
     let descriptor = &open.descriptor;
     if descriptor.destination_node_id != stream.local_node_id {
         return Err(NetworkError::FrameTargetMismatch {
             requested_target_node_id: stream.local_node_id,
             frame_target_node_id: descriptor.destination_node_id.clone(),
-        });
+        }.into());
     }
     let ephemeral = match descriptor.protection {
         RoutedSessionProtection::Plaintext => None,
@@ -2268,7 +2286,7 @@ pub async fn accept_direct_routed_session(
             frame_target_node_id: open.descriptor.destination_node_id.clone(),
         });
     }
-    accept_routed_session_destination(stream, open, descriptor_transcript).await
+    accept_routed_session_destination(stream, open, descriptor_transcript).await.map_err(Into::into)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2697,14 +2715,109 @@ fn routed_relay_copy_error(
 /// frames. They never construct a [`PeerStream`] or receive endpoint key
 /// material.
 pub async fn accept_or_relay_routed_session(
-    mut stream: AuthenticatedDirectStream,
+    stream: AuthenticatedDirectStream,
     directory: &DirectorySnapshot,
     identity: &dyn RoutedSessionIdentity,
     link_provider: &dyn LinkProvider,
     failure_sink: Option<&dyn ConnectivityFailureSink>,
 ) -> Result<RoutedSessionDisposition, NetworkError> {
+    accept_or_relay_routed_session_inner(stream, directory, identity, link_provider, failure_sink).await.map_err(Into::into)
+}
+
+/// Daemon ingress variant: a peer closing the handshake before an application
+/// stream exists is a normal connection exit. Authentication, malformed frames,
+/// and opaque relay transfer failures remain errors. Public client errors and
+/// all wire frames retain their existing representation.
+pub async fn accept_or_relay_routed_session_or_closed(
+    stream: AuthenticatedDirectStream,
+    directory: &DirectorySnapshot,
+    identity: &dyn RoutedSessionIdentity,
+    link_provider: &dyn LinkProvider,
+    failure_sink: Option<&dyn ConnectivityFailureSink>,
+) -> Result<Option<RoutedSessionDisposition>, NetworkError> {
+    let local = stream.local_node_id.clone();
+    let peer = stream.peer_node_id.clone();
+    let outcome = accept_or_relay_routed_session_inner(stream, directory, identity, link_provider, failure_sink).await;
+    routed_handshake_ingress_outcome(outcome, &local, &peer)
+}
+
+fn routed_handshake_ingress_outcome(
+    outcome: Result<RoutedSessionDisposition, RoutedHandshakeFailure>,
+    local: &NodeId,
+    peer: &NodeId,
+) -> Result<Option<RoutedSessionDisposition>, NetworkError> {
+    match outcome {
+        Ok(disposition) => Ok(Some(disposition)),
+        Err(RoutedHandshakeFailure::PeerClosed { operation, detail }) => {
+            tracing::debug!(target: "sinomo.network.routed_handshake",
+                local_node_id = %local, adjacent_peer_node_id = %peer, %operation, %detail,
+                "peer closed routed handshake before application dispatch");
+            Ok(None)
+        }
+        Err(RoutedHandshakeFailure::Network(error)) => Err(error),
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn routed_handshake_actual_frame_io_distinguishes_close_from_malformed_input() {
+    struct ClosedPayload(bool);
+    impl AsyncWrite for ClosedPayload {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut std::task::Context<'_>, bytes: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            if self.0 { return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())); }
+            self.0 = true;
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+    }
+    let error = write_routed_session_frame(&mut ClosedPayload(false), ROUTED_SESSION_ACCEPT_FRAME, b"handshake payload").await.unwrap_err();
+    assert!(matches!(error, RoutedHandshakeFailure::PeerClosed { operation, .. } if operation=="write routed-session frame payload"));
+    assert!(matches!(read_routed_session_frame(&mut tokio::io::empty(), ROUTED_SESSION_OPEN_FRAME).await, Err(RoutedHandshakeFailure::PeerClosed { .. })));
+    let malformed = [0u8; 9];
+    assert!(matches!(read_routed_session_frame(&mut malformed.as_slice(), ROUTED_SESSION_OPEN_FRAME).await, Err(RoutedHandshakeFailure::Network(NetworkError::Serialization { .. }))));
+    let mut oversized = [0u8; 9];
+    oversized[..4].copy_from_slice(&ROUTED_SESSION_WIRE_PREFIX);
+    oversized[4] = ROUTED_SESSION_OPEN_FRAME;
+    oversized[5..].copy_from_slice(&((MAX_ROUTED_SESSION_FRAME_BYTES + 1) as u32).to_be_bytes());
+    assert!(matches!(read_routed_session_frame(&mut oversized.as_slice(), ROUTED_SESSION_OPEN_FRAME).await, Err(RoutedHandshakeFailure::Network(NetworkError::FrameTooLarge { .. }))));
+}
+
+#[cfg(test)]
+#[test]
+fn routed_handshake_closed_io_is_typed_without_changing_public_errors() {
+    for kind in [std::io::ErrorKind::BrokenPipe, std::io::ErrorKind::ConnectionReset, std::io::ErrorKind::UnexpectedEof] {
+        let error = routed_session_io_error("write routed-session frame payload", std::io::Error::from(kind));
+        assert!(matches!(error, RoutedHandshakeFailure::PeerClosed { .. }), "{error:?}");
+        let public: NetworkError = error.into();
+        let prior = NetworkError::Io { operation: "write routed-session frame payload".into(), detail: std::io::Error::from(kind).to_string() };
+        assert_eq!(public.to_string(), prior.to_string());
+        assert_eq!(public.delivery_state(), prior.delivery_state());
+    }
+    assert!(matches!(routed_session_io_error("write routed-session frame payload", std::io::Error::from(std::io::ErrorKind::PermissionDenied)), RoutedHandshakeFailure::Network(NetworkError::Io { .. })));
+}
+
+#[cfg(test)]
+#[test]
+fn routed_handshake_ingress_keeps_auth_unknown_io_and_possible_effects_as_errors() {
+    let node = NodeId::from_legacy_named("handshake-close-control").unwrap();
+    let closed = RoutedHandshakeFailure::PeerClosed { operation: "write routed-session frame payload".into(), detail: "controlled close".into() };
+    assert!(matches!(routed_handshake_ingress_outcome(Err(closed), &node, &node), Ok(None)));
+    for error in [NetworkError::AuthDenied, NetworkError::AuthExpired, NetworkError::Serialization { detail: "malformed handshake".into() }, NetworkError::Io { operation: "write routed-session frame payload".into(), detail: "Broken pipe".into() }, NetworkError::delivery_failed("application exchange", NetworkDeliveryState::PossiblyApplied, "reply lost")] {
+        let expected = error.clone();
+        assert!(matches!(routed_handshake_ingress_outcome(Err(error.into()), &node, &node), Err(actual) if actual==expected));
+    }
+}
+
+async fn accept_or_relay_routed_session_inner(
+    mut stream: AuthenticatedDirectStream,
+    directory: &DirectorySnapshot,
+    identity: &dyn RoutedSessionIdentity,
+    link_provider: &dyn LinkProvider,
+    failure_sink: Option<&dyn ConnectivityFailureSink>,
+) -> Result<RoutedSessionDisposition, RoutedHandshakeFailure> {
     if stream.local_node_id != *identity.local_node_id() {
-        return Err(NetworkError::AuthDenied);
+        return Err(NetworkError::AuthDenied.into());
     }
     let open_frame = read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME).await?;
     let open: RoutedSessionOpen = routed_session_decode(&open_frame)?;
@@ -2732,7 +2845,7 @@ pub async fn accept_or_relay_routed_session(
     let connect_time = routed_session_remaining_connect_time(descriptor)?;
     enum RelayEstablishmentError {
         DirectEdge(NetworkError),
-        DownstreamSession(NetworkError),
+        DownstreamSession(RoutedHandshakeFailure),
     }
     let direct_edge_established = Arc::new(AtomicBool::new(false));
     let establish_edge = Arc::clone(&direct_edge_established);
@@ -2761,15 +2874,15 @@ pub async fn accept_or_relay_routed_session(
         establish_edge.store(true, Ordering::Release);
         write_routed_session_frame(&mut *outgoing.io, ROUTED_SESSION_OPEN_FRAME, &open_frame)
             .await
-            .map_err(RelayEstablishmentError::DownstreamSession)?;
+            .map_err(|error| RelayEstablishmentError::DownstreamSession(error.into()))?;
         let acceptance_frame =
             read_routed_session_frame(&mut *outgoing.io, ROUTED_SESSION_ACCEPT_FRAME)
                 .await
-                .map_err(RelayEstablishmentError::DownstreamSession)?;
+                .map_err(|error| RelayEstablishmentError::DownstreamSession(error.into()))?;
         let acceptance: RoutedSessionAcceptance = routed_session_decode(&acceptance_frame)
-            .map_err(RelayEstablishmentError::DownstreamSession)?;
+            .map_err(|error| RelayEstablishmentError::DownstreamSession(error.into()))?;
         verify_routed_session_acceptance(descriptor, &acceptance)
-            .map_err(RelayEstablishmentError::DownstreamSession)?;
+            .map_err(|error| RelayEstablishmentError::DownstreamSession(error.into()))?;
         Ok::<_, RelayEstablishmentError>((outgoing, acceptance_frame))
     };
     let (outgoing, acceptance_frame) = match tokio::time::timeout(connect_time, establish).await {
@@ -2782,7 +2895,7 @@ pub async fn accept_or_relay_routed_session(
                 &endpoint_id,
                 &error,
             );
-            return Err(error);
+            return Err(error.into());
         }
         Ok(Err(RelayEstablishmentError::DownstreamSession(error))) => return Err(error),
         Err(_) => {
@@ -2807,7 +2920,7 @@ pub async fn accept_or_relay_routed_session(
                     &error,
                 );
             }
-            return Err(error);
+            return Err(error.into());
         }
     };
     write_routed_session_frame(

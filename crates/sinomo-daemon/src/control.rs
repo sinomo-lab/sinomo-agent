@@ -1918,15 +1918,16 @@ async fn handle_daemon_authenticated_transport_stream_async(
         )?
         .into_iter()
         .collect::<Vec<_>>();
-    match sinomo_core::network::accept_or_relay_routed_session(
+    let disposition = sinomo_core::network::accept_or_relay_routed_session_or_closed(
         direct_stream,
         &directory,
         identity.as_ref(),
         &link_provider,
         Some(&failure_sink),
     )
-    .await?
-    {
+    .await?;
+    let Some(disposition) = disposition else { return Ok(false); };
+    match disposition {
         sinomo_core::network::RoutedSessionDisposition::Destination(stream) => {
             let routed_peer_node_id = stream.peer_node_id.clone();
             tracing::debug!(

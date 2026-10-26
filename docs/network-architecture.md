@@ -175,6 +175,13 @@ Owner-local endpoint hints may remain in bootstrap records. The source reader
 excludes `LocalOnly` endpoints both from remote dials and from accepted remote
 edges; a peer's loopback listener does not name a listener on the caller's host.
 
+Daemon ingress treats an authenticated peer closing the routed handshake before
+an application stream exists as a normal connection exit, recorded at debug
+level. The distinction comes from typed handshake I/O, not error text. Invalid
+authentication, malformed frames, unknown I/O errors and failures after relay or
+application dispatch remain errors. Existing client error text and request
+delivery classification are unchanged.
+
 These observations are lost on process restart. Stored expired rows remain
 expired and serve only as semantic baselines or endpoint hints. Cold startup,
 bootstrap and rejoin are genuine activity and may persist necessary changes;

@@ -265,7 +265,7 @@ pub use routing::{
     MAX_ROUTE_CANDIDATES, MultiHopRoutedConnector, PeerStream, RouteConstraints, RouteHop,
     RouteTrace, RoutedAvailability, RoutedConnectFuture, RoutedConnector, RoutedRelayReport,
     RoutedSessionDisposition, RoutedSessionIdentity, RoutedSessionProtection,
-    accept_direct_routed_session, accept_or_relay_routed_session, connect_direct_routed_endpoint,
+    accept_direct_routed_session, accept_or_relay_routed_session, accept_or_relay_routed_session_or_closed, connect_direct_routed_endpoint,
     plan_routes,
 };
 pub use rpc::{
