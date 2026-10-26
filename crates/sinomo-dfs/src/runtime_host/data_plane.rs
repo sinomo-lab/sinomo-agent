@@ -1655,7 +1655,7 @@ pub(crate) fn daemon_dfs_client_node_transport(
 ) -> DfsNodeTransport {
     // This is the already registered component host supplied by the normal
     // client opener. Core effect/genesis constructors do not bind these senders.
-    let peer = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext {data_dir:data_dir.clone(),runtime:runtime.clone()}) });
+    let peer = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime)) });
     let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
     let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
     DfsNodeTransport::with_peer_transports_for_nodes(
@@ -1666,6 +1666,46 @@ pub(crate) fn daemon_dfs_client_node_transport(
         async_peer,
     )
     .with_registered_main_namespace_dispatch()
+}
+
+/// Test-only contact restriction on the SAME actual registered native host.
+/// Not a replacement carrier, fresh owner, source authority or decoded return.
+#[cfg(test)]
+pub(crate) fn daemon_dfs_native_prefix_contact_scoped_transport_for_test(
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    contacts: std::collections::BTreeMap<NodeId, (String, String)>,
+) -> Result<DfsNodeTransport, DfsRuntimeError> {
+    let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "native scoped PREFIX has no existing registered host".into(),
+    })?;
+    if contacts.len() != 3
+        || !contacts.contains_key(&local_node_id)
+        || peer_node_ids
+            .iter()
+            .any(|peer| !contacts.contains_key(peer))
+    {
+        return Err(DfsRuntimeError::Parse {
+            detail: "native scoped PREFIX contact set differs".into(),
+        });
+    }
+    let mut context = super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime);
+    context.contact_scope = Some(contacts);
+    let peer = Arc::new(DaemonDfsPeerTransport {
+        host,
+        native_prefix: Some(context),
+    });
+    let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+    let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
+    Ok(DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync_peer,
+        async_peer,
+    ))
 }
 
 #[derive(Clone)]
@@ -2488,7 +2528,7 @@ pub(crate) fn daemon_dfs_peer_transports_on_runtime(
         let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
         return (peer_transport, async_peer_transport);
     };
-    let transport = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext {data_dir:data_dir.clone(),runtime:runtime.clone()}) });
+    let transport = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime)) });
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)
