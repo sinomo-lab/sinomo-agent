@@ -4,6 +4,217 @@ use crate::{
     DfsPreparedOperationStatus,
 };
 
+#[cfg(test)]
+pub(crate) const NATIVE_GENESIS_COMPLETION_DEFERRED: &str =
+    "injected exact native genesis completion deferred before commit";
+
+#[cfg(test)]
+#[derive(Debug)]
+struct NativeGenesisDeferralState {
+    data_root: PathBuf,
+    root_identity: (u64, u64),
+    owner_identity: (u64, u64),
+    shard: DfsMetadataShardConfig,
+    active: std::sync::atomic::AtomicBool,
+    hits: std::sync::atomic::AtomicUsize,
+    original: Mutex<Option<crate::DfsPreparedOperationRecord>>,
+}
+
+#[cfg(test)]
+type NativeGenesisDeferralKey = (PathBuf, DfsFileSystemId, String);
+
+#[cfg(test)]
+static NATIVE_GENESIS_DEFERRALS: OnceLock<
+    Mutex<BTreeMap<NativeGenesisDeferralKey, std::sync::Weak<NativeGenesisDeferralState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn native_genesis_physical_identity(
+    data_dir: &SinomoDataDir,
+) -> Result<((u64, u64), (u64, u64)), DfsError> {
+    let root = data_dir.root();
+    let named = std::fs::symlink_metadata(&root).map_err(|e| DfsError::Metadata {
+        message: e.to_string(),
+    })?;
+    if !named.is_dir() || named.file_type().is_symlink() {
+        return Err(DfsError::Metadata {
+            message: "native genesis deferral requires its actual physical DATA directory".into(),
+        });
+    }
+    let directory = std::fs::File::open(&root).map_err(|e| DfsError::Metadata {
+        message: e.to_string(),
+    })?;
+    let root_identity =
+        crate::runtime_host::storage_file_identity(&directory).map_err(|e| DfsError::Metadata {
+            message: e.to_string(),
+        })?;
+    let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+        &crate::runtime_host::DfsRuntimePaths::new(data_dir),
+    )
+    .map_err(|e| DfsError::Metadata {
+        message: e.to_string(),
+    })?;
+    let owner_identity = owner
+        .storage_owner_file_identity()
+        .map_err(|e| DfsError::Metadata {
+            message: e.to_string(),
+        })?;
+    Ok((root_identity, owner_identity))
+}
+
+/// Negative-only completion selection. It retains no native owner, admission,
+/// metadata lock or serving capability; normal return releases every owner.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct NativeGenesisCompletionDeferral {
+    state: Arc<NativeGenesisDeferralState>,
+}
+
+#[cfg(test)]
+impl NativeGenesisCompletionDeferral {
+    pub(crate) fn install(
+        data_dir: &SinomoDataDir,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<Self, DfsError> {
+        if shard.epoch != 1 || !shard.replica_node_ids.is_empty() {
+            return Err(DfsError::Metadata {
+                message: "genesis deferral accepts only the supported initial singleton".into(),
+            });
+        }
+        let (root_identity, owner_identity) = native_genesis_physical_identity(data_dir)?;
+        let state = Arc::new(NativeGenesisDeferralState {
+            data_root: data_dir.root(),
+            root_identity,
+            owner_identity,
+            shard: shard.clone(),
+            active: std::sync::atomic::AtomicBool::new(true),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            original: Mutex::new(None),
+        });
+        let mut registry = NATIVE_GENESIS_DEFERRALS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| DfsError::Metadata {
+                message: "native genesis deferral registry poisoned".into(),
+            })?;
+        let key = (
+            state.data_root.clone(),
+            shard.file_system_id.clone(),
+            shard.shard_id.clone(),
+        );
+        if registry
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return Err(DfsError::Metadata {
+                message: "native genesis completion already has a scoped owner".into(),
+            });
+        }
+        registry.insert(key, Arc::downgrade(&state));
+        Ok(Self { state })
+    }
+    pub(crate) fn original_record(
+        &self,
+    ) -> Result<Option<crate::DfsPreparedOperationRecord>, DfsError> {
+        self.state
+            .original
+            .lock()
+            .map(|record| record.clone())
+            .map_err(|_| DfsError::Metadata {
+                message: "native genesis deferral record poisoned".into(),
+            })
+    }
+    pub(crate) fn hits(&self) -> usize {
+        self.state.hits.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn release(&self) {
+        self.state
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(registry) = NATIVE_GENESIS_DEFERRALS.get()
+            && let Ok(mut registry) = registry.lock()
+        {
+            let key = (
+                self.state.data_root.clone(),
+                self.state.shard.file_system_id.clone(),
+                self.state.shard.shard_id.clone(),
+            );
+            if registry
+                .get(&key)
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|current| Arc::ptr_eq(&current, &self.state))
+            {
+                registry.remove(&key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for NativeGenesisCompletionDeferral {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(test)]
+fn defer_native_genesis_completion(
+    data_dir: &SinomoDataDir,
+    shard: &DfsMetadataShardConfig,
+    record: &crate::DfsPreparedOperationRecord,
+) -> Result<(), DfsError> {
+    let Some(registry) = NATIVE_GENESIS_DEFERRALS.get() else {
+        return Ok(());
+    };
+    let state = registry
+        .lock()
+        .map_err(|_| DfsError::Metadata {
+            message: "native genesis deferral registry poisoned".into(),
+        })?
+        .get(&(
+            data_dir.root(),
+            shard.file_system_id.clone(),
+            shard.shard_id.clone(),
+        ))
+        .and_then(std::sync::Weak::upgrade);
+    let Some(state) = state else {
+        return Ok(());
+    };
+    if !state.active.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    record.validate()?;
+    if state.shard != *shard
+        || record.digest.operation_id != genesis_operation_id(shard)
+        || record.digest.file_system_id != shard.file_system_id
+        || record.digest.shard_id.0 != shard.shard_id
+        || record.digest.owner_epoch != 1
+        || record.status != DfsPreparedOperationStatus::Prepared
+        || record.committed_entry.is_some()
+        || native_genesis_physical_identity(data_dir)?
+            != (state.root_identity, state.owner_identity)
+    {
+        return Err(DfsError::Metadata {
+            message: "native genesis completion deferral lost its exact physical scope or original"
+                .into(),
+        });
+    }
+    let mut original = state.original.lock().map_err(|_| DfsError::Metadata {
+        message: "native genesis deferral record poisoned".into(),
+    })?;
+    if original.as_ref().is_some_and(|old| old != record) {
+        return Err(DfsError::Metadata {
+            message: "deferred native genesis original body or digest changed".into(),
+        });
+    }
+    original.get_or_insert_with(|| record.clone());
+    state.hits.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    Err(DfsError::Metadata {
+        message: NATIVE_GENESIS_COMPLETION_DEFERRED.into(),
+    })
+}
+
 pub(super) fn genesis_operation_id(shard: &DfsMetadataShardConfig) -> String {
     format!("genesis:{}:{}:1", shard.file_system_id, shard.shard_id)
 }
@@ -284,6 +495,8 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                             message: "unfinished genesis cannot be expanded or rebound".into(),
                         });
                     }
+                    #[cfg(test)]
+                    defer_native_genesis_completion(&self.data_dir, shard, &record)?;
                     service.commit_stored_prepared_operation(&record.digest)?;
                 }
             } else if service

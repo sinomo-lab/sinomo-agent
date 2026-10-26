@@ -2352,6 +2352,29 @@ pub(crate) fn observe_checkpointed_background_repairs(
     }
 }
 
+/// A negative completion scope and the original native DATA it actually saw.
+/// No scheduler guard, native DATA-owner Arc or publication permit is retained.
+#[cfg(test)]
+pub(crate) struct DeferredNativeGenesis {
+    data_root: std::path::PathBuf,
+    shard: DfsMetadataShardConfig,
+    original_record: DfsPreparedOperationRecord,
+    deferral: crate::default_cluster::genesis::NativeGenesisCompletionDeferral,
+}
+
+#[cfg(test)]
+impl DeferredNativeGenesis {
+    pub(crate) fn shard(&self) -> &DfsMetadataShardConfig {
+        &self.shard
+    }
+    pub(crate) fn original_record(&self) -> &DfsPreparedOperationRecord {
+        &self.original_record
+    }
+    pub(crate) fn deferral_hits(&self) -> usize {
+        self.deferral.hits()
+    }
+}
+
 pub struct DfsTestRuntime {
     root: Option<sinomo_testdir::TestDir>,
     state: sinomo_core::ClusterBootstrapState,
@@ -3871,6 +3894,254 @@ impl DfsTestRuntime {
             return Err("native empty-scope assignment changed while bootstrap completed".into());
         }
         Ok(actual)
+    }
+
+    /// Use the unchanged supported singleton bootstrap, but return only after
+    /// its actual prepare/CAS owner has deferred completion and released locks.
+    #[cfg(test)]
+    pub(crate) fn begin_deferred_native_genesis(
+        &self,
+        shard_id: &str,
+        prefix: &str,
+    ) -> Result<DeferredNativeGenesis, String> {
+        let shard = DfsMetadataShardConfig {
+            file_system_id: self.file_system().file_system_id,
+            shard_id: shard_id.to_owned(),
+            primary_node_id: self.primary.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: crate::posix_path::normalize_posix_path(prefix)
+                    .map_err(|e| e.to_string())?,
+            },
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let data = self.data_dir(&self.primary);
+        let deferral =
+            crate::default_cluster::genesis::NativeGenesisCompletionDeferral::install(data, &shard)
+                .map_err(|e| e.to_string())?;
+        let outcome = self.bootstrap_empty_metadata_prefix(shard_id, prefix);
+        let error = outcome
+            .err()
+            .ok_or("native genesis unexpectedly completed instead of reaching the selected cut")?;
+        if !error.contains(crate::default_cluster::genesis::NATIVE_GENESIS_COMPLETION_DEFERRED) {
+            return Err(error);
+        }
+        let original_record = deferral
+            .original_record()
+            .map_err(|e| e.to_string())?
+            .ok_or("native genesis deferral did not observe an original Prepared record")?;
+        original_record.validate().map_err(|e| e.to_string())?;
+        if original_record.status != DfsPreparedOperationStatus::Prepared
+            || original_record.committed_entry.is_some()
+            || deferral.hits() == 0
+        {
+            return Err("native genesis cut is not the actual incomplete original".into());
+        }
+        // Acquiring and releasing the SAME normal scheduler owner proves that
+        // the selected deferral did not park global admission across probes.
+        let scheduler =
+            crate::runtime_host::daemon_dfs_mutation_scheduler(data).map_err(|e| e.to_string())?;
+        run_unit(Box::pin(async move {
+            tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+                let guard = scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive).await.map_err(|e|e.to_string())?;
+                drop(guard); Ok(())
+            }).await.map_err(|_| "native genesis deferral did not release ordinary admission before its existing deadline".to_string())?
+        }))?;
+        for node in self.nodes.keys() {
+            if self.nodes[node].reconciler.is_some() {
+                self.wait_native_authority(node)?;
+            }
+        }
+        if self
+            .metadata_shards()?
+            .into_iter()
+            .find(|actual| actual.shard_id == shard_id)
+            .as_ref()
+            != Some(&shard)
+        {
+            return Err(
+                "native genesis assignment CAS does not retain the exact singleton scope".into(),
+            );
+        }
+        let phase = DeferredNativeGenesis {
+            data_root: data.root(),
+            shard,
+            original_record,
+            deferral,
+        };
+        if self.read_deferred_native_genesis(&phase)? != phase.original_record {
+            return Err(
+                "native genesis readback differs from its actual pre-commit original".into(),
+            );
+        }
+        Ok(phase)
+    }
+
+    /// Historical read only through the existing inspection owner. A live
+    /// matching DATA owner is required; this does not fake stopped-node readiness.
+    #[cfg(test)]
+    pub(crate) fn read_deferred_native_genesis(
+        &self,
+        phase: &DeferredNativeGenesis,
+    ) -> Result<DfsPreparedOperationRecord, String> {
+        let data = self.data_dir(&phase.shard.primary_node_id);
+        if data.root() != phase.data_root {
+            return Err("deferred genesis names another runtime root".into());
+        }
+        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+            &crate::runtime_host::DfsRuntimePaths::new(data),
+        )
+        .map_err(|e| e.to_string())?;
+        let layout = owner
+            .selected_original_data_layout()
+            .map_err(|e| e.to_string())?;
+        let shard = DfsMetadataShardId::new(&phase.shard.shard_id);
+        let root = crate::local_dfs_metadata_shard_path(data, &shard);
+        if let Some(layout) = &layout {
+            layout
+                .stage(&phase.shard.file_system_id, &shard, &root)
+                .map_err(|e| e.to_string())?;
+        }
+        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "deferred genesis inspection remains unavailable at its existing deadline"
+                        .into(),
+                );
+            }
+            if let Some(_guard) = crate::metadata_lock::try_metadata_inspection_lock(
+                root.clone(),
+                crate::metadata_cursor::journal_write_lock_path(&root),
+            )
+            .map_err(|e| e.to_string())?
+            {
+                let backend = crate::LocalSobjMetadataBackend::open_for_inspection_with_layout(
+                    shard.clone(),
+                    root.clone(),
+                    layout
+                        .clone()
+                        .map(|layout| (phase.shard.file_system_id.clone(), layout)),
+                )
+                .map_err(|e| e.to_string())?;
+                let record = backend
+                    .prepared_operation_record(&phase.original_record.digest.operation_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("original native genesis record is unavailable")?;
+                if record.digest != phase.original_record.digest
+                    || record.payload != phase.original_record.payload
+                {
+                    return Err(
+                        "retained native genesis changed its original digest or body".into(),
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("deferred genesis inspection crossed its original deadline".into());
+                }
+                return Ok(record);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// One explicit owner completion attempt, not a user-write readiness probe.
+    #[cfg(test)]
+    pub(crate) fn complete_deferred_native_genesis(
+        &self,
+        phase: &DeferredNativeGenesis,
+    ) -> Result<DfsPreparedOperationRecord, String> {
+        let shards = self.metadata_shards()?;
+        if shards.iter().find(|s| s.shard_id == phase.shard.shard_id) != Some(&phase.shard) {
+            return Err("deferred genesis assignment changed before explicit completion".into());
+        }
+        self.read_deferred_native_genesis(phase)?;
+        let data = self.data_dir(&phase.shard.primary_node_id).clone();
+        let paths = ClusterPaths::new(&data);
+        let primary = phase.shard.primary_node_id.clone();
+        let file_system = self.file_system();
+        let nodes = self.nodes.keys().cloned().collect::<Vec<_>>();
+        let control = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+            &paths,
+            executor().handle(),
+        );
+        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+            &crate::runtime_host::DfsRuntimePaths::new(&data),
+        )
+        .map_err(|e| e.to_string())?;
+        let scheduler =
+            crate::runtime_host::daemon_dfs_mutation_scheduler(&data).map_err(|e| e.to_string())?;
+        run_unit(Box::pin(async move {
+            tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+                let scope = DfsMessageExecutionScope::GlobalExclusive;
+                let admission = scheduler.admit(&scope).await.map_err(|e|e.to_string())?;
+                let owners = crate::DfsPublicationExecutionOwners::from_runtime(data.root(), scope, admission, owner);
+                let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new_with_resident_metadata_backend(
+                    data, paths, primary.clone(), Box::new(control), None, owners,
+                );
+                // Release only while this actual normal owner holds admission;
+                // no competing completion wins a hidden test-only bypass.
+                phase.deferral.release();
+                host.materialize_default_sifs_metadata_on_shards_async(file_system, shards, nodes, primary)
+                    .await.map_err(|e|e.to_string())
+            }).await.map_err(|_| "explicit native genesis completion reached its existing network deadline".to_string())?
+        }))?;
+        let record = self.read_deferred_native_genesis(phase)?;
+        if record.status != DfsPreparedOperationStatus::Committed
+            || record.committed_entry.is_none()
+        {
+            return Err("normal genesis owner did not complete the same original record".into());
+        }
+        Ok(record)
+    }
+
+    /// A separate explicit OrdinaryDurability operation for the exact actual
+    /// singleton assignment. Three mounted nodes do not turn {A} into fixed3.
+    #[cfg(test)]
+    pub(crate) fn sync_completed_native_genesis(
+        &self,
+        phase: &DeferredNativeGenesis,
+        actual_bootstrap_object_path: &str,
+    ) -> Result<DfsMetadataQuorumSyncCertificate, String> {
+        let record = self.read_deferred_native_genesis(phase)?;
+        if record.status != DfsPreparedOperationStatus::Committed
+            || record.committed_entry.is_none()
+        {
+            return Err("cannot sync an incomplete native genesis as committed".into());
+        }
+        let mut service = crate::runtime_host::open_dfs_runtime_service_on_shard(
+            self.data_dir(&phase.shard.primary_node_id),
+            Some(executor().handle()),
+            &phase.shard,
+        )
+        .map_err(|e| e.to_string())?;
+        let object = service
+            .metadata_backend()
+            .ok_or("normal genesis service has no backend")?
+            .get_object_by_path(&phase.shard.file_system_id, actual_bootstrap_object_path)
+            .map_err(|e| e.to_string())?
+            .ok_or("normal genesis did not create the requested bootstrap object")?;
+        let target = service
+            .capture_metadata_quorum_sync_target(&object)
+            .map_err(|e| e.to_string())?;
+        if target.expected_shard.as_ref() != Some(&phase.shard)
+            || target.authority_epoch != Some(1)
+            || !target.replica_node_ids.is_empty()
+        {
+            return Err(
+                "genesis durability target differs from the actual singleton assignment".into(),
+            );
+        }
+        let certificate = service
+            .sync_metadata_shard_to_quorum(&target, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        if certificate.target != target
+            || certificate.quorum_size != 1
+            || certificate.acknowledged_node_ids != vec![phase.shard.primary_node_id.clone()]
+        {
+            return Err("genesis OrdinaryDurability result does not cover the exact actual assigned set {A}".into());
+        }
+        Ok(certificate)
     }
 
     /// Observe only the exact original completed native handoff, including
