@@ -1852,6 +1852,31 @@ resource-pressure fields bypass storage-health hysteresis because they come from
 exact host callbacks; capacity and health transitions retain their ordinary
 consecutive-sample protection.
 
+The read-only `/dfs/content/advertisement-live` route returns the existing
+`DfsNodeAdvertisement` from the actual content service owner's accepted
+in-memory observation. It uses the existing DFS status-read capability and exact
+authenticated member identity. A node keepalive, passive shadow or cached
+persisted advertisement cannot stand in for that service owner. The route checks
+the current runtime incarnation and data-owner lease, rejects unavailable or
+expired observations, and performs no sampling, scan, repair or publication.
+
+An operation may fetch this observation for an expired canonical advertisement
+within its bounded readiness work. The consumer requires matching confirmed
+semantics, a nonregressing generation and observation time, and a live expiry.
+It rechecks the canonical record, provider configuration and placement generation
+after the response. Accepted observations live in a separate advisory RAM cache;
+they do not rewrite the KV record or grant write authority. Membership, endpoint,
+provider and content changes invalidate that cache, as does owner replacement.
+Missing routes on older peers fail safely: their expired records stay unusable.
+
+First publication and genuine semantic changes retain the existing quorum path.
+Newer observation timestamps or lease age alone do not renew durable records.
+After restart the RAM observation must be established by the actual new owner;
+startup/bootstrap/rejoin may write before normal stabilization. A live read never
+extends old capacity evidence or manufactures a startup event. Stabilized idle
+windows include maintenance and require zero physical writes across daemon,
+shadow, helper and attributable writeback scopes.
+
 ## Roaming and Failure Behavior
 
 Roaming nodes are ordinary trusted members but should not normally be required

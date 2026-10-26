@@ -469,6 +469,12 @@ impl DfsDeviceHealthMonitor {
         snapshot
     }
 
+    /// The observation owner evaluates advertisements after its real samples
+    /// or advisory changes. A service read only borrows that accepted value.
+    pub(crate) fn accepted_advertisement(&self) -> Option<DfsNodeAdvertisement> {
+        self.advertised.clone()
+    }
+
     pub fn aggregate_advertisement(
         &mut self,
         zone: Option<String>,
@@ -1212,6 +1218,22 @@ mod tests {
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("node")
+    }
+
+    #[test]
+    fn accepted_advertisement_read_does_not_create_or_refresh_an_observation() {
+        let node = NodeId::from_legacy_named("live_advertisement_memory_read").unwrap();
+        let mut monitor = DfsDeviceHealthMonitor::new(node.clone(), Vec::new());
+        assert!(monitor.accepted_advertisement().is_none());
+        let at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let mut accepted = DfsNodeAdvertisement::content(node);
+        accepted.updated_at = at;
+        accepted.expires_at = Some(at + time::Duration::minutes(15));
+        monitor.advertised = Some(accepted.clone());
+        assert_eq!(monitor.accepted_advertisement(), Some(accepted.clone()));
+        assert_eq!(monitor.accepted_advertisement(), Some(accepted));
+        assert!(monitor.last_sampled_at.is_none());
+        assert_eq!(monitor.sequence, 0);
     }
 
     #[test]

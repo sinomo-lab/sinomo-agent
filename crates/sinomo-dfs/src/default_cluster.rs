@@ -1710,12 +1710,7 @@ fn stable_dfs_advertisement(
     let Some(current) = current else {
         return desired;
     };
-    let lease_is_fresh = desired.expires_at.is_none()
-        || current.expires_at.is_some_and(|expires_at| {
-            expires_at > OffsetDateTime::now_utc() + time::Duration::seconds(30)
-        });
-    if lease_is_fresh
-        && current.accepts_metadata == desired.accepts_metadata
+    if current.accepts_metadata == desired.accepts_metadata
         && crate::placement_environment::advertisement_semantics_equal(&current, &desired)
     {
         return current;
@@ -1757,7 +1752,7 @@ mod advertisement_publication_tests {
     }
 
     #[test]
-    fn topology_reconciliation_preserves_semantic_changes_and_lease_renewal() {
+    fn topology_reconciliation_preserves_semantic_changes_without_time_only_renewal() {
         let current = current();
         let mutations: &[fn(&mut DfsNodeAdvertisement)] = &[
             |a| a.node_id = NodeId::generate(),
@@ -1782,8 +1777,9 @@ mod advertisement_publication_tests {
         let mut expired = current.clone();
         expired.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
         assert_eq!(
-            stable_dfs_advertisement(Some(expired), current.clone()),
-            current
+            stable_dfs_advertisement(Some(expired.clone()), current),
+            expired,
+            "time-only reconciliation must retain the honest expired canonical payload"
         );
     }
 }

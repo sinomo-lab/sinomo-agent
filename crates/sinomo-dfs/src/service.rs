@@ -695,6 +695,16 @@ impl std::fmt::Display for DfsDataPlaneHostError {
 impl std::error::Error for DfsDataPlaneHostError {}
 
 pub trait DfsDataPlaneHost: Send + Sync {
+    /// Return an accepted observation from this active content owner only.
+    /// Missing owners, samples and expired observations fail closed. This read
+    /// must not initialize storage, sample it, renew timestamps or publish.
+    fn live_content_advertisement(
+        &self,
+        _data_dir: &SinomoDataDir,
+    ) -> Result<crate::DfsNodeAdvertisement, DfsDataPlaneHostError> {
+        Err(DfsDataPlaneHostError::new("live DFS content owner observation unavailable"))
+    }
+
     fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsOperatorStatus>;
 
     /// Return the process-owned content store when the embedding host already
@@ -1100,6 +1110,12 @@ impl Service for DfsDataPlaneService {
                 "data",
             );
             match request.route.as_str() {
+                crate::DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE => {
+                    let _: () = ctx.decode_request_body(&request).await?;
+                    let advertisement = service.host.live_content_advertisement(ctx.data_dir.as_ref())
+                        .map_err(service_error)?;
+                    ctx.respond_value(crate::DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE, advertisement)?;
+                }
                 DFS_SMOKE_ROUTE => {
                     let _: () = ctx.decode_request_body(&request).await?;
                     let report = service.host.run_smoke().await.map_err(service_error)?;
@@ -1401,6 +1417,17 @@ mod tests {
             &runtime.runtime_handle(),
         ));
         (runtime, node, data_dir, host)
+    }
+
+    fn native_live_surface_fixture(name: &str) -> (
+        crate::test_support::DfsTestRuntime, NodeId, Arc<SinomoDataDir>,
+        Arc<crate::runtime_host::DaemonDfsDataPlaneHost>,
+    ) {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let fixture = native_surface_fixture(name);
+        fixture.0.runtime_handle().block_on(fixture.3.wait_live_content_advertisement_for_test(&fixture.2, deadline))
+            .expect("real live-owner startup observation");
+        fixture
     }
 
     fn temp_data_dir() -> (sinomo_testdir::TestDir, Arc<SinomoDataDir>) {
@@ -1739,6 +1766,86 @@ mod tests {
             .await
             .expect("body dispatch");
         frames.lock().expect("frames").pop().expect("response")
+    }
+
+    #[test]
+    fn live_content_advertisement_is_owner_bound_read_only_and_withdraws() {
+        let (mut runtime, node, data_dir, host) = native_live_surface_fixture("native-live-advertisement");
+        let route = crate::DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE;
+        assert_eq!(route, "/dfs/content/advertisement-live");
+        let owner: Arc<dyn DfsDataPlaneHost> = host.clone();
+        let registry = register_services_with_data_plane_host(ServiceRegistry::builder(), owner).build();
+        let before = host.live_content_advertisement(&data_dir).expect("accepted startup sample");
+        assert_eq!(before.node_id, node);
+        let (_, response) = runtime.runtime_handle().block_on(dispatch_local(
+            &registry, Arc::clone(&data_dir), route, &(),
+        ));
+        let actual: crate::DfsNodeAdvertisement = response.decode_body().unwrap();
+        assert_eq!(actual, before, "read must not renew timestamps or resample storage");
+        assert_eq!(host.live_content_advertisement(&data_dir).unwrap(), before);
+        assert!(!registry.owns("/dfs/content/advertisement-live-v1"));
+        assert!(!register_services(ServiceRegistry::builder()).build().owns(route),
+            "a hostless or passive shadow service cannot attest a content owner");
+        let (_, foreign_root) = temp_data_dir();
+        assert!(host.live_content_advertisement(&foreign_root).is_err());
+        runtime.stop_node(&node).expect("normal lifecycle unload");
+        assert!(host.live_content_advertisement(&data_dir).is_err(),
+            "a retained service handle cannot attest an unloaded owner");
+    }
+
+    #[test]
+    fn live_content_advertisement_uses_authenticated_native_target_transport() {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let (mut runtime, nodes) = crate::test_support::DfsTestRuntime::start_cluster(
+            "native-live-advertisement-peer", 2,
+        ).unwrap();
+        let target = &nodes[1];
+        let caller = runtime.component_context(&nodes[0]).unwrap();
+        let transport = caller.object_rpc_transport().unwrap();
+        let target_host = crate::runtime_host::DaemonDfsDataPlaneHost::new_on_runtime(
+            crate::runtime_host::DfsRuntimePaths::for_host_role(runtime.data_dir(target), sinomo_module::ComponentHostRole::Embedded),
+            &runtime.runtime_handle(),
+        );
+        let canonical = runtime.runtime_handle().block_on(target_host.wait_live_content_advertisement_for_test(runtime.data_dir(target), deadline)).unwrap();
+        let live = runtime.runtime_handle().block_on(crate::live_advertisement::fetch_live_content_advertisement(
+            transport.as_ref(), target, &canonical,
+            crate::DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(2)).cluster_rpc_options(),
+        )).unwrap();
+        assert_eq!(live, canonical);
+        runtime.stop_node(target).unwrap();
+        assert!(runtime.runtime_handle().block_on(crate::live_advertisement::fetch_live_content_advertisement(
+            transport.as_ref(), target, &canonical,
+            crate::DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(2)).cluster_rpc_options(),
+        )).is_err(), "a node address does not substitute for the unloaded service");
+        drop(caller);
+        drop(transport);
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn live_content_owner_time_only_refresh_does_not_append_native_wal() {
+        let (mut runtime, node, data_dir, host) = native_live_surface_fixture("native-live-owner-no-heartbeat");
+        let paths = ClusterPaths::new(&data_dir);
+        let desired = host.live_content_advertisement(&data_dir).unwrap();
+        let mut stored = desired.clone();
+        stored.updated_at -= time::Duration::hours(1);
+        stored.expires_at = Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        let key = crate::content_service_key(&node);
+        sinomo_core::cluster::append_cluster_raft_command(&paths, &node, sinomo_core::kv::KvCommand::Op(
+            sinomo_core::kv::KvOp::put_serde(key.clone(), &stored, None).unwrap(),
+        )).unwrap();
+        let mut client = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, &runtime.runtime_handle());
+        let read = runtime.runtime_handle().block_on(crate::AsyncDfsControlPlaneKvClient::get_async(&client, &key)).unwrap().unwrap();
+        assert_eq!(read.decode::<crate::DfsNodeAdvertisement>().unwrap(), stored);
+        let wal = paths.kv_paths().raft_wal_paths(&node).wal;
+        let before = std::fs::read(&wal).unwrap();
+        let published = runtime.runtime_handle().block_on(crate::publish_dfs_content_advertisement_if_needed_async(&mut client, &node, desired.clone())).unwrap();
+        assert!(!published, "matching semantics plus newer observation time is not durable activity");
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        let mut changed = desired; changed.accepts_content = false;
+        assert!(runtime.runtime_handle().block_on(crate::publish_dfs_content_advertisement_if_needed_async(&mut client, &node, changed)).unwrap());
+        assert_ne!(std::fs::read(&wal).unwrap(), before, "a genuine semantic change retains native quorum publication");
+        drop(client); drop(host); runtime.close().unwrap();
     }
 
     #[test]

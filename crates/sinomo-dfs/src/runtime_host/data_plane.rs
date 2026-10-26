@@ -6,12 +6,15 @@ pub(crate) struct DaemonDfsDataPlaneHost {
     pub(super) paths: DaemonPaths,
     pub(super) runtime: tokio::runtime::Handle,
     pub(super) event_client: Option<ComponentEventClient>,
+    live_owner: Option<Weak<DfsRuntimeHost>>,
 }
 
 impl DaemonDfsDataPlaneHost {
     #[cfg(test)]
     pub(crate) fn new_on_runtime(paths: DaemonPaths, runtime: &tokio::runtime::Handle) -> Self {
+        let live_owner = Self::current_live_owner(&paths);
         Self {
+            live_owner,
             paths,
             runtime: runtime.clone(),
             event_client: None,
@@ -23,11 +26,29 @@ impl DaemonDfsDataPlaneHost {
         runtime: &tokio::runtime::Handle,
         event_client: ComponentEventClient,
     ) -> Self {
+        let live_owner = Self::current_live_owner(&paths);
         Self {
+            live_owner,
             paths,
             runtime: runtime.clone(),
             event_client: Some(event_client),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_live_content_advertisement_for_test(
+        &self, data_dir: &SinomoDataDir, deadline: tokio::time::Instant,
+    ) -> Result<sinomo_dfs::DfsNodeAdvertisement, String> {
+        self.validate_data_dir(data_dir).map_err(|error| error.to_string())?;
+        let owner = self.live_owner.as_ref().and_then(Weak::upgrade)
+            .ok_or_else(|| "missing actual live owner".to_string())?;
+        super::placement_environment::wait_live_owner_observation_for_test(data_dir, &owner, deadline).await
+    }
+
+    fn current_live_owner(paths: &DaemonPaths) -> Option<Weak<DfsRuntimeHost>> {
+        let root = daemon_data_dir(paths).ok()?;
+        registered_dfs_runtime_host(&SinomoDataDir::new(root)).ok().flatten()
+            .map(|owner| Arc::downgrade(&owner))
     }
 
     pub(super) fn validate_data_dir(
@@ -751,6 +772,24 @@ pub(super) async fn handle_daemon_dfs_status_async(
 }
 
 impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
+    fn live_content_advertisement(
+        &self,
+        data_dir: &SinomoDataDir,
+    ) -> Result<sinomo_dfs::DfsNodeAdvertisement, DfsDataPlaneHostError> {
+        self.validate_data_dir(data_dir)?;
+        let _data_owner = self.require_data_owner()?;
+        let unavailable = || DfsDataPlaneHostError::new("live DFS content owner observation unavailable");
+        let owner = self.live_owner.as_ref().and_then(Weak::upgrade).ok_or_else(unavailable)?;
+        let current = registered_dfs_runtime_host(data_dir)
+            .map_err(daemon_dfs_data_plane_error)?.ok_or_else(unavailable)?;
+        if !Arc::ptr_eq(&owner, &current) || owner.shutting_down.is_cancelled() {
+            return Err(unavailable());
+        }
+        super::placement_environment::live_daemon_dfs_content_advertisement(
+            data_dir, &owner, time::OffsetDateTime::now_utc(),
+        ).ok_or_else(unavailable)
+    }
+
     fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsOperatorStatus> {
         let data_owner = self.require_data_owner();
         let paths = self.paths.clone();

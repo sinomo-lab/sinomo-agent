@@ -5,12 +5,17 @@ use std::process::{Command, Stdio};
 #[derive(Debug)]
 struct DaemonDfsPlacementEnvironment {
     monitor: sinomo_dfs::DfsDeviceHealthMonitor,
+    local_observation_owner: Option<Weak<DfsRuntimeHost>>,
     cache: sinomo_dfs::DfsPlacementSnapshotCache,
     metering: sinomo_dfs::DfsNetworkMetering,
     resource_pressure: sinomo_dfs::DfsResourcePressure,
     metering_sampled_at: Option<Instant>,
     last_published_local_advertisement: Option<sinomo_dfs::DfsNodeAdvertisement>,
     advertisements: BTreeMap<NodeId, sinomo_dfs::DfsNodeAdvertisement>,
+    // Accepted only from the target's authenticated content-owner RPC, never
+    // from node connectivity or a third-party snapshot. The local owner token
+    // prevents reuse across this component's restart.
+    live_advertisements: BTreeMap<NodeId, (Weak<DfsRuntimeHost>, sinomo_dfs::DfsNodeAdvertisement)>,
     remote_projection_revision: u64,
     remote_projection_pending: bool,
     remote_projection_generation: u64,
@@ -22,6 +27,10 @@ static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
 > = OnceLock::new();
 #[derive(Debug)]
 struct DaemonDfsStorageEnvironmentSignal {
+    #[cfg(test)]
+    completed_owner: Mutex<Option<Weak<DfsRuntimeHost>>>,
+    #[cfg(test)]
+    completed: Arc<tokio::sync::Notify>,
     generation: AtomicU64,
     notify: Arc<tokio::sync::Notify>,
 }
@@ -31,6 +40,7 @@ static DAEMON_DFS_STORAGE_ENVIRONMENT_SIGNALS: OnceLock<
 > = OnceLock::new();
 
 const DAEMON_DFS_METERING_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
 const DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN: time::Duration = time::Duration::minutes(5);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DAEMON_DFS_METERING_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -44,6 +54,10 @@ fn daemon_dfs_storage_environment_signal(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     Arc::clone(signals.entry(data_dir.root()).or_insert_with(|| {
         Arc::new(DaemonDfsStorageEnvironmentSignal {
+            #[cfg(test)]
+            completed_owner: Mutex::new(None),
+            #[cfg(test)]
+            completed: Arc::new(tokio::sync::Notify::new()),
             generation: AtomicU64::new(0),
             notify: Arc::new(tokio::sync::Notify::new()),
         })
@@ -105,12 +119,14 @@ fn with_placement_environment<R>(
                     data_dir.dfs_dir().join("content"),
                 )],
             ),
+            local_observation_owner: None,
             cache: sinomo_dfs::DfsPlacementSnapshotCache::default(),
             metering: sinomo_dfs::DfsNetworkMetering::Unknown,
             resource_pressure: sinomo_dfs::DfsResourcePressure::Normal,
             metering_sampled_at: None,
             last_published_local_advertisement: None,
             advertisements: BTreeMap::new(),
+            live_advertisements: BTreeMap::new(),
             remote_projection_revision: 0,
             remote_projection_pending: false,
             remote_projection_generation: 0,
@@ -183,6 +199,8 @@ fn daemon_dfs_local_content_advertisement_with_resources(
                 environment.metering,
                 environment.resource_pressure,
             );
+            environment.local_observation_owner = registered_dfs_runtime_host(data_dir)
+                .ok().flatten().map(|host| Arc::downgrade(&host));
         } else {
             environment
                 .monitor
@@ -190,6 +208,44 @@ fn daemon_dfs_local_content_advertisement_with_resources(
         }
         environment.monitor.aggregate_advertisement(zone, now)
     })
+}
+
+#[cfg(test)]
+pub(super) async fn wait_live_owner_observation_for_test(
+    data_dir: &SinomoDataDir,
+    owner: &Arc<DfsRuntimeHost>,
+    deadline: tokio::time::Instant,
+) -> Result<sinomo_dfs::DfsNodeAdvertisement, String> {
+    let signal = daemon_dfs_storage_environment_signal(data_dir);
+    loop {
+        let notified = signal.completed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let completed = signal.completed_owner.lock().unwrap().as_ref().and_then(Weak::upgrade)
+            .is_some_and(|completed| Arc::ptr_eq(&completed, owner));
+        if completed && let Some(record) = live_daemon_dfs_content_advertisement(data_dir, owner, time::OffsetDateTime::now_utc()) {
+            return Ok(record);
+        }
+        tokio::time::timeout_at(deadline, notified).await
+            .map_err(|_| "real storage observation did not complete before the original fixture deadline".to_string())?;
+    }
+}
+
+pub(super) fn live_daemon_dfs_content_advertisement(
+    data_dir: &SinomoDataDir,
+    owner: &Arc<DfsRuntimeHost>,
+    now: time::OffsetDateTime,
+) -> Option<sinomo_dfs::DfsNodeAdvertisement> {
+    // Do not use with_placement_environment here: an RPC cannot manufacture
+    // an observer or inherit a previous component incarnation's sample.
+    let environments = placement_environments().lock().ok()?;
+    let environment = environments.get(&data_dir.root())?;
+    let sampled_owner = environment.local_observation_owner.as_ref()?.upgrade()?;
+    if !Arc::ptr_eq(owner, &sampled_owner) || owner.shutting_down.is_cancelled() {
+        return None;
+    }
+    environment.monitor.accepted_advertisement()
+        .filter(|record| record.expires_at.is_some_and(|expiry| expiry > now))
 }
 
 pub(super) fn cached_daemon_dfs_local_content_advertisement(
@@ -209,6 +265,82 @@ pub(crate) fn cached_daemon_dfs_placement_snapshot_cache(
     node_id: &NodeId,
 ) -> sinomo_dfs::DfsPlacementSnapshotCache {
     with_placement_environment(data_dir, node_id, |environment| environment.cache.clone())
+}
+
+/// Demand-owned refresh for actual DFS operations. This creates no timer or
+/// task owner and changes only the advisory placement snapshot. Canonical KV
+/// entries and the caller's write authority stay unchanged.
+pub(super) async fn refresh_live_content_owner_observations(
+    data_dir: &SinomoDataDir,
+    host: &Arc<DfsRuntimeHost>,
+    configuration: &sinomo_dfs::DfsWriteConfigurationProjection,
+    authority: &Arc<DaemonDfsMetadataAuthorityGeneration>,
+    deadline: tokio::time::Instant,
+    #[cfg(test)] transport_override: Option<&dyn sinomo_module::ComponentObjectRpcTransport>,
+) {
+    use futures_util::StreamExt;
+    #[cfg(test)]
+    let transport = transport_override.unwrap_or(host.object_rpc.as_ref());
+    #[cfg(not(test))]
+    let transport = host.object_rpc.as_ref();
+    if host.shutting_down.is_cancelled() { return; }
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) else { return; };
+    let local = state.local_node_id.clone();
+    let now = time::OffsetDateTime::now_utc();
+    let Ok(canonical) = configuration.content_advertisements() else { return; };
+    let (generation, pending) = with_placement_environment(data_dir, &local, |environment| {
+        (environment.remote_projection_generation, environment.remote_projection_pending)
+    });
+    if pending { return; }
+    let needed = canonical.into_iter().filter(|record| {
+        record.node_id != local && record.expires_at.is_some_and(|expiry| expiry <= now)
+            && state.members.iter().any(|member| member.node_id == record.node_id && member.state.is_authorized())
+            && with_placement_environment(data_dir, &local, |environment| {
+                environment.advertisements.get(&record.node_id) == Some(record)
+                    && !environment.live_advertisements.get(&record.node_id).is_some_and(|(owner, live)| {
+                        owner.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, host))
+                            && crate::live_advertisement::matches_confirmed_content_advertisement(&record.node_id, record, live, now)
+                    })
+            })
+    }).collect::<Vec<_>>();
+    let mut requests = futures_util::stream::iter(needed.into_iter().map(|confirmed| async move {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() { return (confirmed, None); }
+        let options = sinomo_dfs::DfsObjectRpcSendOptions::default()
+            .with_overall_timeout(remaining).with_observe_connectivity(false).cluster_rpc_options();
+        let response = tokio::time::timeout_at(deadline, crate::live_advertisement::fetch_live_content_advertisement(
+            transport, &confirmed.node_id, &confirmed, options,
+        )).await.ok().and_then(Result::ok);
+        (confirmed, response)
+    })).buffer_unordered(16);
+    let mut changed = false;
+    while let Some((confirmed, response)) = requests.next().await {
+        let Some(live) = response else { continue; };
+        let Ok(Some(current)) = authority.write_configuration_projection() else { continue; };
+        let key = sinomo_dfs::content_service_key(&confirmed.node_id);
+        let Some(expected_entry) = configuration.entries(&key)
+            .and_then(|entries| entries.iter().find(|entry| entry.key == key)) else { continue; };
+        if current.entries(&key).and_then(|entries| entries.iter().find(|entry| entry.key == key)) != Some(expected_entry)
+            || current.entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+                != configuration.entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX) {
+            continue;
+        }
+        changed |= with_placement_environment(data_dir, &local, |environment| {
+            if host.shutting_down.is_cancelled()
+                || environment.remote_projection_pending
+                || environment.remote_projection_generation != generation
+                || environment.advertisements.get(&confirmed.node_id) != Some(&confirmed)
+                || !registered_dfs_runtime_host(data_dir).ok().flatten().is_some_and(|current| Arc::ptr_eq(&current, host)) {
+                return false;
+            }
+            environment.live_advertisements.insert(confirmed.node_id.clone(), (Arc::downgrade(host), live));
+            true
+        });
+    }
+    if changed {
+        refresh_daemon_dfs_placement_snapshot(data_dir, &cluster_paths, &local, Vec::new());
+    }
 }
 
 pub(super) fn refresh_daemon_dfs_placement_snapshot(
@@ -244,6 +376,23 @@ fn refresh_daemon_dfs_placement_snapshot_at_generation(
     mut advertisements: Vec<sinomo_dfs::DfsNodeAdvertisement>,
     remote_generation: u64,
 ) -> sinomo_dfs::DfsPlacementSnapshotCache {
+    let live_owner = registered_dfs_runtime_host(data_dir).ok().flatten();
+    with_placement_environment(data_dir, local_node_id, |environment| {
+        if environment.remote_projection_generation != remote_generation || environment.remote_projection_pending {
+            return;
+        }
+        for canonical in &mut advertisements {
+            let Some((owner, live)) = environment.live_advertisements.get(&canonical.node_id) else { continue; };
+            if live_owner.as_ref().is_some_and(|current| {
+                !current.shutting_down.is_cancelled()
+                    && owner.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, current))
+            }) && crate::live_advertisement::matches_confirmed_content_advertisement(
+                &canonical.node_id, canonical, live, time::OffsetDateTime::now_utc(),
+            ) {
+                *canonical = live.clone();
+            }
+        }
+    });
     // Data-plane shells consume the daemon cache only. Sampling is owned by
     // the lifecycle lane above and never runs in a DFS request constructor.
     let local_advertisement = cached_daemon_dfs_local_content_advertisement(
@@ -497,6 +646,13 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
         address: "DFS placement snapshot cache".to_string(),
         detail: error.to_string(),
     })?;
+    #[cfg(test)]
+    {
+        let signal = daemon_dfs_storage_environment_signal(&data_dir);
+        let owner = with_placement_environment(&data_dir, &local_node_id, |environment| environment.local_observation_owner.clone());
+        *signal.completed_owner.lock().unwrap() = owner;
+        signal.completed.notify_waiters();
+    }
     Ok(published)
 }
 
@@ -580,6 +736,7 @@ fn observe_daemon_dfs_remote_placement_entries<'a>(
             .advertisements
             .retain(|node_id, _| node_id == local_node_id);
         environment.advertisements.extend(remote_advertisements);
+        environment.live_advertisements.clear();
         environment.remote_projection_generation =
             environment.remote_projection_generation.wrapping_add(1);
         (
@@ -745,6 +902,8 @@ pub(crate) fn subscribe_daemon_dfs_remote_placement_observation(
                     if pending
                         || delta.events.iter().any(|event| {
                             event.key.starts_with("/cluster/members/")
+                                || event.key.starts_with("/cluster/endpoints/")
+                                || event.key.starts_with(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
                                 || event.key.starts_with(sinomo_dfs::content_services_prefix())
                         })
                     {
@@ -757,6 +916,7 @@ pub(crate) fn subscribe_daemon_dfs_remote_placement_observation(
                                 environment.remote_projection_pending = true;
                                 environment.remote_projection_generation =
                                     environment.remote_projection_generation.wrapping_add(1);
+                                environment.live_advertisements.clear();
                                 environment.cache.withdraw();
                             },
                         );
@@ -814,14 +974,11 @@ fn daemon_advertisement_semantics_equal(
 fn daemon_advertisement_publish_required(
     current: Option<&sinomo_dfs::DfsNodeAdvertisement>,
     desired: &sinomo_dfs::DfsNodeAdvertisement,
-    now: time::OffsetDateTime,
+    _now: time::OffsetDateTime,
 ) -> bool {
-    current.is_none_or(|current| {
-        !daemon_advertisement_semantics_equal(current, desired)
-            || current.expires_at.is_none_or(|expires_at| {
-                expires_at <= now + DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN
-            })
-    })
+    // An actual initial observation or semantic transition is durable work.
+    // A storage sample's age never manufactures a publication or a fresh sample.
+    current.is_none_or(|current| !daemon_advertisement_semantics_equal(current, desired))
 }
 
 fn aggregate_path_metering(
@@ -1301,6 +1458,107 @@ mod tests {
         drop(events);
         drop(held);
         assert!(Arc::ptr_eq(&canonical, &cache.snapshot().unwrap()));
+    }
+
+    struct LiveReplyGate {
+        inner: Arc<dyn sinomo_module::ComponentObjectRpcTransport>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl sinomo_module::ComponentObjectRpcTransport for LiveReplyGate {
+        fn call(&self, target: &NodeId, call: ObjectRpcCall, options: sinomo_core::network::ClusterObjectRpcOptions, observe: bool) -> Result<ObjectRpcResult, sinomo_core::network::NetworkError> {
+            self.inner.call(target, call, options, observe)
+        }
+        fn call_async<'a>(&'a self, target: &'a NodeId, call: ObjectRpcCall, options: sinomo_core::network::ClusterObjectRpcOptions, observe: bool)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ObjectRpcResult, sinomo_core::network::NetworkError>> + Send + 'a>> {
+            Box::pin(async move {
+                let result = self.inner.call_async(target, call, options, observe).await?;
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(result)
+            })
+        }
+    }
+
+    #[test]
+    fn live_owner_read_rejects_expiry_and_other_incarnations_without_sampling() {
+        let node = NodeId::from_legacy_named("live_owner_expiry_control").unwrap();
+        let mut fixture = crate::test_support::DfsTestRuntime::new("live-owner-expiry-control", node.clone()).unwrap();
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        fixture.start_nodes().unwrap();
+        let data = fixture.data_dir(&node).clone();
+        let owner = registered_dfs_runtime_host(&data).unwrap().unwrap();
+        let live = fixture.runtime_handle().block_on(wait_live_owner_observation_for_test(&data, &owner, deadline)).unwrap();
+        let sequence = with_placement_environment(&data, &node, |environment| environment.monitor.cached_snapshot().sequence);
+        assert!(live_daemon_dfs_content_advertisement(&data, &owner, live.expires_at.unwrap()).is_none());
+        let other = Arc::new(DfsRuntimeHost::new(owner.cluster.clone(), owner.object_rpc.clone(), None));
+        assert!(live_daemon_dfs_content_advertisement(&data, &other, time::OffsetDateTime::now_utc()).is_none());
+        assert_eq!(with_placement_environment(&data, &node, |environment| environment.monitor.cached_snapshot().sequence), sequence);
+        assert_eq!(live_daemon_dfs_content_advertisement(&data, &owner, time::OffsetDateTime::now_utc()).unwrap(), live);
+        drop(other); drop(owner); fixture.close().unwrap();
+    }
+
+    #[test]
+    fn live_owner_consumer_keeps_kv_expired_and_invalidates_on_endpoint_publication() {
+        let deadline = tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let (mut fixture, nodes) = crate::test_support::DfsTestRuntime::start_cluster("live-owner-consumer-fence", 2).unwrap();
+        let local = nodes[0].clone(); let remote = nodes[1].clone();
+        let data = fixture.data_dir(&local).clone();
+        let paths = ClusterPaths::new(&data);
+        let runtime = fixture.runtime_handle();
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
+        let owner = registered_dfs_runtime_host(&data).unwrap().unwrap();
+        let target = super::super::data_plane::DaemonDfsDataPlaneHost::new_on_runtime(
+            DfsRuntimePaths::for_host_role(fixture.data_dir(&remote), sinomo_module::ComponentHostRole::Embedded), &runtime,
+        );
+        let live = fixture.runtime_handle().block_on(target.wait_live_content_advertisement_for_test(fixture.data_dir(&remote), deadline)).unwrap();
+        let mut expired = live.clone(); expired.updated_at -= time::Duration::hours(1);
+        expired.expires_at = Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        let mut client = DaemonDfsControlPlaneKvClient::new_on_runtime(&paths, &runtime);
+        fixture.runtime_handle().block_on(crate::publish_dfs_content_advertisement_async(&mut client, &remote, expired.clone())).unwrap();
+        refresh_daemon_dfs_remote_placement_observation(&DfsRuntimePaths::for_host_role(&data, sinomo_module::ComponentHostRole::Embedded)).unwrap();
+        let authority = super::super::message_host::daemon_dfs_metadata_authority_generation_for_identity(
+            &paths, &state.cluster_id, &local, Some(&runtime),
+        ).unwrap();
+        let configuration = fixture.runtime_handle().block_on(authority.ready_write_configuration_projection_async()).unwrap().unwrap();
+        fixture.runtime_handle().block_on(refresh_live_content_owner_observations(
+            &data, &owner, &configuration, &authority, tokio::time::Instant::now() + Duration::from_secs(3), None,
+        ));
+        assert!(with_placement_environment(&data, &local, |environment| environment.live_advertisements.contains_key(&remote)),
+            "the actual target's accepted memory sample must supplement its expired canonical baseline");
+        let key = crate::content_service_key(&remote);
+        let stored = fixture.runtime_handle().block_on(crate::AsyncDfsControlPlaneKvClient::get_async(&client, &key)).unwrap().unwrap();
+        assert_eq!(stored.decode::<crate::DfsNodeAdvertisement>().unwrap(), expired, "freshness must not rewrite canonical KV");
+        let endpoint = sinomo_core::network::daemon_lan_endpoint(&remote, "127.0.0.1:39999".into(), 10);
+        let key = sinomo_core::cluster::cluster_endpoint_key(&remote, &endpoint);
+        fixture.runtime_handle().block_on(crate::AsyncDfsControlPlaneKvClient::put_async(
+            &mut client, key, sinomo_core::kv::encode_kv_value(&endpoint).unwrap(),
+        )).unwrap();
+        assert!(!with_placement_environment(&data, &local, |environment| environment.live_advertisements.contains_key(&remote)),
+            "a new endpoint generation must invalidate the prior owner observation");
+        // Hold an actual authenticated owner response while a new semantic
+        // configuration commits. The returned old body cannot populate the
+        // new placement generation even though it matched the original cut.
+        refresh_daemon_dfs_remote_placement_observation(&DfsRuntimePaths::for_host_role(&data, sinomo_module::ComponentHostRole::Embedded)).unwrap();
+        let configuration = fixture.runtime_handle().block_on(authority.ready_write_configuration_projection_async()).unwrap().unwrap();
+        let gate = LiveReplyGate { inner: owner.object_rpc.clone(), entered: Arc::new(tokio::sync::Notify::new()), release: Arc::new(tokio::sync::Notify::new()) };
+        fixture.runtime_handle().block_on(async {
+            let refresh = refresh_live_content_owner_observations(&data, &owner, &configuration, &authority,
+                tokio::time::Instant::now() + Duration::from_secs(3), Some(&gate));
+            tokio::pin!(refresh);
+            tokio::select! {
+                _ = gate.entered.notified() => {},
+                _ = &mut refresh => panic!("the expired canonical record must request its real owner"),
+            }
+            let mut changed = expired.clone(); changed.zone = Some("new-confirmed-zone".into());
+            crate::publish_dfs_content_advertisement_async(&mut client, &remote, changed).await.unwrap();
+            gate.release.notify_one();
+            refresh.await;
+        });
+        assert!(!with_placement_environment(&data, &local, |environment| environment.live_advertisements.contains_key(&remote)),
+            "a real response from an earlier confirmed cut must be discarded");
+        drop(configuration); drop(authority); drop(client); drop(owner); drop(target); fixture.close().unwrap();
     }
 
     #[test]
@@ -1863,25 +2121,19 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_advertisement_renews_only_at_the_safety_margin() {
-        let node_id = NodeId::from_legacy_named("placement-advertisement-lease").expect("node");
+    fn unchanged_advertisement_never_publishes_from_time_alone() {
+        let node_id = NodeId::from_legacy_named("placement-advertisement-lease").unwrap();
         let now = time::OffsetDateTime::now_utc();
         let mut current = sinomo_dfs::DfsNodeAdvertisement::content(node_id);
-        let ttl = time::Duration::try_from(sinomo_dfs::DEFAULT_DFS_STORAGE_OBSERVATION_TTL)
-            .expect("storage observation TTL");
+        let ttl = time::Duration::try_from(sinomo_dfs::DEFAULT_DFS_STORAGE_OBSERVATION_TTL).unwrap();
         current.expires_at = Some(now + ttl);
         let desired = current.clone();
-
-        assert!(!daemon_advertisement_publish_required(
-            Some(&current),
-            &desired,
-            now + ttl - DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN - time::Duration::seconds(1),
-        ));
-        assert!(daemon_advertisement_publish_required(
-            Some(&current),
-            &desired,
-            now + ttl - DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN,
-        ));
+        for at in [now, now + ttl - DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN, now + ttl, now + ttl + time::Duration::seconds(1)] {
+            assert!(!daemon_advertisement_publish_required(Some(&current), &desired, at), "elapsed time alone cannot publish");
+        }
+        let mut changed = desired.clone(); changed.accepts_content = false;
+        assert!(daemon_advertisement_publish_required(Some(&current), &changed, now));
+        assert!(daemon_advertisement_publish_required(None, &desired, now), "initial activity still publishes");
     }
 
     #[test]

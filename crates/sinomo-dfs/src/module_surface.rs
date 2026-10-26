@@ -213,6 +213,14 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             "dfs.status.read",
             ModuleRouteAuth::LocalOrClusterMember,
         ))
+        .with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                crate::DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE,
+                DFS_RPC_CATEGORY,
+                "dfs.status.read",
+                ModuleRouteAuth::LocalOrClusterMember,
+            ).require_exact_member_identity(),
+        )
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_INSPECTION_ROUTE,
             DFS_RPC_CATEGORY,

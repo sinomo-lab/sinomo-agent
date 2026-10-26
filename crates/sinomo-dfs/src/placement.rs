@@ -1586,12 +1586,9 @@ fn dfs_content_advertisement_is_current(
     current: &DfsNodeAdvertisement,
     desired: &DfsNodeAdvertisement,
 ) -> bool {
-    let lease_is_fresh = desired.expires_at.is_none()
-        || current.expires_at.is_some_and(|expires_at| {
-            expires_at > time::OffsetDateTime::now_utc() + time::Duration::seconds(30)
-        });
-    lease_is_fresh
-        && crate::placement_environment::advertisement_semantics_equal(current, desired)
+    // Fresh owner observations are served in memory. The canonical payload
+    // remains an honest semantic baseline even after its sample expires.
+    crate::placement_environment::advertisement_semantics_equal(current, desired)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -1662,7 +1659,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Refresh this node's compact content advertisement only when its
-    /// hysteretic semantics changed or its lease is near expiry.
+    /// hysteretic semantics changed; sample age alone does not publish.
     pub fn publish_local_content_advertisement_if_needed(
         &mut self,
         desired: DfsNodeAdvertisement,
