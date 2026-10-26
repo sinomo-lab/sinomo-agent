@@ -15,7 +15,53 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R61
+## Current development checkpoint — 2026-10-26 R63
+
+The bounded direct native PREFIX return capture is implemented (`bd3e40c5`),
+integrated at `3a721197`, with native controls `2190406a` and test-only borrow
+correction `8268a4cf`. Qualified source `9cc0740a` contains 4,926 inputs. The new
+opt-in NodeTransport producer owns one private per-call attempt with exact
+command, peer, fixed deadline and fresh local correlation identity. Generic peer
+output remains NoNativeProof. Only the actual registered native peer override
+constructs the opaque value after its one target-bound RPC, response matching and
+local physical/source-prefix checks. Trace, inbox, decoded data and generic peer
+results cannot mint that value; a genuine old value cannot be rebound to a new
+attempt. Completed evidence retains no host, runtime, DATA-owner or store lease.
+
+Fresh check/build/seal (I188), all seven selected controls (I189), and full DFS/KV
+boundary analysis (I190: 11 UI controls and three libraries) passed. The panel
+contains four new native controls plus two affected adapter controls and the
+existing native Repair-return regression. **231 other inventory IDs remain
+UNRUN on R63.** R61 was not rerun, and earlier results retain their own source
+qualification. R62/I185 remains FAILED101: two test-only Handle borrow errors,
+no codegen/native execution, all238UNRUN, with original source/logs/archives
+preserved. The successor reversibly changes only those two borrows.
+
+The executed controls establish a genuine direct return and actual receiver
+prefix-floor DATA; generic matching data remains unproven; old-attempt, wrong
+peer/request/root and actual foreign native-owner joins refuse; actual response
+loss yields no capability and the SAME query retries; named physical-owner-file
+replacement refuses reuse and new capture before RPC. All four native reports
+show normal close and source-owner release while historical evidence remains
+held. Getters retain immutable history; live binding validation refuses after
+close. Remote physical generation is unavailable because the protocol supplies
+none.
+
+The physical fault occurs after a completed capture and before the next call;
+replacement during RPC remains untested. A canceled/lost reply is not proof of
+physical late delivery. Routed and asynchronous provenance capture are disabled.
+No durable attestation, full-set aggregate, genesis/serving/C1 activation,
+receipt/W publication, Terminal, Close or root release is added. Existing Repair,
+ordinary fanout, wire and receiver behavior remain unchanged.
+
+`R63-REPORT.md`, its combined receipt and I188/I189/I190 receipts retain exact
+commands, source/ELF, raw observations, 809 archived fixture files, comparison/hash
+checks and complete owned cleanup. The same model/account was used; the old
+capacity-failed integration role was not retried. Original abrupt-node-loss,
+quorum, survivor custody, bounded reconnect and absolute-zero quietness gates
+remain open. No Docker or production/rollout action occurred.
+
+## Historical development checkpoint — 2026-10-26 R61
 
 The existing metadata synchronization engine now has a strict exact-prefix,
 full-assignment mode (`1474f66f`). It revalidates the actual current source
