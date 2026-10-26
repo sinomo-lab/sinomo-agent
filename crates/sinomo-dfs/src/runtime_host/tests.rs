@@ -17547,3 +17547,5 @@ fn actual_runtime_shutdown_cancels_running_maintenance_with_open_component_watch
         "runtime cancellation must wake its already-running blocking child independently of the component watch: {outcome:?}"
     );
 }
+
+mod exact_prefix_sync;
