@@ -1032,6 +1032,32 @@ impl ResidentLocalMetadataShardHandle {
         &self.shard_id
     }
 
+    /// Read an already-open resident record without checkout, opening, replay
+    /// or repair. Outer None is unavailable ownership, inner None is an
+    /// observed missing record; neither creates initialization authority.
+    pub(crate) fn try_read_prepared_operation_record_without_open(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        let state = match self.slot.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MetadataBackendError::Serde(
+                    "resident prepared-record observation is poisoned".into(),
+                ));
+            }
+        };
+        match &*state {
+            ResidentLocalMetadataShardState::Available(backend) => {
+                backend.try_read_certified_prepared_record_for_ingress(operation_id)
+            }
+            ResidentLocalMetadataShardState::Unopened
+            | ResidentLocalMetadataShardState::Opening
+            | ResidentLocalMetadataShardState::CheckedOut => Ok(None),
+        }
+    }
+
     /// Check out only this shard's resident backend for one bounded operation.
     /// A competing checkout waits until the returned lease is dropped.
     pub fn checkout(&self) -> Result<ResidentLocalMetadataShardLease> {
