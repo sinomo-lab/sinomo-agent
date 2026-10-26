@@ -1291,22 +1291,32 @@ fn native_component_reopen_preserves_held_genesis_until_same_owner_completion() 
                     .filter(|event| !before_reopen_calls.contains(&event.call_id))
                     .collect::<Vec<_>>(),
             );
+            let mounted_context = native.component_context(&primary).map(drop);
+            report["held_reopen_mounted_context"] = serde_json::to_value(&mounted_context).unwrap();
+            let callable = route == RoutedAvailability::Candidate && mounted_context.is_ok();
+            assert_eq!(
+                route == RoutedAvailability::Candidate,
+                mounted_context.is_ok(),
+                "endpoint acceptance and actual mounted context must agree"
+            );
             if let Err(error) = &reopened {
-                assert_eq!(
-                    route,
-                    RoutedAvailability::NoPath,
-                    "readiness refusal must not expose a callable endpoint"
-                );
-                if !error
-                    .contains(crate::default_cluster::genesis::NATIVE_GENESIS_COMPLETION_DEFERRED)
-                {
+                let exact_deferral = error
+                    .contains(crate::default_cluster::genesis::NATIVE_GENESIS_COMPLETION_DEFERRED);
+                // ready_node enables the real endpoint BEFORE this final
+                // bounded startup-generation wait. Its error is not NoPath.
+                let final_startup_wait = callable
+                    && error
+                        == "mounted native DFS owners did not complete their current unparked startup generation before the existing network deadline";
+                if !exact_deferral && !final_startup_wait {
                     return Err(format!(
-                        "reopen_node failed outside the retained exact genesis deferral: {error}"
+                        "reopen_node failed outside the retained exact genesis deferral or known final startup wait: {error}"
                     ));
                 }
             } else {
-                assert_eq!(route, RoutedAvailability::Candidate);
-                drop(native.component_context(&primary)?);
+                assert!(
+                    callable,
+                    "successful reopen requires actual endpoint and context"
+                );
             }
             let retained = readback.map_err(|error| format!(
             "read_deferred_native_genesis cannot observe an actual mounted owner after held reopen (not absence): {error}"
@@ -1332,15 +1342,29 @@ fn native_component_reopen_preserves_held_genesis_until_same_owner_completion() 
                 &Arc::downgrade(&remounted_owner)
             ));
             drop(remounted_owner);
-            // A failed reopen gets no request. If the real lifecycle returned
-            // ready, the SAME command is allowed to reach its negative guard.
-            if reopened.is_ok() {
+            // Actual readiness, including a final startup-wait error after
+            // ready_node, permits the SAME command to reach its negative guard.
+            if callable {
+                let probe_markers = legacy_markers(&native, &nodes, &legacy);
                 let held = native_call(&native, &primary, &request, None);
                 report["ready_held_request"] =
                     serde_json::json!({"response":held.response,"expired":held.expired});
                 assert!(refused(&held));
+                assert!(
+                    held.response.as_ref().err().is_some_and(|error| error
+                        .contains(&original.digest.operation_id)
+                        && error.contains(
+                            "remains prepared; mutation deferred before content or request binding"
+                        )),
+                    "actual accepting owner must reject the known Prepared original: {held:?}"
+                );
                 assert_eq!(native.read_deferred_native_genesis(&phase)?, original);
                 assert_eq!(actual_frames(&root)?, frames);
+                assert_eq!(legacy_markers(&native, &nodes, &legacy), probe_markers);
+            } else {
+                assert_eq!(route, RoutedAvailability::NoPath);
+                report["ready_held_request"] =
+                    serde_json::json!("not sent: actual endpoint/context not ready");
             }
             let completion = native.complete_deferred_native_genesis(&phase);
             report["same_owner_completion"] = serde_json::to_value(&completion).unwrap();
