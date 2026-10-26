@@ -72,6 +72,100 @@ pub(crate) struct NativeGenesisCompletionDeferral {
 
 #[cfg(test)]
 impl NativeGenesisCompletionDeferral {
+    /// Restore only a negative test selection before actual component mounting.
+    /// Expected physical identities/body are DATA, never an owner or authority.
+    /// The ordinary hook still requires the newly acquired real native owner.
+    #[cfg(unix)]
+    pub(crate) fn restore_before_mount(
+        data_dir: &SinomoDataDir,
+        shard: &DfsMetadataShardConfig,
+        original: &crate::DfsPreparedOperationRecord,
+        root_identity: (u64, u64),
+        owner_identity: (u64, u64),
+    ) -> Result<Self, DfsError> {
+        original.validate()?;
+        if shard.epoch != 1
+            || !shard.replica_node_ids.is_empty()
+            || original.digest.operation_id != genesis_operation_id(shard)
+            || original.digest.file_system_id != shard.file_system_id
+            || original.digest.shard_id.0 != shard.shard_id
+            || original.digest.owner_epoch != 1
+            || original.status != DfsPreparedOperationStatus::Prepared
+            || original.committed_entry.is_some()
+        {
+            return Err(DfsError::Metadata {
+                message:
+                    "retained genesis negative selection differs from its original singleton body"
+                        .into(),
+            });
+        }
+        for (path, identity, directory) in [
+            (data_dir.root(), root_identity, true),
+            (
+                data_dir.root().join("daemon/data-owner.lock"),
+                owner_identity,
+                false,
+            ),
+        ] {
+            let named = std::fs::symlink_metadata(&path).map_err(|e| DfsError::Metadata {
+                message: e.to_string(),
+            })?;
+            if named.file_type().is_symlink()
+                || named.is_dir() != directory
+                || (!directory && !named.is_file())
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained genesis negative selection has a foreign physical path"
+                        .into(),
+                });
+            }
+            let file = std::fs::File::open(&path).map_err(|e| DfsError::Metadata {
+                message: e.to_string(),
+            })?;
+            if crate::runtime_host::storage_file_identity(&file).map_err(|e| {
+                DfsError::Metadata {
+                    message: e.to_string(),
+                }
+            })? != identity
+            {
+                return Err(DfsError::Metadata {
+                    message: "retained genesis negative selection physical identity changed".into(),
+                });
+            }
+        }
+        let state = Arc::new(NativeGenesisDeferralState {
+            data_root: data_dir.root(),
+            root_identity,
+            owner_identity,
+            shard: shard.clone(),
+            active: std::sync::atomic::AtomicBool::new(true),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            original: Mutex::new(Some(original.clone())),
+        });
+        let mut registry = NATIVE_GENESIS_DEFERRALS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .map_err(|_| DfsError::Metadata {
+                message: "native genesis deferral registry poisoned".into(),
+            })?;
+        let key = (
+            state.data_root.clone(),
+            shard.file_system_id.clone(),
+            shard.shard_id.clone(),
+        );
+        if registry
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return Err(DfsError::Metadata {
+                message: "native genesis completion already has a scoped owner".into(),
+            });
+        }
+        registry.insert(key, Arc::downgrade(&state));
+        Ok(Self { state })
+    }
+
     pub(crate) fn install(
         data_dir: &SinomoDataDir,
         shard: &DfsMetadataShardConfig,

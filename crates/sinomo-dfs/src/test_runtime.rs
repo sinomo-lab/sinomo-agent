@@ -2375,8 +2375,525 @@ impl DeferredNativeGenesis {
     }
 }
 
+#[cfg(all(test, unix))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedNativeGenesisNode {
+    pub(crate) node_id: NodeId,
+    pub(crate) data_root: std::path::PathBuf,
+    pub(crate) data_identity: (u64, u64),
+    pub(crate) owner_identity: (u64, u64),
+    pub(crate) raft_root_identity: (u64, u64),
+    pub(crate) raft_lock_identity: (u64, u64),
+    pub(crate) cluster_state: sinomo_core::ClusterBootstrapState,
+    pub(crate) raft_term: u64,
+    pub(crate) raft_commit_index: u64,
+}
+
+/// Test-owned expectations captured before process death; not a native owner,
+/// transport signer, configuration proof or authorization to adopt old DATA.
+#[cfg(all(test, unix))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedNativeGenesisFixture {
+    pub(crate) format_version: u32,
+    pub(crate) fixture_root: std::path::PathBuf,
+    pub(crate) fixture_identity: (u64, u64),
+    pub(crate) primary: NodeId,
+    pub(crate) nodes: Vec<RetainedNativeGenesisNode>,
+    pub(crate) shard: DfsMetadataShardConfig,
+    pub(crate) shard_identity: (u64, u64),
+    pub(crate) original_record: DfsPreparedOperationRecord,
+    pub(crate) original_frame: Vec<u8>,
+}
+
+#[cfg(all(test, unix))]
+fn retained_native_path_identity(
+    path: &std::path::Path,
+    directory: bool,
+) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !path.is_absolute()
+        || path.canonicalize().map_err(|e| e.to_string())?.as_path() != path
+        || before.file_type().is_symlink()
+        || before.is_dir() != directory
+        || (!directory && !before.is_file())
+    {
+        return Err(format!(
+            "retained native source is missing, aliased or has the wrong physical type: {}",
+            path.display()
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    let after = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let expected = (opened.dev(), opened.ino());
+    if (before.dev(), before.ino()) != expected || (after.dev(), after.ino()) != expected {
+        return Err("retained native source changed while reading physical identity".into());
+    }
+    Ok(expected)
+}
+
+#[cfg(all(test, unix))]
+fn retained_native_original_data(
+    data: &SinomoDataDir,
+    shard: &DfsMetadataShardConfig,
+    expected: &DfsPreparedOperationRecord,
+) -> Result<Vec<u8>, String> {
+    expected.validate().map_err(|e| e.to_string())?;
+    if shard.epoch != 1
+        || !shard.replica_node_ids.is_empty()
+        || expected.status != DfsPreparedOperationStatus::Prepared
+        || expected.committed_entry.is_some()
+        || expected.digest.file_system_id != shard.file_system_id
+        || expected.digest.shard_id.0 != shard.shard_id
+        || expected.digest.owner_epoch != 1
+        || expected.digest.operation_id
+            != crate::default_cluster::genesis::genesis_operation_id(shard)
+    {
+        return Err(
+            "retained original is not the exact supported incomplete native singleton".into(),
+        );
+    }
+    let id = DfsMetadataShardId::new(&shard.shard_id);
+    let root = crate::local_dfs_metadata_shard_path(data, &id);
+    retained_native_path_identity(&root, true)?;
+    crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+        .map_err(|e| e.to_string())?;
+    if crate::metadata_api::read_handoff_freeze_with_layout(
+        &root.join("journal/membership-handoff-write-freeze.sobj"),
+        None,
+    )
+    .map_err(|e| e.to_string())?
+    .is_some()
+    {
+        return Err("retained incomplete singleton has a cooperative or recovery marker".into());
+    }
+    let _guard = crate::metadata_lock::try_metadata_inspection_lock(
+        root.clone(),
+        crate::metadata_cursor::journal_write_lock_path(&root),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or("retained native original is busy or lacks its actual writer-lock file")?;
+    let backend = crate::LocalSobjMetadataBackend::open_for_inspection(id.clone(), root.clone())
+        .map_err(|e| e.to_string())?;
+    let actual = backend
+        .prepared_operation_record(&expected.digest.operation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("retained native original body is unavailable")?;
+    if actual != *expected {
+        return Err(
+            "retained native original body/digest/status differs from precrash DATA".into(),
+        );
+    }
+    let frames = crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+        &root,
+        &[expected.digest.prepare_sequence],
+    )
+    .map_err(|e| e.to_string())?;
+    let frame = frames
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or("retained native original exact prepare frame is unavailable")?;
+    if !matches!(&frame.entry().mutation,DfsMetadataMutation::PrepareOperationV7 { record,.. } if record.as_ref()==expected)
+    {
+        return Err(
+            "retained native original prepare frame differs from its materialized body".into(),
+        );
+    }
+    Ok(frame.exact_bytes().to_vec())
+}
+
+#[cfg(all(test, unix))]
+impl DfsTestRuntime {
+    pub(crate) fn capture_retained_genesis_fixture(
+        &self,
+        phase: &DeferredNativeGenesis,
+    ) -> Result<RetainedNativeGenesisFixture, String> {
+        if self.nodes.len() != 3
+            || !self.component_factories.is_empty()
+            || self
+                .nodes
+                .values()
+                .any(|node| node.selected_original_fixture.is_some() || node.reconciler.is_none())
+        {
+            return Err(
+                "retained restart captures only the actual three-node default P0 fixture".into(),
+            );
+        }
+        if self.read_deferred_native_genesis(phase)? != phase.original_record {
+            return Err("precrash native original changed".into());
+        }
+        let fixture_root = self
+            .root
+            .as_ref()
+            .map(|root| root.path().to_path_buf())
+            .or_else(|| self.retained_fixture_root.clone())
+            .ok_or("actual fixture root unavailable")?;
+        let mut nodes = Vec::new();
+        for (id, node) in &self.nodes {
+            let data = &node.data_dir;
+            if data.root() != fixture_root.join(id.as_str()) {
+                return Err("retained restart requires exact nonaliased node roots".into());
+            }
+            let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+                &crate::runtime_host::DfsRuntimePaths::new(data),
+            )
+            .map_err(|e| e.to_string())?;
+            if owner
+                .selected_original_data_layout()
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err("retained restart refuses selected physical representations".into());
+            }
+            let paths = ClusterPaths::new(data);
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+                .map_err(|e| e.to_string())?;
+            let wal = paths.kv_paths().raft_wal_paths(id);
+            for path in [&wal.hard_state, &wal.wal] {
+                retained_native_path_identity(path, false)?;
+            }
+            let hard = wal.read_persisted_hard_state().map_err(|e| e.to_string())?;
+            nodes.push(RetainedNativeGenesisNode {
+                node_id: id.clone(),
+                data_root: data.root(),
+                data_identity: retained_native_path_identity(&data.root(), true)?,
+                owner_identity: owner
+                    .storage_owner_file_identity()
+                    .map_err(|e| e.to_string())?,
+                raft_root_identity: retained_native_path_identity(&wal.root, true)?,
+                raft_lock_identity: retained_native_path_identity(&wal.lock, false)?,
+                cluster_state: state,
+                raft_term: hard.current_term,
+                raft_commit_index: hard.commit_index,
+            });
+        }
+        let data = self.data_dir(&phase.shard.primary_node_id);
+        let result = RetainedNativeGenesisFixture {
+            format_version: 1,
+            fixture_identity: retained_native_path_identity(&fixture_root, true)?,
+            fixture_root,
+            primary: self.primary.clone(),
+            nodes,
+            shard: phase.shard.clone(),
+            shard_identity: retained_native_path_identity(
+                &crate::local_dfs_metadata_shard_path(
+                    data,
+                    &DfsMetadataShardId::new(&phase.shard.shard_id),
+                ),
+                true,
+            )?,
+            original_frame: retained_native_original_data(
+                data,
+                &phase.shard,
+                &phase.original_record,
+            )?,
+            original_record: phase.original_record.clone(),
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 1024 * 1024
+        {
+            return Err("retained fixture expectation exceeds 1MiB".into());
+        }
+        Ok(result)
+    }
+
+    /// Validate expected DATA before a writable native opener. Parent has
+    /// already verified its own child's death/reap and saved raw files.
+    pub(crate) fn validate_retained_genesis_fixture(
+        expected: &RetainedNativeGenesisFixture,
+    ) -> Result<(), String> {
+        if expected.format_version != 1
+            || expected.nodes.len() != 3
+            || serde_json::to_vec(expected)
+                .map_err(|e| e.to_string())?
+                .len()
+                > 1024 * 1024
+            || retained_native_path_identity(&expected.fixture_root, true)?
+                != expected.fixture_identity
+        {
+            return Err("retained native fixture version/bounds/root identity differs".into());
+        }
+        let ids = expected
+            .nodes
+            .iter()
+            .map(|n| n.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        if ids.len() != 3
+            || !ids.contains(&expected.primary)
+            || expected.shard.primary_node_id != expected.primary
+        {
+            return Err("retained native fixture roster or original primary differs".into());
+        }
+        let mut locks = Vec::new();
+        let primary = expected
+            .nodes
+            .iter()
+            .find(|n| n.node_id == expected.primary)
+            .ok_or("retained primary missing")?;
+        for node in &expected.nodes {
+            if node.data_root != expected.fixture_root.join(node.node_id.as_str())
+                || retained_native_path_identity(&node.data_root, true)? != node.data_identity
+            {
+                return Err("retained native node root was aliased, foreign or replaced".into());
+            }
+            let data = SinomoDataDir::new(&node.data_root);
+            let paths = ClusterPaths::new(&data);
+            let owner = node.data_root.join("daemon/data-owner.lock");
+            if retained_native_path_identity(&owner, false)? != node.owner_identity {
+                return Err("retained native DATA owner file changed".into());
+            }
+            let file = std::fs::File::open(&owner).map_err(|e| e.to_string())?;
+            fs2::FileExt::try_lock_exclusive(&file)
+                .map_err(|e| format!("retained native DATA root is still owned: {e}"))?;
+            locks.push(file);
+            retained_native_path_identity(&paths.state, false)?;
+            let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
+                .map_err(|e| e.to_string())?;
+            if state.local_node_id != node.node_id
+                || state.cluster_id != primary.cluster_state.cluster_id
+                || state.cluster_id != node.cluster_state.cluster_id
+                || state.members.len() != 3
+                || state.members != node.cluster_state.members
+                || state.initialized_at != node.cluster_state.initialized_at
+                || state.term < node.cluster_state.term
+                || state.kv_revision < node.cluster_state.kv_revision
+                || state
+                    .members
+                    .iter()
+                    .map(|m| m.node_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    != ids
+            {
+                return Err(
+                    "retained native node/cluster/membership state differs from precrash DATA"
+                        .into(),
+                );
+            }
+            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(
+                &crate::default_dfs_metadata_shards_root(&data),
+            )
+            .map_err(|e| e.to_string())?;
+            let queue = crate::default_dfs_repair_attempt_snapshot_path(&data);
+            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(
+                queue.parent().ok_or("retained queue has no parent")?,
+            )
+            .map_err(|e| e.to_string())?;
+            let wal = paths.kv_paths().raft_wal_paths(&node.node_id);
+            if retained_native_path_identity(&wal.root, true)? != node.raft_root_identity
+                || retained_native_path_identity(&wal.lock, false)? != node.raft_lock_identity
+            {
+                return Err("retained native Raft physical owner changed".into());
+            }
+            for path in [&wal.hard_state, &wal.wal] {
+                retained_native_path_identity(path, false)?;
+            }
+            if wal.snapshot.exists() {
+                retained_native_path_identity(&wal.snapshot, false)?;
+            }
+            let hard = wal.read_persisted_hard_state().map_err(|e| e.to_string())?;
+            if hard.current_term < node.raft_term
+                || hard.commit_index < node.raft_commit_index
+                || hard.commit_index == 0
+            {
+                return Err("retained native Raft term/commit regressed or is empty".into());
+            }
+            if retained_native_path_identity(&node.data_root, true)? != node.data_identity
+                || retained_native_path_identity(&wal.root, true)? != node.raft_root_identity
+            {
+                return Err("retained native physical roots changed during validation".into());
+            }
+        }
+        let data = SinomoDataDir::new(&primary.data_root);
+        if retained_native_path_identity(
+            &crate::local_dfs_metadata_shard_path(
+                &data,
+                &DfsMetadataShardId::new(&expected.shard.shard_id),
+            ),
+            true,
+        )? != expected.shard_identity
+            || retained_native_original_data(&data, &expected.shard, &expected.original_record)?
+                != expected.original_frame
+        {
+            return Err("retained native genesis physical root or exact frame changed".into());
+        }
+        if retained_native_path_identity(
+            &crate::local_dfs_metadata_shard_path(
+                &data,
+                &DfsMetadataShardId::new(&expected.shard.shard_id),
+            ),
+            true,
+        )? != expected.shard_identity
+        {
+            return Err("retained native genesis root changed across original validation".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reopen_retained_genesis_fixture(
+        expected: RetainedNativeGenesisFixture,
+    ) -> Result<(Self, DeferredNativeGenesis, Result<(), String>), String> {
+        Self::validate_retained_genesis_fixture(&expected)?;
+        let primary_data = SinomoDataDir::new(
+            &expected
+                .nodes
+                .iter()
+                .find(|n| n.node_id == expected.primary)
+                .ok_or("retained primary missing")?
+                .data_root,
+        );
+        let state =
+            sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(&primary_data))
+                .map_err(|e| e.to_string())?;
+        let kv_peers = Arc::new(crate::runtime_host::DfsTestClusterPeerBridge::default());
+        let authority = crate::runtime_host::test_cluster_access_with_peers_for_runtime(
+            &primary_data,
+            Some(Arc::clone(&kv_peers)),
+        );
+        let nodes = expected
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.node_id.clone(),
+                    Node {
+                        data_dir: Arc::new(SinomoDataDir::new(&n.data_root)),
+                        kv_available: Arc::new(AtomicBool::new(false)),
+                        resources: sinomo_device::NodeResourceMonitor::default(),
+                        reconciler: None,
+                        mounted_context: None,
+                        selected_original_fixture: None,
+                    },
+                )
+            })
+            .collect();
+        let mut actual = Self {
+            root: None,
+            retained_fixture_root: Some(expected.fixture_root.clone()),
+            state,
+            primary: expected.primary.clone(),
+            authority,
+            kv_peers,
+            kv_bootstrapped: true,
+            resident_pins: BTreeMap::new(),
+            fabric: Arc::new(Fabric {
+                dropped_observations: AtomicUsize::new(0),
+                exhausted_budgets: AtomicUsize::new(0),
+                next_call: AtomicU64::new(1),
+                nodes: Mutex::new(BTreeMap::new()),
+                faults: Mutex::new(Vec::new()),
+                observations: Mutex::new(Vec::new()),
+                observation_checkpoints: Mutex::new(Vec::new()),
+                transfers: Mutex::new(Vec::new()),
+            }),
+            nodes,
+            closed: false,
+            component_factories: Vec::new(),
+        };
+        let primary = expected
+            .nodes
+            .iter()
+            .find(|n| n.node_id == expected.primary)
+            .expect("validated primary");
+        let deferral =
+            crate::default_cluster::genesis::NativeGenesisCompletionDeferral::restore_before_mount(
+                &primary_data,
+                &expected.shard,
+                &expected.original_record,
+                primary.data_identity,
+                primary.owner_identity,
+            )
+            .map_err(|e| e.to_string())?;
+        let phase = DeferredNativeGenesis {
+            data_root: primary_data.root(),
+            shard: expected.shard.clone(),
+            original_record: expected.original_record.clone(),
+            deferral,
+        };
+        for node in &expected.nodes {
+            let paths = ClusterPaths::new(actual.data_dir(&node.node_id));
+            // Open exactly the existing native WAL owner. This API preserves
+            // pending history and does not bootstrap, set a leader or copy logs.
+            paths
+                .kv_paths()
+                .locked_initialize_raft_resident(&node.node_id)
+                .map_err(|e| e.to_string())?;
+            let pin = sinomo_core::kv::pin_resident_raft_node_registry_for_test(
+                &paths.kv_paths().raft_wal_paths(&node.node_id),
+            )
+            .map_err(|e| e.to_string())?;
+            actual.resident_pins.insert(node.node_id.clone(), pin);
+            let owned = &actual.nodes[&node.node_id];
+            owned.kv_available.store(true, Ordering::Release);
+            actual.kv_peers.register(
+                node.node_id.clone(),
+                (*owned.data_dir).clone(),
+                Arc::clone(&owned.kv_available),
+            );
+        }
+        let keys = vec![
+            crate::metadata_shard_key(&expected.shard.file_system_id, &expected.shard.shard_id),
+            crate::metadata_shard_membership_handoff_key(
+                &expected.shard.file_system_id,
+                &expected.shard.shard_id,
+            ),
+        ];
+        run_unit(Box::pin(async {
+            let read = tokio::time::timeout(
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                actual.authority.kv_get_authoritative_exact_set_async(keys),
+            )
+            .await
+            .map_err(|_| {
+                "retained fixture real ReadIndex reached its original five-second deadline"
+                    .to_string()
+            })?
+            .map_err(|e| e.to_string())?;
+            let [Some(assignment), None] = read.value.as_slice() else {
+                return Err(
+                    "retained fixture ReadIndex has no exact unhanded singleton assignment".into(),
+                );
+            };
+            if assignment
+                .decode::<DfsMetadataShardConfig>()
+                .map_err(|e| e.to_string())?
+                != expected.shard
+            {
+                return Err("retained fixture authoritative assignment changed".into());
+            }
+            Ok(())
+        }))?;
+        let ids = expected.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let startup = actual.start_nodes_after_projection(
+            ids,
+            crate::service_trace::DfsPhaseTimer::new("retained-native-genesis-restart"),
+        );
+        if startup.is_ok() {
+            let readback = actual.read_deferred_native_genesis(&phase).and_then(|record| {
+                if record == expected.original_record { Ok(()) } else {
+                    Err("retained native startup changed original genesis before explicit completion".into())
+                }
+            });
+            if let Err(error) = readback {
+                // Keep the negative hold alive through normal cleanup; an
+                // error must not release it first while mounted owners run.
+                let cleanup = actual.close_inner(None);
+                return Err(format!("{error}; native cleanup: {cleanup:?}"));
+            }
+        }
+        Ok((actual, phase, startup))
+    }
+}
+
 pub struct DfsTestRuntime {
     root: Option<sinomo_testdir::TestDir>,
+    #[cfg(test)]
+    retained_fixture_root: Option<std::path::PathBuf>,
     state: sinomo_core::ClusterBootstrapState,
     primary: NodeId,
     authority: Arc<dyn ClusterAccess>,
@@ -2755,6 +3272,8 @@ impl DfsTestRuntime {
         );
         Ok(Self {
             root: Some(root),
+            #[cfg(test)]
+            retained_fixture_root: None,
             state,
             primary,
             authority,
@@ -3355,6 +3874,14 @@ impl DfsTestRuntime {
                 timing.mark("native-replica-projection-completed");
             }
         }
+        self.start_nodes_after_projection(ids, timing)
+    }
+
+    fn start_nodes_after_projection(
+        &mut self,
+        ids: Vec<NodeId>,
+        mut timing: crate::service_trace::DfsPhaseTimer,
+    ) -> Result<(), String> {
         for id in &ids {
             crate::dfs_perf_trace(format_args!(
                 "native-startup-node owner={} node={} phase=mount",
@@ -4619,11 +5146,16 @@ impl DfsTestRuntime {
             .observation_checkpoints
             .lock()
             .map_err(|_| "observation checkpoints poisoned")?;
-        let path = self
-            .root
-            .as_ref()
-            .ok_or("fixture root was retained")?
-            .join(format!("rpc-observations-{:06}.json", checkpoints.len()));
+        let fixture_root = self.root.as_ref().map(|root| root.path().to_path_buf());
+        #[cfg(test)]
+        let fixture_root = fixture_root.or_else(|| self.retained_fixture_root.clone());
+        let checkpoint_name = format!("rpc-observations-{:06}.json", checkpoints.len());
+        #[cfg(test)]
+        let checkpoint_name = if self.retained_fixture_root.is_some() {
+            format!("rpc-observations-reopen-{}-{:06}.json", std::process::id(), checkpoints.len())
+        } else { checkpoint_name };
+        let path = fixture_root.ok_or("fixture root was retained")?
+            .join(checkpoint_name);
         // Debug includes every field, including the carrier's private timeout
         // and protection options. Do not replace it with a lossy route summary.
         let bytes = serde_json::to_vec(
