@@ -3620,6 +3620,21 @@ impl LocalShardedMetadataBackend {
 
 impl DfsMetadataBackend for LocalShardedMetadataBackend {
     #[cfg(test)]
+    fn retain_native_prefix_history(
+        &mut self,round:&crate::node_transport::OwnedNativeMetadataPrefixRound,
+        provider:&crate::publication_guard::DfsPublicationExecutionProvider,
+        execution:&crate::publication_guard::DfsPublicationExecutionOwners,
+        local:&NodeId,deadline:std::time::Instant,
+    )->Result<crate::metadata_backend::native_prefix_history::NativePrefixHistoryIntake> {
+        self.shard_backend_mut(&round.target().shard_id)?.retain_native_prefix_history(round,provider,execution,local,deadline)
+    }
+    #[cfg(test)]
+    fn read_native_prefix_history(&self,shard:&DfsMetadataShardId)
+        ->Result<Option<crate::metadata_backend::native_prefix_history::NativePrefixHistoryRecord>> {
+        self.shard_backend(shard)?.read_native_prefix_history(shard)
+    }
+
+    #[cfg(test)]
     fn install_selected_local_recovery_fence(
         &mut self,
         reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,

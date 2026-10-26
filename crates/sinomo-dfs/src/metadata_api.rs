@@ -964,6 +964,21 @@ pub struct DfsForeignShardSourceEvictionPlan {
 
 pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     #[cfg(test)]
+    fn retain_native_prefix_history(
+        &mut self, _round:&crate::node_transport::OwnedNativeMetadataPrefixRound,
+        _provider:&crate::publication_guard::DfsPublicationExecutionProvider,
+        _execution:&crate::publication_guard::DfsPublicationExecutionOwners,
+        _local:&NodeId, _deadline:std::time::Instant,
+    )->Result<crate::metadata_backend::native_prefix_history::NativePrefixHistoryIntake> {
+        Err(MetadataBackendError::Serde("backend does not own native prefix historical intake".into()))
+    }
+    #[cfg(test)]
+    fn read_native_prefix_history(&self,_shard:&crate::DfsMetadataShardId)
+        ->Result<Option<crate::metadata_backend::native_prefix_history::NativePrefixHistoryRecord>> {
+        Err(MetadataBackendError::Serde("backend does not own native prefix historical DATA".into()))
+    }
+
+    #[cfg(test)]
     fn install_selected_local_recovery_fence(
         &mut self,
         _reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,

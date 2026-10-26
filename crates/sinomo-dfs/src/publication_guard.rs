@@ -277,6 +277,15 @@ impl DfsPublicationExecutionProvider {
         scope: &crate::DfsPreparedOperationScope,
         node: &sinomo_core::node::NodeId,
     ) -> std::result::Result<Arc<DfsPublicationExecutionOwners>, crate::DfsError> {
+        self.acquire_before(scope, node, None)
+    }
+
+    fn acquire_before(
+        &self,
+        scope: &crate::DfsPreparedOperationScope,
+        node: &sinomo_core::node::NodeId,
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<Arc<DfsPublicationExecutionOwners>, crate::DfsError> {
         if self.authority.storage_generation() != self.storage_generation {
             return Err(crate::DfsError::Metadata {
                 message:
@@ -320,7 +329,21 @@ impl DfsPublicationExecutionProvider {
             file_system_id: scope.file_system_id.clone(),
             shard_id: scope.shard_id.clone(),
         };
-        let future = self.scheduler.admit(&execution_scope);
+        let future = async {
+            if let Some(deadline) = deadline {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.scheduler.admit(&execution_scope),
+                )
+                .await
+                .map_err(|_| crate::DfsError::Metadata {
+                    message: "historical prefix intake admission reached its original deadline"
+                        .into(),
+                })?
+            } else {
+                self.scheduler.admit(&execution_scope).await
+            }
+        };
         let admission = if let Ok(current) = tokio::runtime::Handle::try_current() {
             if current.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
                 return Err(crate::DfsError::Metadata {
@@ -360,6 +383,79 @@ impl DfsPublicationExecutionProvider {
             admission,
             Arc::clone(&self.data_owner),
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_prefix_history_execution(
+        &self,
+        assignment: &crate::DfsMetadataShardConfig,
+        node: &sinomo_core::node::NodeId,
+        round_id: &str,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<Arc<DfsPublicationExecutionOwners>, crate::DfsError> {
+        self.acquire_before(
+            &crate::DfsPreparedOperationScope {
+                file_system_id: assignment.file_system_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(&assignment.shard_id),
+                owner_epoch: assignment.epoch,
+                // Existing correlation label for admission/trace only. No V7
+                // prepare/digest/session or new logical operation is constructed.
+                operation_id: round_id.to_owned(),
+            },
+            node,
+            Some(deadline),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_prefix_history_writer(
+        &self,
+        execution: &DfsPublicationExecutionOwners,
+        scope: &DfsPublicationOwnerScope,
+        expected: &crate::DfsMetadataShardConfig,
+        local: &sinomo_core::node::NodeId,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let invalid = || {
+            MetadataBackendError::Serde(
+                "historical prefix DATA lacks its independent current native writer permission"
+                    .into(),
+            )
+        };
+        let actual = crate::runtime_host::publication_runtime_owner(scope.root())
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            .ok_or_else(invalid)?;
+        if std::time::Instant::now() >= deadline
+            || !Arc::ptr_eq(&actual, &self.data_owner)
+            || !Arc::ptr_eq(&actual, &execution._data_owner)
+            || self.data_root != execution.data_root
+            || self.authority.storage_generation() != self.storage_generation
+            || !execution.admits(
+                scope,
+                &expected.file_system_id,
+                &crate::DfsMetadataShardId::new(&expected.shard_id),
+            )
+            || scope.file_system_id() != &expected.file_system_id
+            || scope.shard_id().0 != expected.shard_id
+            || expected.primary_node_id != *local
+        {
+            return Err(invalid());
+        }
+        let (generation, shards, filesystem) = self
+            .authority
+            .cached_current_publication_configuration(&expected.file_system_id)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            .ok_or_else(invalid)?;
+        if filesystem
+            .as_ref()
+            .is_none_or(|filesystem| filesystem.file_system_id != expected.file_system_id)
+            || !shards.iter().any(|shard| shard == expected)
+            || self.authority.storage_generation() != self.storage_generation
+            || self.authority.projection_generation() != generation
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
 }
 #[derive(Clone, Debug, Default)]
