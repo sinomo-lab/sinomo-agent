@@ -1058,6 +1058,42 @@ impl ResidentLocalMetadataShardHandle {
         }
     }
 
+    /// Use the SAME strict primary slot to prepare storage for ingress, without
+    /// entering a service lane or semantic prepare recovery. None means another
+    /// owner is opening/using the slot; callers wait after releasing admission.
+    pub(crate) fn try_prepare_genesis_record_for_ingress(
+        &self,
+        expected: &DfsMetadataShardConfig,
+        operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        if self.slot.config != *expected
+            || self.slot.open_mode != LocalMetadataShardOpenMode::Strict
+        {
+            return Err(MetadataBackendError::Serde(
+                "genesis ingress preparation requires its exact strict primary slot".into(),
+            ));
+        }
+        let Some(mut lease) = self.try_checkout()? else {
+            return Ok(None);
+        };
+        if let Some(record) = lease.try_read_certified_prepared_record_for_ingress(operation_id)? {
+            return Ok(Some(record));
+        }
+        // Existing storage-owner preparation certifies/replays already durable
+        // frames. It cannot author a CommitV7 or run Core namespace recovery.
+        lease.begin_consistent_read_snapshot()?;
+        lease.end_consistent_read_snapshot();
+        let record = lease
+            .try_read_certified_prepared_record_for_ingress(operation_id)?
+            .ok_or_else(|| {
+                MetadataBackendError::Serde(
+                    "strict genesis ingress preparation has no current certified materialized cut"
+                        .into(),
+                )
+            })?;
+        Ok(Some(record))
+    }
+
     /// Check out only this shard's resident backend for one bounded operation.
     /// A competing checkout waits until the returned lease is dropped.
     pub fn checkout(&self) -> Result<ResidentLocalMetadataShardLease> {
