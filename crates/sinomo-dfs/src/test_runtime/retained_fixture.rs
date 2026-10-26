@@ -381,21 +381,23 @@ fn observe_healthy_shard(
         );
     }
     let prefix = backend.metadata_prefix_proof().map_err(|e| e.to_string())?;
+    let hinted_next = crate::metadata_journal::read_next_journal_sequence_lenient(&root)
+        .map_err(|e| e.to_string())?;
+    let materialized_next = prefix.journal_sequence.checked_add(1)
+        .ok_or("retained healthy prefix sequence overflow")?;
+    // Same read-only join as LocalSobjMetadataBackend::open_for_inspection:
+    // head.sobj is a derived hint, not a certified metadata prefix. A stale
+    // lower hint cannot erase materialized history; an ahead hint still refuses.
+    let logical_next = hinted_next.max(materialized_next).max(1);
+    let later = crate::metadata_journal::durable_journal_entries_since_limited(
+        &root, prefix.journal_sequence, 1,
+    ).map_err(|e| e.to_string())?;
+    eprintln!("RETAINED_HEALTHY_PREFIX node={node} actual={prefix:?} expected={expected_prefix:?} hint_next={hinted_next} logical_next={logical_next} later_sequences={:?}",
+        later.iter().map(|entry|entry.sequence).collect::<Vec<_>>());
     if !expected_prefix.is_well_formed()
         || &prefix != expected_prefix
-        || crate::metadata_journal::read_next_journal_sequence_lenient(&root)
-            .map_err(|e| e.to_string())?
-            != prefix
-                .journal_sequence
-                .checked_add(1)
-                .ok_or("retained healthy prefix sequence overflow")?
-        || !crate::metadata_journal::durable_journal_entries_since_limited(
-            &root,
-            prefix.journal_sequence,
-            1,
-        )
-        .map_err(|e| e.to_string())?
-        .is_empty()
+        || logical_next != materialized_next
+        || !later.is_empty()
     {
         return Err("retained healthy shard prefix differs from the complete native round".into());
     }
