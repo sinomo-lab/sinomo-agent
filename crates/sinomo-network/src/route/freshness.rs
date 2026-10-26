@@ -44,9 +44,12 @@ fn matching_source_records(
         if !directory.is_authorized(source) || !bound {
             continue;
         }
+        // The source's failure count can advance within the same confirmed
+        // health state. Quorum publication coalesces those count-only changes;
+        // use its semantic predicate while retaining the actual live count
+        // for route ordering and the source's existing failure-budget policy.
         if baseline.iter().any(|canonical| {
             crate::cluster_connectivity_stable_eq(canonical, &live)
-                && canonical.consecutive_failures == live.consecutive_failures
                 && live.observed_at >= canonical.observed_at
         }) {
             records.push(live);
@@ -593,7 +596,10 @@ mod tests {
                 0 => rejected.source_node_id = state.local_node_id.clone(),
                 1 => rejected.cluster_id = ClusterId::from_legacy_named("wrong_cluster").unwrap(),
                 2 => rejected.state = ClusterConnectivityState::Degraded,
-                3 => rejected.consecutive_failures = 1,
+                3 => {
+                    rejected.failure_reason =
+                        Some(crate::ClusterConnectivityFailureReason::IdentityMismatch)
+                }
                 4 => rejected.address = "127.0.0.1:39999".into(),
                 5 => rejected.observed_at = baseline.observed_at - time::Duration::seconds(1),
                 6 => rejected.expires_at = now,
@@ -619,6 +625,42 @@ mod tests {
                 .is_empty(),
             "live claims cannot introduce uncommitted remote semantics"
         );
+    }
+
+    #[test]
+    fn confirmed_health_accepts_live_failure_budget_progress_and_reset() {
+        for (health, before, after) in [
+            (ClusterConnectivityState::Healthy, 0, 1),
+            (ClusterConnectivityState::Healthy, 1, 0),
+            (ClusterConnectivityState::Degraded, 1, 2),
+            (ClusterConnectivityState::Degraded, 2, 1),
+        ] {
+            let (directory, state, source, mut baseline, now) = fixture();
+            baseline.state = health;
+            baseline.consecutive_failures = before;
+            let mut live = baseline.clone();
+            live.consecutive_failures = after;
+            live.observed_at = now;
+            live.expires_at =
+                now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+            assert_eq!(
+                matching_source_records(
+                    &directory,
+                    &state,
+                    &source,
+                    &[baseline.clone()],
+                    vec![live.clone()],
+                    now,
+                )
+                .unwrap(),
+                vec![live],
+                "same confirmed health: count {before}->{after}"
+            );
+            assert!(!crate::cluster_network_record_live(
+                baseline.expires_at,
+                now
+            ));
+        }
     }
 
     #[test]

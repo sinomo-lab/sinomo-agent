@@ -24,6 +24,7 @@ enum SourceCase {
     PartiallyLiveMain,
     SaturatedHints,
     ColdSourceProcess,
+    LiveFailureCountReset,
     SemanticChange,
     Deadline,
 }
@@ -179,6 +180,9 @@ async fn multihop_source_scenario(case: SourceCase) {
         expired.expires_at -= time::Duration::hours(1);
         if case == SourceCase::PartiallyLiveMain && i == 0 {
             expired = observation.clone();
+        }
+        if case == SourceCase::LiveFailureCountReset && i == 2 {
+            expired.consecutive_failures = 1;
         }
         kv.put_serde(
             cluster_connectivity_key(
@@ -540,7 +544,8 @@ async fn multihop_source_scenario(case: SourceCase) {
         SourceCase::Success
         | SourceCase::PartiallyLiveMain
         | SourceCase::SaturatedHints
-        | SourceCase::ColdSourceProcess => {
+        | SourceCase::ColdSourceProcess
+        | SourceCase::LiveFailureCountReset => {
             assert_eq!(response.unwrap(), "original response");
             assert_eq!(effects.load(Ordering::SeqCst), 1);
         }
@@ -604,4 +609,9 @@ async fn earlier_stalled_hints_cannot_starve_known_adjacent_source_read() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_source_process_does_not_hide_other_endpoint_live_observation() {
     multihop_source_scenario(SourceCase::ColdSourceProcess).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_source_routes_with_live_failure_count_reset_on_remote_bridge() {
+    multihop_source_scenario(SourceCase::LiveFailureCountReset).await;
 }

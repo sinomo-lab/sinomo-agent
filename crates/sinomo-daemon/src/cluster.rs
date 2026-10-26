@@ -7640,10 +7640,12 @@ impl sinomo_core::cluster::ClusterConnectivityPublishAsyncHost
             // generation. Bind it to confirmed semantics before using it to
             // schedule the next probe; a new/uncommitted health or endpoint
             // change cannot postpone the confirmed generation's deadline.
+            // Failure-count progress retains its existing local durability but
+            // is coalesced by quorum semantic equality, so it cannot require
+            // an additional quorum publication merely to accept live expiry.
             let expiries = records.iter().map(|confirmed| {
                 accepted.iter().find(|live| {
                     sinomo_core::network::cluster_connectivity_stable_eq(confirmed, live)
-                        && live.consecutive_failures == confirmed.consecutive_failures
                         && live.observed_at >= confirmed.observed_at
                         && sinomo_core::network::cluster_network_record_live(live.expires_at, wall_now)
                 }).map_or(confirmed.expires_at, |live| live.expires_at)
@@ -10170,6 +10172,71 @@ mod tests {
     }
 
     #[test]
+    fn expiry_scheduler_accepts_published_health_after_local_failure_budget_progress() {
+        let runtime = daemon_cluster_test_runtime();
+        for (health, before_count, after_count) in [
+            (ClusterConnectivityState::Healthy, 0, 1),
+            (ClusterConnectivityState::Healthy, 1, 0),
+            (ClusterConnectivityState::Degraded, 1, 2),
+            (ClusterConnectivityState::Degraded, 2, 1),
+        ] {
+            let (_root, paths, state, mut published) =
+                expiry_scheduler_fixture("expiry_volatile_count", 1, -30, false);
+            published[0].state = health;
+            published[0].consecutive_failures = before_count;
+            let key = sinomo_core::cluster::cluster_connectivity_key(
+                &state.local_node_id, &published[0].target_node_id, &published[0].endpoint_id,
+            );
+            sinomo_core::cluster::append_cluster_raft_command(
+                &paths, &state.local_node_id, sinomo_core::kv::KvCommand::Op(
+                    sinomo_core::kv::KvOp::put_serde(key.clone(), &published[0], None).unwrap(),
+                ),
+            ).unwrap();
+            let mut seed = published[0].clone();
+            seed.observed_at = OffsetDateTime::now_utc();
+            seed.expires_at = seed.observed_at + time::Duration::seconds(900);
+            sinomo_core::network::write_local_cluster_connectivity_record_set(
+                &paths, &state.local_node_id, &[seed],
+            ).unwrap();
+            let wal = paths.kv_paths().raft_wal_paths(&state.local_node_id).wal;
+            let wal_before = std::fs::read(&wal).unwrap();
+            let mut fresh = published[0].clone();
+            fresh.observed_at = OffsetDateTime::now_utc();
+            fresh.expires_at = fresh.observed_at + time::Duration::seconds(900);
+            fresh.consecutive_failures = after_count;
+            let source_before_progress = std::fs::read(&paths.connectivity_local).unwrap();
+            let expected = sinomo_core::network::__connectivity_store::capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            let accepted = runtime.block_on(sinomo_core::network::__connectivity_store::commit_local_cluster_connectivity_observations_if_snapshot_async(
+                runtime.handle(), &paths, &state, &state.local_node_id, &[fresh.clone()], &expected,
+            )).unwrap();
+            assert!(matches!(accepted, sinomo_core::network::__connectivity_store::LocalClusterConnectivitySourceSetCommit::Committed { .. }));
+            assert_ne!(std::fs::read(&paths.connectivity_local).unwrap(), source_before_progress,
+                "the actual producer still durably records genuine local failure-budget progress");
+            // Genuine failure-budget progress retains its existing local
+            // durability. Publication of unchanged quorum semantics must not
+            // rewrite that accepted source or create a quorum transaction.
+            let source_before = std::fs::read(&paths.connectivity_local).unwrap();
+            let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+            let pending = maintenance.plan_connectivity_publish(&paths, &state).unwrap();
+            runtime.block_on(maintenance.run_pending_work_async(
+                ClusterNetworkMaintenancePendingWork { connectivity_publish: Some(pending), ..Default::default() },
+                runtime.handle().clone(),
+            ));
+            assert_eq!(maintenance.accepted_connectivity_expiry, Some(fresh.expires_at),
+                "confirmed health, locally accepted count {before_count}->{after_count}");
+            assert!(maintenance.next_due_duration(Instant::now()) > Duration::from_secs(290),
+                "expired durable timestamp cannot produce an overdue loop");
+            assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), source_before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+            let snapshot = sinomo_core::cluster::read_cluster_kv_current_snapshot(&paths).unwrap();
+            assert_eq!(snapshot.get(&key).unwrap().decode::<ClusterConnectivityRecord>().unwrap(), published[0]);
+            assert_eq!(sinomo_core::network::read_local_cluster_connectivity_records_for_source(
+                &paths, &state.local_node_id,
+            ).unwrap()[0], fresh);
+        }
+    }
+
+    #[test]
     fn expiry_scheduler_does_not_renew_from_unconfirmed_semantic_changes() {
         let runtime = daemon_cluster_test_runtime();
         for change in 0..3 {
@@ -10181,7 +10248,7 @@ mod tests {
             accepted[0].observed_at += time::Duration::seconds(1);
             match change {
                 0 => accepted[0].state = ClusterConnectivityState::Degraded,
-                1 => accepted[0].consecutive_failures = 1,
+                1 => accepted[0].failure_reason = Some(sinomo_core::network::ClusterConnectivityFailureReason::IdentityMismatch),
                 _ => accepted[0].address = "127.0.0.1:39999".into(),
             }
             sinomo_core::network::write_local_cluster_connectivity_record_set(
