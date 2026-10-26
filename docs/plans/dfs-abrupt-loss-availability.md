@@ -15,7 +15,41 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R56
+## Current development checkpoint — 2026-10-26 R57
+
+R57 adds only a native normal-component-reopen control (`633a9581`, corrected
+endpoint predicate `53cd4601`), integrated at `ae250b84`. Source `24d06b0b`
+contains 4,922 inputs. All production bytes and the prior 53,945-byte test prefix
+are unchanged from R56. Fresh check/build/seal (I170), the one new native case
+(I171), and full DFS/KV boundary analysis (I172: 11 UI controls and three
+libraries) passed. The other **227 of 228 inventory IDs are UNRUN on R57**;
+R56's five passes retain their own source qualification.
+
+The actual case released the old A DATA owner during normal stop, observed
+NoPath, and remounted a distinct owner over the same physical owner file. The
+reopen returned successfully and the endpoint was actually callable. The SAME
+stamped request then received the exact known-Prepared pre-effect refusal,
+without changing the original body/digest or journal. Explicit completion used
+the actual remounted owner and SAME original. A second normal stop/reopen,
+exact full assigned-singleton sync, and SAME request produced Applied and the
+expected object. No endpoint acceptance flag was forced.
+
+The final-startup-wait-error branch exists in the control but was not exercised
+in this run. Normal component restart is not SIGKILL, power loss, one-node loss
+with surviving peers or a three-member recovery quorum. Those gaps, complete
+survivor custody/history/authority, fixed-member initialization, bounded reconnect
+and absolute-zero quietness remain open. All failures and source/artifact seals
+from earlier phases are preserved. `R57-REPORT.md`, the combined receipt and
+I170/I171/I172 receipts retain the actual commands, source, executable, archives,
+comparison/hash checks and complete owned cleanup.
+
+The next bounded development target is actual process-death reconstruction of
+the same owned native fixture. A retained constructor, if needed, must reuse
+persisted native cluster state and real ReadIndex/owner paths; it must not repeat
+fresh bootstrap, overwrite assignment, fabricate an original or treat readable
+files as serving authority. This has no production or rollout activation.
+
+## Historical development checkpoint — 2026-10-26 R56
 
 Cold native mutation admission now prepares the existing strict resident owner
 before content ingestion or Core request planning. Scoped owner waits retain
