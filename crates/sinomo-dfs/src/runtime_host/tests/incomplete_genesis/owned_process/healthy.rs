@@ -297,12 +297,20 @@ fn run_healthy(cut: Cut) {
             .push(if old == '0' { '1' } else { '0' });
         let mut wrong_epoch = expected.clone();
         wrong_epoch.shard.epoch = wrong_epoch.shard.epoch.checked_add(1).unwrap();
+        let mut wrong_fence = expected.clone();
+        let fence = wrong_fence
+            .shards
+            .iter_mut()
+            .find_map(|shard| shard.freeze.as_mut())
+            .ok_or("actual initialized fixture has no retained completed fence")?;
+        fence.activated_epoch = Some(expected.shard.epoch.checked_add(1).unwrap());
         for (label, bad) in [
             ("missing-root", missing),
             ("foreign-physical-node", foreign),
             ("incomplete-full-set", incomplete),
             ("conflicting-prefix", wrong_prefix),
             ("foreign-epoch", wrong_epoch),
+            ("conflicting-retained-fence", wrong_fence),
         ] {
             let result = DfsTestRuntime::validate_retained_healthy_fixture(&bad);
             report["refusals"]
