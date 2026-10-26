@@ -556,3 +556,183 @@ fn native_prefix_history_post_sync_deadline_retains_uncertainty_without_recertif
         },
     );
 }
+
+#[test]
+fn native_prefix_history_canonical_incomplete_or_mismatched_data_refuses_without_repair() {
+    use crate::metadata_backend::native_prefix_history::{
+        NativePrefixHistoryRecord, with_after_publication_cut_for_test,
+    };
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    run_round(
+        "native-prefix-history-structural-replay",
+        |fixture, report| {
+            report["scope"] = serde_json::json!(
+                "native original intake, then deliberately TEST-SUPPLIED canonical SOBJ fault images; no native evidence minted from those images"
+            );
+            report["limits"] = serde_json::json!(
+                "structural/physical reader refusal only, not cryptographic tamper authentication, fsync/power-loss or current authority"
+            );
+            let markers = fixture.markers()?;
+            let round = capture(fixture, &target(fixture))?;
+            let path = slot(fixture);
+            let shard_id = DfsMetadataShardId::new(&fixture.shard.shard_id);
+            let mut service = fixture.native.metadata_primary_service(SEED)?;
+            let first = service.retain_native_prefix_history(&round, Instant::now() + CAP)?;
+            assert_eq!(
+                first.disposition(),
+                NativePrefixHistoryDisposition::WrittenAndSynced
+            );
+            assert_eq!(
+                service.read_native_prefix_history(&shard_id)?.as_ref(),
+                Some(first.record())
+            );
+            let original = file_observation(&path)?;
+            let data = serde_json::to_value(first.record())?;
+            let round_trip: NativePrefixHistoryRecord = serde_json::from_value(data.clone())?;
+            assert_eq!(
+                crate::metadata_io::encode_sobj(&round_trip)?,
+                original.bytes
+            );
+            let original_path = path.with_extension("structural-original.sobj");
+            let mut saved = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&original_path)?;
+            saved.write_all(&original.bytes)?;
+            saved.sync_all()?;
+            drop(saved);
+            report["genuine_original_record"] = serde_json::json!(first.record());
+            report["genuine_original_round"] = observed(&round);
+            report["faults"] = serde_json::json!([]);
+
+            let mut missing = data.clone();
+            missing["peers"].as_array_mut().unwrap().pop().unwrap();
+            let mut duplicate_attempt = data.clone();
+            duplicate_attempt["peers"][1]["attempt_id"] = data["peers"][0]["attempt_id"].clone();
+            let mut reply_sequence = data.clone();
+            reply_sequence["peers"][0]["response"]["next_after_sequence"] = serde_json::json!(
+                round
+                    .target()
+                    .journal_sequence
+                    .checked_add(1)
+                    .ok_or("test sequence overflow")?
+            );
+            let mut command_epoch = data.clone();
+            let foreign_epoch = fixture
+                .shard
+                .epoch
+                .checked_add(1)
+                .ok_or("test epoch overflow")?;
+            command_epoch["peers"][0]["command"]["authority_epoch"] =
+                serde_json::json!(foreign_epoch);
+            command_epoch["peers"][0]["command"]["prefix_probe"]["authority_epoch"] =
+                serde_json::json!(foreign_epoch);
+            let faults = [
+                (
+                    "missing-required-peer",
+                    missing,
+                    "unsupported or inconsistent scope",
+                ),
+                (
+                    "duplicate-attempt",
+                    duplicate_attempt,
+                    "malformed or foreign",
+                ),
+                (
+                    "mismatched-response-sequence",
+                    reply_sequence,
+                    "malformed or foreign",
+                ),
+                (
+                    "foreign-command-and-probe-epoch",
+                    command_epoch,
+                    "malformed or foreign",
+                ),
+            ];
+            let mut last = None;
+            for (index, (name, value, expected_error)) in faults.into_iter().enumerate() {
+                // Canonical decoding/encoding succeeds. This is deliberately
+                // supplied corrupt DATA, not a raw frame converted to provenance.
+                let fault: NativePrefixHistoryRecord = serde_json::from_value(value)?;
+                let bytes = crate::metadata_io::encode_sobj(&fault)?;
+                let decoded: NativePrefixHistoryRecord =
+                    sinomo_core::object::serde_ext::from_bytes(&bytes)?;
+                assert_eq!(crate::metadata_io::encode_sobj(&decoded)?, bytes);
+                assert_ne!(bytes, original.bytes);
+                let preserved_path = path.with_extension(format!("structural-fault-{index}.sobj"));
+                let mut saved = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&preserved_path)?;
+                saved.write_all(&bytes)?;
+                saved.sync_all()?;
+                drop(saved);
+                let mut fault_file = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)?;
+                fault_file.write_all(&bytes)?;
+                fault_file.sync_all()?;
+                drop(fault_file);
+                let before = file_observation(&path)?;
+                let read_error = service
+                    .read_native_prefix_history(&shard_id)
+                    .err()
+                    .ok_or("canonical contradictory DATA passed historical validation")?;
+                let publications = Rc::new(Cell::new(0usize));
+                let hits = Rc::clone(&publications);
+                let intake = with_after_publication_cut_for_test(
+                    move |_, _| hits.set(hits.get() + 1),
+                    || service.retain_native_prefix_history(&round, Instant::now() + CAP),
+                );
+                let intake_error = intake
+                    .err()
+                    .ok_or("contradictory DATA was overwritten or acknowledged")?;
+                report["faults"].as_array_mut().unwrap().push(serde_json::json!({"name":name,
+                "classification":"TEST-SUPPLIED canonical DATA, not native provenance",
+                "preserved_image":preserved_path,"read_error":read_error.to_string(),"intake_error":intake_error.to_string(),
+                "publication_count":publications.get(),"canonical_decode_encode":true}));
+                assert!(
+                    read_error.to_string().contains(expected_error),
+                    "wrong refusal: {read_error}"
+                );
+                assert!(
+                    intake_error.to_string().contains(expected_error),
+                    "wrong refusal: {intake_error}"
+                );
+                assert_eq!(publications.get(), 0);
+                assert_eq!(
+                    file_observation(&path)?,
+                    before,
+                    "reader/intake must preserve the contradictory evidence"
+                );
+                assert_eq!(fixture.markers()?, markers);
+                assert_eq!(fs::read(&original_path)?, original.bytes);
+                last = Some(before);
+            }
+            drop(service);
+            let primary = fixture.shard.primary_node_id.clone();
+            fixture.native.stop_node(&primary)?;
+            fixture.native.reopen_node(primary)?;
+            let mut service = fixture.native.metadata_primary_service(SEED)?;
+            let cold = service
+                .read_native_prefix_history(&shard_id)
+                .err()
+                .ok_or("cold contradictory DATA silently became absent or accepted")?;
+            let cold_intake = service
+                .retain_native_prefix_history(&round, Instant::now() + CAP)
+                .err()
+                .ok_or("cold contradictory DATA was silently repaired")?;
+            assert!(cold.to_string().contains("malformed or foreign"));
+            assert!(cold_intake.to_string().contains("malformed or foreign"));
+            assert_eq!(file_observation(&path)?, last.unwrap());
+            assert_eq!(fixture.markers()?, markers);
+            assert_eq!(fs::read(&original_path)?, original.bytes);
+            report["cold_refusal"] = serde_json::json!({"read":cold.to_string(),"intake":cold_intake.to_string(),
+            "last_fault_and_original_preserved":true,"authority_markers_unchanged":true});
+            Ok(vec![round])
+        },
+    );
+}
