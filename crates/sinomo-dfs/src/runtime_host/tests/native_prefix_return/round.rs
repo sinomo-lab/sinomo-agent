@@ -315,7 +315,7 @@ fn native_prefix_round_refuses_invalid_membership_and_keeps_generic_data_unprove
 fn native_prefix_round_preserves_partial_return_and_requires_fresh_complete_retry() {
     run_round("native-prefix-round-partial", |fixture, report| {
         let target = target(fixture);
-        let peer = fixture.peer();
+        let peer = target.replica_node_ids.iter().max().unwrap().clone();
         let mut producer = fixture.transport();
         let guard = hold(fixture, &peer);
         let cursor = fixture.native.rpc_observations().len();
