@@ -1821,7 +1821,11 @@ fn local_cluster_connectivity_raw_persisted_records_stable(
     }
     let mut candidate = candidate.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut candidate);
+    // Retaining expired, unprobed rows must not hide genuine local routing
+    // progress. In particular, a failure-count change must survive the raw
+    // snapshot reconciliation used by publication and the next bounded probe.
     local_cluster_connectivity_persisted_records_stable(existing_records, &candidate)
+        && local_cluster_connectivity_route_records_stable(existing_records, &candidate)
 }
 
 fn local_cluster_connectivity_route_records_stable(
@@ -3632,6 +3636,57 @@ mod tests {
             routing_before,
             "latency samples are path measurements, not connectivity topology generations"
         );
+    }
+
+    #[test]
+    fn daemon_command_failure_budget_survives_source_snapshot_reconciliation() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("daemon_command_failure_budget");
+        let healthy = cluster_connectivity_record(
+            &state, &endpoint, ClusterConnectivityState::Healthy, Some(1), 0,
+            Some("confirmed success".into()), None, now, CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[healthy]).unwrap();
+        for (expected_state, expected_count) in [
+            (ClusterConnectivityState::Healthy, 1),
+            (ClusterConnectivityState::Degraded, 2),
+            (ClusterConnectivityState::Unreachable, 3),
+        ] {
+            let before = std::fs::read(&paths.connectivity_local).unwrap();
+            let observed = record_daemon_owned_local_cluster_endpoint_command_connectivity(
+                &paths, &state, &endpoint, ClusterConnectivityState::Degraded, None, true,
+            ).unwrap();
+            assert_eq!(observed.state, expected_state);
+            assert_eq!(observed.consecutive_failures, expected_count);
+            // Publication and a later bounded probe capture this same raw cut.
+            // Reconciliation must not silently reopen the single-failure grace.
+            let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths, &local).unwrap(),
+                vec![observed.clone()], "accepted failure count {expected_count} survives capture");
+            assert_eq!(snapshot.persisted_records.as_slice(), &[observed]);
+            assert_ne!(std::fs::read(&paths.connectivity_local).unwrap(), before,
+                "genuine failure-budget progression uses the existing durable owner");
+        }
+        let saturated = std::fs::read(&paths.connectivity_local).unwrap();
+        let mark = crate::cluster_file_mark(&paths.connectivity_local).unwrap();
+        for _ in 0..3 {
+            let observed = record_daemon_owned_local_cluster_endpoint_command_connectivity(
+                &paths, &state, &endpoint, ClusterConnectivityState::Degraded, None, true,
+            ).unwrap();
+            assert_eq!(observed.state, ClusterConnectivityState::Unreachable);
+            assert_eq!(observed.consecutive_failures, 3);
+            capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), saturated);
+            assert_eq!(crate::cluster_file_mark(&paths.connectivity_local).unwrap(), mark,
+                "unchanged saturated liveness does not rewrite the source file");
+        }
+        let recovered = record_daemon_owned_local_cluster_endpoint_command_connectivity(
+            &paths, &state, &endpoint, ClusterConnectivityState::Healthy, Some(1), true,
+        ).unwrap();
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.state, ClusterConnectivityState::Healthy);
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(snapshot.persisted_records.as_slice(), &[recovered]);
     }
 
     #[test]
