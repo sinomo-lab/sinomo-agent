@@ -15,7 +15,60 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R58
+## Current development checkpoint — 2026-10-26 R61
+
+The existing metadata synchronization engine now has a strict exact-prefix,
+full-assignment mode (`1474f66f`). It revalidates the actual current source
+assignment, epoch, head and fingerprint; it never raises the requested target,
+never repairs through a checkpoint snapshot, and never enters the membership
+handoff partial-proof path. Existing journal backfill remains bounded by the
+requested sequence. Ordinary durability and handoff behavior stay on their
+existing paths. The result is live barrier DATA, not a durable attestation,
+unforgeable native-provenance capability, serving floor or genesis activation.
+
+R59's first typecheck failed at five new reporting sites because DfsError is not
+serializable; no native tests ran. Reporting-only correction `97ccdd54`
+preserves that failure. R60 source `6e12732b` actually passed exact-target/full-set
+sync and strict source-advance refusal with the ordinary stronger-head regression.
+Its reply-loss case FAILED: the fault covered only the direct route, and a genuine
+C reply arrived through the routed fallback. The returned certificate contained
+all three members; this was not observed two-member proof acceptance.
+
+Fixture-only `cbddf3fd` covers both exact A-to-C metadata routes with one gate,
+16+16 hit budgets (aggregate32), and evidence capture before assertion. R61
+code is `57927e3b`, source `1224d677` with 4,924 inputs. Fresh check/build/seal
+(I182), the affected native case (I183), and full DFS/KV boundary analysis
+(I184: 11 UI controls and three libraries) passed. **231 other inventory IDs
+remain UNRUN on R61**. The first two R60 passes retain their own source
+qualification; this is not a three-case R61 pass.
+
+I183 observed one eligible call on each route, two of32, with no fault-budget
+exhaustion. Holding C's completed responses produced an original-deadline error
+and no certificate. After exact gate release/drain, the SAME target obtained fresh
+A/B/C acknowledgements with disjoint per-invocation probe IDs. The legacy
+`quorum_size` field remains2; the complete member set is required independently.
+An old canceled response may have been lost rather than physically delivered late;
+that stronger delayed-delivery scenario remains unproved. Waiter count is not
+exposed. The measured 5.027-second failed attempt is not a latency pass.
+
+All 161 fixture files were archived with comparison/hash checks. Exact source,
+ELF, commands, actual outcomes and complete owned cleanup are retained in the
+I182/I183/I184 receipts and `R61-REPORT.md` / combined receipt. Root finished saved
+aggregation after the integration child reported model capacity, following
+already completed cleanup; nothing was rerun and no account/model was switched.
+Every earlier failed source, request and result remains immutable.
+
+Healthy fixed-three genesis is still OPEN. Claude R10's proposal was not accepted:
+a missing new-genesis record cannot silently become legacy, and a public/replayed
+certificate cannot itself grant current serving authority. The strict-sync mode
+is only a bounded prerequisite. Protocol selection, durable native completion
+provenance, the post-commit/full-sync admission interval, complete original-effect
+custody, recovery quorum, checked successor serving and actual single-node-loss
+acceptance remain unresolved. No C1/floor/receipt-application/Close/root-release
+activation, Docker, production or rollout action follows. Quiet windows including
+maintenance still require absolute zero writes.
+
+## Historical development checkpoint — 2026-10-26 R58
 
 R58 qualifies actual process-death reconstruction of the default-P0 native test
 fixture. Helper `02a0a794` and process control `5b1046f5` are integrated at
