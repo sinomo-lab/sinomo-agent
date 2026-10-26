@@ -387,7 +387,7 @@ fn native_exact_prefix_sync_returns_unchanged_full_assignment_target() {
         let outcome = fixture
             .source
             .sync_metadata_shard_exact_prefix_full_assignment(&target, CAP);
-        report["strict_result"] = serde_json::json!(outcome);
+        report["strict_result"] = serde_json::json!(outcome.as_ref().map_err(ToString::to_string));
         report["elapsed"] = serde_json::json!(format!("{:?}", started.elapsed()));
         let outcome = outcome?;
         assert!(started.elapsed() <= CAP);
@@ -453,7 +453,7 @@ fn native_exact_prefix_sync_refuses_real_source_append_while_ordinary_sync_advan
         let strict = fixture
             .source
             .sync_metadata_shard_exact_prefix_full_assignment(&target, CAP);
-        report["strict_after_actual_append"] = serde_json::json!(strict);
+        report["strict_after_actual_append"] = serde_json::json!(strict.as_ref().map_err(ToString::to_string));
         let strict_error = strict.expect_err("strict call cannot silently adopt a stronger head");
         assert!(
             strict_error
@@ -472,7 +472,7 @@ fn native_exact_prefix_sync_refuses_real_source_append_while_ordinary_sync_advan
         no_snapshot(&all[cursor..]);
         report["strict_rpc"] = wire(&all[cursor..]);
         let ordinary = fixture.source.sync_metadata_shard_to_quorum(&target, CAP);
-        report["same_target_ordinary_result"] = serde_json::json!(ordinary);
+        report["same_target_ordinary_result"] = serde_json::json!(ordinary.as_ref().map_err(ToString::to_string));
         let ordinary = ordinary?;
         assert!(ordinary.target.journal_sequence > target.journal_sequence);
         assert!(ordinary.target.journal_sequence >= advanced.last().unwrap().entry.sequence);
@@ -532,7 +532,7 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
         let failed = fixture
             .source
             .sync_metadata_shard_exact_prefix_full_assignment(&target, CAP);
-        report["held_actual_c_response_result"] = serde_json::json!(failed);
+        report["held_actual_c_response_result"] = serde_json::json!(failed.as_ref().map_err(ToString::to_string));
         assert!(
             failed.is_err(),
             "A+B cannot create a full3 result when actual C reply is held"
@@ -603,7 +603,7 @@ fn native_exact_prefix_sync_requires_fresh_c_reply_after_owned_response_loss() {
         let fresh = fixture
             .source
             .sync_metadata_shard_exact_prefix_full_assignment(&target, CAP);
-        report["same_target_fresh_result"] = serde_json::json!(fresh);
+        report["same_target_fresh_result"] = serde_json::json!(fresh.as_ref().map_err(ToString::to_string));
         let fresh = fresh?;
         certificate(&fresh, &target, &fixture.shard);
         let after = fixture.source_raw()?;
