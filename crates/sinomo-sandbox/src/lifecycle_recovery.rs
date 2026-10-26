@@ -2,9 +2,11 @@ use crate::SandboxId;
 use sinomo_core::storage::durable_file::{self, DurableAtomicFileOptions, DurableFileError};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PENDING_DIR: &str = "pending";
+#[cfg(test)]
 const SAFETY_SWEEP_STAMP: &str = "last-safety-sweep";
 const PENDING_MARKER_CONTENT: &[u8] = b"sinomo-sandbox-authoritative-recovery-pending-v1\n";
 pub const SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -19,6 +21,7 @@ pub enum SandboxLifecycleRecoveryError {
 pub struct SandboxLifecycleRecoveryState {
     root: PathBuf,
     safety_sweep_interval: Duration,
+    last_safety_sweep: Arc<Mutex<Option<u64>>>,
 }
 
 impl SandboxLifecycleRecoveryState {
@@ -26,6 +29,7 @@ impl SandboxLifecycleRecoveryState {
         Self {
             root: root.into(),
             safety_sweep_interval: SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL,
+            last_safety_sweep: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -120,24 +124,26 @@ impl SandboxLifecycleRecoveryState {
         &self,
         now_unix_nanos: u64,
     ) -> Result<(), SandboxLifecycleRecoveryError> {
-        self.ensure_dirs()?;
-        self.write_state(
-            &self.sweep_stamp_path(),
-            now_unix_nanos.to_string().as_bytes(),
-        )
+        // Cadence is owned by the live recovery worker, not durable work.
+        // Pending recovery markers remain durable and independent of this hint.
+        *self
+            .last_safety_sweep
+            .lock()
+            .map_err(|_| self.cadence_lock_error())? = Some(now_unix_nanos);
+        Ok(())
     }
 
     pub fn safety_sweep_due_or_initialize(
         &self,
         now_unix_nanos: u64,
     ) -> Result<bool, SandboxLifecycleRecoveryError> {
-        let path = self.sweep_stamp_path();
-        let stored = match std::fs::read_to_string(&path) {
-            Ok(stored) => stored,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(source) => return Err(io_error(&path, source)),
-        };
-        let Ok(last_sweep_unix_nanos) = stored.trim().parse::<u64>() else {
+        let Some(last_sweep_unix_nanos) = *self
+            .last_safety_sweep
+            .lock()
+            .map_err(|_| self.cadence_lock_error())?
+        else {
+            // A new component owner must inspect real pending state. An old
+            // on-disk cadence stamp neither suppresses startup nor grants work.
             return Ok(true);
         };
         if last_sweep_unix_nanos > now_unix_nanos {
@@ -171,8 +177,16 @@ impl SandboxLifecycleRecoveryState {
         self.pending_dir().join(sandbox_id.as_str())
     }
 
+    #[cfg(test)]
     fn sweep_stamp_path(&self) -> PathBuf {
         self.root.join(SAFETY_SWEEP_STAMP)
+    }
+
+    fn cadence_lock_error(&self) -> SandboxLifecycleRecoveryError {
+        SandboxLifecycleRecoveryError::Io {
+            path: self.root.display().to_string(),
+            detail: "sandbox lifecycle sweep cadence lock is poisoned".into(),
+        }
     }
 
     fn ensure_dirs(&self) -> Result<(), SandboxLifecycleRecoveryError> {
@@ -201,5 +215,121 @@ fn io_error(path: &Path, source: std::io::Error) -> SandboxLifecycleRecoveryErro
     SandboxLifecycleRecoveryError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_safety_sweeps_do_not_rewrite_durable_state() {
+        let root = sinomo_testdir::TestDir::new("sandbox-empty-safety-sweep");
+        let state = SandboxLifecycleRecoveryState::new(root.path());
+        let mut scans = 0;
+        let first = 1_000_000_000;
+        state
+            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(first, |pending| {
+                assert!(pending.is_empty());
+                scans += 1;
+                Ok(0)
+            })
+            .unwrap();
+        let stamp = state.sweep_stamp_path();
+        let before = std::fs::read(&stamp).ok();
+        let before_mark = std::fs::metadata(&stamp)
+            .ok()
+            .map(|m| m.modified().unwrap());
+        let next =
+            first + u64::try_from(SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos()).unwrap();
+        state
+            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(next, |pending| {
+                assert!(pending.is_empty());
+                scans += 1;
+                Ok(0)
+            })
+            .unwrap();
+        assert_eq!(scans, 2, "the existing safety sweep still runs when due");
+        assert_eq!(
+            std::fs::read(&stamp).ok(),
+            before,
+            "elapsed time and an empty completed sweep do not renew durable state"
+        );
+        assert_eq!(
+            std::fs::metadata(&stamp)
+                .ok()
+                .map(|m| m.modified().unwrap()),
+            before_mark
+        );
+        state
+            .clone()
+            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(next + 1, |_| {
+                panic!("clones of the same owner must retain the completed sweep cadence")
+            })
+            .unwrap();
+    }
+    #[test]
+    fn pending_markers_remain_durable_and_override_shared_cadence() {
+        let root = sinomo_testdir::TestDir::new("sandbox-pending-cadence");
+        let state = SandboxLifecycleRecoveryState::new(root.path());
+        let id = SandboxId::generate();
+        state.record_safety_sweep(100).unwrap();
+        state.mark_authoritative_recovery_pending(&id).unwrap();
+        let marker = state.pending_marker_path(&id);
+        let before = std::fs::read(&marker).unwrap();
+        for now in [101, 102] {
+            state
+                .clone()
+                .run_due_recovery::<SandboxLifecycleRecoveryError, _>(now, |pending| {
+                    assert_eq!(pending, BTreeSet::from([id.clone()]));
+                    Ok(0)
+                })
+                .unwrap();
+            assert_eq!(
+                std::fs::read(&marker).unwrap(),
+                before,
+                "a successful scan cannot clear the actual recovery obligation"
+            );
+        }
+        let restarted = SandboxLifecycleRecoveryState::new(root.path());
+        assert_eq!(
+            restarted.pending_sandbox_ids().unwrap(),
+            BTreeSet::from([id.clone()])
+        );
+        restarted.clear_authoritative_recovery_pending(&id).unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn failed_scan_stays_due_and_clock_rollback_keeps_existing_behavior() {
+        let root = sinomo_testdir::TestDir::new("sandbox-failed-cadence");
+        let state = SandboxLifecycleRecoveryState::new(root.path());
+        let error = state.run_due_recovery::<SandboxLifecycleRecoveryError, _>(100, |_| {
+            Err(SandboxLifecycleRecoveryError::Io {
+                path: "controlled".into(),
+                detail: "scan failed".into(),
+            })
+        });
+        assert!(error.is_err());
+        assert!(state.safety_sweep_due_or_initialize(101).unwrap());
+        state.record_safety_sweep(101).unwrap();
+        assert!(!state.safety_sweep_due_or_initialize(102).unwrap());
+        assert!(state.safety_sweep_due_or_initialize(100).unwrap());
+        assert!(!state.sweep_stamp_path().exists());
+    }
+
+    #[test]
+    fn new_owner_scans_without_rewriting_or_trusting_legacy_cadence() {
+        let root = sinomo_testdir::TestDir::new("sandbox-new-owner-cadence");
+        let state = SandboxLifecycleRecoveryState::new(root.path());
+        let legacy = b"9000000000000000000";
+        std::fs::write(state.sweep_stamp_path(), legacy).unwrap();
+        state
+            .run_due_recovery::<SandboxLifecycleRecoveryError, _>(100, |_| Ok(0))
+            .unwrap();
+        assert!(!state.clone().safety_sweep_due_or_initialize(101).unwrap());
+        let restarted = SandboxLifecycleRecoveryState::new(root.path());
+        assert!(restarted.safety_sweep_due_or_initialize(101).unwrap());
+        assert_eq!(std::fs::read(state.sweep_stamp_path()).unwrap(), legacy);
     }
 }

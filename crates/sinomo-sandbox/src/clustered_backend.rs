@@ -53,6 +53,7 @@ pub struct ClusteredSandboxBackend {
     data_dir: Arc<SinomoDataDir>,
     cluster: Arc<dyn ClusterAccess>,
     runtime: Option<tokio::runtime::Handle>,
+    recovery: SandboxLifecycleRecoveryState,
 }
 
 impl ClusteredSandboxBackend {
@@ -61,19 +62,21 @@ impl ClusteredSandboxBackend {
         cluster: Arc<dyn ClusterAccess>,
         runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
+        let recovery = SandboxLifecycleRecoveryState::new(
+            data_dir.root().join(SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR),
+        );
         Self {
             data_dir,
             cluster,
             runtime,
+            recovery,
         }
     }
 
     fn recovery_state(&self) -> SandboxLifecycleRecoveryState {
-        SandboxLifecycleRecoveryState::new(
-            self.data_dir
-                .root()
-                .join(SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR),
-        )
+        // The component's existing task clones this backend for each tick.
+        // Keep one cadence for that owner instead of reconstructing it per call.
+        self.recovery.clone()
     }
 
     fn load_policy_config(&self) -> Result<SandboxClusterPolicyConfig, SandboxBackendError> {
