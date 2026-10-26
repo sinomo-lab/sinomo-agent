@@ -430,6 +430,124 @@ pub struct DfsMetadataPrefixProbeReturn {
     pub evidence: DfsMetadataPrefixEvidence,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DfsNativePrefixRoundPeerStatus {
+    Unattempted,
+    NativeCaptured,
+    NoNativeProof,
+    Failed,
+    NativeBindingRejected,
+}
+
+/// One fixed slot in one round. Attempted means the R63 producer was invoked,
+/// not that a wire effect is known to have happened. Unknown stays unknown.
+#[derive(Debug)]
+pub(crate) struct DfsNativePrefixRoundPeer {
+    peer: NodeId,
+    command: DfsMetadataJournalBatchCommand,
+    status: DfsNativePrefixRoundPeerStatus,
+    attempted: bool,
+    response: Option<DfsMetadataJournalBatchResponse>,
+    native_return: Option<crate::runtime_host::OwnedNativeMetadataPrefixReturn>,
+    error: Option<NetworkError>,
+    unattempted_reason: Option<String>,
+}
+
+impl DfsNativePrefixRoundPeer {
+    pub(crate) fn peer(&self) -> &NodeId {
+        &self.peer
+    }
+    pub(crate) fn command(&self) -> &DfsMetadataJournalBatchCommand {
+        &self.command
+    }
+    pub(crate) fn status(&self) -> DfsNativePrefixRoundPeerStatus {
+        self.status
+    }
+    pub(crate) fn attempted(&self) -> bool {
+        self.attempted
+    }
+    pub(crate) fn response(&self) -> Option<&DfsMetadataJournalBatchResponse> {
+        self.response.as_ref()
+    }
+    pub(crate) fn native_return(
+        &self,
+    ) -> Option<&crate::runtime_host::OwnedNativeMetadataPrefixReturn> {
+        self.native_return.as_ref()
+    }
+    pub(crate) fn error(&self) -> Option<&NetworkError> {
+        self.error.as_ref()
+    }
+    pub(crate) fn delivery_state(&self) -> Option<sinomo_core::network::NetworkDeliveryState> {
+        self.error.as_ref().and_then(NetworkError::delivery_state)
+    }
+    pub(crate) fn unattempted_reason(&self) -> Option<&str> {
+        self.unattempted_reason.as_deref()
+    }
+}
+
+/// The common LOCAL source DATA observed by both genuine native returns. This
+/// is neither an invented self acknowledgement nor current serving authority.
+#[derive(Debug)]
+pub(crate) struct DfsNativePrefixRoundSourceObservation {
+    assignment: crate::DfsMetadataShardConfig,
+    prefix: crate::DfsMetadataPrefixProof,
+    physical: crate::runtime_host::NativeMetadataPrefixPhysicalOwner,
+}
+
+impl DfsNativePrefixRoundSourceObservation {
+    pub(crate) fn assignment(&self) -> &crate::DfsMetadataShardConfig {
+        &self.assignment
+    }
+    pub(crate) fn prefix(&self) -> &crate::DfsMetadataPrefixProof {
+        &self.prefix
+    }
+    pub(crate) fn physical_owner(&self) -> &crate::runtime_host::NativeMetadataPrefixPhysicalOwner {
+        &self.physical
+    }
+    pub(crate) fn source_node_id(&self) -> &NodeId {
+        &self.assignment.primary_node_id
+    }
+}
+
+/// Private, call-local complete/incomplete observation. No Clone, serde, raw
+/// constructor or merge/adopt operation; retained values own no native lease.
+#[derive(Debug)]
+pub(crate) struct OwnedNativeMetadataPrefixRound {
+    round_id: String,
+    target: crate::DfsMetadataQuorumSyncTarget,
+    deadline: Instant,
+    peers: Vec<DfsNativePrefixRoundPeer>,
+    common_source: Option<DfsNativePrefixRoundSourceObservation>,
+    finalization_error: Option<NetworkError>,
+}
+
+impl OwnedNativeMetadataPrefixRound {
+    pub(crate) fn round_id(&self) -> &str {
+        &self.round_id
+    }
+    pub(crate) fn target(&self) -> &crate::DfsMetadataQuorumSyncTarget {
+        &self.target
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.common_source.is_some() && self.finalization_error.is_none()
+    }
+    pub(crate) fn peer_outcomes(&self) -> &[DfsNativePrefixRoundPeer] {
+        &self.peers
+    }
+    pub(crate) fn common_source_observation(
+        &self,
+    ) -> Option<&DfsNativePrefixRoundSourceObservation> {
+        self.common_source.as_ref()
+    }
+    /// Local round eligibility error, separate from preserved peer errors.
+    pub(crate) fn finalization_error(&self) -> Option<&NetworkError> {
+        self.finalization_error.as_ref()
+    }
+}
+
 /// Size-independent DFS peer RPC. Ordinary encoded values and explicit
 /// attachments share this one transport contract.
 pub trait DfsPeerTransport: Send + Sync {
@@ -4933,6 +5051,212 @@ fn send_direct_metadata_journal_fanout_blocking(
 }
 
 impl DfsNodeTransport {
+    /// One explicit round over an already initialized three-member scope.
+    /// Both commands precede dispatch; every invoked peer gets exactly one R63
+    /// call under the SAME absolute deadline. No input partial can be adopted.
+    pub(crate) fn capture_metadata_prefix_full_assignment_round(
+        &mut self,
+        target: &crate::DfsMetadataQuorumSyncTarget,
+    ) -> Result<OwnedNativeMetadataPrefixRound, NetworkError> {
+        let invalid = |detail: &str| NetworkError::Serialization {
+            detail: format!("native prefix round: {detail}"),
+        };
+        let assignment = target
+            .expected_shard
+            .as_ref()
+            .ok_or_else(|| invalid("missing exact assignment"))?;
+        let expected = assignment
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let supplied = target
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if target.primary_node_id != self.local_node_id
+            || assignment.primary_node_id != self.local_node_id
+            || assignment.file_system_id != target.file_system_id
+            || assignment.shard_id != target.shard_id.0
+            || assignment.epoch == 0
+            || target.authority_epoch != Some(assignment.epoch)
+            || target.barrier_id.is_empty()
+            || target.state_fingerprint.is_empty()
+            || target.checkpoint_snapshot.is_some()
+            || assignment.replica_node_ids.len() != 2
+            || target.replica_node_ids.len() != 2
+            || expected.len() != 2
+            || supplied != expected
+            || expected.contains(&self.local_node_id)
+        {
+            return Err(invalid(
+                "unsupported, duplicate, subset or inconsistent three-member target",
+            ));
+        }
+        for peer in &expected {
+            if !self.known_remote_nodes.contains(peer) {
+                return Err(NetworkError::UnknownNode {
+                    node_id: peer.clone(),
+                });
+            }
+        }
+        let deadline = self
+            .operation_deadline
+            .filter(|deadline| *deadline > Instant::now())
+            .ok_or_else(|| invalid("missing or expired original operation deadline"))?;
+        let round_id = sinomo_core::Id::generate().to_string();
+        let peers = expected
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| DfsNativePrefixRoundPeer {
+                peer: peer.clone(),
+                command: DfsMetadataJournalBatchCommand {
+                    request_id: format!("dfs_native_prefix_round_{round_id}_{index}"),
+                    source_node_id: Some(self.local_node_id.clone()),
+                    file_system_id: Some(target.file_system_id.clone()),
+                    authority_epoch: target.authority_epoch,
+                    verify_prefix_only: true,
+                    prefix_probe: Some(crate::DfsMetadataPrefixProbe {
+                        barrier_id: format!("{}-{round_id}", target.barrier_id),
+                        file_system_id: Some(target.file_system_id.clone()),
+                        authority_epoch: target.authority_epoch,
+                        shard_id: target.shard_id.clone(),
+                        journal_sequence: target.journal_sequence,
+                        state_fingerprint: target.state_fingerprint.clone(),
+                        primary_handoff_id: None,
+                        repair_custody: None,
+                    }),
+                    authority_probe: None,
+                    durable_replication: None,
+                    batch: crate::DfsMetadataJournalFrameBatch {
+                        shard_id: target.shard_id.clone(),
+                        journal_frames: Vec::new(),
+                        next_after_sequence: target.journal_sequence,
+                    },
+                },
+                status: DfsNativePrefixRoundPeerStatus::Unattempted,
+                attempted: false,
+                response: None,
+                native_return: None,
+                error: None,
+                unattempted_reason: Some("peer invocation has not begun".into()),
+            })
+            .collect::<Vec<_>>();
+        let mut round = OwnedNativeMetadataPrefixRound {
+            round_id,
+            target: target.clone(),
+            deadline,
+            peers,
+            common_source: None,
+            finalization_error: None,
+        };
+        let mut native_attempts = BTreeSet::new();
+        for slot in &mut round.peers {
+            if Instant::now() >= deadline {
+                slot.unattempted_reason =
+                    Some("original round deadline expired before this peer invocation".into());
+                continue;
+            }
+            slot.attempted = true;
+            slot.unattempted_reason = None;
+            match self.capture_metadata_prefix_probe_direct(&slot.peer, &slot.command) {
+                Err(error) => {
+                    slot.status = DfsNativePrefixRoundPeerStatus::Failed;
+                    slot.error = Some(error);
+                }
+                Ok(returned) => {
+                    slot.response = Some(returned.response);
+                    match returned.evidence {
+                        DfsMetadataPrefixEvidence::NoNativeProof => {
+                            slot.status = DfsNativePrefixRoundPeerStatus::NoNativeProof
+                        }
+                        DfsMetadataPrefixEvidence::Native(value) => {
+                            let valid = value.peer() == &slot.peer
+                                && value.command() == &slot.command
+                                && value.response()
+                                    == slot.response.as_ref().expect("actual response retained")
+                                && value.source_assignment() == assignment
+                                && value.source_prefix().is_well_formed()
+                                && value.source_prefix().journal_sequence
+                                    == target.journal_sequence
+                                && value.source_prefix().digest == target.state_fingerprint
+                                && native_attempts.insert(value.attempt_id().to_owned());
+                            slot.status = if valid {
+                                DfsNativePrefixRoundPeerStatus::NativeCaptured
+                            } else {
+                                DfsNativePrefixRoundPeerStatus::NativeBindingRejected
+                            };
+                            if !valid {
+                                slot.error = Some(invalid(
+                                    "native value differs from its fixed peer/command/source or duplicates another attempt",
+                                ));
+                            }
+                            // Preserve genuine captured DATA even if it cannot
+                            // qualify this slot or a later whole-round check.
+                            slot.native_return = Some(value);
+                        }
+                    }
+                }
+            }
+        }
+        let completed = (|| -> Result<DfsNativePrefixRoundSourceObservation, NetworkError> {
+            if Instant::now() >= deadline {
+                return Err(invalid(
+                    "original whole-round deadline expired; observations retained",
+                ));
+            }
+            let actual = round
+                .peers
+                .iter()
+                .map(|slot| slot.peer.clone())
+                .collect::<BTreeSet<_>>();
+            if actual != expected
+                || round.peers.len() != expected.len()
+                || round.peers.iter().any(|slot| {
+                    slot.status != DfsNativePrefixRoundPeerStatus::NativeCaptured
+                        || slot.error.is_some()
+                })
+            {
+                return Err(invalid(
+                    "not every configured remote peer supplied qualifying native evidence in this round",
+                ));
+            }
+            let first = round.peers[0]
+                .native_return
+                .as_ref()
+                .expect("qualified native slot");
+            let common = DfsNativePrefixRoundSourceObservation {
+                assignment: first.source_assignment().clone(),
+                prefix: first.source_prefix().clone(),
+                physical: first.local_physical_owner().clone(),
+            };
+            for slot in &round.peers {
+                let value = slot.native_return.as_ref().expect("qualified native slot");
+                if value.source_assignment() != &common.assignment
+                    || value.source_prefix() != &common.prefix
+                    || value.local_physical_owner() != &common.physical
+                {
+                    return Err(invalid(
+                        "native peer returns have mixed source assignment/prefix/physical observations",
+                    ));
+                }
+                value.validate_binding(&slot.peer, &slot.command, &common.physical.data_root)?;
+            }
+            if Instant::now() >= deadline {
+                return Err(invalid(
+                    "final binding checks crossed the original whole-round deadline",
+                ));
+            }
+            Ok(common)
+        })();
+        match completed {
+            Ok(common) => round.common_source = Some(common),
+            Err(error) => round.finalization_error = Some(error),
+        }
+        Ok(round)
+    }
+
     /// Opt-in, one-call direct PREFIX producer. Routed/fanout output remains
     /// DATA; no second RPC is issued to obtain provenance for an earlier call.
     pub(crate) fn capture_metadata_prefix_probe_direct(
