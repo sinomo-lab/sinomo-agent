@@ -361,14 +361,10 @@ fn probe(
     assert_eq!(result.path, kind.path());
     if let Some(contact) = &result.contact {
         assert_eq!(&contact.node_id, target);
-        assert_eq!(
+        assert!(matches!(
             contact.transport,
-            sinomo_core::ClusterTransportKind::Loopback
-        );
-        assert_eq!(
-            contact.privacy,
-            sinomo_core::ClusterEndpointPrivacy::LocalOnly
-        );
+            sinomo_core::ClusterTransportKind::Loopback | sinomo_core::ClusterTransportKind::LanTcp
+        ));
         let selected = if matches!(kind, ProbeKind::EndpointWrongPeer) {
             node.contacts
                 .keys()

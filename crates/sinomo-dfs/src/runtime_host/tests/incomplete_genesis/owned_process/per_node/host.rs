@@ -170,13 +170,26 @@ async fn probe(
                     "native member key differs from the owned fixture identity",
                 ));
             }
-            // A concrete contact is a route hint, not a directory mutation or
-            // reachability fact. Never select a daemon's default/shadow port.
-            Ok(sinomo_core::network::daemon_loopback_endpoint(
-                node,
-                address.clone(),
-                0,
-            ))
+            // Preserve the native descriptor ID/type/privacy checked by the
+            // routed handshake. Address scope alone cannot recreate that ID.
+            // A missing owned advertisement stays unavailable; do not choose
+            // a default/shadow endpoint or synthesize a replacement descriptor.
+            member
+                .endpoints
+                .iter()
+                .find(|endpoint| {
+                    &endpoint.node_id == node
+                        && &endpoint.address == address
+                        && matches!(
+                            endpoint.transport,
+                            sinomo_core::ClusterTransportKind::Loopback
+                                | sinomo_core::ClusterTransportKind::LanTcp
+                        )
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    invalid("owned listener lacks its current native endpoint descriptor")
+                })
         };
         let mut endpoint = contact(&request.target)?;
         if matches!(request.kind, ProbeKind::EndpointWrongPeer) {
