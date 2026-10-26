@@ -3,7 +3,7 @@
 //! This module owns the default distributed SIFS topology, shard layout, and
 //! service advertisements that make a cluster's DFS usable after bootstrap.
 
-mod genesis;
+pub(crate) mod genesis;
 
 use serde::Serialize;
 use sinomo_core::local::SinomoDataDir;
