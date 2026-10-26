@@ -508,6 +508,9 @@ enum ClusterRaftAppendRequestBuildKey {
 }
 
 #[cfg(test)]
+mod commit_topology_tests;
+
+#[cfg(test)]
 mod post_commit_observation_tests {
     use super::*;
     use sinomo_kv::{ClusterKvRaftConfigRecord, KvCommand, KvOp, encode_kv_value};
@@ -3287,11 +3290,34 @@ fn project_committed_cluster_raft_authority_before_sync_commit(
     projected.kv_revision = projected.kv_revision.max(read_state.revision.0);
     if let Some(entry) = storage.read_index_entry(&sinomo_kv::cluster_kv_raft_config_key())? {
         let config: sinomo_kv::ClusterKvRaftConfigRecord = entry.decode().map_err(kv_err)?;
-        project_cluster_raft_config_record(&mut projected, &config)?;
+        project_committed_cluster_raft_members_for_commit(&mut storage, &mut projected, config)?;
     }
     remaining_raft_commit_budget(deadline, "synchronous authority projection")?;
     *state = projected;
     Ok(())
+}
+
+/// A bootstrap projection can omit a recently admitted learner even though its
+/// native Raft configuration already includes it. Projecting roles alone then
+/// silently drops that learner from committed fanout. Reuse the existing bounded
+/// native member/policy projection only when the config names a missing identity;
+/// never fill the gap from an imported snapshot or a sender's membership claim.
+fn project_committed_cluster_raft_members_for_commit(
+    storage: &mut dyn LocalClusterRaftReadProjection,
+    state: &mut ClusterBootstrapState,
+    config: sinomo_kv::ClusterKvRaftConfigRecord,
+) -> Result<(), NetworkError> {
+    let missing_member = config
+        .voters
+        .iter()
+        .chain(&config.learners)
+        .chain(&config.non_voting)
+        .any(|node_id| !state.members.iter().any(|member| &member.node_id == node_id));
+    if missing_member {
+        read_cluster_raft_forwarding_topology(storage, state, config)?.apply_to(state)
+    } else {
+        project_cluster_raft_config_record(state, &config)
+    }
 }
 
 struct AsyncNodeRaftAppendReplicationHost<'a, H> {
@@ -4757,7 +4783,11 @@ where
                 {
                     let config: sinomo_kv::ClusterKvRaftConfigRecord =
                         entry.decode().map_err(kv_err)?;
-                    project_cluster_raft_config_record(&mut consensus_state, &config)?;
+                    project_committed_cluster_raft_members_for_commit(
+                        storage,
+                        &mut consensus_state,
+                        config,
+                    )?;
                 }
                 Ok::<_, NetworkError>(())
             })();
@@ -4771,6 +4801,10 @@ where
         },
     )
     .await?;
+    // Keep the caller's topology paired with the resident revision, as in the
+    // synchronous path. A delayed local writer must not persist the old member
+    // set with the newly observed revision after this commit returns.
+    *state = consensus_state.clone();
     let request_id = request.request_id.clone();
     let initial_term = consensus_state.term;
     let initial_revision = consensus_state.kv_revision;
