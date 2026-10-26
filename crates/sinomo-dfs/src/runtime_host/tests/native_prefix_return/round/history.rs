@@ -466,7 +466,7 @@ fn native_prefix_history_post_sync_deadline_retains_uncertainty_without_recertif
                 },
                 || service.retain_native_prefix_history(&round, intake_deadline),
             );
-            report["initial_outcome"] = serde_json::json!({"error":result.as_ref().err().map(ToString::to_string()),
+            report["initial_outcome"] = serde_json::json!({"error":result.as_ref().err().map(ToString::to_string),
             "cut_count":cut_count.get(),"intake_deadline_expired":Instant::now() >= intake_deadline,
             "original_round_deadline_unchanged":round.deadline() == original_round_deadline});
             let error = result
