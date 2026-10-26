@@ -15,7 +15,51 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R63
+## Current development checkpoint — 2026-10-26 R64
+
+The next bounded prerequisite collects one in-memory native observation round
+from R63's actual private returns. Source `70e74527` and controls `0f5dca5d` /
+`4c640868` are integrated at `53d67371`, source `486ff574` with 4,927 inputs.
+The existing R63 producer, ordinary sync/fanout and Repair paths remain unchanged.
+
+The direct-capture owner fixes the round identity and both peer commands before
+any dispatch, then invokes R63 once per attempted peer under the same absolute
+deadline. Completion requires the exact configured remote set and matching
+native source assignment, prefix and local physical observations. It does not
+invent a self RPC acknowledgement or use a majority count. Complete and
+incomplete results retain no runtime, store or owner lease and have no raw,
+Clone, serialization or partial-adoption constructor.
+
+Incomplete results preserve actual native returns, response DATA without native
+proof, exact network/delivery errors, and commands/reasons for unattempted peers.
+Unknown outcomes never become not-sent merely to complete a set. This result is
+historical captured evidence, not current serving, effect or commit authority.
+
+Fresh check/build/seal (I191), all three new native controls (I192), and full
+DFS/KV boundary analysis (I193: 11 UI controls and three libraries) passed.
+**238 other inventory IDs remain UNRUN on R64.** R63's seven passes retain their
+original source qualification and were not repeated. The controls verify the
+exact native remote set and owner release, duplicate/subset and generic-DATA
+refusal, and retention of actual B evidence plus C's PossiblyApplied failure.
+After exact fault release/drain, the SAME target completes under a fresh round
+with new native calls; old partial evidence is not adopted. Complete and partial
+values remain held through successful normal source-owner close.
+
+The 473-file fixture archive passed comparison/hash checks. R64-REPORT.md,
+R64-COMBINED-RECEIPT.json and I191/I192/I193 receipts retain exact source/ELF,
+commands, per-case outcomes, raw reports and complete owned cleanup. All previous
+failures remain immutable. There was no model/account switch, competing owner,
+peer build arbitration, Docker or production action.
+
+This slice supports observation of an already initialized three-member scope.
+Deadline-before-next-peer Unattempted and mixed-native-source finalization refusal
+branches are defined but not executed by this panel. Physical late delivery,
+durable intake/replay, genesis selection, current serving/C1, receipt/W
+application, Terminal/Close/root release, recovery quorum and full abrupt-loss /
+reconnection acceptance remain open. Stabilized maintenance still requires
+absolute zero writes; this slice adds no periodic work.
+
+## Historical development checkpoint — 2026-10-26 R63
 
 The bounded direct native PREFIX return capture is implemented (`bd3e40c5`),
 integrated at `3a721197`, with native controls `2190406a` and test-only borrow
