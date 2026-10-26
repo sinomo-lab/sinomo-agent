@@ -15,7 +15,43 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R82
+## Current development checkpoint — 2026-10-26 R83 / bounded R84 continuation
+
+R83 integrated `8a100330`/`11524c55`/`768acb85`/`96e924bb` at `545815e0`
+without conflicts. The actual registered component carrier now exposes one
+optional exact-endpoint call; unsupported carriers refuse without generic
+fallback. The daemon checks its own current authorized member and exact native
+descriptor, then uses the existing authenticated endpoint API under its own
+paths/runtime. Ordinary routing and wire/persistence formats are unchanged.
+The test-only PREFIX contact scope retains the real registered host and all
+source/physical/prefix/participant/deadline checks; DATA cannot mint provenance.
+
+Source `f9098136` /4,934 inputs: I259 fresh check/build/seal PASS;
+I260 **4PASS/1FAIL/253 other inventory controlsUNRUN**; I261 ring18PASS;
+I262 full boundary11UI/three librariesPASS. Actual registered endpoint A-only
+SIGKILL/survivor calls, generic-carrier no-fallback refusal and two affected R63
+PREFIX regressions passed. The new full3 PREFIX positive FAILED before any
+PREFIX peer call or A kill: A expected service-cache generation3 while its
+same authority reported ready generation4; B/C had no existing source cache.
+No stale owner was admitted. All three failed-case daemons exited normally0.
+The original assertion/logs/raw572-file archives remain sealed in combined
+receipt `eee4b8fb` and R83 report;55 known identities and owned scopes/groups/
+cgroups/roots were drained. No full-set baseline or survivor-serving result
+is inferred from the four passes.
+
+R84 source correction `8d515425` changes ONLY the test's initial readiness
+observation. Network ping readiness is not DFS-owner readiness. It retains every
+read-only refusal, waits only within the ORIGINAL60s startup envelope, clamps
+each call to min(original5s, remaining startup), and spaces three-node rounds
+by2s to stay below the unchanged128-record bound. No cache refresh, backend
+opener, generation substitution, initializer, participant reduction or deadline
+extension is added. An actual complete full3 result before the original deadline
+is still required. R84 compilation/execution is pending; persistent refusal will
+expose the normal-owner signature/admission dependency rather than be waived.
+All earlier failures and R74/R81/R82 evidence remain unchanged. Quietness,
+metadata/WN availability and serving/genesis/C1 activation remain unqualified.
+
+## Historical development checkpoint — 2026-10-26 R82
 
 The finite retained per-node constructor is implemented in `78fa3417` with parent
 ownership controls `12c4fb95`, merged at `19a61d44` without conflicts. It consumes
