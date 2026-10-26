@@ -403,6 +403,9 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
     {
         return Err("native child roots are not its exact parent-owned paths".into());
     }
+    if let Some(expected) = input.retained.as_ref() {
+        return run_retained_node(&input, expected);
+    }
     match fs::symlink_metadata(&input.data_root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         _ => return Err("native process constructor requires an absent fresh DATA root".into()),
@@ -505,6 +508,283 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
         "daemon",
         Some(cluster),
         driver_catalog(&input, peers, contacts)?,
+        sinomo_daemon::DaemonRuntimeConfig::default(),
+    )?;
+    Ok(())
+}
+
+const RETAINED_IDENTITY_CAP: usize = 64 * 1024;
+const RETAINED_WAL_CAP: usize = 16 * 1024 * 1024;
+
+fn previous_owned_process_absent(expected: &RetainedNodeStart) -> TestResult<()> {
+    if expected.old_pid == 0 || expected.old_start == 0 || expected.old_pid == std::process::id() {
+        return Err("retained start has no distinct actual previous process identity".into());
+    }
+    match ProcessIdentity::read(expected.old_pid) {
+        Ok(actual) if actual.start == expected.old_start => {
+            Err("retained native process is still present with its captured start identity".into())
+        }
+        Ok(_) => Ok(()), // PID was reused; never signal an unrelated process.
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error), // Unreadable/malformed is not proof of absence.
+    }
+}
+
+fn open_retained_path(
+    path: &Path,
+    directory: bool,
+    expected: Option<[u64; 2]>,
+) -> TestResult<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !path.is_absolute()
+        || path.canonicalize()? != path
+        || before.file_type().is_symlink()
+        || before.is_dir() != directory
+        || (!directory && !before.is_file())
+    {
+        return Err("retained native source is missing, aliased or the wrong physical type".into());
+    }
+    let file = File::open(path)?;
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    let identity = [opened.dev(), opened.ino()];
+    if [before.dev(), before.ino()] != identity
+        || [named.dev(), named.ino()] != identity
+        || expected.is_some_and(|expected| expected != identity)
+    {
+        return Err("retained native physical source was replaced".into());
+    }
+    Ok(file)
+}
+
+fn read_retained_file(path: &Path, file: &File, cap: usize) -> TestResult<Vec<u8>> {
+    let before = FileId::of(&file.metadata()?);
+    let bytes = read_pinned(file, before.size, cap)?;
+    if FileId::of(&file.metadata()?) != before || FileId::of(&fs::symlink_metadata(path)?) != before
+    {
+        return Err("retained native file changed during bounded observation".into());
+    }
+    Ok(bytes)
+}
+
+fn run_retained_node(input: &NodeInput, expected: &RetainedNodeStart) -> TestResult<()> {
+    previous_owned_process_absent(expected)?;
+    let data = SinomoDataDir::new(&input.data_root);
+    // Do not call ensure_root_layout or load_or_create identity here. All
+    // physical sources must already exist before any normal daemon opener.
+    let mut pins = vec![(
+        input.data_root.clone(),
+        open_retained_path(&input.data_root, true, Some(expected.data_identity))?,
+    )];
+    let owner_path = input.data_root.join("daemon/data-owner.lock");
+    let owner = open_retained_path(&owner_path, false, Some(expected.data_owner_identity))?;
+    fs2::FileExt::try_lock_exclusive(&owner)?;
+    pins.push((owner_path, owner));
+    let identity_path = sinomo_core::node::NodeIdentityPaths::new(&input.data_root).main;
+    let identity_file =
+        open_retained_path(&identity_path, false, Some(expected.identity_identity))?;
+    let identity_bytes = read_retained_file(&identity_path, &identity_file, RETAINED_IDENTITY_CAP)?;
+    if blake3::hash(&identity_bytes).to_hex().as_str() != expected.identity_blake3 {
+        return Err("retained native identity bytes differ from the preserved original".into());
+    }
+    // Same native stored DATA codec, read-only. Never print/serialize this
+    // private material, construct a signer or generate a replacement key.
+    let identity: sinomo_core::node::NodeIdentity =
+        sinomo_core::object::serde_ext::from_bytes(&identity_bytes)?;
+    if identity.public_key != expected.public_key || expected.public_key.is_empty() {
+        return Err("retained native public identity differs".into());
+    }
+    drop(identity);
+    drop(identity_bytes);
+    pins.push((identity_path, identity_file));
+    let initial: NodeConfiguration = read_data(&input.owned_root.join("configuration.sobj"))?;
+    let original: NodeHello = read_data(&input.owned_root.join("hello.sobj"))?;
+    if original.pid != expected.old_pid
+        || original.node_id != input.node_id
+        || original.public_key != expected.public_key
+        || original.address != expected.address
+        || input.invocation != format!("{}:restart", original.invocation)
+        || !initial.bootstrap_initial_voter
+        || initial.state.cluster_id != expected.cluster_id
+    {
+        return Err(
+            "retained A start differs from the original owned fixture hello/configuration".into(),
+        );
+    }
+    let peers = validate_configuration(input, &original, &initial)?;
+    let contacts: OwnedContacts = initial
+        .state
+        .members
+        .iter()
+        .map(|member| {
+            (
+                member.node_id.clone(),
+                (
+                    member.endpoints[0].address.clone(),
+                    member.node_public_key.clone(),
+                ),
+            )
+        })
+        .collect();
+    let paths = ClusterPaths::new(&data);
+    let state_file = open_retained_path(&paths.state, false, None)?;
+    // Pin the original DATA before the native read. Never write the initial
+    // configuration back, nor treat its old role/term as current permission.
+    let state_bytes = read_retained_file(&paths.state, &state_file, DATA_CAP)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
+    if state.local_node_id != input.node_id
+        || state.cluster_id != expected.cluster_id
+        || state.initialized_at != initial.state.initialized_at
+        || state.term < initial.state.term
+        || state.kv_revision < initial.state.kv_revision
+        || state.members.len() != 3
+        || state
+            .members
+            .iter()
+            .map(|member| member.node_id.clone())
+            .collect::<BTreeSet<_>>()
+            != peers
+    {
+        return Err(
+            "retained native node/cluster/member state differs from the original fixture".into(),
+        );
+    }
+    for member in &state.members {
+        let (address, key) = contacts
+            .get(&member.node_id)
+            .ok_or("retained member outside original contact allowlist")?;
+        if member.cluster_id != state.cluster_id
+            || member.node_public_key != *key
+            || !member.state.is_authorized()
+            || !member.endpoints.iter().any(|endpoint| {
+                endpoint.node_id == member.node_id
+                    && endpoint.address == *address
+                    && matches!(
+                        endpoint.transport,
+                        sinomo_core::ClusterTransportKind::Loopback
+                            | sinomo_core::ClusterTransportKind::LanTcp
+                    )
+            })
+        {
+            return Err("retained native membership lost an original owned contact/key".into());
+        }
+    }
+    if read_retained_file(&paths.state, &state_file, DATA_CAP)? != state_bytes {
+        return Err("retained native cluster state changed during validation".into());
+    }
+    pins.push((paths.state.clone(), state_file));
+    let wal = paths.kv_paths().raft_wal_paths(&input.node_id);
+    pins.push((
+        wal.root.clone(),
+        open_retained_path(&wal.root, true, Some(expected.wal_root_identity))?,
+    ));
+    let wal_lock = open_retained_path(&wal.lock, false, Some(expected.wal_lock_identity))?;
+    fs2::FileExt::try_lock_exclusive(&wal_lock)?;
+    pins.push((wal.lock.clone(), wal_lock));
+    let wal_file = open_retained_path(&wal.wal, false, Some(expected.wal_identity))?;
+    let wal_bytes = read_retained_file(&wal.wal, &wal_file, RETAINED_WAL_CAP)?;
+    if blake3::hash(&wal_bytes).to_hex().as_str() != expected.wal_blake3 {
+        return Err("retained native WAL bytes differ from the post-kill preservation".into());
+    }
+    drop(wal_bytes);
+    pins.push((wal.wal.clone(), wal_file));
+    let hard_file = open_retained_path(&wal.hard_state, false, Some(expected.hard_state_identity))?;
+    let hard_bytes = read_retained_file(&wal.hard_state, &hard_file, DATA_CAP)?;
+    if blake3::hash(&hard_bytes).to_hex().as_str() != expected.hard_state_blake3 {
+        return Err("retained native Raft hard-state bytes changed after preservation".into());
+    }
+    let hard: sinomo_core::kv::RaftHardState =
+        sinomo_core::object::serde_ext::from_bytes(&hard_bytes)?;
+    if expected.raft_commit_index == 0
+        || hard.current_term < expected.raft_term
+        || hard.commit_index < expected.raft_commit_index
+    {
+        return Err("retained native Raft term/commit is missing or regressed".into());
+    }
+    pins.push((wal.hard_state.clone(), hard_file));
+    match (
+        &expected.wal_snapshot_identity,
+        &expected.wal_snapshot_blake3,
+    ) {
+        (Some(identity), Some(hash)) => {
+            let snapshot = open_retained_path(&wal.snapshot, false, Some(*identity))?;
+            let bytes = read_retained_file(&wal.snapshot, &snapshot, RETAINED_WAL_CAP)?;
+            if blake3::hash(&bytes).to_hex().as_str() != hash.as_str() {
+                return Err(
+                    "retained native Raft snapshot bytes changed after preservation".into(),
+                );
+            }
+            pins.push((wal.snapshot.clone(), snapshot));
+        }
+        (None, None) => match fs::symlink_metadata(&wal.snapshot) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => return Err("retained native Raft snapshot appeared after preservation".into()),
+        },
+        _ => return Err("retained native Raft snapshot expectation is incomplete".into()),
+    }
+    previous_owned_process_absent(expected)?;
+    let address: SocketAddr = expected.address.parse()?;
+    if address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 {
+        return Err("retained native listener is not its exact original loopback contact".into());
+    }
+    let hello_path = input.owned_root.join("restart-hello.sobj");
+    match fs::symlink_metadata(&hello_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => return Err("retained native restart hello already exists; preserve it".into()),
+    }
+    let listener =
+        sinomo_daemon::prepare_daemon_control_listener(sinomo_daemon::DaemonRunOptions {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: address.port(),
+            port_fallback: false,
+        })?;
+    if listener.options().port != address.port() || listener.fallback_from_port().is_some() {
+        return Err("retained native listener changed its original port".into());
+    }
+    // Recheck names against the retained descriptors, with both native lock
+    // files still held. No directory mtime is mistaken for physical identity.
+    for (path, file) in &pins {
+        let descriptor = file.metadata()?;
+        let named = fs::symlink_metadata(path)?;
+        if named.file_type().is_symlink()
+            || [named.dev(), named.ino()] != [descriptor.dev(), descriptor.ino()]
+            || named.is_dir() != descriptor.is_dir()
+            || path.canonicalize()? != *path
+        {
+            return Err("retained native path changed before normal owner acquisition".into());
+        }
+    }
+    let cluster =
+        sinomo_daemon::daemon_cluster_status(&state, sinomo_daemon::DaemonClusterProcess::Main)
+            .ok_or("retained actual startup cluster status unavailable")?;
+    let catalog = driver_catalog(input, peers, contacts)?;
+    write_data(
+        &hello_path,
+        &NodeHello {
+            pid: std::process::id(),
+            invocation: input.invocation.clone(),
+            node_id: input.node_id.clone(),
+            address: expected.address.clone(),
+            public_key: expected.public_key.clone(),
+        },
+    )?;
+    // The normal daemon acquires its OWN actual storage/lifecycle locks. The
+    // manifest and these read-only pins are not runtime authority or a signer.
+    drop(pins);
+    sinomo_daemon::run_daemon_control_loop_with_prepared_listener(
+        listener,
+        sinomo_daemon::DaemonPaths::new(&data),
+        "daemon",
+        Some(cluster),
+        catalog,
         sinomo_daemon::DaemonRuntimeConfig::default(),
     )?;
     Ok(())
