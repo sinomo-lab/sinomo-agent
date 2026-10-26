@@ -24,6 +24,7 @@ enum SourceCase {
     PartiallyLiveMain,
     SaturatedHints,
     ColdSourceProcess,
+    ColdRoutedSourceProcess,
     LiveFailureCountReset,
     SemanticChange,
     Deadline,
@@ -60,20 +61,28 @@ async fn multihop_source_scenario(case: SourceCase) {
         data.push(dir);
     }
     let mut extra_endpoints = Vec::new();
-    if case == SourceCase::ColdSourceProcess {
+    if matches!(
+        case,
+        SourceCase::ColdSourceProcess | SourceCase::ColdRoutedSourceProcess
+    ) {
         // Two authenticated processes advertise the same source node. The
         // preferred endpoint has only expired in-memory source observations;
         // the other process holds the genuine live source renewal.
-        endpoints[0].priority = 10;
+        let source_index = if case == SourceCase::ColdRoutedSourceProcess {
+            2
+        } else {
+            1
+        };
+        endpoints[source_index - 1].priority = 10;
         let listener = sinomo_network::AsyncDaemonControlListener::bind("127.0.0.1:0")
             .await
             .unwrap();
         extra_endpoints.push(sinomo_network::daemon_lan_endpoint(
-            &nodes[1],
+            &nodes[source_index],
             listener.local_addr_string().unwrap(),
             0,
         ));
-        listeners.push((1, listener, true));
+        listeners.push((source_index, listener, true));
     }
     let now = OffsetDateTime::now_utc();
     let mut state = sinomo_base::ClusterBootstrapState::initialized_locally(
@@ -95,7 +104,15 @@ async fn multihop_source_scenario(case: SourceCase) {
         member.endpoints.push(endpoints[i - 1].clone());
         state.members.push(member);
     }
-    state.members[1].endpoints.extend(extra_endpoints.clone());
+    for endpoint in &extra_endpoints {
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == endpoint.node_id)
+            .unwrap()
+            .endpoints
+            .push(endpoint.clone());
+    }
     let mut stalled_servers = tokio::task::JoinSet::new();
     let stalled_connections = Arc::new(AtomicUsize::new(0));
     if case == SourceCase::SaturatedHints {
@@ -164,7 +181,7 @@ async fn multihop_source_scenario(case: SourceCase) {
         .unwrap();
         let mut source = state.clone();
         source.local_node_id = nodes[i].clone();
-        let observation = sinomo_network::cluster_connectivity_record(
+        let mut observation = sinomo_network::cluster_connectivity_record(
             &source,
             endpoint,
             sinomo_network::ClusterConnectivityState::Healthy,
@@ -175,6 +192,13 @@ async fn multihop_source_scenario(case: SourceCase) {
             now,
             900,
         );
+        if case == SourceCase::ColdRoutedSourceProcess && i == 1 {
+            // The fresh process remains reachable through a degraded edge;
+            // the healthy alternate is deliberately the preferred cold one.
+            // This makes process selection deterministic without a timing race.
+            observation.state = sinomo_network::ClusterConnectivityState::Degraded;
+            observation.consecutive_failures = 2;
+        }
         let mut expired = observation.clone();
         expired.observed_at -= time::Duration::hours(1);
         expired.expires_at -= time::Duration::hours(1);
@@ -203,8 +227,14 @@ async fn multihop_source_scenario(case: SourceCase) {
             None,
         )
         .unwrap();
+        let target_index = nodes
+            .iter()
+            .position(|node| node == &endpoint.node_id)
+            .unwrap();
+        let mut source = state.clone();
+        source.local_node_id = nodes[target_index - 1].clone();
         let observation = sinomo_network::cluster_connectivity_record(
-            &state,
+            &source,
             endpoint,
             sinomo_network::ClusterConnectivityState::Healthy,
             None,
@@ -249,7 +279,9 @@ async fn multihop_source_scenario(case: SourceCase) {
         observed.connectivity_records().unwrap().len(),
         usize::from(matches!(
             case,
-            SourceCase::PartiallyLiveMain | SourceCase::ColdSourceProcess
+            SourceCase::PartiallyLiveMain
+                | SourceCase::ColdSourceProcess
+                | SourceCase::ColdRoutedSourceProcess
         ))
     );
     let baseline = observed.connectivity_freshness_baseline().unwrap();
@@ -283,6 +315,20 @@ async fn multihop_source_scenario(case: SourceCase) {
         .is_empty(),
         "controlled live graph has an executable two-bridge route"
     );
+    if case == SourceCase::ColdRoutedSourceProcess {
+        let preferred = sinomo_network::plan_routes(
+            &directory,
+            &live_snapshot,
+            &nodes[0],
+            &nodes[2],
+            Default::default(),
+        );
+        assert_eq!(
+            preferred[0].hops.last().unwrap().endpoint.endpoint_id,
+            extra_endpoints[0].endpoint_id,
+            "the before-control must actually choose the cold process first"
+        );
+    }
     let reads = Arc::new((0..4).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
     let effects = Arc::new(AtomicUsize::new(0));
     let rejected_direct = Arc::new(AtomicUsize::new(0));
@@ -545,6 +591,7 @@ async fn multihop_source_scenario(case: SourceCase) {
         | SourceCase::PartiallyLiveMain
         | SourceCase::SaturatedHints
         | SourceCase::ColdSourceProcess
+        | SourceCase::ColdRoutedSourceProcess
         | SourceCase::LiveFailureCountReset => {
             assert_eq!(response.unwrap(), "original response");
             assert_eq!(effects.load(Ordering::SeqCst), 1);
@@ -573,11 +620,18 @@ async fn multihop_source_scenario(case: SourceCase) {
             assert_eq!(effects.load(Ordering::SeqCst), 0);
         }
     }
-    assert_eq!(
-        reads[2].load(Ordering::SeqCst),
-        1,
-        "C's own authenticated reply is required; B cannot renew C's edge"
-    );
+    if case == SourceCase::ColdRoutedSourceProcess {
+        assert!(
+            (1..=2).contains(&reads[2].load(Ordering::SeqCst)),
+            "C's genuine fresh process must reply; each routed endpoint is read at most once"
+        );
+    } else {
+        assert_eq!(
+            reads[2].load(Ordering::SeqCst),
+            1,
+            "C's own authenticated reply is required; B cannot renew C's edge"
+        );
+    }
     if case != SourceCase::SaturatedHints {
         assert!(rejected_direct.load(Ordering::SeqCst) > 0);
     }
@@ -614,4 +668,9 @@ async fn cold_source_process_does_not_hide_other_endpoint_live_observation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_source_routes_with_live_failure_count_reset_on_remote_bridge() {
     multihop_source_scenario(SourceCase::LiveFailureCountReset).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_routed_source_process_does_not_hide_other_endpoint_live_observation() {
+    multihop_source_scenario(SourceCase::ColdRoutedSourceProcess).await;
 }

@@ -79,14 +79,17 @@ fn merge_observations(
 
 enum SourceRead {
     Direct(ClusterEndpointRecord),
-    Routed(NodeId, Arc<crate::MultiHopRoutedConnector>),
+    Routed(ClusterEndpointRecord, Arc<crate::MultiHopRoutedConnector>),
 }
 impl SourceRead {
-    fn source(&self) -> &NodeId {
+    fn endpoint(&self) -> &ClusterEndpointRecord {
         match self {
-            Self::Direct(endpoint) => &endpoint.node_id,
-            Self::Routed(node, _) => node,
+            Self::Direct(endpoint) | Self::Routed(endpoint, _) => endpoint,
         }
+    }
+
+    fn source(&self) -> &NodeId {
+        &self.endpoint().node_id
     }
 }
 
@@ -120,7 +123,8 @@ async fn read_source(
                     )
                     .await?
             }
-            SourceRead::Routed(source, connector) => {
+            SourceRead::Routed(endpoint, connector) => {
+                let source = &endpoint.node_id;
                 // Reuse the ordinary authenticated carrier and exact request
                 // authority scope. Never recurse into freshness collection.
                 let constraints = stream_native_service_route_constraints();
@@ -132,6 +136,7 @@ async fn read_source(
                     connector.connect_with_destination_process_affinity(source.clone(), crate::ConnectOptions {
                         constraints, timeout: remaining, protection: options.protection,
                     }, affinity),
+                    Some(endpoint.endpoint_id.clone()),
                 ).await?;
                 crate::service_rpc_stream::call_service_rpc_peer_stream(
                     stream,
@@ -259,7 +264,7 @@ pub(super) async fn refresh_connector(
         direct_source_endpoint_candidates(&snapshot, state, &records, &baseline.records)?;
     let mut direct = std::collections::VecDeque::from(candidates);
     let mut reads = futures_util::stream::FuturesUnordered::new();
-    let mut attempted_sources = std::collections::BTreeSet::new();
+    let mut attempted_endpoints = std::collections::BTreeSet::new();
     let mut refreshed = false;
     let mut authenticated = std::collections::BTreeSet::new();
     let mut connector = connector_from_observed_records(
@@ -283,7 +288,6 @@ pub(super) async fn refresh_connector(
             }
             if node.node_id == state.local_node_id
                 || &node.node_id == target
-                || attempted_sources.contains(&node.node_id)
                 || !state.members.iter().any(|member| {
                     member.node_id == node.node_id
                         && member.node_public_key == node.public_key
@@ -294,15 +298,48 @@ pub(super) async fn refresh_connector(
             {
                 continue;
             }
-            attempted_sources.insert(node.node_id.clone());
-            reads.push(read_source(
-                SourceRead::Routed(node.node_id.clone(), connector.clone()),
-                paths,
-                state,
-                options,
-                deadline,
-                route_context,
-            ));
+            for endpoint in &node.endpoints {
+                if reads.len() == MAX_SOURCE_READS_IN_FLIGHT {
+                    break;
+                }
+                let key = (node.node_id.clone(), endpoint.endpoint_id.clone());
+                if attempted_endpoints.contains(&key)
+                    || endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly
+                    || !records.iter().any(|record| {
+                        record.target_node_id == node.node_id
+                            && record.endpoint_id == endpoint.endpoint_id
+                            && record.transport == endpoint.transport
+                            && record.address == endpoint.address
+                            && record.state != ClusterConnectivityState::Unreachable
+                            && crate::cluster_network_record_live(record.expires_at, OffsetDateTime::now_utc())
+                    })
+                {
+                    continue;
+                }
+                // A source node's processes can hold different live views.
+                // Narrow this read to one already-advertised endpoint without
+                // changing the authorized directory cut or inventing an edge.
+                let mut nodes = snapshot.nodes().values().cloned().collect::<Vec<_>>();
+                nodes.iter_mut().find(|n| n.node_id == node.node_id).unwrap()
+                    .endpoints.retain(|candidate| candidate == endpoint);
+                let selected = DirectorySnapshot::try_new(snapshot.version(), nodes)?;
+                let selected_records = records.iter().filter(|record| {
+                    record.target_node_id != node.node_id
+                        || record.endpoint_id == endpoint.endpoint_id
+                }).cloned().collect();
+                let source_connector = connector_from_observed_records(
+                    paths, state, selected, selected_records, options.call_policy().health,
+                    Some(&authenticated),
+                )?;
+                if !source_connector.has_live_observed_route(&node.node_id, crate::DestinationProcessAffinity::Any) {
+                    continue;
+                }
+                attempted_endpoints.insert(key);
+                reads.push(read_source(
+                    SourceRead::Routed(endpoint.clone(), source_connector),
+                    paths, state, options, deadline, route_context,
+                ));
+            }
         }
         while reads.len() < MAX_SOURCE_READS_IN_FLIGHT {
             let Some(endpoint) = direct.pop_front() else {
@@ -337,7 +374,7 @@ pub(super) async fn refresh_connector(
             response,
             now,
         )?;
-        attempted_sources.insert(origin.source().clone());
+        attempted_endpoints.insert((origin.source().clone(), origin.endpoint().endpoint_id.clone()));
         if let SourceRead::Direct(endpoint) = origin {
             // Only a successful direct RPC supplies a local adjacent edge.
             // A routed reply never fabricates local-to-source connectivity.

@@ -570,6 +570,8 @@ struct PoolKey {
     require_relay_forwarding: bool,
     max_hops: usize,
     destination_process_affinity: crate::DestinationProcessAffinity,
+    // Local route-selection constraint, never a new wire affinity or authority.
+    terminal_endpoint_id: Option<Id>,
 }
 
 impl PoolKey {
@@ -596,6 +598,7 @@ impl PoolKey {
             require_relay_forwarding: constraints.require_relay_forwarding,
             max_hops: constraints.max_hops,
             destination_process_affinity,
+            terminal_endpoint_id: None,
         }
     }
 
@@ -615,6 +618,7 @@ impl PoolKey {
             && self.require_relay_forwarding == other.require_relay_forwarding
             && self.max_hops == other.max_hops
             && self.destination_process_affinity == other.destination_process_affinity
+            && self.terminal_endpoint_id == other.terminal_endpoint_id
     }
 }
 
@@ -805,6 +809,7 @@ where
         protection,
         timeout,
         establish,
+        None,
     )
     .await
 }
@@ -822,6 +827,7 @@ pub(crate) async fn open_pooled_routed_stream_with_protection_destination_affini
     protection: crate::RoutedSessionProtection,
     timeout: Duration,
     establish: F,
+    terminal_endpoint_id: Option<Id>,
 ) -> Result<PeerStream, NetworkError>
 where
     F: Future<Output = Result<PeerStream, NetworkError>>,
@@ -838,6 +844,7 @@ where
         timeout,
         establish,
         crate::network_module_routing_generation,
+        terminal_endpoint_id,
     )
     .await
 }
@@ -854,6 +861,7 @@ async fn open_pooled_routed_stream_with_route_compatibility_source<F, G>(
     timeout: Duration,
     establish: F,
     current_route_compatibility_generation: G,
+    terminal_endpoint_id: Option<Id>,
 ) -> Result<PeerStream, NetworkError>
 where
     F: Future<Output = Result<PeerStream, NetworkError>>,
@@ -864,10 +872,14 @@ where
     let observation = tracing::trace_span!(target: "sinomo.perf", "network.carrier.open",
         stage = "network.carrier.open", scope = %scope, local_node_id = %local_node_id,
         peer_node_id = %peer_node_id, route_compatibility_generation, directory_generation,
-        affinity = ?destination_process_affinity, protection = ?protection);
+        affinity = ?destination_process_affinity, protection = ?protection,
+        terminal_endpoint = tracing::field::Empty);
+    if let Some(endpoint) = terminal_endpoint_id.as_ref() {
+        observation.record("terminal_endpoint", tracing::field::display(endpoint));
+    }
     let mut phase = "pool-lookup";
     let open = async {
-        let key = PoolKey::new(
+        let mut key = PoolKey::new(
             scope,
             route_compatibility_generation,
             directory_generation,
@@ -877,6 +889,7 @@ where
             peer_node_id,
             protection,
         );
+        key.terminal_endpoint_id = terminal_endpoint_id.clone();
         let observed_generation = current_route_compatibility_generation();
         if observed_generation != key.route_compatibility_generation {
             return Err(stale_route_compatibility_error(
@@ -984,6 +997,9 @@ where
                 if carrier.local_node_id != key.local_node_id
                     || carrier.peer_node_id != key.peer_node_id
                     || carrier.protection != key.protection
+                    || key.terminal_endpoint_id.as_ref().is_some_and(|endpoint| {
+                        carrier.route_trace.endpoint_ids.last() != Some(endpoint)
+                    })
                 {
                     return Err(NetworkError::AuthDenied);
                 }
@@ -1114,6 +1130,7 @@ where
         timeout,
         carrier,
         || 0,
+        None,
     )
     .await
 }
@@ -1630,6 +1647,7 @@ mod tests {
             timeout,
             establish,
             move || route_compatibility_generation,
+            None,
         )
         .await
     }
@@ -3018,6 +3036,7 @@ async fn delayed_old_generation_cannot_replace_or_coexist_with_a_new_pooled_carr
                 Ok(old_client)
             },
             move || old_generation.load(std::sync::atomic::Ordering::Acquire),
+            None,
         )
         .await
     });
@@ -3039,6 +3058,7 @@ async fn delayed_old_generation_cannot_replace_or_coexist_with_a_new_pooled_carr
         Duration::from_secs(1),
         async move { Ok(new_client) },
         move || new_generation.load(std::sync::atomic::Ordering::Acquire),
+        None,
     )
     .await
     .expect("new generation carrier");
@@ -3070,6 +3090,7 @@ async fn delayed_old_generation_cannot_replace_or_coexist_with_a_new_pooled_carr
             })
         },
         move || reuse_generation.load(std::sync::atomic::Ordering::Acquire),
+        None,
     )
     .await
     .expect("reuse new generation carrier");
@@ -3169,6 +3190,7 @@ async fn main_affinity_never_reuses_an_existing_process_agnostic_carrier() {
         Duration::from_secs(1),
         async move { Ok(any_client) },
         move || generation,
+        None,
     )
     .await
     .expect("process-agnostic shadow-capable carrier");
@@ -3186,6 +3208,7 @@ async fn main_affinity_never_reuses_an_existing_process_agnostic_carrier() {
         Duration::from_secs(1),
         async move { Ok(main_client) },
         move || generation,
+        None,
     )
     .await
     .expect("main-affine carrier");
@@ -3240,4 +3263,68 @@ fn routed_carrier_pool_never_crosses_module_compatibility_generations() {
         !before.same_base_relationship(&unrelated_peer),
         "compatibility pruning must remain scoped to the exact node relationship"
     );
+}
+
+
+#[tokio::test]
+async fn terminal_endpoint_carriers_remain_distinct_and_retire_with_the_owner_scope() {
+    let (mut first_client, first_server) = tests::carrier_pair();
+    let (mut second_client, second_server) = tests::carrier_pair();
+    let local = first_client.local_node_id.clone();
+    let peer = first_client.peer_node_id.clone();
+    let first_endpoint = Id::generate();
+    let second_endpoint = Id::generate();
+    first_client.route_trace.endpoint_ids = vec![first_endpoint.clone()];
+    second_client.route_trace.endpoint_ids = vec![second_endpoint.clone()];
+    let first_session = first_client.session_id.clone();
+    let second_session = second_client.session_id.clone();
+    let scope = Id::generate().to_string();
+    let generation = crate::network_module_routing_generation();
+    let first = open_pooled_routed_stream_with_route_compatibility_source(
+        scope.clone(), generation, 1, RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any, local.clone(), peer.clone(),
+        crate::RoutedSessionProtection::Plaintext, Duration::from_secs(1),
+        async move { Ok(first_client) }, move || generation, Some(first_endpoint.clone()),
+    ).await.unwrap();
+    let second = open_pooled_routed_stream_with_route_compatibility_source(
+        scope.clone(), generation, 1, RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any, local.clone(), peer.clone(),
+        crate::RoutedSessionProtection::Plaintext, Duration::from_secs(1),
+        async move { Ok(second_client) }, move || generation, Some(second_endpoint),
+    ).await.unwrap();
+    assert_eq!(first.session_id, first_session);
+    assert_eq!(second.session_id, second_session);
+    assert_ne!(first.session_id, second.session_id,
+        "the same node identity cannot substitute another process endpoint's carrier");
+    let reused = open_pooled_routed_stream_with_route_compatibility_source(
+        scope.clone(), generation, 1, RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any, local, peer,
+        crate::RoutedSessionProtection::Plaintext, Duration::from_secs(1),
+        async { Err(NetworkError::AuthDenied) }, move || generation, Some(first_endpoint),
+    ).await.expect("the exact endpoint's existing carrier stays reusable");
+    assert_eq!(reused.session_id, first_session);
+    drop((first, second, reused));
+    assert_eq!(retire_pooled_routed_streams(&scope).await, 2,
+        "the original owner-scope retirement includes endpoint-specific carriers");
+    drop((first_server, second_server));
+}
+
+#[tokio::test]
+async fn terminal_endpoint_requirement_rejects_a_different_established_endpoint() {
+    let (mut client, server) = tests::carrier_pair();
+    let local = client.local_node_id.clone();
+    let peer = client.peer_node_id.clone();
+    let wanted = Id::generate();
+    client.route_trace.endpoint_ids = vec![Id::generate()];
+    let scope = Id::generate().to_string();
+    let generation = crate::network_module_routing_generation();
+    let result = open_pooled_routed_stream_with_route_compatibility_source(
+        scope.clone(), generation, 1, RouteConstraints::default(),
+        crate::DestinationProcessAffinity::Any, local, peer,
+        crate::RoutedSessionProtection::Plaintext, Duration::from_secs(1),
+        async move { Ok(client) }, move || generation, Some(wanted),
+    ).await;
+    assert!(matches!(result, Err(NetworkError::AuthDenied)));
+    assert_eq!(retire_pooled_routed_streams(&scope).await, 0);
+    drop(server);
 }

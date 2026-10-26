@@ -178,10 +178,15 @@ needs no such refresh. The original operation is dispatched only after carrier
 establishment, retaining its identity and body.
 
 When a source reply makes the next bridge reachable, the same request can read
-that bridge through the ordinary authenticated carrier. Each source is queried
-at most once through this routed step, sharing the direct-read concurrency cap
-and original deadline. A routed reply supplies only its source-owned rows; it
-never invents a direct edge from the caller to that source. The collector does
+that bridge through the ordinary authenticated carrier. Each reachable source
+endpoint is queried at most once through this routed step, sharing the direct-read
+concurrency cap and original deadline. A process with cold observations cannot
+hide another process's fresh observations for the same node. Each read narrows
+endpoint selection within the existing authorized directory cut; the carrier pool
+also retains that terminal endpoint constraint and its normal owner-scope
+retirement. This adds no wire affinity or Main requirement. A routed reply supplies
+only its source-owned rows; it never invents a direct edge from the caller to that
+source. The collector does
 not recursively invoke freshness discovery or trust relayed third-party rows.
 Owner-local endpoint hints may remain in bootstrap records. The source reader
 excludes `LocalOnly` endpoints both from remote dials and from accepted remote

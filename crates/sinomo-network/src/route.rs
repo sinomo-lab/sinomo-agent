@@ -1841,6 +1841,7 @@ where
                     destination_process_affinity,
                 ).await
             },
+            None,
         )
         .await;
         record_routed_rpc_timeline_stage(
