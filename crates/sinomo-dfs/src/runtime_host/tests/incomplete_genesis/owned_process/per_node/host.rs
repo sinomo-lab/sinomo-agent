@@ -173,7 +173,13 @@ async fn probe(
         let paths = ClusterPaths::new(&data);
         // Endpoint contacts use the actual native-written member view, never
         // a supplied authenticated stream or a synthetic connectivity edge.
-        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
+        let state = if registered_endpoint {
+            // Select from the SAME merged native view used by the actual
+            // registered carrier. It still revalidates the exact descriptor.
+            sinomo_core::cluster::read_cluster_state_cached_shared(&paths)?
+        } else {
+            Arc::new(sinomo_core::cluster::read_cluster_state_without_kv(&paths)?)
+        };
         if &state.local_node_id != source || &state.cluster_id != cluster {
             return Err(invalid(
                 "native diagnostic source identity changed under its process",
