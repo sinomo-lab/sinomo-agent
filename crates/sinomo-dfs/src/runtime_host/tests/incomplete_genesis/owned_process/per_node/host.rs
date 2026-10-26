@@ -20,6 +20,7 @@ use std::time::Instant;
 const COMPONENT: &str = "module.fixture.dfs_native_peer";
 const MAX_DRIVER_INPUT: usize = 4096;
 const MAX_NONCE: usize = 192;
+type OwnedContacts = std::collections::BTreeMap<NodeId, (String, String)>;
 
 fn validate_configuration(
     input: &NodeInput,
@@ -119,6 +120,8 @@ async fn probe(
     source: &NodeId,
     cluster: &sinomo_core::Id,
     peers: &BTreeSet<NodeId>,
+    contacts: &OwnedContacts,
+    selected: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
 ) -> Result<ProbeReply, NetworkError> {
     let wire = match request.kind {
         ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
@@ -159,23 +162,21 @@ async fn probe(
                 .iter()
                 .find(|member| &member.node_id == node && member.state.is_authorized())
                 .ok_or_else(|| invalid("diagnostic target lacks current native member binding"))?;
-            member
-                .endpoints
-                .iter()
-                .find(|endpoint| {
-                    &endpoint.node_id == node
-                        && matches!(
-                            endpoint.transport,
-                            sinomo_core::ClusterTransportKind::Loopback
-                                | sinomo_core::ClusterTransportKind::LanTcp
-                        )
-                        && endpoint
-                            .address
-                            .parse::<std::net::SocketAddr>()
-                            .is_ok_and(|address| address.ip().is_loopback() && address.port() != 0)
-                })
-                .cloned()
-                .ok_or_else(|| invalid("actual member has no concrete owned loopback endpoint"))
+            let (address, public_key) = contacts.get(node).ok_or_else(|| {
+                invalid("diagnostic target lacks its actual held fixture listener")
+            })?;
+            if &member.node_public_key != public_key {
+                return Err(invalid(
+                    "native member key differs from the owned fixture identity",
+                ));
+            }
+            // A concrete contact is a route hint, not a directory mutation or
+            // reachability fact. Never select a daemon's default/shadow port.
+            Ok(sinomo_core::network::daemon_loopback_endpoint(
+                node,
+                address.clone(),
+                0,
+            ))
         };
         let mut endpoint = contact(&request.target)?;
         if matches!(request.kind, ProbeKind::EndpointWrongPeer) {
@@ -187,6 +188,7 @@ async fn probe(
             // all native handshake checks remain unchanged, and must refuse it.
             endpoint.address = contact(other)?.address;
         }
+        *selected.lock().unwrap() = Some(endpoint.clone());
         eprintln!(
             "NATIVE_ENDPOINT_PROBE source={source} target={} nonce={} endpoint={endpoint:?}",
             request.target, request.nonce
@@ -266,7 +268,11 @@ async fn probe(
     })
 }
 
-fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<ComponentCatalog> {
+fn driver_catalog(
+    input: &NodeInput,
+    peers: BTreeSet<NodeId>,
+    contacts: OwnedContacts,
+) -> TestResult<ComponentCatalog> {
     let registration = ModuleRegistration::native_rust(
         ModuleId::from_legacy_named(COMPONENT)?,
         "1.0.0",
@@ -322,6 +328,7 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
             let source = source.clone();
             let root = expected_root.clone();
             let peers = peers.clone();
+            let contacts = contacts.clone();
             scope.set_services(ServiceRegistry::builder().register_dynamic(
                 "dfs-native-peer-fixture",
                 ServiceRoute::from_route_metadata(DRIVER_ROUTE, DRIVER_CATEGORY, "local-command", [DRIVER_OPERATION]),
@@ -330,6 +337,7 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
                     let source = source.clone();
                     let root = root.clone();
                     let peers = peers.clone();
+                    let contacts = contacts.clone();
                     let cluster = cluster.clone();
                     let native_runtime = native_runtime.clone();
                     async move {
@@ -346,9 +354,10 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
                         {
                             return Err(ServiceError::Service("native driver target/nonce is outside the fixture".into()));
                         }
+                        let selected = std::sync::Mutex::new(None);
                         let result = match tokio::time::timeout_at(
                             tokio::time::Instant::from_std(deadline), probe(transport.as_ref(), &command, deadline,
-                                &root, &native_runtime, &source, &cluster, &peers),
+                                &root, &native_runtime, &source, &cluster, &peers, &contacts, &selected),
                         ).await {
                             Ok(result) => result.map_err(failure),
                             Err(_) => Err(failure(NetworkError::timeout("native process driver call and materialization",
@@ -356,7 +365,7 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
                         };
                         context.respond_value(DRIVER_ROUTE, DriverResponse {
                             source_node_id: source, source_pid: std::process::id(), target: command.target,
-                            nonce: command.nonce, path: command.kind.path(), result,
+                            nonce: command.nonce, path: command.kind.path(), contact: selected.into_inner().unwrap(), result,
                         })?;
                         Ok(ServiceDisposition::Continue)
                     }
@@ -418,6 +427,20 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
     }
     let configuration: NodeConfiguration = read_data(&input.owned_root.join("configuration.sobj"))?;
     let peers = validate_configuration(&input, &hello, &configuration)?;
+    let contacts = configuration
+        .state
+        .members
+        .iter()
+        .map(|member| {
+            (
+                member.node_id.clone(),
+                (
+                    member.endpoints[0].address.clone(),
+                    member.node_public_key.clone(),
+                ),
+            )
+        })
+        .collect();
     let paths = ClusterPaths::new(&data);
     let kv = paths.kv_paths();
     if paths.state.exists() || kv.raft_wal_paths(&input.node_id).root.exists() {
@@ -468,7 +491,7 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
         sinomo_daemon::DaemonPaths::new(&data),
         "daemon",
         Some(cluster),
-        driver_catalog(&input, peers)?,
+        driver_catalog(&input, peers, contacts)?,
         sinomo_daemon::DaemonRuntimeConfig::default(),
     )?;
     Ok(())

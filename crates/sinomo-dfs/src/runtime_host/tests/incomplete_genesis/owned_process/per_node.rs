@@ -85,6 +85,7 @@ struct DriverResponse {
     target: NodeId,
     nonce: String,
     path: ProbePath,
+    contact: Option<sinomo_core::ClusterEndpointRecord>,
     result: Result<ProbeReply, ProbeFailure>,
 }
 
@@ -120,6 +121,7 @@ struct NativeNode {
     input: NodeInput,
     hello: Option<NodeHello>,
     released: bool,
+    contacts: std::collections::BTreeMap<NodeId, String>,
 }
 impl NativeNode {
     fn alive_identity(&mut self) -> TestResult<ProcessIdentity> {
@@ -172,6 +174,7 @@ fn launch_native_node(index: usize) -> TestResult<NativeNode> {
         input,
         hello: None,
         released: false,
+        contacts: std::collections::BTreeMap::new(),
     })
 }
 fn read_hello(node: &mut NativeNode, deadline: Instant) -> TestResult<NodeHello> {
@@ -209,6 +212,13 @@ fn read_hello(node: &mut NativeNode, deadline: Instant) -> TestResult<NodeHello>
     }
 }
 fn configure_nodes(nodes: &mut [NativeNode]) -> TestResult<()> {
+    let contacts = nodes
+        .iter()
+        .map(|node| {
+            let hello = node.hello.as_ref().unwrap();
+            (hello.node_id.clone(), hello.address.clone())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let now = time::OffsetDateTime::now_utc();
     let cluster = sinomo_core::Id::generate();
     let a = nodes[0].hello.as_ref().unwrap();
@@ -246,6 +256,7 @@ fn configure_nodes(nodes: &mut [NativeNode]) -> TestResult<()> {
         )];
     }
     for (index, node) in nodes.iter_mut().enumerate() {
+        node.contacts = contacts.clone();
         let mut local = state.clone();
         local.local_node_id = node.input.node_id.clone();
         local.local_node_display_name = node.input.node_id.to_string();
@@ -348,6 +359,36 @@ fn probe(
     assert_eq!(result.target, *target);
     assert_eq!(result.nonce, nonce);
     assert_eq!(result.path, kind.path());
+    if let Some(contact) = &result.contact {
+        assert_eq!(&contact.node_id, target);
+        assert_eq!(
+            contact.transport,
+            sinomo_core::ClusterTransportKind::Loopback
+        );
+        assert_eq!(
+            contact.privacy,
+            sinomo_core::ClusterEndpointPrivacy::LocalOnly
+        );
+        let selected = if matches!(kind, ProbeKind::EndpointWrongPeer) {
+            node.contacts
+                .keys()
+                .find(|id| *id != &node.input.node_id && *id != target)
+                .ok_or("wrong-contact control has no other owned peer")?
+        } else {
+            target
+        };
+        assert_eq!(
+            Some(&contact.address),
+            node.contacts.get(selected),
+            "diagnostic contact may name only its actual owned listener"
+        );
+    }
+    if kind.path() == ProbePath::AuthenticatedEndpoint && result.result.is_ok() {
+        assert!(
+            result.contact.is_some(),
+            "successful endpoint result lacks its selected owned contact"
+        );
+    }
     node.alive_identity()?;
     if let Ok(reply) = &result.result {
         assert!(reply.body.len() <= MAX_REPLY);
@@ -390,7 +431,7 @@ fn record_probe(
             let file = root.join(format!("probe-{index:03}.sobj"));
             write_data(&file, value)?;
             let bytes = fs::read(&file)?;
-            serde_json::json!({"phase":phase,"path":value.path,"source":value.source_node_id,"source_pid":value.source_pid,"target":value.target,"nonce":value.nonce,
+            serde_json::json!({"phase":phase,"path":value.path,"selected_contact":value.contact,"source":value.source_node_id,"source_pid":value.source_pid,"target":value.target,"nonce":value.nonce,
                 "actual_result":match &value.result {Ok(reply)=>serde_json::json!({"route":reply.route,"responder":reply.responder_node_id,"body_bytes":reply.body.len()}),Err(error)=>serde_json::json!({"error":error})},
                 "evidence":file,"blake3":blake3::hash(&bytes).to_hex().to_string()})
         }
@@ -641,6 +682,8 @@ fn run_native_process_case(endpoint_mode: bool) {
             }
         }
         if endpoint_mode {
+            nodes[1].alive_identity()?;
+            nodes[2].alive_identity()?;
             let intended = nodes[2].input.node_id.clone();
             let wrong = probe(
                 &mut nodes[0],
@@ -659,22 +702,8 @@ fn run_native_process_case(endpoint_mode: bool) {
                 !matches!(&wrong, Ok(value) if value.result.is_ok()),
                 "wrong live endpoint cannot authenticate as the intended peer"
             );
-            let ordinary = probe(
-                &mut nodes[0],
-                &intended,
-                ProbeKind::Ping,
-                format!(
-                    "ordinary-routing-observation-{}",
-                    sinomo_core::Id::generate()
-                ),
-                OP_CAP,
-            );
-            record_probe(
-                &root,
-                &mut report,
-                "ordinary-routing-separate-unqualified-observation",
-                &ordinary,
-            )?;
+            nodes[1].alive_identity()?;
+            nodes[2].alive_identity()?;
         }
         let b = nodes[1].alive_identity()?;
         let c = nodes[2].alive_identity()?;
