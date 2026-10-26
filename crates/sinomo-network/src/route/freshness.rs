@@ -156,6 +156,7 @@ fn direct_source_endpoint_candidates(
     snapshot: &DirectorySnapshot,
     state: &ClusterBootstrapState,
     records: &[ClusterConnectivityRecord],
+    baseline: &[ClusterConnectivityRecord],
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
     let mut candidates = Vec::new();
     for node in snapshot.nodes().values() {
@@ -196,6 +197,35 @@ fn direct_source_endpoint_candidates(
             max_records: crate::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
         });
     }
+    // These rows only order authenticated dials. Even expired source-owned
+    // evidence can identify the adjacent bridge worth trying before unrelated
+    // hints; it never becomes a live edge until a new authenticated reply.
+    // Prefer newer accepted local observations over the older canonical row.
+    candidates.sort_by_cached_key(|endpoint| {
+        let observed = records
+            .iter()
+            .chain(baseline)
+            .filter(|record| {
+                record.source_node_id == state.local_node_id
+                    && record.target_node_id == endpoint.node_id
+                    && record.endpoint_id == endpoint.endpoint_id
+                    && record.transport == endpoint.transport
+                    && record.address == endpoint.address
+            })
+            .max_by_key(|record| record.observed_at);
+        let rank = match observed.map(|record| &record.state) {
+            Some(ClusterConnectivityState::Healthy) => 0,
+            Some(ClusterConnectivityState::Degraded) => 1,
+            None => 2,
+            Some(ClusterConnectivityState::Unreachable) => 3,
+        };
+        (
+            rank,
+            endpoint.priority,
+            endpoint.node_id.clone(),
+            endpoint.endpoint_id.clone(),
+        )
+    });
     Ok(candidates)
 }
 
@@ -222,7 +252,8 @@ pub(super) async fn refresh_connector(
             &snapshot,
             ordinary_records,
         )?;
-    let candidates = direct_source_endpoint_candidates(&snapshot, state, &records)?;
+    let candidates =
+        direct_source_endpoint_candidates(&snapshot, state, &records, &baseline.records)?;
     let mut direct = std::collections::VecDeque::from(candidates);
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let mut attempted_sources = std::collections::BTreeSet::new();
@@ -428,6 +459,59 @@ mod tests {
     }
 
     #[test]
+    fn source_read_hint_order_keeps_quarantine_and_newer_failure_evidence() {
+        let (_, mut state, _, mut baseline, now) = fixture();
+        baseline.source_node_id = state.local_node_id.clone();
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == baseline.target_node_id)
+            .unwrap();
+        let known = member.endpoints[0].clone();
+        let mut unknown = known.clone();
+        unknown.endpoint_id = crate::ClusterEndpointId::derived("unknown-source-hint", b"other");
+        unknown.address = "127.0.0.1:21355".into();
+        member.endpoints.push(unknown.clone());
+        let directory =
+            DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), state.members.clone())
+                .unwrap();
+        assert!(!crate::cluster_network_record_live(
+            baseline.expires_at,
+            now
+        ));
+        assert_eq!(
+            direct_source_endpoint_candidates(&directory, &state, &[], &[baseline.clone()])
+                .unwrap()[0],
+            known
+        );
+        let mut current = baseline.clone();
+        current.observed_at = now;
+        current.expires_at = now + time::Duration::seconds(7200);
+        current.state = ClusterConnectivityState::Unreachable;
+        current.consecutive_failures = 3;
+        assert_eq!(
+            direct_source_endpoint_candidates(
+                &directory,
+                &state,
+                &[current.clone()],
+                &[baseline.clone()]
+            )
+            .unwrap()[0],
+            unknown
+        );
+        current.failure_reason = Some(crate::ClusterConnectivityFailureReason::IdentityMismatch);
+        assert_eq!(
+            direct_source_endpoint_candidates(&directory, &state, &[current], &[baseline.clone()])
+                .unwrap(),
+            vec![unknown]
+        );
+        assert!(
+            !crate::cluster_network_record_live(baseline.expires_at, now),
+            "ordering never renews the stored hint"
+        );
+    }
+
+    #[test]
     fn source_read_candidates_do_not_dial_other_nodes_local_only_hints() {
         let (_, mut state, _, baseline, _) = fixture();
         let member = state
@@ -446,7 +530,7 @@ mod tests {
             DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), state.members.clone())
                 .unwrap();
         assert_eq!(
-            direct_source_endpoint_candidates(&directory, &state, &[]).unwrap(),
+            direct_source_endpoint_candidates(&directory, &state, &[], &[]).unwrap(),
             vec![public],
             "a peer's bootstrap loopback hint names its local machine, not a source read endpoint on this caller"
         );

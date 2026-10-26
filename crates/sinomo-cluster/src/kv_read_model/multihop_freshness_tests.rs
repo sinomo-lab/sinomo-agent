@@ -21,6 +21,8 @@ struct OriginalOperation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceCase {
     Success,
+    PartiallyLiveMain,
+    SaturatedHints,
     SemanticChange,
     Deadline,
 }
@@ -75,6 +77,46 @@ async fn multihop_source_scenario(case: SourceCase) {
         member.endpoints.push(endpoints[i - 1].clone());
         state.members.push(member);
     }
+    let mut stalled_servers = tokio::task::JoinSet::new();
+    let stalled_connections = Arc::new(AtomicUsize::new(0));
+    if case == SourceCase::SaturatedHints {
+        let mut selected = 0;
+        for ordinal in 0u32..100_000 {
+            let id = sinomo_network::ClusterEndpointId::derived(
+                "cold-stalled-endpoint",
+                &ordinal.to_le_bytes(),
+            );
+            if id >= endpoints[0].endpoint_id {
+                continue;
+            }
+            let listener = sinomo_network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let mut endpoint = sinomo_network::daemon_lan_endpoint(
+                &nodes[1],
+                listener.local_addr_string().unwrap(),
+                100,
+            );
+            endpoint.endpoint_id = id;
+            state.members[1].endpoints.push(endpoint);
+            let accepted = stalled_connections.clone();
+            stalled_servers.spawn(async move {
+                let mut streams = Vec::new();
+                loop {
+                    streams.push(listener.accept().await.unwrap());
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            selected += 1;
+            if selected == 16 {
+                break;
+            }
+        }
+        assert_eq!(
+            selected, 16,
+            "sixteen earlier hints are deliberately stalled before the known adjacent endpoint"
+        );
+    }
     // Relays sign their own adjacent transport. Each real signer needs its
     // matching bootstrap identity, just as the caller does; a key alone is
     // insufficient for a legacy-named fixture node.
@@ -117,6 +159,9 @@ async fn multihop_source_scenario(case: SourceCase) {
         let mut expired = observation.clone();
         expired.observed_at -= time::Duration::hours(1);
         expired.expires_at -= time::Duration::hours(1);
+        if case == SourceCase::PartiallyLiveMain && i == 0 {
+            expired = observation.clone();
+        }
         kv.put_serde(
             cluster_connectivity_key(
                 &expired.source_node_id,
@@ -148,7 +193,10 @@ async fn multihop_source_scenario(case: SourceCase) {
 
     sinomo_kv::deny_process_local_raft_access_for_root(paths.kv_paths().raft.clone()).unwrap();
     let observed = Arc::new(KvClusterDirectory::new(paths.clone()));
-    assert!(observed.connectivity_records().unwrap().is_empty());
+    assert_eq!(
+        observed.connectivity_records().unwrap().len(),
+        usize::from(case == SourceCase::PartiallyLiveMain)
+    );
     let baseline = observed.connectivity_freshness_baseline().unwrap();
     assert_eq!(baseline.records.len(), 3);
     for record in &live {
@@ -362,15 +410,14 @@ async fn multihop_source_scenario(case: SourceCase) {
     call.request
         .metadata
         .insert("operation-id".into(), "original-multihop".into());
-    let result = client
-        .call_target(
-            &state,
-            &nodes[3],
-            call,
-            ClusterObjectRpcOptions::default()
-                .with_overall_timeout(std::time::Duration::from_secs(5)),
-        )
-        .await;
+    let mut options =
+        ClusterObjectRpcOptions::default().with_overall_timeout(std::time::Duration::from_secs(5));
+    if case == SourceCase::PartiallyLiveMain {
+        options = options.with_destination_process_affinity(
+            sinomo_network::DestinationProcessAffinity::MainDaemon,
+        );
+    }
+    let result = client.call_target(&state, &nodes[3], call, options).await;
     let response = match result {
         Ok(response) => response.decode_body::<String>().await,
         Err(error) => Err(error),
@@ -402,6 +449,9 @@ async fn multihop_source_scenario(case: SourceCase) {
     }
     servers.abort_all();
     while servers.join_next().await.is_some() {}
+    stalled_servers.abort_all();
+    while stalled_servers.join_next().await.is_some() {}
+    assert!(stalled_connections.load(Ordering::SeqCst) <= 16);
     if case != SourceCase::SemanticChange {
         assert_eq!(
             std::fs::read(&paths.kv_paths().snapshot).unwrap(),
@@ -425,7 +475,7 @@ async fn multihop_source_scenario(case: SourceCase) {
         rejected_direct.load(Ordering::SeqCst)
     );
     match case {
-        SourceCase::Success => {
+        SourceCase::Success | SourceCase::PartiallyLiveMain | SourceCase::SaturatedHints => {
             assert_eq!(response.unwrap(), "original response");
             assert_eq!(effects.load(Ordering::SeqCst), 1);
         }
@@ -458,7 +508,9 @@ async fn multihop_source_scenario(case: SourceCase) {
         1,
         "C's own authenticated reply is required; B cannot renew C's edge"
     );
-    assert!(rejected_direct.load(Ordering::SeqCst) > 0);
+    if case != SourceCase::SaturatedHints {
+        assert!(rejected_direct.load(Ordering::SeqCst) > 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -472,4 +524,14 @@ async fn multihop_source_semantic_change_prevents_original_dispatch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multihop_source_deadline_preserves_original_delivery_and_drains() {
     multihop_source_scenario(SourceCase::Deadline).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partially_live_graph_refreshes_remote_bridges_for_main_destination() {
+    multihop_source_scenario(SourceCase::PartiallyLiveMain).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn earlier_stalled_hints_cannot_starve_known_adjacent_source_read() {
+    multihop_source_scenario(SourceCase::SaturatedHints).await;
 }

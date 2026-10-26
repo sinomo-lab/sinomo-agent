@@ -174,6 +174,11 @@ not recursively invoke freshness discovery or trust relayed third-party rows.
 Owner-local endpoint hints may remain in bootstrap records. The source reader
 excludes `LocalOnly` endpoints both from remote dials and from accepted remote
 edges; a peer's loopback listener does not name a listener on the caller's host.
+The bounded direct-read queue tries source-owned adjacent endpoint hints before
+unobserved or failed hints, using the latest exact local-source observation and
+then the endpoint's existing priority. This ordering prevents slow unrelated
+hints from occupying every slot first. Expired evidence can order a dial but
+cannot authorize a route, and newer failure/quarantine evidence still wins.
 
 Daemon ingress treats an authenticated peer closing the routed handshake before
 an application stream exists as a normal connection exit, recorded at debug
