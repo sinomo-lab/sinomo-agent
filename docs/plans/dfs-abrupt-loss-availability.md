@@ -15,7 +15,63 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-25 R50
+## Current development checkpoint — 2026-10-26 R56
+
+Cold native mutation admission now prepares the existing strict resident owner
+before content ingestion or Core request planning. Scoped owner waits retain
+neither the root cache mutex nor mutation admission. Current storage
+certification may replay already durable frames; this does not run semantic
+prepared-operation recovery or author a genesis commit. The affected assignment,
+authority generation and certified record are checked again before effects.
+Unknown or stale state remains unavailable; unrelated ready scopes retain their
+ordinary progress. No readiness flag, timer write, participant-count change or
+serving-floor activation is introduced.
+
+Production correction `bf31155c` was merged at `5d388a06`. R56 code is
+`d6c92466`, source `b03c212c` with 4,922 inputs. Its only additional source delta
+is the test file: append-only cold-held control `8d5fe8cb` and fixture correction
+`1be25649`. The latter requires W=2/N=2 for the original reproduction's unchanged
+remote-content positive assertion. Native served W=1 can legitimately return a
+local durable commit with an N repair obligation even when foreground repair is
+requested; production W1 behavior is unchanged. Within each run the pre/post
+request, body, target version and identity remain identical.
+
+Fresh check/build/seal passed (I167). I168 actually executed all five selected
+native controls, each with exactly one libtest summary, and all five passed:
+
+| Control | Actual result |
+|---|---|
+| Incomplete genesis rejects stamped write and global Rename before effects; SAME genesis completion/full assigned sync then SAME requests succeed | PASS, including real remote content-effect positive |
+| Unrelated ready scope progresses while another scope remains Prepared | PASS |
+| Ordinary initial write and cold-cache root isolation | PASS |
+| Ordinary singleton smoke | PASS |
+| Actual cache eviction/cold opening retains exact Prepared body/digest/journal and refuses mutation, then same-owner completion/sync permits the SAME request | PASS |
+
+The other **222 of 227 inventory IDs remain UNRUN on this source**. I169 full
+current-source DFS/KV analysis passed its 11 UI controls and three library
+analyses. Actual source/artifact bindings, unconditional fixture archives,
+comparison/hash checks and owned process/group/scope/root drains are retained in
+the I167/I168/I169 receipts under the operation directory. These results do not
+transfer to later source changes.
+
+R51-I153, R52-I156 and R53-I159 remain failed. R53 showed real premature intent
+and namespace bookkeeping while the original genesis stayed Prepared. R54-I162
+remains 2 PASS / 2 FAIL: its guard blocked those effects but rejected cold/busy
+resident ownership. R55-I165 remains 3 PASS / 1 FAIL: cold ownership and
+post-completion Rename succeeded, but its W1 fixture did not produce the required
+remote-content positive. The original raw requests, source/binaries, outcomes and
+archives are immutable; no failed result was reclassified.
+
+These fixtures run native members within one libtest process. The newly held
+metadata scope is assigned singleton A; exact sync proves that full assigned set,
+not a three-member recovery quorum. Cold cache reconstruction is not node/process
+restart. Normal component reopen is the next separate control; OS crash, full
+metadata history/promise/decision custody, checked successor effects, B serving,
+C1 floor, application/withdrawal, Terminal/Close/root retirement, degraded W/N,
+abrupt-loss/partition/reconnect and absolute-zero quietness remain open. This
+lane performs no Docker, production/main rollout or activation work.
+
+## Historical development checkpoint — 2026-10-25 R50
 
 The test-only native local-fence RPC observation is integrated. Receiver/wire
 `87794b51`, sender `37982842` and native controls `fb9a004c` merged normally;
