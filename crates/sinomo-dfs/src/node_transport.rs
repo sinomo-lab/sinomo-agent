@@ -393,6 +393,43 @@ impl Default for DfsObjectRpcSendOptions {
     }
 }
 
+/// Per-call producer correlation DATA. Private fields prevent an injectable
+/// peer from manufacturing the producer's next attempt; this is NOT proof.
+#[derive(Debug)]
+pub struct DfsMetadataPrefixProbeAttempt {
+    id: String,
+    peer: NodeId,
+    command: DfsMetadataJournalBatchCommand,
+    deadline: Instant,
+}
+
+impl DfsMetadataPrefixProbeAttempt {
+    pub fn attempt_id(&self) -> &str {
+        &self.id
+    }
+    pub fn peer(&self) -> &NodeId {
+        &self.peer
+    }
+    pub fn command(&self) -> &DfsMetadataJournalBatchCommand {
+        &self.command
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+#[derive(Debug)]
+pub enum DfsMetadataPrefixEvidence {
+    NoNativeProof,
+    Native(crate::runtime_host::OwnedNativeMetadataPrefixReturn),
+}
+
+#[derive(Debug)]
+pub struct DfsMetadataPrefixProbeReturn {
+    pub response: DfsMetadataJournalBatchResponse,
+    pub evidence: DfsMetadataPrefixEvidence,
+}
+
 /// Size-independent DFS peer RPC. Ordinary encoded values and explicit
 /// attachments share this one transport contract.
 pub trait DfsPeerTransport: Send + Sync {
@@ -408,6 +445,133 @@ pub trait DfsPeerTransport: Send + Sync {
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError>;
+
+    /// Generic/injectable peers retain response DATA only. The native runtime
+    /// override owns its ONE actual call; no matcher/trace may construct proof.
+    fn call_metadata_prefix_probe(
+        &self,
+        attempt: &DfsMetadataPrefixProbeAttempt,
+        mut options: DfsObjectRpcSendOptions,
+    ) -> Result<DfsMetadataPrefixProbeReturn, DfsPeerTransportError> {
+        validate_ordinary_metadata_prefix_command(attempt.command())?;
+        let call = crate::dfs_metadata_journal_batch_rpc_call(attempt.command())
+            .map_err(DfsPeerTransportError::from_network)?;
+        let remaining = attempt
+            .deadline()
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                DfsPeerTransportError::new("metadata prefix attempt expired before dispatch")
+            })?;
+        options.overall_timeout = Some(
+            options
+                .overall_timeout
+                .map_or(remaining, |old| old.min(remaining)),
+        );
+        let result = self.call_object_rpc(attempt.peer(), call, options)?;
+        let response = collect_metadata_prefix_probe_return(result, attempt)?;
+        Ok(DfsMetadataPrefixProbeReturn {
+            response,
+            evidence: DfsMetadataPrefixEvidence::NoNativeProof,
+        })
+    }
+}
+
+pub(crate) fn validate_ordinary_metadata_prefix_command(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<(), DfsPeerTransportError> {
+    let probe = command.prefix_probe.as_ref().ok_or_else(|| {
+        DfsPeerTransportError::new("native prefix capture requires an ordinary PREFIX probe")
+    })?;
+    if !command.verify_prefix_only
+        || !command.batch.journal_frames.is_empty()
+        || command.authority_probe.is_some()
+        || command.durable_replication.is_some()
+        || probe.primary_handoff_id.is_some()
+        || probe.repair_custody.is_some()
+        || command.request_id.is_empty()
+        || command.source_node_id.is_none()
+        || command.file_system_id.is_none()
+        || command.authority_epoch.is_none()
+        || probe.file_system_id != command.file_system_id
+        || probe.authority_epoch != command.authority_epoch
+        || probe.shard_id != command.batch.shard_id
+        || probe.journal_sequence != command.batch.next_after_sequence
+        || probe.barrier_id.is_empty()
+        || probe.state_fingerprint.is_empty()
+    {
+        return Err(DfsPeerTransportError::new(
+            "native prefix capture refuses nonordinary, incomplete, handoff, custody, authority or backfill input",
+        ));
+    }
+    Ok(())
+}
+
+/// Pure response decoding/correlation returns DATA only, never provenance.
+pub(crate) fn collect_metadata_prefix_probe_return(
+    result: ObjectRpcResult,
+    attempt: &DfsMetadataPrefixProbeAttempt,
+) -> Result<DfsMetadataJournalBatchResponse, DfsPeerTransportError> {
+    let streamed = result.has_streamed_value();
+    let (mut response, body) = result.into_parts();
+    if response.route != crate::DFS_METADATA_JOURNAL_BATCH_ROUTE || (!streamed && !body.is_empty())
+    {
+        return Err(DfsPeerTransportError::new(
+            "metadata prefix return has a wrong route or semantic attachment",
+        ));
+    }
+    response
+        .error_detail()
+        .map_err(DfsPeerTransportError::from_network)?;
+    if streamed {
+        let deadline = attempt.deadline();
+        let collect = async move {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                body.collect_to_vec(64 * 1024),
+            )
+            .await
+            .map_err(|_| {
+                DfsPeerTransportError::new("metadata prefix return exceeded its original deadline")
+            })?
+            .map_err(DfsPeerTransportError::from_network)
+        };
+        response.body = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if !matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return Err(DfsPeerTransportError::new(
+                    "metadata prefix sync return requires a blocking-capable runtime",
+                ));
+            }
+            tokio::task::block_in_place(|| runtime.block_on(collect))?
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+            let value = runtime.block_on(collect);
+            runtime.shutdown_timeout(Duration::from_millis(250));
+            value?
+        };
+    }
+    if response.body.len() > 64 * 1024 || Instant::now() >= attempt.deadline() {
+        return Err(DfsPeerTransportError::new(
+            "metadata prefix return exceeds its value/deadline bound",
+        ));
+    }
+    let actual = decode_dfs_metadata_journal_batch_rpc_response(&response)
+        .map_err(DfsPeerTransportError::from_network)?;
+    if actual.request_id != attempt.command.request_id
+        || actual.shard_id != attempt.command.batch.shard_id
+        || actual.next_after_sequence != attempt.command.batch.next_after_sequence
+    {
+        return Err(DfsPeerTransportError::new(
+            "metadata prefix return differs from its actual request/shard/sequence",
+        ));
+    }
+    Ok(actual)
 }
 
 fn collect_dfs_attachment_source_sync(
@@ -4769,6 +4933,80 @@ fn send_direct_metadata_journal_fanout_blocking(
 }
 
 impl DfsNodeTransport {
+    /// Opt-in, one-call direct PREFIX producer. Routed/fanout output remains
+    /// DATA; no second RPC is issued to obtain provenance for an earlier call.
+    pub(crate) fn capture_metadata_prefix_probe_direct(
+        &mut self,
+        peer: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+    ) -> Result<DfsMetadataPrefixProbeReturn, NetworkError> {
+        validate_ordinary_metadata_prefix_command(command).map_err(|error| {
+            NetworkError::Serialization {
+                detail: error.to_string(),
+            }
+        })?;
+        if peer == &self.local_node_id
+            || !self.known_remote_nodes.contains(peer)
+            || command.source_node_id.as_ref() != Some(&self.local_node_id)
+        {
+            return Err(NetworkError::Serialization {
+                detail: "metadata prefix attempt has a foreign local source or target peer".into(),
+            });
+        }
+        let deadline = self
+            .operation_deadline
+            .filter(|deadline| *deadline > Instant::now())
+            .ok_or_else(|| NetworkError::Serialization {
+                detail: "metadata prefix capture requires its existing operation deadline".into(),
+            })?;
+        let options = self.current_send_options("capture one native metadata prefix return")?;
+        let transport =
+            self.peer_transport
+                .as_ref()
+                .ok_or_else(|| NetworkError::Serialization {
+                    detail: "metadata prefix capture has no direct peer transport".into(),
+                })?;
+        let attempt = DfsMetadataPrefixProbeAttempt {
+            id: sinomo_core::Id::generate().to_string(),
+            peer: peer.clone(),
+            command: command.clone(),
+            deadline,
+        };
+        let result = transport
+            .call_metadata_prefix_probe(&attempt, options)
+            .map_err(|error| match error.delivery_state() {
+                Some(state) => NetworkError::delivery_failed(
+                    "capture direct metadata prefix return",
+                    state,
+                    error.to_string(),
+                ),
+                None => NetworkError::Io {
+                    operation: "capture direct metadata prefix return".into(),
+                    detail: error.to_string(),
+                },
+            })?;
+        if Instant::now() >= deadline {
+            return Err(NetworkError::delivery_failed(
+                "capture direct metadata prefix return",
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                "metadata prefix capture completed after its original deadline",
+            ));
+        }
+        if result.response.request_id != command.request_id
+            || result.response.shard_id != command.batch.shard_id
+            || result.response.next_after_sequence != command.batch.next_after_sequence
+        {
+            return Err(NetworkError::Serialization {
+                detail: "metadata prefix producer received response DATA for another attempt"
+                    .into(),
+            });
+        }
+        if let DfsMetadataPrefixEvidence::Native(value) = &result.evidence {
+            value.validate_attempt_binding(&attempt, &result.response)?;
+        }
+        Ok(result)
+    }
+
     fn send_metadata_journal_batches_direct_inner(
         &mut self,
         requests: &[(NodeId, DfsMetadataJournalBatchCommand)],

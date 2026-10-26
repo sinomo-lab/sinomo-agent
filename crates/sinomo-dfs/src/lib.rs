@@ -693,6 +693,7 @@ pub(crate) use node_transport::{
 pub use node_transport::{
     AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker, DfsNodeTransport,
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
+    DfsMetadataPrefixProbeAttempt, DfsMetadataPrefixProbeReturn, DfsMetadataPrefixEvidence,
     dfs_message_response_from_rpc_result, dfs_message_response_from_rpc_result_sync,
     dfs_routed_call_rpc_call,
 };

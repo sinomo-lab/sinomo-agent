@@ -2267,6 +2267,8 @@ fn open_dfs_runtime_service_for_effect(
             state.local_node_id.clone(),
             peer_node_ids,
             host,
+            data_dir,
+            &provider_runtime,
         )
     } else {
         // Exact Core effects already own their admitted shard. Delegating a
@@ -3258,6 +3260,8 @@ pub(crate) use control_plane::{
 };
 
 mod data_plane;
+mod native_prefix_return;
+pub use native_prefix_return::{OwnedNativeMetadataPrefixReturn, NativeMetadataPrefixPhysicalOwner};
 #[cfg(test)]
 mod selected_recovery_fence_call;
 #[cfg(test)]

@@ -165,6 +165,7 @@ pub(crate) fn call_native_selected_local_recovery_fence(
     // admission, metadata fence, queue writer or publication guard is held.
     let peer = data_plane::DaemonDfsPeerTransport {
         host: Arc::clone(&host),
+        native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext {data_dir:data_dir.clone(),runtime:runtime.clone()}),
     };
     let result = peer
         .host

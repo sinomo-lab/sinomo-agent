@@ -1650,10 +1650,12 @@ pub(crate) fn daemon_dfs_client_node_transport(
     local_node_id: NodeId,
     peer_node_ids: impl IntoIterator<Item = NodeId>,
     host: Arc<DfsRuntimeHost>,
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
 ) -> DfsNodeTransport {
     // This is the already registered component host supplied by the normal
     // client opener. Core effect/genesis constructors do not bind these senders.
-    let peer = Arc::new(DaemonDfsPeerTransport { host });
+    let peer = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext {data_dir:data_dir.clone(),runtime:runtime.clone()}) });
     let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
     let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
     DfsNodeTransport::with_peer_transports_for_nodes(
@@ -1669,6 +1671,7 @@ pub(crate) fn daemon_dfs_client_node_transport(
 #[derive(Clone)]
 pub(super) struct DaemonDfsPeerTransport {
     pub(super) host: Arc<DfsRuntimeHost>,
+    pub(super) native_prefix: Option<super::native_prefix_return::NativePrefixOwnerContext>,
 }
 
 /// One explicit selected original. Selection changes representation/custody
@@ -2329,6 +2332,7 @@ fn call_native_original_repair_owned_with_call(
     // traits nor the generic decoded inbox can enter the constructor below.
     let peer = DaemonDfsPeerTransport {
         host: Arc::clone(&host),
+        native_prefix: None, // Repair keeps its separate owned-return family.
     };
     #[cfg(any(test, feature = "test-support"))]
     let mut native_attempt = crate::native_shard_trace::begin_rpc_attempt(&target, &expected);
@@ -2419,6 +2423,13 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
 }
 
 impl DfsPeerTransport for DaemonDfsPeerTransport {
+    fn call_metadata_prefix_probe(
+        &self, attempt: &crate::DfsMetadataPrefixProbeAttempt, options: DfsObjectRpcSendOptions,
+    ) -> Result<crate::DfsMetadataPrefixProbeReturn, DfsPeerTransportError> {
+        let context = self.native_prefix.as_ref().ok_or_else(|| DfsPeerTransportError::new("native prefix capture has no actual opener context"))?;
+        super::native_prefix_return::call_native_prefix_probe(context,&self.host,attempt,options)
+    }
+
     fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
         Some(Arc::clone(&self.host.response_delivery))
     }
@@ -2466,7 +2477,7 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
 
 pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     data_dir: &SinomoDataDir,
-    _runtime: &tokio::runtime::Handle,
+    runtime: &tokio::runtime::Handle,
 ) -> (
     Arc<dyn DfsPeerTransport>,
     Arc<dyn sinomo_dfs::AsyncDfsPeerTransport>,
@@ -2477,7 +2488,7 @@ pub(crate) fn daemon_dfs_peer_transports_on_runtime(
         let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
         return (peer_transport, async_peer_transport);
     };
-    let transport = Arc::new(DaemonDfsPeerTransport { host });
+    let transport = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext {data_dir:data_dir.clone(),runtime:runtime.clone()}) });
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)
@@ -2591,7 +2602,7 @@ mod peer_delivery_tests {
                 carrier.clone(),
                 None,
             ));
-            let peer = Arc::new(DaemonDfsPeerTransport { host });
+            let peer = Arc::new(DaemonDfsPeerTransport { host, native_prefix: None });
             let local = NodeId::from_legacy_named("host-delivery-local").unwrap();
             let remote = NodeId::from_legacy_named("host-delivery-remote").unwrap();
             let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
