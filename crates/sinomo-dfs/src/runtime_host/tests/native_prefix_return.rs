@@ -91,7 +91,7 @@ impl Fixture {
             self.shard.primary_node_id.clone(),
             self.nodes.clone(),
             self.native.data_dir(&self.shard.primary_node_id),
-            self.native.runtime_handle(),
+            &self.native.runtime_handle(),
         )
     }
     fn markers(&self) -> TestResult<BTreeMap<PathBuf, Option<Vec<u8>>>> {
@@ -461,7 +461,7 @@ fn native_prefix_return_refuses_generic_data_and_old_attempt_peer_owner_reuse() 
         );
         let (other_sync, other_async) = daemon_dfs_peer_transports_on_runtime(
             fixture.native.data_dir(&wrong_peer),
-            fixture.native.runtime_handle(),
+            &fixture.native.runtime_handle(),
         );
         let mut foreign = crate::DfsNodeTransport::with_peer_transports_for_nodes(
             fixture.shard.primary_node_id.clone(),
