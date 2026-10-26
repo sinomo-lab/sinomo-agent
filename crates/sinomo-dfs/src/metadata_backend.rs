@@ -3291,6 +3291,8 @@ mod tests;
 mod replay;
 
 mod handoff;
+#[cfg(test)]
+pub(crate) mod native_prefix_history;
 
 mod source_adoption;
 pub(crate) use source_adoption::DfsSourceAdoptionWriterCustody;

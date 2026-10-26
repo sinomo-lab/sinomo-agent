@@ -22,6 +22,22 @@ pub(super) fn initial_namespace_batch_before_materialize_for_test(action: impl F
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
     #[cfg(test)]
+    fn retain_native_prefix_history(
+        &mut self,round:&crate::node_transport::OwnedNativeMetadataPrefixRound,
+        provider:&crate::publication_guard::DfsPublicationExecutionProvider,
+        execution:&crate::publication_guard::DfsPublicationExecutionOwners,
+        local:&NodeId,deadline:std::time::Instant,
+    )->Result<crate::metadata_backend::native_prefix_history::NativePrefixHistoryIntake> {
+        self.retain_native_prefix_history_owned(round,provider,execution,local,deadline)
+    }
+    #[cfg(test)]
+    fn read_native_prefix_history(&self,shard:&DfsMetadataShardId)
+        ->Result<Option<crate::metadata_backend::native_prefix_history::NativePrefixHistoryRecord>> {
+        if shard!=&self.shard_id {return Err(MetadataBackendError::Serde("historical DATA reader names another shard".into()));}
+        self.read_native_prefix_history_owned()
+    }
+
+    #[cfg(test)]
     fn install_selected_local_recovery_fence(
         &mut self,
         reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,

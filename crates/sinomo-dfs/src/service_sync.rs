@@ -1695,6 +1695,88 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn retain_native_prefix_history(
+        &mut self,
+        round: &crate::node_transport::OwnedNativeMetadataPrefixRound,
+        deadline: Instant,
+    ) -> Result<crate::metadata_backend::native_prefix_history::NativePrefixHistoryIntake, DfsError>
+    {
+        self.check_cancelled("native prefix historical intake")?;
+        if !round.is_complete()
+            || Instant::now() >= deadline
+            || self.source_adoption.offer().is_some()
+            || self.source_adoption.witness().is_some()
+        {
+            return Err(DfsError::Metadata {message:"historical intake requires a complete private round, live intake budget and no retained source writer".into()});
+        }
+        let assignment =
+            round
+                .target()
+                .expected_shard
+                .as_ref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "historical intake has no exact assignment".into(),
+                })?;
+        let provider = self
+            .publication_provider
+            .current()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "historical intake has no actual native writer provider".into(),
+            })?;
+        // Admission precedes any backend borrow or writer. Reuse an installed
+        // owner instead of waiting recursively for the same scheduler scope.
+        let _restore = if self.publication_execution.current().is_none() {
+            Some(
+                self.publication_execution
+                    .install(provider.acquire_prefix_history_execution(
+                        assignment,
+                        &self.node_id,
+                        round.round_id(),
+                        deadline,
+                    )?),
+            )
+        } else {
+            None
+        };
+        let execution = self
+            .publication_execution
+            .current()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "historical intake has no actual execution owner".into(),
+            })?;
+        self.check_cancelled("native prefix historical intake")?;
+        let result = self
+            .metadata_backend
+            .as_mut()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "historical intake has no metadata writer".into(),
+            })?
+            .retain_native_prefix_history(round, &provider, &execution, &self.node_id, deadline)
+            .map_err(DfsError::from)?;
+        self.check_cancelled("native prefix historical intake").map_err(|error| DfsError::Metadata {
+            message: format!("historical intake completion is uncertain after local processing; retained DATA is not rolled back: {error}"),
+        })?;
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_native_prefix_history(
+        &self,
+        shard: &DfsMetadataShardId,
+    ) -> Result<
+        Option<crate::metadata_backend::native_prefix_history::NativePrefixHistoryRecord>,
+        DfsError,
+    > {
+        self.metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "historical reader has no actual backend".into(),
+            })?
+            .read_native_prefix_history(shard)
+            .map_err(Into::into)
+    }
+
     /// Gather fresh full-assignment proof for exactly this locally captured
     /// target. Refuse source advancement/history loss instead of upgrading it.
     /// The returned existing certificate is DATA, never new serving authority.
