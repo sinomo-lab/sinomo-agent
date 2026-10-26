@@ -99,7 +99,7 @@ fn capture_actual_round(
         target = service.capture_metadata_quorum_sync_target(&object)?;
     }
     drop(service); // never hold a metadata lease across actual native RPC
-    let nodes = std::iter::once(shard.primary_node_id.clone())
+    let nodes: Vec<NodeId> = std::iter::once(shard.primary_node_id.clone())
         .chain(shard.replica_node_ids.iter().cloned())
         .collect();
     let mut transport = crate::runtime_host::daemon_dfs_node_transport_on_runtime(
