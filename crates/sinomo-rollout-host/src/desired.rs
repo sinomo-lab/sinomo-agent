@@ -340,13 +340,41 @@ mod native_watch_route_tests {
                 panic!("direct outcome is not the required pre-delivery refusal: {error}")
             }
         }
+        // Keep the real standalone client's evidence, including a timeout
+        // before registration. This bounded in-process capture does not add
+        // probes, replace replies, or extend any watch deadline.
+        sinomo_core::network::start_network_timeline_capture(
+            sinomo_core::network::NETWORK_TIMELINE_DEFAULT_MAX_EVENTS,
+        ).expect("start this disposable client's bounded timeline");
         let started = host
             .start_watch(
                 &endpoint,
                 &prefix,
                 sinomo_rollout::DESIRED_ROLLOUT_WATCH_START_TIMEOUT,
             )
-            .await
+            .await;
+        let timeline = sinomo_core::network::stop_network_timeline_capture()
+            .expect("stop the disposable client timeline before later measured gates");
+        let events = timeline.events.iter().map(|event| serde_json::json!({
+            "sequence": event.sequence, "monotonic_ns": event.monotonic_ns,
+            "duration_ns": event.duration_ns, "trace_id": event.trace_id,
+            "span_id": event.span_id, "connection_id": event.connection_id,
+            "endpoint_correlation_id": event.endpoint_correlation_id,
+            "call_id": event.call_id, "frame_id": event.frame_id,
+            "stage": event.stage,
+            "stage_name": sinomo_core::network::network_timeline_stage_name(event.stage),
+            "flags": event.flags, "bytes": event.bytes, "aux": event.aux,
+        })).collect::<Vec<_>>();
+        println!("watch_route_client_timeline={}", serde_json::json!({
+            "started_monotonic_ns": timeline.started_monotonic_ns,
+            "captured_monotonic_ns": timeline.captured_monotonic_ns,
+            "max_events": timeline.max_events, "events": events,
+            "endpoint_identities": timeline.endpoint_identities,
+            "dropped_events": timeline.dropped_events, "overflowed": timeline.overflowed,
+            "active": timeline.active,
+            "qualification": "Actual client registration attempt; no supplied responses or timing subtraction. Missing events remain unavailable.",
+        }));
+        let started = started
             .expect("same real authority is reachable through the node-addressed Main carrier");
         let watch_id = started.value.watch_id;
         println!(
