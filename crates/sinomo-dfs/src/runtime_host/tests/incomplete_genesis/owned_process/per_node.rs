@@ -178,6 +178,9 @@ fn read_hello(node: &mut NativeNode, deadline: Instant) -> TestResult<NodeHello>
                         && !hello.public_key.starts_with("pk-")
                 );
                 DirectoryId::read(&node.input.data_root)?;
+                if Instant::now() >= deadline {
+                    return Err("native Hello validation exceeded original60s".into());
+                }
                 return Ok(hello);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -405,6 +408,9 @@ fn wait_for_native_ping(
         );
         record_probe(root, report, "baseline-native-ping", &result)?;
         if matches!(&result,Ok(value) if value.result.is_ok()) {
+            if Instant::now() >= deadline {
+                return Err("native baseline completed after original startup deadline".into());
+            }
             return Ok(());
         }
         nodes[source].alive_identity()?;
@@ -496,6 +502,9 @@ fn normal_drain(nodes: &mut [NativeNode], report: &mut serde_json::Value) -> Tes
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+    if Instant::now() > deadline {
+        failures.push("native lifecycle drain exceeded its original60s envelope".into());
     }
     report["normal_drain"] = serde_json::json!({"exits":exits,"errors":failures});
     if failures.is_empty() {
@@ -640,6 +649,12 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
         Err(_) => serde_json::json!("panic; original assertion retained"),
     };
     let drain = normal_drain(&mut nodes, &mut report);
+    report["normal_drain_result"] = serde_json::json!(
+        drain
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    );
     let saved = save_report(&root.join("per-node-native-process-report.json"), &report);
     if !matches!(&tested, Ok(Ok(()))) || drain.is_err() || saved.is_err() {
         for node in &mut nodes {
