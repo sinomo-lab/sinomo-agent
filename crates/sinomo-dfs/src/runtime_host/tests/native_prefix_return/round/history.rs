@@ -157,8 +157,15 @@ fn native_prefix_history_retains_first_round_without_renewal_through_checkpoint_
             "fresh transport correlation cannot rewrite historical DATA"
         );
         drop(service);
+        assert_eq!(
+            fixture.markers()?,
+            markers,
+            "historical intake and both duplicate forms cannot change an authority marker"
+        );
         // Actual semantic activity makes the maintained table checkpoint useful.
         main_append(fixture, "/native-history-checkpoint-activity")?;
+        let changed = current_target(fixture)?;
+        assert!(changed.journal_sequence > round.target().journal_sequence);
         checkpoint_actual_resident(fixture)?;
         assert_eq!(file_observation(&path)?, before);
         let primary = fixture.shard.primary_node_id.clone();
@@ -175,7 +182,49 @@ fn native_prefix_history_retains_first_round_without_renewal_through_checkpoint_
         report["fresh_semantic_round"] = observed(&fresh);
         report["file_identity"] = serde_json::json!({"dev":before.dev,"ino":before.ino,"mtime":before.mtime,"ctime":before.ctime,
             "exact_duplicate_unchanged":true,"fresh_semantic_duplicate_unchanged":true,"checkpoint_and_reopen_unchanged":true});
-        assert_eq!(fixture.markers()?, markers);
+        let after = fixture.markers()?;
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            markers.keys().collect::<Vec<_>>()
+        );
+        let primary_marker = path
+            .parent()
+            .unwrap()
+            .join("journal/membership-handoff-write-freeze.sobj");
+        let old: crate::DfsMetadataShardWriteFreeze = sinomo_core::object::serde_ext::from_bytes(
+            markers
+                .get(&primary_marker)
+                .and_then(Option::as_ref)
+                .ok_or("original completed native fence unavailable")?,
+        )?;
+        let actual: crate::DfsMetadataShardWriteFreeze =
+            sinomo_core::object::serde_ext::from_bytes(
+                after
+                    .get(&primary_marker)
+                    .and_then(Option::as_ref)
+                    .ok_or("reopened native fence unavailable")?,
+            )?;
+        assert!(
+            actual.rebind_prefix_proof.journal_sequence > old.rebind_prefix_proof.journal_sequence
+        );
+        assert_eq!(
+            actual.rebind_prefix_proof.journal_sequence,
+            changed.journal_sequence
+        );
+        assert_eq!(actual.rebind_prefix_proof.digest, changed.state_fingerprint);
+        let mut expected = old.clone();
+        expected.rebind_prefix_proof = actual.rebind_prefix_proof.clone();
+        assert_eq!(
+            actual, expected,
+            "only the exact semantic descendant may advance; original fence identity/epochs/cut stay immutable"
+        );
+        for (other, bytes) in &markers {
+            if other != &primary_marker {
+                assert_eq!(after.get(other), Some(bytes));
+            }
+        }
+        report["marker_transition"] = serde_json::json!({"before":old,"after":actual,"actual_semantic_target":changed,
+            "intake_and_duplicates_byte_unchanged":true,"limit":"legitimate current-prefix rebind after explicit namespace activity/checkpoint/reopen; no time-only renewal"});
         Ok(vec![round, fresh])
     });
 }
