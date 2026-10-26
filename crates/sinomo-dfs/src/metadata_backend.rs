@@ -564,7 +564,10 @@ impl LocalSobjMetadataBackend {
             backend.prefix_proof = state.prefix_proof;
             backend.table_snapshot_fingerprint = state.snapshot_fingerprint;
             backend.ensure_local_materialization_cursor()?;
-            backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
+            // A lagging cursor is only a scheduling hint. The exact table prefix
+            // below roots replay, so reopening a clean resident handle must not
+            // persist an otherwise unnecessary cursor advance. Missing/ahead
+            // hints and genuine unapplied journal tails still use recovery.
             let bootstrapped_prefix = backend.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
             backend.rewind_local_materialization_cursor_to_table_head_if_ahead()?;
             backend.recover_unmaterialized_local_journal_entries()?;
