@@ -75,6 +75,7 @@ enum ProbeKind {
     RegisteredEndpointPing,
     FormationEndpointPing,
     RegisteredEndpointWrongPeer,
+    RegisteredEndpointWrongId,
     PrefixRound,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -90,7 +91,8 @@ impl ProbeKind {
             Self::Ping | Self::DfsStatus => ProbePath::NodeRouting,
             Self::RegisteredEndpointPing
             | Self::FormationEndpointPing
-            | Self::RegisteredEndpointWrongPeer => ProbePath::RegisteredNativeEndpoint,
+            | Self::RegisteredEndpointWrongPeer
+            | Self::RegisteredEndpointWrongId => ProbePath::RegisteredNativeEndpoint,
             Self::PrefixRound => ProbePath::NativePrefixOwner,
             _ => ProbePath::AuthenticatedEndpoint,
         }
@@ -610,7 +612,8 @@ fn probe(
             | ProbeKind::EndpointWrongPeer
             | ProbeKind::RegisteredEndpointPing
             | ProbeKind::FormationEndpointPing
-            | ProbeKind::RegisteredEndpointWrongPeer => {
+            | ProbeKind::RegisteredEndpointWrongPeer
+            | ProbeKind::RegisteredEndpointWrongId => {
                 assert_eq!(
                     reply.route,
                     sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
@@ -991,6 +994,44 @@ fn run_native_process_case(
             );
             nodes[1].alive_identity()?;
             nodes[2].alive_identity()?;
+        }
+        if registered_endpoint {
+            let intended = nodes[2].input.node_id.clone();
+            let bad = probe(
+                &mut nodes[0],
+                &intended,
+                ProbeKind::RegisteredEndpointWrongId,
+                format!("unknown-endpoint-{}", sinomo_core::Id::generate()),
+                OP_CAP,
+            );
+            record_probe(
+                &root,
+                &mut report,
+                "native-unknown-endpoint-id-refusal",
+                &bad,
+            )?;
+            assert!(
+                matches!(&bad, Ok(value) if value.result.is_err() && value.contact.is_some()),
+                "unknown endpoint must reach actual registered native refusal: {bad:?}"
+            );
+            nodes[2].alive_identity()?;
+            let good = probe(
+                &mut nodes[0],
+                &intended,
+                ProbeKind::RegisteredEndpointPing,
+                format!("after-unknown-endpoint-{}", sinomo_core::Id::generate()),
+                OP_CAP,
+            );
+            record_probe(
+                &root,
+                &mut report,
+                "actual-valid-endpoint-after-refusal",
+                &good,
+            )?;
+            assert!(
+                matches!(&good, Ok(value) if value.result.is_ok()),
+                "same live peer must still answer its genuine endpoint: {good:?}"
+            );
         }
         if prefix_round {
             let mut complete = 0;

@@ -378,8 +378,7 @@ fn dispatch_native_prefix_call(
             .get(attempt.peer())
             .ok_or_else(|| invalid("native PREFIX peer has no owned contact"))?;
         let paths = ClusterPaths::new(&context.data_dir);
-        let state =
-            sinomo_core::cluster::read_cluster_state_cached_shared(&paths).map_err(invalid)?;
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).map_err(invalid)?;
         if attempt.command().source_node_id.as_ref() != Some(&state.local_node_id) {
             return Err(invalid("native PREFIX contact source changed"));
         }

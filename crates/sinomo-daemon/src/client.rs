@@ -1615,8 +1615,9 @@ pub fn send_object_rpc_call_to_target_with_options(
     )
 }
 
-/// The actual registered carrier owns paths/runtime. An endpoint argument is
-/// only a restriction on its current native directory, not supplied authority.
+/// The actual registered carrier owns paths/runtime. A concrete endpoint is
+/// a contact hint, not membership or effect authority. The native handshake
+/// validates its target key and endpoint ID; a merged hint list cannot replace it.
 /// Never fall back to another endpoint, node route or local loopback identity.
 pub(crate) fn send_object_rpc_call_to_exact_endpoint_on_runtime(
     daemon_paths: &DaemonPaths,
@@ -1649,7 +1650,7 @@ pub(crate) fn send_object_rpc_call_to_exact_endpoint_on_runtime(
                 "explicit remote endpoint cannot select a local-loopback carrier",
             ));
         }
-        let member = state
+        let _member = state
             .members
             .iter()
             .find(|member| {
@@ -1658,11 +1659,9 @@ pub(crate) fn send_object_rpc_call_to_exact_endpoint_on_runtime(
                     && member.state.is_authorized()
             })
             .ok_or_else(|| refuse("endpoint target is not a current authorized native member"))?;
-        if !member.endpoints.contains(&endpoint) {
-            return Err(refuse(
-                "explicit endpoint differs from the current native member descriptor",
-            ));
-        }
+        // Do not require discovery hints to be present in merged membership.
+        // The existing endpoint API authenticates this authorized target and
+        // the receiver validates the exact endpoint ID before service dispatch.
         let options = match deadline {
             Some(deadline) => options.with_overall_timeout(
                 deadline

@@ -143,7 +143,8 @@ async fn probe(
         | ProbeKind::EndpointWrongPeer
         | ProbeKind::RegisteredEndpointPing
         | ProbeKind::FormationEndpointPing
-        | ProbeKind::RegisteredEndpointWrongPeer => {
+        | ProbeKind::RegisteredEndpointWrongPeer
+        | ProbeKind::RegisteredEndpointWrongId => {
             sinomo_core::cluster::cluster_network_ping_rpc_request(&request.nonce, 0)?
         }
         ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
@@ -167,19 +168,16 @@ async fn probe(
         ProbeKind::RegisteredEndpointPing
             | ProbeKind::FormationEndpointPing
             | ProbeKind::RegisteredEndpointWrongPeer
+            | ProbeKind::RegisteredEndpointWrongId
     );
     let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint || registered_endpoint {
         let data = SinomoDataDir::new(root);
         let paths = ClusterPaths::new(&data);
         // Endpoint contacts use the actual native-written member view, never
         // a supplied authenticated stream or a synthetic connectivity edge.
-        let state = if registered_endpoint {
-            // Select from the SAME merged native view used by the actual
-            // registered carrier. It still revalidates the exact descriptor.
-            sinomo_core::cluster::read_cluster_state_cached_shared(&paths)?
-        } else {
-            Arc::new(sinomo_core::cluster::read_cluster_state_without_kv(&paths)?)
-        };
+        // Local native discovery supplies the exact owned contact; the real
+        // registered carrier separately authorizes the peer and authenticates it.
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
         if &state.local_node_id != source || &state.cluster_id != cluster {
             return Err(invalid(
                 "native diagnostic source identity changed under its process",
@@ -236,6 +234,19 @@ async fn probe(
             // all native handshake checks remain unchanged, and must refuse it.
             endpoint.address = contact(other)?.address;
         }
+        if matches!(request.kind, ProbeKind::RegisteredEndpointWrongId) {
+            let invalid_id =
+                sinomo_core::Id::derived("dfs.test.unknown-native-endpoint", &request.nonce);
+            if state
+                .members
+                .iter()
+                .flat_map(|m| &m.endpoints)
+                .any(|e| e.endpoint_id == invalid_id)
+            {
+                return Err(invalid("negative endpoint ID unexpectedly already exists"));
+            }
+            endpoint.endpoint_id = invalid_id;
+        }
         *selected.lock().unwrap() = Some(endpoint.clone());
         eprintln!(
             "NATIVE_ENDPOINT_PROBE source={source} target={} nonce={} endpoint={endpoint:?}",
@@ -291,7 +302,8 @@ async fn probe(
         | ProbeKind::EndpointWrongPeer
         | ProbeKind::RegisteredEndpointPing
         | ProbeKind::FormationEndpointPing
-        | ProbeKind::RegisteredEndpointWrongPeer => {
+        | ProbeKind::RegisteredEndpointWrongPeer
+        | ProbeKind::RegisteredEndpointWrongId => {
             let ping: sinomo_core::cluster::ClusterNetworkPingResponse = response.decode_body()?;
             if ping.responder_node_id != request.target
                 || ping.nonce != request.nonce
