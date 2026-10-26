@@ -171,6 +171,9 @@ at most once through this routed step, sharing the direct-read concurrency cap
 and original deadline. A routed reply supplies only its source-owned rows; it
 never invents a direct edge from the caller to that source. The collector does
 not recursively invoke freshness discovery or trust relayed third-party rows.
+Owner-local endpoint hints may remain in bootstrap records. The source reader
+excludes `LocalOnly` endpoints both from remote dials and from accepted remote
+edges; a peer's loopback listener does not name a listener on the caller's host.
 
 These observations are lost on process restart. Stored expired rows remain
 expired and serve only as semantic baselines or endpoint hints. Cold startup,

@@ -35,7 +35,8 @@ fn matching_source_records(
         }
         let bound = directory.node(&live.target_node_id).is_some_and(|target| {
             target.endpoints.iter().any(|endpoint| {
-                endpoint.endpoint_id == live.endpoint_id
+                endpoint.privacy != sinomo_base::ClusterEndpointPrivacy::LocalOnly
+                    && endpoint.endpoint_id == live.endpoint_id
                     && endpoint.transport == live.transport
                     && endpoint.address == live.address
             })
@@ -151,6 +152,53 @@ async fn read_source(
     (origin, response)
 }
 
+fn direct_source_endpoint_candidates(
+    snapshot: &DirectorySnapshot,
+    state: &ClusterBootstrapState,
+    records: &[ClusterConnectivityRecord],
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let mut candidates = Vec::new();
+    for node in snapshot.nodes().values() {
+        if node.node_id == state.local_node_id
+            || !state.members.iter().any(|member| {
+                member.node_id == node.node_id
+                    && member.node_public_key == node.public_key
+                    && member.state.is_authorized()
+            })
+        {
+            continue;
+        }
+        for endpoint in &node.endpoints {
+            // Bootstrap views may retain the owner's local listener hints.
+            // Dialing those for a remote source would hit this caller's own
+            // machine and must never create a cross-node observation.
+            if endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly {
+                continue;
+            }
+            // Preserve existing live identity-mismatch quarantine. An expired
+            // row may be a hint, never an authority grant or synthetic edge.
+            if records.iter().any(|record| {
+                record.source_node_id == state.local_node_id
+                    && record.target_node_id == node.node_id
+                    && record.endpoint_id == endpoint.endpoint_id
+                    && record.failure_reason
+                        == Some(crate::ClusterConnectivityFailureReason::IdentityMismatch)
+            }) {
+                continue;
+            }
+            crate::object::try_reserve_vec(&mut candidates, 1, "collect live source endpoints")?;
+            candidates.push(endpoint.clone());
+        }
+    }
+    if candidates.len() > crate::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
+        return Err(NetworkError::ClusterConnectivitySnapshotRecordLimit {
+            observed_records: candidates.len(),
+            max_records: crate::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
+        });
+    }
+    Ok(candidates)
+}
+
 pub(super) async fn refresh_connector(
     paths: &ClusterPaths,
     directory: &Arc<dyn crate::ClusterDirectory>,
@@ -174,39 +222,7 @@ pub(super) async fn refresh_connector(
             &snapshot,
             ordinary_records,
         )?;
-    let mut candidates = Vec::new();
-    for node in snapshot.nodes().values() {
-        if node.node_id == state.local_node_id
-            || !state.members.iter().any(|member| {
-                member.node_id == node.node_id
-                    && member.node_public_key == node.public_key
-                    && member.state.is_authorized()
-            })
-        {
-            continue;
-        }
-        for endpoint in &node.endpoints {
-            // Preserve existing live identity-mismatch quarantine. An expired
-            // row may be a hint, never an authority grant or synthetic edge.
-            if records.iter().any(|record| {
-                record.source_node_id == state.local_node_id
-                    && record.target_node_id == node.node_id
-                    && record.endpoint_id == endpoint.endpoint_id
-                    && record.failure_reason
-                        == Some(crate::ClusterConnectivityFailureReason::IdentityMismatch)
-            }) {
-                continue;
-            }
-            crate::object::try_reserve_vec(&mut candidates, 1, "collect live source endpoints")?;
-            candidates.push(endpoint.clone());
-        }
-    }
-    if candidates.len() > crate::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS {
-        return Err(NetworkError::ClusterConnectivitySnapshotRecordLimit {
-            observed_records: candidates.len(),
-            max_records: crate::MAX_CLUSTER_CONNECTIVITY_SNAPSHOT_RECORDS,
-        });
-    }
+    let candidates = direct_source_endpoint_candidates(&snapshot, state, &records)?;
     let mut direct = std::collections::VecDeque::from(candidates);
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let mut attempted_sources = std::collections::BTreeSet::new();
@@ -409,6 +425,60 @@ mod tests {
         );
         baseline.source_node_id = source.clone();
         (directory, state, source, baseline, now)
+    }
+
+    #[test]
+    fn source_read_candidates_do_not_dial_other_nodes_local_only_hints() {
+        let (_, mut state, _, baseline, _) = fixture();
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == baseline.target_node_id)
+            .unwrap();
+        let public = member.endpoints[0].clone();
+        let mut private = public.clone();
+        private.endpoint_id = crate::ClusterEndpointId::derived("foreign-local-only", b"loopback");
+        private.privacy = sinomo_base::ClusterEndpointPrivacy::LocalOnly;
+        private.transport = ClusterTransportKind::Loopback;
+        private.address = "127.0.0.1:21354".into();
+        member.endpoints.push(private);
+        let directory =
+            DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), state.members.clone())
+                .unwrap();
+        assert_eq!(
+            direct_source_endpoint_candidates(&directory, &state, &[]).unwrap(),
+            vec![public],
+            "a peer's bootstrap loopback hint names its local machine, not a source read endpoint on this caller"
+        );
+    }
+
+    #[test]
+    fn source_read_cannot_convert_foreign_local_only_rows_into_edges() {
+        let (_, mut state, source, mut baseline, now) = fixture();
+        let member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == baseline.target_node_id)
+            .unwrap();
+        member.endpoints[0].privacy = sinomo_base::ClusterEndpointPrivacy::LocalOnly;
+        let directory =
+            DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), state.members.clone())
+                .unwrap();
+        baseline.observed_at = now;
+        baseline.expires_at = now + time::Duration::seconds(900);
+        assert!(
+            matching_source_records(
+                &directory,
+                &state,
+                &source,
+                std::slice::from_ref(&baseline),
+                vec![baseline.clone()],
+                now
+            )
+            .unwrap()
+            .is_empty(),
+            "an authenticated source cannot make another node's local-only endpoint usable from this caller"
+        );
     }
 
     #[test]
