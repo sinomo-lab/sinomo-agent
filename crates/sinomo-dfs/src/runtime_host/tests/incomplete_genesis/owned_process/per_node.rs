@@ -40,6 +40,22 @@ struct NodeConfiguration {
 enum ProbeKind {
     Ping,
     DfsStatus,
+    EndpointPing,
+    EndpointDfsStatus,
+    EndpointWrongPeer,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ProbePath {
+    NodeRouting,
+    AuthenticatedEndpoint,
+}
+impl ProbeKind {
+    fn path(self) -> ProbePath {
+        match self {
+            Self::Ping | Self::DfsStatus => ProbePath::NodeRouting,
+            _ => ProbePath::AuthenticatedEndpoint,
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +84,7 @@ struct DriverResponse {
     source_pid: u32,
     target: NodeId,
     nonce: String,
+    path: ProbePath,
     result: Result<ProbeReply, ProbeFailure>,
 }
 
@@ -330,11 +347,12 @@ fn probe(
     assert_eq!(result.source_pid, identity.pid);
     assert_eq!(result.target, *target);
     assert_eq!(result.nonce, nonce);
+    assert_eq!(result.path, kind.path());
     node.alive_identity()?;
     if let Ok(reply) = &result.result {
         assert!(reply.body.len() <= MAX_REPLY);
         match kind {
-            ProbeKind::Ping => {
+            ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
                 assert_eq!(
                     reply.route,
                     sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
@@ -345,7 +363,7 @@ fn probe(
                 assert_eq!(&ping.responder_node_id, target);
                 assert_eq!(reply.responder_node_id.as_deref(), Some(target.as_str()));
             }
-            ProbeKind::DfsStatus => {
+            ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
                 assert_eq!(reply.route, crate::DFS_STATUS_ROUTE);
                 let _: crate::DfsOperatorStatus =
                     sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
@@ -372,7 +390,7 @@ fn record_probe(
             let file = root.join(format!("probe-{index:03}.sobj"));
             write_data(&file, value)?;
             let bytes = fs::read(&file)?;
-            serde_json::json!({"phase":phase,"source":value.source_node_id,"source_pid":value.source_pid,"target":value.target,"nonce":value.nonce,
+            serde_json::json!({"phase":phase,"path":value.path,"source":value.source_node_id,"source_pid":value.source_pid,"target":value.target,"nonce":value.nonce,
                 "actual_result":match &value.result {Ok(reply)=>serde_json::json!({"route":reply.route,"responder":reply.responder_node_id,"body_bytes":reply.body.len()}),Err(error)=>serde_json::json!({"error":error})},
                 "evidence":file,"blake3":blake3::hash(&bytes).to_hex().to_string()})
         }
@@ -387,6 +405,7 @@ fn wait_for_native_ping(
     nodes: &mut [NativeNode],
     source: usize,
     target: usize,
+    kind: ProbeKind,
     deadline: Instant,
     root: &Path,
     report: &mut serde_json::Value,
@@ -402,7 +421,7 @@ fn wait_for_native_ping(
         let result = probe(
             &mut nodes[source],
             &target_id,
-            ProbeKind::Ping,
+            kind,
             nonce,
             OP_CAP.min(deadline.saturating_duration_since(Instant::now())),
         );
@@ -557,12 +576,21 @@ fn preserve_native_failure_diagnostics(nodes: &mut [NativeNode], root: &Path) ->
     serde_json::json!(observations)
 }
 
-#[test]
-fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
+fn run_native_process_case(endpoint_mode: bool) {
     let fixture = sinomo_testdir::TestDir::new("dfs-per-node-native-process-control");
     let root = fixture.path().to_path_buf();
     let mut nodes = Vec::new();
-    let mut report = serde_json::json!({"scope":"independent real daemon processes and native authenticated TCP/routed stream calls; no Fabric",
+    let ping_kind = if endpoint_mode {
+        ProbeKind::EndpointPing
+    } else {
+        ProbeKind::Ping
+    };
+    let status_kind = if endpoint_mode {
+        ProbeKind::EndpointDfsStatus
+    } else {
+        ProbeKind::DfsStatus
+    };
+    let mut report = serde_json::json!({"scope":"independent real daemon processes and native authenticated TCP/routed stream calls; no Fabric","explicit_endpoint_diagnostic":endpoint_mode,
         "limits":"initial control voter A, nonvoters B/C; no control-quorum f1/metadata serving/quietness acceptance or private provenance reconstructed",
         "caps":{"startup_seconds":60,"rpc_seconds":5,"owned_reap_seconds":5,"normal_drain_seconds":60},"probes":[]});
     let tested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> TestResult<()> {
@@ -585,22 +613,68 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
         configure_nodes(&mut nodes)?;
         report["nodes"]=serde_json::json!(nodes.iter().map(|n|serde_json::json!({"identity":n.owned.identity,"node":n.input.node_id,"data_root":n.input.data_root,"hello":n.hello})).collect::<Vec<_>>());
         for (source, target) in [(0, 1), (1, 2), (2, 0), (0, 2), (2, 1), (1, 0)] {
-            wait_for_native_ping(&mut nodes, source, target, deadline, &root, &mut report)?;
+            wait_for_native_ping(
+                &mut nodes,
+                source,
+                target,
+                ping_kind,
+                deadline,
+                &root,
+                &mut report,
+            )?;
         }
         for (source, target) in [(0, 1), (1, 2), (2, 0)] {
             let peer = nodes[target].input.node_id.clone();
             let result = probe(
                 &mut nodes[source],
                 &peer,
-                ProbeKind::DfsStatus,
+                status_kind,
                 format!("baseline-dfs-{}", sinomo_core::Id::generate()),
                 OP_CAP,
             );
             record_probe(&root, &mut report, "baseline-native-dfs-status", &result)?;
-            assert!(
-                matches!(&result,Ok(value) if value.result.is_ok()),
-                "native DFS status route unavailable: {result:?}"
+            if !endpoint_mode {
+                assert!(
+                    matches!(&result,Ok(value) if value.result.is_ok()),
+                    "native DFS status route unavailable: {result:?}"
+                );
+            }
+        }
+        if endpoint_mode {
+            let intended = nodes[2].input.node_id.clone();
+            let wrong = probe(
+                &mut nodes[0],
+                &intended,
+                ProbeKind::EndpointWrongPeer,
+                format!("wrong-contact-{}", sinomo_core::Id::generate()),
+                OP_CAP,
             );
+            record_probe(
+                &root,
+                &mut report,
+                "wrong-live-peer-contact-refusal",
+                &wrong,
+            )?;
+            assert!(
+                !matches!(&wrong, Ok(value) if value.result.is_ok()),
+                "wrong live endpoint cannot authenticate as the intended peer"
+            );
+            let ordinary = probe(
+                &mut nodes[0],
+                &intended,
+                ProbeKind::Ping,
+                format!(
+                    "ordinary-routing-observation-{}",
+                    sinomo_core::Id::generate()
+                ),
+                OP_CAP,
+            );
+            record_probe(
+                &root,
+                &mut report,
+                "ordinary-routing-separate-unqualified-observation",
+                &ordinary,
+            )?;
         }
         let b = nodes[1].alive_identity()?;
         let c = nodes[2].alive_identity()?;
@@ -631,7 +705,7 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
             let result = probe(
                 &mut nodes[source],
                 &peer,
-                ProbeKind::Ping,
+                ping_kind,
                 format!("survivor-{}", sinomo_core::Id::generate()),
                 OP_CAP,
             );
@@ -651,7 +725,7 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
         let failed = probe(
             &mut nodes[1],
             &a_id,
-            ProbeKind::Ping,
+            ping_kind,
             format!("dead-A-{}", sinomo_core::Id::generate()),
             OP_CAP,
         );
@@ -665,7 +739,7 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
             let status = probe(
                 &mut nodes[source],
                 &peer,
-                ProbeKind::DfsStatus,
+                status_kind,
                 format!("survivor-dfs-{}", sinomo_core::Id::generate()),
                 OP_CAP,
             );
@@ -716,4 +790,14 @@ fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
     tested.unwrap().unwrap();
     drain.unwrap();
     saved.unwrap();
+}
+
+#[test]
+fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
+    run_native_process_case(false);
+}
+
+#[test]
+fn native_authenticated_endpoint_processes_survive_a_loss_without_routing_authority() {
+    run_native_process_case(true);
 }

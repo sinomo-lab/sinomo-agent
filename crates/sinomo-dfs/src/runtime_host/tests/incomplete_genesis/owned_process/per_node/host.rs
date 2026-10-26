@@ -114,12 +114,17 @@ async fn probe(
     transport: &dyn ComponentObjectRpcTransport,
     request: &DriverRequest,
     deadline: Instant,
+    root: &Path,
+    runtime: &tokio::runtime::Handle,
+    source: &NodeId,
+    cluster: &sinomo_core::Id,
+    peers: &BTreeSet<NodeId>,
 ) -> Result<ProbeReply, NetworkError> {
     let wire = match request.kind {
-        ProbeKind::Ping => {
+        ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
             sinomo_core::cluster::cluster_network_ping_rpc_request(&request.nonce, 0)?
         }
-        ProbeKind::DfsStatus => {
+        ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
             ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())?
         }
     };
@@ -134,14 +139,78 @@ async fn probe(
                 NetworkDeliveryState::DefinitelyNotSent,
             )
         })?;
-    let result = transport
-        .call_async(
-            &request.target,
-            ObjectRpcCall::value(wire),
-            ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
-            true,
-        )
-        .await?;
+    let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint {
+        let data = SinomoDataDir::new(root);
+        let paths = ClusterPaths::new(&data);
+        // Endpoint contacts use the actual native-written member view, never
+        // a supplied authenticated stream or a synthetic connectivity edge.
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
+        if &state.local_node_id != source || &state.cluster_id != cluster {
+            return Err(invalid(
+                "native diagnostic source identity changed under its process",
+            ));
+        }
+        let contact = |node: &NodeId| -> Result<sinomo_core::ClusterEndpointRecord, NetworkError> {
+            if !peers.contains(node) {
+                return Err(invalid("diagnostic contact is outside owned fixture"));
+            }
+            let member = state
+                .members
+                .iter()
+                .find(|member| &member.node_id == node && member.state.is_authorized())
+                .ok_or_else(|| invalid("diagnostic target lacks current native member binding"))?;
+            member
+                .endpoints
+                .iter()
+                .find(|endpoint| {
+                    &endpoint.node_id == node
+                        && matches!(
+                            endpoint.transport,
+                            sinomo_core::ClusterTransportKind::Loopback
+                                | sinomo_core::ClusterTransportKind::LanTcp
+                        )
+                        && endpoint
+                            .address
+                            .parse::<std::net::SocketAddr>()
+                            .is_ok_and(|address| address.ip().is_loopback() && address.port() != 0)
+                })
+                .cloned()
+                .ok_or_else(|| invalid("actual member has no concrete owned loopback endpoint"))
+        };
+        let mut endpoint = contact(&request.target)?;
+        if matches!(request.kind, ProbeKind::EndpointWrongPeer) {
+            let other = peers
+                .iter()
+                .find(|node| *node != source && **node != request.target)
+                .ok_or_else(|| invalid("wrong-contact control lacks another actual peer"))?;
+            // Deliberately invalid address hint only. The intended node/key and
+            // all native handshake checks remain unchanged, and must refuse it.
+            endpoint.address = contact(other)?.address;
+        }
+        eprintln!(
+            "NATIVE_ENDPOINT_PROBE source={source} target={} nonce={} endpoint={endpoint:?}",
+            request.target, request.nonce
+        );
+        let mut host = sinomo_daemon::DaemonObjectRpcAsyncHost::direct_only(runtime)
+            .with_paths(&sinomo_daemon::DaemonPaths::new(&data));
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths)
+            .call_endpoint(
+                &state,
+                &endpoint,
+                ObjectRpcCall::value(wire),
+                ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
+            )
+            .await?
+    } else {
+        transport
+            .call_async(
+                &request.target,
+                ObjectRpcCall::value(wire),
+                ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
+                true,
+            )
+            .await?
+    };
     // Semantic attachments are refused by the maintained value decoder. It
     // consumes the actual result exactly once, within the same absolute cap.
     let response = result.into_materialized_value_response(MAX_REPLY).await?;
@@ -158,7 +227,7 @@ async fn probe(
         return Err(invalid("native driver reply names another responder"));
     }
     let responder_node_id = match request.kind {
-        ProbeKind::Ping => {
+        ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
             let ping: sinomo_core::cluster::ClusterNetworkPingResponse = response.decode_body()?;
             if ping.responder_node_id != request.target
                 || ping.nonce != request.nonce
@@ -175,7 +244,7 @@ async fn probe(
             }
             Some(ping.responder_node_id.to_string())
         }
-        ProbeKind::DfsStatus => {
+        ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
             let _: crate::DfsOperatorStatus = response.decode_body()?;
             // DFS status has no echoed nonce or responder in its typed body.
             // Preserve only an actual native header, never copy the target.
@@ -245,6 +314,11 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
             if local.local_node_id != source {
                 return Err(bad("native driver component has another startup node"));
             }
+            let cluster = local.cluster_id.clone();
+            let native_runtime = component
+                .runtime()
+                .ok_or_else(|| bad("native driver has no actual runtime"))?
+                .clone();
             let source = source.clone();
             let root = expected_root.clone();
             let peers = peers.clone();
@@ -256,6 +330,8 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
                     let source = source.clone();
                     let root = root.clone();
                     let peers = peers.clone();
+                    let cluster = cluster.clone();
+                    let native_runtime = native_runtime.clone();
                     async move {
                         let deadline = Instant::now() + OP_CAP;
                         if context.data_dir.root() != root || request.route != DRIVER_ROUTE {
@@ -271,7 +347,8 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
                             return Err(ServiceError::Service("native driver target/nonce is outside the fixture".into()));
                         }
                         let result = match tokio::time::timeout_at(
-                            tokio::time::Instant::from_std(deadline), probe(transport.as_ref(), &command, deadline),
+                            tokio::time::Instant::from_std(deadline), probe(transport.as_ref(), &command, deadline,
+                                &root, &native_runtime, &source, &cluster, &peers),
                         ).await {
                             Ok(result) => result.map_err(failure),
                             Err(_) => Err(failure(NetworkError::timeout("native process driver call and materialization",
@@ -279,7 +356,7 @@ fn driver_catalog(input: &NodeInput, peers: BTreeSet<NodeId>) -> TestResult<Comp
                         };
                         context.respond_value(DRIVER_ROUTE, DriverResponse {
                             source_node_id: source, source_pid: std::process::id(), target: command.target,
-                            nonce: command.nonce, result,
+                            nonce: command.nonce, path: command.kind.path(), result,
                         })?;
                         Ok(ServiceDisposition::Continue)
                     }
@@ -352,8 +429,12 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
         // store adoption. The owner bootstrap also checks all empty KV fields.
         let node = kv.open_raft_node(&input.node_id)?;
         let snapshot = node.store().try_snapshot()?;
-        eprintln!("NATIVE_FIXTURE_INITIAL_RAFT hard_state={:?} revision={} entries={}",
-            node.hard_state(), snapshot.revision.0, snapshot.entries.len());
+        eprintln!(
+            "NATIVE_FIXTURE_INITIAL_RAFT hard_state={:?} revision={} entries={}",
+            node.hard_state(),
+            snapshot.revision.0,
+            snapshot.entries.len()
+        );
         // The actual native fresh hard state starts at term1, not term0.
         // Compare every field with that owner's exact default; never accept
         // a retained vote/leader/commit or nonempty revision-zero snapshot.
