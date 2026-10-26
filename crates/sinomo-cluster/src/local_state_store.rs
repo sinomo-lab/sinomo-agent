@@ -573,6 +573,66 @@ pub fn write_cluster_state(
     write_cluster_state_unlocked(paths, state)
 }
 
+fn remote_endpoint_projection_changed(
+    previous: &sinomo_base::ClusterMemberRecord,
+    current: &sinomo_base::ClusterMemberRecord,
+) -> bool {
+    if previous.endpoints == current.endpoints || current.updated_at < previous.updated_at {
+        return false;
+    }
+    // This materializer cannot add membership, change keys or grants, or copy
+    // a role/name change under the guise of endpoint maintenance.
+    let mut same_identity_and_attributes = current.clone();
+    same_identity_and_attributes.endpoints = previous.endpoints.clone();
+    same_identity_and_attributes.updated_at = previous.updated_at;
+    &same_identity_and_attributes == previous
+}
+
+/// Materialize a genuine remote endpoint change observed by the existing
+/// maintenance owner. Ordinary state reads remain side-effect free. The caller's
+/// view is only a hint: recapture the merged view under the existing state-writer
+/// lock before replacing any endpoints, preserving concurrent local listeners.
+pub async fn materialize_cluster_remote_endpoints_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    observed: &ClusterBootstrapState,
+) -> Result<bool, NetworkError> {
+    let paths = paths.clone();
+    let observed = observed.clone();
+    runtime.spawn_blocking(move || {
+        let _mutation_lock = acquire_local_cluster_state_mutation_lock(&paths)?;
+        let mut stored = read_cluster_state_without_kv(&paths)?;
+        if stored.cluster_id != observed.cluster_id || stored.local_node_id != observed.local_node_id {
+            return Ok(false);
+        }
+        let needs_projection = stored.members.iter().any(|previous| {
+            !cluster_node_is_local_process(&stored, &previous.node_id)
+                && previous.state.is_authorized()
+                && observed.members.iter().any(|current| remote_endpoint_projection_changed(previous, current))
+        });
+        if !needs_projection { return Ok(false); }
+        let current = read_cluster_state(&paths)?;
+        let mut changed = 0usize;
+        let local_members = stored.members.iter()
+            .filter(|member| cluster_node_is_local_process(&stored, &member.node_id))
+            .map(|member| member.node_id.clone()).collect::<Vec<_>>();
+        for previous in &mut stored.members {
+            if local_members.contains(&previous.node_id) || !previous.state.is_authorized() { continue; }
+            if let Some(member) = current.members.iter().find(|member| remote_endpoint_projection_changed(previous, member)) {
+                *previous = member.clone();
+                changed += 1;
+            }
+        }
+        if changed == 0 { return Ok(false); }
+        write_cluster_state_unlocked(&paths, &stored)?;
+        tracing::debug!(target: "sinomo.cluster.formation", changed_members = changed,
+            "materialized changed remote endpoints in public bootstrap projection");
+        Ok(true)
+    }).await.map_err(|error| NetworkError::Io {
+        operation: "materialize remote endpoint projection".into(), detail: error.to_string(),
+    })?
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcceptedClusterJoinStatePersistence {
     Applied {
@@ -792,6 +852,76 @@ mod tests {
             "pk-local",
             OffsetDateTime::now_utc(),
         )
+    }
+
+    #[test]
+    fn remote_endpoint_projection_rejects_time_only_and_attribute_changes() {
+        let mut state = test_state("endpoint_projection_scope");
+        let peer = add_learner(&mut state, "endpoint_projection_scope_peer");
+        let mut previous = state.members.iter().find(|member| member.node_id == peer).unwrap().clone();
+        previous.endpoints = vec![observed_listener(&peer, "192.0.2.1:21353")];
+        let mut current = previous.clone();
+        current.updated_at += time::Duration::seconds(1);
+        assert!(!remote_endpoint_projection_changed(&previous, &current));
+        current.endpoints = vec![observed_listener(&peer, "192.0.2.2:21353")];
+        assert!(remote_endpoint_projection_changed(&previous, &current));
+        for change in 0..6 {
+            let mut rejected = current.clone();
+            match change {
+                0 => rejected.node_public_key = "different-key".into(),
+                1 => rejected.node_id = NodeId::generate(),
+                2 => rejected.role = ClusterMemberRole::Voter,
+                3 => rejected.display_name = "different-name".into(),
+                4 => rejected.allowed_capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter),
+                _ => rejected.updated_at = previous.updated_at - time::Duration::seconds(1),
+            }
+            assert!(!remote_endpoint_projection_changed(&previous, &rejected), "case {change}");
+        }
+    }
+
+    #[test]
+    fn remote_endpoint_projection_recaptures_and_preserves_new_local_listeners() {
+        let root = sinomo_testdir::TestDir::new("remote_endpoint_projection_race");
+        let data = SinomoDataDir::new(&root);
+        data.ensure_root_layout().unwrap();
+        let paths = ClusterPaths::new(&data);
+        paths.ensure().unwrap();
+        let mut initial = test_state("remote_endpoint_projection_race");
+        let peer = add_learner(&mut initial, "remote_endpoint_projection_race_peer");
+        initial.members.iter_mut().find(|member| member.node_id == peer).unwrap().endpoints = vec![observed_listener(&peer,"192.0.2.1:21353")];
+        write_cluster_state(&paths, &initial).unwrap();
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &initial).unwrap();
+        let mut changed = initial.clone();
+        let remote = changed.members.iter_mut().find(|member| member.node_id == peer).unwrap();
+        remote.endpoints = vec![observed_listener(&peer,"192.0.2.2:21353")];
+        remote.updated_at += time::Duration::seconds(1);
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &changed).unwrap();
+        let observed = read_cluster_state(&paths).unwrap();
+        // Both the local listener owner and the observed committed generation
+        // advance after the caller captures its hint, before materialization.
+        let local_endpoint = observed_listener(&initial.local_node_id,"192.0.2.4:21353");
+        let mut local = initial.clone();
+        local.members.iter_mut().find(|member| member.node_id == initial.local_node_id).unwrap().endpoints = vec![local_endpoint.clone()];
+        write_cluster_state(&paths, &local).unwrap();
+        let remote = changed.members.iter_mut().find(|member| member.node_id == peer).unwrap();
+        remote.endpoints = vec![observed_listener(&peer,"192.0.2.3:21353")];
+        remote.updated_at += time::Duration::seconds(1);
+        let expected = remote.clone();
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &changed).unwrap();
+        let wal = paths.kv_paths().raft_wal_paths(&initial.local_node_id).wal;
+        let wal_before = std::fs::read(&wal).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(runtime.block_on(materialize_cluster_remote_endpoints_async(runtime.handle(), &paths, &observed)).unwrap());
+        let stored = read_cluster_state_without_kv(&paths).unwrap();
+        assert_eq!(stored.members.iter().find(|member| member.node_id == peer).unwrap(), &expected);
+        assert_eq!(stored.members.iter().find(|member| member.node_id == initial.local_node_id).unwrap().endpoints, vec![local_endpoint]);
+        assert_eq!(stored.kv_revision, initial.kv_revision, "endpoint materialization cannot mint an authority revision");
+        let bytes = std::fs::read(&paths.state).unwrap();
+        let mark = cluster_file_mark(&paths.state).unwrap();
+        assert!(!runtime.block_on(materialize_cluster_remote_endpoints_async(runtime.handle(), &paths, &observed)).unwrap());
+        assert_eq!(std::fs::read(&paths.state).unwrap(), bytes);
+        assert_eq!(cluster_file_mark(&paths.state).unwrap(), mark);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
     }
 
     fn add_learner(state: &mut ClusterBootstrapState, name: &str) -> NodeId {

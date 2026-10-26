@@ -2486,6 +2486,11 @@ impl ClusterNetworkMaintenance {
                 .await
         }
         .map_err(DaemonError::from)?;
+        if publish_due || probe_due || connectivity_publish_due {
+            sinomo_core::cluster::materialize_cluster_remote_endpoints_async(
+                &runtime, &cluster_paths, &state,
+            ).await.map_err(DaemonError::from)?;
+        }
         self.local_node_role = sinomo_core::network::cluster_local_node_role(&state);
         if sinomo_core::network::cluster_state_needs_join_registration(&state) {
             if publish_due {
@@ -10068,6 +10073,46 @@ mod tests {
         )
         .unwrap();
         (root, paths, state, published)
+    }
+
+    #[test]
+    fn maintenance_materializes_changed_remote_endpoints_without_time_only_writes() {
+        let runtime = daemon_cluster_test_runtime();
+        let (_root, paths, initial, _) = expiry_scheduler_fixture("remote_endpoint_projection", 1, 900, true);
+        let data_dir = SinomoDataDir::new(paths.root.parent().unwrap());
+        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
+        daemon_paths.ensure().unwrap();
+        let options = DaemonRunOptions::default();
+        write_daemon_status(&daemon_paths, &crate::DaemonStatus::new(&options, &daemon_paths,
+            Some(daemon_cluster_status(&initial, crate::DaemonClusterProcess::Main).unwrap()))).unwrap();
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.request_connectivity_refresh(Instant::now());
+        let _ = run_cluster_network_maintenance_tick_for_test(&mut maintenance, &daemon_paths, &options, &runtime).unwrap();
+        let remote = initial.members[1].node_id.clone();
+        let mut changed = sinomo_core::cluster::read_cluster_state(&paths).unwrap();
+        let member = changed.members.iter_mut().find(|member| member.node_id == remote).unwrap();
+        member.endpoints = vec![sinomo_core::network::daemon_lan_endpoint(&remote, "127.0.0.1:32001".into(), 10)];
+        member.updated_at += time::Duration::seconds(1);
+        let expected = member.endpoints.clone();
+        // Real native applied projection changes; the separate public bootstrap
+        // file deliberately retains the old remote listener, as in R18.
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &changed).unwrap();
+        assert_ne!(sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap().members.into_iter().find(|m| m.node_id == remote).unwrap().endpoints, expected);
+        assert_eq!(sinomo_core::cluster::read_cluster_state(&paths).unwrap().members.into_iter().find(|m| m.node_id == remote).unwrap().endpoints, expected);
+        let wal = paths.kv_paths().raft_wal_paths(&initial.local_node_id).wal;
+        let before_wal = std::fs::read(&wal).unwrap();
+        maintenance.request_connectivity_refresh(Instant::now());
+        let _ = run_cluster_network_maintenance_tick_for_test(&mut maintenance, &daemon_paths, &options, &runtime).unwrap();
+        assert_eq!(sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap().members.into_iter().find(|m| m.node_id == remote).unwrap().endpoints, expected,
+            "the existing maintenance owner must persist the genuine remote endpoint change even when its local listeners are unchanged");
+        assert_eq!(std::fs::read(&wal).unwrap(), before_wal, "materialization cannot create another quorum effect");
+        let bytes = std::fs::read(&paths.state).unwrap();
+        let mark = sinomo_core::network::cluster_file_mark(&paths.state).unwrap();
+        maintenance.request_connectivity_refresh(Instant::now());
+        let _ = run_cluster_network_maintenance_tick_for_test(&mut maintenance, &daemon_paths, &options, &runtime).unwrap();
+        assert_eq!(std::fs::read(&paths.state).unwrap(), bytes);
+        assert_eq!(sinomo_core::network::cluster_file_mark(&paths.state).unwrap(), mark, "unchanged maintenance must not rename or rewrite the public projection");
+        assert_eq!(std::fs::read(&wal).unwrap(), before_wal);
     }
 
     #[test]

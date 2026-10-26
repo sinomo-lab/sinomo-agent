@@ -180,6 +180,14 @@ live source evidence cannot make an expired route valid. Neither live evidence
 nor the raw baseline changes the existing read-authority classification,
 semantic routing generation or effect-authority checks.
 
+The existing Main maintenance turn also materializes genuine remote endpoint
+changes into the public bootstrap projection. This is limited to already-known
+members whose identity and all non-endpoint attributes are unchanged. It
+recaptures the merged view under the existing state-writer lock, preserves local
+listeners, and does not advance an authority revision or append a quorum command.
+An unchanged turn leaves the file untouched. Ordinary reads and passive shadow
+maintenance do not perform this materialization.
+
 Routed edge feedback preserves a typed distinction between transport failure and
 identity mismatch. A refused connection, timeout, or expired handshake during
 restart remains eligible for transport recovery; it must not be persisted as a
