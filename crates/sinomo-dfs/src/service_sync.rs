@@ -99,6 +99,17 @@ struct MetadataSyncSendDiagnostic {
     request_id: String,
     sequence: u64,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_batch_error: Option<MetadataSyncBatchError>,
+}
+
+#[derive(Serialize)]
+struct MetadataSyncBatchError {
+    request_id: String,
+    sequence: u64,
+    detail: String,
+    detail_truncated: bool,
+    delivery_state: Option<String>,
 }
 
 impl MetadataSyncAttemptDiagnostics {
@@ -111,6 +122,21 @@ impl MetadataSyncAttemptDiagnostics {
                 .map(|node_id| (node_id, BTreeMap::new()))
                 .collect(),
         }
+    }
+
+    fn first_batch_error(&mut self, node: &NodeId, phase: &'static str,
+        request_id: &str, sequence: u64, error: &sinomo_core::network::NetworkError) {
+        let Some(last) = self.peers.get_mut(node).and_then(|phases| phases.get_mut(phase)) else { return; };
+        if last.first_batch_error.is_some() { return; }
+        let detail = error.to_string();
+        // This is the batch return, not proof each member reached the wire.
+        // Retain its own original request/sequence alongside the first error.
+        last.first_batch_error = Some(MetadataSyncBatchError {
+            request_id: request_id.to_owned(), sequence,
+            detail: detail.chars().take(2048).collect(),
+            detail_truncated: detail.chars().count() > 2048,
+            delivery_state: error.delivery_state().map(|state| format!("{state:?}")),
+        });
     }
 
     fn record(
@@ -2707,6 +2733,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             status,
                             false,
                         );
+                        if let Err(error) = &outcome {
+                            diagnostics.first_batch_error(node_id, "direct-catchup", &command.request_id,
+                                command.batch.next_after_sequence, error);
+                        }
                     }
                     BTreeSet::new()
                 }
