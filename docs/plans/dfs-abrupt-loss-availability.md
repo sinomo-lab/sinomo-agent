@@ -15,7 +15,64 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-27 R90
+## Current development checkpoint — 2026-10-27 R93
+
+The original per-node process gap is implemented and has actual native evidence:
+R81/R90/R92 killed and reaped only A while B/C retained their exact PID/start
+identities and made fresh authenticated calls; R82 reopened A's same root/key/
+listener through its normal native owner while B/C stayed alive. Wrong live
+peer and unknown endpoint-ID negatives are native refusals, with a valid call
+afterward. Each result remains bound to its own source/ELF. These are transport/
+lifecycle results, not metadata survivor-serving acceptance.
+
+R91 `36ef46bf`, integrated at `e2293a73`, retains one existing memory-only
+reconciliation edge after an actual newly published genesis, after recording
+the settled signature, preserving confirmed progress before later Result errors.
+It introduces no timer, new original/body, owner, ledger or authority grant.
+Its first execution was **1PASS/3FAIL/256otherUNRUN**: two controls reached the
+real commit/edge/error cuts but failed unchanged-file assertions; full3 formation
+also failed. Exact saved bytes isolated local-materialization cursor1→2 writes
+while both canonical frames stayed unchanged. Those failures remain immutable.
+
+R92 `7e60e6e2`, integrated at `daaa0fb0`, removes only the strict constructor's
+redundant lagging-cursor persistence. Recovery already roots its in-memory cursor
+at the independently certified materialized prefix. Missing initialization,
+ahead rewind, canonical-frame validation, actual suffix replay, physical/fencing
+checks, repair fallback and512checkpoint policy remain unchanged. Execution on
+`48e3f072` /4,936 inputs was **6PASS/2FAIL/256otherUNRUN**: both original no-write
+controls passed, plus suffix recovery/settled reuse, missing/ahead handling,
+corrupt/foreign/missing-frame refusal, and native endpoint/A-loss regression.
+The full3 positive still failed. The remaining new storage-test failure was
+first admission of a copied physical root legitimately repairing head1→5 and
+creating its tail certificate; it was not another local-cursor mutation.
+
+R93 fixture-only `7824c954`, integrated at `e4b0d2c2`, now performs that real
+physical admission and verifies the same canonical frames/prefix/head before
+reintroducing cursor lag and taking the unchanged-store baseline. All byte/
+mtime/identity assertions, repeated opens, IDs and caps remain fixed; production
+is byte-identical to R92. Source `5153d375` /4,936 inputs passed fresh check/build/
+seal, **1PASS/263otherUNRUN**, and its own full DFS/KV boundary11UI/three-library
+gate. R93 combined receipt `112f48f4` retains55-file equal archives and27 known
+identity/group/scope/cgroup/root drains. R92 combined `88a24e03` retains its
+six passes and two failures; those counts do not transfer to R93. No whole-daemon
+quietness or disk power-loss acceptance is inferred from scoped file equality.
+
+The concrete unresolved gate is native full3 metadata formation: captured current
+assignments remain epoch1/A singleton despite actual retained genesis originals
+and exact local commit sequence2. The existing provider-discovery/genesis/
+`put_metadata_shard_async` guarded-handoff owner must produce and certify the
+three-member assignment. The next finite diagnostic must capture that owner's
+actual eligible/selected service-provider inputs and pending-handoff outcome;
+forcing replicas/epoch, dropping participants, inventing an ACK or treating
+inspection DATA as serving authority is prohibited. The full3 PREFIX positive
+remains failed before any PREFIX peer send or A kill in that case. Full W/N,
+majority history/promise/decision/custody, survivor reads/writes and reconnect
+under activity remain open. This is a separate nonblocking lane; no production,
+Docker, host configuration, account/model change, peer arbitration, push or
+merge into main/debug occurred. All historical failures and quietness gates stay
+intact.
+
+## Historical development checkpoint — 2026-10-27 R90
 
 The native per-node slice has executed actual A-only SIGKILL/reap with B/C
 remaining the same live processes and making fresh authenticated calls; R82
