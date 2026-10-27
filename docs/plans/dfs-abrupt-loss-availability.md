@@ -24,8 +24,9 @@ endpoint/process observations, not survivor metadata serving. All earlier
 source-specific evidence and failures remain preserved.
 
 R87 source `456bb20c` executed1PASS/1FAIL/256otherUNRUN. The carrier regression
-passed with real wrong-peer and unknown-endpoint-ID refusals, followed by a
-valid call; full3 formation refused actual epoch1 singleton assignments. R88
+passed its then-existing negative control and A-only-loss checks; full3 formation
+refused actual epoch1 singleton assignments. The stronger live unknown-endpoint-ID
+and valid-after controls were added and executed later in R90. R88
 source `2a0845f4` failed earlier during endpoint baseline, leaving its new
 existing-owner genesis observer unreached. R89 source `b2740e9b` executed
 0PASS/2FAIL/256otherUNRUN: same merged-view selection lost numeric held endpoints,
