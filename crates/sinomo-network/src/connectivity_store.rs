@@ -2017,10 +2017,20 @@ fn write_local_cluster_connectivity_records_inner(
         && !explicit_source_clear
         && !persist_observation_details
     {
+        // Merge-only imports must compare accepted values, as the aggregate
+        // importer does. A superseded input was already rejected above; letting
+        // it shorten a raw expiry here would flush unrelated RAM renewals even
+        // though the accepted routing state did not change. Explicit owner
+        // replacements retain their original omission semantics.
+        let effective_records = if replace_source_records {
+            records
+        } else {
+            merged.as_slice()
+        };
         persisted_records_stable = local_cluster_connectivity_raw_persisted_records_stable(
             &raw_existing_records,
             source_node_id,
-            records,
+            effective_records,
             replace_source_records,
         );
     }
@@ -2800,6 +2810,137 @@ mod tests {
             assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(),before,"a peer import has no authority to persist another source's passive health transition");
             assert_eq!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap(),vec![old]);
         }
+    }
+
+    fn superseded_peer_import_keeps_renewal_in_memory(aggregate: bool) {
+        let (_root, paths, mut state, local, endpoint, now) =
+            connectivity_generation_fixture("superseded_peer_import_owner_refresh");
+        let mut local_endpoint = endpoint.clone();
+        local_endpoint.node_id = local.clone();
+        local_endpoint.endpoint_id =
+            ClusterEndpointId::derived("superseded-import-local", b"local");
+        local_endpoint.address = "local:21353".into();
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == local)
+            .unwrap()
+            .endpoints
+            .push(local_endpoint.clone());
+        let old = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now - time::Duration::seconds(1000),
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut peer_state = state.clone();
+        peer_state.local_node_id = endpoint.node_id.clone();
+        let peer = cluster_connectivity_record(
+            &peer_state,
+            &local_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut raw = vec![old, peer.clone()];
+        sort_cluster_connectivity_records(&mut raw);
+        write_object_file(&paths.connectivity_local, &raw).unwrap();
+        let bytes = std::fs::read(&paths.connectivity_local).unwrap();
+        let fresh = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let captured = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert!(matches!(
+            commit_local_cluster_connectivity_observations_if_snapshot(
+                &paths,
+                &state,
+                &local,
+                &[fresh.clone()],
+                &captured,
+            )
+            .unwrap(),
+            LocalClusterConnectivitySourceSetCommit::Committed { .. }
+        ));
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), bytes);
+        let mark = crate::cluster_file_mark(&paths.connectivity_local).unwrap();
+        let generation = local_cluster_connectivity_routing_generation(&paths);
+        let import = |record: ClusterConnectivityRecord| {
+            if aggregate {
+                write_local_cluster_connectivity_record_groups(
+                    &paths,
+                    &BTreeMap::from([(endpoint.node_id.clone(), vec![record])]),
+                )
+                .unwrap();
+            } else {
+                write_local_cluster_connectivity_records(&paths, &endpoint.node_id, &[record])
+                    .unwrap();
+            }
+        };
+        let mut late = peer.clone();
+        late.observed_at -= time::Duration::seconds(1);
+        late.expires_at -= time::Duration::seconds(1);
+        import(late);
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            bytes,
+            "an ignored older peer response must not flush another source's RAM renewal"
+        );
+        assert_eq!(
+            crate::cluster_file_mark(&paths.connectivity_local).unwrap(),
+            mark
+        );
+        assert_eq!(
+            local_cluster_connectivity_routing_generation(&paths),
+            generation
+        );
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local).unwrap(),
+            vec![fresh]
+        );
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &endpoint.node_id).unwrap(),
+            vec![peer.clone()]
+        );
+
+        // Actual accepted failure-budget progress must still survive snapshot
+        // reconciliation. The no-op correction must not discard that change.
+        let mut progressed = peer;
+        progressed.observed_at = OffsetDateTime::now_utc();
+        progressed.consecutive_failures = 1;
+        import(progressed.clone());
+        assert_ne!(std::fs::read(&paths.connectivity_local).unwrap(), bytes);
+        capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &endpoint.node_id).unwrap(),
+            vec![progressed]
+        );
+    }
+
+    #[test]
+    fn superseded_single_peer_import_does_not_flush_ram_renewal() {
+        superseded_peer_import_keeps_renewal_in_memory(false);
+    }
+
+    #[test]
+    fn superseded_aggregate_peer_import_does_not_flush_ram_renewal() {
+        superseded_peer_import_keeps_renewal_in_memory(true);
     }
 
     #[test]
