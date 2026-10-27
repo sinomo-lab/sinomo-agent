@@ -164,7 +164,19 @@ fn native_daemon_process_child() -> TestResult<()> {
         return Err("per-node owned input/path binding differs".into());
     }
     DirectoryId::read(&input.owned_root)?;
-    host::run_node(input)
+    let trace = crate::default_cluster::bootstrap_observation::CaptureGuard::start(
+        input.data_root.clone(),
+        input.node_id.clone(),
+    );
+    let trace_path = input.owned_root.join(if input.retained.is_some() {
+        "restart-bootstrap-owner-observation.sobj"
+    } else {
+        "bootstrap-owner-observation.sobj"
+    });
+    let result = host::run_node(input);
+    let saved = write_data(&trace_path, &trace.snapshot());
+    result?;
+    saved
 }
 
 struct NativeNode {
@@ -1277,6 +1289,25 @@ fn run_native_process_case(
             .as_ref()
             .map(|_| ())
             .map_err(|error| error.to_string())
+    );
+    report["bootstrap_owner_observations"] = serde_json::json!(
+        nodes
+            .iter()
+            .map(|node| {
+                let path = node
+                    .input
+                    .owned_root
+                    .join(if node.input.retained.is_some() {
+                        "restart-bootstrap-owner-observation.sobj"
+                    } else {
+                        "bootstrap-owner-observation.sobj"
+                    });
+                let observed = read_data::<serde_json::Value>(&path);
+                serde_json::json!({"node":node.input.node_id,"process":node.owned.identity,
+            "observation":observed.as_ref().map(|v|v).map_err(|e|e.to_string()),
+            "qualification":"post-drain diagnostic DATA; killed owner can be unavailable"})
+            })
+            .collect::<Vec<_>>()
     );
     let saved = save_report(&root.join("per-node-native-process-report.json"), &report);
     if !matches!(&tested, Ok(Ok(()))) || drain.is_err() || saved.is_err() {
