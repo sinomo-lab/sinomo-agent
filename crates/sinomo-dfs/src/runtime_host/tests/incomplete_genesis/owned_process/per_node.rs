@@ -12,6 +12,7 @@ const DRIVER_CATEGORY: &str = "dfs.test.native.peer";
 const DRIVER_OPERATION: &str = "dfs.test.native.peer.query";
 const OP_CAP: Duration = sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
 const MAX_REPLY: usize = 1024 * 1024;
+type PrefixRouteHints = std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +109,7 @@ struct DriverRequest {
     nonce: String,
     kind: ProbeKind,
     owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
+    prefix_contact_hints: Option<PrefixRouteHints>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -579,12 +581,24 @@ fn probe_with_contact(
     budget: Duration,
     owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
 ) -> TestResult<DriverResponse> {
+    probe_with_routes(node, target, kind, nonce, budget, owned_contact_hint, None)
+}
+fn probe_with_routes(
+    node: &mut NativeNode,
+    target: &NodeId,
+    kind: ProbeKind,
+    nonce: String,
+    budget: Duration,
+    owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
+    prefix_contact_hints: Option<PrefixRouteHints>,
+) -> TestResult<DriverResponse> {
     let identity = node.alive_identity()?;
     let request = DriverRequest {
         target: target.clone(),
         nonce: nonce.clone(),
         kind,
         owned_contact_hint,
+        prefix_contact_hints,
     };
     let response = local_rpc(
         node,
@@ -730,6 +744,14 @@ fn observed_owned_contact(
     assert_eq!(endpoint.node_id, node.input.node_id);
     assert_eq!(endpoint.address, node.hello.as_ref().unwrap().address);
     Ok(endpoint) // Route DATA only; the native carrier still checks current identity.
+}
+fn owned_prefix_route_hints(nodes: &mut [NativeNode], report: &serde_json::Value)
+    -> TestResult<PrefixRouteHints>
+{
+    nodes.iter_mut().map(|node| {
+        let endpoint = observed_owned_contact(node, report)?;
+        Ok((node.input.node_id.clone(), endpoint))
+    }).collect()
 }
 fn wait_for_native_ping(
     nodes: &mut [NativeNode],
@@ -912,14 +934,22 @@ fn observe_native_prefix(
     report: &mut serde_json::Value,
     phase: &str,
     budget: Duration,
+    hints: &PrefixRouteHints,
 ) -> TestResult<Option<serde_json::Value>> {
     let local = node.input.node_id.clone();
-    let result = probe(
+    let nonce = format!("owned-prefix-{}", sinomo_core::Id::generate());
+    write_data(&root.join(format!("prefix-request-{}.sobj", nonce)), &DriverRequest {
+        target: local.clone(), nonce: nonce.clone(), kind: ProbeKind::PrefixRound,
+        owned_contact_hint: None, prefix_contact_hints: Some(hints.clone()),
+    })?;
+    let result = probe_with_routes(
         node,
         &local,
         ProbeKind::PrefixRound,
-        format!("owned-prefix-{}", sinomo_core::Id::generate()),
+        nonce,
         budget,
+        None,
+        Some(hints.clone()),
     );
     record_probe(root, report, phase, &result)?;
     let Ok(response) = result else {
@@ -1107,7 +1137,8 @@ fn run_native_process_case(
                     let nonce = format!("fixture-members-{}", sinomo_core::Id::generate());
                     write_data(&root.join(format!("membership-request-{rounds:03}.sobj")),
                         &DriverRequest { target: source.clone(), nonce: nonce.clone(),
-                            kind: ProbeKind::RequestMetadataMembers, owned_contact_hint: None })?;
+                            kind: ProbeKind::RequestMetadataMembers, owned_contact_hint: None,
+                            prefix_contact_hints: None })?;
                     let result = probe(&mut nodes[0], &source,
                         ProbeKind::RequestMetadataMembers,
                         nonce,
@@ -1133,6 +1164,7 @@ fn run_native_process_case(
                         continue;
                     }
                 }
+                let hints = owned_prefix_route_hints(&mut nodes, &report)?;
                 for node in &mut nodes {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -1144,6 +1176,7 @@ fn run_native_process_case(
                         &mut report,
                         "baseline-owned-native-prefix",
                         OP_CAP.min(left),
+                        &hints,
                     )?;
                     complete += usize::from(data.as_ref().is_some_and(|v| v["complete"] == true));
                     observations.push(data);
@@ -1168,6 +1201,37 @@ fn run_native_process_case(
                 complete > 0 && !expired,
                 "native positive prerequisite has no actual complete full3 PREFIX round within original startup60s"
             );
+        }
+        let prefix_hints = if prefix_round {
+            Some(owned_prefix_route_hints(&mut nodes, &report)?)
+        } else { None };
+        if let Some(hints) = &prefix_hints {
+            let wrong_peer = nodes[2].input.node_id.clone();
+            let other_peer = nodes[1].input.node_id.clone();
+            let mut foreign = hints.clone();
+            foreign.insert(wrong_peer.clone(), hints[&other_peer].clone());
+            let rejected = observe_native_prefix(&mut nodes[0], &root, &mut report,
+                "PREFIX-foreign-owned-route-refusal", OP_CAP, &foreign)?;
+            assert!(rejected.is_none());
+            assert!(report["probes"].as_array().unwrap().last().unwrap()
+                ["actual_result"]["error"]["error"].as_str().is_some_and(|e|
+                    e.contains("native scoped PREFIX contact set differs")));
+            let mut changed = hints.clone();
+            changed.get_mut(&wrong_peer).unwrap().endpoint_id = sinomo_core::Id::derived(
+                "dfs.test.prefix.unknown-endpoint", &sinomo_core::Id::generate().to_string());
+            let partial = observe_native_prefix(&mut nodes[0], &root, &mut report,
+                "PREFIX-changed-endpoint-native-refusal", OP_CAP, &changed)?
+                .ok_or("changed endpoint must return actual partial round DATA")?;
+            assert_eq!(partial["complete"], false);
+            let outcomes = partial["peers"].as_array().unwrap();
+            assert!(outcomes.iter().any(|p| p["peer"] == wrong_peer.as_str()
+                && p["native_present"] == false && !p["error"].is_null()));
+            assert!(outcomes.iter().any(|p| p["peer"] == other_peer.as_str()
+                && p["native_present"] == true && p["binding_valid"] == true));
+            let restored = observe_native_prefix(&mut nodes[0], &root, &mut report,
+                "PREFIX-valid-owned-routes-after-refusal", OP_CAP, hints)?
+                .ok_or("restored native route round absent")?;
+            assert_eq!(restored["complete"], true);
         }
         let survivor_contacts = if prefix_round {
             let nonprimary = nodes[1].input.node_id.clone();
@@ -1291,6 +1355,7 @@ fn run_native_process_case(
                     &mut report,
                     "after-A-death-owned-native-prefix",
                     OP_CAP,
+                    prefix_hints.as_ref().unwrap(),
                 )?;
                 assert!(
                     !data.as_ref().is_some_and(|value| value["complete"] == true),

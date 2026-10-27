@@ -9,12 +9,21 @@ use crate::{
 };
 use sinomo_core::network::NetworkError;
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct NativePrefixContactScope {
+    pub(super) owned: std::collections::BTreeMap<NodeId, (String, String)>,
+    /// Route observations only; the actual native call still authenticates the
+    /// peer and validates its current endpoint before returning any provenance.
+    pub(super) hints: std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>,
+}
+
 #[derive(Clone)]
 pub(super) struct NativePrefixOwnerContext {
     pub(super) data_dir: SinomoDataDir,
     pub(super) runtime: tokio::runtime::Handle,
     #[cfg(test)]
-    pub(super) contact_scope: Option<std::collections::BTreeMap<NodeId, (String, String)>>,
+    pub(super) contact_scope: Option<NativePrefixContactScope>,
 }
 impl NativePrefixOwnerContext {
     pub(super) fn new(data_dir: &SinomoDataDir, runtime: &tokio::runtime::Handle) -> Self {
@@ -374,7 +383,7 @@ fn dispatch_native_prefix_call(
     if let Some(scope) = &context.contact_scope {
         // Contact scope restricts an actual registered native carrier; it never
         // supplies a signer, response, source admission or current authority.
-        let (address, key) = scope
+        let (address, key) = scope.owned
             .get(attempt.peer())
             .ok_or_else(|| invalid("native PREFIX peer has no owned contact"))?;
         let paths = ClusterPaths::new(&context.data_dir);
@@ -392,11 +401,14 @@ fn dispatch_native_prefix_call(
                     && member.node_public_key == *key
             })
             .ok_or_else(|| invalid("native PREFIX contact has no matching current member/key"))?;
-        let endpoint = member
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.node_id == *attempt.peer() && endpoint.address == *address)
-            .ok_or_else(|| invalid("native PREFIX actual held endpoint is absent"))?;
+        let endpoint = scope.hints.get(attempt.peer())
+            .ok_or_else(|| invalid("native PREFIX actual observed endpoint hint is absent"))?;
+        if endpoint.node_id != member.node_id || endpoint.address != *address
+            || !matches!(endpoint.transport, sinomo_core::ClusterTransportKind::Loopback
+                | sinomo_core::ClusterTransportKind::LanTcp)
+        {
+            return Err(invalid("native PREFIX endpoint hint differs from owned peer"));
+        }
         let mut scoped = options;
         let left = remaining(attempt)?;
         scoped.overall_timeout = Some(scoped.overall_timeout.map_or(left, |cap| cap.min(left)));

@@ -134,6 +134,9 @@ async fn probe(
     selected: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
     observed_source: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
 ) -> Result<ProbeReply, NetworkError> {
+    if request.prefix_contact_hints.is_some() && !matches!(request.kind, ProbeKind::PrefixRound) {
+        return Err(invalid("PREFIX route hints are not admitted for this probe kind"));
+    }
     if request.owned_contact_hint.is_some()
         && !matches!(request.kind, ProbeKind::RegisteredEndpointPing
             | ProbeKind::RegisteredEndpointWrongId)

@@ -1716,11 +1716,19 @@ pub(crate) fn daemon_dfs_native_prefix_contact_scoped_transport_for_test(
     data_dir: &SinomoDataDir,
     runtime: &tokio::runtime::Handle,
     contacts: std::collections::BTreeMap<NodeId, (String, String)>,
+    hints: std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>,
 ) -> Result<DfsNodeTransport, DfsRuntimeError> {
     let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
         detail: "native scoped PREFIX has no existing registered host".into(),
     })?;
     if contacts.len() != 3
+        || hints.len() != contacts.len()
+        || hints.iter().any(|(node, endpoint)| {
+            endpoint.node_id != *node
+                || contacts.get(node).is_none_or(|(address, _)| *address != endpoint.address)
+                || !matches!(endpoint.transport, sinomo_core::ClusterTransportKind::Loopback
+                    | sinomo_core::ClusterTransportKind::LanTcp)
+        })
         || !contacts.contains_key(&local_node_id)
         || peer_node_ids
             .iter()
@@ -1731,7 +1739,9 @@ pub(crate) fn daemon_dfs_native_prefix_contact_scoped_transport_for_test(
         });
     }
     let mut context = super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime);
-    context.contact_scope = Some(contacts);
+    context.contact_scope = Some(super::native_prefix_return::NativePrefixContactScope {
+        owned: contacts, hints,
+    });
     let peer = Arc::new(DaemonDfsPeerTransport {
         host,
         native_prefix: Some(context),

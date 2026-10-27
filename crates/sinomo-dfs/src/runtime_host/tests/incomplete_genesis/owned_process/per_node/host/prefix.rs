@@ -324,8 +324,10 @@ pub(super) fn probe(
     }
     let data = SinomoDataDir::new(root);
     let selected = select(&data, source, cluster, peers, deadline)?;
+    let hints = request.prefix_contact_hints.as_ref()
+        .ok_or_else(|| refuse("native PREFIX lacks observed owned route hints"))?;
     let mut transport = crate::runtime_host::data_plane::daemon_dfs_native_prefix_contact_scoped_transport_for_test(
-        source.clone(), selected.target.replica_node_ids.clone(), &data, runtime, contacts.clone(),
+        source.clone(), selected.target.replica_node_ids.clone(), &data, runtime, contacts.clone(), hints.clone(),
     ).map_err(refuse)?;
     check_deadline(deadline)?;
     transport.set_operation_deadline(Some(deadline));
