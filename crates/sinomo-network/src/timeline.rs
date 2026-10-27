@@ -775,6 +775,61 @@ fn capture_bytes(max_events: usize) -> Result<usize, NetworkTimelineCaptureError
     )
 }
 
+/// Exact-count timeline fixtures own a process, not merely the capture-control
+/// mutex: ordinary network producers in sibling tests also record globally.
+#[cfg(test)]
+pub(crate) fn run_network_timeline_test_in_own_process(case: &str) -> bool {
+    const CHILD: &str = "SINOMO_NETWORK_TIMELINE_ISOLATED_CASE";
+    if std::env::var(CHILD).as_deref() != Ok(case) {
+        // The timeline is process-global and deliberately drops events on
+        // recorder contention. The capture-control mutex excludes other
+        // capture owners, not ordinary network producers in sibling tests.
+        // Exact ring counts require an owned process; keep all original
+        // delivery/cancellation assertions and normal test workers there.
+        let evidence = sinomo_testdir::TestDir::new("network-timeline-owned-process");
+        let result =
+            std::process::Command::new(std::env::current_exe().expect("libtest executable"))
+                .args(["--exact", case, "--nocapture"])
+                .env(CHILD, case)
+                .output()
+                .expect("run isolated timeline fixture");
+        std::fs::write(
+            evidence.join("boundary-diagnostic-timeline-child.stdout"),
+            &result.stdout,
+        )
+        .expect("retain child output");
+        std::fs::write(
+            evidence.join("boundary-diagnostic-timeline-child.stderr"),
+            &result.stderr,
+        )
+        .expect("retain child error output");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            result.status.success(),
+            "isolated timeline fixture failed: {}; raw evidence: {}",
+            result.status,
+            evidence.display()
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == format!("test {case} ... ok")),
+            "the exact child test must actually execute; evidence: {}",
+            evidence.display()
+        );
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"))
+                .count(),
+            1,
+            "zero selection or an ignored child is not a pass"
+        );
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +902,11 @@ mod tests {
 
     #[test]
     fn capture_validates_memory_cap_and_preallocates() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "timeline::tests::capture_validates_memory_cap_and_preallocates",
+        ) {
+            return;
+        }
         let _serial = serial_capture_test();
         ensure_capture_stopped();
         assert_eq!(NETWORK_TIMELINE_EVENT_BYTES, 96);
@@ -874,6 +934,11 @@ mod tests {
 
     #[test]
     fn endpoint_identity_is_exact_bounded_and_stable_across_captures() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "timeline::tests::endpoint_identity_is_exact_bounded_and_stable_across_captures",
+        ) {
+            return;
+        }
         let _serial = serial_capture_test();
         ensure_capture_stopped();
         let mut endpoint = ClusterEndpointRecord::loopback(
@@ -910,6 +975,11 @@ mod tests {
 
     #[test]
     fn bounded_capture_reports_overflow_and_drops() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "timeline::tests::bounded_capture_reports_overflow_and_drops",
+        ) {
+            return;
+        }
         let _serial = serial_capture_test();
         ensure_capture_stopped();
         start_network_timeline_capture(2).expect("start bounded capture");
@@ -929,7 +999,41 @@ mod tests {
     }
 
     #[test]
+    fn contended_capture_accounts_for_dropped_event_without_blocking_producer() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "timeline::tests::contended_capture_accounts_for_dropped_event_without_blocking_producer",
+        ) {
+            return;
+        }
+        let _serial = serial_capture_test();
+        ensure_capture_stopped();
+        start_network_timeline_capture(2).expect("bounded capture");
+        {
+            let storage = CAPTURE.get().expect("actual capture storage");
+            let held = storage.lock().expect("hold actual recorder boundary");
+            let count = held.as_ref().unwrap().events.len();
+            let dropped = CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed);
+            record_network_timeline_event_now(test_event(20));
+            assert_eq!(
+                held.as_ref().unwrap().events.len(),
+                count,
+                "a contended recorder must not fabricate stored evidence"
+            );
+            assert!(
+                CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed) > dropped,
+                "the nonblocking omission must be accounted"
+            );
+        }
+        stop_network_timeline_capture().expect("release capture");
+    }
+
+    #[test]
     fn disabled_recording_does_not_initialize_or_mutate_capture() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "timeline::tests::disabled_recording_does_not_initialize_or_mutate_capture",
+        ) {
+            return;
+        }
         let _serial = serial_capture_test();
         ensure_capture_stopped();
         let dropped_before = CAPTURE_DROPPED_EVENTS.load(Ordering::Relaxed);

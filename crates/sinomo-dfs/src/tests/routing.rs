@@ -3,6 +3,141 @@
 use super::*;
 
 #[test]
+fn outsider_fixture_observes_completed_assignment_after_a_withheld_native_delta() {
+    let mut cluster = sifs_posix_cluster("outsider-completed-configuration", "/users");
+    let fs = sifs_file_system_id();
+    let configs = cluster._runtime.metadata_shards().unwrap();
+    let current = configs
+        .iter()
+        .find(|config| config.shard_id == "users")
+        .unwrap();
+    assert_eq!(current.primary_node_id, cluster.primary_node);
+    let mut desired = current.clone();
+    desired.replica_node_ids = vec![cluster.writer_node.clone()];
+    desired.epoch = current.epoch.checked_add(1).unwrap();
+    let fault = cluster
+        ._runtime
+        .lose_configuration_delta_and_pause_rebuild(
+            &cluster.writer_node,
+            crate::metadata_shard_key(&fs, "users"),
+        )
+        .unwrap();
+    // Retain the already-open native primary while injecting this loss.
+    // The general runtime.client() fixture opener waits for every node's
+    // configuration readiness, including the rebuild deliberately paused here.
+    let observation_deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    let requested =
+        DfsControlPlaneStore::new(cluster.primary.control_plane.as_mut().unwrap().as_mut())
+            .begin_metadata_shard_membership_handoff(current, &desired)
+            .expect("submit the actual native outsider handoff")
+            .expect("the source assignment is unchanged");
+    // The existing native maintenance owner completes this request. Driving a
+    // second reconciliation through the retained service can lose its owner
+    // binding after the real activation and correctly report StaleOwnerEpoch.
+    // Observe the committed delta instead, under the original five-second
+    // completion bound and the already-established overall observation bound.
+    let completion_deadline = observation_deadline.min(Instant::now() + Duration::from_secs(5));
+    let dropped = loop {
+        if let Some(delta) = fault.dropped_delta() {
+            break delta;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "native owner did not complete the requested users assignment"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    // Read through the retained primary client: runtime fixture openers wait
+    // for all configuration observers, including the replica paused above.
+    let keys = vec![
+        crate::metadata_shard_key(&fs, "users"),
+        crate::control_plane::metadata_shard_membership_handoff_proof_key(&fs, "users"),
+        crate::control_plane::metadata_shard_membership_handoff_key(&fs, "users"),
+    ];
+    let observed = cluster
+        .primary
+        .control_plane
+        .as_mut()
+        .unwrap()
+        .get_authoritative_consistent_before(&keys, observation_deadline)
+        .expect("observe the exact completed handoff without waiting for the paused replica");
+    assert_eq!(observed.len(), keys.len());
+    let active = observed[0]
+        .as_ref()
+        .expect("active users assignment")
+        .decode::<DfsMetadataShardConfig>()
+        .unwrap();
+    let proof = observed[1]
+        .as_ref()
+        .expect("actual native handoff completion proof")
+        .decode::<crate::control_plane::DfsMetadataShardMembershipHandoffProof>()
+        .unwrap();
+    let pending = observed[2].as_ref();
+    assert_eq!(
+        active, desired,
+        "the requested native handoff really activated"
+    );
+    assert_eq!(proof.handoff_id, requested.handoff_id);
+    assert_eq!(proof.cause, requested.cause);
+    assert_eq!(proof.retiring_shard, requested.retiring_shard);
+    assert_eq!(proof.desired_shard, requested.desired_shard);
+    assert!(proof.journal_sequence >= requested.required_prepared_sequence);
+    assert!(pending.is_none(), "the exact handoff must be complete");
+    fault.release();
+    drop(fault);
+
+    sifs_cluster_observe_completed_assignments(&mut cluster, &[active.clone()]);
+    let capture = cluster
+        ._runtime
+        .capture_namespace_requests(&cluster.primary_node, 32)
+        .unwrap();
+    let result = cluster.writer.posix_write_file(
+        "/users/observed-completed-assignment",
+        b"first",
+        DfsWriteOptions::replicated_eventual(vec![cluster.writer_node.clone()]),
+    );
+    let requests = capture.records();
+    std::fs::write(
+        cluster.root.join("boundary-diagnostic-outsider-configuration.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "actual_withheld_delta": dropped,
+            "requested_handoff": requested,
+            "committed_handoff_proof": proof,
+            "installed": active,
+            "requests": requests,
+            "result": format!("{result:?}"),
+            "qualification": "One fresh write after real handoff and exact native authority observation. No supplied positive reply or historical write replay."
+        })).unwrap(),
+    ).unwrap();
+    let stat = result.expect("first write uses the observed completed configuration");
+    assert_eq!(stat.size_bytes, Some(5));
+    let stamped = requests
+        .iter()
+        .filter_map(|message| {
+            let DfsNetworkMessage::NamespaceRequest(request) = &message.message else {
+                return None;
+            };
+            request
+                .authority_shards
+                .iter()
+                .find(|shard| shard.shard_id == "users")
+        })
+        .collect::<Vec<_>>();
+    assert!(!stamped.is_empty(), "actual native request was captured");
+    assert!(stamped.iter().all(|shard| **shard == active));
+    drop(capture);
+    let SifsPosixCluster {
+        primary,
+        writer,
+        observer,
+        _runtime,
+        ..
+    } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().expect("normal native fixture drain");
+}
+
+#[test]
 fn routed_mkdir_all_uses_applied_result_without_a_discarded_stat_projection() {
     use crate::test_runtime::{FaultAction, FaultRule, StatReplyFault};
     let mut cluster = sifs_outsider_cluster("mkdir-applied-without-stat");
@@ -1072,6 +1207,83 @@ fn authoritative_stat_outsider_counts_link_and_unlink_without_local_replay() {
         }
     }
     assert_sifs_cluster_no_posix_leaks(&cluster, "authoritative stat outsider");
+}
+
+#[test]
+fn browser_exact_parent_hint_without_replica_cannot_recreate_a_deleted_parent() {
+    let mut cluster = sifs_outsider_cluster("browser-exact-parent-outsider");
+    let parent = "/users/browser-exact-parent-outsider/parent";
+    let child = format!("{parent}/child");
+    cluster.writer.posix_mkdir_all(parent).unwrap();
+    let old_parent = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        owner.metadata_backend().unwrap()
+            .get_object_by_path(&sifs_file_system_id(), parent).unwrap().unwrap()
+    };
+    assert_eq!(old_parent.kind, DfsObjectKind::Directory);
+    cluster.writer.posix_rmdir(parent).unwrap();
+    let tombstone = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        let row = owner.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap().unwrap();
+        assert_eq!(row.kind, DfsObjectKind::Tombstone);
+        row
+    };
+    assert!(cluster._runtime.metadata_shards().unwrap().iter().all(|shard| {
+        shard.primary_node_id != cluster.observer_node
+            && !shard.replica_node_ids.contains(&cluster.observer_node)
+    }));
+    cluster.observer.add_transient_object_metadata(old_parent.clone()).unwrap();
+    assert_eq!(cluster.observer.metadata().object(&old_parent.object_id), Some(&old_parent));
+    let before = cluster.observer.metadata_backend().unwrap().metadata_shard_statuses().unwrap();
+    let capture = cluster._runtime.capture_served_work(&cluster.primary_node, 32).unwrap();
+    crate::browser_service::prepare_sifs_browser_write_parent(&mut cluster.observer, &child).unwrap();
+    let reports = capture.records();
+    let implicit_creates = reports.iter().filter(|work| {
+        work.command.routed_message.source_node_id == cluster.observer_node
+            && matches!(&work.command.routed_message.message,
+                DfsNetworkMessage::NamespaceRequest(request)
+                    if matches!(&request.operation, DfsNamespaceOperation::MkdirAll { path } if path == parent))
+    }).count();
+    let after = {
+        let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+        owner.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap().unwrap()
+    };
+    std::fs::write(
+        cluster._runtime.data_dir(&cluster.observer_node).root().join("boundary-diagnostic-outsider-parent-hint.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "caller": cluster.observer_node, "primary": cluster.primary_node,
+            "old_hint": old_parent, "tombstone": tombstone, "after_preparation": after,
+            "implicit_mkdir_all_calls": implicit_creates,
+            "actual_invocations": reports.iter().map(|work| serde_json::json!({
+                "command": work.command.routed_message,
+                "publish_metadata": work.committed_work.publish_metadata,
+                "semantic_changes": work.committed_work.semantic_changes,
+                "succeeded": work.succeeded,
+            })).collect::<Vec<_>>(),
+            "qualification": "Normal authenticated member removed from metadata assignment through native handoff, with a genuinely observed old parent row as advisory DATA. Original Main metadata never removed or replaced."
+        })).unwrap(),
+    ).unwrap();
+    assert_eq!(implicit_creates, 0, "an exact parent hint must not cause an implicit Main recreation");
+    assert_eq!(after, tombstone);
+    assert_eq!(before, cluster.observer.metadata_backend().unwrap().metadata_shard_statuses().unwrap());
+    let create = cluster.observer.posix_write_file(
+        &child, b"must remain absent",
+        DfsWriteOptions::replicated_eventual(vec![cluster.observer_node.clone()]),
+    );
+    match create {
+        Err(DfsPosixError::MissingParent { path }) | Err(DfsPosixError::NotFound { path }) => {
+            assert!(path == parent || path == child);
+        }
+        other => panic!("the actual Main must reject the missing parent: {other:?}"),
+    }
+    let owner = cluster._runtime.metadata_primary_service(parent).unwrap();
+    assert_eq!(owner.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap(), Some(tombstone));
+    assert!(owner.metadata_backend().unwrap().get_object_by_path(&sifs_file_system_id(), &child).unwrap().is_none());
+    drop(owner);
+    drop(capture);
+    let SifsPosixCluster { primary, writer, observer, _runtime, .. } = cluster;
+    drop((primary, writer, observer));
+    _runtime.close().unwrap();
 }
 
 #[test]

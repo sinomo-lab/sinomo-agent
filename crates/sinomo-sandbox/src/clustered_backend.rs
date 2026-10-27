@@ -10,6 +10,9 @@ use sinomo_core::service::{ClusterAccess, ServiceContext, ServiceError};
 
 use crate::*;
 
+#[cfg(test)]
+mod quiet_discovery;
+
 const SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR: &str = "daemon/sandbox-lifecycle-recovery";
 pub const SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -53,6 +56,7 @@ pub struct ClusteredSandboxBackend {
     data_dir: Arc<SinomoDataDir>,
     cluster: Arc<dyn ClusterAccess>,
     runtime: Option<tokio::runtime::Handle>,
+    recovery: SandboxLifecycleRecoveryState,
 }
 
 impl ClusteredSandboxBackend {
@@ -61,19 +65,21 @@ impl ClusteredSandboxBackend {
         cluster: Arc<dyn ClusterAccess>,
         runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
+        let recovery = SandboxLifecycleRecoveryState::new(
+            data_dir.root().join(SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR),
+        );
         Self {
             data_dir,
             cluster,
             runtime,
+            recovery,
         }
     }
 
     fn recovery_state(&self) -> SandboxLifecycleRecoveryState {
-        SandboxLifecycleRecoveryState::new(
-            self.data_dir
-                .root()
-                .join(SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR),
-        )
+        // The component's existing task clones this backend for each tick.
+        // Keep one cadence for that owner instead of reconstructing it per call.
+        self.recovery.clone()
     }
 
     fn load_policy_config(&self) -> Result<SandboxClusterPolicyConfig, SandboxBackendError> {
@@ -245,18 +251,32 @@ impl ClusteredSandboxBackend {
             .map_err(|error| SandboxBackendError::Other(error.to_string()))
     }
 
+    fn discover_lifecycle_recovery(
+        &self,
+        content: sinomo_dfs::LocalContentStore,
+    ) -> Result<(Vec<NodeId>, Vec<SandboxInstanceManifest>), SandboxBackendError> {
+        // Discovery is observational even when no sandbox has ever existed.
+        // Only the actual candidates enter the ordinary recovery writer.
+        let dfs = sinomo_dfs::runtime_host::open_dfs_runtime_inspection_service_with_content(
+            &self.data_dir,
+            self.runtime.as_ref(),
+            content,
+        )
+        .map_err(|error| SandboxBackendError::Other(error.to_string()))?;
+        let replica_candidates =
+            sinomo_dfs::runtime_host::dfs_runtime_replica_candidates(&self.data_dir, dfs.node_id());
+        let mut store = SifsSandboxInstanceStore::new(dfs);
+        let pending = store.list_pending_authoritative_manifests()?;
+        Ok((replica_candidates, pending))
+    }
+
     fn run_lifecycle_recovery_scan(
         &self,
         marked_sandbox_ids: BTreeSet<SandboxId>,
     ) -> Result<usize, SandboxBackendError> {
         let content = self.open_content_store()?;
-        let dfs = self.open_dfs_service_with_content(content.clone())?;
-        let replica_candidates =
-            sinomo_dfs::runtime_host::dfs_runtime_replica_candidates(&self.data_dir, dfs.node_id());
-        let mut authoritative_store =
-            SifsSandboxInstanceStore::new(dfs).with_replica_candidates(replica_candidates.clone());
-        let pending_manifests = authoritative_store.list_pending_authoritative_manifests()?;
-        drop(authoritative_store);
+        let (replica_candidates, pending_manifests) =
+            self.discover_lifecycle_recovery(content.clone())?;
 
         let pending_sandbox_ids = pending_manifests
             .into_iter()

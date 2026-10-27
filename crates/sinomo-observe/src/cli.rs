@@ -109,6 +109,7 @@ impl Default for ObserveOptions {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ObserveControlOptions {
+    live_log_writing: Option<bool>,
     filter: Option<String>,
     quiet_filter_directives: Vec<String>,
     clear_quiet_filter_directives: bool,
@@ -313,8 +314,9 @@ fn observe_cli_help() -> CliCommandHelp {
             "      Serve cached live metrics for Prometheus; use Prometheus or Grafana for durable history.",
             "  sinomo observe traces [--target-prefix <prefix>] [--traceparent <id>] [--after-sequence <n>] [--capture <id>] [--target <node-id> | --all] [--limit <n>] [--json]",
             "      Read live bounded trace events.",
-            "  sinomo observe control [--filter <directive>] [--quiet-filter <directive>...] [--capture <id> | --clear-capture --expected-capture <id>] [--clear-traces] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
+            "  sinomo observe control [--live-log-writing | --no-live-log-writing] [--filter <directive>] [--quiet-filter <directive>...] [--capture <id> | --clear-capture --expected-capture <id>] [--clear-traces] [--clear-quiet-filters | --reset] [--target <node-id> | --all] [--json]",
             "      Read or update live tracing; capture-owned filters restore on clear or after the ten-minute lease.",
+            "      Routine text writing is opt-in; disabling it never dumps buffered history. Export logs/traces with --json.",
             "  sinomo observe profile cpu start [--capture <id>] [--duration-seconds <1..30>] [--frequency-hz <10..500>] [--target <node-id>] [--json]",
             "  sinomo observe profile cpu status [--target <node-id>] [--json]",
             "  sinomo observe profile cpu stop [--capture <id>] [--target <node-id>] [--json]",
@@ -466,6 +468,14 @@ fn observe_cli_autocomplete() -> CliAutocompleteSpec {
                 CliAutocompleteOption::flag("--json", "emit JSON"),
             ]),
             CliAutocompleteSpec::new("control", "read or update observe control").with_options([
+                CliAutocompleteOption::flag(
+                    "--live-log-writing",
+                    "write subsequent routine logs to existing sinks",
+                ),
+                CliAutocompleteOption::flag(
+                    "--no-live-log-writing",
+                    "keep routine logs in bounded memory",
+                ),
                 CliAutocompleteOption::with_value(
                     "--filter",
                     "tracing filter directive",
@@ -1037,6 +1047,7 @@ fn parse_observe_options(
 
 fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOptions, CliParseError> {
     let mut options = ObserveControlOptions {
+        live_log_writing: None,
         filter: None,
         quiet_filter_directives: Vec::new(),
         clear_quiet_filter_directives: false,
@@ -1052,6 +1063,16 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--live-log-writing" | "--no-live-log-writing" => {
+                let enabled = args[index] == "--live-log-writing";
+                if options
+                    .live_log_writing
+                    .is_some_and(|previous| previous != enabled)
+                {
+                    return Err(CliParseError::Usage);
+                }
+                options.live_log_writing = Some(enabled);
+            }
             "--filter" => {
                 index += 1;
                 let Some(filter) = args.get(index) else {
@@ -1109,6 +1130,10 @@ fn parse_observe_control_options(args: &[String]) -> Result<ObserveControlOption
         return Err(CliParseError::Usage);
     }
     if options.clear_capture && options.capture_id.is_some() {
+        return Err(CliParseError::Usage);
+    }
+    if options.live_log_writing.is_some() && (options.capture_id.is_some() || options.clear_capture)
+    {
         return Err(CliParseError::Usage);
     }
     if options.expected_capture_id.is_some() && !options.clear_capture {
@@ -1995,6 +2020,7 @@ fn observe_control(
     options: ObserveControlOptions,
 ) -> Result<(), CliCommandError> {
     let request = ObserveControlRequest {
+        live_log_writing: options.live_log_writing,
         filter: options.filter.clone(),
         quiet_filter_directives: (!options.quiet_filter_directives.is_empty())
             .then_some(options.quiet_filter_directives.clone()),
@@ -2014,6 +2040,29 @@ fn observe_control(
         )?;
         if request.capture_id.is_some() || request.clear_capture {
             validate_cluster_capture_control(rpc, &request, &response)?;
+        }
+        if options.live_log_writing.is_some() {
+            let mut issues = response
+                .errors
+                .iter()
+                .map(|error| format!("{}: {}", error.target_node_id, error.error))
+                .collect::<Vec<_>>();
+            for target in &response.targets {
+                if let Err(error) =
+                    validate_live_log_writing(options.live_log_writing, &target.response)
+                {
+                    issues.push(format!("{}: {error}", target.target_node_id));
+                }
+            }
+            if response.targets.is_empty() {
+                issues.push("no node acknowledged the requested live-writing mode".into());
+            }
+            if !issues.is_empty() {
+                return Err(CliCommandError::new(format!(
+                    "live log writing was not confirmed on every target: {}; successful targets keep their acknowledged setting",
+                    issues.join("; ")
+                )));
+            }
         }
         return print_observe_fanout(
             context,
@@ -2036,12 +2085,29 @@ fn observe_control(
         || request.capture_id.is_some()
         || request.clear_capture
         || request.clear_traces
+        || request.live_log_writing.is_some()
     {
         update_observe_control(request).map_err(command_error)?
     } else {
         observe_control_snapshot()
     };
+    validate_live_log_writing(options.live_log_writing, &response)?;
     print_observe_control_response(context, response, options.json)
+}
+
+fn validate_live_log_writing(
+    requested: Option<bool>,
+    response: &ObserveControlResponse,
+) -> Result<(), CliCommandError> {
+    if let Some(expected) = requested
+        && response.live_log_writing != Some(expected)
+    {
+        return Err(CliCommandError::new(format!(
+            "live log writing acknowledgement missing or mismatched (requested={expected}, reported={:?}); an older runtime may not support this control",
+            response.live_log_writing
+        )));
+    }
+    Ok(())
 }
 
 fn validate_cluster_capture_control(
@@ -2081,6 +2147,7 @@ fn validate_cluster_capture_control(
     let mut rollback_issues = Vec::new();
     if let Some(capture_id) = request.capture_id.as_ref() {
         let rollback = ObserveControlRequest {
+            live_log_writing: None,
             filter: None,
             quiet_filter_directives: None,
             clear_quiet_filter_directives: false,
@@ -2154,6 +2221,14 @@ fn print_observe_control_response(
             response.quiet_filter_directives.join(",")
         };
         context.stdout_line(format_args!("observe quiet filters: {quiet_filters}"))?;
+        context.stdout_line(format_args!(
+            "observe live log writing: {}",
+            match response.live_log_writing {
+                Some(true) => "enabled",
+                Some(false) => "disabled (routine history in bounded memory)",
+                None => "unavailable (unsupported or uninitialized runtime)",
+            }
+        ))?;
         context.stdout_line(format_args!(
             "observe capture: {}",
             response.active_capture_id.as_deref().unwrap_or("<none>")
@@ -2543,6 +2618,52 @@ fn command_error(error: impl fmt::Display) -> CliCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_log_writing_control_is_explicit_and_separate_from_capture_lifecycle() {
+        assert_eq!(
+            parse_observe_control_options(&[]).unwrap().live_log_writing,
+            None
+        );
+        for (flag, enabled) in [
+            ("--live-log-writing", true),
+            ("--no-live-log-writing", false),
+        ] {
+            let options = parse_observe_control_options(&[flag.into()]).unwrap();
+            assert_eq!(options.live_log_writing, Some(enabled));
+            assert!(options.filter.is_none());
+            assert!(
+                parse_observe_control_options(&[
+                    flag.into(),
+                    "--capture".into(),
+                    "capture-a".into()
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            parse_observe_control_options(&[
+                "--live-log-writing".into(),
+                "--no-live-log-writing".into()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn live_log_writing_requires_an_explicit_matching_peer_acknowledgement() {
+        let mut response: ObserveControlResponse = serde_json::from_str(
+            r#"{"active_filter":"trace","base_filter":"trace","quiet_filter_directives":[],"changed":false}"#,
+        ).unwrap();
+        assert!(validate_live_log_writing(None, &response).is_ok());
+        assert!(validate_live_log_writing(Some(false), &response).is_err());
+        assert!(validate_live_log_writing(Some(true), &response).is_err());
+        response.live_log_writing = Some(true);
+        assert!(validate_live_log_writing(Some(true), &response).is_ok());
+        assert!(validate_live_log_writing(Some(false), &response).is_err());
+        response.live_log_writing = Some(false);
+        assert!(validate_live_log_writing(Some(false), &response).is_ok());
+    }
 
     #[test]
     fn trace_cursor_parses_and_rejects_invalid_or_unrelated_use() {
@@ -3145,6 +3266,7 @@ mod tests {
                 sinomo_core::network::ObjectRpcResponse::encode_body(
                     OBSERVE_CONTROL_ROUTE,
                     &ObserveControlResponse {
+                        live_log_writing: None,
                         active_filter: "warn,sinomo=info".to_string(),
                         base_filter: "warn,sinomo=info".to_string(),
                         quiet_filter_directives: Vec::new(),
@@ -3157,6 +3279,7 @@ mod tests {
             })
         };
         let request = ObserveControlRequest {
+            live_log_writing: None,
             filter: None,
             quiet_filter_directives: None,
             clear_quiet_filter_directives: false,
@@ -3171,6 +3294,7 @@ mod tests {
                 ObserveTargetResponse {
                     target_node_id: "node-a".to_string(),
                     response: ObserveControlResponse {
+                        live_log_writing: None,
                         active_filter: "warn,sinomo=info".to_string(),
                         base_filter: "warn,sinomo=info".to_string(),
                         quiet_filter_directives: Vec::new(),
@@ -3182,6 +3306,7 @@ mod tests {
                 ObserveTargetResponse {
                     target_node_id: "node-b".to_string(),
                     response: ObserveControlResponse {
+                        live_log_writing: None,
                         active_filter: "warn,sinomo=info".to_string(),
                         base_filter: "warn,sinomo=info".to_string(),
                         quiet_filter_directives: Vec::new(),

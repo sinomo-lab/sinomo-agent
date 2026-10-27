@@ -4,6 +4,357 @@ use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[test]
+fn native_repair_eligibility_is_observational_but_receipt_effect_keeps_its_permit() {
+    let (runtime, nodes, jobs, gate, _events, _calls) = native_managed_work(
+        "native-repair-eligibility-observation",
+        &[("/", DfsPlacementScope::Subtree)],
+    );
+    let scheduler =
+        crate::runtime_host::daemon_dfs_mutation_scheduler(runtime.data_dir(&nodes[0])).unwrap();
+    let admission = crate::test_runtime::executor()
+        .block_on(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let store = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&nodes[0])),
+    );
+    let before = store.view().unwrap();
+    assert_eq!(before.records.len(), 8);
+    let original = before.records[0].clone();
+    assert_eq!(
+        placement_reconciliation_job_id_from_intent_id(&original.intent_id),
+        Some(jobs[0].as_str())
+    );
+    let mut core = runtime.metadata_primary_service("/native-managed-0").unwrap();
+    core.restore_pending_write_for_intent_if_missing(&original.intent_id, &original.object_id)
+        .unwrap();
+    let object = core.current_read_object_metadata(&original.object_id).unwrap();
+    assert_eq!(object.version, original.version);
+    assert_eq!(object.content_hash.as_ref(), Some(&original.content_hash));
+
+    // Observe actual native KV requests while the real owner's global
+    // admission excludes competing maintenance. The hook only records; it
+    // neither rejects a request nor supplies a reply or authority.
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let observed_phase = Arc::clone(&phase);
+    let mutations = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&mutations);
+    let hook = runtime.native_kv_request_hook(&nodes[0], move |request| {
+        let phase = observed_phase.load(std::sync::atomic::Ordering::SeqCst);
+        if phase == 0 {
+            return Ok(());
+        }
+        for operation in &request.txn.success {
+            let (kind, key) = match operation {
+                sinomo_core::kv::KvOp::Put { key, .. } => ("put", key),
+                sinomo_core::kv::KvOp::Delete { key } => ("delete", key),
+                _ => continue,
+            };
+            if key.ends_with("/placement-authority-permit-v1") {
+                let mut captured = captured.lock().unwrap();
+                assert!(captured.len() < 64, "bounded native permit observation");
+                captured.push((phase, kind, key.clone()));
+            }
+        }
+        Ok(())
+    }).unwrap();
+    assert!(core.placement_intent_remains_authoritative(&original.intent_id).unwrap());
+    assert_eq!(store.view().unwrap().records, before.records);
+    assert_eq!(core.current_read_object_metadata(&original.object_id).unwrap(), object);
+
+    // Use the real exact local-content receipt path, including its deduplicated
+    // receipt case. Eligibility must not replace this effect-time authority.
+    phase.store(2, std::sync::atomic::Ordering::SeqCst);
+    core.record_local_pending_write_receipt_if_desired(
+        &original.intent_id,
+        &original.object_id,
+        &original.version,
+        &original.content_hash,
+    ).unwrap();
+    phase.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mutations = mutations.lock().unwrap().clone();
+    std::fs::write(
+        runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-repair-eligibility.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original": original, "object": object, "queue": before.records,
+            "actual_permit_mutations": mutations,
+            "phases": {"1": "eligibility", "2": "actual-local-receipt-handler"},
+            "qualification": "Real native host, current managed job and original queue custody. No fabricated authority or successful response. Receiver transfers remain a separate existing regression."
+        })).unwrap(),
+    ).unwrap();
+    drop(hook);
+    drop(core);
+    drop(admission);
+    gate.add_permits(64);
+    runtime.close().unwrap();
+    assert!(mutations.iter().all(|(phase, _, _)| *phase != 1),
+        "eligibility must not acquire and release a mutation permit: {mutations:?}");
+    assert!(mutations.iter().any(|(phase, kind, _)| *phase == 2 && *kind == "put"));
+    assert!(mutations.iter().any(|(phase, kind, _)| *phase == 2 && *kind == "delete"));
+}
+
+#[test]
+fn native_stale_placement_plan_preserves_original_unsent_repair_custody() {
+    native_stale_placement_custody(false);
+}
+
+#[test]
+fn native_stale_placement_custody_survives_restart_and_authoritative_successor() {
+    native_stale_placement_custody(true);
+}
+
+fn native_stale_placement_custody(recover: bool) {
+    let name = if recover {
+        "native-stale-plan-repair-recovery"
+    } else {
+        "native-stale-plan-repair-custody"
+    };
+    let (mut runtime, nodes, jobs, gate, _events, subscription, admission, authority, control) =
+        native_managed_setup(name, &[("/", DfsPlacementScope::Subtree)]);
+    let observed = authority.reader();
+    let job_id = jobs[0].clone();
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_block = blocked.clone();
+    let old_job = job_id.clone();
+    let hook = runtime.native_kv_request_hook(&nodes[0], move |request| {
+        if repair_group_scan_is_incomplete(request, &observed) {
+            return Err(native_group_scan_gate_error());
+        }
+        let acquiring = request.txn.success.iter().any(|op| matches!(op,
+            sinomo_core::kv::KvOp::Put { key, .. } if key.contains("/placement-authority-permit-v1")));
+        if acquiring && observed.group_acquisition_is_open(&old_job) {
+            saw_block.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Err(native_group_scan_gate_error());
+        }
+        Ok(())
+    }).unwrap();
+    drop(admission);
+    for _ in 0..8 {
+        let tick = runtime
+            .maintenance_tick(&nodes[0], sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        assert_eq!(tick.omitted_kv_event_count, 0);
+        if blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+    }
+    assert!(blocked.load(std::sync::atomic::Ordering::SeqCst));
+    let store = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&nodes[0])),
+    );
+    let before = store.view().unwrap();
+    assert_eq!(before.records.len(), 8);
+    assert!(before.records.iter().all(|row| !row.in_flight
+        && row.transfer_request_id.is_none()
+        && row.completed_transfer_request_id.is_none()
+        && row.transfer_delivery_state
+            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)));
+
+    // Change only a different subtree through the actual configuration owner.
+    // No metadata, receipt, producer identity, or authority result is supplied.
+    let scheduler =
+        crate::runtime_host::daemon_dfs_mutation_scheduler(runtime.data_dir(&nodes[0])).unwrap();
+    let admission = crate::test_runtime::executor()
+        .block_on(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    drop(hook);
+    control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
+        let fs = &runtime.file_system().file_system_id;
+        let expected = store.get_file_system_config(fs).unwrap().unwrap();
+        let original = store
+            .placement_reconciliation(fs, &job_id)
+            .unwrap()
+            .unwrap();
+        let mut desired = expected.clone();
+        upsert_placement_rule(
+            &mut desired.subtree_policies,
+            normalize_placement_rule(
+                "/unrelated-repair-policy",
+                DfsPlacementScope::Subtree,
+                DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 1)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let successor = crate::control_plane::build_placement_reconciliation_job(
+            sinomo_core::Id::generate().to_string(),
+            &desired,
+            "/unrelated-repair-policy".into(),
+            DfsPlacementScope::Subtree,
+            Default::default(),
+            original.candidate_snapshot,
+            None,
+            dfs_now_unix_nanos(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .compare_and_put_placement_update(&expected, &desired, &successor)
+                .unwrap()
+        );
+    });
+    drop(admission);
+    let mut ticks = Vec::new();
+    for _ in 0..8 {
+        let tick = runtime
+            .maintenance_tick(&nodes[0], sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+        assert_eq!(tick.omitted_kv_event_count, 0);
+        ticks.push(format!("{:?}", tick.outcome));
+    }
+    let after = store.view().unwrap();
+    let retained = before.records.iter().all(|prior| {
+        after.records.iter().any(|row| {
+            row.intent_id == prior.intent_id
+                && row.object_id == prior.object_id
+                && row.version == prior.version
+                && row.content_hash == prior.content_hash
+                && row.missing_replica_node_id == prior.missing_replica_node_id
+                && row.transfer_kind == prior.transfer_kind
+                && row.transfer_request_id == prior.transfer_request_id
+                && row.completed_transfer_request_id == prior.completed_transfer_request_id
+                && row.transfer_delivery_state == prior.transfer_delivery_state
+        })
+    });
+    std::fs::write(
+        runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-stale-plan-custody.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original_job": job_id, "before": before.records, "after": after.records,
+            "ticks": ticks, "original_unsent_custody_retained": retained,
+            "qualification": "Fresh actual native owners and configuration transaction. Different subtree changed; no historical operation replay or supplied successful authority."
+        })).unwrap(),
+    ).unwrap();
+    gate.add_permits(64);
+    runtime.clear_faults();
+    drop(control);
+    drop(subscription);
+    drop(authority);
+    if !recover || !retained {
+        runtime.close().unwrap();
+        assert!(
+            retained,
+            "stale placement eligibility cannot erase live original unsent custody"
+        );
+        return;
+    }
+    drop(store);
+    drop(scheduler);
+    runtime.stop_node(&nodes[0]).unwrap();
+    runtime.reopen_node(nodes[0].clone()).unwrap();
+    let store = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&nodes[0])),
+    );
+    let reopened = store.view().unwrap();
+    for record in &after.records {
+        assert_eq!(
+            reopened.records.iter().find(|row| {
+                row.intent_id == record.intent_id
+                    && row.missing_replica_node_id == record.missing_replica_node_id
+            }),
+            Some(record),
+            "actual Main restart keeps the parked original producer record exactly"
+        );
+    }
+
+    // A fresh accepted plan supplies actual successor authority. This is not
+    // a retry of a historical write under a different operation identity.
+    let candidates = {
+        let mut client = runtime.client(&nodes[0]).unwrap();
+        client.placement_content_candidates().unwrap()
+    };
+    let control = runtime.shared_control_plane().unwrap();
+    let successor = control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
+        let fs = &runtime.file_system().file_system_id;
+        let current = store.get_file_system_config(fs).unwrap().unwrap();
+        let successor = crate::control_plane::build_placement_reconciliation_job(
+            sinomo_core::Id::generate().to_string(),
+            &current,
+            "/".into(),
+            DfsPlacementScope::Subtree,
+            Default::default(),
+            candidates,
+            None,
+            dfs_now_unix_nanos(),
+        )
+        .unwrap();
+        assert!(
+            store
+                .compare_and_put_placement_update(&current, &current, &successor)
+                .unwrap()
+        );
+        successor
+    });
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for _ in 0..8 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "existing native repair deadline");
+        runtime
+            .maintenance_tick(&nodes[0], remaining)
+            .unwrap()
+            .outcome
+            .unwrap();
+        let started = store
+            .view()
+            .unwrap()
+            .records
+            .into_iter()
+            .filter_map(|row| {
+                row.transfer_request_id
+                    .map(|id| (row.intent_id, row.missing_replica_node_id, id))
+            })
+            .collect::<BTreeSet<_>>();
+        while store.view().unwrap().records.iter().any(|row| {
+            row.in_flight
+                && row.transfer_request_id.as_ref().is_some_and(|id| {
+                    started.contains(&(
+                        row.intent_id.clone(),
+                        row.missing_replica_node_id.clone(),
+                        id.clone(),
+                    ))
+                })
+        }) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if store.view().unwrap().records.is_empty() {
+            break;
+        }
+    }
+    let final_queue = store.view().unwrap();
+    std::fs::write(
+        runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-stale-plan-recovery.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "original": after.records, "reopened": reopened.records,
+            "successor": successor.job_id, "final": final_queue.records,
+            "qualification": "Actual Main stop/reopen and a new accepted placement plan; original content identities unchanged."
+        })).unwrap(),
+    ).unwrap();
+    assert!(
+        final_queue.records.is_empty(),
+        "authoritative successor completes and settles the original parked custody"
+    );
+    for node in &nodes {
+        let mut client = runtime.client(node).unwrap();
+        for index in 0..4 {
+            let path = format!("/native-managed-{index}");
+            assert_eq!(
+                client.posix_read_file(&path).unwrap(),
+                vec![index as u8; 64]
+            );
+            let current = client.posix_stat_distributed(&path).unwrap();
+            assert!(before.records.iter().any(|record| {
+                record.object_id == current.object_id
+                    && record.version == current.version
+                    && Some(record.content_hash.as_str()) == current.content_hash.as_deref()
+            }));
+        }
+    }
+    drop(control);
+    runtime.close().unwrap();
+}
+
 const NATIVE_GROUP_SCAN_GATE: &str =
     "negative native repair-group gate until its real scan completes";
 

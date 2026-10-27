@@ -46,11 +46,78 @@ def require_limits(services):
     return len(services) * NODE_LIMIT
 
 
-def preflight(config, artifacts):
+def process_start(pid):
+    raw = Path(f"/proc/{pid}/stat").read_text()
+    return int(raw[raw.rindex(")") + 2:].split()[19])
+
+
+def sample_reused_nodes(project):
+    rows = inspect_nodes(project)
+    if len(rows) != 6 or len({row["Id"] for row in rows}) != 6 or {row["Config"]["Labels"]["com.docker.compose.service"] for row in rows} != NODES:
+        raise RuntimeError("reuse admission requires the exact six existing owned nodes")
+    result = {}
+    for row in rows:
+        if row["Config"]["Labels"].get("com.docker.compose.project") != project:
+            raise RuntimeError("reuse admission cannot borrow another project's memory")
+        checked = check_node(row)
+        if not checked["running"]:
+            raise RuntimeError("reuse admission requires live container ownership")
+        pid = checked["pid"]
+        start = process_start(pid)
+        root = Path("/sys/fs/cgroup") / checked["cgroup"].lstrip("/")
+        identity = root.stat()
+        raw = (root / "memory.stat").read_text()
+        stat = {key: int(value) for key, value in (line.split() for line in raw.splitlines())}
+        current = int((root / "memory.current").read_text())
+        swap = int((root / "memory.swap.current").read_text())
+        if "anon" not in stat or stat["anon"] < 0 or current < 0 or swap:
+            raise RuntimeError("reuse anonymous-memory coverage unavailable or swap present")
+        after = root.stat()
+        group = next(line.split("::", 1)[1] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines() if line.startswith("0::"))
+        if (identity.st_dev, identity.st_ino) != (after.st_dev, after.st_ino) or process_start(pid) != start or group != checked["cgroup"]:
+            raise RuntimeError("reuse memory owner changed during observation")
+        result[checked["node"]] = {
+            "container_id": row["Id"], "pid": pid, "start_ticks": start,
+            "cgroup": checked["cgroup"], "cgroup_identity": [identity.st_dev, identity.st_ino],
+            "anonymous_bytes": min(stat["anon"], current, NODE_LIMIT),
+            "memory_current_bytes": current, "memory_stat": raw,
+            "effective_limits_and_events": checked["limits_and_counters"],
+        }
+    return result
+
+
+def reused_anonymous_credit(before, after):
+    if set(before) != NODES or set(after) != NODES:
+        raise RuntimeError("reuse samples must cover all six owned nodes")
+    identity_fields = ("container_id", "pid", "start_ticks", "cgroup", "cgroup_identity")
+    credit = 0
+    for node in sorted(NODES):
+        if any(before[node][key] != after[node][key] for key in identity_fields):
+            raise RuntimeError(f"{node}: reuse ownership changed across host-memory sample")
+        values = [before[node]["anonymous_bytes"], after[node]["anonymous_bytes"]]
+        if any(not isinstance(value, int) or value < 0 for value in values):
+            raise RuntimeError(f"{node}: anonymous-memory observation unavailable")
+        credit += min(*values, NODE_LIMIT)
+    return credit
+
+
+def preflight(config, artifacts, reuse_project=None):
     required = require_limits(config["services"])
+    reuse = None
+    if reuse_project is not None and (not reuse_project or config.get("name") != reuse_project):
+        raise RuntimeError("reuse project must match the resolved Compose configuration")
+    before = sample_reused_nodes(reuse_project) if reuse_project else None
     memory = {line.split(":")[0]: int(line.split()[1]) * 1024
               for line in Path("/proc/meminfo").read_text().splitlines()
               if line.startswith(("MemTotal:", "MemAvailable:", "Shmem:", "SwapTotal:"))}
+    credit = 0
+    if reuse_project:
+        after = sample_reused_nodes(reuse_project)
+        credit = reused_anonymous_credit(before, after)
+        reuse = {"project": reuse_project, "before": before, "after": after,
+                 "already_resident_anonymous_bytes": credit,
+                 "qualification": "Lower bracketing anonymous charge of the same live owned containers only. File cache, shared ancestors and unrelated workloads receive no credit. This is sampled admission, not an atomic host reservation or a resource-gate waiver."}
+    additional = required - credit
     paths = {Path("/tmp"), artifacts, Path(docker("info", "--format", "{{.DockerRootDir}}").strip())}
     capacity = {}
     for path in paths:
@@ -58,12 +125,13 @@ def preflight(config, artifacts):
         capacity[str(path)] = {"free_bytes": stat.f_bavail * stat.f_frsize,
                                "free_inodes": stat.f_favail, "reports_inodes": bool(stat.f_files)}
     result = {"node_count": 6, "per_node_bytes": NODE_LIMIT, "node_allocation_bytes": required,
-              "memory": memory, "filesystems_used": capacity,
-              "host_accounting": "MemAvailable already reflects current host/driver use; no fixed 4 GiB driver allocation is added. Future host/driver growth remains observed overhead, not node capacity.",
+              "memory": memory, "filesystems_used": capacity, "reuse": reuse,
+              "additional_available_bytes_required": additional,
+              "host_accounting": "Fresh launch requires the full12GiB. Explicit reuse credits only already resident owned anonymous memory, which MemAvailable has already excluded; remaining capacity must still be available. No file-cache/observer subtraction, fixed driver allocation, or whole-host acceptance limit.",
               "build_limits": "Separate build guard; no compiler cap or build headroom change."}
     save(artifacts / "resource-preflight.json", result)
-    if memory["MemAvailable"] < required:
-        raise RuntimeError(f"insufficient available host memory for six 2 GiB nodes: {memory}")
+    if memory["MemAvailable"] < additional:
+        raise RuntimeError(f"insufficient available host memory for six 2 GiB nodes: additional_required={additional}, already_resident_anon={credit}, memory={memory}")
     for path, value in capacity.items():
         if value["free_bytes"] < 5 * 1024**3 or (value["reports_inodes"] and value["free_inodes"] < 65536):
             raise RuntimeError(f"storage reserve unavailable at {path}: {value}")
@@ -213,6 +281,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["preflight", "verify", "watch", "expect-exit"])
     parser.add_argument("--project")
+    parser.add_argument("--reuse-project", help="preflight only: exact existing project; no new/recreated nodes")
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--parent-pid", type=int)
@@ -220,7 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--reason", default="explicit verifier restart")
     args = parser.parse_args()
     if args.action == "preflight":
-        preflight(json.loads(args.config.read_text()), args.artifacts)
+        preflight(json.loads(args.config.read_text()), args.artifacts, args.reuse_project)
     elif args.action == "expect-exit":
         expect_exit(args.nodes, args.reason)
     elif args.action == "watch":

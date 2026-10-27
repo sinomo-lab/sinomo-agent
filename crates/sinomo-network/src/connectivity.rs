@@ -46,6 +46,11 @@ pub fn cluster_connectivity_record_should_refresh(
     expires_at <= now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS)
 }
 
+/// Equality of the connectivity semantics published through cluster quorum.
+/// Failure counts remain inputs to the source owner's local failure budget and
+/// route ordering, but do not create a distinct quorum generation within the
+/// same health state and failure reason. Authenticated freshness readers use
+/// this same boundary; they still require genuine, unexpired source evidence.
 pub fn cluster_connectivity_stable_eq(
     left: &ClusterConnectivityRecord,
     right: &ClusterConnectivityRecord,

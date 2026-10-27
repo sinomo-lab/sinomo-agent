@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_runtime::{DfsTestRuntime, RpcPhase};
-use crate::{SharedDfsControlPlaneKvClient, sifs_file_system_id};
+use crate::{DfsMetadataShardId, SharedDfsControlPlaneKvClient, sifs_file_system_id};
 
 fn native_placement_job(
     config: DfsFileSystemConfig,
@@ -102,6 +102,13 @@ impl NativePlacementFixture {
         }));
         let mut writer = runtime.client(&primary).unwrap();
         writer.posix_mkdir_all(path).unwrap();
+        // Large native corpora use the existing verified trace windows. Keep
+        // the 4096-event live buffer and every original event; small fixtures'
+        // lifetime observation/call-count expectations remain unchanged.
+        let checkpoint_setup = count > crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT;
+        if checkpoint_setup {
+            runtime.checkpoint_rpc_observation_window().unwrap();
+        }
         let mut objects = Vec::new();
         for index in 0..count {
             let name = format!("{path}/object-{index:03}.bin");
@@ -118,6 +125,12 @@ impl NativePlacementFixture {
                     .current_read_object_metadata(&stat.object_id)
                     .unwrap(),
             );
+            if checkpoint_setup && index % 16 == 15 {
+                runtime.checkpoint_rpc_observation_window().unwrap();
+            }
+        }
+        if checkpoint_setup {
+            runtime.checkpoint_rpc_observation_window().unwrap();
         }
         if remote {
             // A client facade never replays journal replies into Main's store.
@@ -222,6 +235,122 @@ impl NativePlacementFixture {
         drop(self.service);
         self.runtime.close().unwrap();
     }
+}
+
+fn reconcile_fixture_placement(
+    service: &mut NetworkedDfsService<crate::DfsNodeTransport>,
+    primary: &NodeId,
+    config: &DfsFileSystemConfig,
+    job: &DfsPlacementReconciliationJob,
+    object: &DfsObjectMetadata,
+) -> Result<(), DfsError> {
+    let (resolved, replication, placement) =
+        reconciliation_placement_for_object(config, job, object).unwrap();
+    // This is a browser fixture. The ordinary authenticated Main route owns
+    // admission and effect execution; a direct local effect races maintenance.
+    let reply = service.route_namespace_operation_to_metadata_primary_with_timeout_and_options(
+        object.file_system_id.clone(),
+        primary.clone(),
+        DfsNamespaceOperation::ReconcilePlacement {
+            job_id: job.job_id.clone(),
+            path: object.path.clone(),
+            object_id: object.object_id.clone(),
+            expected_version: object.version.clone(),
+            object_policy: resolved.policy.consistency,
+            replication_policy: replication,
+            desired_replica_node_ids: placement.plan.desired_replica_nodes,
+        },
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        false,
+        false,
+    )?;
+    assert_eq!(reply.result, crate::DfsNamespaceResult::Applied);
+    Ok(())
+}
+
+#[test]
+fn native_placement_fixture_queues_behind_the_actual_admission_and_permit_owner() {
+    let mut case = NativePlacementFixture::with_nodes_and_initial_job(
+        "native-placement-fixture-admission",
+        false,
+        1,
+        1,
+        false,
+    );
+    let scheduler =
+        crate::runtime_host::daemon_dfs_mutation_scheduler(case.runtime.data_dir(&case.primary))
+            .unwrap();
+    let admission = crate::test_runtime::executor()
+        .block_on(scheduler.admit(&crate::DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    assert!(case.control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .compare_and_put_placement_update(
+                &case.job.accepted_config,
+                &case.job.accepted_config,
+                &case.job,
+            )
+            .unwrap()
+    }));
+    let object = case.objects[0].clone();
+    let mut owner = case.runtime.metadata_primary_service(&object.path).unwrap();
+    let (_, _, mut permit) = owner
+        .acquire_authoritative_placement_reconciliation(
+            &object.file_system_id,
+            &case.job.job_id,
+            Some(&object.path),
+        )
+        .unwrap()
+        .expect("actual current Main host granted the held permit");
+    let before = case.runtime.rpc_observations().len();
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let runtime = &case.runtime;
+    let primary = case.primary.clone();
+    let job = case.job.clone();
+    let service = &mut case.service;
+    let (observed_dispatch, release, outcome) = std::thread::scope(|scope| {
+        let request = scope.spawn(|| {
+            reconcile_fixture_placement(service, &primary, &job.accepted_config, &job, &object)
+        });
+        let observed_dispatch = loop {
+            let observed = runtime
+                .rpc_observations()
+                .into_iter()
+                .skip(before)
+                .any(|call| {
+                    call.target == primary
+                        && call.route == crate::DFS_DATA_NAMESPACE_ROUTE
+                        && call.phase == RpcPhase::BeforeDispatch
+                });
+            if observed || request.is_finished() || std::time::Instant::now() >= deadline {
+                break observed;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let release = owner.release_placement_authority_permit(&mut permit);
+        drop(owner);
+        drop(admission);
+        (observed_dispatch, release, request.join().unwrap())
+    });
+    let within_deadline = std::time::Instant::now() < deadline;
+    std::fs::write(
+        case.runtime.data_dir(&case.primary).root().join("boundary-diagnostic-placement-fixture-admission.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "primary": case.primary, "job": case.job, "object": object,
+            "observed_native_dispatch_while_owner_held": observed_dispatch,
+            "release": format!("{release:?}"), "outcome": format!("{outcome:?}"),
+            "within_original_network_deadline": within_deadline,
+            "qualification": "Actual Main admission and native KV permit, released normally before join. No supplied reply, fabricated authority or historical write replay."
+        })).unwrap(),
+    ).unwrap();
+    case.close();
+    release.unwrap();
+    assert!(
+        observed_dispatch,
+        "fixture effect must enter the actual Main admission path: {outcome:?}"
+    );
+    outcome.unwrap();
+    assert!(within_deadline);
 }
 
 #[test]
@@ -750,12 +879,144 @@ fn native_placement_replay_after_handoff_preserves_original_committed_obligation
 
 #[test]
 fn native_unfinished_placement_repair_survives_primary_handoff() {
-    native_unfinished_placement_repair(true);
+    native_unfinished_placement_repair(true, true, false, false, false);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_recovers_without_request_replay() {
+    native_unfinished_placement_repair(true, false, false, false, false);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_explicit_recovery_control() {
+    native_unfinished_placement_repair(true, false, true, false, false);
 }
 
 #[test]
 fn native_unfinished_placement_repair_progresses_with_same_primary() {
-    native_unfinished_placement_repair(false);
+    native_unfinished_placement_repair(false, true, false, false, false);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_preserves_lost_reply_request_identity() {
+    native_unfinished_placement_repair(true, false, false, true, false);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_restarts_from_original_custody() {
+    native_unfinished_placement_repair(true, false, false, false, true);
+}
+
+#[test]
+fn native_unfinished_placement_handoff_restarts_with_lost_reply_identity() {
+    native_unfinished_placement_repair(true, false, false, true, true);
+}
+
+#[test]
+fn native_repair_handoff_waits_for_registered_main_carrier_drain() {
+    let label = "native-repair-handoff-actual-carrier-drain";
+    let case = NativePlacementFixture::with_nodes_and_initial_job(label, false, 1, 3, false);
+    let nodes = DfsTestRuntime::ordered_node_ids(label, 3);
+    let old = case.primary.clone();
+    let peers = nodes
+        .iter()
+        .filter(|node| **node != old)
+        .cloned()
+        .collect::<Vec<_>>();
+    let promoted = peers[1].clone();
+    let fs = case.objects[0].file_system_id.clone();
+    let active = case
+        .runtime
+        .reassign_metadata_shard(&fs, "services", old.clone(), peers)
+        .unwrap();
+    let mut source = case
+        .runtime
+        .metadata_primary_service(&case.objects[0].path)
+        .unwrap();
+    let scope = source
+        .metadata_backend()
+        .unwrap()
+        .publication_owner_scope(&fs, &DfsMetadataShardId::new("services"))
+        .unwrap();
+    let owner = crate::runtime_host::publication_runtime_owner(scope.root())
+        .unwrap()
+        .unwrap();
+    let gate = crate::runtime_message::registered_repair_handoff_drain_gate(&owner, &old).unwrap();
+    let held = gate.lock().unwrap();
+    let handoff = case
+        .control
+        .with_client(|kv| {
+            DfsControlPlaneStore::new(kv.as_mut())
+                .request_metadata_shard_primary_handoff(&active, &promoted)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        source
+            .reconcile_pending_metadata_shard_membership_handoffs(
+                std::slice::from_ref(&active),
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            )
+            .unwrap(),
+        0,
+        "handoff must yield instead of waiting while it holds response admission"
+    );
+    let (still_active, still_pending) = case.control.with_client(|kv| {
+        let store = DfsControlPlaneStore::new(kv.as_mut());
+        (
+            store.get_metadata_shard(&fs, "services").unwrap(),
+            store
+                .get_metadata_shard_membership_handoff(&fs, "services")
+                .unwrap(),
+        )
+    });
+    assert_eq!(still_active.as_ref(), Some(&active));
+    assert_eq!(still_pending.as_ref(), Some(&handoff));
+    drop(held);
+    let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    let attempt = source.reconcile_pending_metadata_shard_membership_handoffs(
+        std::slice::from_ref(&active),
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    // A normal Main can complete this SAME pending handoff while the caller
+    // queues for native admission. Require its existing exact completion
+    // proof; neither a stale-owner error nor a retry count is success.
+    let mut completion_observations = 0;
+    loop {
+        completion_observations += 1;
+        if let Some(completed) = case
+            .runtime
+            .observe_completed_native_handoff(&case.control, &handoff, deadline)
+            .unwrap()
+        {
+            assert_eq!(completed, handoff.desired_shard);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original handoff must complete after actual carrier drain: {attempt:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (after, pending) = case.control.with_client(|kv| {
+        let store = DfsControlPlaneStore::new(kv.as_mut());
+        (
+            store.get_metadata_shard(&fs, "services").unwrap(),
+            store
+                .get_metadata_shard_membership_handoff(&fs, "services")
+                .unwrap(),
+        )
+    });
+    assert_eq!(after.as_ref(), Some(&handoff.desired_shard));
+    assert!(pending.is_none());
+    std::fs::write(case.runtime.data_dir(&old).root().join("boundary-diagnostic-repair-handoff-gate.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"physical_scope": format!("{scope:?}"), "original": handoff,
+            "active_while_held": still_active, "pending_while_held": still_pending, "after": after, "pending_after": pending,
+            "caller_attempt": format!("{attempt:?}"), "completion_observations": completion_observations,
+            "qualification": "Actual registered Main carrier gate; no simulated authority or reply."})).unwrap()).unwrap();
+    drop(source);
+    drop(owner);
+    case.close();
 }
 
 #[test]
@@ -889,8 +1150,24 @@ fn native_unfinished_placement_replay_keeps_retired_receipt_and_journal() {
     assert_eq!(after.2.head_sequence, before.2.head_sequence);
 }
 
-fn native_unfinished_placement_repair(handoff: bool) {
-    let label = if handoff {
+fn native_unfinished_placement_repair(
+    handoff: bool,
+    replay_request: bool,
+    explicit_recovery: bool,
+    lose_reply: bool,
+    restart_after_handoff: bool,
+) {
+    let label = if restart_after_handoff && lose_reply {
+        "native-unfinished-placement-handoff-lost-reply-restart"
+    } else if restart_after_handoff {
+        "native-unfinished-placement-handoff-restart"
+    } else if lose_reply {
+        "native-unfinished-placement-handoff-lost-reply"
+    } else if explicit_recovery {
+        "native-unfinished-placement-handoff-explicit-recovery"
+    } else if handoff && !replay_request {
+        "native-unfinished-placement-handoff-no-replay"
+    } else if handoff {
         "native-unfinished-placement-handoff"
     } else {
         "native-unfinished-placement-same-owner"
@@ -907,10 +1184,11 @@ fn native_unfinished_placement_repair(handoff: bool) {
     let object = case.objects[0].clone();
     // Hold the actual old owner's content producer before claim. Metadata
     // publication and the real handoff remain live; no receipt is supplied.
-    let held = case
-        .runtime
-        .deny_background_replica_before_claim(&old_primary)
-        .unwrap();
+    let mut held = Some(
+        case.runtime
+            .deny_background_replica_before_claim(&old_primary)
+            .unwrap(),
+    );
     let original = case.job.accepted_config.clone();
     let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     policy.required_node_ids = vec![old_primary.clone(), replica.clone()];
@@ -969,6 +1247,92 @@ fn native_unfinished_placement_repair(handoff: bool) {
         );
         record
     };
+    let source_queue = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(case.runtime.data_dir(&old_primary)),
+    );
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    if lose_reply {
+        case.runtime.install_fault(crate::test_runtime::FaultRule {
+            source: Some(old_primary.clone()),
+            target: Some(replica.clone()),
+            route: Some(crate::DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+            call_id: None,
+            origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+            remaining_hits: 1,
+            action: crate::test_runtime::FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
+                intent_id: Some(intent_id.clone()),
+                captured: std::sync::Arc::clone(&captured),
+            },
+        });
+        drop(held.take());
+        let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+        loop {
+            let row = source_queue
+                .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+                .unwrap();
+            if !captured.lock().unwrap().is_empty()
+                && row.iter().any(|row| {
+                    row.transfer_request_id.is_some()
+                        && !row.in_flight
+                        && row.last_error.is_some()
+                        && row.completed_transfer_request_id.is_none()
+                        && row.transfer_delivery_state
+                            != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                })
+            {
+                break;
+            }
+            let remaining = deadline.checked_duration_since(Instant::now()).expect(
+                "actual lost reply reaches its durable original queue within the existing budget",
+            );
+            case.runtime
+                .maintenance_tick(
+                    &old_primary,
+                    remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        held = Some(
+            case.runtime
+                .deny_background_replica_before_claim(&old_primary)
+                .unwrap(),
+        );
+        case.runtime.clear_faults();
+    }
+    let original_queue = source_queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(
+        original_queue.len(),
+        1,
+        "the actual original producer has durable custody"
+    );
+    if lose_reply {
+        let original_request = original_queue[0].transfer_request_id.as_deref().unwrap();
+        assert!(captured.lock().unwrap().iter().any(|message| matches!(&message.message,
+            crate::DfsNetworkMessage::RepairReplicaResponse(reply) if reply.request_id == original_request && reply.intent_id == intent_id)));
+    }
+    let promoted_paths =
+        crate::runtime_host::DfsRuntimePaths::new(case.runtime.data_dir(&promoted));
+    let reconciliation_generation =
+        || crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(&promoted_paths);
+    if handoff && !replay_request {
+        // Startup reconciliation may otherwise accidentally supply the later
+        // handoff wake. Drain this actual Main's pre-existing request first.
+        let drain_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        while reconciliation_generation().is_some() {
+            let remaining = drain_deadline
+                .checked_duration_since(Instant::now())
+                .expect("ordinary initial recovery drains within its native budget");
+            case.runtime
+                .maintenance_tick(&promoted, remaining)
+                .unwrap()
+                .outcome
+                .unwrap();
+        }
+    }
+    let reconciliation_before_handoff = reconciliation_generation();
     if handoff {
         case.runtime
             .reassign_metadata_shard(
@@ -979,11 +1343,59 @@ fn native_unfinished_placement_repair(handoff: bool) {
             )
             .unwrap();
     }
+    if restart_after_handoff {
+        case.runtime.stop_node(&promoted).unwrap();
+        case.runtime.reopen_node(promoted.clone()).unwrap();
+    }
+    let reconciliation_after_handoff = reconciliation_generation();
+    let explicit_recovery_generation = explicit_recovery.then(|| {
+        case.runtime
+            .request_repair_reconciliation(&promoted)
+            .unwrap()
+    });
     drop(held);
     case.service.refresh_control_plane_latest().unwrap();
-    let replay = case
-        .service
-        .route_namespace_operation(promoted.clone(), operation);
+    let replay = replay_request.then(|| {
+        case.service
+            .route_namespace_operation(promoted.clone(), operation)
+    });
+    let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    let mut binding_observations = Vec::new();
+    if handoff {
+        loop {
+            // Read only the bounded persisted marker. No client/Core open is
+            // allowed to supply the new owner's activation or recovery wake.
+            let marker = crate::read_local_dfs_metadata_shard_write_freeze(
+                case.runtime.data_dir(&promoted),
+                &DfsMetadataShardId::new("services"),
+            )
+            .unwrap();
+            if marker.as_ref().is_some_and(|marker| {
+                marker.repair_custody.as_ref().is_some_and(|cut| {
+                    marker.activated_epoch == Some(cut.handoff.desired_shard.epoch)
+                })
+            }) {
+                break;
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("actual Main binds original custody without a foreground client open");
+            let tick = case
+                .runtime
+                .maintenance_tick(
+                    &promoted,
+                    remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                )
+                .unwrap();
+            binding_observations
+                .push(serde_json::json!({"marker":marker,"outcome":format!("{:?}",tick.outcome)}));
+            assert!(
+                tick.outcome.is_ok(),
+                "ordinary native binding: {:?}",
+                tick.outcome
+            );
+        }
+    }
     let after = {
         let owner = case.runtime.metadata_primary_service(&object.path).unwrap();
         assert_eq!(owner.node_id(), &promoted);
@@ -994,10 +1406,9 @@ fn native_unfinished_placement_repair(handoff: bool) {
             .unwrap()
             .unwrap()
     };
-    let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
     let mut completed = false;
     let mut maintenance = Vec::new();
-    while replay.is_ok() && Instant::now() < deadline {
+    while replay.as_ref().is_none_or(Result::is_ok) && Instant::now() < deadline {
         // The native fixture exposes the registered Main's ordinary bounded
         // maintenance call explicitly. Observational reads do not drive it.
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -1006,6 +1417,7 @@ fn native_unfinished_placement_repair(handoff: bool) {
         let remaining = remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
         let observation = case.runtime.maintenance_tick(&promoted, remaining).unwrap();
         maintenance.push(serde_json::json!({
+            "reconciliation_generation": reconciliation_generation(),
             "outcome": format!("{:?}", observation.outcome),
             "queue_before": format!("{:?}", observation.queue_before),
             "queue_after": format!("{:?}", observation.queue_after),
@@ -1057,7 +1469,14 @@ fn native_unfinished_placement_repair(handoff: bool) {
         serde_json::to_vec_pretty(&serde_json::json!({
             "original": original_record, "after": after, "replay": format!("{replay:?}"),
             "old_primary": old_primary, "new_primary": promoted, "replica": replica, "handoff": handoff,
-            "completed": completed, "maintenance": maintenance,
+            "request_replayed": replay_request,
+            "reconciliation_before_handoff": reconciliation_before_handoff,
+            "reconciliation_after_handoff": reconciliation_after_handoff,
+            "explicit_recovery_generation": explicit_recovery_generation,
+            "original_queue": original_queue,
+            "lost_reply": lose_reply,
+            "restart_after_handoff": restart_after_handoff,
+            "completed": completed, "binding_observations": binding_observations, "maintenance": maintenance,
             "all_rpc_observation_count": calls.len(), "selected_dfs_rpc_observations": selected,
             "qualification": "Actual fresh native fixture; selected DFS RPCs only. Full call count states omitted other routes. No supplied success, receipt or replacement authority."
         }))
@@ -1068,11 +1487,34 @@ fn native_unfinished_placement_repair(handoff: bool) {
         "unfinished-placement-handoff original={original_record:?} replay={replay:?} after={after:?} completed={completed} maintenance={maintenance:?}"
     );
     case.close();
-    replay.expect("the new actual primary must resume the exact unfinished placement");
+    if let Some(replay) = replay {
+        replay.expect("the new actual primary must resume the exact unfinished placement");
+    }
     assert_eq!(
         after, original_record,
         "handoff cannot rewrite the committed placement identity or captured body"
     );
+    if lose_reply {
+        let original_request = original_queue[0].transfer_request_id.as_deref().unwrap();
+        assert!(
+            calls.iter().any(|call| call.source == promoted
+                && call.target == replica
+                && call.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE
+                && call.phase == RpcPhase::BeforeDispatch
+                && call.dfs_request_id.as_deref() == Some(original_request)),
+            "the successor resumes the actual uncertain transfer identity"
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.source == promoted
+                    && call.target == replica
+                    && call.route == crate::DFS_DATA_REPAIR_REPLICA_ROUTE
+                    && call.dfs_intent_id.as_deref() == Some(intent_id.as_str()))
+                .all(|call| call.dfs_request_id.as_deref() == Some(original_request)),
+            "handoff cannot mint a replacement identity for an uncertain transfer"
+        );
+    }
     assert!(completed, "the real missing target must become durable");
 }
 
@@ -1202,18 +1644,7 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
             .unwrap()
     }));
     case.service.refresh_control_plane_latest().unwrap();
-    let (resolved, replication, placement) =
-        reconciliation_placement_for_object(&one_copy, &job, &object).unwrap();
-    case.service
-        .reconcile_object_placement_local(
-            &job.job_id,
-            &object.path,
-            &object.object_id,
-            &object.version,
-            resolved.policy.consistency,
-            replication,
-            &placement.plan.desired_replica_nodes,
-        )
+    reconcile_fixture_placement(&mut case.service, &case.primary, &one_copy, &job, &object)
         .unwrap();
     if replay_after_handoff {
         let intent_id = format!(
@@ -2059,4 +2490,243 @@ fn native_served_maintenance_skips_parked_job_for_tail_and_retires_superseded_he
     gate.add_permits(64);
     runtime.clear_faults();
     runtime.close().unwrap();
+}
+
+#[test]
+fn native_primary_handoff_preserves_every_repair_across_custody_pages() {
+    const COUNT: usize = 513;
+    let label = "native-primary-handoff-paged-repair-custody";
+    let case = NativePlacementFixture::with_nodes_and_initial_job(label, false, COUNT, 3, false);
+    let nodes = DfsTestRuntime::ordered_node_ids(label, 3);
+    let old = case.primary.clone();
+    let others = nodes
+        .iter()
+        .filter(|node| **node != old)
+        .cloned()
+        .collect::<Vec<_>>();
+    let replica = others[0].clone();
+    let promoted = others[1].clone();
+    let held = case
+        .runtime
+        .deny_background_replica_before_claim(&old)
+        .unwrap();
+    let original = case.job.accepted_config.clone();
+    let mut policy = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
+    policy.required_node_ids = vec![old.clone(), replica.clone()];
+    let desired = placement_config_with_override(
+        &original,
+        &case.job.path,
+        DfsPlacementScope::Subtree,
+        Some(policy),
+    )
+    .unwrap();
+    let job = native_placement_job(
+        desired.clone(),
+        &case.job.path,
+        case.job.candidate_snapshot.clone(),
+        "native-paged-original-placement".into(),
+    );
+    assert!(case.control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .compare_and_put_placement_update(&original, &desired, &job)
+            .unwrap()
+    }));
+    case.runtime.checkpoint_rpc_observation_window().unwrap();
+    let mut caller = case.runtime.client(&old).unwrap();
+    for (ordinal, object) in case.objects.iter().enumerate() {
+        let (resolved, replication, placement) =
+            reconciliation_placement_for_object(&desired, &job, object).unwrap();
+        caller
+            .route_namespace_operation(
+                old.clone(),
+                DfsNamespaceOperation::ReconcilePlacement {
+                    job_id: job.job_id.clone(),
+                    path: object.path.clone(),
+                    object_id: object.object_id.clone(),
+                    expected_version: object.version.clone(),
+                    object_policy: resolved.policy.consistency,
+                    replication_policy: replication,
+                    desired_replica_node_ids: placement.plan.desired_replica_nodes,
+                },
+            )
+            .unwrap();
+        if ordinal % 16 == 15 {
+            case.runtime.checkpoint_rpc_observation_window().unwrap();
+        }
+    }
+    drop(caller);
+    case.runtime.checkpoint_rpc_observation_window().unwrap();
+    let queue = crate::LocalDfsRepairQueueStore::new(
+        crate::default_dfs_repair_attempt_snapshot_path(case.runtime.data_dir(&old)),
+    );
+    let before = queue.view().unwrap();
+    let expected = case
+        .objects
+        .iter()
+        .map(|object| {
+            (
+                format!(
+                    "placement:{}:{}:{}",
+                    job.job_id, object.object_id, object.version
+                ),
+                object.object_id.clone(),
+                object.version.clone(),
+                object.content_hash.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (intent, object, version, hash) in &expected {
+        assert!(
+            before.records.iter().any(|row| &row.intent_id == intent
+                && &row.object_id == object
+                && &row.version == version
+                && Some(&row.content_hash) == hash.as_ref()
+                && row.missing_replica_node_id == replica
+                && row.transfer_delivery_state
+                    == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+                && row.transfer_request_id.is_none()),
+            "every original missing target has actual pre-dispatch custody"
+        );
+    }
+    case.runtime
+        .reassign_metadata_shard(
+            &case.objects[0].file_system_id,
+            "services",
+            promoted.clone(),
+            vec![old.clone(), replica.clone()],
+        )
+        .unwrap();
+    drop(held);
+    case.runtime.checkpoint_rpc_observation_window().unwrap();
+    let started = Instant::now();
+    let deadline = started + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    // Keep the actual native reader for this fixed ownership generation.
+    // Reopening its whole Core per poll dominated the measured completion
+    // window; ordinary getters still refresh their current physical view.
+    // Initial open and every read remain inside the original deadline.
+    let owner_open_started = Instant::now();
+    let observer = case
+        .runtime
+        .metadata_primary_service(&case.objects[0].path)
+        .unwrap();
+    let initial_owner_open_elapsed_micros = owner_open_started.elapsed().as_micros();
+    let mut maintenance = Vec::new();
+    let mut completed = false;
+    let mut diagnostic_completed = false;
+    // Preserve the original gate verdict. If it fails, one separately labelled
+    // bounded observation window follows the SAME pending operations through
+    // ordinary maintenance; late success cannot satisfy the 45-second test.
+    for diagnostic_only in [false, true] {
+        if completed {
+            break;
+        }
+        let window_deadline = if diagnostic_only {
+            Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT
+        } else {
+            deadline
+        };
+        while let Some(remaining) = window_deadline.checked_duration_since(Instant::now()) {
+            let tick_started = Instant::now();
+            let tick = case
+                .runtime
+                .maintenance_tick(
+                    &promoted,
+                    remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+                )
+                .unwrap();
+            let tick_elapsed_micros = tick_started.elapsed().as_micros();
+            maintenance.push(serde_json::json!({"outcome":format!("{:?}",tick.outcome),"queue_before":format!("{:?}",tick.queue_before),"queue_after":format!("{:?}",tick.queue_after),"omitted_kv_events":tick.omitted_kv_event_count}));
+            if tick.outcome.is_err() {
+                break;
+            }
+            let observation_started = Instant::now();
+            let backend = observer.metadata_backend().unwrap();
+            let mut count = 0;
+            for (_, object, version, hash) in &expected {
+                if backend
+                    .receipts_for_version(object, version)
+                    .unwrap()
+                    .iter()
+                    .any(|receipt| {
+                        receipt.replica_node_id == replica && receipt.content_hash == *hash
+                    })
+                {
+                    count += 1;
+                }
+            }
+            let receipt_observation_elapsed_micros = observation_started.elapsed().as_micros();
+            let window = case.runtime.rpc_observations();
+            let mut routes = BTreeMap::<String, usize>::new();
+            for event in &window {
+                *routes
+                    .entry(format!(
+                        "{} {} -> {} {:?}",
+                        event.route, event.source, event.target, event.phase
+                    ))
+                    .or_default() += 1;
+            }
+            let checkpointed = case.runtime.checkpoint_rpc_observation_window().unwrap();
+            let observation = maintenance.last_mut().unwrap();
+            observation["diagnostic_only"] = serde_json::json!(diagnostic_only);
+            observation["durable_target_receipts"] = serde_json::json!(count);
+            observation["maintenance_elapsed_micros"] = serde_json::json!(tick_elapsed_micros);
+            observation["receipt_observation_elapsed_micros"] =
+                serde_json::json!(receipt_observation_elapsed_micros);
+            observation["elapsed_millis"] = serde_json::json!(started.elapsed().as_millis());
+            observation["checkpointed_rpc_events"] = serde_json::json!(checkpointed);
+            observation["rpc_routes"] = serde_json::json!(routes);
+            observation["reconciliation_generation"] = serde_json::json!(
+                crate::runtime_host::daemon_dfs_maintenance_reconciliation_generation(
+                    &crate::runtime_host::DfsRuntimePaths::new(case.runtime.data_dir(&promoted))
+                )
+            );
+            if count == COUNT {
+                if diagnostic_only {
+                    diagnostic_completed = true;
+                } else {
+                    completed = true;
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let cut = observer
+        .metadata_backend()
+        .unwrap()
+        .metadata_shard_write_freeze(&DfsMetadataShardId::new("services"))
+        .unwrap()
+        .unwrap()
+        .repair_custody
+        .unwrap();
+    assert!(
+        cut.page_count >= 2,
+        "actual workload crosses the unchanged 512-record carrier limit"
+    );
+    assert!(cut.record_count >= COUNT as u64);
+    drop(observer);
+    let target = case.runtime.client(&replica).unwrap();
+    if completed || diagnostic_completed {
+        for (index, object) in case.objects.iter().enumerate() {
+            assert_eq!(
+                target
+                    .content()
+                    .read_object_version(object.object_id.as_str(), object.version.as_str())
+                    .unwrap()
+                    .1,
+                vec![index as u8; 4096]
+            );
+        }
+    }
+    drop(target);
+    assert!(
+        !completed || Instant::now() < deadline,
+        "all exact replica bytes are verified within the same original completion window"
+    );
+    std::fs::write(case.runtime.data_dir(&promoted).root().join("boundary-diagnostic-paged-repair-handoff.json"), serde_json::to_vec_pretty(&serde_json::json!({"expected_count":COUNT,"initial_owner_open_elapsed_micros":initial_owner_open_elapsed_micros,"original_queue":before.records,"cut":cut,"maintenance":maintenance,"completed":completed,"diagnostic_completed":diagnostic_completed,"original_deadline_seconds":45,"additional_diagnostic_window_seconds":if completed {0} else {45},"qualification":"513 actual native files and original placement identities; no supplied receipt or target bytes. Diagnostic continuation preserves the original failed deadline and cannot satisfy its assertion."})).unwrap()).unwrap();
+    case.close();
+    assert!(
+        completed,
+        "every original paginated repair must complete within the unchanged sync budget"
+    );
 }

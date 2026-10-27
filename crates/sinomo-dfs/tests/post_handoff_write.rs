@@ -221,11 +221,74 @@ fn promoted_services_primary_fetches_new_create_from_outside_replica_plan() {
         Instant::now() < deadline,
         "negative and recovery share the original window"
     );
+    let repair_object = intent.object_id.clone();
+    let repair_version = intent.target_version.clone();
+    let repair_intent = intent.intent_id.clone();
+    let repair_hash = intent.content_hash.clone();
     // Evaluate the success expectation after closing the actual native runtime,
     // so a failure retains DATA without orphaning fixture owners.
     drop(owner);
     let bytes = writer.posix_read_file_distributed(path);
     drop(writer);
+    let queue = sinomo_dfs::LocalDfsRepairQueueStore::new(
+        sinomo_dfs::default_dfs_repair_attempt_snapshot_path(runtime.data_dir(&promoted)),
+    );
+    let initial_queue = queue.view().unwrap();
+    let mut ticks = Vec::new();
+    let repair_result = (|| -> Result<(), String> {
+        loop {
+            let owner = runtime.metadata_primary_service(path)?;
+            let backend = owner.metadata_backend().unwrap();
+            let actual = backend
+                .receipts_for_version(&repair_object, &repair_version)
+                .map_err(|error| error.to_string())?;
+            let complete = selected.iter().all(|target| {
+                actual.iter().any(|receipt| {
+                    &receipt.replica_node_id == target
+                        && receipt.receipt.file_system_id == captured.file_system_id
+                        && receipt.receipt.object_id == repair_object
+                        && receipt.receipt.committed_version == repair_version
+                        && receipt.content_hash == repair_hash
+                })
+            });
+            drop(owner);
+            if complete {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("missing N receipt after the original absolute write/repair window".into());
+            }
+            let tick = runtime.maintenance_tick(&promoted, remaining);
+            if ticks.len() == 8 {
+                ticks.remove(0);
+            }
+            ticks.push(format!("{tick:?}"));
+            tick?;
+        }
+    })();
+    let final_queue = queue.view().unwrap();
+    let replica_bytes = selected
+        .iter()
+        .map(|target| {
+            let bytes = runtime.client(target).and_then(|replica| {
+                replica.content()
+                    .read_object_version(repair_object.as_str(), repair_version.as_str())
+                    .map_err(|error| error.to_string())
+            });
+            (target.clone(), bytes)
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        runtime.data_dir(&promoted).root().join("post-handoff-n-repair.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "intent_id":repair_intent,"object_id":repair_object,"version":repair_version,
+            "expected_targets":selected,"initial_queue":initial_queue.records,
+            "final_queue":final_queue.records,"result":repair_result,"last_ticks":ticks,
+            "replica_bytes":replica_bytes,
+            "qualification":"actual normal Main maintenance, same original absolute deadline; no second create or supplied transfer evidence"
+        })).unwrap(),
+    ).unwrap();
     runtime.close().unwrap();
     let written = result.expect("promoted primary must fetch, obtain W, and publish the create");
     let object = object.expect("a returned commit has an actual visible object");
@@ -237,6 +300,13 @@ fn promoted_services_primary_fetches_new_create_from_outside_replica_plan() {
     );
     assert!(!object.current_locations.contains(&requester));
     assert_eq!(bytes.unwrap(), b"new-primary-active");
+    repair_result.expect("promoted primary must retain fresh producer evidence and complete N");
+    for (target, bytes) in replica_bytes {
+        let (manifest, bytes) = bytes.unwrap();
+        assert_eq!(Some(manifest.content_hash), repair_hash, "actual replica {target}");
+        assert_eq!(manifest.size_bytes, 18, "actual replica {target}");
+        assert_eq!(bytes, b"new-primary-active", "actual replica {target}");
+    }
     assert!(
         receipts
             .iter()

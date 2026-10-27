@@ -1134,8 +1134,17 @@ fn sifs_cluster_write_options(node_id: &NodeId) -> DfsWriteOptions {
 /// metadata-shard primary, so the write routes over the network) and pumps the
 /// cluster until the writer observes the committed content at the path.
 fn sifs_cluster_routed_posix_write(cluster: &mut SifsPosixCluster, path: &str, bytes: &[u8]) {
-    let expected_hash = content_hash(bytes);
     let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    sifs_cluster_routed_posix_write_with_options(cluster, path, bytes, options);
+}
+
+fn sifs_cluster_routed_posix_write_with_options(
+    cluster: &mut SifsPosixCluster,
+    path: &str,
+    bytes: &[u8],
+    options: DfsWriteOptions,
+) {
+    let expected_hash = content_hash(bytes);
     match cluster.writer.posix_write_file(path, bytes, options) {
         Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
         Err(error) => panic!("routed POSIX write to {path} failed: {error}"),
@@ -1683,13 +1692,14 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
 /// through routed-response batches and SyncPath pulls.
 fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
     let mut cluster = sifs_posix_cluster(name, "/users");
+    let mut installed = Vec::new();
     for config in cluster
         ._runtime
         .metadata_shards()
         .expect("native source configuration")
     {
         let replicas = vec![cluster.writer_node.clone()];
-        cluster
+        let active = cluster
             ._runtime
             .reassign_metadata_shard(
                 &config.file_system_id,
@@ -1698,7 +1708,9 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
                 replicas,
             )
             .expect("native outsider membership handoff");
+        installed.push(active);
     }
+    sifs_cluster_observe_completed_assignments(&mut cluster, &installed);
     for service in [
         &mut cluster.primary,
         &mut cluster.writer,
@@ -1709,6 +1721,42 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
             .expect("native active generation");
     }
     cluster
+}
+
+/// The fixture deliberately changes assignments after opening its clients.
+/// Handoff completion proves activation at the owner, not delivery of every
+/// retained client's configuration observation. Join that known committed cut
+/// through each client's real authority path before testing unrelated behavior.
+fn sifs_cluster_observe_completed_assignments(
+    cluster: &mut SifsPosixCluster,
+    installed: &[DfsMetadataShardConfig],
+) {
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    let keys = installed
+        .iter()
+        .map(|config| crate::metadata_shard_key(&config.file_system_id, &config.shard_id))
+        .collect::<Vec<_>>();
+    for service in [
+        &mut cluster.primary,
+        &mut cluster.writer,
+        &mut cluster.observer,
+    ] {
+        let observed = service
+            .control_plane
+            .as_mut()
+            .expect("normal native fixture control client")
+            .get_authoritative_consistent_before(&keys, deadline)
+            .expect("observe completed handoffs within the fixture's bounded window")
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .expect("completed native assignment remains present")
+                    .decode::<DfsMetadataShardConfig>()
+                    .expect("actual native assignment")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed, installed, "exact completed fixture assignments");
+    }
 }
 
 // Shared fixtures remain in this parent so each focused suite can use

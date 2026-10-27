@@ -7,6 +7,9 @@ use sinomo_core::network::ObjectRpcResponse;
 
 pub const DFS_RPC_CATEGORY: &str = "dfs";
 
+/// Read the active content owner's already accepted in-memory advertisement.
+pub const DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE: &str = "/dfs/content/advertisement-live";
+
 pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
 pub const DFS_REPAIR_RETRY_ROUTE: &str = "/dfs/repair/retry";
 

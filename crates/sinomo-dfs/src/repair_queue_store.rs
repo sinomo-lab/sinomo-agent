@@ -627,6 +627,57 @@ pub struct LocalDfsRepairQueueStore {
 }
 
 impl LocalDfsRepairQueueStore {
+    /// Bounded DATA capture. The handoff owner separately retains the native
+    /// shard admission and carrier drain exclusion; sequence changes reject
+    /// a capture rather than combining queue generations.
+    pub(crate) fn handoff_page(
+        &self,
+        after: Option<&DfsRepairQueueKey>,
+    ) -> Result<(u64, Vec<DfsRepairAttemptRecord>, bool), DfsError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        let mut rows = state
+            .records
+            .range((after.map_or(Unbounded, Excluded), Unbounded));
+        let page = rows
+            .by_ref()
+            .take(crate::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT)
+            .map(|(_, row)| row.clone())
+            .collect();
+        Ok((state.head_sequence, page, rows.next().is_some()))
+    }
+
+    /// Import into the SAME queue/log/fsync path, without replacing any other
+    /// producer. A crash before the page receipt can replay exact rows only.
+    pub(crate) fn install_handoff_records(
+        &self,
+        records: &[DfsRepairAttemptRecord],
+    ) -> Result<(), DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        for record in records {
+            if state
+                .records
+                .get(&DfsRepairQueueKey::from_record(record))
+                .is_some_and(|existing| existing != record)
+            {
+                return Err(DfsError::Metadata {
+                    message: "repair handoff conflicts with existing original producer custody"
+                        .into(),
+                });
+            }
+        }
+        state.append_operations(
+            records
+                .iter()
+                .cloned()
+                .map(|record| DfsRepairQueueOperation::EnqueueIfMissing { record })
+                .collect(),
+        )?;
+        Ok(())
+    }
+
     pub fn new(snapshot_path: impl Into<PathBuf>) -> Self {
         let snapshot_path = snapshot_path.into();
         let mut stores = DFS_REPAIR_QUEUE_STORES

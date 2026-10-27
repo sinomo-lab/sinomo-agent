@@ -1815,6 +1815,19 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.mark_membership_handoff_write_freeze_activated(handoff_id, activated_epoch)
     }
 
+    fn bind_metadata_shard_repair_handoff_cut(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cut: &crate::DfsRepairHandoffCut,
+    ) -> Result<()> {
+        if shard_id != &self.shard_id {
+            return Err(MetadataBackendError::Serde(
+                "repair custody names another physical shard".into(),
+            ));
+        }
+        self.bind_repair_handoff_cut(cut)
+    }
+
     fn clear_metadata_shard_membership_handoff_freeze(
         &mut self,
         shard_id: &DfsMetadataShardId,

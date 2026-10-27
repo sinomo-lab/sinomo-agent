@@ -5376,7 +5376,9 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     require_positive("bytes", bytes)?;
 
     let payload_started = Instant::now();
-    let expected = large_payload(&path, bytes);
+    // Keep the exact expected byte pattern, not a second payload-sized buffer
+    // alongside the complete read result in this container.
+    let expected_pattern = payload_pattern(&format!("{path}|sinomo-dfs-large"));
     let payload_build_elapsed = payload_started.elapsed();
     let raw_baseline = if min_raw_read_ratio > 0.0 {
         Some(raw_disk_baseline(
@@ -5408,12 +5410,12 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         match backend.read_file(&path) {
             Ok(actual) => {
                 let read_elapsed = read_started.elapsed();
-                if actual.as_slice() != expected.as_slice() {
+                if !matches_payload_pattern(&actual, expected_pattern.as_bytes(), bytes) {
                     mismatch_attempts = mismatch_attempts.saturating_add(1);
                     last_state = format!(
                         "{path} content mismatch ({} bytes, expected {})",
                         actual.len(),
-                        expected.len()
+                        bytes
                     );
                     last_state_elapsed_ms = measurement_started.elapsed().as_millis() as u64;
                     if Instant::now() >= deadline {
@@ -5454,6 +5456,8 @@ fn run_large_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     "expected_payload_build_elapsed_ms",
                     payload_build_elapsed.as_millis() as u64,
                 );
+                ctx.record("expected_payload_representation", "repeating-pattern");
+                ctx.record("expected_pattern_bytes", expected_pattern.len() as u64);
                 ctx.record("elapsed_ms", elapsed_ms);
                 ctx.record(
                     "convergence_elapsed_ms",
@@ -6082,8 +6086,22 @@ fn required_payload_bytes(ctx: &SinomoTestContext) -> Result<Vec<u8>, SinomoTest
     Ok(pattern_payload(seed, bytes))
 }
 
+fn payload_pattern(seed: &str) -> String {
+    format!("{seed}|sinomo-dfs-payload|")
+}
+
+fn matches_payload_pattern(actual: &[u8], pattern: &[u8], bytes: usize) -> bool {
+    // Validate every byte, including a final partial period, and reject both
+    // truncation and trailing data. payload_pattern always supplies a period.
+    actual.len() == bytes
+        && !pattern.is_empty()
+        && actual
+            .chunks(pattern.len())
+            .all(|chunk| chunk == &pattern[..chunk.len()])
+}
+
 fn pattern_payload(seed: &str, bytes: usize) -> Vec<u8> {
-    let seed = format!("{seed}|sinomo-dfs-payload|");
+    let seed = payload_pattern(seed);
     let mut payload = Vec::with_capacity(bytes);
     while payload.len() < bytes {
         payload.extend_from_slice(seed.as_bytes());
@@ -6662,6 +6680,43 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn large_expect_pattern_matches_the_original_payload_at_every_period_boundary() {
+        for path in ["/large.bin", "/services/δ/文件.bin", ""] {
+            let literal = format!("{path}|sinomo-dfs-large|sinomo-dfs-payload|");
+            let pattern = payload_pattern(&format!("{path}|sinomo-dfs-large"));
+            assert_eq!(pattern, literal);
+            for bytes in 0..=3 * literal.len() + 1 {
+                let original: Vec<_> = literal.bytes().cycle().take(bytes).collect();
+                assert_eq!(large_payload(path, bytes), original);
+                assert!(matches_payload_pattern(&original, pattern.as_bytes(), bytes));
+            }
+        }
+    }
+
+    #[test]
+    fn large_expect_pattern_rejects_each_corrupt_byte_and_wrong_length() {
+        let path = "/services/large.bin";
+        let pattern = payload_pattern(&format!("{path}|sinomo-dfs-large"));
+        let bytes = 3 * pattern.len() + 7;
+        let mut actual = large_payload(path, bytes);
+        for offset in 0..bytes {
+            actual[offset] ^= 1;
+            assert!(!matches_payload_pattern(&actual, pattern.as_bytes(), bytes));
+            actual[offset] ^= 1;
+        }
+        assert!(matches_payload_pattern(&actual, pattern.as_bytes(), bytes));
+        assert!(!matches_payload_pattern(
+            &actual[..bytes - 1],
+            pattern.as_bytes(),
+            bytes
+        ));
+        actual.push(pattern.as_bytes()[bytes % pattern.len()]);
+        assert!(!matches_payload_pattern(&actual, pattern.as_bytes(), bytes));
+        assert!(!matches_payload_pattern(&actual, b"", bytes));
+        assert!(!matches_payload_pattern(b"", b"", 0));
+    }
 
     #[test]
     fn self_contained_dfs_tests_use_unique_run_namespaces() {

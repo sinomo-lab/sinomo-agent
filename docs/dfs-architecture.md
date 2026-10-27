@@ -187,6 +187,14 @@ Object identity remains stable across path moves. Versions are immutable once
 committed. Tombstones preserve enough history for replicas and caches to reject
 stale paths without retaining deleted content indefinitely.
 
+Authority transfer also preserves the retiring owner's durable repair work,
+including original operation identities, delivery uncertainty and retry state.
+The successor must durably receive that work before it can publish under the
+new assignment. Partial transfer, incompatible evidence or conflicting custody
+leaves the affected work fenced; retained source records cannot authorize the
+retired owner to resume effects. Metadata handoff does not manufacture missing
+content or weaken the configured durability requirement.
+
 ## Content Stores
 
 ### File attachments
@@ -257,6 +265,11 @@ delivery unknown. Networking may still reuse an authenticated duplex carrier
 or select a relay route. DFS must not turn that endpoint failure into a replica
 exclusion before routing runs; storage admission, configured replica counts,
 and durable content receipts continue to gate the write.
+
+An accepted placement intent retains the meaning of its captured observations
+at creation time. Fresh previews evaluate current observations, while every
+effect still rechecks current authority, policy, pins and storage evidence.
+A content-read scheduling hint cannot settle an uncertain storage mutation.
 
 Session locality, privacy, and trust-domain inputs still belong in upstream
 eligibility. Bringing every input into one auditable placement policy is tracked
@@ -460,6 +473,14 @@ DFS emits events for filesystem and object lifecycle, reads, write intents,
 staging, receipts, commits, rejection, repair, cache activity, and policy
 violations. Events carry node, filesystem, object, version, policy, content hash,
 and routing metadata when applicable.
+
+Live content availability observations come from the actual active content
+owner, with authenticated node identity, current process ownership and original
+evidence freshness. Reading an observation does not sample storage, renew
+expired evidence, publish durable state or grant write authority. Missing or
+stale owner evidence fails closed. Idle observation and maintenance must not
+create physical writes merely to refresh timestamps or report unchanged work;
+quietness includes attributable helper and writeback activity.
 
 Operators need metrics for repair backlog, metadata counts, content footprint,
 namespace jobs, transfer progress, quota pressure, and shard catch-up. Metrics

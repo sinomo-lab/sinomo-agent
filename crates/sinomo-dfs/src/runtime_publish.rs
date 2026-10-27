@@ -70,20 +70,17 @@ where
         // acquire another permit or require unrelated native owners to be idle.
         #[cfg(test)]
         let admission = Arc::new(admission);
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::task::spawn_blocking(move || {
+        let (returned_plan, attempt) = run_owned_metadata_publish_blocking(task_owner, move || {
             // A cancelled scheduler future cannot release admission while its
             // blocking durable-view refresh is still reading the shard.
             let attempt = plan(&admission);
             // Preserve the prior JoinHandle boundary: the returned plan is
             // consumed only after exact admission has been released.
             drop(admission);
-            let _ = result_tx.send((plan, attempt));
-        });
-        // Register the same blocking child before the first await. Cancelling
-        // its outer publisher must not detach a still-running FD/guard owner.
-        task_owner.own_task(task);
-        let (returned_plan, attempt) = result_rx.await.map_err(|error| {
+            (plan, attempt)
+        })
+        .await
+        .map_err(|error| {
             format!("DFS metadata publish planning task ended without a result: {error}")
         })?;
         plan = returned_plan;
@@ -110,17 +107,38 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::task::spawn_blocking(move || {
+    run_owned_metadata_publish_blocking(task_owner, move || {
         // Tokio cannot cancel an already-running blocking closure. Retain the
         // host capability until nested async transport/cursor commits finish.
         let result = runtime.block_on(execute);
         // Match the former JoinHandle boundary before exposing any result.
         drop(execution_guard);
-        let _ = result_tx.send(result);
-    });
-    task_owner.own_task(task);
-    result_rx.await.map_err(|error| {
+        result
+    })
+    .await
+    .map_err(|error| {
         format!("DFS metadata publish execution task ended without a result: {error}")
     })?
+}
+
+/// Keep the actual blocking child in the same host drain as its publisher.
+/// Cancelling an async caller cannot stop a started blocking closure; its
+/// existing admission and DATA custody must live until that closure finishes.
+pub(crate) async fn run_owned_metadata_publish_blocking<T, F>(
+    task_owner: &crate::runtime_host::DfsRuntimeHost,
+    execute: F,
+) -> Result<T, tokio::sync::oneshot::error::RecvError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let result = execute();
+        let _ = result_tx.send(result);
+    });
+    // Register before the first await, including when shutdown has already
+    // started. The existing host cancels queued work and joins running work.
+    task_owner.own_task(task);
+    result_rx.await
 }

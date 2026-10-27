@@ -4474,6 +4474,31 @@ render_formation_observation_artifacts() {
     done < <(find "$node_dir/network-timeline-artifacts" -type f -name timeline.json -print0)
   done
 
+  if [ "${SINOMO_TEST_DEFER_PPROF_PRESENTATION:-0}" = 1 ]; then
+    # Raw captures/CPU manifests and all collection above stay in this phase.
+    # Nested restart harnesses inherit the same explicit per-run setting.
+    while IFS= read -r -d '' profile; do
+      profile_dir="$(dirname "$profile")"
+      python3 "$flamegraph_renderer" "$profile" --defer-presentation \
+        --manifest "$profile_dir/manifest.json" --provenance "${BASH_SOURCE[0]}" \
+        -o "$profile_dir/pprof-presentation.json" \
+        > "$profile_dir/pprof-presentation.stdout.log" \
+        2> "$profile_dir/pprof-presentation.stderr.log" || true
+    done < <(find "$observe_dir" -type f -name cpu.pprof.pb -print0)
+    # Missing current captures remain unavailable, not a successful deferral.
+    for node in $NODES; do
+      profile_dir="$observe_dir/$node/profile-artifact"
+      if [ ! -f "$profile_dir/cpu.pprof.pb" ]; then
+        mkdir -p "$profile_dir"
+        python3 "$flamegraph_renderer" "$profile_dir/cpu.pprof.pb" --defer-presentation \
+          --manifest "$profile_dir/manifest.json" --provenance "${BASH_SOURCE[0]}" \
+          -o "$profile_dir/pprof-presentation.json" \
+          > "$profile_dir/pprof-presentation.stdout.log" \
+          2> "$profile_dir/pprof-presentation.stderr.log" || true
+      fi
+    done
+    return 0
+  fi
   [ -x "$flamegraph_renderer" ] || return 0
   while IFS= read -r -d '' profile; do
     profile_dir="$(dirname "$profile")"
@@ -4542,6 +4567,12 @@ capture_failure_context() {
       > "$ARTIFACTS/$node.daemon.stderr.log" 2>/dev/null || true
     compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/main.stdout.log \
       > "$ARTIFACTS/$node.daemon.stdout.log" 2>/dev/null || true
+    # Optional owned-I/O mode retains shadow/entrypoint/helpers inside DATA
+    # instead of delegating persistence to Docker's external log driver.
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/entrypoint-shadow.stdout.log \
+      > "$ARTIFACTS/$node.entrypoint-shadow.stdout.log" 2>/dev/null || true
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" tail -n 20000 /data/daemon/entrypoint-shadow.stderr.log \
+      > "$ARTIFACTS/$node.entrypoint-shadow.stderr.log" 2>/dev/null || true
     compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo cluster connectivity \
       > "$ARTIFACTS/$node.cluster-connectivity.txt" 2>&1 || true
     # Local cluster-KV view: snapshot revision + invitation/shard keys, the
@@ -4683,8 +4714,13 @@ if [ "${SINOMO_TEST_BUILD:-1}" = 1 ]; then
 fi
 
 compose config --format json > "$ARTIFACTS/compose-effective.json" || exit 1
+RESOURCE_PREFLIGHT_ARGS=()
+if [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
+  RESOURCE_PREFLIGHT_ARGS+=(--reuse-project "$PROJECT")
+fi
 python3 "$SINOMO_DOCKER_DIR/runtime_resources.py" preflight \
-  --config "$ARTIFACTS/compose-effective.json" --artifacts "$ARTIFACTS" || exit 1
+  --config "$ARTIFACTS/compose-effective.json" --artifacts "$ARTIFACTS" \
+  "${RESOURCE_PREFLIGHT_ARGS[@]}" || exit 1
 export SINOMO_TEST_RESOURCE_INTENTS="$ARTIFACTS/runtime-resource-intents.jsonl"
 trap 'FAILED_SCENARIOS="${FAILED_SCENARIOS:+$FAILED_SCENARIOS }runtime-resources"; exit 1' USR1
 

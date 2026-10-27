@@ -1,5 +1,7 @@
 //! Object RPC over the stream-native node-routing executor.
 
+mod freshness;
+
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterPaths, DaemonRpcTimeouts, NetworkCallPolicy,
@@ -1237,36 +1239,10 @@ fn prepare_cluster_object_rpc_connector(
                 node_id: target_node_id.clone(),
             });
         }
-        let connectivity = crate::connectivity_snapshot_from_directory_records(
-            &directory_snapshot,
-            crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
-                paths,
-                state,
-                &directory_snapshot,
-                directory_connectivity,
-            )?,
-            OffsetDateTime::now_utc(),
+        let records = crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
+            paths, state, &directory_snapshot, directory_connectivity,
         )?;
-        let connectivity = Arc::new(crate::ConnectivityTracker::new(connectivity));
-        let data_dir = cluster_paths_data_dir(Some(paths))?;
-        let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
-            crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), data_dir)?,
-        );
-        let provider: Arc<dyn crate::LinkProvider> = Arc::new(crate::ClusterLinkProvider::new(
-            state.local_node_id.clone(),
-            Arc::clone(&identity),
-            health,
-        )?);
-        let connectivity_view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
-        let failure_sink: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
-        let connector = Arc::new(crate::MultiHopRoutedConnector::from_snapshot(
-            state.local_node_id.clone(),
-            directory_snapshot,
-            connectivity_view,
-            failure_sink,
-            provider,
-            identity,
-        )?);
+        let connector = connector_from_observed_records(paths, state, directory_snapshot, records, health, None)?;
         if crate::network_module_routing_generation() != module_generation {
             continue;
         }
@@ -1283,6 +1259,42 @@ fn prepare_cluster_object_rpc_connector(
         detail: "network module registry changed repeatedly while capturing a routed connector"
             .to_string(),
     })
+}
+
+fn connector_from_observed_records(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    directory: crate::DirectorySnapshot,
+    records: Vec<crate::ClusterConnectivityRecord>,
+    health: NetworkHealthPolicy,
+    authenticated: Option<&std::collections::BTreeSet<(NodeId, NodeId, crate::ClusterEndpointId)>>,
+) -> Result<Arc<crate::MultiHopRoutedConnector>, NetworkError> {
+    let snapshot = crate::connectivity_snapshot_from_directory_records(
+        &directory, records, OffsetDateTime::now_utc(),
+    )?;
+    let snapshot = if let Some(authenticated) = authenticated {
+        let mut observations = snapshot.edges().to_vec();
+        for observation in &mut observations {
+            if authenticated.contains(&(observation.source_node_id.clone(), observation.target_node_id.clone(), observation.endpoint.endpoint_id.clone())) {
+                observation.provenance = if observation.source_node_id == state.local_node_id {
+                    "authenticated-direct-source-read"
+                } else { "authenticated-source-live-read" }.into();
+            }
+        }
+        crate::ConnectivitySnapshot::try_new(snapshot.generation(), snapshot.directory_generation(), snapshot.published_at(), observations)?
+    } else { snapshot };
+    let connectivity = Arc::new(crate::ConnectivityTracker::new(snapshot));
+    let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
+        crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), cluster_paths_data_dir(Some(paths))?)?,
+    );
+    let provider: Arc<dyn crate::LinkProvider> = Arc::new(crate::ClusterLinkProvider::new(
+        state.local_node_id.clone(), Arc::clone(&identity), health,
+    )?);
+    let view: Arc<dyn crate::ConnectivityView> = connectivity.clone();
+    let failures: Arc<dyn crate::ConnectivityFailureSink> = connectivity;
+    Ok(Arc::new(crate::MultiHopRoutedConnector::from_snapshot(
+        state.local_node_id.clone(), directory, view, failures, provider, identity,
+    )?))
 }
 
 /// Cluster object-RPC client facade.
@@ -1696,7 +1708,8 @@ where
             &[],
         );
         prepare_call_for_active_network_timeline(&mut call);
-        let result = cluster_object_rpc_call_with_deadline(
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let mut result = cluster_object_rpc_call_with_deadline(
             Box::pin(self.call_target_stream_native(
                 context.paths,
                 directory,
@@ -1706,11 +1719,16 @@ where
                 call,
                 options,
                 deadline,
+                &dispatched,
             )),
             deadline,
             timeout_error,
         )
         .await;
+        if !dispatched.load(std::sync::atomic::Ordering::Acquire)
+            && let Err(NetworkError::Timeout { delivery_state, .. }) = &mut result {
+            *delivery_state = NetworkDeliveryState::DefinitelyNotSent;
+        }
         record_cluster_target_rpc_outcome(context.paths, state, target_node_id, &result);
         result
     }
@@ -1725,6 +1743,7 @@ where
         call: ObjectRpcCall,
         options: ClusterObjectRpcOptions,
         deadline: ClusterEndpointRpcDeadline,
+        dispatched: &std::sync::atomic::AtomicBool,
     ) -> Result<ObjectRpcResult, NetworkError> {
         if target_node_id == &state.local_node_id {
             return Err(NetworkError::Io {
@@ -1799,15 +1818,30 @@ where
             target_node_id.clone(),
             options.protection,
             connect_timeout,
-            connector.connect_with_destination_process_affinity(
-                target_node_id.clone(),
-                crate::ConnectOptions {
-                    constraints,
-                    timeout: connect_timeout,
-                    protection: options.protection,
-                },
-                destination_process_affinity,
-            ),
+            async {
+                // The pool polls this only when a real carrier must be
+                // established. Live carriers do not trigger freshness reads.
+                let establishment_deadline = tokio::time::Instant::now() + connect_timeout;
+                let connector = if connector.has_live_observed_route(target_node_id, destination_process_affinity) {
+                    connector
+                } else {
+                    freshness::refresh_connector(
+                        paths, &directory, state, target_node_id, options, establishment_deadline,
+                        (directory_identity, module_generation, directory_generation),
+                    ).await?.unwrap_or(connector)
+                };
+                let remaining = establishment_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(NetworkError::timeout("establish routed service RPC stream", NetworkTimeoutPhase::Connect,
+                        connect_timeout, NetworkDeliveryState::DefinitelyNotSent));
+                }
+                connector.connect_with_destination_process_affinity(
+                    target_node_id.clone(),
+                    crate::ConnectOptions { constraints, timeout: remaining, protection: options.protection },
+                    destination_process_affinity,
+                ).await
+            },
+            None,
         )
         .await;
         record_routed_rpc_timeline_stage(
@@ -1820,6 +1854,7 @@ where
         let exchange_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
+        dispatched.store(true, std::sync::atomic::Ordering::Release);
         let result = crate::service_rpc_stream::call_service_rpc_peer_stream(
             stream,
             call,
@@ -2577,6 +2612,11 @@ mod tests {
 
     #[test]
     fn active_timeline_can_annotate_forwarded_streamed_value_metadata() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "route::tests::active_timeline_can_annotate_forwarded_streamed_value_metadata",
+        ) {
+            return;
+        }
         let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
         if crate::network_timeline_capture_is_active() {
             let _ = crate::stop_network_timeline_capture();
@@ -2603,6 +2643,11 @@ mod tests {
 
     #[test]
     fn active_timeline_still_samples_mutable_calls() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "route::tests::active_timeline_still_samples_mutable_calls",
+        ) {
+            return;
+        }
         let _capture_guard = crate::timeline::network_timeline_test_capture_guard();
         if crate::network_timeline_capture_is_active() {
             let _ = crate::stop_network_timeline_capture();

@@ -2372,6 +2372,11 @@ mod tests {
 
     #[tokio::test]
     async fn owned_mux_timeline_ready_precedes_synchronous_wake_consumer() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "owned_mux::tests::owned_mux_timeline_ready_precedes_synchronous_wake_consumer",
+        ) {
+            return;
+        }
         let _serial = crate::timeline::network_timeline_test_capture_guard();
         let _capture = MuxTimelineCapture::start(1024);
         let connection = 0x4d55_5801;
@@ -2474,6 +2479,11 @@ mod tests {
 
     #[tokio::test]
     async fn owned_mux_timeline_tx_queue_wake_poll_write_preserve_slab_identity() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "owned_mux::tests::owned_mux_timeline_tx_queue_wake_poll_write_preserve_slab_identity",
+        ) {
+            return;
+        }
         let _serial = crate::timeline::network_timeline_test_capture_guard();
         let _capture = MuxTimelineCapture::start(1024);
         let connection = 0x4d55_5802;
@@ -2570,6 +2580,11 @@ mod tests {
 
     #[tokio::test]
     async fn owned_mux_timeline_disabled_and_overflow_do_not_change_delivery_or_cancellation() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "owned_mux::tests::owned_mux_timeline_disabled_and_overflow_do_not_change_delivery_or_cancellation",
+        ) {
+            return;
+        }
         let _serial = crate::timeline::network_timeline_test_capture_guard();
         let _ = crate::timeline::stop_network_timeline_capture();
         let connection = 0x4d55_5803;

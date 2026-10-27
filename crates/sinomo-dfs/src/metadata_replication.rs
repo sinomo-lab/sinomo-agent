@@ -6938,6 +6938,29 @@ pub(crate) fn verify_dfs_metadata_journal_prefix(
     }
     let verified_primary_handoff_id =
         validated_pending_primary_handoff_prefix_probe_id(context, source_node_id, probe)?;
+    let needs_repair_custody = verified_primary_handoff_id.is_some()
+        && context
+            .pending_membership_handoff
+            .as_ref()
+            .is_some_and(|handoff| {
+                matches!(
+                    handoff.cause,
+                    crate::DfsMetadataShardHandoffCause::Membership
+                )
+            });
+    if needs_repair_custody != probe.repair_custody.is_some() {
+        return Err("primary rotation requires versioned exact repair custody; ordinary probes cannot import it".to_string().into());
+    }
+    if let Some(page) = probe.repair_custody.as_ref() {
+        page.validate().map_err(|error| error.to_string())?;
+        if context.pending_membership_handoff.as_ref() != Some(&page.cut.handoff) {
+            return Err(
+                "repair custody differs from the authenticated pending handoff"
+                    .to_string()
+                    .into(),
+            );
+        }
+    }
     backend
         .refresh_metadata_shard_durable_view(&probe.shard_id)
         .map_err(|error| {
@@ -7034,6 +7057,31 @@ pub(crate) fn verify_dfs_metadata_journal_prefix(
                 batch.shard_id.0, probe.journal_sequence
             )
         })?;
+    if let Some(page) = probe.repair_custody.as_ref() {
+        let scope = backend
+            .publication_owner_scope(&context.shard.file_system_id, &probe.shard_id)
+            .map_err(|error| error.to_string())?;
+        let _owner = crate::runtime_host::publication_runtime_owner(scope.root())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repair custody receive has no actual native DATA owner".to_string())?;
+        for row in &page.records {
+            if backend
+                .get_object_on_shard(&probe.shard_id, &row.object_id)
+                .map_err(|error| error.to_string())?
+                .is_none_or(|object| object.file_system_id != context.shard.file_system_id)
+            {
+                return Err("repair custody row is outside the exact frozen shard"
+                    .to_string()
+                    .into());
+            }
+        }
+        backend
+            .bind_metadata_shard_repair_handoff_cut(&probe.shard_id, &page.cut)
+            .map_err(|error| error.to_string())?;
+        let confirmation = crate::repair_handoff::receive(scope.root(), page)
+            .map_err(|error| error.to_string())?;
+        return Ok(Some(confirmation));
+    }
     Ok(verified_primary_handoff_id)
 }
 
@@ -7907,6 +7955,7 @@ fn dfs_metadata_caught_up_probe_command(
             journal_sequence,
             state_fingerprint,
             primary_handoff_id: None,
+            repair_custody: None,
         }),
         authority_probe: None,
         durable_replication: None,

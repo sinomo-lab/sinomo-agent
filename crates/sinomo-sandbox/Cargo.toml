@@ -44,6 +44,7 @@ tracing.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+sinomo-dfs = { workspace = true, features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio.workspace = true
 wat = "1.253.0"

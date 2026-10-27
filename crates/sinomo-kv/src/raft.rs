@@ -2142,9 +2142,23 @@ fn take_cluster_kv_raft_apply_failure_for_test(paths: &KvWalPaths) -> Option<usi
         .remove(&paths.root)
 }
 
+// Copies of diagnostic values only: no span, task, resident or authority lease.
+// A snapshot never prolongs the lifetime of the admission it describes.
+#[derive(Clone, Debug)]
+struct ClusterKvRaftOperationOwner {
+    generation: u64,
+    acquired_at: Instant,
+    caller: &'static std::panic::Location<'static>,
+    span_id: Option<u64>,
+    span_name: Option<&'static str>,
+}
+
+static NEXT_OPERATION_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Default)]
 struct ClusterKvRaftOperationLockState {
     held: bool,
+    owner: Option<ClusterKvRaftOperationOwner>,
     waiters: VecDeque<u64>,
     next_ticket: u64,
 }
@@ -2286,6 +2300,12 @@ impl Drop for ClusterKvRaftOperationGuard {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tracing::trace!(target: "sinomo.kv.admission",
+                gate = "operation", root = %self.root.display(),
+                owner_generation = state.owner.as_ref().map(|owner| owner.generation),
+                held_us = self.acquired_at.elapsed().as_micros() as u64,
+                "Raft operation admission released");
+            state.owner = None;
             state.held = false;
             // Every waiter re-checks its FIFO ticket. `notify_one` can wake a
             // later ticket and leave the eligible front asleep indefinitely.
@@ -2298,12 +2318,14 @@ impl Drop for ClusterKvRaftOperationGuard {
     }
 }
 
+#[track_caller]
 pub fn lock_cluster_kv_raft_operation_for_root(
     root: impl AsRef<Path>,
 ) -> Result<ClusterKvRaftOperationGuard, KvError> {
     lock_cluster_kv_raft_operation_for_root_with_wait(root, None)
 }
 
+#[track_caller]
 fn lock_cluster_kv_raft_operation_for_root_with_wait(
     root: impl AsRef<Path>,
     wait: Option<Duration>,
@@ -2354,6 +2376,7 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
         if let Some(deadline) = deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                trace_busy_operation_owner(&root, &state);
                 drop(state);
                 waiter.cancel("timeout");
                 return Err(KvError::Busy {
@@ -2377,6 +2400,7 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
             if timeout.timed_out()
                 && (state.held || state.waiters.front().copied() != Some(waiter.ticket))
             {
+                trace_busy_operation_owner(&root, &state);
                 drop(state);
                 waiter.cancel("timeout");
                 return Err(KvError::Busy {
@@ -2403,6 +2427,19 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
     debug_assert_eq!(dequeued_ticket, Some(waiter.ticket));
     state.held = true;
     let acquired_at = Instant::now();
+    let span = tracing::Span::current();
+    let owner = ClusterKvRaftOperationOwner {
+        generation: NEXT_OPERATION_OWNER_GENERATION.fetch_add(1, Ordering::Relaxed),
+        acquired_at,
+        caller: std::panic::Location::caller(),
+        span_id: span.id().map(|id| id.into_u64()),
+        span_name: span.metadata().map(|metadata| metadata.name()),
+    };
+    tracing::trace!(target: "sinomo.kv.admission",
+        gate = "operation", root = %root.display(), owner_generation = owner.generation,
+        owner_caller = %owner.caller, owner_span_id = owner.span_id,
+        owner_span_name = owner.span_name, "Raft operation admission acquired");
+    state.owner = Some(owner);
     drop(state);
     waiter.finish_after_dequeue("acquired");
     metrics::gauge!("sinomo.kv.raft.operation.inflight").increment(1.0);
@@ -2411,6 +2448,39 @@ fn lock_cluster_kv_raft_operation_for_root_with_wait(
         lock,
         acquired_at,
     })
+}
+
+fn trace_busy_operation_owner(root: &Path, state: &ClusterKvRaftOperationLockState) {
+    let owner = state.owner.as_ref();
+    tracing::trace!(target: "sinomo.kv.admission",
+        gate = "operation", root = %root.display(), held = state.held,
+        queued_waiters = state.waiters.len(), owner_observed = owner.is_some(),
+        owner_generation = owner.map(|owner| owner.generation),
+        owner_caller = ?owner.map(|owner| owner.caller.to_string()),
+        owner_span_id = owner.and_then(|owner| owner.span_id),
+        owner_span_name = owner.and_then(|owner| owner.span_name),
+        owner_held_us = owner.map(|owner| owner.acquired_at.elapsed().as_micros() as u64),
+        "Raft operation admission busy");
+}
+
+/// Non-owning test observation of the actual operation gate, not the WAL gate.
+/// `None` means no live registry entry at this instant, not historical absence.
+#[cfg(any(test, feature = "test-support"))]
+pub fn cluster_kv_raft_operation_owner_for_test(
+    paths: &ClusterKvPaths,
+) -> Option<(u64, String, usize)> {
+    let lock = CLUSTER_KV_RAFT_OPERATION_LOCKS
+        .lock()
+        .ok()?
+        .get(&paths.root)?
+        .upgrade()?;
+    let state = lock.state.lock().ok()?;
+    let owner = state.owner.as_ref()?;
+    Some((
+        owner.generation,
+        owner.caller.to_string(),
+        state.waiters.len(),
+    ))
 }
 
 #[cfg(test)]
@@ -3277,12 +3347,14 @@ mod operation_lock_tests {
     }
 }
 
+#[track_caller]
 pub fn lock_cluster_kv_raft_operation_for_paths(
     paths: &ClusterKvPaths,
 ) -> Result<ClusterKvRaftOperationGuard, KvError> {
     lock_cluster_kv_raft_operation_for_root(&paths.root)
 }
 
+#[track_caller]
 pub fn lock_cluster_kv_raft_operation_for_wal_paths(
     paths: &KvWalPaths,
 ) -> Result<ClusterKvRaftOperationGuard, KvError> {
@@ -3431,8 +3503,8 @@ pub struct ClusterKvRaftCommitResult {
 }
 
 /// Incremental result of applying one committed Raft entry to the resident KV
-/// state. Its cost is proportional to the command's emitted event set, not the
-/// complete retained keyspace.
+/// state. Ordinary commits remain proportional to their emitted event set;
+/// connectivity updates also capture the shared projection for cold readers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterKvRaftCompactCommitResult {
     pub txn_response: Option<KvTxnResponse>,
@@ -3440,10 +3512,9 @@ pub struct ClusterKvRaftCompactCommitResult {
     pub committed_request: KvCommittedRequestRecord,
     pub read_state: ClusterKvRaftReadIndexState,
     pub compacted_revision: KvRevision,
-    /// Present when this operation built a periodic Raft checkpoint or changed
-    /// a critical/unknown keyspace whose shared main/shadow projection cannot
-    /// safely lag. Deferrable operational and telemetry commits keep this
-    /// `None` and remain proportional to their command delta.
+    /// Present for a periodic Raft checkpoint or a committed connectivity
+    /// update whose independent shadow/client projection cannot safely lag.
+    /// Other ordinary commits keep this `None` and remain bounded deltas.
     pub checkpoint_snapshot: Option<Arc<KvSnapshot>>,
     pub final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
     /// Process-local delivery ownership; never serialized or used as authority.
@@ -6804,14 +6875,11 @@ pub(crate) fn validate_cluster_kv_txn_compact_commit_response(
             "compact cluster KV transaction response omitted its transaction result",
         )
     })?;
-    if response.authority.term == 0
-        || response.authority.commit_index == 0
-        || txn_response.revision != response.authority.revision
-    {
-        return Err(invalid_forwarded_cluster_kv_commit(
-            "compact cluster KV transaction response carries an invalid authority proof",
-        ));
-    }
+    crate::validate_cluster_kv_txn_authority_proof(
+        &response.authority,
+        response.replayed_committed_request,
+        txn_response.revision,
+    )?;
     match response.authority.basis {
         KvAuthorityBasis::CurrentTermQuorum {
             voter_acks,
@@ -6819,8 +6887,7 @@ pub(crate) fn validate_cluster_kv_txn_compact_commit_response(
         } => {
             let voter_count = cluster_kv_raft_voter_ids(state)?.len();
             let expected_quorum = cluster_kv_raft_quorum_size(voter_count);
-            if response.replayed_committed_request
-                || response.authority.term < state.term
+            if response.authority.term < state.term
                 || required_quorum != expected_quorum
                 || voter_acks < expected_quorum
                 || voter_acks > voter_count
@@ -6830,13 +6897,7 @@ pub(crate) fn validate_cluster_kv_txn_compact_commit_response(
                 ));
             }
         }
-        KvAuthorityBasis::ExactCommittedRequest => {
-            if !response.replayed_committed_request {
-                return Err(invalid_forwarded_cluster_kv_commit(
-                    "compact exact-request proof was not marked as a replay",
-                ));
-            }
-        }
+        KvAuthorityBasis::ExactCommittedRequest => {}
     }
     Ok(())
 }
@@ -7795,10 +7856,12 @@ impl ClusterKvRaftStore {
         &self.paths
     }
 
+    #[track_caller]
     pub fn lock_operation(&self) -> Result<ClusterKvRaftOperationGuard, KvError> {
         lock_cluster_kv_raft_operation_for_paths(&self.paths)
     }
 
+    #[track_caller]
     fn lock_operation_with_wait(
         &self,
         wait: Duration,
@@ -8621,8 +8684,8 @@ impl ClusterKvRaftStore {
 
     /// Applies follower AppendEntries without converting the resident KV store
     /// into a full snapshot. A full value is carried only when the leader
-    /// supplied one for restore or this append naturally crossed the periodic
-    /// checkpoint threshold.
+    /// supplied one for restore, periodic compaction requires one, or committed
+    /// connectivity must reach the independent shared projection.
     pub fn apply_append_entries_with_optional_snapshot_compact(
         &self,
         node_id: &NodeId,
@@ -8633,9 +8696,9 @@ impl ClusterKvRaftStore {
             .map(|(outcome, _)| outcome)
     }
 
-    // Only the legacy full-view API materializes the terminal snapshot. Capture
-    // it under the same native owner as apply, rather than reopening a later
-    // producer's view after that owner releases.
+    // Capture requested full views under the same native owner as apply,
+    // rather than reopening a later producer's view after that owner releases.
+    // Compact connectivity publication uses that same exact applied view.
     fn apply_append_entries_with_optional_snapshot_capture(
         &self,
         node_id: &NodeId,
@@ -8701,7 +8764,16 @@ impl ClusterKvRaftStore {
             node.store().events_after_revision(delta_base)?
         };
         let final_key_states = committed_final_key_states(node.store(), &committed_events)?;
-        let checkpoint_snapshot = self.compact_node_if_needed_with_checkpoint(&mut node)?;
+        let mut checkpoint_snapshot = self.compact_node_if_needed_with_checkpoint(&mut node)?;
+        if checkpoint_snapshot.is_none()
+            && committed_events
+                .iter()
+                .any(|event| crate::keyspace::is_cluster_kv_connectivity_key(&event.key))
+        {
+            // Capture this applied generation while its native owner is held.
+            // The existing post-apply writer publishes after ownership drops.
+            checkpoint_snapshot = Some(Arc::new(node.store().try_snapshot()?));
+        }
         let read_state = read_index_state_from_open_node(&node);
         let compacted_revision = node.store().compacted_revision();
         let full_snapshot = if capture_full_snapshot {
@@ -8761,8 +8833,8 @@ impl ClusterKvRaftStore {
         let outcome =
             self.apply_append_entries_with_optional_snapshot_compact(node_id, snapshot, append)?;
         // The materialized file is an observational checkpoint. A follower
-        // publishes only an installed snapshot or a periodic Raft checkpoint;
-        // ordinary committed deltas stay in the resident indexed state.
+        // publishes an installed/periodic snapshot or the captured connectivity
+        // projection; other ordinary deltas stay in the resident indexed state.
         let wrote = self.publish_compact_append_entries_apply_outcome(&outcome)?;
         Ok((outcome, wrote))
     }
@@ -9543,8 +9615,8 @@ impl ClusterKvRaftStore {
     }
 
     /// Publishes only state that was already materialized by follower apply.
-    /// Heartbeats and ordinary appends therefore perform no complete-keyspace
-    /// conversion or materialized snapshot rewrite.
+    /// Heartbeats and ordinary appends outside the connectivity exception
+    /// perform no complete-keyspace conversion or projection rewrite.
     pub fn publish_compact_append_entries_apply_outcome(
         &self,
         outcome: &RaftAppendEntriesCompactApplyOutcome,
@@ -9552,7 +9624,7 @@ impl ClusterKvRaftStore {
         let completion =
             KvObservationPublicationCompletion::new(outcome.observation_receipt.as_ref());
         let publication = (|| {
-            let wrote = if let Some(snapshot) = outcome.restored_snapshot.as_ref() {
+            let mut wrote = if let Some(snapshot) = outcome.restored_snapshot.as_ref() {
                 write_cluster_kv_authoritative_snapshot_if_changed(&self.paths, snapshot)?
             } else if let Some(snapshot) = outcome.checkpoint_snapshot.as_ref() {
                 self.paths
@@ -9561,6 +9633,21 @@ impl ClusterKvRaftStore {
             } else {
                 false
             };
+            if outcome.restored_snapshot.is_some()
+                && outcome
+                    .committed_events
+                    .iter()
+                    .any(|event| crate::keyspace::is_cluster_kv_connectivity_key(&event.key))
+                && let Some(snapshot) = outcome.checkpoint_snapshot.as_ref()
+            {
+                // A restore may be followed by a renewal in the same append.
+                // Expose that terminal view without relabelling the separately
+                // retained installed snapshot or its original applied index.
+                wrote |= self
+                    .paths
+                    .local_cache()
+                    .write_raft_snapshot_if_changed(snapshot)?;
+            }
             if outcome.committed_events.is_empty() && outcome.commit_advanced {
                 notify_cluster_kv_watchers(&self.paths);
             } else {
@@ -11244,7 +11331,14 @@ where
             if let Some(receipt) = node.observation_receipt() {
                 receipt.capture_original_current_term_requests(node, before_index, commit_index);
             }
-            let checkpoint_snapshot = store.compact_node_if_needed_with_checkpoint(node)?;
+            let mut checkpoint_snapshot = store.compact_node_if_needed_with_checkpoint(node)?;
+            if checkpoint_snapshot.is_none()
+                && events
+                    .iter()
+                    .any(|event| crate::keyspace::is_cluster_kv_connectivity_key(&event.key))
+            {
+                checkpoint_snapshot = Some(Arc::new(node.store().try_snapshot()?));
+            }
             let committed_request = node
                 .log_entry_at(index)
                 .and_then(|entry| node.store().committed_request(&entry.request_id))
@@ -11280,9 +11374,10 @@ where
                     .map(|_| result.read_state.applied_index),
             )?;
         }
-        // `checkpoint_snapshot` is populated only by the Raft compaction
-        // policy. Ordinary commits, including critical-key and lease changes,
-        // remain bounded deltas and never serialize the complete state machine.
+        // The shared projection is captured only for periodic compaction and
+        // the connectivity exception. Other commits, including critical keys
+        // and leases, retain the ordinary bounded-delta path. Publication stays
+        // on the existing post-commit side of the native ownership boundary.
         if let Some(node) = self.node.as_ref() {
             node.refresh_resident_read_view();
         }
@@ -11507,8 +11602,8 @@ pub struct RaftAppendEntriesCompactApplyOutcome {
     pub committed_events: Arc<Vec<KvEvent>>,
     pub read_state: ClusterKvRaftReadIndexState,
     pub compacted_revision: KvRevision,
-    /// Present when follower apply emitted a periodic checkpoint or when a
-    /// critical/unknown keyspace requires an immediate shared projection.
+    /// Present for a periodic checkpoint or the captured applied view after a
+    /// connectivity update. An installed snapshot keeps its separate identity.
     pub checkpoint_snapshot: Option<Arc<KvSnapshot>>,
     pub final_key_states: Arc<Vec<ClusterKvCommittedKeyState>>,
     pub commit_advanced: bool,

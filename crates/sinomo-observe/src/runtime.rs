@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{Event, Subscriber, field};
-use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::filter::{EnvFilter, dynamic_filter_fn};
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::reload;
@@ -69,6 +69,9 @@ pub struct ObserveRuntimeConfig {
     pub node_id: Option<String>,
     pub filter: String,
     pub quiet_filter_directives: Vec<String>,
+    /// Write subsequent enabled routine events to the existing formatted sinks.
+    /// Structured collection is independent and remains bounded in memory.
+    pub live_log_writing: bool,
 }
 
 impl ObserveRuntimeConfig {
@@ -96,12 +99,18 @@ impl ObserveRuntimeConfig {
             node_id,
             filter: configured_filter,
             quiet_filter_directives: observe_quiet_filter_directives_from_env(),
+            live_log_writing: std::env::var("SINOMO_OBSERVE_LIVE_LOG_WRITING")
+                .ok()
+                .is_some_and(|value| observe_env_value_is_truthy(&value)),
         }
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveControlRequest {
+    /// Opt in/out of formatted routine output without flushing buffered history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_log_writing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +136,9 @@ pub struct ObserveControlRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObserveControlResponse {
+    /// None means unsupported or no initialized runtime, never confirmed disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_log_writing: Option<bool>,
     pub active_filter: String,
     pub base_filter: String,
     pub quiet_filter_directives: Vec<String>,
@@ -355,6 +367,7 @@ struct ObserveRuntime {
     dropped_traces: Arc<AtomicU64>,
     capture: Arc<Mutex<Option<ActiveObserveCapture>>>,
     control_update: Arc<Mutex<()>>,
+    live_log_writing: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -555,12 +568,22 @@ pub fn init_observe_runtime(config: ObserveRuntimeConfig) -> Result<(), ObserveE
 /// One-shot CLI commands use this when explicitly asked for DFS performance
 /// tracing so machine-readable stdout remains valid.
 pub fn init_observe_runtime_with_stderr(config: ObserveRuntimeConfig) -> Result<(), ObserveError> {
-    init_observe_runtime_inner(config, None, true)
+    // This entry point is an explicit one-shot diagnostic text export, unlike
+    // the default main/shadow initialization. Keep JSON stdout untouched.
+    init_observe_runtime_inner(
+        ObserveRuntimeConfig {
+            live_log_writing: true,
+            ..config
+        },
+        None,
+        true,
+    )
 }
 
 /// Initialize the observe runtime with formatted trace output additionally copied to
 /// `log_file` (created/appended, ANSI disabled). Graphical processes use this: they
-/// have no supervised stdout, so without a file sink their diagnostics are lost.
+/// have no supervised stdout. Enabled warnings/errors use the file by default;
+/// routine history stays in the structured buffers unless live writing is enabled.
 pub fn init_observe_runtime_with_log_file(
     config: ObserveRuntimeConfig,
     log_file: &std::path::Path,
@@ -613,6 +636,7 @@ fn init_observe_runtime_inner(
     let traces = Arc::new(Mutex::new(VecDeque::with_capacity(trace_capacity)));
     let dropped_traces = Arc::new(AtomicU64::new(0));
     let capture = Arc::new(Mutex::new(None));
+    let live_log_writing = Arc::new(AtomicBool::new(config.live_log_writing));
     let runtime = ObserveRuntime {
         trace_capacity,
         started_at: OffsetDateTime::now_utc(),
@@ -624,6 +648,7 @@ fn init_observe_runtime_inner(
         dropped_traces: Arc::clone(&dropped_traces),
         capture: Arc::clone(&capture),
         control_update: Arc::new(Mutex::new(())),
+        live_log_writing: Arc::clone(&live_log_writing),
         config,
     };
 
@@ -635,9 +660,19 @@ fn init_observe_runtime_inner(
             .with_target(true)
             .with_ansi(false)
             .with_writer(file)
+            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing)))
     });
-    let stdout_layer = (!stderr).then(|| fmt::layer().with_target(true));
-    let stderr_layer = stderr.then(|| fmt::layer().with_target(true).with_writer(std::io::stderr));
+    let stdout_layer = (!stderr).then(|| {
+        fmt::layer()
+            .with_target(true)
+            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing)))
+    });
+    let stderr_layer = stderr.then(|| {
+        fmt::layer()
+            .with_target(true)
+            .with_writer(std::io::stderr)
+            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing)))
+    });
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(ObserveTraceLayer {
@@ -658,12 +693,39 @@ fn init_observe_runtime_inner(
         .or(Ok(()))
 }
 
+fn formatted_log_filter<S: Subscriber>(
+    live_log_writing: Arc<AtomicBool>,
+) -> impl tracing_subscriber::layer::Filter<S> {
+    // Dynamic interest is essential: a callsite disabled at startup must be
+    // checked again after live writing changes. Admit span context without
+    // formatting span lifecycle events. The global filter still applies.
+    dynamic_filter_fn(move |metadata, _| {
+        metadata.is_span()
+            || *metadata.level() <= tracing::Level::WARN
+            || live_log_writing.load(Ordering::Acquire)
+    })
+}
+
 pub fn update_observe_control(
     request: ObserveControlRequest,
 ) -> Result<ObserveControlResponse, ObserveError> {
     let runtime = OBSERVE_RUNTIME.get().ok_or_else(|| ObserveError::Runtime {
         detail: "observe runtime is not initialized".to_string(),
     })?;
+    if request.live_log_writing.is_some() && !LOG_COLLECTOR_INSTALLED.load(Ordering::Acquire) {
+        return Err(ObserveError::Runtime {
+            detail: "observe formatted sinks are not installed; live log writing is unavailable"
+                .to_string(),
+        });
+    }
+    if request.live_log_writing.is_some() && (request.capture_id.is_some() || request.clear_capture)
+    {
+        return Err(ObserveError::Runtime {
+            detail:
+                "live log writing and capture lifecycle changes must be separate control requests"
+                    .to_string(),
+        });
+    }
     if request.clear_quiet_filter_directives && request.quiet_filter_directives.is_some() {
         return Err(ObserveError::Runtime {
             detail: "observe control cannot both set and clear quiet filter directives".to_string(),
@@ -836,6 +898,11 @@ pub fn update_observe_control(
             runtime.install_filter_state(restore_filter)?;
         }
         return Err(error);
+    }
+    if let Some(enabled) = request.live_log_writing {
+        // No queue, backlog dump or deferred flush: only subsequent formatted
+        // events change. Already executing synchronous writes still drain normally.
+        runtime.live_log_writing.store(enabled, Ordering::Release);
     }
     Ok(runtime.control_snapshot(true, cleared_trace_count))
 }
@@ -1581,8 +1648,15 @@ impl ObserveRuntime {
         cleared_trace_count: usize,
     ) -> ObserveControlResponse {
         let capture_id = self.current_capture_id();
-        self.current_filter_state()
-            .to_control_response(capture_id, changed, cleared_trace_count)
+        let mut response = self.current_filter_state().to_control_response(
+            capture_id,
+            changed,
+            cleared_trace_count,
+        );
+        response.live_log_writing = LOG_COLLECTOR_INSTALLED
+            .load(Ordering::Acquire)
+            .then(|| self.live_log_writing.load(Ordering::Acquire));
+        response
     }
 
     fn current_capture_id(&self) -> Option<String> {
@@ -1618,6 +1692,7 @@ impl ObserveFilterState {
         cleared_trace_count: usize,
     ) -> ObserveControlResponse {
         ObserveControlResponse {
+            live_log_writing: None,
             active_filter: self.active_filter.clone(),
             base_filter: self.base_filter.clone(),
             quiet_filter_directives: self.quiet_filter_directives.clone(),
@@ -1646,7 +1721,8 @@ impl ObserveControlRequest {
     }
 
     fn changes_runtime_state(&self) -> bool {
-        self.changes_filter_state()
+        self.live_log_writing.is_some()
+            || self.changes_filter_state()
             || self.capture_id.is_some()
             || self.clear_capture
             || self.clear_traces
@@ -3126,6 +3202,212 @@ mod tests {
     }
 
     #[test]
+    fn dfs_routine_repair_observations_stay_in_ram_and_failures_persist() {
+        let root = sinomo_testdir::TestDir::new("observe-dfs-repair-summary");
+        let path = root.path().join("formatted.log");
+        let file = Arc::new(std::fs::File::create(&path).unwrap());
+        let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
+        let traces = Arc::new(Mutex::new(VecDeque::new()));
+        let live = Arc::new(AtomicBool::new(false));
+        let subscriber = Registry::default().with(EnvFilter::new("debug,sinomo.perf=trace"))
+            .with(ObserveTraceLayer {
+                trace_capacity: TRACE_BUFFER_LIMIT, logs: logs.clone(), traces: traces.clone(),
+                dropped_traces: Arc::new(AtomicU64::new(0)), capture: Arc::new(Mutex::new(None)),
+            }).with(fmt::layer().with_ansi(false).with_writer(file)
+                .with_filter(formatted_log_filter(live.clone())));
+        let attempt = sinomo_dfs::DfsRepairAttemptRecord {
+            intent_id: "original-unfinished-repair".into(),
+            object_id: sinomo_dfs::DfsObjectId::generate(), version: sinomo_dfs::DfsVersion::generate(),
+            content_hash: "retained-content".into(), missing_replica_node_id: sinomo_core::node::NodeId::generate(),
+            attempts: 1, in_flight: true, last_attempt_unix_nanos: 1, next_retry_unix_nanos: 0,
+            transfer_request_id: Some("original-transfer".into()), last_error: None,
+            transfer_delivery_state: None, completed_transfer_request_id: None, transfer_kind: None,
+        };
+        let report = sinomo_dfs::DfsMaintenanceTickReport {
+            namespace_jobs: Default::default(), write_intents: Default::default(), placement_reconciliation: None,
+            lifecycle_reports: Vec::new(), scheduled_repairs: Vec::new(), followup_events: Vec::new(),
+            repair_attempts_before: vec![attempt.clone()], repair_attempts_after: vec![attempt],
+            repair_budget_exhausted: false, repair_page_checkpoint: Default::default(), metadata_replication: sinomo_dfs::DfsMetadataJournalReplicationReport { outcomes: Vec::new() },
+        };
+        let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
+        assert_eq!(observations.repair_attempt_in_flight_count, 1);
+        tracing::subscriber::with_default(subscriber, || {
+            observations.emit_daemon_notice_logs();
+            observations.emit_daemon_notice_logs();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0,
+                "unchanged routine repair summaries must not append formatted disk logs");
+            let mut failed = report.clone();
+            failed.followup_events.push(sinomo_dfs::NetworkedDfsServiceEvent::RepairRetryFailed { reason: "controlled failure".into() });
+            sinomo_dfs::dfs_maintenance_tick_observations(&failed).emit_daemon_notice_logs();
+            let warning = std::fs::read_to_string(&path).unwrap();
+            assert!(warning.contains("DFS repair retry failed: controlled failure"));
+            assert!(!warning.contains("DFS repairs: scheduled="));
+            live.store(true, Ordering::Release);
+            observations.emit_daemon_notice_logs();
+            let explicit = std::fs::read_to_string(&path).unwrap();
+            assert!(explicit.contains("DFS repairs: scheduled=0, followups=0"));
+            assert!(explicit.contains("active=1, in_flight=1"));
+            live.store(false, Ordering::Release);
+            observations.emit_daemon_notice_logs();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), explicit);
+        });
+        let (records, _, _) = logs.lock().unwrap().snapshot(&crate::ObserveLogsRequest::default());
+        let routine = records.iter().filter(|r| r.message.contains("DFS repairs:") || r.message.contains("DFS repair attempts:")).collect::<Vec<_>>();
+        assert_eq!(routine.len(), 10, "all routine summaries remain observable in RAM");
+        assert!(routine.iter().all(|r| r.severity == crate::OperationalSeverity::Info));
+        assert!(records.iter().any(|r| r.message.contains("controlled failure")));
+        assert_eq!(report.repair_attempts_before, report.repair_attempts_after, "observation cannot complete or mutate retained repair work");
+    }
+
+    #[test]
+    fn routine_logs_stay_in_memory_and_live_writing_has_no_backlog() {
+        let root = sinomo_testdir::TestDir::new("observe-live-log-writing");
+        let path = root.path().join("formatted.log");
+        let file = Arc::new(std::fs::File::create(&path).unwrap());
+        let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
+        let traces = Arc::new(Mutex::new(VecDeque::new()));
+        let live = Arc::new(AtomicBool::new(false));
+        let subscriber = Registry::default()
+            .with(EnvFilter::new("trace"))
+            .with(ObserveTraceLayer {
+                trace_capacity: TRACE_BUFFER_LIMIT,
+                logs: Arc::clone(&logs),
+                traces: Arc::clone(&traces),
+                dropped_traces: Arc::new(AtomicU64::new(0)),
+                capture: Arc::new(Mutex::new(Some(ActiveObserveCapture::new(
+                    "retention-control".into(),
+                    None,
+                )))),
+            })
+            .with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file)
+                    .with_filter(formatted_log_filter(Arc::clone(&live))),
+            );
+        // Reuse the SAME callsites across switches, proving that cached interest
+        // cannot keep a routine event enabled/disabled after the mode changes.
+        fn emit_routine(phase: &str) {
+            let span = tracing::info_span!("retention-context", owner = "main-or-shadow");
+            let _entered = span.enter();
+            tracing::trace!(target: "sinomo.test.retention", phase, sequence_in_phase = 1u64, "routine trace");
+            tracing::debug!(target: "sinomo.test.retention", phase, sequence_in_phase = 2u64, "routine debug");
+            tracing::info!(target: "sinomo.test.retention", phase, sequence_in_phase = 3u64, "routine info");
+        }
+        tracing::subscriber::with_default(subscriber, || {
+            emit_routine("memory-before");
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            tracing::warn!(target: "sinomo.test.retention", operation_id = "warn-original", "persistent warning");
+            tracing::error!(target: "sinomo.test.retention", operation_id = "error-original", "persistent error");
+            let warning_text = std::fs::read_to_string(&path).unwrap();
+            assert!(warning_text.contains("persistent warning"));
+            assert!(warning_text.contains("persistent error"));
+            assert!(!warning_text.contains("routine"));
+
+            live.store(true, Ordering::Release);
+            emit_routine("live-now");
+            let live_text = std::fs::read_to_string(&path).unwrap();
+            assert!(live_text.contains("routine trace"));
+            assert!(live_text.contains("routine debug"));
+            assert!(live_text.contains("routine info"));
+            assert!(live_text.contains("live-now"));
+            assert!(!live_text.contains("memory-before"));
+
+            live.store(false, Ordering::Release);
+            emit_routine("memory-after");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), live_text);
+            // A subsequent enable also must not replay the retained backlog.
+            live.store(true, Ordering::Release);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), live_text);
+            live.store(false, Ordering::Release);
+        });
+        let (records, _, _) = logs
+            .lock()
+            .unwrap()
+            .snapshot(&crate::ObserveLogsRequest::default());
+        assert_eq!(records.len(), 11);
+        for phase in ["memory-before", "live-now", "memory-after"] {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|r| r.fields["phase"] == phase)
+                    .count(),
+                3
+            );
+        }
+        let traces = traces.lock().unwrap();
+        for phase in ["memory-before", "live-now", "memory-after"] {
+            let records = traces
+                .iter()
+                .filter(|r| r.fields["phase"] == phase)
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 3);
+            assert!(
+                records
+                    .iter()
+                    .all(|r| r.capture_id.as_deref() == Some("retention-control"))
+            );
+            assert!(records.iter().all(|r| {
+                r.spans
+                    .iter()
+                    .any(|s| s.name == "retention-context" && s.fields["owner"] == "main-or-shadow")
+            }));
+            assert!(records.windows(2).all(|r| r[0].sequence < r[1].sequence));
+        }
+    }
+
+    #[test]
+    fn live_writing_does_not_override_the_global_observe_filter() {
+        let root = sinomo_testdir::TestDir::new("observe-live-global-filter");
+        let path = root.path().join("formatted.log");
+        let logs = Arc::new(Mutex::new(crate::logs::LogBuffer::default()));
+        let traces = Arc::new(Mutex::new(VecDeque::new()));
+        let subscriber = Registry::default()
+            .with(EnvFilter::new("warn"))
+            .with(ObserveTraceLayer {
+                trace_capacity: TRACE_BUFFER_LIMIT,
+                logs: Arc::clone(&logs),
+                traces: Arc::clone(&traces),
+                dropped_traces: Arc::new(AtomicU64::new(0)),
+                capture: Arc::new(Mutex::new(None)),
+            })
+            .with(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Arc::new(std::fs::File::create(&path).unwrap()))
+                    .with_filter(formatted_log_filter(Arc::new(AtomicBool::new(true)))),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("excluded routine event");
+            tracing::warn!("included warning event");
+        });
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(!text.contains("excluded routine event"));
+        assert!(text.contains("included warning event"));
+        let (records, _, _) = logs
+            .lock()
+            .unwrap()
+            .snapshot(&crate::ObserveLogsRequest::default());
+        assert_eq!(records.len(), 1);
+        assert_eq!(traces.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_control_response_does_not_claim_live_writing_disabled() {
+        let response: ObserveControlResponse = serde_json::from_str(
+            r#"{"active_filter":"trace","base_filter":"trace","quiet_filter_directives":[],"changed":false}"#,
+        ).unwrap();
+        assert_eq!(response.live_log_writing, None);
+        let request: ObserveControlRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(request.live_log_writing, None);
+        assert!(!request.changes_runtime_state());
+        let request: ObserveControlRequest =
+            serde_json::from_str(r#"{"live_log_writing":false}"#).unwrap();
+        assert!(request.changes_runtime_state());
+        assert!(!request.changes_filter_state());
+    }
+
+    #[test]
     fn capture_expiry_restores_owned_filter_state() {
         let original = ObserveFilterState::new("warn,sinomo=info".to_string(), Vec::new());
         let capture_filter =
@@ -3136,6 +3418,7 @@ mod tests {
             trace_capacity: TRACE_BUFFER_LIMIT,
             logs: Arc::new(Mutex::new(crate::logs::LogBuffer::default())),
             config: ObserveRuntimeConfig {
+                live_log_writing: false,
                 process_role: "test".to_string(),
                 node_id: None,
                 filter: original.base_filter.clone(),
@@ -3149,6 +3432,7 @@ mod tests {
             dropped_traces: Arc::new(AtomicU64::new(0)),
             capture: Arc::new(Mutex::new(None)),
             control_update: Arc::new(Mutex::new(())),
+            live_log_writing: Arc::new(AtomicBool::new(false)),
         };
         runtime
             .install_filter_state(capture_filter.clone())

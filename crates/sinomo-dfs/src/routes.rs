@@ -11,7 +11,7 @@ use sinomo_core::network::{
 };
 use sinomo_core::node::NodeId;
 
-pub use sinomo_api::dfs::routes::DFS_RPC_CATEGORY;
+pub use sinomo_api::dfs::routes::{DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE, DFS_RPC_CATEGORY};
 pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
 pub use sinomo_api::dfs::routes::DFS_INSPECTION_ROUTE;
 pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
@@ -51,7 +51,7 @@ pub const DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE: &str =
 // non-message data-plane routes, then typed message routes. The public service
 // inventories below borrow those groups instead of maintaining copied lists.
 const DFS_CONTROL_PLANE_ROUTE_COUNT: usize = 4;
-const DFS_NON_MESSAGE_DATA_PLANE_ROUTE_COUNT: usize = 2;
+const DFS_NON_MESSAGE_DATA_PLANE_ROUTE_COUNT: usize = 3;
 pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
     DFS_INSPECTION_ROUTE,
@@ -59,6 +59,7 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE,
     DFS_DIRECT_READ_ROUTE,
+    DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE,
     DFS_DATA_READ_ROUTE,
     DFS_DATA_READ_RESPONSE_ROUTE,
     DFS_DATA_BULK_READ_ROUTE,

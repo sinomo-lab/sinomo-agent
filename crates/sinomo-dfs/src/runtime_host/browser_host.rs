@@ -50,10 +50,16 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
                     "daemon write configuration owner is unavailable".into(),
                 )
             })?;
-            authority
-                .ensure_write_configuration_ready_async()
-                .await
-                .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+            let configuration = authority.ready_write_configuration_projection_async().await
+                .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))?;
+            if let Some(configuration) = configuration {
+                super::placement_environment::refresh_live_content_owner_observations(
+                    _data_dir, &self.task_owner, &configuration, authority,
+                    tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    #[cfg(test)] None,
+                ).await;
+            }
+            Ok(())
         })
     }
     fn operation_guard(

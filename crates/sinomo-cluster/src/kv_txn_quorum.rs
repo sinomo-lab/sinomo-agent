@@ -5414,9 +5414,9 @@ mod tests {
         quorum_delay: Duration,
         object_rpc_stream_opens: usize,
         contended: Option<Arc<ContendedExactSetReadIndexHostState>>,
-        release_busy_admission_on_forward: Option<sinomo_kv::ClusterKvRaftOperationGuard>,
+        release_busy_admission_on_forward: Option<HeldNativeReadMutation>,
         busy_admission_release_delay: Duration,
-        release_busy_admission_on_snapshot_forward: Option<sinomo_kv::ClusterKvRaftOperationGuard>,
+        release_busy_admission_on_snapshot_forward: Option<HeldNativeReadMutation>,
         forwarded_point_reads: usize,
         forwarded_point_read: Option<KvAuthoritativeRead<Option<sinomo_kv::KvEntry>>>,
         forwarded_point_read_returns_busy_count: usize,
@@ -5847,6 +5847,26 @@ mod tests {
         state: ClusterBootstrapState,
         local: NodeId,
         initial_last_index: u64,
+    }
+
+    // A busy-read fixture must own the actual mutable resident, not only the
+    // operation permit: an idle current-term resident can serve ReadIndex.
+    // Field order checks the resident in before releasing operation admission.
+    struct HeldNativeReadMutation {
+        _resident: sinomo_kv::DurableRaftKvNode,
+        _operation: sinomo_kv::ClusterKvRaftOperationGuard,
+    }
+
+    fn hold_native_read_mutation(fixture: &ColdBarrierFixture) -> HeldNativeReadMutation {
+        let operation =
+            sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths())
+                .expect("hold local Raft operation admission");
+        let resident = crate::open_cluster_raft_kv_node(&fixture.paths, &fixture.local)
+            .expect("hold actual native mutable resident");
+        HeldNativeReadMutation {
+            _resident: resident,
+            _operation: operation,
+        }
     }
 
     struct CrossedFloorTopologyFixture {
@@ -7797,8 +7817,7 @@ mod tests {
         let last_index_before = commit_current_term_barrier(&fixture);
         let preparations_before =
             crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root);
-        let held = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths())
-            .expect("hold local Raft operation admission");
+        let held = hold_native_read_mutation(&fixture);
         let mut state = fixture.state.clone();
         let mut host = ExactSetReadIndexHost {
             release_busy_admission_on_forward: Some(held),
@@ -8003,8 +8022,7 @@ mod tests {
         let last_index_before = commit_current_term_barrier(&fixture);
         let preparations_before =
             crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root);
-        let held = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths())
-            .expect("hold local Raft operation admission");
+        let held = hold_native_read_mutation(&fixture);
         let mut state = fixture.state.clone();
         let mut host = ExactSetReadIndexHost {
             release_busy_admission_on_forward: Some(held),
@@ -8077,8 +8095,7 @@ mod tests {
             .expect("open follower fixture node")
             .clear_known_leader()
             .expect("make fixture a follower without a known leader");
-        let held = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths())
-            .expect("hold local Raft operation admission");
+        let held = hold_native_read_mutation(&fixture);
         let mut state = fixture.state.clone();
         let forwarded = KvAuthoritativeRead {
             value: Vec::new(),
@@ -8304,8 +8321,7 @@ mod tests {
     fn busy_local_snapshot_read_waits_for_bounded_admission_without_campaigning() {
         let fixture = cold_barrier_fixture("busy_local_snapshot_bounded_rejoin");
         let last_index = commit_current_term_barrier(&fixture);
-        let held =
-            sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths()).unwrap();
+        let held = hold_native_read_mutation(&fixture);
         let mut state = fixture.state.clone();
         let mut host = ExactSetReadIndexHost {
             release_busy_admission_on_snapshot_forward: Some(held),
@@ -8352,9 +8368,7 @@ mod tests {
         for allow_forwarding in [false, true] {
             let fixture = cold_barrier_fixture("busy_snapshot_deadline");
             commit_current_term_barrier(&fixture);
-            let _held =
-                sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths())
-                    .unwrap();
+            let _held = hold_native_read_mutation(&fixture);
             let mut state = fixture.state.clone();
             let mut host = ExactSetReadIndexHost::default();
             let mut options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
@@ -8393,8 +8407,7 @@ mod tests {
         let last_index_before = commit_current_term_barrier(&fixture);
         let preparations_before =
             crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root);
-        let held = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&fixture.paths.kv_paths())
-            .expect("hold local Raft operation admission");
+        let held = hold_native_read_mutation(&fixture);
         let mut state = fixture.state.clone();
         let mut host = ExactSetReadIndexHost {
             release_busy_admission_on_snapshot_forward: Some(held),

@@ -27,6 +27,17 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     },
     BeforeReplicaContextComparison,
     BeforeResidentBackendOpen,
+    /// Actual publisher cache-generation task boundaries; observers supply no owner.
+    PublishGenerationAdmissionRequested {
+        owner: &'static str,
+        caller_task: Option<tokio::task::Id>,
+    },
+    PublishGenerationWorkerStarted {
+        owner: &'static str,
+        caller_task: Option<tokio::task::Id>,
+        global_admission: bool,
+        data_owner_token: usize,
+    },
     /// Whether the captured actual runtime admission owner has been dropped.
     ReplicaAdmissionReleased {
         released: bool,

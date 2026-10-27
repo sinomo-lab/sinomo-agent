@@ -765,8 +765,20 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
         )
         .unwrap();
     super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &accepted);
+    // Keep the fixture's writer-local predecessor under the actual managed rule.
+    let mut write_options = sifs_cluster_write_options(&cluster.writer_node);
+    write_options.policy = cluster
+        .writer
+        .managed_write_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    assert_eq!(write_options.policy.min_commit_replicas, 1);
+    assert_eq!(write_options.policy.desired_replicas, 1);
+    assert_eq!(
+        write_options.policy.required_node_ids,
+        vec![cluster.writer_node.clone()]
+    );
 
-    sifs_cluster_routed_posix_write(&mut cluster, path, &bytes);
+    sifs_cluster_routed_posix_write_with_options(&mut cluster, path, &bytes, write_options);
     assert_eq!(
         cluster
             .writer

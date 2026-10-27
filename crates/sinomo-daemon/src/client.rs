@@ -1241,6 +1241,50 @@ where
     .map_err(Into::into)
 }
 
+/// A watch belongs to the selected authority node's Main process, not to one
+/// advertised address. Reuse the ordinary node-addressed carrier so segmented
+/// peers can reach that SAME owner through authenticated relay routes.
+async fn send_cluster_kv_watch_value_to_node_async<Req, Resp>(
+    paths: &sinomo_core::network::ClusterPaths,
+    target: &NodeId,
+    route: &str,
+    value: &Req,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned + Send + 'static,
+{
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Network {
+        address: target.to_string(),
+        detail: "cluster watch paths have no data directory parent".to_string(),
+    })?;
+    let main_paths = DaemonPaths::new(&sinomo_core::local::SinomoDataDir::new(data_dir));
+    let call = ObjectRpcCall::encode_borrowed_value(
+        route,
+        sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+        value,
+    )?;
+    send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
+        &main_paths,
+        target,
+        call,
+        sinomo_core::network::ClusterObjectRpcOptions::new(
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        )
+        .with_destination_process_affinity(
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+        ),
+        runtime,
+        true,
+    )
+    .await?
+    .decode_body()
+    .await
+    .map_err(Into::into)
+}
+
 pub fn send_daemon_rpc_shared_value<Req, Resp>(
     address: &str,
     route: &str,
@@ -1915,6 +1959,27 @@ pub async fn fetch_cluster_kv_local_entry_from_endpoint_async(
     validate_cluster_kv_local_entry(key, read)
 }
 
+pub async fn fetch_cluster_kv_local_entry_from_node_async(
+    paths: &sinomo_core::network::ClusterPaths,
+    target: &NodeId,
+    key: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvLocalRead<Option<KvEntry>>, DaemonError> {
+    let read = send_cluster_kv_watch_value_to_node_async(
+        paths,
+        target,
+        sinomo_core::kv::CLUSTER_KV_LOCAL_ENTRY_ROUTE,
+        &sinomo_core::kv::ClusterKvEntryRequest {
+            key: key.to_string(),
+        },
+        timeout,
+        runtime,
+    )
+    .await?;
+    validate_cluster_kv_local_entry(key, read)
+}
+
 pub fn fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     prefix: &str,
@@ -2005,6 +2070,28 @@ pub async fn start_cluster_kv_authoritative_watch_from_endpoint_async(
     Ok(read)
 }
 
+pub async fn start_cluster_kv_authoritative_watch_from_node_async(
+    paths: &sinomo_core::network::ClusterPaths,
+    target: &NodeId,
+    prefix: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<KvAuthoritativeRead<ClusterKvWatchRegistration>, DaemonError> {
+    let read = send_cluster_kv_watch_value_to_node_async(
+        paths,
+        target,
+        sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_WATCH_START_ROUTE,
+        &ClusterKvAuthoritativeWatchStartRequest {
+            prefix: prefix.to_string(),
+        },
+        timeout,
+        runtime,
+    )
+    .await?;
+    sinomo_core::kv::validate_cluster_kv_authoritative_watch_start_response(&read)?;
+    Ok(read)
+}
+
 pub fn drain_cluster_kv_watch_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchDrainRequest,
@@ -2038,6 +2125,24 @@ pub async fn drain_cluster_kv_watch_from_endpoint_async(
     .await
 }
 
+pub async fn drain_cluster_kv_watch_from_node_async(
+    paths: &sinomo_core::network::ClusterPaths,
+    target: &NodeId,
+    request: &ClusterKvWatchDrainRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterKvWatchDrainResponse, DaemonError> {
+    send_cluster_kv_watch_value_to_node_async(
+        paths,
+        target,
+        sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_DRAIN_ROUTE,
+        request,
+        timeout,
+        runtime,
+    )
+    .await
+}
+
 pub fn cancel_cluster_kv_watch_from_endpoint_on_runtime(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterKvWatchCancelRequest,
@@ -2066,6 +2171,24 @@ pub async fn cancel_cluster_kv_watch_from_endpoint_async(
         sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
         request,
         sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+        runtime,
+    )
+    .await
+}
+
+pub async fn cancel_cluster_kv_watch_from_node_async(
+    paths: &sinomo_core::network::ClusterPaths,
+    target: &NodeId,
+    request: &ClusterKvWatchCancelRequest,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ClusterKvWatchCancelResponse, DaemonError> {
+    send_cluster_kv_watch_value_to_node_async(
+        paths,
+        target,
+        sinomo_core::kv::CLUSTER_KV_LOCAL_WATCH_CANCEL_ROUTE,
+        request,
+        timeout,
         runtime,
     )
     .await

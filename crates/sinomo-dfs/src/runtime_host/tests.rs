@@ -1,5 +1,6 @@
 use super::*;
 mod effect_open_configuration;
+mod publish_generation_custody;
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsMessageTransport, DfsPosixSyncKind,
@@ -1988,6 +1989,7 @@ fn caught_up_metadata_prefix_probe_waits_without_preempting_maintenance() {
                 journal_sequence: 0,
                 state_fingerprint: "blake3:prefix-probe-state".to_string(),
                 primary_handoff_id: None,
+                repair_custody: None,
             }),
             authority_probe: None,
             durable_replication: None,

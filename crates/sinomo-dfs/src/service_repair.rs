@@ -152,7 +152,6 @@ enum ManagedRepairPreparation {
 }
 
 struct PreparedManagedRepairBatch {
-    retired_intents: Vec<DfsRepairAttemptRecord>,
     error: Option<DfsError>,
     processed: BTreeSet<(String, NodeId)>,
     dispatches: Vec<(
@@ -310,11 +309,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let copies = receipts
             .iter()
             .filter(|receipt| {
-                receipt.receipt.file_system_id == version.file_system_id
-                    && receipt.receipt.object_id == version.object_id
-                    && receipt.receipt.committed_version == durability.source_version
-                    && receipt.receipt.owner_node_id == durability.coordinator_node_id
-                    && receipt.content_hash == version.content_hash
+                crate::metadata_receipt::recorded_receipt_matches_version(receipt, version)
                     && durability
                         .desired_replica_node_ids
                         .contains(&receipt.replica_node_id)
@@ -836,10 +831,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let obsolete_identities = candidates
-            .iter()
-            .map(|(job, _, pending, _)| retired_repair_identity(job, pending))
-            .collect::<Vec<_>>();
         let obsolete = candidates
             .iter()
             .map(|(_, intent, _, _)| intent.clone())
@@ -851,7 +842,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             candidates.len(),
             |service, job, config| {
                 let mut stale = Vec::new();
-                let mut retired_intents = Vec::new();
                 let mut error = None;
                 let mut recheck_current = false;
                 let mut dispatches = Vec::new();
@@ -892,7 +882,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 target.missing_replica_node_id.clone(),
                             ));
                         }
-                        retired_intents.push(retired_repair_identity(&repair, &pending));
                         stale.push(intent);
                         continue;
                     }
@@ -947,7 +936,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 service.retire_stale_placement_intents(&stale)?;
                 Ok((
                     PreparedManagedRepairBatch {
-                        retired_intents,
                         error,
                         dispatches,
                         processed,
@@ -959,12 +947,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(((mut batch, recheck_current), release)) = result {
             if let Err(error) = release {
                 batch.dispatches.clear();
-                batch.processed.retain(|(id, _)| {
-                    batch
-                        .retired_intents
-                        .iter()
-                        .any(|record| &record.intent_id == id)
-                });
+                batch.processed.clear();
                 batch.error = Some(error);
             }
             if batch.processed.is_empty() && batch.error.is_none() {
@@ -992,7 +975,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect();
         Ok(Some(ManagedRepairPreparation::Prepared(
             PreparedManagedRepairBatch {
-                retired_intents: obsolete_identities,
                 error: None,
                 dispatches: Vec::new(),
                 processed,
@@ -2092,7 +2074,6 @@ where
                 let reserved = budget.reserve(batch.target_count());
                 debug_assert_eq!(reserved, batch.target_count());
                 error = batch.error;
-                retired_intents.extend(batch.retired_intents);
                 let mut dispatches = batch.dispatches.into_iter();
                 while let Some((prepared, fanout_jobs)) = dispatches.next() {
                     for (candidate, _) in &fanout_jobs {
@@ -2124,20 +2105,11 @@ where
             // A parked or non-local target performs no effect and needs no
             // distributed placement permit. Validate only eligible retries;
             // receipts independently retain their effect-time authority check.
-            let mut retired = false;
-            let authority =
-                self.placement_intent_remains_authoritative_recording(&job.intent_id, &mut retired);
-            if retired {
-                retired_intents.push(retired_repair_identity(&job, &pending));
-            }
-            match authority {
+            match self.placement_intent_remains_authoritative(&job.intent_id) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(failed) => {
-                    if !retired {
-                        examined
-                            .remove(&(job.intent_id.clone(), job.missing_replica_node_id.clone()));
-                    }
+                    examined.remove(&(job.intent_id.clone(), job.missing_replica_node_id.clone()));
                     error = Some(failed);
                     break;
                 }
@@ -2884,6 +2856,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             false
         });
+    }
+
+    /// Losing a placement plan's execution eligibility does not settle the
+    /// committed content obligation. Keep its actual producer DATA parked in
+    /// the existing queue until authoritative replacement or completion.
+    pub(crate) fn park_committed_repairs(&mut self, intent_ids: &BTreeSet<String>) {
+        let preserved = self
+            .repair_attempt_records
+            .iter()
+            .filter(|((id, _), _)| intent_ids.contains(id))
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect::<Vec<_>>();
+        self.retire_committed_repairs(intent_ids);
+        for (key, mut record) in preserved {
+            record.next_retry_unix_nanos = u64::MAX;
+            self.repair_attempt_records.insert(key, record);
+        }
     }
 
     /// Resolve only the outgoing identities affected by this publication.
@@ -5179,10 +5168,14 @@ pub(crate) fn repair_transfer_custody_unresolved(record: &DfsRepairAttemptRecord
 
 /// Negative custody DATA only; this predicate grants no request or dispatch.
 pub(crate) fn repair_record_has_unidentified_producer(record: &DfsRepairAttemptRecord) -> bool {
-    repair_transfer_custody_unresolved(record)
-        && (record.transfer_kind.is_none()
-            || (record.transfer_request_id.is_none()
-                && record.completed_transfer_request_id.is_none()))
+    // `in_flight` also retains read-only Fetch backoff. That row still owns
+    // scheduling DATA, but typed NotSent is not an unidentified mutation.
+    // Unknown kind/delivery and PossiblyApplied remain parked without an ID.
+    record.transfer_kind.is_none()
+        || (record.transfer_request_id.is_none()
+            && record.completed_transfer_request_id.is_none()
+            && record.transfer_delivery_state
+                != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent))
 }
 
 pub(crate) fn join_transfer_delivery(
@@ -5596,5 +5589,135 @@ mod receipt_projection_tests {
         drop(retained);
         drop(background);
         runtime.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retained_receipt_publisher_tests {
+    use super::*;
+
+    #[test]
+    fn native_retained_receipts_allow_primary_publisher_distinct_from_write_coordinator() {
+        let path = "/services/retained-publisher-role.bin";
+        let (runtime, browser, config) = crate::test_support::current_native_metadata_service(
+            "native-retained-publisher-role",
+            3,
+            path,
+        )
+        .unwrap();
+        drop(browser);
+        let primary = config.primary_node_id.clone();
+        let caller = config.replica_node_ids[0].clone();
+        assert_ne!(caller, primary);
+        let mut writer = runtime.client(&caller).unwrap();
+        let stat = writer
+            .posix_write_file(
+                path,
+                b"actual routed W2 retained content",
+                crate::DfsWriteOptions {
+                    policy: crate::DfsReplicationPolicy::new(2, 2).unwrap(),
+                    replica_candidates: vec![primary.clone(), caller.clone()],
+                    wait_for_commit: true,
+                    foreground_replica_repair: true,
+                },
+            )
+            .unwrap();
+        let primary_service = runtime.metadata_primary_service(path).unwrap();
+        let original = primary_service
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        let plan = original.content_durability.as_ref().unwrap();
+        assert_eq!(plan.coordinator_node_id, caller);
+        assert_eq!(plan.policy.min_commit_replicas, 2);
+        assert_eq!(plan.policy.desired_replicas, 2);
+        let receipts = primary_service
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&stat.object_id, &plan.source_version)
+            .unwrap();
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|r| &r.replica_node_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        assert!(receipts.iter().all(|r| r.receipt.owner_node_id == primary));
+        drop(primary_service);
+
+        let capture_request = crate::DfsContentReferenceRequest {
+            namespace: "vendor.semantic".into(),
+            path: path.into(),
+            identity: crate::DfsRevisionReference {
+                file_system_id: stat.file_system_id.clone(),
+                object_id: stat.object_id.clone(),
+                version: stat.version.clone(),
+            },
+            operation: crate::DfsContentReferenceOperation::CaptureCurrent {
+                reference_id: "primary-publisher".into(),
+                metadata: None,
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        };
+        let capture = writer.retain_content_revision(capture_request.clone());
+        let reader = runtime.metadata_primary_service(path).unwrap();
+        let retained = reader
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained.has_retention_grant(),
+            "normal capture must publish actual retained provenance"
+        );
+        let owner = reader.recorded_retained_repair_owner(&retained);
+        eprintln!(
+            "RETAINED_RECEIPT_ROLE {}",
+            serde_json::json!({
+                "primary": primary, "coordinator": caller,
+                "object": stat.object_id, "version": stat.version,
+                "capture_operation": capture_request.operation_id,
+                "capture_result": format!("{capture:?}"),
+                "owner_result": format!("{owner:?}"),
+                "receipts": receipts,
+            })
+        );
+        if owner.is_ok() {
+            // These are invalid requested views of real recorded receipts, not
+            // supplied acknowledgements or mutations of the actual metadata.
+            let mut wrong = retained.clone();
+            wrong.content_hash = Some("blake3:wrong".into());
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong.content_durability.as_mut().unwrap().source_version = DfsVersion::generate();
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong.object_id = DfsObjectId::generate();
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong.file_system_id = DfsFileSystemId::generate();
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+            let mut wrong = retained.clone();
+            wrong
+                .content_durability
+                .as_mut()
+                .unwrap()
+                .desired_replica_node_ids = vec![primary.clone(), primary.clone()];
+            assert!(reader.recorded_retained_repair_owner(&wrong).is_err());
+        }
+        drop(reader);
+        drop(writer);
+        runtime.close().unwrap();
+        capture.expect(
+            "normal retained capture keeps actual W2 evidence across publisher/coordinator roles",
+        );
+        let owner = owner.expect("recorded actual primary receipts satisfy retained W2");
+        assert_eq!(owner.coordinator_node_id, caller);
+        assert_eq!(owner.policy.min_commit_replicas, 2);
     }
 }

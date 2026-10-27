@@ -1034,6 +1034,19 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
         )
         .unwrap();
     super::writes::finish_native_placement_fixture_apply(&cluster._runtime, &accepted);
+    // Consume the accepted managed policy, not only candidate hints. Main's
+    // shared placement view may otherwise choose another valid W1/N1 holder.
+    let mut write_options = sifs_cluster_write_options(&cluster.writer_node);
+    write_options.policy = cluster
+        .writer
+        .managed_write_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    assert_eq!(write_options.policy.min_commit_replicas, 1);
+    assert_eq!(write_options.policy.desired_replicas, 1);
+    assert_eq!(
+        write_options.policy.required_node_ids,
+        vec![cluster.writer_node.clone()]
+    );
 
     let base = (0..256 * 1024 + 17)
         .map(|index| (index % 251) as u8)
@@ -1047,7 +1060,7 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
     expected.extend_from_slice(&patch);
     let expected_hash = content_hash(&expected);
 
-    sifs_cluster_routed_posix_write(&mut cluster, path, &base);
+    sifs_cluster_routed_posix_write_with_options(&mut cluster, path, &base, write_options.clone());
 
     struct RoutedStreamingReader {
         bytes: Vec<u8>,
@@ -1078,7 +1091,7 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
     }
 
     let bulk_reads = Arc::new(AtomicUsize::new(0));
-    let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    let options = write_options;
     let write =
         sifs_cluster_writer_call_with_pump(&mut cluster, "routed reader overlay write_at", {
             let bulk_reads = Arc::clone(&bulk_reads);

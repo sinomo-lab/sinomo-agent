@@ -2623,12 +2623,83 @@ pub(super) fn assert_native_remote_manifest_fetch_deferral(name: &str, foregroun
         // Main owns the durable queue and its actual producer admission. A
         // public browser's private retry maps do not drive that queue.
         runtime.request_repair_reconciliation(&primary).unwrap();
-        runtime
-            .maintenance_tick(&primary, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
-            .unwrap()
-            .outcome
+        let completion_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        let maintenance = runtime
+            .maintenance_tick(
+                &primary,
+                completion_deadline.saturating_duration_since(Instant::now()),
+            )
             .unwrap();
+        maintenance.outcome.as_ref().unwrap();
+        let matches_original = |captured: &crate::test_runtime::CapturedFetchReply| {
+            matches!(&captured.routed.message,
+                DfsNetworkMessage::FetchBlobResponse(response)
+                if response.intent_id == intent && response.object_id == request.object_id
+                    && response.version == request.target_version)
+        };
+        let after_tick_reply_count = captured_fetch.lock().unwrap().len();
+        let after_tick_matched = captured_fetch.lock().unwrap().iter().any(&matches_original);
+        // Main hands off the original call after maintenance admission releases.
+        // One returned tick is not transport completion. Observe that SAME call
+        // within the existing budget, without issuing another maintenance turn.
+        let matched_within_budget = loop {
+            let matched = captured_fetch.lock().unwrap().iter().any(&matches_original);
+            let remaining = completion_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break false;
+            }
+            if matched {
+                break true;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        };
         let replies = captured_fetch.lock().unwrap().clone();
+        {
+            // Retain both cuts, including any reply still absent at the deadline.
+            // Diagnostic I/O cannot replace or mask the exact assertion below.
+            let diagnostic = runtime
+                .data_dir(&primary)
+                .root()
+                .join("boundary-diagnostic-post-commit-fetch.json");
+            let captured = serde_json::json!({
+                "operation_id": operation, "intent_id": intent, "request": request,
+                "primary": primary, "requester": requester,
+                "content_hash": manifest.content_hash, "bytes": manifest.size_bytes,
+                "maintenance": format!("{maintenance:#?}"),
+                "after_tick_reply_count": after_tick_reply_count,
+                "after_tick_matched_original": after_tick_matched,
+                "matched_within_original_budget": matched_within_budget,
+                "matched_original_at_final_observation": replies.iter().any(&matches_original),
+                "remaining_original_budget_ns": completion_deadline.saturating_duration_since(Instant::now()).as_nanos().to_string(),
+                "captured_reply_count": replies.len(),
+                "reply_heads": replies.iter().take(8).map(|captured| {
+                    let mut head = serde_json::json!({
+                        "rpc_request_id": captured.rpc_request_id,
+                        "source": captured.routed.source_node_id,
+                        "target": captured.routed.target_node_id,
+                    });
+                    if let DfsNetworkMessage::FetchBlobResponse(response) = &captured.routed.message {
+                        head["request_id"] = serde_json::json!(response.request_id);
+                        head["intent_id"] = serde_json::json!(response.intent_id);
+                        head["object_id"] = serde_json::json!(response.object_id);
+                        head["version"] = serde_json::json!(response.version);
+                        if let DfsFetchBlobResult::Found { content_hash, bytes } = &response.result {
+                            head["found"] = serde_json::json!({"hash":content_hash,"byte_count":bytes.len()});
+                        }
+                    }
+                    head
+                }).collect::<Vec<_>>(),
+                "reply_heads_omitted": replies.len().saturating_sub(8),
+                "rpc_omitted": runtime.observation_dropped_count(),
+                "rpc_at_final_observation": format!("{:#?}", runtime.rpc_observations()),
+                "qualification": "Actual returned tick and same original detached reply; one unchanged network budget starts before tick. No recovery lookup, additional tick, new write identity, enlarged deadline or supplied reply."
+            });
+            eprintln!(
+                "post-commit fetch diagnostic {:?}: {:?}",
+                diagnostic,
+                std::fs::write(&diagnostic, serde_json::to_vec_pretty(&captured).unwrap())
+            );
+        }
         let original = replies
             .iter()
             .find(|captured| {
@@ -2638,6 +2709,10 @@ pub(super) fn assert_native_remote_manifest_fetch_deferral(name: &str, foregroun
                 && response.version == request.target_version)
             })
             .expect("actual Main's selected post-commit Fetch reply");
+        assert!(
+            matched_within_budget,
+            "the original detached Fetch must finish within the unchanged network budget"
+        );
         assert_eq!(original.routed.source_node_id, requester);
         assert_eq!(original.routed.target_node_id, primary);
         let DfsNetworkMessage::FetchBlobResponse(response) = &original.routed.message else {
@@ -4902,6 +4977,131 @@ fn settle_real_fetch_retry(
                 && &event.target == target
                 && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
                 && event.phase == crate::test_support::DfsTestRpcPhase::Completed)
+    );
+}
+
+#[test]
+fn native_fetch_read_does_not_park_known_not_sent_repair_custody() {
+    let (runtime, owner, source, target, mut dfs, request, bytes, intent, captured) =
+        native_fetch_retry_fixture(
+            "native-fetch-is-not-replica-mutation",
+            crate::test_runtime::FetchReplyFault::Missing,
+        );
+    let pending = dfs.writes.pending_writes.get(&intent).unwrap();
+    assert!(pending.fetch_inflight_request_ids.contains_key(&source));
+    assert!(!pending.repair_inflight_request_ids.contains_key(&target));
+    let rows = dfs.durable_repair_queue_records();
+    let row = rows
+        .iter()
+        .find(|row| row.intent_id == intent && row.missing_replica_node_id == target)
+        .unwrap();
+    assert!(
+        row.in_flight,
+        "the actual Fetch keeps its existing read backoff"
+    );
+    assert!(row.transfer_request_id.is_none());
+    assert_eq!(
+        row.transfer_delivery_state,
+        Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+    );
+    // Main's maintenance boundary persists these actual exported facts before
+    // the next service turn. Without this checkpoint the custody reader sees
+    // no physical row and the test never exercises the Docker failure edge.
+    let queue = checkpoint_actual_native_custody(&runtime, &owner, &rows);
+    assert!(queue.view().unwrap().records.contains(row));
+    std::fs::write(
+        runtime
+            .data_dir(&owner)
+            .root()
+            .join("boundary-diagnostic-fetch-mutation-custody.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "intent": intent, "object": request.object_id, "version": request.target_version,
+            "source": source, "target": target, "queue": row,
+            "fetch_request": pending.fetch_inflight_request_ids.get(&source),
+            "repair_request": pending.repair_inflight_request_ids.get(&target),
+            "physical_records": queue.view().unwrap().records,
+            "physical_head_sequence": queue.view().unwrap().head_sequence,
+            "observation_omissions": runtime.observation_dropped_count(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let job = dfs
+        .coordinator()
+        .repair_jobs()
+        .iter()
+        .find(|job| job.intent_id == intent && job.missing_replica_node_id == target)
+        .unwrap()
+        .clone();
+    let readiness = dfs.restore_pending_write_for_repair_job(&job).unwrap();
+    std::fs::write(
+        runtime
+            .data_dir(&owner)
+            .root()
+            .join("boundary-diagnostic-fetch-readiness.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "intent": intent, "target": target, "readiness": format!("{readiness:?}"),
+            "physical_records": queue.view().unwrap().records,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        readiness,
+        crate::service_commit::RepairProducerCustodyReadiness::Ready,
+        "a correlated Fetch read plus exact physical NotSent repair state is not unidentified mutation custody"
+    );
+    // The queue has crossed Main's durable maintenance boundary. Withdraw
+    // this borrowed Core (and its withheld read reply), then let the real Main
+    // own the next Fetch and the mutation claim/checkpoint before dispatch.
+    // A private foreground send cannot substitute for that physical claim.
+    drop(captured);
+    drop(dfs);
+    runtime.clear_faults();
+    let deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    let mut completed = false;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        runtime
+            .maintenance_tick(
+                &owner,
+                remaining.min(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT),
+            )
+            .unwrap()
+            .outcome
+            .unwrap();
+        let primary = runtime.metadata_primary_service("/services").unwrap();
+        let receipts = primary
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&request.object_id, &request.target_version)
+            .unwrap();
+        if receipts.iter().any(|receipt| {
+            receipt.replica_node_id == target
+                && receipt.content_hash.as_deref() == Some(content_hash(&bytes).as_str())
+        }) {
+            assert_eq!(receipts.len(), 3, "the original N is unchanged");
+            let replica = runtime.client(&target).unwrap();
+            assert_eq!(
+                replica
+                    .content()
+                    .read_object_version(
+                        request.object_id.as_str(),
+                        request.target_version.as_str(),
+                    )
+                    .unwrap()
+                    .1,
+                bytes
+            );
+            completed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    runtime.close().unwrap();
+    assert!(
+        completed,
+        "Main must complete the same queued write within the unchanged sync budget"
     );
 }
 
@@ -8267,10 +8467,13 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
     let mut continue_owner = matches!(
         &observation.outcome,
         Ok(crate::DfsMaintenanceTickOutcome::Continued
-            | crate::DfsMaintenanceTickOutcome::Completed { reached_limit: true })
+            | crate::DfsMaintenanceTickOutcome::Completed {
+                reached_limit: true
+            })
     );
     let mut retained_continuations = usize::from(matches!(
-        &observation.outcome, Ok(crate::DfsMaintenanceTickOutcome::Continued)
+        &observation.outcome,
+        Ok(crate::DfsMaintenanceTickOutcome::Continued)
     ));
     let mut continuation_passes = 0;
     // The ordinary tick checkpoints custody before its detached carrier runs.
@@ -8363,12 +8566,15 @@ fn native_browser_fresh_repair_custody_reaches_n2_after_healing() {
             assert_eq!(continued.omitted_kv_event_count, 0);
             continuation_passes += 1;
             retained_continuations += usize::from(matches!(
-                &continued.outcome, Ok(crate::DfsMaintenanceTickOutcome::Continued)
+                &continued.outcome,
+                Ok(crate::DfsMaintenanceTickOutcome::Continued)
             ));
             continue_owner = matches!(
                 &continued.outcome,
                 Ok(crate::DfsMaintenanceTickOutcome::Continued
-                    | crate::DfsMaintenanceTickOutcome::Completed { reached_limit: true })
+                    | crate::DfsMaintenanceTickOutcome::Completed {
+                        reached_limit: true
+                    })
             );
         }
         std::thread::yield_now();

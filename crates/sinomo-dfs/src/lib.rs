@@ -138,6 +138,7 @@ pub use control_plane::{
     DfsPlacementUpdatePlan, build_adaptive_placement_reconciliation_job,
     build_placement_reconciliation_job,
 };
+mod live_advertisement;
 mod placement_environment;
 mod posix;
 mod posix_model;
@@ -146,7 +147,9 @@ mod posix_path;
 mod protocol;
 mod renewable_lease;
 mod repair;
+mod repair_handoff;
 mod repair_queue_store;
+pub use repair_handoff::{DfsRepairHandoffCut, DfsRepairHandoffPage};
 mod response_delivery;
 pub use response_delivery::DfsRoutedResponseDelivery;
 #[cfg(any(test, feature = "test-support"))]
@@ -796,6 +799,7 @@ pub use routes::{
     DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE,
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE,
     DFS_DATA_WRITE_RESPONSE_ROUTE, DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE,
+    DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE,
     DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
     DFS_STATUS_ROUTE, DfsMessageExecutionScope, decode_dfs_inspection_rpc_response,

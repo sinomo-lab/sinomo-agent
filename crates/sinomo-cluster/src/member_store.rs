@@ -5,6 +5,10 @@ use crate::keyspace::{
 };
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
+use crate::local_membership::{
+    daemon_tcp_endpoint_is_listener_advertisement, locally_learned_route_endpoint,
+    remove_superseded_daemon_listeners,
+};
 use sinomo_base::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterMemberRole,
     ClusterMemberState, ClusterNodeStatusRecord,
@@ -80,16 +84,52 @@ pub(crate) fn merge_cluster_state_from_peer(
 
 pub(crate) fn merge_member_record(
     local: &mut ClusterBootstrapState,
-    incoming: ClusterMemberRecord,
+    mut incoming: ClusterMemberRecord,
 ) -> bool {
     if incoming.cluster_id != local.cluster_id {
         return false;
     }
+    let local_process = sinomo_node::cluster_node_is_local_process(local, &incoming.node_id);
     if let Some(existing) = local
         .members
         .iter_mut()
         .find(|member| member.node_id == incoming.node_id)
     {
+        if local_process && existing.state.is_authorized() {
+            // Peer snapshots echo routing observations; they do not own this
+            // process's listener. Keep the owner's replacement even when the
+            // peer has newer membership fields (including removal). Only TCP
+            // listener observations are retained here, not stale authority or
+            // other transport metadata.
+            remove_superseded_daemon_listeners(&mut incoming.endpoints, &existing.endpoints);
+            for endpoint in existing
+                .endpoints
+                .iter()
+                .filter(|endpoint| daemon_tcp_endpoint_is_listener_advertisement(endpoint))
+            {
+                upsert_member_endpoint(&mut incoming, endpoint.clone());
+            }
+        } else if incoming.updated_at < existing.updated_at
+            && existing.state.is_authorized()
+            && existing.endpoints.iter().any(|endpoint| {
+                daemon_tcp_endpoint_is_listener_advertisement(endpoint)
+                    && !locally_learned_route_endpoint(endpoint)
+            })
+        {
+            // The newer member body replaced its managed listeners. An older
+            // peer echo may still contribute other transports or a locally
+            // useful named bridge hint, but cannot resurrect retired sockets.
+            let hints = incoming
+                .endpoints
+                .iter()
+                .filter(|endpoint| locally_learned_route_endpoint(endpoint))
+                .cloned()
+                .collect::<Vec<_>>();
+            remove_superseded_daemon_listeners(&mut incoming.endpoints, &existing.endpoints);
+            for endpoint in hints {
+                upsert_member_endpoint(&mut incoming, endpoint);
+            }
+        }
         let mut changed = false;
         if incoming.updated_at > existing.updated_at {
             *existing = incoming;

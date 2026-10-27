@@ -19,6 +19,95 @@ fn native_browser_service(
 }
 
 #[test]
+fn browser_parent_exact_hint_does_not_recreate_a_confirmed_deleted_parent() {
+    browser_parent_hint_deletion_control(false);
+}
+
+#[test]
+fn browser_parent_hint_survives_actual_backend_catchup_without_recreating_parent() {
+    browser_parent_hint_deletion_control(true);
+}
+
+fn browser_parent_hint_deletion_control(hint_before_deletion: bool) {
+    let local = node(if hint_before_deletion {
+        "browser_parent_hint_before_deletion"
+    } else {
+        "browser_parent_confirmed_tombstone"
+    });
+    let (runtime, mut browser) = native_browser_service(
+        if hint_before_deletion { "browser-parent-hint-before-deletion" }
+        else { "browser-parent-confirmed-tombstone" }, local.clone(),
+    );
+    let parent = "/services/browser-parent-confirmed-tombstone/parent";
+    let child = format!("{parent}/child");
+    browser.posix_mkdir_all(parent).unwrap();
+    let old_parent = {
+        let owner = runtime.metadata_primary_service(parent).unwrap();
+        owner.metadata_backend().unwrap()
+            .get_object_by_path(&sifs_file_system_id(), parent).unwrap().unwrap()
+    };
+    assert_eq!(old_parent.kind, DfsObjectKind::Directory);
+    if hint_before_deletion {
+        browser.add_transient_object_metadata(old_parent.clone()).unwrap();
+        assert!(!browser.transient_metadata_object_ids.contains(&old_parent.object_id),
+            "the genuinely current backend row initially needs no pagination overlay");
+    }
+    let mut remover = runtime.client(&local).unwrap();
+    remover.posix_rmdir(parent).unwrap();
+    drop(remover);
+    let deleted_parent = {
+        let owner = runtime.metadata_primary_service(parent).unwrap();
+        assert!(matches!(owner.posix_stat(parent), Err(DfsPosixError::NotFound { path }) if path == parent));
+        let backend = owner.metadata_backend().unwrap();
+        backend.get_object(&old_parent.object_id).unwrap().unwrap()
+    };
+    assert_eq!(deleted_parent.kind, DfsObjectKind::Tombstone);
+    assert_ne!(deleted_parent.version, old_parent.version);
+    assert_eq!(browser.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap(),
+        Some(deleted_parent.clone()), "actual backend catchup, not a supplied tombstone");
+    // The sole private hint is the genuinely observed old row. It grants no
+    // authority and does not recreate its ancestors or overwrite the tombstone.
+    if !hint_before_deletion {
+        browser.add_transient_object_metadata(old_parent.clone()).unwrap();
+    }
+    assert_eq!(browser.metadata().object(&old_parent.object_id), Some(&old_parent));
+    let capture = runtime.capture_served_work(&local, 32).unwrap();
+    prepare_sifs_browser_write_parent(&mut browser, &child).unwrap();
+    let reports = capture.records();
+    let implicit_creates = reports.iter().filter(|work| matches!(
+        &work.command.routed_message.message,
+        DfsNetworkMessage::NamespaceRequest(request)
+            if matches!(&request.operation, DfsNamespaceOperation::MkdirAll { path } if path == parent)
+    )).count();
+    let after = {
+        let owner = runtime.metadata_primary_service(parent).unwrap();
+        let backend = owner.metadata_backend().unwrap();
+        assert!(backend.get_object_by_path(&sifs_file_system_id(), &child).unwrap().is_none());
+        backend.get_object(&old_parent.object_id).unwrap().unwrap()
+    };
+    std::fs::write(
+        runtime.data_dir(&local).root().join("boundary-diagnostic-cached-parent-preparation.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "old_hint": old_parent, "deleted_parent": deleted_parent, "after_preparation": after,
+            "hint_before_deletion": hint_before_deletion,
+            "implicit_mkdir_all_calls": implicit_creates,
+            "actual_invocations": reports.iter().map(|work| serde_json::json!({
+                "command": work.command.routed_message,
+                "publish_metadata": work.committed_work.publish_metadata,
+                "semantic_changes": work.committed_work.semantic_changes,
+                "succeeded": work.succeeded,
+            })).collect::<Vec<_>>(),
+            "qualification": "Actual registered Main created and removed the parent. The copied old row is advisory DATA only; no fabricated receipt or supplied successful response."
+        })).unwrap(),
+    ).unwrap();
+    drop(capture);
+    drop(browser);
+    runtime.close().unwrap();
+    assert_eq!(implicit_creates, 0, "an old positive hint cannot authorize implicit recreation");
+    assert_eq!(after, deleted_parent, "preparation must preserve the actual tombstone exactly");
+}
+
+#[test]
 fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
     let local = node("browser_policy_paths");
     let (mut runtime, mut dfs) = native_browser_service(

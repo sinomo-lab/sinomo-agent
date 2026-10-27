@@ -181,6 +181,8 @@ def main():
             links = f"[pprof]({row['artifact']})"
             if row.get("flamegraph"):
                 links += f" / [flamegraph]({row['flamegraph']}) / [top]({row['top']})"
+            if row.get("presentation_status") == "deferred":
+                links += f" / [presentation deferred]({row['presentation_receipt']})"
             lines.append(f"| {row['node']} | {row['sample_count']} | {links} |")
         lines += ["", "Main/shadow endpoint deltas use kernel process counters and stable PID/start ticks. "
                   "They exclude short-lived helpers and do not replace the whole-container gate. Node network "

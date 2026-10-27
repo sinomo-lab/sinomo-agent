@@ -329,6 +329,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "file history routing path no longer identifies the requested object",
             ));
         }
+        // The immutable request keeps its original routing hint across moves.
+        // Fence the resolved object, not a retired path in another shard.
+        self.ensure_object_not_in_cross_shard_flight(&object)?;
         self.require_file_history_shard_support(&request.identity.file_system_id, &object.path)?;
         let backend = self
             .metadata_backend

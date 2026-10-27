@@ -253,6 +253,9 @@ pub fn storage_file_identity(file: &File) -> std::io::Result<(u64, u64)> {
 }
 
 impl DfsDataOwnerLock {
+    pub(crate) fn physical_data_root(&self) -> &Path {
+        &self.physical_data_root
+    }
     /// Identity of the actual retained OS owner lock, used by source-owner
     /// capabilities. It grants no filesystem or cluster authorization.
     pub fn storage_owner_file_identity(&self) -> std::io::Result<(u64, u64)> {
@@ -1920,12 +1923,35 @@ pub fn open_dfs_runtime_service_on_shard(
     open_dfs_runtime_service_for_effect(data_dir, runtime, content, Some(expected))
 }
 
+/// Open an observational client using the existing native configuration and
+/// authenticated owner transport. Metadata inspection does not acquire a
+/// writable backend, rebind a primary, bootstrap namespaces or ingest replicas.
+/// Actual recovery effects must use the ordinary mutable opener.
+pub fn open_dfs_runtime_inspection_service_with_content(
+    data_dir: &SinomoDataDir,
+    runtime: Option<&tokio::runtime::Handle>,
+    content: LocalContentStore,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
+    open_dfs_runtime_service_for_use(data_dir, runtime, content, None, true)
+}
+
 fn open_dfs_runtime_service_for_effect(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
     content: LocalContentStore,
     effect: Option<&crate::DfsMetadataShardConfig>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
+    open_dfs_runtime_service_for_use(data_dir, runtime, content, effect, false)
+}
+
+fn open_dfs_runtime_service_for_use(
+    data_dir: &SinomoDataDir,
+    runtime: Option<&tokio::runtime::Handle>,
+    content: LocalContentStore,
+    effect: Option<&crate::DfsMetadataShardConfig>,
+    read_only: bool,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
+    debug_assert!(!read_only || effect.is_none());
     let cluster_paths = ClusterPaths::new(data_dir);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let provider_runtime = runtime
@@ -1957,7 +1983,8 @@ fn open_dfs_runtime_service_for_effect(
     })
     .map_err(|error| DfsRuntimeError::Parse {
         detail: error.to_string(),
-    })?.ok_or_else(|| DfsRuntimeError::Parse {
+    })?
+    .ok_or_else(|| DfsRuntimeError::Parse {
         detail: "native DFS service has no current certified metadata topology".into(),
     })?;
     let control_plane =
@@ -1972,7 +1999,8 @@ fn open_dfs_runtime_service_for_effect(
     // returned by readiness. A later refresh cannot erase this read input;
     // actual effects still reacquire and validate their current authority.
     let members = registered_dfs_runtime_members(control_plane.as_ref())?;
-    let services = configuration.entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+    let services = configuration
+        .entries(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
         .ok_or_else(|| DfsRuntimeError::Parse {
             detail: "native DFS configuration has no complete service-offer scope".into(),
         })?;
@@ -1994,7 +2022,7 @@ fn open_dfs_runtime_service_for_effect(
     shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
     // Only a fresh ordinary shell needs local bindings here. This precedes
     // request-local writes/reads; rebuilding an active producer would lose custody.
-    let cold_local_shards = if effect.is_none() {
+    let cold_local_shards = if effect.is_none() && !read_only {
         shards
             .iter()
             .filter(|shard| shard.primary_node_id == state.local_node_id)
@@ -2006,7 +2034,18 @@ fn open_dfs_runtime_service_for_effect(
     // The client view owns no resident ingress checkout across a remote RPC.
     // Each effect still acquires its normal admission and physical writer;
     // replicas keep their actual per-shard resident ingress sessions available.
-    let metadata: Box<dyn crate::DfsMetadataBackend> = if let Some(expected) = effect {
+    let metadata: Box<dyn crate::DfsMetadataBackend> = if read_only {
+        Box::new(
+            crate::local_state::open_local_sharded_metadata_backend_for_inspection_at_node(
+                crate::default_dfs_metadata_shards_root(data_dir),
+                shards,
+                &state.local_node_id,
+            )
+            .map_err(|error| DfsRuntimeError::Parse {
+                detail: error.to_string(),
+            })?,
+        )
+    } else if let Some(expected) = effect {
         if expected.primary_node_id != state.local_node_id || !shards.contains(expected) {
             return Err(DfsRuntimeError::Parse {
                 detail: "effect opener has no exact current locally owned shard".into(),
@@ -2035,13 +2074,17 @@ fn open_dfs_runtime_service_for_effect(
             })?,
         )
     };
-    let publication_provider = crate::DfsPublicationExecutionProvider::from_runtime(
-        data_dir.root(),
-        owner,
-        daemon_dfs_mutation_scheduler(data_dir)?,
-        authority,
-        provider_runtime.clone(),
-    );
+    let publication_provider = if read_only {
+        None
+    } else {
+        Some(crate::DfsPublicationExecutionProvider::from_runtime(
+            data_dir.root(),
+            owner,
+            daemon_dfs_mutation_scheduler(data_dir)?,
+            authority,
+            provider_runtime.clone(),
+        ))
+    };
     let cancellation = host.shutting_down.clone();
     let transport = if effect.is_none() {
         data_plane::daemon_dfs_client_node_transport(
@@ -2069,13 +2112,21 @@ fn open_dfs_runtime_service_for_effect(
             data_dir,
             &state.local_node_id,
         ));
-    service
-        .publication_provider
-        .retain_runtime_provider(publication_provider);
+    if let Some(publication_provider) = publication_provider {
+        service
+            .publication_provider
+            .retain_runtime_provider(publication_provider);
+    }
     let service = service.with_boxed_control_plane(control_plane);
     let mut service = service
         .with_boxed_metadata_backend_lazy(metadata)
         .map_err(DfsRuntimeError::from)?;
+    if read_only {
+        // Keep the catalog used by outgoing POSIX reads, but never turn their
+        // responses into an implicit durable replica update.
+        service.disable_implicit_read_replica_ingest();
+        return Ok(service);
+    }
     if let Some(expected) = effect {
         // A fresh physical shard instance does not inherit another lane's
         // completed membership-handoff binding. Reuse normal mutation admission's

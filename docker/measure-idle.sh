@@ -6,6 +6,8 @@
 # orders of magnitude above that bounded burst allowance.
 #
 #   docker/measure-idle.sh [window_seconds]   (default 60)
+# Set SINOMO_GATE_OWNED_IO_ARTIFACTS to retain stable-container block I/O,
+# helper/writeback and collector-exit coverage alongside the unchanged gates.
 
 # These helpers target the dev cluster compose file regardless of the caller's
 # working directory (the root docker-compose.yml is the production node).
@@ -49,7 +51,11 @@ node_io() {
     total_r=0; total_w=0; total_rc=0; total_wc=0
     main_count=0; shadow_count=0
     main_identity=""; shadow_identity=""
-    for pid in $(pgrep -x sinomo 2>/dev/null); do
+    for comm in /proc/[0-9]*/comm; do
+      IFS= read -r name < "$comm" || continue
+      [ "$name" = sinomo ] || continue
+      directory=${comm%/comm}
+      pid=${directory##*/}
       io=/proc/$pid/io
       [ -r "$io" ] || continue
       cmd=$(tr "\000" " " </proc/$pid/cmdline 2>/dev/null) || continue
@@ -58,11 +64,25 @@ node_io() {
         *" daemon run "*) role=main; main_count=$((main_count + 1)) ;;
         *) continue ;;
       esac
-      start=$(awk "{print \$22}" /proc/$pid/stat 2>/dev/null)
-      rc=$(awk "/^rchar:/{print \$2}" "$io"); wc=$(awk "/^wchar:/{print \$2}" "$io")
-      rb=$(awk "/^read_bytes:/{print \$2}" "$io"); wb=$(awk "/^write_bytes:/{print \$2}" "$io")
-      [ -n "$start" ] && [ -n "$rc" ] && [ -n "$wc" ] \
-        && [ -n "$rb" ] && [ -n "$wb" ] || exit 1
+      IFS= read -r process_stat < /proc/$pid/stat || exit 1
+      stat_fields=${process_stat##*) }
+      set -- $stat_fields
+      [ "$#" -ge 20 ] || exit 1
+      shift 19
+      start=$1
+      rc=""; wc=""; rb=""; wb=""
+      while read -r key value extra; do
+        [ -z "$extra" ] || exit 1
+        case "$key" in
+          rchar:) [ -z "$rc" ] || exit 1; rc=$value ;;
+          wchar:) [ -z "$wc" ] || exit 1; wc=$value ;;
+          read_bytes:) [ -z "$rb" ] || exit 1; rb=$value ;;
+          write_bytes:) [ -z "$wb" ] || exit 1; wb=$value ;;
+        esac
+      done < "$io"
+      for value in "$start" "$rc" "$wc" "$rb" "$wb"; do
+        case "$value" in ""|*[!0-9]*) exit 1 ;; esac
+      done
       if [ "$role" = main ]; then
         main_identity="$pid:$start"
       else
@@ -88,14 +108,27 @@ sample_node_io() {
 
 node_net() {
   docker compose exec -T "$1" sh -c '
-    awk "NR > 2 {
-      iface=\$1
-      sub(\":\", \"\", iface)
-      if (iface != \"lo\") {
-        rx += \$2
-        tx += \$10
-      }
-    } END { printf \"%d %d\\n\", rx, tx }" /proc/net/dev
+    nr=0; rx=0; tx=0
+    while IFS= read -r line; do
+      nr=$((nr + 1))
+      [ "$nr" -gt 2 ] || continue
+      set -- $line
+      [ "$#" -eq 17 ] || exit 1
+      iface=${1%:}
+      [ "$iface" != "$1" ] || exit 1
+      shift
+      received=$1
+      shift 8
+      sent=$1
+      for value in "$received" "$sent"; do
+        case "$value" in ""|*[!0-9]*) exit 1 ;; esac
+      done
+      if [ "$iface" != lo ]; then
+        rx=$((rx + received)); tx=$((tx + sent))
+      fi
+    done < /proc/net/dev
+    [ "$nr" -gt 2 ] || exit 1
+    printf "%s %s\n" "$rx" "$tx"
   ' 2>/dev/null
 }
 
@@ -147,6 +180,18 @@ check_delta() {
   fi
   return 0
 }
+
+# Optional stable whole-container I/O coverage encloses this unchanged sampler,
+# including its endpoint collectors. The child flag prevents recursion only.
+if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ] && [ "${SINOMO_IDLE_OWNED_IO_CHILD:-0}" != "1" ]; then
+  mkdir -p "$SINOMO_GATE_OWNED_IO_ARTIFACTS"
+  owned_artifacts="$(mktemp -d "$SINOMO_GATE_OWNED_IO_ARTIFACTS/idle-XXXXXXXX")"
+  read -r -a owned_nodes <<< "$NODES"
+  exec python3 "$SINOMO_DOCKER_DIR/measure-owned-io.py" \
+    --project "$COMPOSE_PROJECT_NAME" --nodes "${owned_nodes[@]}" \
+    --window "$WINDOW" --max-read-bps "$MAX_READ_BLOCK_BPS" --legacy-idle \
+    --output "$owned_artifacts/io.json"
+fi
 
 declare -A daemon_id0 r0 w0 rc0 wc0
 declare -A rx0 tx0

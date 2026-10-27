@@ -74,9 +74,10 @@ pub use client::{
     DaemonObjectRpcAsyncHost, RemoteConfigClient, block_on_daemon_client_on_owner_runtime,
     block_on_daemon_client_on_process_runtime, block_on_daemon_client_session,
     cancel_cluster_kv_watch_from_endpoint_async, cancel_cluster_kv_watch_from_endpoint_on_runtime,
-    drain_cluster_kv_watch_from_endpoint_async, drain_cluster_kv_watch_from_endpoint_on_runtime,
+    cancel_cluster_kv_watch_from_node_async, drain_cluster_kv_watch_from_endpoint_async,
+    drain_cluster_kv_watch_from_endpoint_on_runtime, drain_cluster_kv_watch_from_node_async,
     fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime,
-    fetch_cluster_kv_local_entry_from_endpoint_async,
+    fetch_cluster_kv_local_entry_from_endpoint_async, fetch_cluster_kv_local_entry_from_node_async,
     fetch_cluster_kv_local_snapshot_from_endpoint_async, fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint, fetch_daemon_status_from_endpoint_async,
     local_session_cluster_state, local_session_data_dir, local_session_endpoint_for_address,
@@ -97,6 +98,7 @@ pub use client::{
     send_object_rpc_to_target_with_timeouts,
     start_cluster_kv_authoritative_watch_from_endpoint_async,
     start_cluster_kv_authoritative_watch_from_endpoint_on_runtime,
+    start_cluster_kv_authoritative_watch_from_node_async,
 };
 pub(crate) use client::{
     cluster_paths_from_env, fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,

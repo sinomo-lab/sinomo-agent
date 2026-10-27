@@ -1389,6 +1389,7 @@ fn analyze_object_placement(
             &resolved.policy.consistency,
             snapshot,
             pinned_node_ids,
+            time::OffsetDateTime::now_utc(),
         )?
     } else {
         explain_replicas_best_effort(&request)?
@@ -1585,19 +1586,9 @@ fn dfs_content_advertisement_is_current(
     current: &DfsNodeAdvertisement,
     desired: &DfsNodeAdvertisement,
 ) -> bool {
-    let lease_is_fresh = desired.expires_at.is_none()
-        || current.expires_at.is_some_and(|expires_at| {
-            expires_at > time::OffsetDateTime::now_utc() + time::Duration::seconds(30)
-        });
-    lease_is_fresh
-        && current.node_id == desired.node_id
-        && current.accepts_content == desired.accepts_content
-        && current.capacity_weight == desired.capacity_weight
-        && current.zone == desired.zone
-        && current.storage_health == desired.storage_health
-        && current.storage_freshness == desired.storage_freshness
-        && current.content_location_count == desired.content_location_count
-        && current.network_metering == desired.network_metering
+    // Fresh owner observations are served in memory. The canonical payload
+    // remains an honest semantic baseline even after its sample expires.
+    crate::placement_environment::advertisement_semantics_equal(current, desired)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -1668,7 +1659,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Refresh this node's compact content advertisement only when its
-    /// hysteretic semantics changed or its lease is near expiry.
+    /// hysteretic semantics changed; sample age alone does not publish.
     pub fn publish_local_content_advertisement_if_needed(
         &mut self,
         desired: DfsNodeAdvertisement,
@@ -3644,6 +3635,13 @@ fn reconciliation_placement_for_object_with_pins(
         &resolved.policy.consistency,
         job.placement_snapshot.as_ref(),
         pinned_node_ids,
+        // The accepted job and its captured telemetry define one plan. Aging
+        // those same observations during retry used to change the target set
+        // of an already committed, immutable placement intent.
+        time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(job.created_at_unix_nanos))
+            .map_err(|error| DfsError::Metadata {
+                message: format!("invalid placement job creation timestamp: {error}"),
+            })?,
     )
     .map_err(placement_reconciliation_policy_error)?;
     Ok((resolved, replication, placement))
@@ -3655,6 +3653,7 @@ fn explain_object_placement(
     consistency: &DfsObjectPolicy,
     snapshot: Option<&crate::DfsPlacementSnapshot>,
     pinned_node_ids: &[NodeId],
+    planning_time: time::OffsetDateTime,
 ) -> Result<DfsReplicaPlacementExplanation, DfsDistributedError> {
     if matches!(
         consistency,
@@ -3679,12 +3678,15 @@ fn explain_object_placement(
         });
     }
     match snapshot {
-        Some(snapshot) => explain_replicas_with_placement_snapshot(
-            request,
-            snapshot,
-            &object.current_locations,
-            pinned_node_ids,
-        ),
+        Some(snapshot) => {
+            crate::placement_environment::explain_replicas_with_placement_snapshot_at(
+                request,
+                snapshot,
+                &object.current_locations,
+                pinned_node_ids,
+                planning_time,
+            )
+        }
         None => explain_replicas(request),
     }
 }
@@ -3895,6 +3897,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.acquire_authoritative_placement_reconciliation(file_system_id, job_id, Some(path))
     }
 
+    /// sinomo:kv-configuration: Read the existing native host/process identity; this performs no KV request and grants no placement permit.
+    fn current_placement_process_identity(
+        &self,
+        job_id: &str,
+    ) -> Result<crate::DfsPlacementAuthorityProcessIdentity, DfsError> {
+        self.control_plane
+            .as_ref()
+            .and_then(|control| control.placement_authority_process_identity())
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!(
+                    "cannot acquire placement reconciliation job {job_id}: this control-plane host has no daemon placement-authority session"
+                ),
+            })
+    }
+
     /// sinomo:kv-consistency: Fence an existing placement reconciliation against concurrent policy Apply before granting its mutation permit.
     pub(crate) fn acquire_authoritative_placement_reconciliation(
         &mut self,
@@ -3923,6 +3940,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             else {
                 return Ok(None);
             };
+            let holder_process = self.current_placement_process_identity(job_id)?;
             let permit = {
                 let Some(control_plane) = self.control_plane.as_mut() else {
                     return Err(DfsError::Distributed {
@@ -3931,13 +3949,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ),
                     });
                 };
-                let holder_process = control_plane
-                    .placement_authority_process_identity()
-                    .ok_or_else(|| DfsError::Distributed {
-                        message: format!(
-                            "cannot acquire placement reconciliation job {job_id}: this control-plane host has no daemon placement-authority session"
-                        ),
-                    })?;
                 DfsControlPlaneStore::new(control_plane.as_mut())
                     .try_acquire_placement_authority_permit(
                         &job,
@@ -4087,14 +4098,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<PlacementIntentAuthority, DfsError> {
-        self.placement_intent_authority_recording(intent_id, &mut false)
-    }
-
-    fn placement_intent_authority_recording(
-        &mut self,
-        intent_id: &str,
-        retired: &mut bool,
-    ) -> Result<PlacementIntentAuthority, DfsError> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(PlacementIntentAuthority::Stale);
         };
@@ -4141,9 +4144,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut held_permit = authority.map(|(_, _, permit)| permit);
 
         let abort_result = self.retire_stale_placement_intents(std::slice::from_ref(&intent));
-        if abort_result.is_ok() && intent.state == DfsWriteIntentState::Committed {
-            *retired = true;
-        }
         let release_result = held_permit
             .as_mut()
             .map(|permit| self.release_placement_authority_permit(permit))
@@ -4157,7 +4157,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     /// Shared scalar/group stale semantics. A committed publication is never
-    /// rewritten as Aborted; only its derived execution ownership is retired.
+    /// rewritten as Aborted; its execution is withdrawn and actual producer
+    /// DATA is parked. Stale plan eligibility is not terminal repair evidence.
     /// The caller retains any exact placement permit through these transitions.
     pub(crate) fn retire_stale_placement_intents(
         &mut self,
@@ -4185,12 +4186,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.coordinator.restore_intent(aborted)?;
             self.remove_pending_write_state(&intent.intent_id);
         }
-        self.retire_committed_repairs(&committed);
+        self.park_committed_repairs(&committed);
         Ok(())
     }
 
-    /// Validate one intent while the caller owns the existing exact job permit.
-    /// Scalar checks and bounded repair batches share these payload/pin rules.
+    /// Validate an intent against the exact job/configuration cut. Eligibility
+    /// checks and permit-held effects share these payload/pin rules; this
+    /// comparison alone never grants mutation authority.
     #[tracing::instrument(target = "sinomo.perf", level = "trace",
         name = "dfs.repair.authority.validate", skip_all,
         fields(stage = "dfs.repair.authority.validate", intent_id = %intent.intent_id,
@@ -4240,30 +4242,53 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(matches)
     }
 
-    /// Fence delayed receipts and repair retries belonging to a managed
-    /// placement job. Placement intent ids already durably encode their job id
-    /// (`placement:<job-id>:...`), including across metadata-shard migration,
-    /// so this is backward-compatible with existing intent records.
+    /// Check committed repair eligibility against the existing job/config view.
+    /// This boolean lends no mutation authority: receipt/effect paths retain
+    /// their own permit. An already-released permit cannot fence later work.
+    /// Uncommitted intents keep the original permit-held retirement path.
     pub(crate) fn placement_intent_remains_authoritative(
         &mut self,
         intent_id: &str,
     ) -> Result<bool, DfsError> {
-        self.placement_intent_remains_authoritative_recording(intent_id, &mut false)
-    }
-
-    pub(crate) fn placement_intent_remains_authoritative_recording(
-        &mut self,
-        intent_id: &str,
-        retired: &mut bool,
-    ) -> Result<bool, DfsError> {
-        match self.placement_intent_authority_recording(intent_id, retired)? {
-            PlacementIntentAuthority::Ordinary => Ok(true),
-            PlacementIntentAuthority::Stale => Ok(false),
-            PlacementIntentAuthority::Managed(mut permit) => {
-                self.release_placement_authority_permit(&mut permit)?;
-                Ok(true)
-            }
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(false);
+        };
+        if intent.state != DfsWriteIntentState::Committed {
+            return match self.placement_intent_authority(intent_id)? {
+                PlacementIntentAuthority::Ordinary => Ok(true),
+                PlacementIntentAuthority::Stale => Ok(false),
+                PlacementIntentAuthority::Managed(mut permit) => {
+                    self.release_placement_authority_permit(&mut permit)?;
+                    Ok(true)
+                }
+            };
         }
+        let Some(job_id) = placement_reconciliation_job_id_from_intent_id(intent_id) else {
+            if intent_id.starts_with("placement:") {
+                return Err(DfsError::Distributed {
+                    message: format!("malformed reserved placement intent id: {intent_id}"),
+                });
+            }
+            return Ok(true);
+        };
+        let object = self.current_read_object_metadata(&intent.object_id)?;
+        let context = self.authoritative_placement_reconciliation_for_path(
+            &intent.file_system_id,
+            job_id,
+            Some(&object.path),
+        )?;
+        let eligible = if let Some((job, config, _)) = context {
+            // Retain the native host/process requirement of the permit path;
+            // a configuration reader alone cannot become a repair producer.
+            self.current_placement_process_identity(job_id)?;
+            self.managed_placement_intent_matches_job(&intent, &object, &job, &config)?
+        } else {
+            false
+        };
+        if !eligible {
+            self.retire_stale_placement_intents(std::slice::from_ref(&intent))?;
+        }
+        Ok(eligible)
     }
 
     /// Run one bounded placement-derived mutation while holding the exact v1
@@ -5165,6 +5190,104 @@ mod tests {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         }
+    }
+
+    #[test]
+    fn accepted_placement_keeps_its_snapshot_cut_after_path_evidence_expires() {
+        let accepted_at = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let candidates = vec![
+            advertisement("node-a", "east"),
+            advertisement("node-b", "east"),
+            advertisement("node-c", "east"),
+        ];
+        let config = placement_config_with_override(
+            &placement_config(node("node-a")),
+            "/services",
+            DfsPlacementScope::Subtree,
+            Some(DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap()),
+        )
+        .unwrap();
+        let object = placement_object(
+            "accepted-snapshot-cut",
+            "/services/accepted.bin",
+            DfsObjectKind::File,
+            node("node-c"),
+            vec![node("node-c")],
+            Some(4096),
+        );
+        let snapshot = crate::DfsPlacementSnapshot {
+            schema_version: crate::DFS_PLACEMENT_SNAPSHOT_SCHEMA_VERSION,
+            generation: 3,
+            primary_node_id: node("node-a"),
+            observed_at: accepted_at,
+            expires_at: accepted_at + time::Duration::minutes(5),
+            nodes: Vec::new(),
+            paths: [
+                ("node-b", crate::DfsPlacementPathState::Healthy),
+                ("node-c", crate::DfsPlacementPathState::Degraded),
+            ]
+            .into_iter()
+            .map(|(target, state)| crate::DfsPlacementPathObservation {
+                source_node_id: node("node-a"),
+                target_node_id: node(target),
+                state,
+                latency_micros: None,
+                delivered_bytes_per_second: None,
+                metering: crate::DfsNetworkMetering::Unknown,
+                observed_at: accepted_at,
+                expires_at: accepted_at + time::Duration::minutes(15),
+            })
+            .collect(),
+        };
+        let mut job = reconciliation_job("/services", DfsPlacementScope::Subtree, BTreeSet::new());
+        job.accepted_config = config.clone();
+        job.candidate_snapshot = candidates.clone();
+        job.placement_snapshot = Some(snapshot.clone());
+        job.created_at_unix_nanos = u64::try_from(accepted_at.unix_timestamp_nanos()).unwrap();
+        // A new preview still evaluates freshness now and retains the existing
+        // copy when both old path observations have expired.
+        let preview = preview_placement_with_snapshot_and_unavailable_nodes(
+            &config,
+            &object.path,
+            object.object_id.clone(),
+            object.version.clone(),
+            object.policy.clone(),
+            node("node-a"),
+            object.current_locations.clone(),
+            candidates,
+            None,
+            DfsPlacementScope::SelfOnly,
+            Some(&snapshot),
+            &[],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            preview.placement.plan.desired_replica_nodes,
+            vec![node("node-a"), node("node-c")]
+        );
+        let (_, policy, accepted) =
+            reconciliation_placement_for_object(&config, &job, &object).unwrap();
+        assert_eq!(
+            (policy.min_commit_replicas, policy.desired_replicas),
+            (1, 2)
+        );
+        assert_eq!(
+            accepted.plan.desired_replica_nodes,
+            vec![node("node-a"), node("node-b")],
+            "an accepted job must not silently choose a different immutable repair body as its captured path telemetry ages"
+        );
+        let (_, _, pinned) = reconciliation_placement_for_object_with_pins(
+            &config,
+            &job,
+            &object,
+            &[node("node-c")],
+        )
+        .unwrap();
+        assert!(
+            pinned.plan.desired_replica_nodes.contains(&node("node-c")),
+            "current pin constraints still apply"
+        );
     }
 
     fn preview_with(

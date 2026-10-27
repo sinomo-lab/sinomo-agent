@@ -23,6 +23,7 @@ sinomo-api.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
 metrics.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true

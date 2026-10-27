@@ -4329,6 +4329,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn eager_ready_typed_request_stages_in_caller_without_task_or_payload_copy() {
+        if crate::timeline::run_network_timeline_test_in_own_process(
+            "object_rpc_stream::tests::eager_ready_typed_request_stages_in_caller_without_task_or_payload_copy",
+        ) {
+            return;
+        }
         let _serial = crate::timeline::network_timeline_test_capture_guard();
         let _ = crate::timeline::stop_network_timeline_capture();
         crate::timeline::start_network_timeline_capture(128).unwrap();

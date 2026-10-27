@@ -3321,6 +3321,31 @@ impl DfsTestRuntime {
         )
         .map_err(|e| e.to_string())
     }
+    /// One ordinary client-open attempt with the caller's startup deadline and
+    /// typed Pending result intact. No admission is retained on a yielded open;
+    /// recovery callers can use their existing exact-root continuation path.
+    pub fn client_with_startup_deadline_once(
+        &self,
+        node: &NodeId,
+        deadline: tokio::time::Instant,
+    ) -> Result<NetworkedDfsService<DfsNodeTransport>, crate::runtime_host::DfsRuntimeError> {
+        use crate::runtime_host::DfsRuntimeError;
+        if self.nodes[node].reconciler.is_none() {
+            return Err(DfsRuntimeError::Parse { detail: "DFS case node is stopped".into() });
+        }
+        self.wait_startup_completion_with_budget(Some(deadline), None)
+            .map_err(|detail| DfsRuntimeError::Parse { detail })?;
+        let client = crate::runtime_host::open_dfs_runtime_service(
+            self.data_dir(node), Some(executor().handle()),
+        )?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DfsRuntimeError::Parse {
+                detail: "native client preparation completed after its original startup deadline".into(),
+            });
+        }
+        Ok(client)
+    }
+
     pub fn pause_replica_materialization(
         &self,
         node: &NodeId,
@@ -5183,12 +5208,17 @@ mod normal_native_kv_admission_tests {
         let paths = ClusterPaths::new(native.data_dir(&nodes[0]));
         let held =
             sinomo_core::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+        // An operation permit alone leaves an idle canonical resident readable.
+        // This negative control must hold the actual mutable native checkout.
+        let resident = sinomo_core::cluster::open_cluster_raft_kv_node(&paths, &nodes[0])
+            .expect("hold actual native mutable resident");
         let (release, released) = std::sync::mpsc::channel();
         let budget = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
             .kv_txn_quorum_options(true)
             .raft_append_timeout;
         let holder = std::thread::spawn(move || {
             let observed_busy = released.recv_timeout(budget);
+            drop(resident);
             drop(held);
             observed_busy.expect("the real native read must encounter the owned admission");
         });

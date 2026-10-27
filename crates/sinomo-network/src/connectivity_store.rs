@@ -56,6 +56,9 @@ static LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST: LazyLock<Mutex<HashMap<
 
 #[derive(Clone)]
 struct LocalClusterConnectivityRecordCacheEntry {
+    // Passive process observations remain local while this exact shared
+    // semantic source snapshot is unchanged. This token is never persisted.
+    memory_owner_snapshot: Option<Arc<Vec<ClusterConnectivityRecord>>>,
     records: Vec<ClusterConnectivityRecord>,
     earliest_expires_at: Option<OffsetDateTime>,
     last_used: u64,
@@ -504,9 +507,10 @@ pub fn write_local_cluster_connectivity_record_groups(
 
     let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
     let now = OffsetDateTime::now_utc();
-    let existing_records = read_persisted_live_local_cluster_connectivity_records(paths, now)?;
+    let (raw_existing_records, accepted_records) = reconciled_connectivity_mutation_base(paths, now)?;
+    let existing_records = raw_existing_records.iter().filter(|record| cluster_network_record_live(record.expires_at, now)).cloned().collect::<Vec<_>>();
     let observation_watermarks = local_cluster_connectivity_observation_watermarks(paths)?;
-    let mut merged = existing_records
+    let mut merged = accepted_records
         .iter()
         .map(|record| (cluster_connectivity_record_key(record), record.clone()))
         .collect::<BTreeMap<_, _>>();
@@ -561,11 +565,21 @@ pub fn write_local_cluster_connectivity_record_groups(
     merged_records.extend(merged.into_values());
     sort_cluster_connectivity_records(&mut merged_records);
 
-    let records_changed = existing_records != merged_records;
+    let records_changed = accepted_records != merged_records;
     let route_records_stable =
-        local_cluster_connectivity_route_records_stable(&existing_records, &merged_records);
-    let persisted_records_stable = route_records_stable
+        local_cluster_connectivity_route_records_stable(&accepted_records, &merged_records);
+    let mut persisted_records_stable = local_cluster_connectivity_route_records_stable(&existing_records, &merged_records)
         && local_cluster_connectivity_persisted_records_stable(&existing_records, &merged_records);
+    if !persisted_records_stable {
+        // This import is merge-only. Expiry in the old disk image cannot by
+        // itself authorize omission or a durable refresh of another source.
+        let mut candidate = raw_existing_records.iter().map(|record| (cluster_connectivity_record_key(record), record.clone())).collect::<BTreeMap<_,_>>();
+        for record in &merged_records { candidate.insert(cluster_connectivity_record_key(record), record.clone()); }
+        let mut candidate = candidate.into_values().collect::<Vec<_>>();
+        sort_cluster_connectivity_records(&mut candidate);
+        persisted_records_stable = local_cluster_connectivity_route_records_stable(&raw_existing_records, &candidate)
+            && local_cluster_connectivity_persisted_records_stable(&raw_existing_records, &candidate);
+    }
     if !persisted_records_stable {
         if merged_records.is_empty() {
             remove_optional_file(&paths.connectivity_local)?;
@@ -669,16 +683,32 @@ fn acquire_local_cluster_connectivity_mutation_lock(
     Ok(lock)
 }
 
-fn read_persisted_live_local_cluster_connectivity_records(
+// Called only while holding the existing cross-process mutation lock. Reload
+// the actual file first, then reuse the existing reconciliation fence before
+// borrowing accepted RAM payloads. A peer import must not roll back another
+// source's accepted renewal to the intentionally older persisted timestamp.
+fn reconciled_connectivity_mutation_base(
     paths: &ClusterPaths,
     now: OffsetDateTime,
-) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    let mut records =
-        read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
-            .unwrap_or_default();
-    records.retain(|record| cluster_network_record_live(record.expires_at, now));
-    sort_cluster_connectivity_records(&mut records);
-    Ok(records)
+) -> Result<(Vec<ClusterConnectivityRecord>, Vec<ClusterConnectivityRecord>), NetworkError> {
+    let mut persisted = read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?.unwrap_or_default();
+    sort_cluster_connectivity_records(&mut persisted);
+    reconcile_local_cluster_connectivity_cache_with_persisted_records(paths, &persisted, now)?;
+    let cached = read_local_cluster_connectivity_records_from_cache(paths, now)?.unwrap_or_default();
+    let mut accepted = persisted.iter().filter(|record| cluster_network_record_live(record.expires_at, now))
+        .map(|record| (cluster_connectivity_record_key(record), record.clone())).collect::<BTreeMap<_,_>>();
+    for live in cached {
+        // Passive shadow observations can have uncommitted semantic changes.
+        // A different source's import cannot promote those into a durable set.
+        if persisted.iter().any(|stored| cluster_connectivity_record_key(stored) == cluster_connectivity_record_key(&live)
+            && cluster_connectivity_routing_projection(stored) == cluster_connectivity_routing_projection(&live)
+            && live.observed_at >= stored.observed_at && live.expires_at >= stored.expires_at) {
+            accepted.insert(cluster_connectivity_record_key(&live), live);
+        }
+    }
+    let mut accepted = accepted.into_values().collect::<Vec<_>>();
+    sort_cluster_connectivity_records(&mut accepted);
+    Ok((persisted, accepted))
 }
 
 pub fn prune_local_cluster_connectivity_records_for_state(
@@ -769,9 +799,9 @@ pub enum LocalClusterConnectivitySourceSetCommit {
     Committed {
         records: Vec<ClusterConnectivityRecord>,
         snapshot: LocalClusterConnectivityStoreSnapshot,
-        /// Whether this commit changed the material local source projection.
-        /// Observation timestamps, latency samples, and diagnostic timestamps
-        /// alone deliberately leave this false.
+        /// Whether accepted source payload differs from the captured stored
+        /// projection. This can include a RAM-only freshness update; it is not
+        /// evidence that the source file was written.
         content_changed: bool,
     },
     Superseded {
@@ -809,6 +839,35 @@ impl PartialEq for LocalClusterConnectivityStoreSnapshot {
 
 impl Eq for LocalClusterConnectivityStoreSnapshot {}
 
+impl LocalClusterConnectivityStoreSnapshot {
+    /// Compare the decoded persisted records independently of accepted RAM
+    /// payload generations. A fenced commit changes these only when its
+    /// existing semantic writer actually changes the local source file.
+    #[doc(hidden)]
+    pub fn has_same_persisted_records(&self, other: &Self) -> bool {
+        self.persisted_records == other.persisted_records
+    }
+
+    /// Exact stored source data for publication, including expired observations.
+    /// This is not a routing/liveness view; ordinary readers still filter TTLs.
+    #[doc(hidden)]
+    pub fn persisted_records_for_source(
+        &self,
+        source_node_id: &NodeId,
+    ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+        let mut records = Vec::new();
+        for record in self
+            .persisted_records
+            .iter()
+            .filter(|record| record.source_node_id == *source_node_id)
+        {
+            crate::object::try_reserve_vec(&mut records, 1, "capture stored connectivity source")?;
+            records.push(record.clone());
+        }
+        Ok(records)
+    }
+}
+
 /// Captures the exact persisted base that a later source-set commit may
 /// replace. The read and cache reconciliation share the cross-process
 /// mutation lock with all supported writers.
@@ -835,6 +894,64 @@ pub fn capture_local_cluster_connectivity_store_snapshot(
     })
 }
 
+/// Prepare publication of a generation already owned by the local store.
+/// Reading a TTL-filtered routing view cannot author a new source omission.
+/// A genuine topology revocation still uses the existing fenced writer; a
+/// concurrent source change remains Superseded, including an explicit clear.
+#[doc(hidden)]
+pub fn prepare_local_cluster_connectivity_publication_if_snapshot(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    let actual = capture_local_cluster_connectivity_store_snapshot(paths)?;
+    let records = actual.persisted_records_for_source(source_node_id)?;
+    if &actual != expected_snapshot {
+        return Ok(LocalClusterConnectivitySourceSetCommit::Superseded {
+            records,
+            snapshot: actual,
+        });
+    }
+    let topology = LocalConnectivityTopology::from_state(state);
+    if actual
+        .persisted_records
+        .iter()
+        .all(|record| topology.record_matches_topology(record))
+    {
+        return Ok(LocalClusterConnectivitySourceSetCommit::Committed {
+            records,
+            snapshot: actual,
+            content_changed: false,
+        });
+    }
+    // Do not add a second mutation path. The existing writer rechecks the
+    // physical source fence and prunes revoked/rebound endpoints atomically.
+    match commit_local_cluster_connectivity_source_set_if_snapshot(
+        paths,
+        state,
+        source_node_id,
+        &records,
+        &actual,
+    )? {
+        LocalClusterConnectivitySourceSetCommit::Committed {
+            snapshot,
+            content_changed,
+            ..
+        } => Ok(LocalClusterConnectivitySourceSetCommit::Committed {
+            records: snapshot.persisted_records_for_source(source_node_id)?,
+            snapshot,
+            content_changed,
+        }),
+        LocalClusterConnectivitySourceSetCommit::Superseded { snapshot, .. } => {
+            Ok(LocalClusterConnectivitySourceSetCommit::Superseded {
+                records: snapshot.persisted_records_for_source(source_node_id)?,
+                snapshot,
+            })
+        }
+    }
+}
+
 /// Atomically verifies `expected_snapshot`, prunes records against `state`,
 /// and replaces the complete source-owned set.
 ///
@@ -857,6 +974,7 @@ pub fn commit_local_cluster_connectivity_source_set_if_snapshot(
         records,
         expected_snapshot,
         true,
+        true,
     )
 }
 
@@ -878,6 +996,7 @@ pub fn commit_local_cluster_connectivity_observations_if_snapshot(
         records,
         expected_snapshot,
         false,
+        true,
     )
 }
 
@@ -888,6 +1007,7 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
     records: &[ClusterConnectivityRecord],
     expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
     replace_source: bool,
+    persist_semantics: bool,
 ) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
     validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
@@ -946,6 +1066,24 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
         .iter()
         .map(|record| (cluster_connectivity_record_key(record), record))
         .collect::<BTreeMap<_, _>>();
+    // A previous bounded batch may have accepted a fresh observation without
+    // rewriting its semantically identical disk row. Keep those live values
+    // as the merge base, fenced by the raw file and this snapshot generation.
+    let memory_base_is_current = !persist_semantics && LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock()
+        .ok().and_then(|cache| cache.get(&paths.root).and_then(|entry| entry.memory_owner_snapshot.clone()))
+        .is_some_and(|baseline| baseline.as_slice() == existing_records.as_slice());
+    let live_records = read_local_cluster_connectivity_records(paths)?;
+    let mut accepted_by_key = existing_by_key.clone();
+    for record in &live_records {
+        let key = cluster_connectivity_record_key(record);
+        if (memory_base_is_current && record.source_node_id == *source_node_id)
+            || existing_by_key.get(&key).is_some_and(|stored| {
+                cluster_connectivity_stable_eq(stored, record)
+                    && local_cluster_connectivity_routing_record_stable_eq((stored, record))
+            }) {
+            accepted_by_key.insert(key, record);
+        }
+    }
     let incoming_source_keys = records
         .iter()
         .filter(|record| {
@@ -953,8 +1091,9 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
         })
         .map(cluster_connectivity_record_key)
         .collect::<BTreeSet<_>>();
-    let mut merged = existing_records
-        .iter()
+    let mut merged = accepted_by_key
+        .values()
+        .copied()
         .filter(|record| {
             topology.record_is_usable(record, now)
                 && (!replace_source
@@ -971,7 +1110,7 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
     for record in records {
         if record.source_node_id == *source_node_id && topology.record_is_usable(record, now) {
             let key = cluster_connectivity_record_key(record);
-            let retained = existing_by_key
+            let retained = accepted_by_key
                 .get(&key)
                 .copied()
                 .filter(|existing| topology.record_is_usable(existing, now))
@@ -1015,12 +1154,32 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
     let records_changed = existing_records != committed_records;
     let route_records_stable =
         local_cluster_connectivity_route_records_stable(&existing_records, &committed_records);
-    let persisted_records_stable = route_records_stable
+    let persisted_records_stable = (route_records_stable
         && local_cluster_connectivity_persisted_records_stable(
             &existing_records,
             &committed_records,
-        );
-    let persisted_records = if !persisted_records_stable {
+        ))
+        || (existing_records
+            .iter()
+            .all(|record| topology.record_matches_topology(record))
+            && local_cluster_connectivity_raw_persisted_records_stable(
+                &existing_records,
+                source_node_id,
+                records,
+                replace_source,
+            )
+            && records.iter().all(|record| {
+                existing_by_key
+                    .get(&cluster_connectivity_record_key(record))
+                    .is_some_and(|existing| {
+                        local_cluster_connectivity_routing_record_stable_eq((existing, record))
+                    })
+            }));
+    // Expiry only removes evidence from the live view. A bounded observation
+    // cannot turn an unprobed expired row into a durable source omission.
+    // Explicit source replacement, topology revocation and routing changes
+    // still cross the existing durable boundary.
+    let persisted_records = if persist_semantics && !persisted_records_stable {
         if committed_records.is_empty() {
             remove_optional_file(&paths.connectivity_local)?;
         } else {
@@ -1051,6 +1210,9 @@ fn commit_local_cluster_connectivity_records_if_snapshot_inner(
             committed_records,
             now,
         );
+    }
+    if !persist_semantics && let Some(entry) = cache.get_mut(&paths.root) {
+        entry.memory_owner_snapshot = Some(Arc::new(persisted_records.clone()));
     }
     drop(cache);
     if records_changed {
@@ -1089,6 +1251,7 @@ pub async fn commit_local_cluster_connectivity_source_set_if_snapshot_async(
         records,
         expected_snapshot,
         true,
+        true,
     )
     .await
 }
@@ -1110,8 +1273,30 @@ pub async fn commit_local_cluster_connectivity_observations_if_snapshot_async(
         records,
         expected_snapshot,
         false,
+        true,
     )
     .await
+}
+
+/// Accept this process's completed source observations without granting it
+/// publication ownership. Shared-file changes still supersede the snapshot.
+#[doc(hidden)]
+pub async fn commit_local_cluster_connectivity_observations_in_memory_if_snapshot_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
+) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
+    if source_node_id != &state.local_node_id {
+        return Err(NetworkError::ClusterConnectivitySourceMismatch {
+            expected_source_node_id: state.local_node_id.clone(), record_source_node_id: source_node_id.clone(),
+        });
+    }
+    commit_local_cluster_connectivity_records_if_snapshot_async_inner(
+        runtime, paths, state, source_node_id, records, expected_snapshot, false, false,
+    ).await
 }
 
 async fn commit_local_cluster_connectivity_records_if_snapshot_async_inner(
@@ -1122,6 +1307,7 @@ async fn commit_local_cluster_connectivity_records_if_snapshot_async_inner(
     records: &[ClusterConnectivityRecord],
     expected_snapshot: &LocalClusterConnectivityStoreSnapshot,
     replace_source: bool,
+    persist_semantics: bool,
 ) -> Result<LocalClusterConnectivitySourceSetCommit, NetworkError> {
     let paths = paths.clone();
     let state = state.clone();
@@ -1137,6 +1323,7 @@ async fn commit_local_cluster_connectivity_records_if_snapshot_async_inner(
                 &records,
                 &expected_snapshot,
                 replace_source,
+                persist_semantics,
             )
         })
         .await
@@ -1164,21 +1351,40 @@ fn reconcile_local_cluster_connectivity_cache_with_persisted_records(
                 operation: "lock local cluster connectivity cache".to_string(),
                 detail: error.to_string(),
             })?;
+    let memory_base_is_current = cache.get(&paths.root).and_then(|entry| entry.memory_owner_snapshot.as_ref())
+        .is_some_and(|baseline| baseline.as_slice() == persisted_records);
     let cached_records = cache.get_mut(&paths.root).map(|entry| {
         prune_expired_local_cluster_connectivity_cache_entry(&paths.root, entry, now);
         let mut records = entry.records.clone();
         sort_cluster_connectivity_records(&mut records);
         records
     });
-    let persisted_is_current = cached_records.as_ref().is_none_or(|cached_records| {
+    let persisted_is_current = memory_base_is_current || cached_records.as_ref().is_none_or(|cached_records| {
+        // An accepted live refresh can outlast its unchanged disk copy.
+        // Compare that key against the raw stored value, not a TTL-filtered
+        // omission. Missing/rebound/changed keys still invalidate the cache.
+        let cached_keys = cached_records
+            .iter()
+            .map(cluster_connectivity_record_key)
+            .collect::<BTreeSet<_>>();
+        let relevant_persisted = persisted_records
+            .iter()
+            .filter(|record| {
+                cluster_network_record_live(record.expires_at, now)
+                    || cached_keys.contains(&cluster_connectivity_record_key(record))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         cached_records == &live_persisted_records
             || (local_cluster_connectivity_persisted_records_stable(
-                &live_persisted_records,
+                &relevant_persisted,
                 cached_records,
             ) && local_cluster_connectivity_route_records_stable(
-                &live_persisted_records,
+                &relevant_persisted,
                 cached_records,
-            ))
+            ) && relevant_persisted.iter().zip(cached_records).all(|(stored, live)| {
+                live.observed_at >= stored.observed_at
+            }))
     });
     if persisted_is_current {
         if cached_records.is_none() && !live_persisted_records.is_empty() {
@@ -1192,7 +1398,7 @@ fn reconcile_local_cluster_connectivity_cache_with_persisted_records(
         drop(cache);
         reconcile_local_cluster_connectivity_observation_watermarks(
             paths,
-            &live_persisted_records,
+            cached_records.as_deref().unwrap_or(&live_persisted_records),
             live_persisted_records.iter(),
         )?;
         return Ok(());
@@ -1265,11 +1471,14 @@ impl LocalConnectivityTopology {
     }
 
     fn record_is_usable(&self, record: &ClusterConnectivityRecord, now: OffsetDateTime) -> bool {
+        cluster_network_record_live(record.expires_at, now) && self.record_matches_topology(record)
+    }
+
+    fn record_matches_topology(&self, record: &ClusterConnectivityRecord) -> bool {
         if self
             .cluster_id
             .as_ref()
             .is_some_and(|cluster_id| record.cluster_id != *cluster_id)
-            || !cluster_network_record_live(record.expires_at, now)
             || !self.authorized_nodes.contains(&record.source_node_id)
             || !self.authorized_nodes.contains(&record.target_node_id)
         {
@@ -1384,6 +1593,7 @@ fn store_local_cluster_connectivity_cache_entry(
     cache.insert(
         key,
         LocalClusterConnectivityRecordCacheEntry {
+            memory_owner_snapshot: None,
             earliest_expires_at: earliest_cluster_connectivity_expiry(&records),
             records,
             last_used: local_cluster_connectivity_cache_tick(),
@@ -1568,8 +1778,8 @@ fn local_cluster_connectivity_observation_advanced_since_snapshot(
 ///
 /// A stable record is retained only while it has more than the probe refresh
 /// margin left. Once expiry enters that margin, accepting the new observation
-/// renews the durable evidence and gives the ordinary publisher enough time to
-/// refresh cluster KV before the old record expires.
+/// refreshes the accepted in-memory evidence. Semantic stability is checked
+/// separately before writing; elapsed time alone does not renew durable data.
 fn local_cluster_connectivity_observation_is_stable(
     existing: &ClusterConnectivityRecord,
     observed: &ClusterConnectivityRecord,
@@ -1611,7 +1821,11 @@ fn local_cluster_connectivity_raw_persisted_records_stable(
     }
     let mut candidate = candidate.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut candidate);
+    // Retaining expired, unprobed rows must not hide genuine local routing
+    // progress. In particular, a failure-count change must survive the raw
+    // snapshot reconciliation used by publication and the next bounded probe.
     local_cluster_connectivity_persisted_records_stable(existing_records, &candidate)
+        && local_cluster_connectivity_route_records_stable(existing_records, &candidate)
 }
 
 fn local_cluster_connectivity_route_records_stable(
@@ -1693,9 +1907,9 @@ fn write_local_cluster_connectivity_records_inner(
     let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
     let now = OffsetDateTime::now_utc();
     // Always reload the shared file after acquiring the process-safe lock. The
-    // in-process route cache is intentionally allowed to lag an external
-    // daemon-control writer and therefore cannot be the base of a mutation.
-    let existing_records = read_persisted_live_local_cluster_connectivity_records(paths, now)?;
+    // cache can be retained only after reconciling that exact persisted cut.
+    let (raw_existing_records, accepted_records) = reconciled_connectivity_mutation_base(paths, now)?;
+    let existing_records = raw_existing_records.iter().filter(|record| cluster_network_record_live(record.expires_at, now)).cloned().collect::<Vec<_>>();
     let observation_watermarks = local_cluster_connectivity_observation_watermarks(paths)?;
     let replacement_keys = if replace_source_records {
         records
@@ -1721,7 +1935,7 @@ fn write_local_cluster_connectivity_records_inner(
                 .max()
         })
         .flatten();
-    let mut merged = existing_records
+    let mut merged = accepted_records
         .iter()
         .filter(|record| {
             cluster_network_record_live(record.expires_at, now)
@@ -1790,25 +2004,33 @@ fn write_local_cluster_connectivity_records_inner(
     merged_records.extend(merged.into_values());
     let mut merged = merged_records;
     sort_cluster_connectivity_records(&mut merged);
-    let records_changed = existing_records != merged;
+    let records_changed = accepted_records != merged;
     let route_records_stable =
-        local_cluster_connectivity_route_records_stable(&existing_records, &merged);
+        local_cluster_connectivity_route_records_stable(&accepted_records, &merged);
+    let persisted_route_stable = local_cluster_connectivity_route_records_stable(&existing_records, &merged);
     let mut persisted_records_stable = existing_records == merged
         || (!persist_observation_details
-            && route_records_stable
+            && persisted_route_stable
             && local_cluster_connectivity_persisted_records_stable(&existing_records, &merged));
     let explicit_source_clear = replace_source_records && records.is_empty();
     if !persisted_records_stable
         && !explicit_source_clear
         && !persist_observation_details
-        && let Some(mut raw_existing_records) =
-            read_optional_object_file::<Vec<ClusterConnectivityRecord>>(&paths.connectivity_local)?
     {
-        sort_cluster_connectivity_records(&mut raw_existing_records);
+        // Merge-only imports must compare accepted values, as the aggregate
+        // importer does. A superseded input was already rejected above; letting
+        // it shorten a raw expiry here would flush unrelated RAM renewals even
+        // though the accepted routing state did not change. Explicit owner
+        // replacements retain their original omission semantics.
+        let effective_records = if replace_source_records {
+            records
+        } else {
+            merged.as_slice()
+        };
         persisted_records_stable = local_cluster_connectivity_raw_persisted_records_stable(
             &raw_existing_records,
             source_node_id,
-            records,
+            effective_records,
             replace_source_records,
         );
     }
@@ -1948,6 +2170,85 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
         (root, paths, state, local, endpoint, now)
+    }
+
+    #[test]
+    fn publication_preparation_preserves_newer_source_and_prunes_revoked_topology() {
+        let (_root, paths, mut state, local, endpoint_a, now) =
+            connectivity_generation_fixture("publication_topology_and_source_fence");
+        let mut endpoint_b = endpoint_a.clone();
+        endpoint_b.endpoint_id = ClusterEndpointId::derived("publication-second-endpoint", b"b");
+        endpoint_b.address = "target:21354".to_string();
+        state.members[1].endpoints.push(endpoint_b.clone());
+        let a = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let b = cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_record_set(&paths, &local, &[a.clone(), b]).unwrap();
+        let old = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let fresh = cluster_connectivity_record(
+            &state,
+            &endpoint_a,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some("new actual observation".into()),
+            now + time::Duration::seconds(1),
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[fresh.clone()]).unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let superseded = prepare_local_cluster_connectivity_publication_if_snapshot(
+            &paths, &state, &local, &old,
+        )
+        .unwrap();
+        assert!(
+            matches!(superseded, LocalClusterConnectivitySourceSetCommit::Superseded { ref records, .. }
+            if records.iter().any(|r| r == &fresh)),
+            "actual newer source wins: {superseded:?}"
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            before,
+            "stale publication must not mutate the winner"
+        );
+        let current = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        state.members[1]
+            .endpoints
+            .retain(|endpoint| endpoint.endpoint_id != endpoint_b.endpoint_id);
+        let pruned = prepare_local_cluster_connectivity_publication_if_snapshot(
+            &paths, &state, &local, &current,
+        )
+        .unwrap();
+        assert!(
+            matches!(pruned, LocalClusterConnectivitySourceSetCommit::Committed { ref records, content_changed: true, .. }
+            if records == &vec![fresh.clone()]),
+            "revoked endpoint is actually pruned: {pruned:?}"
+        );
+        invalidate_local_cluster_connectivity_cache(&paths).unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local).unwrap(),
+            vec![fresh]
+        );
     }
 
     #[test]
@@ -2415,6 +2716,462 @@ mod tests {
     }
 
     #[test]
+    fn passive_source_observations_remain_in_memory_across_batches_and_external_fences() {
+        let (_root, paths, mut state, local, a, now) = connectivity_generation_fixture("passive_source_memory");
+        let mut b = a.clone(); b.endpoint_id = ClusterEndpointId::derived("passive-source-b", b"b"); b.address = "target:21354".into();
+        state.members.iter_mut().find(|m| m.node_id == b.node_id).unwrap().endpoints.push(b.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let record = |endpoint: &ClusterEndpointRecord| cluster_connectivity_record(
+            &state, endpoint, ClusterConnectivityState::Unreachable, None, 3, None, None, now, 7200,
+        );
+        for endpoint in [&a, &b] {
+            let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            let result = runtime.block_on(commit_local_cluster_connectivity_observations_in_memory_if_snapshot_async(
+                runtime.handle(), &paths, &state, &local, &[record(endpoint)], &snapshot,
+            )).unwrap();
+            assert!(matches!(result, LocalClusterConnectivitySourceSetCommit::Committed { .. }));
+            assert!(!paths.connectivity_local.exists());
+        }
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(read_local_cluster_connectivity_records(&paths).unwrap().len(), 2);
+        assert!(snapshot.persisted_records.is_empty());
+        let mut external = record(&a); external.state = ClusterConnectivityState::Healthy; external.consecutive_failures = 0;
+        external.observed_at += time::Duration::seconds(1);
+        write_object_file(&paths.connectivity_local, &vec![external.clone()]).unwrap();
+        let bytes = std::fs::read(&paths.connectivity_local).unwrap();
+        let rejected = runtime.block_on(commit_local_cluster_connectivity_observations_in_memory_if_snapshot_async(
+            runtime.handle(), &paths, &state, &local, &[record(&a)], &snapshot,
+        )).unwrap();
+        assert!(matches!(rejected, LocalClusterConnectivitySourceSetCommit::Superseded { .. }));
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), bytes);
+        assert_eq!(read_local_cluster_connectivity_records(&paths).unwrap(), vec![external]);
+    }
+
+    fn peer_import_keeps_accepted_owner_observation(aggregate: bool) {
+        for expired in [false, true] {
+            let (_root, paths, mut state, local, endpoint, now) =
+                connectivity_generation_fixture(if aggregate { "aggregate_import_owner_refresh" } else { "single_import_owner_refresh" });
+            let mut local_endpoint = endpoint.clone();
+            local_endpoint.node_id = local.clone();
+            local_endpoint.endpoint_id = ClusterEndpointId::derived("import-local-endpoint", b"local");
+            local_endpoint.address = "local:21353".into();
+            state.members.iter_mut().find(|member| member.node_id == local).unwrap().endpoints.push(local_endpoint.clone());
+            let old = cluster_connectivity_record(&state, &endpoint, ClusterConnectivityState::Healthy, Some(1), 0, None, None,
+                now - time::Duration::seconds(if expired { 1000 } else { 850 }), CLUSTER_CONNECTIVITY_TTL_SECONDS);
+            let mut peer_state = state.clone(); peer_state.local_node_id = endpoint.node_id.clone();
+            let peer = cluster_connectivity_record(&peer_state, &local_endpoint, ClusterConnectivityState::Healthy, Some(1), 0, None, None, now, CLUSTER_CONNECTIVITY_TTL_SECONDS);
+            let mut raw = vec![old.clone(), peer.clone()]; sort_cluster_connectivity_records(&mut raw);
+            write_object_file(&paths.connectivity_local, &raw).unwrap();
+            let bytes = std::fs::read(&paths.connectivity_local).unwrap();
+            let fresh = cluster_connectivity_record(&state, &endpoint, ClusterConnectivityState::Healthy, Some(2), 0, None, None, now, CLUSTER_CONNECTIVITY_TTL_SECONDS);
+            let captured = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            assert!(matches!(commit_local_cluster_connectivity_observations_if_snapshot(&paths,&state,&local,&[fresh.clone()],&captured).unwrap(), LocalClusterConnectivitySourceSetCommit::Committed { .. }));
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap(),vec![fresh.clone()]);
+            assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(),bytes);
+            let mark = crate::cluster_file_mark(&paths.connectivity_local).unwrap();
+            let generation = local_cluster_connectivity_routing_generation(&paths);
+            if aggregate {
+                write_local_cluster_connectivity_record_groups(&paths,&BTreeMap::from([(endpoint.node_id.clone(),vec![peer.clone()])])).unwrap();
+            } else {
+                write_local_cluster_connectivity_records(&paths,&endpoint.node_id,&[peer.clone()]).unwrap();
+            }
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap(),vec![fresh.clone()],
+                "peer import must not replace this owner's accepted renewal with its older persisted row (expired={expired}, aggregate={aggregate})");
+            assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(),bytes);
+            assert_eq!(crate::cluster_file_mark(&paths.connectivity_local).unwrap(),mark);
+            assert_eq!(local_cluster_connectivity_routing_generation(&paths),generation);
+            let mut external=fresh;external.state=ClusterConnectivityState::Unreachable;external.consecutive_failures=3;external.observed_at+=time::Duration::seconds(1);
+            let mut changed=vec![external.clone(),peer.clone()];sort_cluster_connectivity_records(&mut changed);write_object_file(&paths.connectivity_local,&changed).unwrap();
+            if aggregate { write_local_cluster_connectivity_record_groups(&paths,&BTreeMap::from([(endpoint.node_id.clone(),vec![peer.clone()])])).unwrap(); }
+            else { write_local_cluster_connectivity_records(&paths,&endpoint.node_id,&[peer.clone()]).unwrap(); }
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap(),vec![external]);
+            write_local_cluster_connectivity_record_set(&paths,&local,&[]).unwrap();
+            if aggregate { write_local_cluster_connectivity_record_groups(&paths,&BTreeMap::from([(endpoint.node_id.clone(),vec![peer.clone()])])).unwrap(); }
+            else { write_local_cluster_connectivity_records(&paths,&endpoint.node_id,&[peer]).unwrap(); }
+            assert!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap().is_empty(),"explicit owner clear remains effective");
+        }
+    }
+
+    #[test]
+    fn peer_import_does_not_publish_another_sources_passive_semantic_change() {
+        for aggregate in [false, true] {
+            let (_root, paths, state, local, endpoint, now) = connectivity_generation_fixture("peer_import_passive_scope");
+            let old = cluster_connectivity_record(&state, &endpoint, ClusterConnectivityState::Healthy, Some(1), 0, None, None, now, 900);
+            let mut peer = old.clone(); peer.source_node_id = endpoint.node_id.clone();
+            let mut raw = vec![old.clone(),peer.clone()];sort_cluster_connectivity_records(&mut raw);write_object_file(&paths.connectivity_local,&raw).unwrap();
+            let before=std::fs::read(&paths.connectivity_local).unwrap();
+            let mut passive=old.clone();passive.state=ClusterConnectivityState::Unreachable;passive.consecutive_failures=3;passive.observed_at+=time::Duration::seconds(1);
+            let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let snapshot=capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            runtime.block_on(commit_local_cluster_connectivity_observations_in_memory_if_snapshot_async(runtime.handle(),&paths,&state,&local,&[passive.clone()],&snapshot)).unwrap();
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap(),vec![passive]);
+            if aggregate { write_local_cluster_connectivity_record_groups(&paths,&BTreeMap::from([(endpoint.node_id.clone(),vec![peer])])).unwrap(); }
+            else { write_local_cluster_connectivity_records(&paths,&endpoint.node_id,&[peer]).unwrap(); }
+            assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(),before,"a peer import has no authority to persist another source's passive health transition");
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths,&local).unwrap(),vec![old]);
+        }
+    }
+
+    fn superseded_peer_import_keeps_renewal_in_memory(aggregate: bool) {
+        let (_root, paths, mut state, local, endpoint, now) =
+            connectivity_generation_fixture("superseded_peer_import_owner_refresh");
+        let mut local_endpoint = endpoint.clone();
+        local_endpoint.node_id = local.clone();
+        local_endpoint.endpoint_id =
+            ClusterEndpointId::derived("superseded-import-local", b"local");
+        local_endpoint.address = "local:21353".into();
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == local)
+            .unwrap()
+            .endpoints
+            .push(local_endpoint.clone());
+        let old = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now - time::Duration::seconds(1000),
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut peer_state = state.clone();
+        peer_state.local_node_id = endpoint.node_id.clone();
+        let peer = cluster_connectivity_record(
+            &peer_state,
+            &local_endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut raw = vec![old, peer.clone()];
+        sort_cluster_connectivity_records(&mut raw);
+        write_object_file(&paths.connectivity_local, &raw).unwrap();
+        let bytes = std::fs::read(&paths.connectivity_local).unwrap();
+        let fresh = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let captured = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert!(matches!(
+            commit_local_cluster_connectivity_observations_if_snapshot(
+                &paths,
+                &state,
+                &local,
+                &[fresh.clone()],
+                &captured,
+            )
+            .unwrap(),
+            LocalClusterConnectivitySourceSetCommit::Committed { .. }
+        ));
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), bytes);
+        let mark = crate::cluster_file_mark(&paths.connectivity_local).unwrap();
+        let generation = local_cluster_connectivity_routing_generation(&paths);
+        let import = |record: ClusterConnectivityRecord| {
+            if aggregate {
+                write_local_cluster_connectivity_record_groups(
+                    &paths,
+                    &BTreeMap::from([(endpoint.node_id.clone(), vec![record])]),
+                )
+                .unwrap();
+            } else {
+                write_local_cluster_connectivity_records(&paths, &endpoint.node_id, &[record])
+                    .unwrap();
+            }
+        };
+        let mut late = peer.clone();
+        late.observed_at -= time::Duration::seconds(1);
+        late.expires_at -= time::Duration::seconds(1);
+        import(late);
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            bytes,
+            "an ignored older peer response must not flush another source's RAM renewal"
+        );
+        assert_eq!(
+            crate::cluster_file_mark(&paths.connectivity_local).unwrap(),
+            mark
+        );
+        assert_eq!(
+            local_cluster_connectivity_routing_generation(&paths),
+            generation
+        );
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &local).unwrap(),
+            vec![fresh]
+        );
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &endpoint.node_id).unwrap(),
+            vec![peer.clone()]
+        );
+
+        // Actual accepted failure-budget progress must still survive snapshot
+        // reconciliation. The no-op correction must not discard that change.
+        let mut progressed = peer;
+        progressed.observed_at = OffsetDateTime::now_utc();
+        progressed.consecutive_failures = 1;
+        import(progressed.clone());
+        assert_ne!(std::fs::read(&paths.connectivity_local).unwrap(), bytes);
+        capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records_for_source(&paths, &endpoint.node_id).unwrap(),
+            vec![progressed]
+        );
+    }
+
+    #[test]
+    fn superseded_single_peer_import_does_not_flush_ram_renewal() {
+        superseded_peer_import_keeps_renewal_in_memory(false);
+    }
+
+    #[test]
+    fn superseded_aggregate_peer_import_does_not_flush_ram_renewal() {
+        superseded_peer_import_keeps_renewal_in_memory(true);
+    }
+
+    #[test]
+    fn peer_single_import_keeps_accepted_renewal_and_external_fences() {
+        peer_import_keeps_accepted_owner_observation(false);
+    }
+
+    #[test]
+    fn peer_aggregate_import_keeps_accepted_renewal_and_external_fences() {
+        peer_import_keeps_accepted_owner_observation(true);
+    }
+
+    #[test]
+    fn live_refresh_survives_persisted_expiry_without_rewriting_or_reviving_disk() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("live_refresh_persisted_expiry");
+        let expired = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(1),
+            0,
+            None,
+            None,
+            now - time::Duration::seconds(1000),
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_object_file(&paths.connectivity_local, &vec![expired.clone()]).unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let fresh = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(2),
+            0,
+            None,
+            None,
+            now,
+            CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, std::slice::from_ref(&fresh)).unwrap();
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), before);
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(snapshot.persisted_records.as_slice(), &[expired]);
+        assert_eq!(
+            read_local_cluster_connectivity_records(&paths).unwrap(),
+            vec![fresh.clone()]
+        );
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), before);
+        // A newer external observation with less remaining lifetime wins;
+        // raw-file reconciliation cannot mistake it for our old disk copy.
+        let mut external = fresh;
+        external.observed_at += time::Duration::seconds(1);
+        external.expires_at = now + time::Duration::seconds(60);
+        write_object_file(&paths.connectivity_local, &vec![external.clone()]).unwrap();
+        capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(read_local_cluster_connectivity_records(&paths).unwrap(), vec![external]);
+        // A cold process has no fresh evidence, and an external authority-owned
+        // clear must still invalidate a warm process's accepted evidence.
+        remove_optional_file(&paths.connectivity_local).unwrap();
+        capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_observation_does_not_persist_time_only_expiry_omission() {
+        let (_root, paths, mut state, local, a, now) =
+            connectivity_generation_fixture("bounded_observation_expiry_omission");
+        let mut b = a.clone();
+        b.endpoint_id = ClusterEndpointId::derived("expired-unprobed", b"b");
+        b.address = "target:21354".into();
+        state
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == b.node_id)
+            .unwrap()
+            .endpoints
+            .push(b.clone());
+        let record = |endpoint: &ClusterEndpointRecord, at| {
+            cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                None,
+                None,
+                at,
+                CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            )
+        };
+        let initial = vec![
+            record(&a, now),
+            record(&b, now - time::Duration::seconds(1000)),
+        ];
+        write_object_file(&paths.connectivity_local, &initial).unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let expected = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let observed = record(&a, now + time::Duration::seconds(1));
+        let result = commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[observed],
+            &expected,
+        )
+        .unwrap();
+        assert!(
+            matches!(result, LocalClusterConnectivitySourceSetCommit::Committed { ref records, .. }
+            if records.len() == 1 && records[0].endpoint_id == a.endpoint_id)
+        );
+        assert_eq!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            before,
+            "an unprobed record expiring is not an authority-owned omission"
+        );
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .unwrap()
+                .iter()
+                .all(|r| r.endpoint_id != b.endpoint_id),
+            "expired disk evidence is never routable"
+        );
+        state
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == b.node_id)
+            .unwrap()
+            .endpoints
+            .retain(|e| e.endpoint_id != b.endpoint_id);
+        let expected = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[],
+            &expected,
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read(&paths.connectivity_local).unwrap(),
+            before,
+            "a genuine endpoint revocation must still be durable"
+        );
+    }
+
+    #[test]
+    fn bounded_live_refreshes_preserve_each_other_and_observation_order() {
+        let (_root, paths, mut state, local, a, now) =
+            connectivity_generation_fixture("bounded_live_refreshes");
+        let mut b = a.clone();
+        b.endpoint_id = ClusterEndpointId::derived("bounded-live-b", b"b");
+        b.address = "target:21354".into();
+        state
+            .members
+            .iter_mut()
+            .find(|m| m.node_id == b.node_id)
+            .unwrap()
+            .endpoints
+            .push(b.clone());
+        let record = |endpoint: &ClusterEndpointRecord, at| {
+            cluster_connectivity_record(
+                &state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                Some(1),
+                0,
+                None,
+                None,
+                at,
+                CLUSTER_CONNECTIVITY_TTL_SECONDS,
+            )
+        };
+        write_object_file(
+            &paths.connectivity_local,
+            &vec![
+                record(&a, now - time::Duration::seconds(1000)),
+                record(&b, now - time::Duration::seconds(1000)),
+            ],
+        )
+        .unwrap();
+        let before = std::fs::read(&paths.connectivity_local).unwrap();
+        let fresh_a = record(&a, now);
+        let fresh_b = record(&b, now);
+        for observed in [&fresh_a, &fresh_b] {
+            let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            commit_local_cluster_connectivity_observations_if_snapshot(
+                &paths,
+                &state,
+                &local,
+                std::slice::from_ref(observed),
+                &snapshot,
+            )
+            .unwrap();
+        }
+        let expected = read_local_cluster_connectivity_records(&paths).unwrap();
+        assert_eq!(
+            expected.len(),
+            2,
+            "a bounded batch cannot discard an unprobed live refresh"
+        );
+        assert!(expected.contains(&fresh_a) && expected.contains(&fresh_b));
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        let older_a = record(&a, now - time::Duration::seconds(1));
+        commit_local_cluster_connectivity_observations_if_snapshot(
+            &paths,
+            &state,
+            &local,
+            &[older_a],
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            read_local_cluster_connectivity_records(&paths).unwrap(),
+            expected
+        );
+        assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), before);
+        invalidate_local_cluster_connectivity_cache(&paths).unwrap();
+        assert!(
+            read_local_cluster_connectivity_records(&paths)
+                .unwrap()
+                .is_empty(),
+            "a cold reader cannot reuse expired disk evidence as fresh"
+        );
+    }
+
+    #[test]
     fn identical_healthy_source_generation_renews_inside_expiry_margin() {
         let (_root, paths, state, local, endpoint, now) =
             connectivity_generation_fixture("connectivity_observation_expiry_refresh");
@@ -2466,7 +3223,7 @@ mod tests {
                     ..
                 } if records == std::slice::from_ref(&refreshed)
             ),
-            "expiry-driven renewal must remain a real durable generation: {outcome:?}"
+            "expiry-driven renewal must remain accepted live evidence: {outcome:?}"
         );
         assert_ne!(
             local_cluster_connectivity_content_generation(&paths),
@@ -3020,6 +3777,57 @@ mod tests {
             routing_before,
             "latency samples are path measurements, not connectivity topology generations"
         );
+    }
+
+    #[test]
+    fn daemon_command_failure_budget_survives_source_snapshot_reconciliation() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("daemon_command_failure_budget");
+        let healthy = cluster_connectivity_record(
+            &state, &endpoint, ClusterConnectivityState::Healthy, Some(1), 0,
+            Some("confirmed success".into()), None, now, CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        write_local_cluster_connectivity_records(&paths, &local, &[healthy]).unwrap();
+        for (expected_state, expected_count) in [
+            (ClusterConnectivityState::Healthy, 1),
+            (ClusterConnectivityState::Degraded, 2),
+            (ClusterConnectivityState::Unreachable, 3),
+        ] {
+            let before = std::fs::read(&paths.connectivity_local).unwrap();
+            let observed = record_daemon_owned_local_cluster_endpoint_command_connectivity(
+                &paths, &state, &endpoint, ClusterConnectivityState::Degraded, None, true,
+            ).unwrap();
+            assert_eq!(observed.state, expected_state);
+            assert_eq!(observed.consecutive_failures, expected_count);
+            // Publication and a later bounded probe capture this same raw cut.
+            // Reconciliation must not silently reopen the single-failure grace.
+            let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            assert_eq!(read_local_cluster_connectivity_records_for_source(&paths, &local).unwrap(),
+                vec![observed.clone()], "accepted failure count {expected_count} survives capture");
+            assert_eq!(snapshot.persisted_records.as_slice(), &[observed]);
+            assert_ne!(std::fs::read(&paths.connectivity_local).unwrap(), before,
+                "genuine failure-budget progression uses the existing durable owner");
+        }
+        let saturated = std::fs::read(&paths.connectivity_local).unwrap();
+        let mark = crate::cluster_file_mark(&paths.connectivity_local).unwrap();
+        for _ in 0..3 {
+            let observed = record_daemon_owned_local_cluster_endpoint_command_connectivity(
+                &paths, &state, &endpoint, ClusterConnectivityState::Degraded, None, true,
+            ).unwrap();
+            assert_eq!(observed.state, ClusterConnectivityState::Unreachable);
+            assert_eq!(observed.consecutive_failures, 3);
+            capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+            assert_eq!(std::fs::read(&paths.connectivity_local).unwrap(), saturated);
+            assert_eq!(crate::cluster_file_mark(&paths.connectivity_local).unwrap(), mark,
+                "unchanged saturated liveness does not rewrite the source file");
+        }
+        let recovered = record_daemon_owned_local_cluster_endpoint_command_connectivity(
+            &paths, &state, &endpoint, ClusterConnectivityState::Healthy, Some(1), true,
+        ).unwrap();
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.state, ClusterConnectivityState::Healthy);
+        let snapshot = capture_local_cluster_connectivity_store_snapshot(&paths).unwrap();
+        assert_eq!(snapshot.persisted_records.as_slice(), &[recovered]);
     }
 
     #[test]

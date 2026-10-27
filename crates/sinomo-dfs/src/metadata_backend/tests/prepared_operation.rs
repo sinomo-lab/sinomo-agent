@@ -2,6 +2,7 @@
 mod immutable_payload;
 mod checkpoint_cache;
 mod owned_namespace_plan;
+mod quiet_open;
 use super::*;
 use crate::DfsControlPlaneStore;
 use crate::test_support::{DfsTestRuntime, current_native_metadata_service};
@@ -1576,6 +1577,144 @@ fn metadata_only_effect_preserves_actual_recorded_data_generation_and_w() {
 }
 
 #[test]
+fn metadata_only_successor_repair_uses_recorded_content_generation() {
+    let (runtime, mut service, config) = native_case("v7-metadata-successor-repair", 3);
+    let shard = DfsMetadataShardId::new(config.shard_id.clone());
+    let original = actual_w2_object(&mut service, &config, "/services/repair-before-rename");
+    let original_version = service
+        .metadata_backend()
+        .unwrap()
+        .get_version(&original.object_id, &original.version)
+        .unwrap()
+        .unwrap();
+    let plan = original_version.content_durability.clone().unwrap();
+    let original_intent = service
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&original.object_id)
+        .unwrap()
+        .into_iter()
+        .find(|intent| {
+            intent.status == DfsWriteIntentStatus::Committed
+                && intent.target_version == original.version
+        })
+        .expect("actual committed native write");
+    let renamed = service
+        .posix_rename(&original.path, "/services/repair-after-rename")
+        .unwrap();
+    let current = service
+        .metadata_backend()
+        .unwrap()
+        .get_object(&renamed.object_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.version, original.version);
+    assert_eq!(current.content_hash, original.content_hash);
+    let version = service
+        .metadata_backend()
+        .unwrap()
+        .get_version(&current.object_id, &current.version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.content_durability, Some(plan.clone()));
+    assert_ne!(current.version, plan.source_version);
+
+    // This is the actual persistence path used by placement repair after a
+    // metadata-only rename. It creates no new byte generation or supplied ACK.
+    let mut repair = crate::intent::distributed_intent_from_record(&original_intent);
+    repair.intent_id = format!(
+        "placement:metadata-successor:{}:{}",
+        current.object_id, current.version
+    );
+    repair.base_version = Some(current.version.clone());
+    repair.target_version = current.version.clone();
+    repair.operation_id = None;
+    repair.operation_order_token = None;
+    service
+        .put_metadata_intent_and_receipts(&repair, current.content_hash.as_ref().unwrap(), &[])
+        .expect(
+            "repair of the actual metadata head retains the original data-generation W evidence",
+        );
+    let recorded = service
+        .metadata_backend()
+        .unwrap()
+        .get_intent(&current.object_id, &repair.intent_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::intent::distributed_intent_from_record(&recorded),
+        repair
+    );
+    assert_eq!(recorded.object_metadata.as_ref(), Some(&current));
+    let after = entries(&service, &shard);
+    service
+        .put_metadata_intent_and_receipts(&repair, current.content_hash.as_ref().unwrap(), &[])
+        .unwrap();
+    assert_eq!(
+        entries(&service, &shard),
+        after,
+        "exact repair replay has no new journal effect"
+    );
+
+    for wrong_target in [true, false] {
+        let mut forged = repair.clone();
+        forged.intent_id.push_str(if wrong_target {
+            ":wrong-target"
+        } else {
+            ":wrong-base"
+        });
+        if wrong_target {
+            forged.target_version = DfsVersion::generate();
+        } else {
+            forged.base_version = Some(DfsVersion::generate());
+        }
+        assert!(
+            service
+                .put_metadata_intent_and_receipts(
+                    &forged,
+                    current.content_hash.as_ref().unwrap(),
+                    &[]
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .metadata_backend()
+                .unwrap()
+                .get_intent(&current.object_id, &forged.intent_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(entries(&service, &shard), after);
+    }
+    assert_eq!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .get_version(&current.object_id, &current.version)
+            .unwrap()
+            .unwrap()
+            .content_durability,
+        Some(plan.clone())
+    );
+    assert!(
+        service
+            .metadata_backend()
+            .unwrap()
+            .receipts_for_version(&current.object_id, &plan.source_version)
+            .unwrap()
+            .len()
+            >= plan.policy.min_commit_replicas
+    );
+    assert_eq!(
+        service.posix_read_file(&current.path).unwrap(),
+        vec![0x4d; 4096]
+    );
+    drop(service);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_kernel_trace_observes_actual_hidden_prepare_and_visible_commit() {
     let (runtime, mut service, config) = native_case("v7-native-raw-trace", 3);
     let original = directory(&mut service, "/services/v7-native-trace-directory");
@@ -2015,6 +2154,78 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
     );
     drop(reopened);
     runtime.close().unwrap();
+}
+
+#[test]
+fn initial_epoch_binding_accepts_a_coherent_cut_before_an_unrelated_refresh() {
+    let (runtime, mut service, config) = native_case("initial-binding-current-cut", 1);
+    let current = directory(&mut service, "/services/initial-binding-current-cut");
+    let mut changed = current.clone();
+    changed.version = DfsVersion::generate();
+    changed.mode = 0o600;
+    let payload = namespace_payload(&config, &current, changed.clone(), "initial-binding-current-cut");
+    let execution_guard = service.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+        file_system_id: payload.file_system_id.clone(), shard_id: payload.shard_id.clone(),
+        owner_epoch: payload.owner_epoch, operation_id: payload.operation_id.clone(),
+    }).unwrap();
+    let digest = service.metadata_backend_mut().unwrap().prepare_operation(payload, None).unwrap();
+    let scope = service.metadata_backend().unwrap()
+        .publication_owner_scope(&digest.file_system_id, &digest.shard_id).unwrap();
+    let execution = service.publication_execution.current().expect("actual native effect admission");
+    let authority = crate::runtime_host::daemon_dfs_metadata_authority_generation(
+        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(&config.primary_node_id)),
+        &runtime.runtime_handle(),
+    ).unwrap();
+    let control = runtime.shared_control_plane().unwrap();
+    let update = std::sync::Arc::clone(&authority);
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let recorded = std::sync::Arc::clone(&observed);
+    let fs = config.file_system_id.clone();
+    crate::publication_guard::INITIAL_BINDING_AFTER_CUT.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(move || {
+            let before = update.projection_generation();
+            let storage = update.storage_generation();
+            control.with_client(|kv| {
+                let mut store = DfsControlPlaneStore::new(kv.as_mut());
+                let mut config = store.get_file_system_config(&fs).unwrap().unwrap();
+                config.display_name.push_str("-real-binding-refresh");
+                store.put_file_system_config(&config).unwrap();
+            });
+            crate::test_runtime::executor().block_on(async {
+                tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                    update.ensure_write_configuration_ready_async()).await.unwrap().unwrap();
+            });
+            let after = update.projection_generation();
+            assert!(after > before);
+            assert_eq!(update.storage_generation(), storage);
+            *recorded.lock().unwrap() = Some((before, after, storage));
+        })).is_none());
+    });
+    let binding = service.publication_provider.validate_initial_binding_from_retained_provider(
+        &scope, &digest, &execution, &config,
+    );
+    crate::publication_guard::INITIAL_BINDING_AFTER_CUT.with(|slot| slot.borrow_mut().take());
+    let advanced = *observed.lock().unwrap();
+    // Finish only the same genuine prepared body through the normal kernel.
+    // This fixture drain does not turn a rejected read qualification into PASS.
+    let completion = commit_kernel(&mut service, &digest);
+    std::fs::write(
+        runtime.data_dir(&config.primary_node_id).root().join("boundary-diagnostic-initial-binding-cut.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "digest": digest, "expected_shard": config, "actual_generation_advance": advanced,
+            "binding_result": format!("{binding:?}"), "same_digest_completion": format!("{completion:?}"),
+            "qualification": "Actual retained provider and execution owner. Real configuration transaction and shared native refresh; no injected cache value, fabricated authority or replacement operation identity."
+        })).unwrap(),
+    ).unwrap();
+    let after = service.metadata_backend().unwrap().get_object(&current.object_id).unwrap();
+    drop(execution);
+    drop(execution_guard);
+    drop(service);
+    runtime.close().unwrap();
+    assert!(advanced.is_some(), "the actual update boundary must be exercised");
+    assert!(binding.is_ok(), "coherent initial binding cut: {binding:?}");
+    assert!(completion.unwrap().published);
+    assert_eq!(after, Some(changed));
 }
 
 #[test]

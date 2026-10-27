@@ -468,6 +468,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             transport,
             content,
             cross_shard_namespace_locks,
+            placement_snapshot_cache,
+            content_pin_node_ids,
             replication,
             implicit_read_replica_ingest_enabled,
             pending_namespace_request_recovery_cursor,
@@ -488,6 +490,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // the same live job-owned admission projection after explicit disaster
         // recovery collapses its fully hydrated service back to lazy state.
         service.cross_shard_namespace_locks = cross_shard_namespace_locks;
+        // These are the same host-owned placement inputs, not hydrated metadata.
+        // Dropping the shared cache disconnects later writes from live placement
+        // and falls back to standalone owner normalization, which can widen N.
+        service.placement_snapshot_cache = placement_snapshot_cache;
+        service.content_pin_node_ids = content_pin_node_ids;
         service.replication = replication.into_lazy();
         service.implicit_read_replica_ingest_enabled = implicit_read_replica_ingest_enabled;
         // This cursor is tiny but provides bounded-scan fairness across routine

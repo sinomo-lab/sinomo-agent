@@ -5996,6 +5996,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             .freeze_metadata_shard_for_membership_handoff(shard_id, handoff_id, retiring_epoch)
     }
 
+    fn bind_metadata_shard_repair_handoff_cut(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+        cut: &crate::DfsRepairHandoffCut,
+    ) -> Result<()> {
+        self.shard_backend_mut(shard_id)?
+            .bind_metadata_shard_repair_handoff_cut(shard_id, cut)
+    }
+
     fn mark_metadata_shard_membership_handoff_activated(
         &mut self,
         shard_id: &DfsMetadataShardId,

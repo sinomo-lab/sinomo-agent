@@ -9,7 +9,7 @@ use crate::kv_local_store::{
 use crate::kv_read_model::read_cluster_members_from_kv;
 use crate::local_membership::{
     locally_learned_remote_route_endpoints, merge_cluster_join_registration,
-    preserve_locally_learned_remote_route_endpoints,
+    preserve_locally_learned_remote_route_endpoints, remove_superseded_daemon_listeners,
 };
 use crate::member_store::merge_member_record;
 use fs2::FileExt;
@@ -243,14 +243,22 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         state.members = kv_members;
         preserve_locally_learned_remote_route_endpoints(&mut state, local_remote_route_endpoints);
         for local_member in local_process_members {
-            if let Some(mut kv_member) = state
+            if let Some(kv_member) = state
                 .members
                 .iter()
                 .find(|member| member.node_id == local_member.node_id)
                 .cloned()
             {
                 let mut local_member = local_member;
-                for endpoint in kv_member.endpoints.drain(..) {
+                // The local owner already replaced its listener advertisements.
+                // Reuse that same merge when overlaying an older KV projection,
+                // so a later caller cannot persist retired local addresses again.
+                let mut published_endpoints = kv_member.endpoints;
+                remove_superseded_daemon_listeners(
+                    &mut published_endpoints,
+                    &local_member.endpoints,
+                );
+                for endpoint in published_endpoints {
                     upsert_member_endpoint(&mut local_member, endpoint);
                 }
                 cleanup_member_endpoint_duplicates(&mut local_member);
@@ -511,7 +519,7 @@ pub(crate) fn write_cluster_state_unlocked(
 /// Accepted joins instead need the revision on disk as a generation fence for
 /// delayed local read/modify/write work, so only an exact revision match may
 /// take the semantic-skip path here.
-fn write_accepted_cluster_state_unlocked(
+pub(crate) fn write_accepted_cluster_state_unlocked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
@@ -563,6 +571,66 @@ pub fn write_cluster_state(
         }
     }
     write_cluster_state_unlocked(paths, state)
+}
+
+fn remote_endpoint_projection_changed(
+    previous: &sinomo_base::ClusterMemberRecord,
+    current: &sinomo_base::ClusterMemberRecord,
+) -> bool {
+    if previous.endpoints == current.endpoints || current.updated_at < previous.updated_at {
+        return false;
+    }
+    // This materializer cannot add membership, change keys or grants, or copy
+    // a role/name change under the guise of endpoint maintenance.
+    let mut same_identity_and_attributes = current.clone();
+    same_identity_and_attributes.endpoints = previous.endpoints.clone();
+    same_identity_and_attributes.updated_at = previous.updated_at;
+    &same_identity_and_attributes == previous
+}
+
+/// Materialize a genuine remote endpoint change observed by the existing
+/// maintenance owner. Ordinary state reads remain side-effect free. The caller's
+/// view is only a hint: recapture the merged view under the existing state-writer
+/// lock before replacing any endpoints, preserving concurrent local listeners.
+pub async fn materialize_cluster_remote_endpoints_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    observed: &ClusterBootstrapState,
+) -> Result<bool, NetworkError> {
+    let paths = paths.clone();
+    let observed = observed.clone();
+    runtime.spawn_blocking(move || {
+        let _mutation_lock = acquire_local_cluster_state_mutation_lock(&paths)?;
+        let mut stored = read_cluster_state_without_kv(&paths)?;
+        if stored.cluster_id != observed.cluster_id || stored.local_node_id != observed.local_node_id {
+            return Ok(false);
+        }
+        let needs_projection = stored.members.iter().any(|previous| {
+            !cluster_node_is_local_process(&stored, &previous.node_id)
+                && previous.state.is_authorized()
+                && observed.members.iter().any(|current| remote_endpoint_projection_changed(previous, current))
+        });
+        if !needs_projection { return Ok(false); }
+        let current = read_cluster_state(&paths)?;
+        let mut changed = 0usize;
+        let local_members = stored.members.iter()
+            .filter(|member| cluster_node_is_local_process(&stored, &member.node_id))
+            .map(|member| member.node_id.clone()).collect::<Vec<_>>();
+        for previous in &mut stored.members {
+            if local_members.contains(&previous.node_id) || !previous.state.is_authorized() { continue; }
+            if let Some(member) = current.members.iter().find(|member| remote_endpoint_projection_changed(previous, member)) {
+                *previous = member.clone();
+                changed += 1;
+            }
+        }
+        if changed == 0 { return Ok(false); }
+        write_cluster_state_unlocked(&paths, &stored)?;
+        tracing::debug!(target: "sinomo.cluster.formation", changed_members = changed,
+            "materialized changed remote endpoints in public bootstrap projection");
+        Ok(true)
+    }).await.map_err(|error| NetworkError::Io {
+        operation: "materialize remote endpoint projection".into(), detail: error.to_string(),
+    })?
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -786,6 +854,76 @@ mod tests {
         )
     }
 
+    #[test]
+    fn remote_endpoint_projection_rejects_time_only_and_attribute_changes() {
+        let mut state = test_state("endpoint_projection_scope");
+        let peer = add_learner(&mut state, "endpoint_projection_scope_peer");
+        let mut previous = state.members.iter().find(|member| member.node_id == peer).unwrap().clone();
+        previous.endpoints = vec![observed_listener(&peer, "192.0.2.1:21353")];
+        let mut current = previous.clone();
+        current.updated_at += time::Duration::seconds(1);
+        assert!(!remote_endpoint_projection_changed(&previous, &current));
+        current.endpoints = vec![observed_listener(&peer, "192.0.2.2:21353")];
+        assert!(remote_endpoint_projection_changed(&previous, &current));
+        for change in 0..6 {
+            let mut rejected = current.clone();
+            match change {
+                0 => rejected.node_public_key = "different-key".into(),
+                1 => rejected.node_id = NodeId::generate(),
+                2 => rejected.role = ClusterMemberRole::Voter,
+                3 => rejected.display_name = "different-name".into(),
+                4 => rejected.allowed_capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter),
+                _ => rejected.updated_at = previous.updated_at - time::Duration::seconds(1),
+            }
+            assert!(!remote_endpoint_projection_changed(&previous, &rejected), "case {change}");
+        }
+    }
+
+    #[test]
+    fn remote_endpoint_projection_recaptures_and_preserves_new_local_listeners() {
+        let root = sinomo_testdir::TestDir::new("remote_endpoint_projection_race");
+        let data = SinomoDataDir::new(&root);
+        data.ensure_root_layout().unwrap();
+        let paths = ClusterPaths::new(&data);
+        paths.ensure().unwrap();
+        let mut initial = test_state("remote_endpoint_projection_race");
+        let peer = add_learner(&mut initial, "remote_endpoint_projection_race_peer");
+        initial.members.iter_mut().find(|member| member.node_id == peer).unwrap().endpoints = vec![observed_listener(&peer,"192.0.2.1:21353")];
+        write_cluster_state(&paths, &initial).unwrap();
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &initial).unwrap();
+        let mut changed = initial.clone();
+        let remote = changed.members.iter_mut().find(|member| member.node_id == peer).unwrap();
+        remote.endpoints = vec![observed_listener(&peer,"192.0.2.2:21353")];
+        remote.updated_at += time::Duration::seconds(1);
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &changed).unwrap();
+        let observed = read_cluster_state(&paths).unwrap();
+        // Both the local listener owner and the observed committed generation
+        // advance after the caller captures its hint, before materialization.
+        let local_endpoint = observed_listener(&initial.local_node_id,"192.0.2.4:21353");
+        let mut local = initial.clone();
+        local.members.iter_mut().find(|member| member.node_id == initial.local_node_id).unwrap().endpoints = vec![local_endpoint.clone()];
+        write_cluster_state(&paths, &local).unwrap();
+        let remote = changed.members.iter_mut().find(|member| member.node_id == peer).unwrap();
+        remote.endpoints = vec![observed_listener(&peer,"192.0.2.3:21353")];
+        remote.updated_at += time::Duration::seconds(1);
+        let expected = remote.clone();
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &changed).unwrap();
+        let wal = paths.kv_paths().raft_wal_paths(&initial.local_node_id).wal;
+        let wal_before = std::fs::read(&wal).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(runtime.block_on(materialize_cluster_remote_endpoints_async(runtime.handle(), &paths, &observed)).unwrap());
+        let stored = read_cluster_state_without_kv(&paths).unwrap();
+        assert_eq!(stored.members.iter().find(|member| member.node_id == peer).unwrap(), &expected);
+        assert_eq!(stored.members.iter().find(|member| member.node_id == initial.local_node_id).unwrap().endpoints, vec![local_endpoint]);
+        assert_eq!(stored.kv_revision, initial.kv_revision, "endpoint materialization cannot mint an authority revision");
+        let bytes = std::fs::read(&paths.state).unwrap();
+        let mark = cluster_file_mark(&paths.state).unwrap();
+        assert!(!runtime.block_on(materialize_cluster_remote_endpoints_async(runtime.handle(), &paths, &observed)).unwrap());
+        assert_eq!(std::fs::read(&paths.state).unwrap(), bytes);
+        assert_eq!(cluster_file_mark(&paths.state).unwrap(), mark);
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+    }
+
     fn add_learner(state: &mut ClusterBootstrapState, name: &str) -> NodeId {
         let node_id = NodeId::from_legacy_named(format!("node_{name}")).expect("learner node id");
         let mut member = ClusterMemberRecord::pending_learner(
@@ -801,6 +939,328 @@ mod tests {
             .members
             .sort_by(|left, right| left.node_id.cmp(&right.node_id));
         node_id
+    }
+
+    fn observed_listener(node: &NodeId, address: &str) -> sinomo_base::ClusterEndpointRecord {
+        sinomo_base::ClusterEndpointRecord {
+            endpoint_id: sinomo_base::Id::from_legacy_named(format!("listener_{node}_{address}"))
+                .expect("listener identity"),
+            node_id: node.clone(),
+            transport: sinomo_base::ClusterTransportKind::LanTcp,
+            address: address.to_string(),
+            source: sinomo_base::ClusterEndpointSource::Observed,
+            privacy: sinomo_base::ClusterEndpointPrivacy::Lan,
+            priority: 25,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn local_listener_replacement_survives_stale_kv_member_overlay_and_persistence() {
+        for source in [
+            sinomo_base::ClusterEndpointSource::Observed,
+            sinomo_base::ClusterEndpointSource::Mdns,
+        ] {
+            let root = sinomo_testdir::TestDir::new("local-listener-stale-overlay");
+            let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+            paths.ensure().expect("paths");
+            let mut local = test_state("local_listener_stale_overlay");
+            let remote = add_learner(&mut local, "local_listener_remote");
+            let mut old = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+            old.source = source;
+            let current = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+            let remote_endpoint = observed_listener(&remote, "10.0.0.3:21353");
+            let mut published = local.clone();
+            published
+                .members
+                .iter_mut()
+                .find(|m| m.node_id == local.local_node_id)
+                .expect("local member")
+                .endpoints = vec![old.clone()];
+            published
+                .members
+                .iter_mut()
+                .find(|m| m.node_id == remote)
+                .expect("remote member")
+                .endpoints = vec![remote_endpoint.clone()];
+            write_cluster_state(&paths, &published).expect("bootstrap projection");
+            crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &published)
+                .expect("seed the deliberately stale observational KV fixture");
+            local
+                .members
+                .iter_mut()
+                .find(|m| m.node_id == local.local_node_id)
+                .expect("local member")
+                .endpoints = vec![current.clone()];
+            write_cluster_state(&paths, &local)
+                .expect("publish current local listener observation");
+            let merged = read_cluster_state(&paths).expect("read merged routing view");
+            let member = merged
+                .members
+                .iter()
+                .find(|m| m.node_id == local.local_node_id)
+                .unwrap();
+            assert_eq!(
+                member.endpoints,
+                vec![current.clone()],
+                "an old KV advertisement must not resurrect a retired local listener"
+            );
+            assert!(
+                merged
+                    .members
+                    .iter()
+                    .find(|m| m.node_id == remote)
+                    .unwrap()
+                    .endpoints
+                    .contains(&remote_endpoint),
+                "remote routing endpoints remain available"
+            );
+            write_cluster_state(&paths, &merged).expect("persist a caller's derived projection");
+            let reread = read_cluster_state(&paths).expect("read after persistence");
+            assert_eq!(
+                reread
+                    .members
+                    .iter()
+                    .find(|m| m.node_id == local.local_node_id)
+                    .unwrap()
+                    .endpoints,
+                vec![current]
+            );
+            assert_eq!(reread.cluster_id, local.cluster_id);
+            assert_eq!(reread.local_node_id, local.local_node_id);
+            assert_eq!(reread.term, local.term);
+        }
+    }
+
+    #[test]
+    fn local_listener_replacement_survives_peer_merge_without_hiding_member_changes() {
+        for newer in [false, true] {
+            for source in [
+                sinomo_base::ClusterEndpointSource::Observed,
+                sinomo_base::ClusterEndpointSource::Mdns,
+            ] {
+                let root = sinomo_testdir::TestDir::new("local-listener-peer-merge");
+                let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+                paths.ensure().expect("paths");
+                let mut local = test_state("local_listener_peer_merge");
+                let remote = add_learner(&mut local, "peer_listener_remote");
+                let current = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+                let index = local
+                    .members
+                    .iter()
+                    .position(|m| m.node_id == local.local_node_id)
+                    .unwrap();
+                local.members[index].endpoints = vec![current.clone()];
+                let original = local.members[index].clone();
+                let mut peer = local.clone();
+                let mut retired = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+                retired.source = source;
+                let mut relay = observed_listener(&local.local_node_id, "peer-relay-placeholder");
+                relay.address = "https://relay.invalid/peer".to_string();
+                relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+                relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+                relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+                let incoming = &mut peer.members[index];
+                incoming.endpoints = vec![retired, relay.clone()];
+                incoming.updated_at += time::Duration::seconds(if newer { 1 } else { -1 });
+                incoming.state = ClusterMemberState::Removed;
+                incoming.display_name = "newer peer membership".to_string();
+                let mut expected = if newer { incoming.clone() } else { original };
+                expected.endpoints = vec![current, relay];
+                cleanup_member_endpoint_duplicates(&mut expected);
+                expected
+                    .endpoints
+                    .sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+                let remote_member = peer
+                    .members
+                    .iter_mut()
+                    .find(|m| m.node_id == remote)
+                    .unwrap();
+                remote_member.endpoints = vec![observed_listener(&remote, "10.0.0.3:21353")];
+                remote_member.updated_at += time::Duration::seconds(1);
+                let expected_remote = remote_member.clone();
+                assert!(crate::member_store::merge_cluster_state_from_peer(
+                    &mut local, peer
+                ));
+                // Endpoint order is not routing identity; compare every field
+                // after canonicalizing only this unordered collection.
+                local.members[index]
+                    .endpoints
+                    .sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+                assert_eq!(
+                    local.members[index], expected,
+                    "a peer cannot replace owned listeners; newer membership fields must still apply"
+                );
+                assert_eq!(
+                    local.members.iter().find(|m| m.node_id == remote).unwrap(),
+                    &expected_remote
+                );
+                write_cluster_state(&paths, &local).expect("persist merged peer view");
+                let reopened =
+                    read_cluster_state_without_kv(&paths).expect("read physical local state");
+                assert_eq!(
+                    reopened
+                        .members
+                        .iter()
+                        .find(|m| m.node_id == local.local_node_id)
+                        .unwrap(),
+                    &expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_mdns_hint_does_not_override_newer_peer_member() {
+        let mut local = test_state("local_mdns_peer_merge");
+        let mut hint = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        hint.source = sinomo_base::ClusterEndpointSource::Mdns;
+        local.members[0].endpoints = vec![hint];
+        let mut peer = local.clone();
+        peer.members[0].endpoints = vec![observed_listener(&local.local_node_id, "10.0.0.4:21353")];
+        peer.members[0].updated_at += time::Duration::seconds(1);
+        let expected = peer.members[0].clone();
+        assert!(crate::member_store::merge_cluster_state_from_peer(
+            &mut local, peer
+        ));
+        assert_eq!(local.members[0], expected);
+    }
+
+    #[test]
+    fn retired_remote_listener_cannot_return_from_an_older_peer_member() {
+        let mut local = test_state("retired_remote_listener_echo");
+        let remote = add_learner(&mut local, "retired_remote_listener_target");
+        let index = local
+            .members
+            .iter()
+            .position(|member| member.node_id == remote)
+            .unwrap();
+        let current = observed_listener(&remote, "192.0.2.22:21353");
+        local.members[index].endpoints = vec![current.clone()];
+        let mut peer = local.clone();
+        let mut stale = local.members[index].clone();
+        stale.updated_at -= time::Duration::seconds(1);
+        let retired = observed_listener(&remote, "192.0.2.11:21353");
+        let hint = observed_listener(&remote, "bridge-local.example:21353");
+        let mut relay = observed_listener(&remote, "relay-placeholder");
+        relay.address = "https://relay.invalid/route".into();
+        relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+        relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+        relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+        stale.endpoints = vec![retired.clone(), hint.clone(), relay.clone()];
+        peer.members[index] = stale;
+        crate::member_store::merge_cluster_state_from_peer(&mut local, peer);
+        let endpoints = &local.members[index].endpoints;
+        assert!(endpoints.contains(&current));
+        assert!(
+            endpoints.contains(&hint),
+            "locally useful named bridge hints remain advisory routes"
+        );
+        assert!(
+            endpoints.contains(&relay),
+            "other transports retain their existing merge behavior"
+        );
+        assert!(
+            !endpoints.contains(&retired),
+            "an older peer member cannot resurrect a replaced listener"
+        );
+    }
+
+    #[test]
+    fn local_listener_overlay_retains_non_listener_published_routes() {
+        let root = sinomo_testdir::TestDir::new("local-listener-published-relay");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let mut local = test_state("local_listener_published_relay");
+        let listener = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+        let mut relay = observed_listener(&local.local_node_id, "relay-placeholder");
+        relay.address = "https://relay.invalid/node".to_string();
+        relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+        relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+        relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+        let mut published = local.clone();
+        published.members[0].endpoints.push(relay.clone());
+        write_cluster_state(&paths, &local).expect("bootstrap projection");
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &published)
+            .expect("seed published relay metadata without dialing it");
+        local.members[0].endpoints.push(listener.clone());
+        write_cluster_state(&paths, &local).expect("current local listener observation");
+        let view = read_cluster_state(&paths).expect("merged routing view");
+        let endpoints = &view
+            .members
+            .iter()
+            .find(|m| m.node_id == local.local_node_id)
+            .unwrap()
+            .endpoints;
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.contains(&listener));
+        assert!(endpoints.contains(&relay));
+    }
+
+    #[test]
+    fn mdns_hint_alone_does_not_retire_owned_listeners() {
+        let local = test_state("mdns_hint_is_not_listener_ownership");
+        let current = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+        let mut hint = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        hint.source = sinomo_base::ClusterEndpointSource::Mdns;
+        let mut existing = vec![current.clone()];
+        remove_superseded_daemon_listeners(&mut existing, &[hint]);
+        assert_eq!(existing, vec![current]);
+    }
+
+    #[test]
+    fn owned_listener_refresh_retires_mdns_echo_and_preserves_other_transports() {
+        let mut local = test_state("owned_listener_mdns_echo");
+        let mut old = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        old.source = sinomo_base::ClusterEndpointSource::Mdns;
+        let current = observed_listener(&local.local_node_id, "10.0.0.4:21353");
+        let mut relay = observed_listener(&local.local_node_id, "relay-placeholder");
+        relay.address = "https://relay.invalid/node".to_string();
+        relay.transport = sinomo_base::ClusterTransportKind::HttpsRelay;
+        relay.source = sinomo_base::ClusterEndpointSource::Rendezvous;
+        relay.privacy = sinomo_base::ClusterEndpointPrivacy::Relayed;
+        let mut quic = observed_listener(&local.local_node_id, "10.0.0.3:31337");
+        quic.transport = sinomo_base::ClusterTransportKind::LanQuic;
+        quic.source = sinomo_base::ClusterEndpointSource::Mdns;
+        local.members[0].endpoints = vec![old.clone(), relay.clone(), quic.clone()];
+        let replacement = local.members[0].clone();
+        let capabilities = replacement.capabilities.clone();
+        assert!(crate::local_membership::upsert_daemon_member(
+            &mut local,
+            replacement,
+            capabilities,
+            vec![current.clone()],
+            OffsetDateTime::now_utc(),
+        ));
+        let endpoints = &local.members[0].endpoints;
+        assert_eq!(endpoints.len(), 3);
+        assert!(endpoints.contains(&current));
+        assert!(endpoints.contains(&relay));
+        assert!(endpoints.contains(&quic));
+        assert!(!endpoints.contains(&old));
+    }
+
+    #[test]
+    fn local_member_without_listener_observation_keeps_published_endpoint() {
+        let root = sinomo_testdir::TestDir::new("local-listener-no-observation");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let local = test_state("local_listener_no_observation");
+        let endpoint = observed_listener(&local.local_node_id, "10.0.0.3:21353");
+        let mut published = local.clone();
+        published.members[0].endpoints.push(endpoint.clone());
+        write_cluster_state(&paths, &local).expect("bootstrap projection");
+        crate::member_mutation::sync_cluster_state_to_local_kv_unchecked(&paths, &published)
+            .expect("seed the published observational KV fixture");
+        let read = read_cluster_state(&paths).expect("read routing view without local observation");
+        assert!(
+            read.members
+                .iter()
+                .find(|m| m.node_id == local.local_node_id)
+                .unwrap()
+                .endpoints
+                .contains(&endpoint)
+        );
     }
 
     #[test]

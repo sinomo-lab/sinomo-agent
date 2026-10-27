@@ -20,6 +20,8 @@
 #   SINOMO_GATE_QUIESCE_WAIT    initial settle delay after readiness
 #   SINOMO_GATE_QUIESCE_WINDOW  zero-write window required after the settle deadline
 #   SINOMO_GATE_QUIESCE_TIMEOUT maximum seconds to find a full zero-write window
+#   SINOMO_GATE_NO_QUIET_RETRY=1 fail after the first fixed quiet window
+#   SINOMO_GATE_OWNED_IO_ARTIFACTS opt into complete stable-container I/O evidence
 
 # These helpers target the dev cluster compose file regardless of the caller's
 # working directory (the root docker-compose.yml is the production node).
@@ -43,7 +45,13 @@ CYCLES="${SINOMO_GATE_CYCLES:-1}"
 QUIESCE_WAIT="${SINOMO_GATE_QUIESCE_WAIT:-10}"
 QUIESCE_WINDOW="${SINOMO_GATE_QUIESCE_WINDOW:-135}"
 QUIESCE_TIMEOUT="${SINOMO_GATE_QUIESCE_TIMEOUT:-600}"
+NO_QUIET_RETRY="${SINOMO_GATE_NO_QUIET_RETRY:-0}"
 MEASURE_NODES="${SINOMO_GATE_IDLE_NODES:-node1 node2 node3 node4 node5 node6}"
+
+case "$NO_QUIET_RETRY" in
+  0|1) ;;
+  *) echo "SINOMO_GATE_NO_QUIET_RETRY must be 0 or 1"; exit 2 ;;
+esac
 
 case "$IDLE_WINDOW:$BRIDGE_RECOVERY_WAIT:$FORMATION_WAIT:$POLL_INTERVAL:$COMMAND_TIMEOUT:$EXPECTED_MAINS:$CYCLES:$QUIESCE_WAIT:$QUIESCE_WINDOW:$QUIESCE_TIMEOUT" in
   *[!0-9:]*)
@@ -198,6 +206,35 @@ enforce_idle_write_stability() {
   local -A before=()
   while :; do
     attempt=$(( attempt + 1 ))
+    if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ]; then
+      mkdir -p "$SINOMO_GATE_OWNED_IO_ARTIFACTS"
+      local owned_artifacts owned_status
+      local -a owned_nodes
+      owned_artifacts="$(mktemp -d "$SINOMO_GATE_OWNED_IO_ARTIFACTS/settling-XXXXXXXX")"
+      read -r -a owned_nodes <<< "$MEASURE_NODES"
+      owned_status=0
+      python3 "$SINOMO_DOCKER_DIR/measure-owned-io.py" \
+        --project "$COMPOSE_PROJECT_NAME" --nodes "${owned_nodes[@]}" \
+        --window "$QUIESCE_WINDOW" --output "$owned_artifacts/io.json" || owned_status=$?
+      if [ "$owned_status" -eq 0 ]; then
+        echo "owned main/shadow/helper block writes stayed quiet for ${QUIESCE_WINDOW}s (attempt ${attempt})"
+        return
+      fi
+      if [ "$owned_status" -ne 1 ]; then
+        echo "owned I/O observation incomplete; preserving failed coverage, no reset/stitching"
+        exit "$owned_status"
+      fi
+      if [ "$NO_QUIET_RETRY" = 1 ]; then
+        echo "first fixed owned quiet window failed; retaining evidence without phase search"
+        exit 1
+      fi
+      now="$(date +%s)"
+      if [ $(( now + QUIESCE_WINDOW )) -gt "$deadline" ]; then
+        break
+      fi
+      echo "retrying owned zero-write window before the original quiescence deadline"
+      continue
+    fi
     before=()
     for node in $MEASURE_NODES; do
       if ! before_snapshot="$(node_daemon_write_snapshot "$node")" || [ -z "$before_snapshot" ]; then
@@ -244,6 +281,10 @@ enforce_idle_write_stability() {
 
     echo "daemon block writes still settling on attempt ${attempt}; delta=${total_delta}B over ${QUIESCE_WINDOW}s"
     echo "nonzero node deltas: $delta_details"
+    if [ "$NO_QUIET_RETRY" = 1 ]; then
+      echo "first fixed quiet window failed; retaining evidence without phase search"
+      exit 1
+    fi
     now="$(date +%s)"
     if [ $(( now + QUIESCE_WINDOW )) -gt "$deadline" ]; then
       break
@@ -271,6 +312,12 @@ run_validation_cycle() {
   echo "=== cycle ${cycle}/${CYCLES}: bridge loss/recovery (${BRIDGE_RECOVERY_WAIT}s recovery budget) ==="
   docker/test-bridge-recovery.sh "$BRIDGE_RECOVERY_WAIT"
   wait_for_named_ready "cycle ${cycle}/${CYCLES} final"
+  if [ -n "${SINOMO_GATE_OWNED_IO_ARTIFACTS:-}" ]; then
+    # Recovery is a new workload. Reuse the same bounded settling and idle
+    # checks; never splice its counters into the pre-recovery ownership window.
+    enforce_idle_write_stability "cycle ${cycle}/${CYCLES} post-recovery"
+    docker/measure-idle.sh "$IDLE_WINDOW"
+  fi
 }
 
 if [ "$REBUILD" != "0" ]; then

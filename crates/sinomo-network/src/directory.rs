@@ -249,6 +249,15 @@ impl DirectorySnapshot {
 ///
 /// Implementations wrap whatever store owns cluster state; errors are
 /// reported as [`NetworkError::Directory`].
+/// Raw semantic baselines for authenticated source freshness reads. Expired
+/// values here are never routable by themselves. This is an observational
+/// directory cut, not a new effect-authority certificate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryConnectivityBaseline {
+    pub version: DirectoryVersion,
+    pub records: Vec<ClusterConnectivityRecord>,
+}
+
 pub trait ClusterDirectory: Send + Sync {
     /// Authorized cluster member records, including endpoint/capability
     /// overlays from the backing store.
@@ -269,6 +278,19 @@ pub trait ClusterDirectory: Send + Sync {
     /// may complete a sparse graph with imported relay edges; afterwards only
     /// the current node's own newer observations are overlaid.
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
+
+    /// Capture raw confirmed semantic rows separately from the TTL-filtered
+    /// routing view. Providers without retained expired rows safely offer only
+    /// their ordinary evidence. No caller may extend a row without a fresh,
+    /// authenticated statement from that row's actual source.
+    fn connectivity_freshness_baseline(&self) -> Result<DirectoryConnectivityBaseline, NetworkError> {
+        let before = self.routing_version()?;
+        let records = self.connectivity_records()?;
+        if self.routing_version()? != before {
+            return Err(NetworkError::Directory { detail: "directory changed during connectivity baseline capture".into() });
+        }
+        Ok(DirectoryConnectivityBaseline { version: before, records })
+    }
 
     /// Monotonic stamp of the backing store used for routing-cache
     /// invalidation.
@@ -470,6 +492,11 @@ impl ClusterDirectory for BootstrapAwareClusterDirectory {
         self.inner.connectivity_records()
     }
 
+    fn connectivity_freshness_baseline(&self) -> Result<DirectoryConnectivityBaseline, NetworkError> {
+        self.inner.connectivity_freshness_baseline()
+    }
+
+
     fn version(&self) -> Result<DirectoryVersion, NetworkError> {
         Ok(self.inner.version()?.max(self.bootstrap_version))
     }
@@ -570,6 +597,11 @@ impl ClusterDirectory for FencedBootstrapConnectivityDirectory {
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
         Ok(self.observed_connectivity_records())
     }
+
+    fn connectivity_freshness_baseline(&self) -> Result<DirectoryConnectivityBaseline, NetworkError> {
+        self.connectivity.connectivity_freshness_baseline()
+    }
+
 
     fn version(&self) -> Result<DirectoryVersion, NetworkError> {
         self.exact.version()

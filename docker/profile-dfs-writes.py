@@ -26,6 +26,7 @@ def load(path, name):
 ROOT = Path(__file__).resolve().parents[1]
 latency = load(ROOT / "docker/measure-dfs-write-latency.py", "write_latency")
 reporter = load(ROOT / "scripts/debug/report-performance.py", "performance_report")
+presentation = load(ROOT / "scripts/debug/render-pprof-flamegraph.py", "pprof_presentation")
 
 
 def save(path, value):
@@ -125,6 +126,8 @@ def render_index(root, result):
         links = f"[pprof]({row['artifact']})"
         if row.get("flamegraph"):
             links += f" / [flamegraph]({row['flamegraph']}) / [top]({row['top']})"
+        if row.get("presentation_status") == "deferred":
+            links += f" / [presentation deferred]({row['presentation_receipt']})"
         lines.append(f"| {row['case']} | {row['node']} | {row.get('sample_count')} | {row.get('artifact_bytes')} | {links} |")
     if result.get("error"):
         lines += ["", "Run error: " + result["error"]]
@@ -153,7 +156,16 @@ def collect_cpu_profiles(run, capture, name, nodes):
             cpu_row = {"case": name, "node": alias,
                 "sample_count": cpu.get("sample_count"), "artifact_bytes": cpu.get("artifact_bytes"),
                 "artifact": f"{name}/{node}/cpu.pprof.pb"}
-            if shutil.which("go"):
+            if run.env.get("SINOMO_TEST_DEFER_PPROF_PRESENTATION") == "1":
+                deferred = presentation.record_deferred_presentation(
+                    capture / node / "cpu.pprof.pb", capture / node / "cpu-manifest.json",
+                    capture / node / "pprof-presentation.json",
+                    [profile_path, Path(__file__), Path(presentation.__file__)], include_top=True)
+                cpu_row.update(presentation_status=deferred["status"],
+                    presentation_receipt=f"{name}/{node}/pprof-presentation.json",
+                    artifact_sha256=deferred["inputs"]["profile"]["sha256"],
+                    manifest_sha256=deferred["inputs"]["manifest"]["sha256"])
+            elif shutil.which("go"):
                 with (capture / node / "cpu-top.txt").open("w") as top:
                     subprocess.run(["go", "tool", "pprof", "-top", "-nodecount=20",
                         str(capture / node / "cpu.pprof.pb")], stdout=top, stderr=subprocess.STDOUT, timeout=30)

@@ -100,6 +100,7 @@ fn node_transport_completes_synchronous_replica_write() {
 
 #[test]
 fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
+    let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let (runtime, service, _) = crate::test_support::current_native_metadata_service(
         "default-native-records",
         1,
@@ -107,6 +108,58 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
     )
     .expect("normal component initialization");
     let control = runtime.shared_control_plane().unwrap();
+    // Metadata startup and the first physical storage sample are independent
+    // native owners. This positive content fixture must observe the latter;
+    // the initial NeverSampled advertisement correctly fails closed.
+    let (changed, wake) = std::sync::mpsc::sync_channel(1);
+    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+        &sinomo_core::network::ClusterPaths::new(runtime.data_dir(service.node_id())),
+        move |_| {
+            let _ = changed.try_send(());
+        },
+    );
+    let read_content = || {
+        control.with_client(|kv| {
+            // Content advertisements are outside the retained filesystem
+            // prefix. A committed-observation wake does not invalidate this
+            // client's exact-key cache. Read the actual publisher's record
+            // before the original startup deadline, including on the first
+            // read after subscribing (publication may already have finished).
+            let entries = kv
+                .get_authoritative_consistent_before(
+                    &[crate::content_service_key(service.node_id())],
+                    deadline,
+                )
+                .expect("authoritative storage advertisement within the startup budget");
+            entries[0]
+                .as_ref()
+                .expect("normal startup published its content record")
+                .decode::<crate::DfsNodeAdvertisement>()
+                .expect("actual content advertisement")
+        })
+    };
+    let initial = read_content();
+    let mut sampled = initial.clone();
+    while sampled.storage_freshness == crate::DfsObservationFreshness::NeverSampled {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "native storage publication startup deadline"
+        );
+        // No client, admission, or cache lock is held while its actual owner
+        // publishes. Wakeups may coalesce; each read observes the real record.
+        wake.recv_timeout(remaining)
+            .expect("first actual storage advertisement within the existing startup budget");
+        sampled = read_content();
+    }
+    std::fs::write(
+        runtime.data_dir(service.node_id()).root().join("boundary-diagnostic-native-content-ready.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "initial": initial, "sampled": sampled,
+            "qualification": "Actual committed advertisements; notification wakeups coalesce. No synthetic capacity, readiness, or authority."
+        })).unwrap(),
+    ).unwrap();
+    drop(subscription);
     control.with_client(|kv| {
         let store = DfsControlPlaneStore::new(kv.as_mut());
         let config = store
@@ -650,9 +703,13 @@ fn posix_non_foreground_write_reports_only_durable_locations() {
     let path = "/services/async-repair.txt";
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     placement.required_node_ids = vec![local.clone(), remote.clone()];
-    runtime
+    let applied = runtime
         .apply_placement_policy(&local, path, DfsPlacementScope::SelfOnly, placement.clone())
         .unwrap();
+    // Finish the accepted setup job before creating the object whose original
+    // write repair is measured below. Otherwise that independent job can also
+    // schedule a placement repair for the same newly created version.
+    finish_native_placement_fixture_apply(&runtime, &applied);
     for route in [DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE] {
         runtime.install_fault(crate::test_runtime::FaultRule {
             source: Some(local.clone()),

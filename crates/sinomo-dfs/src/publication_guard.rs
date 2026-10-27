@@ -16,6 +16,9 @@ thread_local! {
     /// Pause only after the real author guard and complete participant evidence
     /// exist. Tests may interrupt delivery; they cannot supply acknowledgement claims.
     pub(crate) static AFTER_PREPARED_AUTHORIZATION: std::cell::RefCell<Option<Box<dyn FnOnce(&DfsPreparedOperationDigest, &crate::DfsPreparedOperationPayload)>>> = const { std::cell::RefCell::new(None) };
+    /// Observe a genuine configuration update after the initial binding cut.
+    /// The hook supplies no configuration, execution owner or publication proof.
+    pub(crate) static INITIAL_BINDING_AFTER_CUT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Actual backend identity. This is a lock index, never author permission.
@@ -214,30 +217,59 @@ impl DfsPublicationExecutionProvider {
                 "initial epoch owner/storage generation changed".into(),
             ));
         }
-        let generation = self.authority.projection_generation();
-        let (shards, filesystem) = self
-            .authority
-            .cached_publication_configuration(&digest.file_system_id, generation)
-            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
-            .ok_or_else(|| {
-                MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
-            })?;
-        if filesystem
-            .as_ref()
-            .is_none_or(|filesystem| filesystem.file_system_id != digest.file_system_id)
-            || !scope.matches(digest)
-            || expected.file_system_id != digest.file_system_id
-            || expected.shard_id != digest.shard_id.0
-            || expected.epoch != digest.owner_epoch
-            || !shards.iter().any(|shard| shard == expected)
-            || self.authority.storage_generation() != self.storage_generation
-            || self.authority.projection_generation() != generation
+        let binding = self.authority.with_current_publication_configuration(
+            &digest.file_system_id,
+            |generation, shards, filesystem| {
+                let mismatch = if filesystem
+                    .as_ref()
+                    .is_none_or(|filesystem| filesystem.file_system_id != digest.file_system_id)
+                {
+                    Some("filesystem")
+                } else if !scope.matches(digest) {
+                    Some("physical-scope")
+                } else if expected.file_system_id != digest.file_system_id {
+                    Some("filesystem-id")
+                } else if expected.shard_id != digest.shard_id.0 {
+                    Some("shard-id")
+                } else if expected.epoch != digest.owner_epoch {
+                    Some("owner-epoch")
+                } else if !shards.iter().any(|shard| shard == expected) {
+                    Some("selected-shard")
+                } else if self.authority.storage_generation() != self.storage_generation {
+                    Some("storage-generation")
+                } else if self.authority.projection_generation() != generation {
+                    Some("projection-generation")
+                } else {
+                    None
+                };
+                if let Some(reason) = mismatch {
+                    #[cfg(any(test, feature = "test-support"))]
+                    eprintln!(
+                        "NATIVE_INITIAL_EPOCH_BINDING_REJECTED branch={reason} root={:?} digest={digest:?} expected={expected:?} cached_shards={shards:?} sampled_projection={generation} projection_at_log={} expected_storage={} storage_at_log={}",
+                        scope.root(), self.authority.projection_generation(),
+                        self.storage_generation, self.authority.storage_generation(),
+                    );
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    let _ = reason;
+                    return Err(MetadataBackendError::Serde(
+                        "initial epoch differs from the coherent configuration".into(),
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+        .ok_or_else(|| {
+            MetadataBackendError::Serde("initial epoch configuration is unavailable".into())
+        })?;
+        #[cfg(test)]
         {
-            return Err(MetadataBackendError::Serde(
-                "initial epoch differs from the coherent configuration".into(),
-            ));
+            let hook = INITIAL_BINDING_AFTER_CUT.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
         }
-        Ok(())
+        binding
     }
 
     fn acquire(
@@ -261,10 +293,9 @@ impl DfsPublicationExecutionProvider {
             &self.data_owner,
             scope,
         );
-        let projection_generation = self.authority.projection_generation();
-        let (shards, filesystem_config) = self
+        let (_, shards, filesystem_config) = self
             .authority
-            .cached_publication_configuration(&scope.file_system_id, projection_generation)?
+            .cached_current_publication_configuration(&scope.file_system_id)?
             .ok_or_else(|| crate::DfsError::Metadata {
                 message: "publication configuration is not current".into(),
             })?;
@@ -305,14 +336,13 @@ impl DfsPublicationExecutionProvider {
         // Rebind to one actual current cache cut, preserving every semantic
         // configuration row selected before the wait. A missing cut cannot
         // authorize work, and structural changes still require reopening.
-        let current_projection = self.authority.projection_generation();
         let current = self
             .authority
-            .cached_publication_configuration(&scope.file_system_id, current_projection)?;
+            .cached_current_publication_configuration(&scope.file_system_id)?;
         if self.authority.storage_generation() != self.storage_generation
             || current
                 .as_ref()
-                .is_none_or(|(current_shards, current_filesystem)| {
+                .is_none_or(|(_, current_shards, current_filesystem)| {
                     current_shards
                         .iter()
                         .find(|current| current.shard_id == scope.shard_id.0)
@@ -341,6 +371,19 @@ pub(crate) struct DfsPublicationProviderRestore {
     previous: Option<Arc<DfsPublicationExecutionProvider>>,
 }
 impl DfsPublicationProviderSlot {
+    #[cfg(test)]
+    pub(crate) fn validate_initial_binding_from_retained_provider(
+        &self,
+        scope: &DfsPublicationOwnerScope,
+        digest: &DfsPreparedOperationDigest,
+        execution: &DfsPublicationExecutionOwners,
+        expected: &crate::DfsMetadataShardConfig,
+    ) -> Result<()> {
+        self.current()
+            .ok_or_else(|| MetadataBackendError::Serde("test has no retained native provider".into()))?
+            .validate_initial_epoch_binding(scope, digest, execution, expected)
+    }
+
     pub(crate) fn retain_runtime_provider(&self, provider: Arc<DfsPublicationExecutionProvider>) {
         *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(provider);
     }

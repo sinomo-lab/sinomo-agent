@@ -18,7 +18,6 @@ use crate::local_membership::refresh_local_daemon_membership_from_disk;
 use crate::local_state_store::write_cluster_state;
 use crate::local_state_store::{
     acquire_local_cluster_state_mutation_lock, read_cluster_state_without_kv,
-    write_cluster_state_unlocked,
 };
 use crate::member_store::{
     apply_cluster_raft_role, cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store,
@@ -461,7 +460,20 @@ pub fn update_cluster_node_role_with_host(
     now: OffsetDateTime,
     host: &mut (impl ClusterMemberMutationHost + ?Sized),
 ) -> Result<ClusterNodeRoleUpdate, NetworkError> {
-    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state)?;
+    let _observation = tracing::trace_span!(target: "sinomo.perf", "cluster.role.update",
+        local_node_id = %state.local_node_id, target_node_id = %node_id,
+        requested_role = ?role)
+    .entered();
+    tracing::trace!(target: "sinomo.perf", phase = "authoritative-snapshot", outcome = "started",
+        "cluster role update boundary");
+    let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state).inspect_err(|error| {
+        tracing::trace!(target: "sinomo.perf", phase = "authoritative-snapshot", outcome = "error",
+            %error, "cluster role update boundary");
+    })?;
+    tracing::trace!(target: "sinomo.perf", phase = "authoritative-snapshot", outcome = "completed",
+        "cluster role update boundary");
+    let projection_revision = authoritative.value.revision.0;
+    let projection_term = authoritative.authority.term;
     let store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;
     let member_key = cluster_member_key(&node_id);
     let Some(member_entry) = store.get(&member_key).cloned() else {
@@ -473,7 +485,13 @@ pub fn update_cluster_node_role_with_host(
     let previous_role = member.node_role.clone();
     let changed = previous_role != role;
     if !changed {
-        update_local_cluster_node_role_if_present(paths, &node_id, role.clone(), now)?;
+        update_local_confirmed_member_if_present(
+            paths,
+            &member,
+            projection_revision,
+            projection_term,
+            false,
+        )?;
         return Ok(ClusterNodeRoleUpdate {
             node_id,
             previous_role,
@@ -483,10 +501,25 @@ pub fn update_cluster_node_role_with_host(
     }
     apply_cluster_node_role(&mut member, role.clone(), now);
     let txn = cluster_member_update_txn_from_store(&store, member_entry, &member)?;
-    let result =
-        host.commit_cluster_kv_txn_with_quorum(paths, &mut state, KvTxnRequest::generated(txn))?;
-    require_cluster_kv_txn_succeeded(result, "updating cluster node role")?;
-    update_local_cluster_node_role_if_present(paths, &node_id, role.clone(), now)?;
+    let request = KvTxnRequest::generated(txn);
+    tracing::trace!(target: "sinomo.perf", phase = "commit", outcome = "started",
+        request_id = %request.request_id, "cluster role update boundary");
+    let result = host
+        .commit_cluster_kv_txn_with_quorum(paths, &mut state, request)
+        .inspect_err(|error| {
+            tracing::trace!(target: "sinomo.perf", phase = "commit", outcome = "error",
+            %error, "cluster role update boundary");
+        })?;
+    tracing::trace!(target: "sinomo.perf", phase = "commit", outcome = "returned",
+        "cluster role update boundary");
+    let result = require_cluster_kv_txn_succeeded(result, "updating cluster node role")?;
+    update_local_confirmed_member_if_present(
+        paths,
+        &member,
+        result.authority.revision.0,
+        result.authority.term,
+        false,
+    )?;
     Ok(ClusterNodeRoleUpdate {
         node_id,
         previous_role,
@@ -504,6 +537,8 @@ pub fn update_cluster_node_name_with_host(
     host: &mut (impl ClusterMemberMutationHost + ?Sized),
 ) -> Result<ClusterNodeNameUpdate, NetworkError> {
     let authoritative = host.authoritative_cluster_kv_snapshot(paths, &mut state)?;
+    let projection_revision = authoritative.value.revision.0;
+    let projection_term = authoritative.authority.term;
     let store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;
     let member_key = cluster_member_key(&node_id);
     let Some(member_entry) = store.get(&member_key).cloned() else {
@@ -515,7 +550,13 @@ pub fn update_cluster_node_name_with_host(
     let previous_name = member.display_name.clone();
     let changed = previous_name != name;
     if !changed {
-        update_local_cluster_node_name_if_present(paths, &node_id, name.clone(), now)?;
+        update_local_confirmed_member_if_present(
+            paths,
+            &member,
+            projection_revision,
+            projection_term,
+            true,
+        )?;
         return Ok(ClusterNodeNameUpdate {
             node_id,
             previous_name,
@@ -527,8 +568,14 @@ pub fn update_cluster_node_name_with_host(
     let txn = cluster_member_update_txn_from_store(&store, member_entry, &member)?;
     let result =
         host.commit_cluster_kv_txn_with_quorum(paths, &mut state, KvTxnRequest::generated(txn))?;
-    require_cluster_kv_txn_succeeded(result, "updating cluster node name")?;
-    update_local_cluster_node_name_if_present(paths, &node_id, name.clone(), now)?;
+    let result = require_cluster_kv_txn_succeeded(result, "updating cluster node name")?;
+    update_local_confirmed_member_if_present(
+        paths,
+        &member,
+        result.authority.revision.0,
+        result.authority.term,
+        true,
+    )?;
     Ok(ClusterNodeNameUpdate {
         node_id,
         previous_name,
@@ -537,63 +584,65 @@ pub fn update_cluster_node_name_with_host(
     })
 }
 
-fn update_local_cluster_node_role_if_present(
+/// The attribute producer already has the confirmed member generation. Copy
+/// that body rather than stamping a new role/name timestamp onto old endpoints.
+/// This is a derived bootstrap projection, never an additional authority source.
+fn update_local_confirmed_member_if_present(
     paths: &ClusterPaths,
-    node_id: &NodeId,
-    role: ClusterNodeRole,
-    now: OffsetDateTime,
+    confirmed: &ClusterMemberRecord,
+    revision: u64,
+    term: u64,
+    update_local_name: bool,
 ) -> Result<(), NetworkError> {
     let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
     let mut state = read_cluster_state_without_kv(paths)?;
-    let Some(member) = state
-        .members
-        .iter_mut()
-        .find(|member| member.node_id == *node_id)
-    else {
-        return Ok(());
-    };
-    if member.node_role == role {
+    if state.cluster_id != confirmed.cluster_id {
+        return Err(NetworkError::InvalidClusterCommand {
+            detail: "confirmed member belongs to a different local cluster".into(),
+        });
+    }
+    if (revision, term) < (state.kv_revision, state.term) {
         return Ok(());
     }
-    apply_cluster_node_role(member, role, now);
-    state.updated_at = now;
-    write_cluster_state_unlocked(paths, &state)?;
-    Ok(())
-}
-
-fn update_local_cluster_node_name_if_present(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    name: String,
-    now: OffsetDateTime,
-) -> Result<(), NetworkError> {
-    let _mutation_lock = acquire_local_cluster_state_mutation_lock(paths)?;
-    let mut state = read_cluster_state_without_kv(paths)?;
-    let mut changed = false;
-    if state.local_node_id == *node_id && state.local_node_display_name != name {
-        state.local_node_display_name = name.clone();
-        changed = true;
+    let before = state.clone();
+    if update_local_name && state.local_node_id == confirmed.node_id {
+        state.local_node_display_name = confirmed.display_name.clone();
     }
-    let Some(member) = state
+    if let Some(index) = state
         .members
-        .iter_mut()
-        .find(|member| member.node_id == *node_id)
-    else {
-        if changed {
-            state.updated_at = now;
-            write_cluster_state_unlocked(paths, &state)?;
+        .iter()
+        .position(|member| member.node_id == confirmed.node_id)
+    {
+        let mut projected = confirmed.clone();
+        if sinomo_node::cluster_node_is_local_process(&state, &confirmed.node_id)
+            && state.members[index].state.is_authorized()
+        {
+            // Reuse the listener owner's existing retirement rule. A confirmed
+            // cluster record still cannot replace a newer locally bound socket.
+            crate::local_membership::remove_superseded_daemon_listeners(
+                &mut projected.endpoints,
+                &state.members[index].endpoints,
+            );
+            for endpoint in state.members[index].endpoints.iter().filter(|endpoint| {
+                crate::local_membership::daemon_tcp_endpoint_is_listener_advertisement(endpoint)
+            }) {
+                sinomo_network::upsert_member_endpoint(&mut projected, endpoint.clone());
+            }
         }
+        let local_hints = crate::local_membership::locally_learned_remote_route_endpoints(&state);
+        state.members[index] = projected;
+        crate::local_membership::preserve_locally_learned_remote_route_endpoints(
+            &mut state,
+            local_hints,
+        );
+    }
+    if sinomo_node::cluster_bootstrap_state_stable_eq(&before, &state) {
         return Ok(());
-    };
-    if member.display_name != name {
-        apply_cluster_node_name(member, name, now);
-        changed = true;
     }
-    if changed {
-        state.updated_at = now;
-        write_cluster_state_unlocked(paths, &state)?;
-    }
-    Ok(())
+    state.kv_revision = state.kv_revision.max(revision);
+    state.term = state.term.max(term);
+    state.updated_at = state.updated_at.max(confirmed.updated_at);
+    crate::local_state_store::write_accepted_cluster_state_unlocked(paths, &state)
 }
 
 fn apply_cluster_node_name(member: &mut ClusterMemberRecord, name: String, now: OffsetDateTime) {
@@ -2533,6 +2582,157 @@ mod tests {
                 .expect("unchanged name");
         assert!(!name_update.changed);
         assert_eq!(host.commit_index, commit_index);
+    }
+
+    fn attribute_projection_endpoint_generation_control(rename: bool, changed: bool) {
+        let (mut confirmed, target, now) = non_voting_member_state();
+        let temp = sinomo_testdir::TestDir::new("cluster-attribute-endpoint-generation");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(temp.path()));
+        paths.ensure().unwrap();
+        let index = confirmed
+            .members
+            .iter()
+            .position(|m| m.node_id == target)
+            .unwrap();
+        let current_endpoint =
+            sinomo_network::daemon_lan_endpoint(&target, "192.0.2.22:21353".into(), 20);
+        confirmed.members[index].endpoints = vec![current_endpoint.clone()];
+        confirmed.members[index].updated_at = now;
+        let mut stale = confirmed.clone();
+        stale.members[index].endpoints = vec![sinomo_network::daemon_lan_endpoint(
+            &target,
+            "192.0.2.11:21353".into(),
+            20,
+        )];
+        stale.members[index].updated_at = now - time::Duration::seconds(60);
+        write_cluster_state(&paths, &stale).unwrap();
+        let mut host = MemoryMutationHost::new(&confirmed);
+        let before_commit_index = host.commit_index;
+        if rename {
+            let name = if changed {
+                "new name".into()
+            } else {
+                confirmed.members[index].display_name.clone()
+            };
+            let update = update_cluster_node_name_with_host(
+                &paths,
+                stale,
+                target.clone(),
+                name,
+                now + time::Duration::seconds(1),
+                &mut host,
+            )
+            .unwrap();
+            assert_eq!(update.changed, changed);
+        } else {
+            let role = if changed {
+                ClusterNodeRole::Mobile
+            } else {
+                confirmed.members[index].node_role.clone()
+            };
+            let update = update_cluster_node_role_with_host(
+                &paths,
+                stale,
+                target.clone(),
+                role,
+                now + time::Duration::seconds(1),
+                &mut host,
+            )
+            .unwrap();
+            assert_eq!(update.changed, changed);
+        }
+        if !changed {
+            assert_eq!(
+                host.commit_index, before_commit_index,
+                "repairing a derived projection cannot manufacture a quorum write"
+            );
+        }
+        let canonical: ClusterMemberRecord = host
+            .store
+            .get(&cluster_member_key(&target))
+            .unwrap()
+            .decode()
+            .unwrap();
+        let reopened = read_cluster_state_without_kv(&paths).unwrap();
+        let projected = reopened
+            .members
+            .iter()
+            .find(|m| m.node_id == target)
+            .unwrap();
+        assert_eq!(canonical.endpoints, vec![current_endpoint]);
+        assert_eq!(
+            projected, &canonical,
+            "the confirmed attribute update must not promote an older endpoint body under its new member timestamp"
+        );
+    }
+
+    #[test]
+    fn member_attribute_projection_role_keeps_confirmed_endpoints() {
+        attribute_projection_endpoint_generation_control(false, true);
+    }
+
+    #[test]
+    fn member_attribute_projection_name_keeps_confirmed_endpoints() {
+        attribute_projection_endpoint_generation_control(true, true);
+    }
+
+    #[test]
+    fn member_attribute_projection_unchanged_role_repairs_only_the_local_copy() {
+        attribute_projection_endpoint_generation_control(false, false);
+    }
+
+    #[test]
+    fn member_attribute_projection_unchanged_name_repairs_only_the_local_copy() {
+        attribute_projection_endpoint_generation_control(true, false);
+    }
+
+    #[test]
+    fn member_attribute_projection_preserves_owned_listener_and_newer_projection() {
+        let (mut confirmed, _, now) = non_voting_member_state();
+        let target = confirmed.local_node_id.clone();
+        let index = confirmed
+            .members
+            .iter()
+            .position(|member| member.node_id == target)
+            .unwrap();
+        confirmed.members[index].endpoints = vec![sinomo_network::daemon_lan_endpoint(
+            &target,
+            "192.0.2.11:21353".into(),
+            20,
+        )];
+        let mut local = confirmed.clone();
+        let current = sinomo_network::daemon_lan_endpoint(&target, "192.0.2.22:21353".into(), 20);
+        local.members[index].endpoints = vec![current.clone()];
+        let temp = sinomo_testdir::TestDir::new("cluster-attribute-owner-generation");
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(temp.path()));
+        paths.ensure().unwrap();
+        write_cluster_state(&paths, &local).unwrap();
+        let mut host = MemoryMutationHost::new(&confirmed);
+        update_cluster_node_role_with_host(
+            &paths,
+            local,
+            target.clone(),
+            ClusterNodeRole::Mobile,
+            now + time::Duration::seconds(1),
+            &mut host,
+        )
+        .unwrap();
+        let projected = read_cluster_state_without_kv(&paths).unwrap();
+        let member = projected
+            .members
+            .iter()
+            .find(|member| member.node_id == target)
+            .unwrap();
+        assert_eq!(member.node_role, ClusterNodeRole::Mobile);
+        assert_eq!(member.endpoints, vec![current]);
+        let bytes = std::fs::read(&paths.state).unwrap();
+        update_local_confirmed_member_if_present(&paths, &confirmed.members[index], 0, 0, false)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&paths.state).unwrap(),
+            bytes,
+            "a delayed old projection cannot replace the accepted generation"
+        );
     }
 
     #[test]

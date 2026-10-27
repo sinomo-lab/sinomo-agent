@@ -1166,6 +1166,7 @@ impl ClusterKvTxnQuorumAsyncHost for InviteChallengeReadHost {
 }
 struct InviteChallengeNativeAccess<'a> {
     paths: &'a ClusterPaths,
+    allow_forwarding: bool,
 }
 impl sinomo_service::ClusterAccess for InviteChallengeNativeAccess<'_> {
     fn kv_get_local(
@@ -1214,7 +1215,7 @@ impl sinomo_service::ClusterAccess for InviteChallengeNativeAccess<'_> {
                 &mut state,
                 keys,
                 ClusterControlPlaneTimeouts::default_daemon_transport()
-                    .kv_txn_quorum_options(false),
+                    .kv_txn_quorum_options(self.allow_forwarding),
                 &mut InviteChallengeReadHost,
             )
             .await
@@ -1245,12 +1246,20 @@ fn native_test_invite_challenge_proof(
         paths,
         identity,
         request,
-        &InviteChallengeNativeAccess { paths },
+        &InviteChallengeNativeAccess {
+            paths,
+            allow_forwarding: false,
+        },
     ))
 }
 
-#[test]
-fn cluster_invite_challenge_proof_creation_uses_network_state() {
+fn native_invite_challenge_fixture() -> (
+    sinomo_testdir::TestDir,
+    ClusterPaths,
+    sinomo_node::NodeIdentity,
+    ClusterJoinInvite,
+    ClusterInviteChallengeRequest,
+) {
     let root = sinomo_testdir::TestDir::new("sinomo-network-invite-challenge-create");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -1299,6 +1308,13 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
         challenge: "create-proof-challenge".to_string(),
     };
 
+    (root, paths, identity, invite, request)
+}
+
+#[test]
+fn cluster_invite_challenge_proof_creation_uses_network_state() {
+    let (_root, paths, identity, invite, request) = native_invite_challenge_fixture();
+    let local_node_id = read_cluster_state_without_kv(&paths).unwrap().local_node_id;
     let proof = native_test_invite_challenge_proof(&paths, &identity, &request)
         .expect("create native authoritative proof");
 
@@ -1308,6 +1324,147 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
     assert_eq!(proof.responder_public_key, identity.public_key);
     verify_cluster_invite_challenge_proof(&invite, &request.challenge, &proof)
         .expect("created proof verifies");
+}
+
+fn invite_control_root_identity(root: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(root).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+// Same real signer/read path and single-voter current-term authority as the
+// existing fixture. No remote host can supply an acknowledgement or proof.
+#[test]
+fn native_invite_challenge_reads_idle_resident_while_operation_owner_is_held() {
+    let (_root, paths, identity, invite, request) = native_invite_challenge_fixture();
+    let node_id = read_cluster_state_without_kv(&paths).unwrap().local_node_id;
+    let wal = paths.kv_paths().raft_wal_paths(&node_id);
+    let _pin = sinomo_kv::pin_resident_raft_node_registry_for_test(&wal).unwrap();
+    assert!(
+        sinomo_kv::with_cluster_kv_resident_read_projection(&wal, &node_id, |resident| resident
+            .read_index_state(),)
+        .is_some(),
+        "the real canonical resident is idle before admission"
+    );
+    let owner = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths())
+        .expect("actual operation admission owner");
+    let observed = sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths())
+        .expect("live held owner must be observable");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let start = Instant::now();
+    let result = runtime.block_on(async {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(start + Duration::from_secs(20)),
+            create_cluster_invite_challenge_proof(
+                &paths,
+                &identity,
+                &request,
+                &InviteChallengeNativeAccess {
+                    paths: &paths,
+                    allow_forwarding: true,
+                },
+            ),
+        )
+        .await
+    });
+    let after = sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths());
+    eprintln!(
+        "ADMISSION_CONTROL {}",
+        serde_json::json!({
+            "operation_root": paths.kv_paths().root, "resident_root": wal.root,
+            "owner_before": observed, "owner_after": after,
+            "elapsed_ms": start.elapsed().as_millis(), "result": format!("{result:?}"),
+            "physical_root": {
+            "metadata": format!("{:?}", std::fs::metadata(&paths.root)),
+            "unix_device_inode": invite_control_root_identity(&paths.root),
+        },
+            "capture": "one synchronous before and after snapshot; no historical coverage claimed",
+        })
+    );
+    assert_eq!(after, Some(observed));
+    assert_eq!(
+        sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()),
+        0
+    );
+    drop(owner);
+    assert!(sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths()).is_none());
+    let proof = result
+        .expect("unchanged 20-second challenge budget")
+        .expect("an idle canonical resident must not require the mutation operation permit");
+    verify_cluster_invite_challenge_proof(&invite, &request.challenge, &proof).unwrap();
+}
+
+#[test]
+fn native_invite_challenge_mutable_owner_cancellation_and_release_are_fail_closed() {
+    let (_root, paths, identity, invite, request) = native_invite_challenge_fixture();
+    let node_id = read_cluster_state_without_kv(&paths).unwrap().local_node_id;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let owner = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+    let observed = sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths()).unwrap();
+    let resident = open_cluster_raft_kv_node(&paths, &node_id).unwrap();
+    let access = InviteChallengeNativeAccess {
+        paths: &paths,
+        allow_forwarding: true,
+    };
+    let failed = runtime.block_on(create_cluster_invite_challenge_proof(
+        &paths, &identity, &request, &access,
+    ));
+    assert!(
+        matches!(&failed, Err(NetworkError::ClusterReadOnly { detail }) if detail.contains("admission is busy")),
+        "{failed:?}"
+    );
+    let cancelled = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            create_cluster_invite_challenge_proof(&paths, &identity, &request, &access),
+        )
+        .await
+    });
+    assert!(
+        cancelled.is_err(),
+        "caller cancellation must not mint a proof"
+    );
+    let after = sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths());
+    eprintln!(
+        "ADMISSION_CONTROL {}",
+        serde_json::json!({
+            "operation_root": paths.kv_paths().root,
+            "resident_root": paths.kv_paths().raft_wal_paths(&node_id).root,
+            "owner_before": observed, "owner_after_cancellation": after,
+            "failed_read": format!("{failed:?}"), "cancelled": cancelled.is_err(),
+        })
+    );
+    assert_eq!(after, Some(observed));
+    assert_eq!(
+        sinomo_kv::cluster_kv_raft_operation_queue_depth_for_test(&paths.kv_paths()),
+        0
+    );
+    drop(resident);
+    drop(owner);
+    assert!(sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths()).is_none());
+    let proof = runtime
+        .block_on(create_cluster_invite_challenge_proof(
+            &paths, &identity, &request, &access,
+        ))
+        .expect("actual owner release permits progress");
+    verify_cluster_invite_challenge_proof(&invite, &request.challenge, &proof).unwrap();
+    let successor = sinomo_kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+    let successor_observation =
+        sinomo_kv::cluster_kv_raft_operation_owner_for_test(&paths.kv_paths()).unwrap();
+    assert_ne!(
+        successor_observation.0,
+        after.unwrap().0,
+        "successor has a distinct permit lifetime"
+    );
+    drop(successor);
 }
 
 #[test]
@@ -13733,7 +13890,7 @@ fn telemetry_kv_read_views_keep_current_raft_over_stale_materialized_snapshot() 
 }
 
 #[test]
-fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
+fn telemetry_defers_but_connectivity_commits_materialize_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-volatile-deferred-materialized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -13827,15 +13984,24 @@ fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
         read_cluster_kv_snapshot(&paths)
             .expect("materialized after connectivity")
             .revision,
-        materialized_baseline.revision,
-        "multiple volatile updates should coalesce behind the materialized cache"
+        connectivity_snapshot.revision,
+        "committed connectivity must reach independent process projections"
     );
     assert!(
         read_cluster_kv_current_snapshot(&paths)
             .expect("current after connectivity")
             .get(&connectivity_key)
             .is_some(),
-        "deferred connectivity should still be visible through the raft view"
+        "committed connectivity must also remain visible through the raft view"
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("materialized connectivity")
+            .get(&connectivity_key)
+            .expect("connectivity record")
+            .decode::<ClusterConnectivityRecord>()
+            .expect("decode connectivity"),
+        connectivity
     );
 
     let mut renamed_local = state.members[0].clone();
@@ -13864,7 +14030,7 @@ fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
     );
     assert!(
         materialized.get(&connectivity_key).is_some(),
-        "structural flush should include the deferred connectivity record"
+        "structural flush must retain the published connectivity record"
     );
     assert_eq!(
         materialized
@@ -13961,7 +14127,7 @@ fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structura
 }
 
 #[test]
-fn imported_connectivity_route_change_materializes_snapshot() {
+fn imported_connectivity_route_change_and_renewal_materialize_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-imported-connectivity-route");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -14041,7 +14207,6 @@ fn imported_connectivity_route_change_materializes_snapshot() {
         "route read models must see imported connectivity without waiting for a structural import"
     );
 
-    let connectivity_revision = connectivity_snapshot.revision;
     let mut stable_refresh_store =
         InProcessKvStore::restore(connectivity_snapshot).expect("restore connectivity");
     let mut refreshed_connectivity = connectivity;
@@ -14050,20 +14215,29 @@ fn imported_connectivity_route_change_materializes_snapshot() {
     refreshed_connectivity.observed_at = now + time::Duration::seconds(5);
     refreshed_connectivity.expires_at = now + time::Duration::seconds(605);
     stable_refresh_store
-        .put_serde(connectivity_key, &refreshed_connectivity, None)
+        .put_serde(connectivity_key.clone(), &refreshed_connectivity, None)
         .expect("refreshed connectivity");
     let stable_refresh_snapshot = stable_refresh_store.snapshot().expect("snapshot");
 
     assert!(
-        !write_imported_cluster_kv_snapshot_if_changed(&paths, &stable_refresh_snapshot)
+        write_imported_cluster_kv_snapshot_if_changed(&paths, &stable_refresh_snapshot)
             .expect("import stable connectivity refresh"),
-        "stable imported connectivity refreshes should remain deferred while far from expiry"
+        "committed renewals must reach independent readers even without a route change"
     );
     assert_eq!(
         read_cluster_kv_snapshot(&paths)
             .expect("materialized after stable connectivity refresh")
             .revision,
-        connectivity_revision
+        stable_refresh_snapshot.revision
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("renewed materialized connectivity")
+            .get(&connectivity_key)
+            .expect("renewed connectivity record")
+            .decode::<ClusterConnectivityRecord>()
+            .expect("decode renewed connectivity"),
+        refreshed_connectivity
     );
 }
 
@@ -26128,7 +26302,7 @@ fn connectivity_full_sync_batches_large_stale_deletions() {
 }
 
 #[test]
-fn connectivity_sync_refreshes_stable_records_near_expiry() {
+fn connectivity_sync_does_not_persist_time_only_freshness() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-refresh");
     let data_dir = sinomo_local::SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -26157,10 +26331,8 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         last_failure_at: None,
         failure_reason: None,
         observed_at: now - time::Duration::seconds(300),
-        // Inside the connectivity probe margin but outside the generic
-        // network-info margin. Local renewal and KV renewal must stay one
-        // generation so low-frequency node roles cannot let the older KV row
-        // lapse before their next scheduled tick.
+        // Inside the existing probe margin: the live observation may refresh,
+        // but time alone must not author a durable source generation.
         expires_at: now + time::Duration::seconds(90),
     };
     let mut incoming = stored.clone();
@@ -26192,8 +26364,8 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
     .expect("connectivity sync ops");
     assert_eq!(
         ops.len(),
-        1,
-        "stable connectivity records near expiry must refresh their KV TTL"
+        0,
+        "time-only freshness inside the margin must not mutate KV"
     );
 
     stored.expires_at = now + time::Duration::seconds(300);
@@ -26213,7 +26385,7 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
     let ops = cluster_connectivity_full_sync_batch_ops(
         &paths,
         &source_node_id,
-        &[incoming],
+        &[incoming.clone()],
         sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
     )
     .expect("fresh ops");
@@ -26221,6 +26393,19 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         ops.is_empty(),
         "fresh stable connectivity records should not be rewritten just to update timestamps"
     );
+    stored.expires_at = now - time::Duration::seconds(1);
+    let key = cluster_connectivity_key(&stored.source_node_id, &stored.target_node_id, &stored.endpoint_id);
+    store.put_serde(key, &stored, None).unwrap();
+    write_cluster_kv_snapshot(&paths, &store.snapshot().unwrap()).unwrap();
+    assert!(cluster_connectivity_full_sync_batch_ops(
+        &paths, &source_node_id, &[incoming.clone()], sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    ).unwrap().is_empty(), "raw expired canonical rows remain semantic baselines, never live routes");
+    incoming.state = ClusterConnectivityState::Unreachable;
+    incoming.consecutive_failures = 3;
+    assert_eq!(cluster_connectivity_full_sync_batch_ops(
+        &paths, &source_node_id, &[incoming], sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    ).unwrap().len(), 1, "a genuine health transition still requires publication");
+
 }
 
 #[test]

@@ -347,6 +347,22 @@ docker/measure-final.sh 60 90
 `docker/test-rollout-recovery.sh` additionally needs compatible baseline and
 candidate Linux binaries; see the Docker guide for its inputs.
 
+The ignored rollout-host case
+`desired::native_watch_route_tests::desired_watch_uses_real_main_route_when_authority_endpoint_is_unreachable`
+requires a live, owned segmented dev cluster. Build and seal the matching
+`sinomo-rollout-host` libtest, mount it read-only in node6, and execute that exact
+case there with `--ignored --nocapture`, `SINOMO_TEST_EXTERNAL_MAIN_WATCH=1`,
+`SINOMO_TEST_WATCH_DATA_DIR=/data`, and `SINOMO_DATA_DIR=/data`. Require an actual
+one-test summary; the ordinary whole executable intentionally ignores it.
+The fixture installs the same local-Raft ownership denial and KV directory as
+the real shadow before reading state. It requires actual endpoint-only
+pre-delivery refusal, then verifies the same authority's node-addressed watch
+registration, read barrier, drain and cancellation using production timeouts.
+It supplies no authority, connectivity records or successful replies. Keep its
+output and original watch identity, and run it before settling measurements so
+its work and delayed writes remain covered. This control does not establish
+multi-voter failover, crash recovery or the cause of an earlier failed run.
+
 These commands can take substantial time and create containers, volumes, and
 artifacts. Read their options, use a distinct Compose project where supported,
 and preserve the generated failure bundle before teardown.

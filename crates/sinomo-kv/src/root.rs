@@ -430,8 +430,8 @@ pub use raft::{
 #[cfg(any(test, feature = "test-support"))]
 pub use raft::{
     ResidentRaftNodeRegistryPin, clear_process_local_raft_access_denial_for_test,
-    cluster_kv_raft_operation_queue_depth_for_test, evict_resident_raft_node_for_test,
-    pin_resident_raft_node_registry_for_test,
+    cluster_kv_raft_operation_owner_for_test, cluster_kv_raft_operation_queue_depth_for_test,
+    evict_resident_raft_node_for_test, pin_resident_raft_node_registry_for_test,
 };
 #[cfg(test)]
 pub(crate) use request::lock_cluster_kv_request_attempt_ledger_for_test;
@@ -504,6 +504,7 @@ pub use rpc::{
     validate_cluster_kv_authoritative_entry_read, validate_cluster_kv_authoritative_snapshot_read,
     validate_cluster_kv_authoritative_watch_start_response,
     validate_cluster_kv_current_term_authority_proof, validate_cluster_kv_request_outcome_read,
+    validate_cluster_kv_txn_authority_proof,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use snapshot::evict_cluster_kv_cached_snapshot_arc_for_test;

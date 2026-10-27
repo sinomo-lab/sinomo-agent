@@ -44,6 +44,10 @@ use crate::{
 /// may mutate; independently opened stale instances remain fenced. Read,
 /// snapshot, prefix-proof, and replication-cursor operations remain usable.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(
+    into = "DfsMetadataShardWriteFreezeWire",
+    try_from = "DfsMetadataShardWriteFreezeWire"
+)]
 pub struct DfsMetadataShardWriteFreeze {
     pub handoff_id: String,
     pub retiring_epoch: u64,
@@ -64,6 +68,90 @@ pub struct DfsMetadataShardWriteFreeze {
     /// advances this proof before pruning the journal history needed to
     /// reconstruct it. Current markers always carry the exact proof.
     pub rebind_prefix_proof: crate::DfsMetadataPrefixProof,
+    /// New primary rotations retain their complete original repair cut.
+    /// Legacy completed markers cannot invent missing historical custody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_custody: Option<crate::DfsRepairHandoffCut>,
+}
+
+// A new custody-bearing marker cannot be interpreted by an older binary as
+// an ordinary metadata-only freeze. Keep legacy completed markers readable,
+// but put the new contract in an explicit envelope: old readers lack their
+// required top-level handoff_id and fail closed rather than ignore custody.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum DfsMetadataShardWriteFreezeWire {
+    CustodyV1 {
+        repair_custody_v1: DfsMetadataShardWriteFreezePayload,
+    },
+    Legacy(DfsMetadataShardWriteFreezePayload),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DfsMetadataShardWriteFreezePayload {
+    handoff_id: String,
+    retiring_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activated_epoch: Option<u64>,
+    journal_sequence: u64,
+    state_fingerprint: String,
+    rebind_prefix_proof: crate::DfsMetadataPrefixProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repair_custody: Option<crate::DfsRepairHandoffCut>,
+}
+
+impl From<DfsMetadataShardWriteFreeze> for DfsMetadataShardWriteFreezeWire {
+    fn from(value: DfsMetadataShardWriteFreeze) -> Self {
+        let payload = DfsMetadataShardWriteFreezePayload {
+            handoff_id: value.handoff_id,
+            retiring_epoch: value.retiring_epoch,
+            activated_epoch: value.activated_epoch,
+            journal_sequence: value.journal_sequence,
+            state_fingerprint: value.state_fingerprint,
+            rebind_prefix_proof: value.rebind_prefix_proof,
+            repair_custody: value.repair_custody,
+        };
+        if payload.repair_custody.is_some() {
+            Self::CustodyV1 {
+                repair_custody_v1: payload,
+            }
+        } else {
+            Self::Legacy(payload)
+        }
+    }
+}
+
+impl TryFrom<DfsMetadataShardWriteFreezeWire> for DfsMetadataShardWriteFreeze {
+    type Error = &'static str;
+    fn try_from(wire: DfsMetadataShardWriteFreezeWire) -> std::result::Result<Self, Self::Error> {
+        let payload = match wire {
+            DfsMetadataShardWriteFreezeWire::CustodyV1 {
+                repair_custody_v1: payload,
+            } if payload
+                .repair_custody
+                .as_ref()
+                .is_some_and(|cut| cut.version == 1) =>
+            {
+                payload
+            }
+            DfsMetadataShardWriteFreezeWire::Legacy(payload)
+                if payload.repair_custody.is_none() =>
+            {
+                payload
+            }
+            _ => return Err("unsupported repair custody freeze marker"),
+        };
+        Ok(Self {
+            handoff_id: payload.handoff_id,
+            retiring_epoch: payload.retiring_epoch,
+            activated_epoch: payload.activated_epoch,
+            journal_sequence: payload.journal_sequence,
+            state_fingerprint: payload.state_fingerprint,
+            rebind_prefix_proof: payload.rebind_prefix_proof,
+            repair_custody: payload.repair_custody,
+        })
+    }
 }
 
 /// Capability for one replica ingest from an already validated active source.
@@ -2151,6 +2239,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         _retiring_epoch: u64,
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
         Ok(None)
+    }
+
+    fn bind_metadata_shard_repair_handoff_cut(
+        &mut self,
+        _shard_id: &DfsMetadataShardId,
+        _cut: &crate::DfsRepairHandoffCut,
+    ) -> Result<()> {
+        Err(MetadataBackendError::Serde(
+            "backend does not support exact repair custody handoff".into(),
+        ))
     }
 
     /// Durably mark the exact matching freeze as activated without binding

@@ -1367,28 +1367,43 @@ impl LocalContentStore {
         let sentinel = initialization::marker(&self.root)?
             .unwrap_or_else(ContentStoreReservationBatchSentinel::new);
         let bytes = encode_content_reservation_batch_sentinel(&sentinel)?;
-        match write_file_create_new_atomic(&sentinel_path, &bytes) {
-            Ok(()) => {
-                self.sync_new_sharded_record_parents(
-                    &reservation_root,
-                    sentinel_path.parent(),
-                    root_existed,
-                    shard_existed,
-                )?;
-            }
-            Err(ContentStoreError::Io { source, .. })
-                if source.kind() == io::ErrorKind::AlreadyExists =>
-            {
-                let existing =
-                    decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
-                validate_content_reservation_batch_sentinel(&existing)?;
-                if initialization::pending(&self.root)? && existing != sentinel {
-                    return Err(ContentStoreError::InvalidContentLayout {
-                        message: "current content marker differs from initialization intent".into(),
-                    });
+        // The reservation lock serializes initialization. Reopening an existing
+        // marker must not stage and fsync a disposable copy only to discover
+        // AlreadyExists at publication. Retain atomic no-replace publication
+        // for a missing marker and still validate/sync every existing marker.
+        let created = if sentinel_path
+            .try_exists()
+            .map_err(|source| ContentStoreError::Io {
+                path: sentinel_path.clone(),
+                source,
+            })? {
+            false
+        } else {
+            match write_file_create_new_atomic(&sentinel_path, &bytes) {
+                Ok(()) => true,
+                Err(ContentStoreError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    false
                 }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
+        };
+        if created {
+            self.sync_new_sharded_record_parents(
+                &reservation_root,
+                sentinel_path.parent(),
+                root_existed,
+                shard_existed,
+            )?;
+        } else {
+            let existing = decode_content_reservation_batch_sentinel(&read_file(&sentinel_path)?)?;
+            validate_content_reservation_batch_sentinel(&existing)?;
+            if initialization::pending(&self.root)? && existing != sentinel {
+                return Err(ContentStoreError::InvalidContentLayout {
+                    message: "current content marker differs from initialization intent".into(),
+                });
+            }
         }
         // Windows rejects FlushFileBuffers for the read-only handle returned by
         // File::open, even when this process owns the file. Open the durable
@@ -7029,6 +7044,44 @@ mod tests {
     use super::*;
 
     static TEST_ORPHAN_CATALOG_OBSERVATION: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_current_store_open_does_not_stage_a_redundant_sentinel() {
+        let root = temp_root("existing_content_sentinel_no_stage");
+        let initialized = LocalContentStore::new(&root).unwrap();
+        let sentinel = initialized.content_reservation_batch_sentinel_path();
+        let shard = sentinel.parent().unwrap();
+        let bytes = fs::read(&sentinel).unwrap();
+        drop(initialized);
+        // A controlled fixture timestamp exposes transient create/unlink work
+        // even when the existing sentinel bytes are never replaced.
+        let directory = fs::File::open(shard).unwrap();
+        directory
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        let before = fs::metadata(shard).unwrap().modified().unwrap();
+        let reopened = LocalContentStore::new(&root).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(shard).unwrap().modified().unwrap(),
+            before,
+            "opening an initialized store must not stage and remove an already-present sentinel"
+        );
+        // This remains a normal writer with its existing durability fences.
+        let object = sinomo_core::Id::generate().to_string();
+        let version = sinomo_core::Id::generate().to_string();
+        reopened
+            .put_object_version(&object, &version, b"genuine activity")
+            .unwrap();
+        assert_eq!(
+            reopened.read_object_version(&object, &version).unwrap().1,
+            b"genuine activity"
+        );
+        drop(reopened);
+        drop(directory);
+        cleanup(&root);
+    }
 
     #[cfg(windows)]
     #[test]

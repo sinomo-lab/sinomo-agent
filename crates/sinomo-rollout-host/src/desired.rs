@@ -69,8 +69,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
         Self::Error,
     > {
         Box::pin(async move {
-            sinomo_daemon::start_cluster_kv_authoritative_watch_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::start_cluster_kv_authoritative_watch_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 prefix,
                 timeout,
                 self.runtime,
@@ -88,8 +89,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
     ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::KvLocalRead<Option<KvEntry>>, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::fetch_cluster_kv_local_entry_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::fetch_cluster_kv_local_entry_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 key,
                 timeout,
                 self.runtime,
@@ -107,8 +109,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
     ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::ClusterKvWatchDrainResponse, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::drain_cluster_kv_watch_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::drain_cluster_kv_watch_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 request,
                 timeout,
                 self.runtime,
@@ -126,8 +129,9 @@ impl DesiredRolloutReactorHost for DesiredRolloutHost<'_> {
     ) -> DesiredRolloutReactorFuture<'a, sinomo_core::kv::ClusterKvWatchCancelResponse, Self::Error>
     {
         Box::pin(async move {
-            sinomo_daemon::cancel_cluster_kv_watch_from_endpoint_async(
-                endpoint,
+            sinomo_daemon::cancel_cluster_kv_watch_from_node_async(
+                self.cluster_paths,
+                &endpoint.node_id,
                 request,
                 timeout,
                 self.runtime,
@@ -220,4 +224,214 @@ fn reconcile_desired_rollout_record(
         "desired rollout reconciliation completed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod native_watch_route_tests {
+    use super::*;
+    use sinomo_core::cluster::ClusterKvPathsExt;
+
+    /// Runs only inside the lane's already initialized disposable node6, using
+    /// its actual Main, membership, keys and remote authority. No test server
+    /// manufactures a watch registration, read proof, drain or cancellation.
+    #[tokio::test]
+    #[ignore = "requires the explicit owned segmented Docker fixture"]
+    async fn desired_watch_uses_real_main_route_when_authority_endpoint_is_unreachable() {
+        assert_eq!(
+            std::env::var("SINOMO_TEST_EXTERNAL_MAIN_WATCH").as_deref(),
+            Ok("1")
+        );
+        let root = std::env::var_os("SINOMO_TEST_WATCH_DATA_DIR")
+            .expect("explicit disposable DATA path; never use an ambient user root");
+        let data = sinomo_core::local::SinomoDataDir::new(std::path::PathBuf::from(root));
+        assert_eq!(
+            std::env::var_os("SINOMO_DATA_DIR").as_deref(),
+            Some(data.root().as_os_str()),
+            "the direct control and routed callback must use the same actual DATA identity"
+        );
+        // Match the shadow's actual startup order: deny local voter ownership
+        // before any state/routing read, then install its ordinary read model.
+        // Otherwise this external fixture follows the Main reader path rather
+        // than the materialized projection used by the host under test.
+        let shadow_paths = DaemonPaths::for_shadow(&data);
+        sinomo_daemon::deny_shadow_daemon_local_raft_access(&shadow_paths)
+            .expect("install the real shadow's local Raft ownership denial");
+        sinomo_core::cluster::install_kv_cluster_directory();
+        let cluster_paths = ClusterPaths::new(&data);
+        assert!(sinomo_core::kv::process_local_raft_access_is_denied(
+            &cluster_paths.kv_paths().raft
+        ));
+        let (routing_version, members, endpoints, connectivity) =
+            sinomo_core::network::cluster_directory_for(&cluster_paths)
+                .routing_records_snapshot()
+                .expect("the real shadow's observed routing projection")
+                .into_parts();
+        println!(
+            "watch_route_shadow_projection version={routing_version:?} members={} endpoints={} live_connectivity={} local_raft_denied=true",
+            members.len(),
+            endpoints.len(),
+            connectivity.len()
+        );
+        let state = sinomo_core::cluster::read_cluster_state(&cluster_paths).unwrap();
+        let main = sinomo_daemon::read_daemon_status(&DaemonPaths::new(&data)).unwrap();
+        assert_eq!(main.cluster.as_ref().unwrap().node_id, state.local_node_id);
+        assert_eq!(main.cluster.as_ref().unwrap().process, "daemon-main");
+        let runtime = tokio::runtime::Handle::current();
+        let host = DesiredRolloutHost {
+            paths: &shadow_paths,
+            cluster_paths: &cluster_paths,
+            runtime: &runtime,
+        };
+        let endpoint = host
+            .watch_targets()
+            .unwrap()
+            .into_iter()
+            .find(|endpoint| {
+                endpoint.node_id != state.local_node_id
+                    && endpoint.transport == sinomo_core::ClusterTransportKind::LanTcp
+            })
+            .expect("actual remote authority endpoint");
+        let prefix = format!(
+            "/test/dev-debug/watch-route/{}/",
+            sinomo_core::Id::generate()
+        );
+        println!(
+            "watch_route_fixture local={} target={} endpoint={} prefix={}",
+            state.local_node_id, endpoint.node_id, endpoint.address, prefix
+        );
+        // The old endpoint-only call cannot use the segmented route. Require
+        // an actual pre-delivery failure, never reinterpret uncertainty.
+        let direct = sinomo_daemon::start_cluster_kv_authoritative_watch_from_endpoint_async(
+            &endpoint,
+            &prefix,
+            sinomo_rollout::DESIRED_ROLLOUT_WATCH_START_TIMEOUT,
+            &runtime,
+        )
+        .await;
+        match direct {
+            Err(sinomo_daemon::DaemonError::NetworkDelivery {
+                address,
+                detail,
+                delivery_state,
+            }) => {
+                println!(
+                    "watch_route_direct_refusal address={address} delivery={delivery_state:?} detail={detail}"
+                );
+                assert_eq!(
+                    delivery_state,
+                    sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent
+                );
+            }
+            Ok(unexpected) => {
+                let cancelled = host
+                    .cancel_watch(
+                        &endpoint,
+                        &ClusterKvWatchCancelRequest {
+                            watch_id: unexpected.value.watch_id,
+                        },
+                        sinomo_rollout::DESIRED_ROLLOUT_WATCH_CANCEL_TIMEOUT,
+                    )
+                    .await;
+                panic!(
+                    "fixture unexpectedly has direct authority reachability; original watch cancellation={cancelled:?}"
+                );
+            }
+            Err(error) => {
+                panic!("direct outcome is not the required pre-delivery refusal: {error}")
+            }
+        }
+        // Keep the real standalone client's evidence, including a timeout
+        // before registration. This bounded in-process capture does not add
+        // probes, replace replies, or extend any watch deadline.
+        sinomo_core::network::start_network_timeline_capture(
+            sinomo_core::network::NETWORK_TIMELINE_DEFAULT_MAX_EVENTS,
+        ).expect("start this disposable client's bounded timeline");
+        let started = host
+            .start_watch(
+                &endpoint,
+                &prefix,
+                sinomo_rollout::DESIRED_ROLLOUT_WATCH_START_TIMEOUT,
+            )
+            .await;
+        let timeline = sinomo_core::network::stop_network_timeline_capture()
+            .expect("stop the disposable client timeline before later measured gates");
+        let events = timeline.events.iter().map(|event| serde_json::json!({
+            "sequence": event.sequence, "monotonic_ns": event.monotonic_ns,
+            "duration_ns": event.duration_ns, "trace_id": event.trace_id,
+            "span_id": event.span_id, "connection_id": event.connection_id,
+            "endpoint_correlation_id": event.endpoint_correlation_id,
+            "call_id": event.call_id, "frame_id": event.frame_id,
+            "stage": event.stage,
+            "stage_name": sinomo_core::network::network_timeline_stage_name(event.stage),
+            "flags": event.flags, "bytes": event.bytes, "aux": event.aux,
+        })).collect::<Vec<_>>();
+        println!("watch_route_client_timeline={}", serde_json::json!({
+            "started_monotonic_ns": timeline.started_monotonic_ns,
+            "captured_monotonic_ns": timeline.captured_monotonic_ns,
+            "max_events": timeline.max_events, "events": events,
+            "endpoint_identities": timeline.endpoint_identities,
+            "dropped_events": timeline.dropped_events, "overflowed": timeline.overflowed,
+            "active": timeline.active,
+            "qualification": "Actual client registration attempt; no supplied responses or timing subtraction. Missing events remain unavailable.",
+        }));
+        let started = started
+            .expect("same real authority is reachable through the node-addressed Main carrier");
+        let watch_id = started.value.watch_id;
+        println!(
+            "watch_route_registered watch_id={watch_id:?} authority={:?}",
+            started.authority
+        );
+        let verification = async {
+            if started.value.prefix != prefix
+                || started.value.next_revision != started.authority.revision.next()
+            {
+                return Err("watch prefix/barrier provenance changed".to_string());
+            }
+            let read = host
+                .read_local_entry(
+                    &endpoint,
+                    &format!("{prefix}missing"),
+                    sinomo_rollout::DESIRED_ROLLOUT_WATCH_READ_TIMEOUT,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if read.revision < started.authority.revision || read.value.is_some() {
+                return Err("fresh exact-key watch catch-up is inconsistent".to_string());
+            }
+            let drain = host
+                .drain_watch(
+                    &endpoint,
+                    &ClusterKvWatchDrainRequest {
+                        watch_id,
+                        wait_timeout_millis: sinomo_rollout::DESIRED_ROLLOUT_WATCH_DRAIN_WAIT
+                            .as_millis()
+                            .try_into()
+                            .unwrap(),
+                    },
+                    sinomo_rollout::DESIRED_ROLLOUT_WATCH_DRAIN_TIMEOUT,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if drain.watch_id != watch_id || !drain.events.is_empty() {
+                return Err(
+                    "drain changed identity or invented events for the fresh prefix".to_string(),
+                );
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        // Always drain the exact registration we actually received, even when
+        // the read/drain assertions failed. No alternate owner or fresh ID.
+        let cancelled = host
+            .cancel_watch(
+                &endpoint,
+                &ClusterKvWatchCancelRequest { watch_id },
+                sinomo_rollout::DESIRED_ROLLOUT_WATCH_CANCEL_TIMEOUT,
+            )
+            .await
+            .expect("cancel original actual registration");
+        assert_eq!(cancelled.watch_id, watch_id);
+        assert!(cancelled.cancelled);
+        verification.expect("real watch read/drain provenance");
+    }
 }

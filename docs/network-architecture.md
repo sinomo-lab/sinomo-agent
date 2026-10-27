@@ -135,6 +135,91 @@ change a node's status. Probe owners and routed-session executors submit
 observations through an explicit sink. The tracker validates ownership,
 deduplicates updates, expires stale facts, and publishes a new snapshot.
 
+The live routing view and the stored source generation are distinct. A periodic
+publication pass forwards the generation already committed by the observation
+owner; TTL expiry in a read view does not itself authorize a new source-set
+mutation or a quorum deletion. Expired stored observations remain unusable for
+routing and are not renewed by publication. Actual source updates, explicit
+clears, and topology revocations still reconcile through the existing
+cross-process snapshot fence and writer. Publication retries re-read stored
+source data, so a newer source generation wins without replacing its evidence
+with a clock-filtered omission.
+
+Routine liveness refreshes stay in the observing process's memory. The existing
+maintenance owner keeps the 900-second healthy/degraded TTL, 7200-second
+unreachable TTL and 120-second refresh margin. Its deadline follows accepted
+observations; Main binds those observations to confirmed semantic records.
+Uncommitted probe results cannot postpone that deadline. Semantic source changes
+still use the existing source writer and quorum publication. A passive shadow
+accepts only its own observations in RAM, fenced by the shared source snapshot;
+it gains neither publication ownership nor a local Raft dependency.
+Peer imports reconcile the actual persisted cut under the same writer lock before
+merging accepted RAM observations. They retain newer freshness only when it still
+matches the persisted semantic record; an unrelated import cannot roll it back
+to the old disk timestamp or persist a passive shadow's uncommitted health change.
+Newer external records and explicit source clears still supersede that cache.
+
+A cold routed caller can recover live evidence during carrier establishment
+through the existing authenticated `/cluster/network/connectivity` read. It
+accepts remote rows only from their authenticated source, against the exact
+canonical semantic baseline and current member/endpoint bindings, and rechecks
+the directory cut after the reads. Semantic matching uses the same predicate as
+quorum publication: a source-owned failure count may progress or reset within
+the same confirmed health state and failure reason. Such a count remains part
+of local failure-budget processing and route-cache ordering; its existing local
+persistence and reconciliation are unchanged. It does not require a redundant
+quorum update before an authenticated live observation can be used. State,
+failure-reason, endpoint and generation changes still require their existing
+confirmation. A successful direct read also supplies an actual local edge
+observation. Third-party rows cannot renew another source's
+evidence. Reads share the existing establishment deadline, have bounded
+concurrency, and are dropped on completion or cancellation. A pooled live carrier
+needs no such refresh. The original operation is dispatched only after carrier
+establishment, retaining its identity and body.
+
+When a source reply makes the next bridge reachable, the same request can read
+that bridge through the ordinary authenticated carrier. Each reachable source
+endpoint is queried at most once through this routed step, sharing the direct-read
+concurrency cap and original deadline. A process with cold observations cannot
+hide another process's fresh observations for the same node. Each read narrows
+endpoint selection within the existing authorized directory cut; the carrier pool
+also retains that terminal endpoint constraint and its normal owner-scope
+retirement. This adds no wire affinity or Main requirement. A routed reply supplies
+only its source-owned rows; it never invents a direct edge from the caller to that
+source. The collector does
+not recursively invoke freshness discovery or trust relayed third-party rows.
+Owner-local endpoint hints may remain in bootstrap records. The source reader
+excludes `LocalOnly` endpoints both from remote dials and from accepted remote
+edges; a peer's loopback listener does not name a listener on the caller's host.
+The bounded direct-read queue tries source-owned adjacent endpoint hints before
+unobserved or failed hints, using the latest exact local-source observation and
+then the endpoint's existing priority. This ordering prevents slow unrelated
+hints from occupying every slot first. Expired evidence can order a dial but
+cannot authorize a route, and newer failure/quarantine evidence still wins.
+
+Daemon ingress treats an authenticated peer closing the routed handshake before
+an application stream exists as a normal connection exit, recorded at debug
+level. The distinction comes from typed handshake I/O, not error text. Invalid
+authentication, malformed frames, unknown I/O errors and failures after relay or
+application dispatch remain errors. Existing client error text and request
+delivery classification are unchanged.
+
+These observations are lost on process restart. Stored expired rows remain
+expired and serve only as semantic baselines or endpoint hints. Cold startup,
+bootstrap and rejoin are genuine activity and may persist necessary changes;
+time-only refreshes after stabilization do not write. Older peers without usable
+live source evidence cannot make an expired route valid. Neither live evidence
+nor the raw baseline changes the existing read-authority classification,
+semantic routing generation or effect-authority checks.
+
+The existing Main maintenance turn also materializes genuine remote endpoint
+changes into the public bootstrap projection. This is limited to already-known
+members whose identity and all non-endpoint attributes are unchanged. It
+recaptures the merged view under the existing state-writer lock, preserves local
+listeners, and does not advance an authority revision or append a quorum command.
+An unchanged turn leaves the file untouched. Ordinary reads and passive shadow
+maintenance do not perform this materialization.
+
 Routed edge feedback preserves a typed distinction between transport failure and
 identity mismatch. A refused connection, timeout, or expired handshake during
 restart remains eligible for transport recovery; it must not be persisted as a
@@ -188,6 +273,13 @@ directory interface containing:
 Local observations may supplement route choice for their source node. They do
 not authorize an absent member, extend an expired remote observation, or
 override a newer non-empty authoritative projection.
+
+When a local owner replaces its complete TCP listener observations, retirement
+also removes mDNS copies of those retired listeners. Otherwise an old discovered
+IP can survive a restart and later name a different node. Only current local
+static/observed listener input triggers this replacement; an mDNS hint alone
+does not. The same retirement rule applies when overlaying older KV records,
+while other transports and independently published routes remain intact.
 
 ## Routing Contract
 

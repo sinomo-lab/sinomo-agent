@@ -1,6 +1,121 @@
 use super::*;
 
 #[test]
+fn native_replica_validation_restores_all_rows_after_success_and_late_rejection() {
+    let (runtime, mut service, config) = native_case("native-replica-validation-rollback", 1);
+    directory(&mut service, "/services/validation-rollback");
+    let shard = DfsMetadataShardId::new(&config.shard_id);
+    let root =
+        crate::local_dfs_metadata_shard_path(runtime.data_dir(&config.primary_node_id), &shard);
+    // An actual earlier inspection cut supplies tables, never author authority.
+    // Validation below is in-memory only; native Main produces every input.
+    let mut earlier = LocalSobjMetadataBackend::open_for_inspection(shard.clone(), &root).unwrap();
+    let before_sequence = earlier.journal_last_sequence();
+    let before_tables = earlier.tables.clone();
+    let before_prefix = earlier.prefix_proof.clone();
+    let before_materialized = earlier.materialized_through_sequence;
+    let first = directory(&mut service, "/services/validation-rollback/first");
+    let second = directory(&mut service, "/services/validation-rollback/second");
+    let suffix = entries(&service, &shard)
+        .into_iter()
+        .filter(|entry| entry.sequence > before_sequence)
+        .collect::<Vec<_>>();
+    assert!(suffix.len() >= 4, "two actual prepare/commit pairs");
+    let prepare_index = suffix
+        .iter()
+        .rposition(|entry| {
+            matches!(
+                entry.mutation,
+                DfsMetadataMutation::PrepareOperationV7 { .. }
+            )
+        })
+        .unwrap();
+    let DfsMetadataMutation::PrepareOperationV7 { record, .. } = &suffix[prepare_index].mutation
+    else {
+        unreachable!()
+    };
+    let digest = record.digest.clone();
+    let operation = crate::DfsMetadataAuthorityOperation::PreparedOperation {
+        operation_id: digest.operation_id.clone(),
+        file_system_id: digest.file_system_id.clone(),
+        shard_id: digest.shard_id.clone(),
+        owner_epoch: digest.owner_epoch,
+        prepare_sequence: digest.prepare_sequence,
+        payload_digest: digest.payload_digest.clone(),
+    };
+    let assert_restored = |backend: &LocalSobjMetadataBackend| {
+        assert_eq!(
+            backend.tables, before_tables,
+            "all rows and derived indexes remain exact"
+        );
+        assert_eq!(backend.journal_last_sequence(), before_sequence);
+        assert_eq!(backend.materialized_through_sequence, before_materialized);
+        assert_eq!(backend.prefix_proof, before_prefix);
+        assert!(!backend.tables.objects.contains_key(&first.object_id));
+        assert!(!backend.tables.objects.contains_key(&second.object_id));
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            earlier
+                .validate_replica_journal_suffix(&suffix, Some(&operation))
+                .unwrap(),
+            Some(digest.clone())
+        );
+        assert_restored(&earlier);
+    }
+    // The whole batch has passed checked replay before this proof rejection.
+    let mut wrong_operation = operation.clone();
+    let crate::DfsMetadataAuthorityOperation::PreparedOperation { owner_epoch, .. } =
+        &mut wrong_operation;
+    *owner_epoch += 1;
+    assert!(
+        earlier
+            .validate_replica_journal_suffix(&suffix, Some(&wrong_operation))
+            .is_err()
+    );
+    assert_restored(&earlier);
+    let mut missing_prepare = suffix.clone();
+    missing_prepare.remove(prepare_index);
+    assert!(
+        earlier
+            .validate_replica_journal_suffix(&missing_prepare, None)
+            .is_err()
+    );
+    assert_restored(&earlier);
+    let mut changed_commit = suffix.clone();
+    let DfsMetadataMutation::CommitPreparedOperationV7 { digest, .. } =
+        &mut changed_commit.last_mut().unwrap().mutation
+    else {
+        panic!("actual terminal native commit");
+    };
+    digest.payload_digest.push_str("-corrupt");
+    assert!(
+        earlier
+            .validate_replica_journal_suffix(&changed_commit, None)
+            .is_err()
+    );
+    assert_restored(&earlier);
+    assert_eq!(
+        earlier
+            .validate_replica_journal_suffix(&suffix, None)
+            .unwrap(),
+        None
+    );
+    assert_restored(&earlier);
+    // Neither failed nor successful validation alters the actual producer.
+    assert_eq!(
+        directory(&mut service, "/services/validation-rollback/first"),
+        first
+    );
+    assert_eq!(
+        directory(&mut service, "/services/validation-rollback/second"),
+        second
+    );
+    drop((earlier, service));
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_commit_body_lookup_uses_exact_resident_content_without_current_view() {
     let (runtime, mut service, config) = native_case("native-immutable-commit-body", 1);
     directory(&mut service, "/services/body-lookup");

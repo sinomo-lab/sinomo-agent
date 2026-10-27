@@ -163,6 +163,8 @@ impl RetryFixture {
                     | DaemonDfsPreDispatchTestPoint::BeforeContentCopyStep { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeReplicaContextComparison
+                    | DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { .. }
+                    | DaemonDfsPreDispatchTestPoint::PublishGenerationWorkerStarted { .. }
                     | DaemonDfsPreDispatchTestPoint::AfterReport { .. } => {}
                     DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess
                     | DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess

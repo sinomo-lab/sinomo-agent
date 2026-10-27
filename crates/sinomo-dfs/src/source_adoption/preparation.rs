@@ -2472,8 +2472,18 @@ mod actual_unbound_capture_tests {
                     }))
                 };
                 registration.release();
-                if let Some(capture) = capture {
-                    let _ = capture.join();
+                let uncaptured_outcome = capture.map(|capture| format!("{:?}", capture.join()));
+                if held.is_err() {
+                    std::fs::write(
+                        native.data_dir(&node).root().join("boundary-diagnostic-cancelled-offer-registration.json"),
+                        serde_json::to_vec_pretty(&serde_json::json!({
+                            "plan": original_plan, "original_token": original_token,
+                            "wait_result": format!("{held:?}"),
+                            "actual_capture_thread_result_after_release": uncaptured_outcome,
+                            "qualification": "Actual capture result retained after the unchanged wait failed and the existing registration gate was released; not evidence that the checkpoint passed."
+                        })).unwrap(),
+                    ).unwrap();
+                    eprintln!("actual source registration wait={held:?}; capture after release={uncaptured_outcome:?}");
                 }
                 let held = held.expect("actual fresh writer reached post-capture registration");
                 assert_eq!(held.plan, original_plan);

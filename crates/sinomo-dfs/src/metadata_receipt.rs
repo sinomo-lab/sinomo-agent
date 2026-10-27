@@ -31,6 +31,24 @@ pub(crate) fn receipt_for_replica_from_backend<B: DfsMetadataBackend + ?Sized>(
     Ok(found)
 }
 
+/// Match content evidence already admitted by the metadata writer. The receipt
+/// publisher is not necessarily the write coordinator (or the file owner), so
+/// publisher identity is not the retained byte subject. Authority is enforced
+/// when recording the receipt; callers still check assigned replicas and W.
+pub(crate) fn recorded_receipt_matches_version(
+    receipt: &DfsReplicaReceiptRecord,
+    version: &crate::DfsObjectVersionRecord,
+) -> bool {
+    let Some(plan) = version.content_durability.as_ref() else {
+        return false;
+    };
+    version.content_hash.is_some()
+        && receipt.receipt.file_system_id == version.file_system_id
+        && receipt.receipt.object_id == version.object_id
+        && receipt.receipt.committed_version == plan.source_version
+        && receipt.content_hash == version.content_hash
+}
+
 pub(crate) fn replay_receipt_matches_existing(
     existing: &DfsReplicaReceiptRecord,
     replayed: &DfsReplicaReceiptRecord,

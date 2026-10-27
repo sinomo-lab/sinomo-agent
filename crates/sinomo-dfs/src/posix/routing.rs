@@ -1060,10 +1060,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             _ => None,
         };
         if let DfsNamespaceOperation::ContentReference { request } = operation {
-            self.ensure_path_not_in_cross_shard_flight(
-                &request.identity.file_system_id,
-                &request.path,
-            )?;
             return self
                 .apply_content_reference_local(request)
                 .map_err(DfsPosixError::from);
