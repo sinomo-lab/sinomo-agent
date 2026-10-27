@@ -104,6 +104,7 @@ struct DriverRequest {
     target: NodeId,
     nonce: String,
     kind: ProbeKind,
+    owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +128,7 @@ struct DriverResponse {
     nonce: String,
     path: ProbePath,
     contact: Option<sinomo_core::ClusterEndpointRecord>,
+    source_contact: Option<sinomo_core::ClusterEndpointRecord>,
     result: Result<ProbeReply, ProbeFailure>,
 }
 
@@ -564,11 +566,22 @@ fn probe(
     nonce: String,
     budget: Duration,
 ) -> TestResult<DriverResponse> {
+    probe_with_contact(node, target, kind, nonce, budget, None)
+}
+fn probe_with_contact(
+    node: &mut NativeNode,
+    target: &NodeId,
+    kind: ProbeKind,
+    nonce: String,
+    budget: Duration,
+    owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
+) -> TestResult<DriverResponse> {
     let identity = node.alive_identity()?;
     let request = DriverRequest {
         target: target.clone(),
         nonce: nonce.clone(),
         kind,
+        owned_contact_hint,
     };
     let response = local_rpc(
         node,
@@ -582,6 +595,12 @@ fn probe(
     assert_eq!(result.target, *target);
     assert_eq!(result.nonce, nonce);
     assert_eq!(result.path, kind.path());
+    if let Some(contact) = &result.source_contact {
+        assert_eq!(contact.node_id, node.input.node_id);
+        assert_eq!(contact.address, node.hello.as_ref().unwrap().address);
+        assert!(matches!(contact.transport,
+            sinomo_core::ClusterTransportKind::Loopback | sinomo_core::ClusterTransportKind::LanTcp));
+    }
     if let Some(contact) = &result.contact {
         assert_eq!(&contact.node_id, target);
         assert!(matches!(
@@ -673,7 +692,7 @@ fn record_probe(
             let file = root.join(format!("probe-{index:03}.sobj"));
             write_data(&file, value)?;
             let bytes = fs::read(&file)?;
-            serde_json::json!({"phase":phase,"path":value.path,"selected_contact":value.contact,"source":value.source_node_id,"source_pid":value.source_pid,"target":value.target,"nonce":value.nonce,
+            serde_json::json!({"phase":phase,"path":value.path,"selected_contact":value.contact,"source_contact":value.source_contact,"source":value.source_node_id,"source_pid":value.source_pid,"target":value.target,"nonce":value.nonce,
                 "actual_result":match &value.result {Ok(reply)=>serde_json::json!({"route":reply.route,"responder":reply.responder_node_id,"body_bytes":reply.body.len()}),Err(error)=>serde_json::json!({"error":error})},
                 "evidence":file,"blake3":blake3::hash(&bytes).to_hex().to_string()})
         }
@@ -683,6 +702,22 @@ fn record_probe(
     };
     report["probes"].as_array_mut().unwrap().push(summary);
     Ok(())
+}
+fn observed_owned_contact(
+    node: &mut NativeNode,
+    report: &serde_json::Value,
+) -> TestResult<sinomo_core::ClusterEndpointRecord> {
+    let identity = node.alive_identity()?;
+    let entry = report["probes"].as_array().unwrap().iter().rev().find(|entry| {
+        entry["source"] == node.input.node_id.as_str()
+            && entry["source_pid"] == identity.pid
+            && !entry["source_contact"].is_null()
+    }).ok_or("same owned process has no actual observed local endpoint; no synthesis")?;
+    let endpoint: sinomo_core::ClusterEndpointRecord =
+        serde_json::from_value(entry["source_contact"].clone())?;
+    assert_eq!(endpoint.node_id, node.input.node_id);
+    assert_eq!(endpoint.address, node.hello.as_ref().unwrap().address);
+    Ok(endpoint) // Route DATA only; the native carrier still checks current identity.
 }
 fn wait_for_native_ping(
     nodes: &mut [NativeNode],
@@ -1090,6 +1125,28 @@ fn run_native_process_case(
                 "native positive prerequisite has no actual complete full3 PREFIX round within original startup60s"
             );
         }
+        let survivor_contacts = if prefix_round {
+            let b_contact = observed_owned_contact(&mut nodes[1], &report)?;
+            let c_contact = observed_owned_contact(&mut nodes[2], &report)?;
+            let intended = nodes[2].input.node_id.clone();
+            let foreign = probe_with_contact(&mut nodes[1], &intended,
+                ProbeKind::RegisteredEndpointPing,
+                format!("foreign-owned-hint-{}", sinomo_core::Id::generate()),
+                OP_CAP, Some(b_contact.clone()));
+            record_probe(&root, &mut report, "foreign-owned-hint-refusal", &foreign)?;
+            assert!(matches!(&foreign, Ok(value) if value.contact.is_none()
+                && value.result.as_ref().is_err_and(|error|
+                    error.error.contains("owned hint differs from intended held listener"))),
+                "foreign hint must refuse before dispatch: {foreign:?}");
+            let changed = probe_with_contact(&mut nodes[1], &intended,
+                ProbeKind::RegisteredEndpointWrongId,
+                format!("changed-owned-hint-{}", sinomo_core::Id::generate()),
+                OP_CAP, Some(c_contact.clone()));
+            record_probe(&root, &mut report, "changed-owned-hint-native-refusal", &changed)?;
+            assert!(matches!(&changed, Ok(value) if value.contact.is_some() && value.result.is_err()),
+                "changed ID must reach actual registered refusal: {changed:?}");
+            Some([b_contact, c_contact])
+        } else { None };
         let b = nodes[1].alive_identity()?;
         let c = nodes[2].alive_identity()?;
         let a_id = nodes[0].input.node_id.clone();
@@ -1116,12 +1173,13 @@ fn run_native_process_case(
         report["a_raw"] = serde_json::json!({"files":raw.files.len(),"entries":entries,"bytes":bytes,"blake3":blake3::hash(&encoded).to_hex().to_string(),"before_any_reopen":true});
         for (source, target) in [(1, 2), (2, 1)] {
             let peer = nodes[target].input.node_id.clone();
-            let result = probe(
+            let result = probe_with_contact(
                 &mut nodes[source],
                 &peer,
                 ping_kind,
                 format!("survivor-{}", sinomo_core::Id::generate()),
                 OP_CAP,
+                survivor_contacts.as_ref().map(|contacts| contacts[target - 1].clone()),
             );
             record_probe(
                 &root,

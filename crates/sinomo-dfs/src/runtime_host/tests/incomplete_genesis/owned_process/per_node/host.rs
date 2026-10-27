@@ -131,7 +131,14 @@ async fn probe(
     peers: &BTreeSet<NodeId>,
     contacts: &OwnedContacts,
     selected: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
+    observed_source: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
 ) -> Result<ProbeReply, NetworkError> {
+    if request.owned_contact_hint.is_some()
+        && !matches!(request.kind, ProbeKind::RegisteredEndpointPing
+            | ProbeKind::RegisteredEndpointWrongId)
+    {
+        return Err(invalid("owned route hint is not admitted for this probe kind"));
+    }
     if matches!(request.kind, ProbeKind::PrefixRound) {
         return prefix::probe(
             request, deadline, root, runtime, source, cluster, peers, contacts,
@@ -183,6 +190,17 @@ async fn probe(
                 "native diagnostic source identity changed under its process",
             ));
         }
+        // Piggyback only this already-read native owner's held-listener
+        // descriptor. It is route DATA, never a reconstructed capability.
+        let (own_address, own_key) = contacts.get(source)
+            .ok_or_else(|| invalid("source has no actual owned listener"))?;
+        let own_member = state.members.iter().find(|m| &m.node_id == source
+            && m.state.is_authorized() && &m.node_public_key == own_key)
+            .ok_or_else(|| invalid("source native member/held key differs"))?;
+        *observed_source.lock().unwrap() = own_member.endpoints.iter().find(|e|
+            &e.node_id == source && &e.address == own_address
+            && matches!(e.transport, sinomo_core::ClusterTransportKind::Loopback
+                | sinomo_core::ClusterTransportKind::LanTcp)).cloned();
         let contact = |node: &NodeId| -> Result<sinomo_core::ClusterEndpointRecord, NetworkError> {
             if !peers.contains(node) {
                 return Err(invalid("diagnostic contact is outside owned fixture"));
@@ -199,6 +217,20 @@ async fn probe(
                 return Err(invalid(
                     "native member key differs from the owned fixture identity",
                 ));
+            }
+            if node == &request.target
+                && let Some(hint) = &request.owned_contact_hint
+            {
+                if &hint.node_id != node || &hint.address != address
+                    || !matches!(hint.transport, sinomo_core::ClusterTransportKind::Loopback
+                        | sinomo_core::ClusterTransportKind::LanTcp)
+                {
+                    return Err(invalid("owned hint differs from intended held listener"));
+                }
+                // Explicit input selection, never a failed-call fallback.
+                // Native transport must authenticate this target and reject a
+                // stale/foreign endpoint ID even if these route bytes match.
+                return Ok(hint.clone());
             }
             // Preserve the native descriptor ID/type/privacy checked by the
             // routed handshake. Address scope alone cannot recreate that ID.
@@ -430,9 +462,10 @@ fn driver_catalog(
                             return Err(ServiceError::Service("native driver target/nonce is outside the fixture".into()));
                         }
                         let selected = std::sync::Mutex::new(None);
+                        let observed_source = std::sync::Mutex::new(None);
                         let result = match tokio::time::timeout_at(
                             tokio::time::Instant::from_std(deadline), probe(transport.as_ref(), &command, deadline,
-                                &root, &native_runtime, &source, &cluster, &peers, &contacts, &selected),
+                                &root, &native_runtime, &source, &cluster, &peers, &contacts, &selected, &observed_source),
                         ).await {
                             Ok(result) => result.map_err(failure),
                             Err(_) => Err(failure(NetworkError::timeout("native process driver call and materialization",
@@ -440,7 +473,8 @@ fn driver_catalog(
                         };
                         context.respond_value(DRIVER_ROUTE, DriverResponse {
                             source_node_id: source, source_pid: std::process::id(), target: command.target,
-                            nonce: command.nonce, path: command.kind.path(), contact: selected.into_inner().unwrap(), result,
+                            nonce: command.nonce, path: command.kind.path(), contact: selected.into_inner().unwrap(),
+                            source_contact: observed_source.into_inner().unwrap(), result,
                         })?;
                         Ok(ServiceDisposition::Continue)
                     }
