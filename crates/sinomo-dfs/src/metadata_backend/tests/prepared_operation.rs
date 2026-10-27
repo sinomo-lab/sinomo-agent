@@ -2,6 +2,7 @@
 mod immutable_payload;
 mod checkpoint_cache;
 mod owned_namespace_plan;
+mod local_cursor;
 use super::*;
 use crate::DfsControlPlaneStore;
 use crate::test_support::{DfsTestRuntime, current_native_metadata_service};
