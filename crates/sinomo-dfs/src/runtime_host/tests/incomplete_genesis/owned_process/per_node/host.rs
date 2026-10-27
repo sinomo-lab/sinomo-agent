@@ -450,6 +450,12 @@ fn driver_catalog(
         },
     )?);
     Ok(ComponentCatalog::builder()
+        // Match the initialized Main profile: only the actual live registry's
+        // lifecycle owner may advertise DFS providers. Without this component
+        // the receiver routes exist locally but peer discovery stays empty.
+        .register_factory(Arc::new(
+            sinomo_module::cluster_service_catalog_publisher_component_factory()?,
+        ))?
         .register_module_factory(
             crate::dfs_module_registration(),
             Arc::new(crate::component_factory()?),
