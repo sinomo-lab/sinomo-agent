@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod prefix;
+mod membership;
 
 const COMPONENT: &str = "module.fixture.dfs_native_peer";
 const MAX_DRIVER_INPUT: usize = 4096;
@@ -144,6 +145,9 @@ async fn probe(
             request, deadline, root, runtime, source, cluster, peers, contacts,
         );
     }
+    if matches!(request.kind, ProbeKind::RequestMetadataMembers) {
+        return membership::request(request, deadline, root, runtime, source, cluster, peers).await;
+    }
     let wire = match request.kind {
         ProbeKind::Ping
         | ProbeKind::EndpointPing
@@ -157,7 +161,7 @@ async fn probe(
         ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
             ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())?
         }
-        ProbeKind::PrefixRound => unreachable!("PREFIX observation dispatched above"),
+        ProbeKind::PrefixRound | ProbeKind::RequestMetadataMembers => unreachable!("native owner call dispatched above"),
     };
     let route = wire.route.clone();
     let remaining = deadline
@@ -358,7 +362,7 @@ async fn probe(
             // Preserve only an actual native header, never copy the target.
             header_responder
         }
-        ProbeKind::PrefixRound => unreachable!("PREFIX observation dispatched above"),
+        ProbeKind::PrefixRound | ProbeKind::RequestMetadataMembers => unreachable!("native owner call dispatched above"),
     };
     if Instant::now() >= deadline {
         return Err(NetworkError::timeout(

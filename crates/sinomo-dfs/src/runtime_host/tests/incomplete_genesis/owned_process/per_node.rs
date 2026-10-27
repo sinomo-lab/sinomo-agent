@@ -76,6 +76,7 @@ enum ProbeKind {
     FormationEndpointPing,
     RegisteredEndpointWrongPeer,
     RegisteredEndpointWrongId,
+    RequestMetadataMembers,
     PrefixRound,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,6 +85,7 @@ enum ProbePath {
     AuthenticatedEndpoint,
     RegisteredNativeEndpoint,
     NativePrefixOwner,
+    NativeMetadataConfiguration,
 }
 impl ProbeKind {
     fn path(self) -> ProbePath {
@@ -94,6 +96,7 @@ impl ProbeKind {
             | Self::RegisteredEndpointWrongPeer
             | Self::RegisteredEndpointWrongId => ProbePath::RegisteredNativeEndpoint,
             Self::PrefixRound => ProbePath::NativePrefixOwner,
+            Self::RequestMetadataMembers => ProbePath::NativeMetadataConfiguration,
             _ => ProbePath::AuthenticatedEndpoint,
         }
     }
@@ -665,6 +668,15 @@ fn probe_with_contact(
                 // This is DATA describing checks inside the actual owner. No
                 // private round/capability can be reconstructed in the parent.
             }
+            ProbeKind::RequestMetadataMembers => {
+                assert_eq!(reply.route, DRIVER_ROUTE);
+                assert_eq!(target, &node.input.node_id);
+                let data: serde_json::Value =
+                    sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
+                assert!(matches!(data["state"].as_str(),
+                    Some("Waiting" | "NotPrimary" | "Requested" | "AlreadyConfigured")));
+                assert_eq!(data["mutation_attempted"], data["state"] == "Requested");
+            }
             ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
                 assert_eq!(reply.route, crate::DFS_STATUS_ROUTE);
                 let _: crate::DfsOperatorStatus =
@@ -1084,11 +1096,43 @@ fn run_native_process_case(
             let mut complete = 0;
             let mut observations = Vec::new();
             let mut rounds = 0;
+            let mut membership_request_done = false;
             // Listener/ping readiness is not DFS-owner readiness. Observe the
             // existing owner within the ORIGINAL startup deadline, without
             // warming/reopening it or replacing an expected generation.
             while complete == 0 && Instant::now() < deadline {
                 rounds += 1;
+                if !membership_request_done {
+                    let source = nodes[0].input.node_id.clone();
+                    let nonce = format!("fixture-members-{}", sinomo_core::Id::generate());
+                    write_data(&root.join(format!("membership-request-{rounds:03}.sobj")),
+                        &DriverRequest { target: source.clone(), nonce: nonce.clone(),
+                            kind: ProbeKind::RequestMetadataMembers, owned_contact_hint: None })?;
+                    let result = probe(&mut nodes[0], &source,
+                        ProbeKind::RequestMetadataMembers,
+                        nonce,
+                        OP_CAP.min(deadline.saturating_duration_since(Instant::now())));
+                    // Preserve the exact attempt before interpreting any result.
+                    // Errors/timeouts are uncertain and stop, never resubmit.
+                    record_probe(&root, &mut report, "guarded-fixture-membership-request", &result)?;
+                    let reply = result?.result.map_err(|e| e.error)?;
+                    let data: serde_json::Value =
+                        sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
+                    membership_request_done = match data["state"].as_str() {
+                        Some("Waiting") => false, // Explicit no-effect observation only.
+                        Some("AlreadyConfigured" | "Requested") => true,
+                        _ => return Err("fixture source is not the actual metadata primary".into()),
+                    };
+                    report["fixture_membership_request"] = data;
+                    if !membership_request_done {
+                        // This round is setup-only. Reuse the existing wait and
+                        // evidence cap, rather than collecting three redundant
+                        // PREFIX refusals before an assignment can be requested.
+                        std::thread::sleep(Duration::from_secs(2)
+                            .min(deadline.saturating_duration_since(Instant::now())));
+                        continue;
+                    }
+                }
                 for node in &mut nodes {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -1126,6 +1170,14 @@ fn run_native_process_case(
             );
         }
         let survivor_contacts = if prefix_round {
+            let nonprimary = nodes[1].input.node_id.clone();
+            let denied = probe(&mut nodes[1], &nonprimary, ProbeKind::RequestMetadataMembers,
+                format!("nonprimary-members-{}", sinomo_core::Id::generate()), OP_CAP);
+            record_probe(&root, &mut report, "nonprimary-fixture-membership-refusal", &denied)?;
+            let denied = denied?.result.map_err(|e| e.error)?;
+            let denied: serde_json::Value = sinomo_core::object::serde_ext::from_bytes(&denied.body)?;
+            assert_eq!(denied["state"], "NotPrimary");
+            assert_eq!(denied["mutation_attempted"], false);
             let b_contact = observed_owned_contact(&mut nodes[1], &report)?;
             let c_contact = observed_owned_contact(&mut nodes[2], &report)?;
             let intended = nodes[2].input.node_id.clone();
