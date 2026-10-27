@@ -2976,8 +2976,12 @@ fn remember_join_channel_endpoint_in_local_state(
     state: &mut ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
 ) {
+    // Acceptance already bound this channel to an authorized member. Its
+    // published snapshot can still predate that member's listener endpoints,
+    // so the replacement daemon must retain numeric introducers as well as
+    // hostnames to reach the authority and catch up. This supplies route data;
+    // the normal transport and membership checks still authorize every call.
     if endpoint.node_id == state.local_node_id
-        || endpoint.address.parse::<SocketAddr>().is_ok()
         || !matches!(
             endpoint.transport,
             ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback

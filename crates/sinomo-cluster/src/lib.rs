@@ -392,7 +392,6 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_node::{NodeId, shadow_daemon_node_id};
 
     pub(crate) use std::collections::{BTreeMap, BTreeSet};
-    pub(crate) use std::net::SocketAddr;
     pub(crate) use std::time::Duration;
     #[allow(unused_imports)]
     pub(crate) use thiserror::Error;
