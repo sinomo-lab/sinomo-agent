@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::node::LocalNodePermissionStore;
 use std::time::Duration;
 pub mod protocol;
+pub mod surfaces;
 
 /// Background messages are preferred. Raw input is an explicit fallback on a
 /// monitor target and can affect the user's pointer, keyboard and foreground.
@@ -33,6 +34,8 @@ pub const MAX_TARGETS: usize = 1024;
 pub enum DesktopError {
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("desktop interaction required: {0}")]
+    InteractionRequired(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     #[error("invalid input: {0}")]
@@ -117,15 +120,22 @@ pub fn authorize(
     target: &DesktopTarget,
     operation: &str,
 ) -> DesktopResult<()> {
+    authorize_resource(store, &target.resource_id(), operation)
+}
+pub fn authorize_resource(
+    store: &LocalNodePermissionStore,
+    resource: &str,
+    operation: &str,
+) -> DesktopResult<()> {
     let permission = store
         .load()
         .map_err(|e| DesktopError::PermissionDenied(e.to_string()))?;
     if !permission.remote_management_enabled()
-        || !permission.resource_operation_exposed(&target.resource_id(), operation)
+        || !permission.resource_operation_exposed(resource, operation)
     {
         return Err(DesktopError::PermissionDenied(format!(
             "remote-management and {} / {operation} exposure are required",
-            target.resource_id()
+            resource
         )));
     }
     Ok(())
@@ -345,11 +355,32 @@ fn default_cursor() -> bool {
 
 /// Continuous native samples consumed by the shared media encoder.
 pub trait DesktopFrameSource: Send {
+    fn identity(&self) -> Option<surfaces::DesktopCaptureIdentity> {
+        None
+    }
+    fn tiles(&self) -> Vec<surfaces::DesktopOverviewTile> {
+        Vec::new()
+    }
     fn next(
         &self,
         after_sequence: u64,
         timeout: Duration,
     ) -> DesktopResult<Option<NativeVideoSample>>;
+}
+impl<T: DesktopFrameSource + ?Sized> DesktopFrameSource for Box<T> {
+    fn identity(&self) -> Option<surfaces::DesktopCaptureIdentity> {
+        (**self).identity()
+    }
+    fn tiles(&self) -> Vec<surfaces::DesktopOverviewTile> {
+        (**self).tiles()
+    }
+    fn next(
+        &self,
+        after_sequence: u64,
+        timeout: Duration,
+    ) -> DesktopResult<Option<NativeVideoSample>> {
+        (**self).next(after_sequence, timeout)
+    }
 }
 
 #[cfg(test)]

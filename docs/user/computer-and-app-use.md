@@ -130,6 +130,82 @@ The provider verifies that initialization exposes a controller endpoint; an API
 success without an endpoint is reported as unsupported. It installs no virtual
 controller driver and never substitutes keyboard input.
 
+## Applications with multiple windows
+
+On Windows, the `capabilities` result includes a `surfaces` object describing
+application sessions, window events and semantic tray/menu support. Existing
+single-window and raw operations retain their original scope on every platform.
+
+`applications` returns running process instances with an executable label,
+process identity and application resource ID. Use the returned identity with
+`open_application`. An application session follows that process lifetime, so
+closing its main window does not close a tray-only application session.
+
+Grant `observe` on the application resource to follow its windows. Optional
+application `input` and `capture` grants cover windows created by that same
+process instance. These are explicit additional grants; an existing window
+exposure never becomes an application-wide grant. Related windows in other
+processes can be discovered through owner relationships, but require their own
+surface grants. Matching titles, executable names and owner links are not control
+authority. A process restart requires fresh identity and consent.
+
+Use `surfaces` with the application session ID. Results distinguish top-level
+windows and child controls and include owner/parent relationships, visibility,
+enabled state and whether an owned popup blocks its owner. Observations are
+coalesced; the current surface list is authoritative for selecting a target.
+The local event bus publishes `app.window.added`, `app.window.changed`,
+`app.window.removed` and `app.session.closed` observations with session/actor
+provenance. Do not treat them as a complete historical record of transient UI.
+
+Use `open_window` with the application session ID and the current opaque
+`surface_id`. Every input on that window session includes the same surface ID;
+references are not reused after an observed destruction/recreation. Per-surface
+resource IDs are scoped to that observation lifetime. Existing window grants
+continue to work through the original `open` API and are not reinterpreted as
+surface-lifetime grants. Input to a disabled application window is rejected so
+the agent can select its dialog explicitly.
+
+`open_overview` opens a bounded application media view. `select_window` changes
+that view between thumbnails (`surface_id:null`) and a selected full-resolution
+window. It never changes any input session's target. Frames carry capture
+identity; overview tiles carry their surface IDs, dimensions and timestamps.
+Omitted windows are explicit. An `unavailable` identity describes a generated
+view-status frame, not pixels captured from a window. Refresh the surface list
+and explicitly select another window when the selected one disappears.
+
+## Tray icons and menus
+
+`tray_items` lists exposed visible Windows UI Automation controls. It does not
+open the overflow flyout. Tray controls are shell-owned, so their application
+ownership is reported as unknown rather than inferred from a tooltip. Their
+resource IDs and references are tied to the observed shell element; rediscover
+after disappearance, expiry or shell recreation.
+
+`invoke_tray` accepts an item ID and `operation:invoke` or `context_menu`.
+`menu_items` lists menu items for a specific application window; use
+`invoke_menu_item` with that same application/window identity. A nullable
+context-menu capability means provider support is unverified; an attempted
+operation can report unsupported. UI Automation automatic focus is disabled,
+but the shell or application may activate UI in response to an action.
+
+These semantic actions require explicit `allow_desktop_interaction:true`.
+Tray resources additionally require local `invoke` and `desktop-interaction`
+grants. Menu invocation requires `input` and `desktop-interaction` grants for
+the application or exact surface. Application grants never authorize Explorer
+or the entire tray. For example, use the resource returned by discovery:
+
+```sh
+sinomo node permissions expose "TRAY_RESOURCE_FROM_DISCOVERY" invoke
+sinomo node permissions expose "TRAY_RESOURCE_FROM_DISCOVERY" desktop-interaction
+```
+
+Hidden/overflow icons may not exist in the UIA tree until the shell UI is shown.
+No background operation silently opens it or injects real input. There is no
+Explorer-memory or private callback-message fallback. A timed-out semantic
+invocation may have an unknown outcome; observe its result before deciding what
+to do next and never replay it automatically. An unresponsive UIA worker cannot
+be unloaded while it might still execute provider code.
+
 ## Continuous video and cleanup
 
 An open response supplies a stream descriptor when capture is requested.

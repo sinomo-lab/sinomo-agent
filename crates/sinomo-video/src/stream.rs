@@ -6,6 +6,7 @@ use sinomo_lm::{
     RealtimeVideoInputConfig, RealtimeVideoPixelFormat,
 };
 use sinomo_runtime::device::desktop::DesktopFrameSource;
+use sinomo_runtime::device::desktop::surfaces::{DesktopCaptureIdentity, DesktopOverviewTile};
 use sinomo_runtime::device::{NativeVideoSample, NativeVideoSampleFormat};
 use sinomo_runtime::network::ObjectRpcBodySource;
 use std::io;
@@ -26,6 +27,10 @@ pub const MAX_METADATA_BYTES: usize = 4096;
 /// encoded image. The outer object RPC owns routing, authorization and framing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoFrameMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<DesktopCaptureIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiles: Vec<DesktopOverviewTile>,
     pub sequence: u64,
     pub timestamp_ns: u64,
     pub duration_ns: u64,
@@ -79,6 +84,8 @@ pub fn encode_sample(
         return Err("encoded video frame exceeds limit".into());
     }
     let metadata = VideoFrameMetadata {
+        identity: None,
+        tiles: Vec::new(),
         sequence: sample.sequence,
         timestamp_ns: sample.timestamp_ns,
         duration_ns: sample.duration_ns,
@@ -91,6 +98,76 @@ pub fn encode_sample(
         coordinate_grid: config.coordinate_grid,
     };
     Ok((metadata, encoded))
+}
+
+/// A bounded application overview, assembled from native samples without an
+/// intermediate image codec. Tiles retain their original dimensions/timestamps;
+/// callers select a full window stream before grounding input coordinates.
+pub fn compose_desktop_overview(
+    samples: &[(String, NativeVideoSample)],
+    sequence: u64,
+    timestamp_ns: u64,
+) -> Result<(NativeVideoSample, Vec<DesktopOverviewTile>), String> {
+    if samples.is_empty() || samples.len() > 4 {
+        return Err("overview requires 1..4 samples".into());
+    }
+    let (width, height) = (1024u32, 768u32);
+    let columns = if samples.len() == 1 { 1 } else { 2 };
+    let rows = if samples.len() <= 2 { 1 } else { 2 };
+    let (cell_w, cell_h) = (width / columns, height / rows);
+    let mut pixels = [28u8, 20, 12, 255].repeat((width * height) as usize);
+    let mut tiles = Vec::new();
+    let mut captured_at = 0;
+    for (index, (id, sample)) in samples.iter().enumerate() {
+        sample.validate().map_err(|e| e.to_string())?;
+        if sample.format != NativeVideoSampleFormat::Bgra8 {
+            return Err("overview expects native BGRA samples".into());
+        }
+        let factor =
+            (cell_w as f64 / sample.width as f64).min(cell_h as f64 / sample.height as f64);
+        let w = (sample.width as f64 * factor).round().max(1.0) as u32;
+        let h = (sample.height as f64 * factor).round().max(1.0) as u32;
+        let left = index as u32 % columns * cell_w + (cell_w - w) / 2;
+        let top = index as u32 / columns * cell_h + (cell_h - h) / 2;
+        let plane = sample.planes[0];
+        for y in 0..h {
+            let source_y = u64::from(y) * u64::from(sample.height) / u64::from(h);
+            for x in 0..w {
+                let source_x = u64::from(x) * u64::from(sample.width) / u64::from(w);
+                let src = plane.offset
+                    + source_y as usize * plane.stride as usize
+                    + source_x as usize * 4;
+                let dst = (((top + y) * width + left + x) * 4) as usize;
+                pixels[dst..dst + 4].copy_from_slice(&sample.data[src..src + 4]);
+            }
+        }
+        captured_at = captured_at.max(sample.captured_at_unix_ms);
+        tiles.push(DesktopOverviewTile {
+            surface_id: id.clone(),
+            bounds: [left, top, left + w, top + h],
+            source_width: sample.width,
+            source_height: sample.height,
+            captured_at_unix_ms: sample.captured_at_unix_ms.min(u64::MAX as u128) as u64,
+        });
+    }
+    let sample = NativeVideoSample {
+        sequence,
+        format: NativeVideoSampleFormat::Bgra8,
+        width,
+        height,
+        timestamp_ns,
+        duration_ns: 0,
+        captured_at_unix_ms: captured_at,
+        planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+            offset: 0,
+            len: pixels.len(),
+            width,
+            height,
+            stride: width * 4,
+        }]),
+        data: pixels.into(),
+    };
+    Ok((sample, tiles))
 }
 fn record(metadata: &VideoFrameMetadata, image: &[u8]) -> Result<Vec<u8>, String> {
     let metadata = serde_json::to_vec(metadata).map_err(|e| e.to_string())?;
@@ -145,7 +222,9 @@ pub fn desktop_capture_body(
                     continue;
                 };
                 sequence = sample.sequence;
-                let (metadata, encoded) = encode_sample(&sample, &encoding)?;
+                let (mut metadata, encoded) = encode_sample(&sample, &encoding)?;
+                metadata.identity = capture.identity();
+                metadata.tiles = capture.tiles();
                 next_encode = Instant::now() + encode_interval;
                 match sender.try_send(record(&metadata, &encoded.image)?) {
                     Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
@@ -337,6 +416,47 @@ impl Drop for RemoteVideoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overview_tiles_preserve_surface_identity_and_source_geometry() {
+        let make = |color: [u8; 4], width, height, time| NativeVideoSample {
+            sequence: 1,
+            format: NativeVideoSampleFormat::Bgra8,
+            width,
+            height,
+            timestamp_ns: 1,
+            duration_ns: 1,
+            captured_at_unix_ms: time,
+            data: color.repeat((width * height) as usize).into(),
+            planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+                offset: 0,
+                len: (width * height * 4) as usize,
+                width,
+                height,
+                stride: width * 4,
+            }]),
+        };
+        let (sample, tiles) = compose_desktop_overview(
+            &[
+                ("a".into(), make([0, 0, 255, 255], 2, 1, 10)),
+                ("b".into(), make([255, 0, 0, 255], 1, 2, 20)),
+            ],
+            9,
+            42,
+        )
+        .unwrap();
+        assert_eq!(sample.sequence, 9);
+        assert_eq!(sample.captured_at_unix_ms, 20);
+        assert_eq!(tiles[0].surface_id, "a");
+        assert_eq!((tiles[0].source_width, tiles[0].source_height), (2, 1));
+        assert_eq!(tiles[1].surface_id, "b");
+        assert_eq!(tiles[0].captured_at_unix_ms, 10);
+        for (tile, color) in tiles.iter().zip([[0, 0, 255, 255], [255, 0, 0, 255]]) {
+            let x = (tile.bounds[0] + tile.bounds[2]) / 2;
+            let y = (tile.bounds[1] + tile.bounds[3]) / 2;
+            let offset = ((y * sample.width + x) * 4) as usize;
+            assert_eq!(&sample.data[offset..offset + 4], &color);
+        }
+    }
     #[tokio::test]
     async fn backpressure_does_not_fetch_unconsumed_native_frames() {
         use std::sync::atomic::AtomicUsize;
@@ -435,6 +555,8 @@ mod tests {
     #[tokio::test]
     async fn continuous_records_preserve_sequence_and_reject_truncation() {
         let metadata = VideoFrameMetadata {
+            identity: None,
+            tiles: Vec::new(),
             sequence: 5,
             timestamp_ns: 50_000_000,
             duration_ns: 10,

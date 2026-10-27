@@ -259,7 +259,7 @@ impl VideoRecording {
             std::fs::File::create(directory.join("encoder.log")).map_err(|e| e.to_string())?;
         let timeline = std::fs::File::create(directory.join("video-frames.jsonl"))
             .map_err(|e| e.to_string())?;
-        let mut child = Command::new(ffmpeg).args(["-hide_banner", "-loglevel", "warning", "-y", "-f", "image2pipe", "-framerate", "10", "-i", "pipe:0", "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        let mut child = Command::new(ffmpeg).args(["-hide_banner", "-loglevel", "warning", "-y", "-f", "image2pipe", "-vcodec", "mjpeg", "-framerate", "10", "-i", "pipe:0", "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
             .arg(directory.join("recording.mp4")).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::from(encoder_log)).creation_flags(0x08000000).spawn().map_err(|e| e.to_string())?;
         let Some(mut stdin) = child.stdin.take() else {
             let _ = child.kill();
@@ -958,6 +958,8 @@ mod tests {
     fn sample(time: u128) -> VideoFrame {
         (
             sinomo_video::stream::VideoFrameMetadata {
+                identity: None,
+                tiles: Vec::new(),
                 sequence: time as u64,
                 timestamp_ns: 0,
                 duration_ns: 100_000_000,
