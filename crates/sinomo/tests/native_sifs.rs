@@ -27,6 +27,7 @@ use std::{
 struct Node {
     child: Child,
     status: Option<DaemonStatus>,
+    sifs_readiness: Option<serde_json::Value>,
     exit: Arc<Mutex<ExitObservation>>,
 }
 
@@ -58,6 +59,7 @@ impl Node {
                 .spawn()
                 .expect("start the isolated candidate daemon"),
             status: None,
+            sifs_readiness: None,
             exit: Arc::new(Mutex::new(ExitObservation::default())),
         };
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -86,6 +88,57 @@ impl Node {
                     fs::canonicalize(&status.data_dir).unwrap(),
                     fs::canonicalize(data.root()).unwrap()
                 );
+                if let Some(cluster) = &status.cluster {
+                    // Status establishes process identity, not publication of
+                    // component capabilities. Observe the same local catalog
+                    // used by chat discovery before exercising its SIFS reads.
+                    // Only a successful, not-yet-published observation waits;
+                    // RPC/decoding/permission failures remain immediate errors.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "isolated SIFS catalog readiness timed out"
+                    );
+                    let client = DaemonApiClient::at_address(&status.address)
+                        .with_timeout(remaining.min(Duration::from_millis(300)));
+                    let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+                        sinomo_runtime::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+                        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
+                        &sinomo_runtime::service::CLUSTER_SERVICES_KV_PREFIX.to_string(),
+                    )
+                    .unwrap();
+                    let read: sinomo_runtime::kv::KvLocalRead<Vec<sinomo_runtime::kv::KvEntry>> =
+                        client
+                            .call_request(&request)
+                            .expect("observe owned local service catalog")
+                            .decode_body()
+                            .expect("decode owned local service catalog");
+                    let instances =
+                        sinomo_runtime::service::service_instances_from_entries(&read.value)
+                            .expect("decode advertised provider identities");
+                    let providers = sinomo_runtime::service::service_instances_providing_capability(
+                        instances,
+                        sinomo_runtime::dfs::SIFS_PATH_ACCESS_CAPABILITY,
+                    );
+                    if !providers
+                        .iter()
+                        .any(|provider| provider.node_id == cluster.node_id)
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "owned SIFS provider was not published"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    node.sifs_readiness = Some(serde_json::json!({
+                        "pid": status.pid, "launch_id": status.app_launch_id,
+                        "node_id": cluster.node_id, "catalog_revision": read.revision.0,
+                        "observed_term": read.observed_term, "applied_index": read.applied_index,
+                        "providers": providers,
+                        "authority": "observational prerequisite only; normal route checks remain required"
+                    }));
+                }
                 node.status = Some(status);
                 return node;
             }
@@ -345,6 +398,7 @@ fn undeleted_chat_shutdown(fixture_unwind: bool) {
     record(
         &mut receipt,
         serde_json::json!({"phase":"retained-chat-readback", "status":readback.status(),
+        "sifs_readiness":readback.sifs_readiness,
         "session_id":session,"chat_exists_not_deleted":true}),
     );
     // Reacquire a real agent mount on the retained DATA without touching the
