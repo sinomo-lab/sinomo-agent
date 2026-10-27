@@ -40,17 +40,35 @@ impl LocalSobjMetadataBackend {
         &self,
         operation_id: &str,
     ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        self.certified_prepared_record_for_ingress(operation_id, false)
+    }
+
+    /// Required ingress uses the same existing inspection fence, waiting only
+    /// for its current holder. It still cannot create, replay or certify DATA.
+    pub(crate) fn read_certified_prepared_record_for_ingress(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        self.certified_prepared_record_for_ingress(operation_id, true)
+    }
+
+    fn certified_prepared_record_for_ingress(
+        &self,
+        operation_id: &str,
+        required: bool,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
         if self.consistent_read_snapshot_depth != 0
             || !self.stat_read_snapshots.is_empty()
             || self.replica_repair_only
         {
             return Ok(None);
         }
-        let Some(_fence) = crate::metadata_lock::try_metadata_inspection_lock(
-            self.root.clone(),
-            self.journal_write_lock_path(),
-        )?
-        else {
+        let fence = if required {
+            crate::metadata_lock::metadata_inspection_lock(self.root.clone(), self.journal_write_lock_path())?
+        } else {
+            crate::metadata_lock::try_metadata_inspection_lock(self.root.clone(), self.journal_write_lock_path())?
+        };
+        let Some(_fence) = fence else {
             return Ok(None);
         };
         let Some(prefix) = crate::metadata_journal::admission::current_owned_materialized_prefix(

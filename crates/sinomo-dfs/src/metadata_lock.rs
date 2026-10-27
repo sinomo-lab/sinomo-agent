@@ -45,6 +45,23 @@ pub(crate) fn try_metadata_inspection_lock(
     root: PathBuf,
     lock_path: PathBuf,
 ) -> Result<Option<MetadataWriteLock>> {
+    inspection_lock(root, lock_path, false)
+}
+
+/// Required work on an owned blocking worker may wait for the existing fence.
+/// Missing/replaced storage is still unavailable; this never creates a writer.
+pub(crate) fn metadata_inspection_lock(
+    root: PathBuf,
+    lock_path: PathBuf,
+) -> Result<Option<MetadataWriteLock>> {
+    inspection_lock(root, lock_path, true)
+}
+
+fn inspection_lock(
+    root: PathBuf,
+    lock_path: PathBuf,
+    required: bool,
+) -> Result<Option<MetadataWriteLock>> {
     let file = match fs::OpenOptions::new().read(true).open(&lock_path) {
         Ok(file) => file,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -55,10 +72,14 @@ pub(crate) fn try_metadata_inspection_lock(
             });
         }
     };
-    let Some(path_guard) = MetadataPathWriteGuard::try_lock(root) else {
-        return Ok(None);
+    let path_guard = if required {
+        MetadataPathWriteGuard::lock(root)
+    } else {
+        let Some(guard) = MetadataPathWriteGuard::try_lock(root) else { return Ok(None); };
+        guard
     };
-    match FileExt::try_lock_shared(&file) {
+    let locked = if required { FileExt::lock_shared(&file) } else { FileExt::try_lock_shared(&file) };
+    match locked {
         Ok(()) => {
             // A replaced lock inode cannot fence the current writer pathname.
             #[cfg(unix)]

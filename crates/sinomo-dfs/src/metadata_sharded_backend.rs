@@ -1032,30 +1032,25 @@ impl ResidentLocalMetadataShardHandle {
         &self.shard_id
     }
 
-    /// Read an already-open resident record without checkout, opening, replay
-    /// or repair. Outer None is unavailable ownership, inner None is an
-    /// observed missing record; neither creates initialization authority.
-    pub(crate) fn try_read_prepared_operation_record_without_open(
+    /// Required nonopening read through the SAME resident slot. Wait for its
+    /// current checkout, but refuse a missing owner instead of opening storage.
+    /// No replay/repair or initialization authority is supplied by this read.
+    pub(crate) fn read_prepared_operation_record_without_open(
         &self,
         operation_id: &str,
     ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
-        let state = match self.slot.state.try_lock() {
-            Ok(state) => state,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(MetadataBackendError::Serde(
-                    "resident prepared-record observation is poisoned".into(),
-                ));
-            }
+        let backend = self.slot.checkout_with_open(&mut || {
+            Err(MetadataBackendError::Serde(
+                "resident prepared-record observation requires an already-open owner".into(),
+            ))
+        })?;
+        let lease = ResidentLocalMetadataShardLease {
+            file_system_id: self.file_system_id.clone(),
+            shard_id: self.shard_id.clone(),
+            slot: Arc::clone(&self.slot),
+            backend: Some(backend),
         };
-        match &*state {
-            ResidentLocalMetadataShardState::Available(backend) => {
-                backend.try_read_certified_prepared_record_for_ingress(operation_id)
-            }
-            ResidentLocalMetadataShardState::Unopened
-            | ResidentLocalMetadataShardState::Opening
-            | ResidentLocalMetadataShardState::CheckedOut => Ok(None),
-        }
+        lease.read_certified_prepared_record_for_ingress(operation_id)
     }
 
     /// Use the SAME strict primary slot to prepare storage for ingress, without
