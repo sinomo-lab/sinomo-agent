@@ -1886,7 +1886,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.clear_pending_metadata_sync_replications_for_barrier(&probe_barrier_id);
         #[cfg(test)]
         if let Some((root, _)) = self.native_publication_owner_for_observation() {
-            crate::default_cluster::bootstrap_observation::record(&root, &self.node_id, "handoff-sync-result", ||
+            crate::default_cluster::bootstrap_observation::record(&root, &self.node_id, "metadata-sync-result", ||
                 serde_json::json!({"target":target,"barrier":probe_barrier_id,"purpose":format!("{purpose:?}"),
                     "required_intersection":required_intersection,"result":result.as_ref().map(|v|v).map_err(|e|e.to_string())}));
         }
