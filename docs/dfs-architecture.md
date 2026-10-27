@@ -108,6 +108,12 @@ KV access on DFS operation paths is explicit. Namespace routing and policy reads
 reuse the existing retained configuration projections; peer routing and connection
 health remain owned by the network layer.
 
+Content eligibility joins authorized cluster membership, compatible filesystem
+providers and explicit content acceptance from one coherent configuration.
+Offline desired replicas remain repair targets without supplying current
+receipts. Observation and discovery cannot substitute for an active owner,
+current authority or durable content evidence.
+
 Cluster KV retains its atomic transactional API and orders cluster
 configuration and authority changes. DFS does not add caller bindings,
 caller sessions, historical replay APIs, or substitute KV operation ledgers.

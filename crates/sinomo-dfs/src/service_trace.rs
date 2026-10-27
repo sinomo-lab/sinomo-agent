@@ -99,6 +99,13 @@ pub(crate) fn dfs_network_message_trace_label(message: &DfsNetworkMessage) -> &'
         DfsNetworkMessage::CommitVersion(_) => "commit-version",
         DfsNetworkMessage::CommitVersionResponse(_) => "commit-version-response",
         DfsNetworkMessage::RepairReplica(_) => "repair-replica",
+        DfsNetworkMessage::SelectedOriginalRepair(_) => "selected-original-repair",
+        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => "original-repair-history-request",
+        DfsNetworkMessage::OriginalRepairHistoryResponse(_) => "original-repair-history-response",
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => "selected-local-recovery-fence-request",
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => "selected-local-recovery-fence-response",
         DfsNetworkMessage::RepairReplicaResponse(_) => "repair-replica-response",
         DfsNetworkMessage::FetchBlob(_) => "fetch-blob",
         DfsNetworkMessage::FetchBlobResponse(_) => "fetch-blob-response",

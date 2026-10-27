@@ -55,7 +55,7 @@ impl DfsStorageImportContentReceiver {
         let local_node = sinomo_core::cluster::read_cluster_state_without_kv(&paths)
             .map_err(crate::DfsError::from_network)?
             .local_node_id;
-        let peer = Arc::new(data_plane::DaemonDfsPeerTransport { host });
+        let peer = Arc::new(data_plane::DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext::new(context.data_dir(), &runtime)) });
         let transport = crate::DfsNodeTransport::new_with_peer_transports_for_nodes(
             local_node,
             [authenticated_requester.clone()],

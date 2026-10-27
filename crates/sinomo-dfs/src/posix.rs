@@ -493,6 +493,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         options: &DfsWriteOptions,
         local_content_staged: bool,
     ) -> std::result::Result<Vec<NodeId>, DfsError> {
+        self.posix_replica_candidates_for_write_creation(
+            object,
+            options,
+            local_content_staged,
+            DfsWriteCreation::Upsert,
+            None,
+        )
+    }
+
+    fn posix_replica_candidates_for_write_creation(
+        &mut self,
+        object: &DfsObjectMetadata,
+        options: &DfsWriteOptions,
+        local_content_staged: bool,
+        creation: DfsWriteCreation,
+        target_version: Option<&DfsVersion>,
+    ) -> std::result::Result<Vec<NodeId>, DfsError> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let mut candidates = options.replica_candidates.clone();
         if !options.policy.forbidden_node_ids.contains(&self.node_id)
@@ -508,11 +525,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
             object_id: object.object_id.clone(),
-            target_version: next_version(&object.version),
+            target_version: target_version
+                .cloned()
+                .unwrap_or_else(|| next_version(&object.version)),
             requesting_node_id: self.node_id.clone(),
         };
-        let mut plan =
-            self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
+        let mut plan = self.plan_namespace_creation_replicas(
+            &request,
+            object,
+            candidates,
+            options.policy.clone(),
+            creation,
+            if options.foreground_replica_repair {
+                DfsWriteRepair::Foreground
+            } else {
+                DfsWriteRepair::Background
+            },
+        )?;
 
         // A remote metadata primary now ingests the only sender-owned payload
         // directly. Represent that durable copy honestly by replacing an
@@ -3355,7 +3384,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
         }
-        let candidates = match self.posix_replica_candidates_for_write(&object, &options) {
+        // This fact comes from the successful namespace lookup/allocation
+        // above; the transient overlay index alone cannot prove creation.
+        let creation = DfsWriteCreation::from_namespace_resolution(
+            exclusive_create,
+            transient_create && !options.foreground_replica_repair,
+        );
+        let candidates = match self.posix_replica_candidates_for_write_creation(
+            &object,
+            &options,
+            false,
+            creation,
+            creation.is_fresh_namespace().then_some(&target_version),
+        ) {
             Ok(candidates) => candidates,
             Err(error) => {
                 if transient_create {
@@ -3435,11 +3476,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsDistributedWriteOptions {
                     publication: Default::default(),
                     touch_parent_on_create,
-                    creation: if exclusive_create {
-                        DfsWriteCreation::Exclusive
-                    } else {
-                        DfsWriteCreation::Upsert
-                    },
+                    creation,
                     repair: if options.foreground_replica_repair {
                         DfsWriteRepair::Foreground
                     } else {
@@ -3470,11 +3507,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsDistributedWriteOptions {
                     publication: Default::default(),
                     touch_parent_on_create,
-                    creation: if exclusive_create {
-                        DfsWriteCreation::Exclusive
-                    } else {
-                        DfsWriteCreation::Upsert
-                    },
+                    creation,
                     repair: if options.foreground_replica_repair {
                         DfsWriteRepair::Foreground
                     } else {

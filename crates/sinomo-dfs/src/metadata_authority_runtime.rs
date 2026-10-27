@@ -266,6 +266,15 @@ enum DfsWriteConfigurationReadError {
     Pending(DfsError),
     Unavailable(DfsError),
 }
+
+/// Owned read inputs for the existing original-Repair validator, not an
+/// execution capability or a new native proof.
+pub(crate) struct DfsOriginalRepairConfigurationSnapshot {
+    pub(crate) view: Arc<crate::DfsWriteConfigurationProjection>,
+    pub(crate) projection_generation: u64,
+    pub(crate) shards: Vec<DfsMetadataShardConfig>,
+    pub(crate) filesystem: Option<crate::DfsFileSystemConfig>,
+}
 impl From<DfsError> for DfsWriteConfigurationReadError {
     fn from(error: DfsError) -> Self {
         Self::Unavailable(error)
@@ -438,6 +447,57 @@ impl DfsMetadataAuthorityRuntime {
         read: impl FnOnce(u64, Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>) -> R,
     ) -> Result<Option<R>, sinomo_core::kv::KvError> {
         self.state.with_current_publication_configuration(file_system_id, read)
+    }
+
+    /// Read the native floor before locking, then copy the current continuous
+    /// configuration and metadata cache together. No caller or floor callback
+    /// runs while the existing configuration -> projection locks are held.
+    pub(crate) fn current_original_repair_configuration(
+        self: &Arc<Self>,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<DfsOriginalRepairConfigurationSnapshot, DfsError> {
+        let invalid = || DfsError::Metadata {
+            message: "original Repair configuration publication was withdrawn or replaced during capture".into(),
+        };
+        let checked = self.write_configuration_projection()?.ok_or_else(invalid)?;
+        let configuration = self.write_configuration.lock().map_err(|_| DfsError::Network {
+            message: "DFS write configuration projection lock poisoned".into(),
+        })?;
+        let view = configuration.snapshot().ok_or_else(invalid)?;
+        if !view.has_same_native_proof_origin(&checked) {
+            return Err(invalid());
+        }
+        let projection = self.state.projection.lock().map_err(|_| DfsError::Network {
+            message: "DFS metadata authority projection lock poisoned".into(),
+        })?;
+        if projection.revision != Some(view.revision())
+            || view.revision() < projection.required_revision
+        {
+            return Err(invalid());
+        }
+        let projection_generation = self.state.projection_generation();
+        let (shards, filesystem) = DfsMetadataAuthorityState::publication_configuration_values(
+            &projection,
+            file_system_id,
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::native_shard_trace::record_metadata_cache_cut(
+            projection_generation,
+            projection.revision,
+            projection.required_revision,
+            &projection.entries,
+            projection.native_evidence.as_ref(),
+            projection.native_evidence_loss_count,
+        );
+        let snapshot = DfsOriginalRepairConfigurationSnapshot {
+            view,
+            projection_generation,
+            shards,
+            filesystem,
+        };
+        drop(projection);
+        drop(configuration);
+        Ok(snapshot)
     }
 
     pub fn shard_projection_state(
@@ -1205,6 +1265,13 @@ impl DfsMetadataAuthorityRuntime {
             let providers = host
                 .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[2])
                 .await?;
+            #[cfg(test)]
+            if let Some(observer) = native_read_observer {
+                observer(DFS_WRITE_CONFIGURATION_PREFIXES[3]);
+            }
+            let members = host
+                .read_authoritative_configuration_prefix(DFS_WRITE_CONFIGURATION_PREFIXES[3])
+                .await?;
             let after = host.write_configuration_floor()?;
             if before.value.is_none()
                 || before.value != after.value
@@ -1229,7 +1296,7 @@ impl DfsMetadataAuthorityRuntime {
                 });
             }
             configuration
-                .install_bootstrap(token, [filesystem, content, providers], after)
+                .install_bootstrap(token, [filesystem, content, providers, members], after)
                 .map_err(DfsError::from)?;
             authority_changed |= if let Some(published) = configuration.snapshot() {
                 match self
@@ -1649,6 +1716,25 @@ impl DfsMetadataAuthorityState {
             );
             return Ok(None);
         }
+        let (shards, config) = Self::publication_configuration_values(&projection, file_system_id)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::native_shard_trace::record_metadata_cache_cut(
+            current_projection_generation,
+            projection.revision,
+            projection.required_revision,
+            &projection.entries,
+            projection.native_evidence.as_ref(),
+            projection.native_evidence_loss_count,
+        );
+        Ok(Some(read(current_projection_generation, shards, config)))
+    }
+
+    /// Pure decoding shared by the old locked callback and the owned original
+    /// Repair snapshot. The caller already owns the projection lock.
+    fn publication_configuration_values(
+        projection: &DfsMetadataAuthorityProjection,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<(Vec<DfsMetadataShardConfig>, Option<crate::DfsFileSystemConfig>), sinomo_core::kv::KvError> {
         let shards = match projection
             .metadata_shards_by_file_system
             .get(file_system_id.as_str())
@@ -1668,16 +1754,7 @@ impl DfsMetadataAuthorityState {
             .ok()
             .map(|index| projection.entries[index].decode::<crate::DfsFileSystemConfig>())
             .transpose()?;
-        #[cfg(any(test, feature = "test-support"))]
-        crate::native_shard_trace::record_metadata_cache_cut(
-            current_projection_generation,
-            projection.revision,
-            projection.required_revision,
-            &projection.entries,
-            projection.native_evidence.as_ref(),
-            projection.native_evidence_loss_count,
-        );
-        Ok(Some(read(current_projection_generation, shards, config)))
+        Ok((shards, config))
     }
 
     pub fn shard_projection_state(

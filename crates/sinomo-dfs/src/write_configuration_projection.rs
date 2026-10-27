@@ -1,7 +1,7 @@
 //! Bounded write configuration derived from native proofs and committed deltas.
 //!
 //! This state owns no watcher, task, transport, or storage. Its caller starts
-//! buffering before issuing the three native reads and supplies the exact
+//! buffering before issuing the four native reads and supplies the exact
 //! resident consensus floor. Native certificates keep their original revisions;
 //! `revision` is the watermark reached by contiguous committed replay.
 
@@ -17,23 +17,36 @@ use sinomo_core::kv::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-pub(crate) const DFS_WRITE_CONFIGURATION_PREFIXES: [&str; 3] = [
+pub(crate) const DFS_WRITE_CONFIGURATION_PREFIXES: [&str; 4] = [
     "/dfs/filesystems/",
     "/dfs/services/content/",
     "/cluster/services/",
+    "/cluster/members/",
 ];
+
+pub(crate) const DFS_WRITE_CONFIGURATION_SCOPE_COUNT: usize =
+    DFS_WRITE_CONFIGURATION_PREFIXES.len();
 
 #[derive(Clone, Debug)]
 pub struct DfsWriteConfigurationProjection {
     pub(crate) revision: KvRevision,
-    pub(crate) scopes: [Vec<KvEntry>; 3],
-    pub(crate) authority: [KvAuthorityProof; 3],
+    pub(crate) scopes: [Vec<KvEntry>; DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
+    pub(crate) authority: [KvAuthorityProof; DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
     pub(crate) floor: KvLocalRead<Option<KvEntry>>,
 }
 
 impl DfsWriteConfigurationProjection {
     pub fn revision(&self) -> KvRevision {
         self.revision
+    }
+
+    /// Contiguous replay keeps these native bootstrap inputs unchanged. This
+    /// relation is not permission: callers still need a fresh resident-floor
+    /// check, a stable current capture, and their native authority/store fences.
+    pub(crate) fn has_same_native_proof_origin(&self, previous: &Self) -> bool {
+        self.authority == previous.authority
+            && self.floor == previous.floor
+            && self.revision >= previous.revision
     }
 
     /// Returns a complete borrowed range only inside one of the proven scopes.
@@ -124,7 +137,7 @@ impl DfsWriteConfigurationState {
     pub(crate) fn install_bootstrap(
         &mut self,
         token: u64,
-        reads: [KvAuthoritativeRead<Vec<KvEntry>>; 3],
+        reads: [KvAuthoritativeRead<Vec<KvEntry>>; DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
         floor: KvLocalRead<Option<KvEntry>>,
     ) -> Result<bool, KvError> {
         if token != self.refresh_token || !self.bootstrap_active {
@@ -268,7 +281,7 @@ fn unavailable(detail: &str) -> KvError {
 }
 
 fn validate_bootstrap(
-    reads: [KvAuthoritativeRead<Vec<KvEntry>>; 3],
+    reads: [KvAuthoritativeRead<Vec<KvEntry>>; DFS_WRITE_CONFIGURATION_SCOPE_COUNT],
     floor: KvLocalRead<Option<KvEntry>>,
 ) -> Result<DfsWriteConfigurationProjection, KvError> {
     let config_entry = floor.value.as_ref().ok_or_else(|| {
@@ -540,7 +553,7 @@ mod tests {
         }
     }
 
-    fn reads(revisions: [u64; 3]) -> [KvAuthoritativeRead<Vec<KvEntry>>; 3] {
+    fn reads(revisions: [u64; 4]) -> [KvAuthoritativeRead<Vec<KvEntry>>; 4] {
         std::array::from_fn(|scope| KvAuthoritativeRead {
             value: vec![entry(
                 &format!("{}fixture", DFS_WRITE_CONFIGURATION_PREFIXES[scope]),
@@ -596,7 +609,7 @@ mod tests {
         let token = state.begin_refresh();
         assert!(
             state
-                .install_bootstrap(token, reads([10; 3]), floor(10))
+                .install_bootstrap(token, reads([10; 4]), floor(10))
                 .unwrap()
         );
         state
@@ -604,7 +617,7 @@ mod tests {
 
     #[test]
     fn write_configuration_differing_prefix_revisions_replay_complete_zones() {
-        let mut native = reads([10, 11, 12]);
+        let mut native = reads([10, 11, 12, 12]);
         native[1].value = vec![entry(
             "/dfs/services/content/node-a",
             br#"{"zones":["east","west"]}"#,
@@ -628,7 +641,12 @@ mod tests {
         assert_eq!(view.revision(), KvRevision(12));
         assert_eq!(
             view.authority.map(|proof| proof.revision),
-            [KvRevision(10), KvRevision(11), KvRevision(12)]
+            [
+                KvRevision(10),
+                KvRevision(11),
+                KvRevision(12),
+                KvRevision(12)
+            ]
         );
         assert_eq!(
             view.entries("/dfs/filesystems/").unwrap()[0].value,
@@ -669,12 +687,28 @@ mod tests {
     }
 
     #[test]
+    fn write_configuration_membership_read_reaches_the_same_committed_watermark() {
+        let native = reads([12, 12, 12, 10]);
+        let member = native[3].value.clone();
+        let mut state = DfsWriteConfigurationState::new();
+        let token = state.begin_refresh();
+        assert!(!state.observe_delta(&put(11, "/unrelated/progress", b"observed")));
+        assert!(!state.observe_delta(&put(12, "/cluster/services/fixture", b"current")));
+        assert!(state.install_bootstrap(token, native, floor(12)).unwrap());
+        let view = state.snapshot().unwrap();
+        assert_eq!(view.revision(), KvRevision(12));
+        assert_eq!(view.authority[3].revision, KvRevision(10));
+        assert_eq!(view.entries("/cluster/members/").unwrap(), member);
+        assert!(view.matches_floor(&floor(12)));
+    }
+
+    #[test]
     fn write_configuration_pending_bundle_publishes_only_after_later_deltas() {
         let mut state = DfsWriteConfigurationState::new();
         let token = state.begin_refresh();
         assert!(
             !state
-                .install_bootstrap(token, reads([10, 11, 12]), floor(12))
+                .install_bootstrap(token, reads([10, 11, 12, 12]), floor(12))
                 .unwrap()
         );
         assert!(state.snapshot().is_none());
@@ -725,7 +759,7 @@ mod tests {
         assert!(!state.observe_delta(&grouped));
         assert!(
             state
-                .install_bootstrap(token, reads([10, 11, 12]), floor(12))
+                .install_bootstrap(token, reads([10, 11, 12, 12]), floor(12))
                 .unwrap()
         );
         let view = state.snapshot().unwrap();
@@ -744,7 +778,7 @@ mod tests {
         let token = state.begin_refresh();
         assert!(
             state
-                .install_bootstrap(token, reads([10; 3]), floor(10))
+                .install_bootstrap(token, reads([10; 4]), floor(10))
                 .is_err(),
             "native reads older than the pre-refresh committed floor cannot replace it"
         );
@@ -759,7 +793,7 @@ mod tests {
         assert!(!state.observe_delta(&put(10, "/dfs/filesystems/old", b"old")));
         assert!(
             !state
-                .install_bootstrap(token, reads([12; 3]), floor(12))
+                .install_bootstrap(token, reads([12; 4]), floor(12))
                 .unwrap()
         );
         assert!(state.snapshot().is_none() && state.needs_refresh());
@@ -772,13 +806,13 @@ mod tests {
         let current = state.begin_refresh();
         assert!(
             state
-                .install_bootstrap(current, reads([20; 3]), floor(20))
+                .install_bootstrap(current, reads([20; 4]), floor(20))
                 .unwrap()
         );
         let published = state.snapshot().unwrap();
         assert!(
             !state
-                .install_bootstrap(old, reads([10; 3]), floor(10))
+                .install_bootstrap(old, reads([10; 4]), floor(10))
                 .unwrap()
         );
         state.finish_refresh(old);
@@ -886,10 +920,12 @@ mod tests {
             "mixed-terms",
             "bad-quorum",
             "out-of-scope",
+            "membership-mixed-term",
+            "membership-out-of-scope",
         ] {
             let mut state = DfsWriteConfigurationState::new();
             let token = state.begin_refresh();
-            let mut native = reads([10; 3]);
+            let mut native = reads([10; 4]);
             let mut observed = floor(10);
             match failure {
                 "missing-floor" => observed.value = None,
@@ -903,6 +939,8 @@ mod tests {
                     }
                 }
                 "out-of-scope" => native[1].value[0].key = "/wrong/scope".into(),
+                "membership-mixed-term" => native[3].authority.term = 8,
+                "membership-out-of-scope" => native[3].value[0].key = "/wrong/member".into(),
                 _ => unreachable!(),
             }
             assert!(
@@ -941,7 +979,7 @@ mod tests {
         assert!(state.snapshot().is_none() && state.needs_refresh());
         let mut state = DfsWriteConfigurationState::new();
         let token = state.begin_refresh();
-        let mut native = reads([10; 3]);
+        let mut native = reads([10; 4]);
         native[0].value = (0..CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES)
             .map(|index| entry(&format!("/dfs/filesystems/{index:08}"), b"bounded", 5))
             .collect();

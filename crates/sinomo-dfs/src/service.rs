@@ -314,6 +314,20 @@ pub fn component_factory_with_storage_preparation(
 fn component_factory_with_preparation(
     preparation: Option<crate::DfsStoragePreparationProviderBuilder>,
 ) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_selected_layout(preparation, None)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn component_factory_with_selected_original_data_fixture(
+    fixture: crate::runtime_host::DfsSelectedOriginalDataFixture,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_selected_layout(None, Some(fixture))
+}
+
+fn component_factory_with_selected_layout(
+    preparation: Option<crate::DfsStoragePreparationProviderBuilder>,
+    selected_fixture: Option<crate::runtime_host::DfsSelectedOriginalDataFixture>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     let descriptor =
         sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?
             .with_offer(sifs_path_access_service_offer())
@@ -353,12 +367,53 @@ fn component_factory_with_preparation(
                     &data_dir,
                     context.host_role(),
                 );
+                // Reject the experimental representation before acquiring
+                // (and writing) the physical owner lock on a default mount.
+                if selected_fixture.is_none() {
+                    for root in [
+                        crate::default_dfs_metadata_shards_root(&data_dir),
+                        crate::default_dfs_repair_attempt_snapshot_path(&data_dir)
+                            .parent().expect("native queue has a parent").to_path_buf(),
+                    ] {
+                        crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+                            .map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                    }
+                }
                 let data_owner = match crate::source_adoption::retained_owner_for_mount(context)? {
-                    Some(actual_retained_owner) => actual_retained_owner,
-                    None => Arc::new(crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
-                        .map_err(|error| sinomo_module::ComponentError::Component {
-                            component_id: caller.component_id.clone(), detail: error.to_string(),
-                        })?),
+                    Some(actual_retained_owner) => {
+                        if selected_fixture.is_none() && actual_retained_owner.selected_original_data_layout()
+                            .map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?.is_some()
+                        {
+                            return Err(sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(),
+                                detail: "default DFS mount cannot inherit a selected DATA layout".into(),
+                            });
+                        }
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(fixture) = &selected_fixture {
+                            fixture.validate_retained(&actual_retained_owner).map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                        }
+                        actual_retained_owner
+                    }
+                    None => {
+                        let mut actual = crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+                            .map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(fixture) = &selected_fixture {
+                            fixture.admit(&mut actual).map_err(|error| sinomo_module::ComponentError::Component {
+                                component_id: caller.component_id.clone(), detail: error.to_string(),
+                            })?;
+                        }
+                        Arc::new(actual)
+                    }
                 };
                 #[cfg(any(test, feature = "test-support"))]
                 let native_trace_mount = crate::native_shard_trace::register_mount(
@@ -694,6 +749,23 @@ impl std::fmt::Display for DfsDataPlaneHostError {
 
 impl std::error::Error for DfsDataPlaneHostError {}
 
+/// Sealed authenticated ingress for the selected local-fence test protocol.
+/// Only the real service signer/carrier join below constructs this wrapper.
+/// Decoded DTOs and arbitrary NodeIds cannot construct it or serving authority.
+#[cfg(test)]
+pub struct AuthenticatedSelectedLocalRecoveryFenceIngress {
+    command: DfsMessageCommand,
+    authenticated_source: NodeId,
+    deadline: std::time::Instant,
+}
+
+#[cfg(test)]
+impl AuthenticatedSelectedLocalRecoveryFenceIngress {
+    pub(crate) fn into_parts(self) -> (DfsMessageCommand, NodeId, std::time::Instant) {
+        (self.command, self.authenticated_source, self.deadline)
+    }
+}
+
 pub trait DfsDataPlaneHost: Send + Sync {
     /// Return an accepted observation from this active content owner only.
     /// Missing owners, samples and expired observations fail closed. This read
@@ -703,6 +775,19 @@ pub trait DfsDataPlaneHost: Send + Sync {
         _data_dir: &SinomoDataDir,
     ) -> Result<crate::DfsNodeAdvertisement, DfsDataPlaneHostError> {
         Err(DfsDataPlaneHostError::new("live DFS content owner observation unavailable"))
+    }
+
+    #[cfg(test)]
+    fn install_selected_local_recovery_fence_rpc<'a>(
+        &'a self,
+        _data_dir: Arc<SinomoDataDir>,
+        _ingress: AuthenticatedSelectedLocalRecoveryFenceIngress,
+    ) -> DfsDataPlaneHostFuture<'a, DfsMessageResponse> {
+        Box::pin(async {
+            Err(DfsDataPlaneHostError::new(
+                "host does not support selected local recovery fence RPC",
+            ))
+        })
     }
 
     fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsOperatorStatus>;
@@ -936,7 +1021,10 @@ impl Service for DfsService {
                         return Ok(ServiceDisposition::Continue);
                     }
                     #[cfg(any(test, feature = "test-support"))]
-                    crate::test_runtime::pause_decoded_write_commit_publication(&command).await?;
+                    {
+                        crate::test_runtime::pause_decoded_write_commit_publication(&command).await?;
+                        crate::test_runtime::pause_decoded_selected_original_custody(&command).await?;
+                    }
                     let may_have_deferred_materialization =
                         command.durable_replication.is_some() || command.authority_probe.is_some();
                     let materialize_shard_id = command.batch.shard_id.clone();
@@ -1104,6 +1192,10 @@ impl Service for DfsDataPlaneService {
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let service = self.clone();
+        // Includes decoding and every later await; never renewed by the host.
+        #[cfg(test)]
+        let selected_recovery_deadline = std::time::Instant::now()
+            + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         Box::pin(async move {
             let mut operation_metrics = crate::performance_metrics::DfsOperationMetricGuard::start(
                 request.route.as_str(),
@@ -1135,12 +1227,21 @@ impl Service for DfsDataPlaneService {
                     } else {
                         let head: crate::body_rpc::DfsAttachmentMessageCommand =
                             ctx.decode_request_body(&request).await?;
+                        #[cfg(test)]
+                        if matches!(&head.command.routed_message.message,
+                            crate::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_)
+                            | crate::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_)) {
+                            return Err(ServiceError::Service("selected local recovery fence RPC refuses attachments before collection".into()));
+                        }
                         let request_attachment = ctx.take_request_body();
                         crate::body_rpc::validate_incoming_attachment_length(
                             &head.attachment,
                             &request_attachment,
                             "DFS request",
                         )?;
+                        if let crate::DfsNetworkMessage::SelectedOriginalRepair(command) = &head.command.routed_message.message {
+                            crate::body_rpc::validate_selected_original_repair_attachment(command, &head.attachment)?;
+                        }
                         if matches!(
                             &head.command.routed_message.message,
                             crate::DfsNetworkMessage::StageBlob(_)
@@ -1177,6 +1278,30 @@ impl Service for DfsDataPlaneService {
                             "authenticated DFS message caller {authenticated_source_node_id} does not match claimed source {} for route {route}",
                             command.routed_message.source_node_id
                         )));
+                    }
+                    #[cfg(test)]
+                    match &command.routed_message.message {
+                        crate::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => {
+                            if route != crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE || attachment.is_some() {
+                                return Err(ServiceError::Service("selected local recovery fence request has a wrong route or attachment".into()));
+                            }
+                            // The signer was resolved by the real cluster context and
+                            // compared to this exact carrier immediately above.
+                            let ingress = AuthenticatedSelectedLocalRecoveryFenceIngress {
+                                command, authenticated_source: authenticated_source_node_id,
+                                deadline: selected_recovery_deadline,
+                            };
+                            let response = service.host.install_selected_local_recovery_fence_rpc(
+                                Arc::clone(&ctx.data_dir), ingress,
+                            ).await.map_err(service_error)?;
+                            ctx.respond_value(route, response)?;
+                            operation_metrics.succeed();
+                            return Ok(ServiceDisposition::Continue);
+                        }
+                        crate::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => {
+                            return Err(ServiceError::Service("selected local recovery fence reply has no inbound request authority".into()));
+                        }
+                        _ => {}
                     }
                     #[cfg(any(test, feature = "test-support"))]
                     crate::test_runtime::observe_decoded_namespace_call(&command);
@@ -1547,6 +1672,38 @@ mod tests {
         .expect("same retained volume OS lease released");
         drop(owner);
         runtime.close().expect("drain shared runtime");
+    }
+
+    #[test]
+    fn default_component_factory_rejects_selected_native_layout_before_owner_lock_mutation() {
+        use sinomo_module::ComponentFactory as _;
+        let name = "default-mount-selected-native-root";
+        let node = NodeId::from_legacy_named(name).unwrap();
+        let mut runtime = crate::test_runtime::DfsTestRuntime::new(name, node.clone()).unwrap();
+        runtime.select_original_data_fixture_before_start(&node).unwrap();
+        runtime.start_nodes().unwrap();
+        let context = runtime.component_context(&node).unwrap();
+        let path = runtime.data_dir(&node).root().join("daemon/data-owner.lock");
+        let before_bytes = std::fs::read(&path).unwrap();
+        let before_identity = std::fs::symlink_metadata(&path).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let factory = component_factory().unwrap();
+            let mounted = factory.mount(&context);
+            let error = match mounted {
+                Err(error) => error,
+                Ok(scope) => { drop(scope); panic!("default mount adopted experimental DATA"); }
+            };
+            assert!(error.to_string().contains("default reader rejects selected original physical layout"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+            assert!(crate::repair_queue_store::same_file_observation(&before_identity, &std::fs::symlink_metadata(&path).unwrap()));
+        }));
+        drop(context);
+        let closed = runtime.close();
+        if let Err(error) = outcome {
+            if let Err(close_error) = closed { eprintln!("default selected mount cleanup also failed: {close_error}"); }
+            std::panic::resume_unwind(error);
+        }
+        closed.expect("selected owner survives rejected default mount and drains normally");
     }
 
     #[test]

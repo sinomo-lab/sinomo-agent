@@ -771,6 +771,185 @@ pub(super) async fn handle_daemon_dfs_status_async(
     })?
 }
 
+/// One explicitly requested local-fence effect, never a maintenance caller.
+/// No native metadata/namespace mutation permit spans an authoritative read.
+#[cfg(test)]
+fn install_selected_local_recovery_rpc_owned(
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    owner: &Arc<DaemonDataOwnerLock>,
+    expected_host: &Weak<DfsRuntimeHost>,
+    command: crate::DfsMessageCommand,
+    authenticated_source: NodeId,
+    deadline: std::time::Instant,
+) -> Result<crate::DfsMessageResponse, DfsDataPlaneHostError> {
+    use crate::{
+        DfsSelectedLocalRecoveryFenceRpcData as Data,
+        DfsSelectedLocalRecoveryFenceRpcOutcome as Outcome,
+        DfsSelectedLocalRecoveryFenceRpcResponse as Reply,
+    };
+    let crate::DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(request) =
+        &command.routed_message.message
+    else {
+        return Err(DfsDataPlaneHostError::new(
+            "selected recovery ingress has no request",
+        ));
+    };
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir))
+        .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+    let local = state.local_node_id;
+    let response = |outcome| crate::DfsMessageResponse {
+        request_id: command.request_id.clone(),
+        outbound_messages: vec![crate::DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: command.routed_message.source_node_id.clone(),
+            frame_id: command.routed_message.frame_id,
+            message_id: command.routed_message.message_id,
+            message: crate::DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(Reply {
+                reservation: request.reservation.clone(),
+                acceptor_node_id: local.clone(),
+                outcome,
+            }),
+        }],
+    };
+    let refused = |reason: String| response(Outcome::Refused { reason });
+    if std::time::Instant::now() >= deadline {
+        return Ok(refused(
+            "selected recovery receiver deadline expired before publication".into(),
+        ));
+    }
+    if command.request_id.is_empty()
+        || command.routed_message.source_node_id != authenticated_source
+        || authenticated_source != request.reservation.ballot.candidate_node_id
+        || authenticated_source == local
+        || command.routed_message.target_node_id != local
+        || request.expected_target != local
+    {
+        return Ok(refused("selected recovery authenticated candidate/carrier/expected target differs from actual local owner".into()));
+    }
+    let check_host = || -> Result<(), DfsDataPlaneHostError> {
+        let expected = expected_host.upgrade().ok_or_else(|| {
+            DfsDataPlaneHostError::new("selected recovery original host disappeared")
+        })?;
+        let current = registered_dfs_runtime_host(data_dir)
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?
+            .ok_or_else(|| {
+                DfsDataPlaneHostError::new("selected recovery registered host disappeared")
+            })?;
+        if !Arc::ptr_eq(&current, &expected) || current.shutting_down.is_cancelled() {
+            return Err(DfsDataPlaneHostError::new(
+                "selected recovery registered host changed or stopped",
+            ));
+        }
+        let held = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+        if !Arc::ptr_eq(&held, owner) {
+            return Err(DfsDataPlaneHostError::new(
+                "selected recovery actual DATA owner changed",
+            ));
+        }
+        Ok(())
+    };
+    if let Err(error) = check_host() {
+        return Ok(refused(error.to_string()));
+    }
+    let layout = match owner.selected_original_data_layout() {
+        Ok(Some(layout)) => layout,
+        Ok(None) => {
+            return Ok(refused(
+                "default owner refuses selected local recovery fence RPC".into(),
+            ));
+        }
+        Err(error) => return Ok(refused(error.to_string())),
+    };
+    if let Err(error) = layout.check_owner(owner) {
+        return Ok(refused(error.to_string()));
+    }
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let Some(mut control) =
+        daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime))
+    else {
+        return Ok(refused(
+            "selected recovery receiver has no authoritative control owner".into(),
+        ));
+    };
+    // Use the independently verified stored request, not a substituted wire
+    // body. R42 validates the full deterministic request and fixed member set.
+    let authoritative = match crate::DfsControlPlaneStore::new(control.as_mut())
+        .verify_metadata_shard_recovery_ballot_before(&request.reservation, &local, deadline)
+    {
+        Ok(crate::control_plane::DfsRecoveryBallotVerify::Verified(actual)) => actual,
+        Ok(crate::control_plane::DfsRecoveryBallotVerify::Refused(reason)) => {
+            return Ok(refused(format!(
+                "selected recovery reservation refused: {reason:?}"
+            )));
+        }
+        Err(error) => return Ok(refused(error.to_string())),
+    };
+    drop(control);
+    let mut service = match open_dfs_runtime_service(data_dir, Some(runtime)) {
+        Ok(service) => service,
+        Err(error) => return Ok(refused(error.to_string())),
+    };
+    if service.node_id() != &local || std::time::Instant::now() >= deadline {
+        return Ok(refused("selected recovery actual service identity or original deadline changed before publication".into()));
+    }
+    let Some((_, service_owner)) = service.native_publication_owner_for_observation() else {
+        return Ok(refused(
+            "selected recovery service lost its actual DATA owner".into(),
+        ));
+    };
+    if !Arc::ptr_eq(&service_owner, owner) {
+        return Ok(refused(
+            "selected recovery service belongs to another DATA owner".into(),
+        ));
+    }
+    if let Err(error) = check_host().and_then(|_| {
+        layout
+            .check_owner(owner)
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))
+    }) {
+        return Ok(refused(error.to_string()));
+    }
+    // From this invocation onward every error is conservative uncertainty:
+    // the atomic publisher may have made bytes visible before a later failure.
+    let installed = match service.install_selected_local_recovery_fence(&authoritative, deadline) {
+        Ok(installed) => installed,
+        Err(error) => {
+            return Ok(response(Outcome::Uncertain {
+                reason: error.to_string(),
+            }));
+        }
+    };
+    let data = Data {
+        fence: installed.data.fence,
+        marker_digest: blake3::hash(&installed.data.marker_bytes)
+            .to_hex()
+            .to_string(),
+        marker_bytes: installed.data.marker_bytes.len() as u64,
+    };
+    let post = check_host().and_then(|_| {
+        layout
+            .check_owner(owner)
+            .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))
+    });
+    let reason = if !installed.reservation_current {
+        Some(
+            installed
+                .post_verification_error
+                .unwrap_or_else(|| "post-publication reservation unavailable".into()),
+        )
+    } else if std::time::Instant::now() >= deadline {
+        Some("selected recovery receiver deadline expired after publication; stored DATA is not a Fenced response".into())
+    } else {
+        post.err().map(|error| error.to_string())
+    };
+    Ok(response(match reason {
+        Some(reason) => Outcome::StoredButUnverified { data, reason },
+        None => Outcome::Fenced { data },
+    }))
+}
+
 impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
     fn live_content_advertisement(
         &self,
@@ -788,6 +967,57 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         super::placement_environment::live_daemon_dfs_content_advertisement(
             data_dir, &owner, time::OffsetDateTime::now_utc(),
         ).ok_or_else(unavailable)
+    }
+
+    #[cfg(test)]
+    fn install_selected_local_recovery_fence_rpc<'a>(
+        &'a self,
+        data_dir: Arc<SinomoDataDir>,
+        ingress: crate::service::AuthenticatedSelectedLocalRecoveryFenceIngress,
+    ) -> DfsDataPlaneHostFuture<'a, crate::DfsMessageResponse> {
+        let validation = self.validate_data_dir(&data_dir);
+        let data_owner = self.require_data_owner();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            validation?;
+            let owner = data_owner?;
+            let task_owner = registered_dfs_runtime_host(&data_dir)
+                .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?
+                .ok_or_else(|| {
+                    DfsDataPlaneHostError::new(
+                        "selected recovery receiver has no registered task owner",
+                    )
+                })?;
+            if task_owner.shutting_down.is_cancelled() {
+                return Err(DfsDataPlaneHostError::new(
+                    "selected recovery receiver is shutting down",
+                ));
+            }
+            let expected_host = Arc::downgrade(&task_owner);
+            let (command, source, deadline) = ingress.into_parts();
+            let process_runtime = runtime.clone();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let task = runtime.spawn_blocking(move || {
+                // Actual DATA ownership remains inside the registered host's
+                // task even if the calling RPC future is cancelled.
+                let response = install_selected_local_recovery_rpc_owned(
+                    &data_dir,
+                    &process_runtime,
+                    &owner,
+                    &expected_host,
+                    command,
+                    source,
+                    deadline,
+                );
+                let _ = send.send(response);
+            });
+            task_owner.own_task(task);
+            receive.await.map_err(|error| {
+                DfsDataPlaneHostError::new(format!(
+                    "selected recovery owned receiver ended without a result (uncertain): {error}"
+                ))
+            })?
+        })
     }
 
     fn status<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsOperatorStatus> {
@@ -914,7 +1144,29 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         command: sinomo_dfs::DfsMetadataJournalBatchCommand,
         context: Option<sinomo_dfs::DfsMetadataReplicaShardContext>,
     ) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsMetadataJournalBatchResponse> {
+        // NEW selected-only receiver processing clock. Capture before the
+        // async body; earlier service authority lookup is outside this cap.
+        let selected_clock = command.prefix_probe.as_ref()
+            .and_then(|probe| probe.repair_custody.as_ref())
+            .filter(|page| page.cut.version == 2)
+            .map(|_| {
+                let captured = std::time::Instant::now();
+                (captured, captured + Duration::from_secs(5))
+            });
         let data_owner = self.require_data_owner();
+        #[cfg(any(test, feature = "test-support"))]
+        let selected_clock_observation = (|| -> Result<(), DfsDataPlaneHostError> {
+            if let Some((captured, deadline)) = selected_clock {
+                let owner = data_owner.as_ref().map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+                if let Some(layout) = owner.selected_original_data_layout()
+                    .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?
+                {
+                    layout.observe_receiver_clock(&command.request_id, captured, deadline)
+                        .map_err(|error| DfsDataPlaneHostError::new(error.to_string()))?;
+                }
+            }
+            Ok(())
+        })();
         let validation = self.validate_data_dir(data_dir.as_ref());
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
@@ -922,6 +1174,8 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         Box::pin(async move {
             let _data_owner = data_owner?;
             validation?;
+            #[cfg(any(test, feature = "test-support"))]
+            selected_clock_observation?;
             #[cfg(any(test, feature = "test-support"))]
             let diagnostic = command.authority_probe.as_ref().filter(|probe| {
                 matches!(&probe.operation, crate::DfsMetadataAuthorityOperation::PreparedOperation { operation_id, .. }
@@ -1016,11 +1270,13 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                         } else {
                             command.batch.decoded()
                         };
-                        let response = sinomo_dfs::process_dfs_metadata_journal_batch(
-                            backend,
-                            Some(context),
-                            command,
-                        );
+                        let response = if let Some((captured, deadline)) = selected_clock {
+                            crate::metadata_replication::process_dfs_metadata_journal_batch_with_selected_receiver_budget(
+                                backend, Some(context), command, captured, deadline,
+                            )
+                        } else {
+                            sinomo_dfs::process_dfs_metadata_journal_batch(backend, Some(context), command)
+                        };
                         #[cfg(any(test, feature = "test-support"))]
                         if let Some((root, probe, started)) = &diagnostic_apply {
                             crate::native_boundary_diagnostics::record(root, "replica-authority-applied", || serde_json::json!({
@@ -1109,6 +1365,14 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                         .await;
                     }
                 }
+            }
+            if selected_clock.is_some_and(|(_, deadline)| std::time::Instant::now() >= deadline)
+                && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
+            {
+                return Ok(daemon_dfs_metadata_journal_rejection_for(
+                    response.request_id, response.shard_id, rejection_next_after_sequence,
+                    "selected receiver processing budget expired after processing; DATA retained without ACK",
+                ));
             }
             Ok(response)
         })
@@ -1425,10 +1689,12 @@ pub(crate) fn daemon_dfs_client_node_transport(
     local_node_id: NodeId,
     peer_node_ids: impl IntoIterator<Item = NodeId>,
     host: Arc<DfsRuntimeHost>,
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
 ) -> DfsNodeTransport {
     // This is the already registered component host supplied by the normal
     // client opener. Core effect/genesis constructors do not bind these senders.
-    let peer = Arc::new(DaemonDfsPeerTransport { host });
+    let peer = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime)) });
     let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
     let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
     DfsNodeTransport::with_peer_transports_for_nodes(
@@ -1441,9 +1707,766 @@ pub(crate) fn daemon_dfs_client_node_transport(
     .with_registered_main_namespace_dispatch()
 }
 
+/// Test-only contact restriction on the SAME actual registered native host.
+/// Not a replacement carrier, fresh owner, source authority or decoded return.
+#[cfg(test)]
+pub(crate) fn daemon_dfs_native_prefix_contact_scoped_transport_for_test(
+    local_node_id: NodeId,
+    peer_node_ids: Vec<NodeId>,
+    data_dir: &SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    contacts: std::collections::BTreeMap<NodeId, (String, String)>,
+) -> Result<DfsNodeTransport, DfsRuntimeError> {
+    let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
+        detail: "native scoped PREFIX has no existing registered host".into(),
+    })?;
+    if contacts.len() != 3
+        || !contacts.contains_key(&local_node_id)
+        || peer_node_ids
+            .iter()
+            .any(|peer| !contacts.contains_key(peer))
+    {
+        return Err(DfsRuntimeError::Parse {
+            detail: "native scoped PREFIX contact set differs".into(),
+        });
+    }
+    let mut context = super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime);
+    context.contact_scope = Some(contacts);
+    let peer = Arc::new(DaemonDfsPeerTransport {
+        host,
+        native_prefix: Some(context),
+    });
+    let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+    let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
+    Ok(DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync_peer,
+        async_peer,
+    ))
+}
+
 #[derive(Clone)]
 pub(super) struct DaemonDfsPeerTransport {
     pub(super) host: Arc<DfsRuntimeHost>,
+    pub(super) native_prefix: Option<super::native_prefix_return::NativePrefixOwnerContext>,
+}
+
+/// One explicit selected original. Selection changes representation/custody
+/// routing only; the producer must independently hold real native admission.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub(super) struct NativeRepairCustodyScope {
+    material: crate::DfsOriginalRepairMaterial,
+    selection_live: std::sync::atomic::AtomicBool,
+    held: std::sync::atomic::AtomicBool,
+    attempts: std::sync::atomic::AtomicUsize,
+    captured: Mutex<Option<NativeRepairCustodyObservation>>,
+    completion: Mutex<Option<Weak<OwnedOriginalRepairCompletion>>>,
+    last_error: Mutex<Option<String>>,
+    retained: Mutex<Option<crate::repair_queue_store::NativeOwnedRepairCompletionRef>>,
+    #[cfg(test)]
+    fail_namespace_once: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug)]
+pub(crate) struct NativeRepairCustodyObservation {
+    pub(crate) carrier: DfsRoutedMessage,
+    pub(crate) returned_frame: DfsRoutedMessage,
+    pub(crate) attempt_sequence: u64,
+    pub(crate) rpc_request_id: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct NativeRepairCustodySelection {
+    owner: Weak<DfsDataOwnerLock>,
+    scope: Arc<NativeRepairCustodyScope>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl NativeRepairCustodySelection {
+    pub(crate) fn allow_intake(&self) {
+        self.scope.held.store(false, Ordering::Release);
+    }
+    pub(crate) fn captured(&self) -> Option<NativeRepairCustodyObservation> {
+        self.scope.captured.lock().ok()?.clone()
+    }
+    pub(crate) fn retained_reference(
+        &self,
+    ) -> Option<crate::repair_queue_store::NativeOwnedRepairCompletionRef> {
+        self.scope.retained.lock().ok()?.clone()
+    }
+    pub(crate) fn intake_attempts(&self) -> usize {
+        self.scope.attempts.load(Ordering::Acquire)
+    }
+    pub(crate) fn captured_completion(&self) -> Option<Arc<OwnedOriginalRepairCompletion>> {
+        self.scope.completion.lock().ok()?.as_ref()?.upgrade()
+    }
+    pub(crate) fn last_intake_error(&self) -> Option<String> {
+        self.scope.last_error.lock().ok()?.clone()
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_namespace_once(&self) {
+        self.scope
+            .fail_namespace_once
+            .store(true, Ordering::Release);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for NativeRepairCustodySelection {
+    fn drop(&mut self) {
+        self.scope.selection_live.store(false, Ordering::Release);
+        let durably_deferred = self.scope.retained.lock().is_ok_and(|value| value.is_some());
+        if let Some(owner) = self.owner.upgrade()
+            && let Ok(mut selected) = owner.native_repair_custody.lock()
+            && selected
+                .as_ref()
+                .is_some_and(|scope| Arc::ptr_eq(scope, &self.scope))
+            && (Arc::strong_count(&self.scope) == 2 || durably_deferred)
+        {
+            selected.take();
+        }
+        // Already captured returns keep their typed custody route. Removing a
+        // fixture scope never turns them into ordinary application responses.
+        self.scope.held.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DfsDataOwnerLock {
+    pub(crate) fn native_repair_custody_return_pending(
+        &self,
+        carrier: &DfsRoutedMessage,
+    ) -> Result<bool, crate::DfsError> {
+        let selected =
+            self.native_repair_custody
+                .lock()
+                .map_err(|_| crate::DfsError::Metadata {
+                    message: "native Repair custody selection poisoned".into(),
+                })?;
+        let Some(scope) = selected
+            .as_ref()
+            .filter(|scope| scope.material.matches_carrier(carrier))
+        else {
+            return Ok(false);
+        };
+        Ok(scope
+            .captured
+            .lock()
+            .map_err(|_| crate::DfsError::Metadata {
+                message: "native custody observation poisoned".into(),
+            })?
+            .is_some())
+    }
+    pub(crate) fn reject_raw_selected_repair_response(
+        &self,
+        returned: &DfsRoutedMessage,
+    ) -> Result<(), crate::DfsError> {
+        let selected =
+            self.native_repair_custody
+                .lock()
+                .map_err(|_| crate::DfsError::Metadata {
+                    message: "native Repair custody selection poisoned".into(),
+                })?;
+        if selected.as_ref().is_some_and(|scope| {
+            crate::node_transport::all_background_replica_response_identity_matches(
+                &scope.material.original.source_node_id,
+                &scope.material.original.routed(),
+                returned,
+            )
+        }) {
+            return Err(crate::DfsError::Metadata {
+                message: "selected original Repair response lacks native owned-return provenance"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn native_repair_custody_material_for_carrier(
+        &self,
+        carrier: &DfsRoutedMessage,
+    ) -> Result<Option<crate::DfsOriginalRepairMaterial>, crate::DfsError> {
+        let selected =
+            self.native_repair_custody
+                .lock()
+                .map_err(|_| crate::DfsError::Metadata {
+                    message: "native Repair custody selection poisoned".into(),
+                })?;
+        let Some(scope) = selected
+            .as_ref()
+            .filter(|scope| scope.material.matches_carrier(carrier))
+        else {
+            return Ok(None);
+        };
+        if scope
+            .captured
+            .lock()
+            .map_err(|_| crate::DfsError::Metadata {
+                message: "native custody observation poisoned".into(),
+            })?
+            .is_some()
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "native Repair scoped return awaits custody settlement".into(),
+            });
+        }
+        Ok(Some(scope.material.clone()))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn select_native_original_repair_custody(
+    data_dir: &SinomoDataDir,
+    material: &crate::DfsOriginalRepairMaterial,
+) -> Result<NativeRepairCustodySelection, crate::DfsError> {
+    material.validate()?;
+    let error = |message: String| crate::DfsError::Metadata { message };
+    let owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
+        .map_err(|e| error(e.to_string()))?;
+    let layout = owner
+        .selected_original_data_layout()
+        .map_err(|e| error(e.to_string()))?
+        .ok_or_else(|| {
+            error("native Repair custody selection requires actual selected owner".into())
+        })?;
+    let queue = layout.queue()?;
+    let birth = queue
+        .original_repair(&material.original.routed())?
+        .ok_or_else(|| error("native Repair custody selection lacks genuine original".into()))?;
+    if birth.original_wire_material()? != *material
+        || birth.closed_at_sequence.is_some()
+        || !birth.observed.is_empty()
+    {
+        return Err(error(
+            "native Repair custody selection changed open original".into(),
+        ));
+    }
+    owner
+        .repair_payload_inspection_context()
+        .map_err(|e| error(e.to_string()))?
+        .inspect(&birth.root)?;
+    let mut selected = owner
+        .native_repair_custody
+        .lock()
+        .map_err(|_| error("native Repair custody selection poisoned".into()))?;
+    if selected.is_some() {
+        return Err(error("native Repair custody selection is occupied".into()));
+    }
+    let scope = Arc::new(NativeRepairCustodyScope {
+        material: material.clone(),
+        selection_live: std::sync::atomic::AtomicBool::new(true),
+        held: std::sync::atomic::AtomicBool::new(true),
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+        captured: Mutex::new(None),
+        completion: Mutex::new(None),
+        last_error: Mutex::new(None),
+        retained: Mutex::new(None),
+        #[cfg(test)]
+        fail_namespace_once: std::sync::atomic::AtomicBool::new(false),
+    });
+    *selected = Some(Arc::clone(&scope));
+    Ok(NativeRepairCustodySelection {
+        owner: Arc::downgrade(&owner),
+        scope,
+    })
+}
+
+/// Created only by the admitted normal producer. The actual body remains in
+/// that producer's DfsRoutedSend; this carries no live mutation admission.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct PreparedNativeRepairCustody {
+    attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
+    data_dir: SinomoDataDir,
+    owner: Arc<DfsDataOwnerLock>,
+    host: Weak<DfsRuntimeHost>,
+    scope: Arc<NativeRepairCustodyScope>,
+    admission: crate::publication_guard::NativeRepairProducerAdmission,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Debug for PreparedNativeRepairCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedNativeRepairCustody")
+            .field("carrier", self.attempt.carrier())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn prepare_native_repair_custody(
+    data_dir: &SinomoDataDir,
+    owner: Arc<DfsDataOwnerLock>,
+    admission: crate::publication_guard::NativeRepairProducerAdmission,
+    carrier: &DfsRoutedMessage,
+    material: &crate::DfsOriginalRepairMaterial,
+) -> Result<PreparedNativeRepairCustody, crate::DfsError> {
+    let error = |message: String| crate::DfsError::Metadata { message };
+    let current = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(data_dir))
+        .map_err(|e| error(e.to_string()))?;
+    if !Arc::ptr_eq(&owner, &current) {
+        return Err(error(
+            "native Repair custody preparation changed owner".into(),
+        ));
+    }
+    let host = registered_dfs_runtime_host(data_dir)
+        .map_err(|e| error(e.to_string()))?
+        .ok_or_else(|| error("native Repair custody preparation has no registered host".into()))?;
+    let scope = owner
+        .native_repair_custody
+        .lock()
+        .map_err(|_| error("native Repair custody selection poisoned".into()))?
+        .as_ref()
+        .filter(|scope| scope.material == *material)
+        .cloned()
+        .ok_or_else(|| {
+            error("native Repair custody selection changed during preparation".into())
+        })?;
+    let layout = owner
+        .selected_original_data_layout()
+        .map_err(|e| error(e.to_string()))?
+        .ok_or_else(|| error("native Repair custody preparation lost selected owner".into()))?;
+    let attempt = layout
+        .queue()?
+        .capture_original_repair_attempt_witness(carrier, material)?;
+    owner
+        .repair_payload_inspection_context()
+        .map_err(|e| error(e.to_string()))?
+        .inspect(attempt.payload_root())?;
+    admission.revalidate_before_dispatch()?;
+    Ok(PreparedNativeRepairCustody {
+        attempt,
+        data_dir: data_dir.clone(),
+        owner,
+        host: Arc::downgrade(&host),
+        scope,
+        admission,
+    })
+}
+
+/// Ephemeral DATA from one actual target-bound native RPC. Private fields and
+/// no serialization or raw-frame constructor keep this distinct from a saved
+/// unverified completion candidate. It grants no application or custody effect.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct OwnedOriginalRepairCompletion {
+    attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
+    returned: DfsRoutedMessage,
+    rpc_request_id: String,
+    owner: Arc<DfsDataOwnerLock>,
+    scope: Option<Arc<NativeRepairCustodyScope>>,
+    producer_admission: Option<crate::publication_guard::HistoricalNativeRepairProducerAdmission>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Debug for OwnedOriginalRepairCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedOriginalRepairCompletion")
+            .field("carrier", self.attempt.carrier())
+            .field("attempt_sequence", &self.attempt.attempt_sequence())
+            .field("returned", &self.returned)
+            .field("rpc_request_id", &self.rpc_request_id)
+            .finish()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl OwnedOriginalRepairCompletion {
+    pub(crate) fn carrier(&self) -> &DfsRoutedMessage {
+        self.attempt.carrier()
+    }
+    pub(crate) fn material(&self) -> &crate::DfsOriginalRepairMaterial {
+        self.attempt.material()
+    }
+    pub(crate) fn returned_frame(&self) -> &DfsRoutedMessage {
+        &self.returned
+    }
+    pub(crate) fn attempt_sequence(&self) -> u64 {
+        self.attempt.attempt_sequence()
+    }
+    pub(crate) fn queue_incarnation(&self) -> &str {
+        self.attempt.queue_incarnation()
+    }
+    pub(crate) fn rpc_request_id(&self) -> &str {
+        &self.rpc_request_id
+    }
+    pub(crate) fn payload_root(&self) -> &crate::content_store::RepairPayloadRoot {
+        self.attempt.payload_root()
+    }
+    pub(crate) fn revalidate_custody_owner(
+        &self,
+        queue: &crate::repair_queue_store::LocalDfsRepairQueueStore,
+    ) -> Result<(), crate::DfsError> {
+        if self.scope.is_none() || self.producer_admission.is_none() {
+            return Err(crate::DfsError::Metadata {
+                message: "native completion lacks admitted producer custody provenance".into(),
+            });
+        }
+        // Past admission and actual RPC provenance remain DATA after retirement.
+        // Do not read current serving authority or take a source dispatch gate.
+        self.owner
+            .selected_original_data_layout()
+            .map_err(|e| crate::DfsError::Metadata {
+                message: e.to_string(),
+            })?
+            .ok_or_else(|| crate::DfsError::Metadata {
+                message: "native completion lost physical selected owner".into(),
+            })?;
+        queue.check_original_repair_attempt_physical_owner(&self.attempt)?;
+        self.owner
+            .repair_payload_inspection_context()
+            .map_err(|e| crate::DfsError::Metadata {
+                message: e.to_string(),
+            })?
+            .inspect(self.attempt.payload_root())?;
+        Ok(())
+    }
+    pub(super) fn custody_queue(
+        &self,
+    ) -> Result<crate::repair_queue_store::LocalDfsRepairQueueStore, crate::DfsError> {
+        Ok(self.owner
+            .selected_original_data_layout()
+            .map_err(|e| crate::DfsError::Metadata {
+                message: e.to_string(),
+            })?
+            .ok_or_else(|| crate::DfsError::Metadata {
+                message: "native completion lost selected queue".into(),
+            })?
+            .queue()?)
+    }
+    pub(super) fn before_custody_intake(self: &Arc<Self>) -> Result<(), crate::DfsError> {
+        let scope = self
+            .scope
+            .as_ref()
+            .ok_or_else(|| crate::DfsError::Metadata {
+                message: "native completion has no selected custody route".into(),
+            })?;
+        let _ = scope
+            .attempts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_add(1))
+            });
+        let mut captured = scope
+            .captured
+            .lock()
+            .map_err(|_| crate::DfsError::Metadata {
+                message: "native custody observation poisoned".into(),
+            })?;
+        if captured.is_none() {
+            *captured = Some(NativeRepairCustodyObservation {
+                carrier: self.carrier().clone(),
+                returned_frame: self.returned.clone(),
+                attempt_sequence: self.attempt_sequence(),
+                rpc_request_id: self.rpc_request_id.clone(),
+            });
+        }
+        drop(captured);
+        if let Ok(mut completion) = scope.completion.lock() {
+            *completion = Some(Arc::downgrade(self));
+        }
+        if scope.held.load(Ordering::Acquire) {
+            return Err(crate::DfsError::Metadata {
+                message: "native original Repair custody intake held".into(),
+            });
+        }
+        Ok(())
+    }
+    pub(super) fn record_custody_deferred(
+        &self,
+        deferred: &crate::repair_queue_store::DeferredNativeRepairCompletion,
+    ) {
+        if let Some(scope) = &self.scope
+            && let Ok(mut retained) = scope.retained.lock()
+        {
+            *retained = Some(deferred.reference().clone());
+        }
+        if let Some(scope) = &self.scope
+            && !scope.selection_live.load(Ordering::Acquire)
+            && let Ok(mut selected) = self.owner.native_repair_custody.lock()
+            && selected
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(scope, current))
+        {
+            selected.take();
+        }
+    }
+    pub(super) fn record_custody_error(&self, error: &crate::DfsError) {
+        if let Some(scope) = &self.scope
+            && let Ok(mut last) = scope.last_error.lock()
+        {
+            *last = Some(error.to_string().chars().take(8192).collect());
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn take_namespace_failure(&self) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|scope| scope.fail_namespace_once.swap(false, Ordering::AcqRel))
+    }
+}
+
+/// Send exactly one existing original/attempt through its registered native
+/// owner, retaining the returned DATA without delivering or applying it locally.
+/// The body is opened from the witness's actual retained root, never supplied
+/// by a caller or reconstructed from current metadata. No ordinary send path
+/// selects this dormant test-support primitive and no retry is performed here.
+/// Historical attempt DATA is not source authority: this uses the existing
+/// final source dispatch gate, and production activation still requires the
+/// ordinary producer's native execution/admission ownership to be carried in.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn call_native_original_repair_owned(
+    data_dir: &SinomoDataDir,
+    attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
+    options: DfsObjectRpcSendOptions,
+) -> Result<OwnedOriginalRepairCompletion, crate::DfsError> {
+    let invalid = |detail: &str| crate::DfsError::Metadata {
+        message: format!("native original Repair completion {detail}"),
+    };
+    // The caller's existing whole-call budget includes owner/body preparation;
+    // do not restart it after local reads or accept a return after its expiry.
+    let deadline = options
+        .overall_timeout
+        .map(|budget| {
+            Instant::now()
+                .checked_add(budget)
+                .ok_or_else(|| invalid("caller deadline is not representable"))
+        })
+        .transpose()?;
+    let paths = DaemonPaths::new(data_dir);
+    let owner =
+        require_daemon_dfs_data_owner_lock(&paths).map_err(|error| invalid(&error.to_string()))?;
+    let host = registered_dfs_runtime_host(data_dir)
+        .map_err(|error| invalid(&error.to_string()))?
+        .ok_or_else(|| invalid("has no registered native host"))?;
+    if host.shutting_down.is_cancelled() {
+        return Err(invalid("native host is shutting down"));
+    }
+    let identity =
+        sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir))
+            .map_err(crate::DfsError::from_network)?;
+    let carrier = attempt.carrier();
+    if carrier.source_node_id != identity.local_node_id
+        || carrier.target_node_id == identity.local_node_id
+        || !attempt.material().matches_carrier(carrier)
+    {
+        return Err(invalid(
+            "original carrier does not belong to this native producer",
+        ));
+    }
+    let layout = owner
+        .selected_original_data_layout()
+        .map_err(|error| invalid(&error.to_string()))?
+        .ok_or_else(|| invalid("requires its actual selected queue owner"))?;
+    let queue = layout.queue()?;
+    queue.revalidate_original_repair_attempt_witness(&attempt)?;
+    let inspection = owner
+        .repair_payload_inspection_context()
+        .map_err(|error| invalid(&error.to_string()))?;
+    inspection.inspect(attempt.payload_root())?;
+    let content = owner
+        .open_native_content()
+        .map_err(|error| invalid(&error.to_string()))?;
+    let reader = content.open_retained_repair_payload(attempt.payload_root())?;
+    let material = attempt.material();
+    material.validate()?;
+    let content_hash = material
+        .attachment
+        .content_hash
+        .as_deref()
+        .ok_or_else(|| invalid("original attachment has no exact hash"))?;
+    let mut call = crate::DfsRoutedCall::with_attachment(
+        carrier.clone(),
+        crate::DfsOutboundAttachment::from_reader(
+            reader,
+            material.attachment.total_size_bytes,
+            content_hash,
+        ),
+    );
+    if owner
+        .selects_original_repair_target(&carrier.target_node_id)
+        .map_err(|error| invalid(&error.to_string()))?
+    {
+        call = call.with_original_repair(material.clone())?;
+    }
+    call_native_original_repair_owned_with_call(
+        data_dir, owner, host, attempt, call, options, deadline, None, None,
+    )
+}
+
+/// Only the normal admitted producer can create the private preparation. Its
+/// already-owned body is consumed here without substitution or reopening.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn send_prepared_native_repair_custody(
+    prepared: PreparedNativeRepairCustody,
+    call: crate::DfsRoutedCall,
+    options: DfsObjectRpcSendOptions,
+) -> Result<OwnedOriginalRepairCompletion, crate::DfsError> {
+    let invalid = || crate::DfsError::Metadata {
+        message: "native custody send changed its admitted original/body".into(),
+    };
+    if call.message != *prepared.attempt.carrier()
+        || call.attachment.as_ref().map(|body| &body.descriptor)
+            != Some(&prepared.attempt.material().attachment)
+        || call
+            .original_repair
+            .as_ref()
+            .is_some_and(|material| material != prepared.attempt.material())
+    {
+        return Err(invalid());
+    }
+    let deadline = options
+        .overall_timeout
+        .map(|budget| Instant::now().checked_add(budget).ok_or_else(invalid))
+        .transpose()?;
+    prepared.admission.revalidate_before_dispatch()?;
+    let host = prepared
+        .host
+        .upgrade()
+        .ok_or_else(|| crate::DfsError::Metadata {
+            message: "native custody prepared host is no longer registered".into(),
+        })?;
+    call_native_original_repair_owned_with_call(
+        &prepared.data_dir,
+        prepared.owner,
+        host,
+        prepared.attempt,
+        call,
+        options,
+        deadline,
+        Some(prepared.scope),
+        Some(prepared.admission),
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn call_native_original_repair_owned_with_call(
+    data_dir: &SinomoDataDir,
+    owner: Arc<DfsDataOwnerLock>,
+    host: Arc<DfsRuntimeHost>,
+    attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
+    call: crate::DfsRoutedCall,
+    mut options: DfsObjectRpcSendOptions,
+    deadline: Option<Instant>,
+    scope: Option<Arc<NativeRepairCustodyScope>>,
+    producer_admission: Option<crate::publication_guard::NativeRepairProducerAdmission>,
+) -> Result<OwnedOriginalRepairCompletion, crate::DfsError> {
+    let invalid = |detail: &str| crate::DfsError::Metadata {
+        message: format!("native original Repair completion {detail}"),
+    };
+    let possibly_applied = |detail: String| crate::DfsError::NetworkDelivery {
+        message: format!("native original Repair completion {detail}"),
+        delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+    };
+    let paths = DaemonPaths::new(data_dir);
+    let current_host = registered_dfs_runtime_host(data_dir)
+        .map_err(|e| invalid(&e.to_string()))?
+        .ok_or_else(|| invalid("has no registered native host"))?;
+    let current_owner =
+        require_daemon_dfs_data_owner_lock(&paths).map_err(|e| invalid(&e.to_string()))?;
+    if !Arc::ptr_eq(&host, &current_host)
+        || !Arc::ptr_eq(&owner, &current_owner)
+        || host.shutting_down.is_cancelled()
+    {
+        return Err(invalid("prepared native owner changed before dispatch"));
+    }
+    let layout = owner
+        .selected_original_data_layout()
+        .map_err(|e| invalid(&e.to_string()))?
+        .ok_or_else(|| invalid("requires its actual selected queue owner"))?;
+    let queue = layout.queue()?;
+    queue.revalidate_original_repair_attempt_witness(&attempt)?;
+    let inspection = owner
+        .repair_payload_inspection_context()
+        .map_err(|e| invalid(&e.to_string()))?;
+    inspection.inspect(attempt.payload_root())?;
+    let target = attempt.carrier().target_node_id.clone();
+    let (expected, call) = crate::node_transport::dfs_routed_call_rpc_call(call)
+        .map_err(crate::DfsError::from_network)?;
+    // Reuse the last gate of the existing detached sender: a closed/observed
+    // birth or a frozen source cannot send merely because historical Attempt
+    // DATA remains. This branch neither records a delivery nor renews admission.
+    let dispatch = crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
+        data_dir,
+        crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
+            message: expected.routed_message.clone(),
+        },
+        Some(&layout),
+        Some(&inspection),
+    )?;
+    if matches!(
+        dispatch,
+        crate::node_transport::DfsBackgroundReplicaDispatch::Fenced
+    ) {
+        return Err(invalid("source dispatch is fenced"));
+    }
+    if let Some(deadline) = deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| invalid("caller deadline expired before dispatch"))?;
+        options.overall_timeout = Some(remaining);
+    }
+    // Concrete native owner only: neither DfsMessageSender, arbitrary peer
+    // traits nor the generic decoded inbox can enter the constructor below.
+    let peer = DaemonDfsPeerTransport {
+        host: Arc::clone(&host),
+        native_prefix: None, // Repair keeps its separate owned-return family.
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    let mut native_attempt = crate::native_shard_trace::begin_rpc_attempt(&target, &expected);
+    let raw_return = peer.host.object_rpc.call(
+        &target,
+        call,
+        options.cluster_rpc_options(),
+        options.observe_connectivity,
+    );
+    #[cfg(any(test, feature = "test-support"))]
+    if let (Some(observation), Err(error)) = (native_attempt.as_mut(), &raw_return) {
+        observation.returned(&Err(DfsPeerTransportError::from_network(error.clone())));
+    }
+    let raw_return = raw_return.map_err(crate::DfsError::from_network)?;
+    let decoded = crate::node_transport::dfs_message_response_from_rpc_result_sync(raw_return);
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(observation) = native_attempt.as_mut() {
+        observation.returned(&decoded);
+    }
+    let decoded = decoded.map_err(|error| possibly_applied(error.to_string()))?;
+    let returned =
+        crate::node_transport::validate_original_repair_owned_rpc_return(&expected, decoded)
+            .map_err(|error| possibly_applied(error.to_string()))?;
+    let revalidate = || -> Result<(), crate::DfsError> {
+        let current_host = registered_dfs_runtime_host(data_dir)
+            .map_err(|error| invalid(&error.to_string()))?
+            .ok_or_else(|| invalid("registered native host disappeared during RPC"))?;
+        let current_owner = require_daemon_dfs_data_owner_lock(&paths)
+            .map_err(|error| invalid(&error.to_string()))?;
+        if !Arc::ptr_eq(&host, &current_host)
+            || !Arc::ptr_eq(&owner, &current_owner)
+            || current_host.shutting_down.is_cancelled()
+        {
+            return Err(invalid("native host or DATA owner changed during RPC"));
+        }
+        current_owner
+            .selected_original_data_layout()
+            .map_err(|error| invalid(&error.to_string()))?
+            .ok_or_else(|| invalid("selected owner disappeared during RPC"))?;
+        queue.revalidate_original_repair_attempt_witness(&attempt)?;
+        inspection.inspect(attempt.payload_root())?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(invalid("caller deadline expired before completion capture"));
+        }
+        Ok(())
+    };
+    revalidate().map_err(|error| possibly_applied(error.to_string()))?;
+    Ok(OwnedOriginalRepairCompletion {
+        attempt,
+        returned,
+        rpc_request_id: expected.request_id,
+        owner,
+        scope,
+        producer_admission: producer_admission.map(|proof| proof.into_historical()),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1479,6 +2502,13 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsUnavailablePeerTransport {
 }
 
 impl DfsPeerTransport for DaemonDfsPeerTransport {
+    fn call_metadata_prefix_probe(
+        &self, attempt: &crate::DfsMetadataPrefixProbeAttempt, options: DfsObjectRpcSendOptions,
+    ) -> Result<crate::DfsMetadataPrefixProbeReturn, DfsPeerTransportError> {
+        let context = self.native_prefix.as_ref().ok_or_else(|| DfsPeerTransportError::new("native prefix capture has no actual opener context"))?;
+        super::native_prefix_return::call_native_prefix_probe(context,&self.host,attempt,options)
+    }
+
     fn response_delivery_owner(&self) -> Option<Arc<crate::DfsRoutedResponseDelivery>> {
         Some(Arc::clone(&self.host.response_delivery))
     }
@@ -1526,7 +2556,7 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
 
 pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     data_dir: &SinomoDataDir,
-    _runtime: &tokio::runtime::Handle,
+    runtime: &tokio::runtime::Handle,
 ) -> (
     Arc<dyn DfsPeerTransport>,
     Arc<dyn sinomo_dfs::AsyncDfsPeerTransport>,
@@ -1537,7 +2567,7 @@ pub(crate) fn daemon_dfs_peer_transports_on_runtime(
         let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
         return (peer_transport, async_peer_transport);
     };
-    let transport = Arc::new(DaemonDfsPeerTransport { host });
+    let transport = Arc::new(DaemonDfsPeerTransport { host, native_prefix: Some(super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime)) });
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)
@@ -1651,7 +2681,7 @@ mod peer_delivery_tests {
                 carrier.clone(),
                 None,
             ));
-            let peer = Arc::new(DaemonDfsPeerTransport { host });
+            let peer = Arc::new(DaemonDfsPeerTransport { host, native_prefix: None });
             let local = NodeId::from_legacy_named("host-delivery-local").unwrap();
             let remote = NodeId::from_legacy_named("host-delivery-remote").unwrap();
             let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();

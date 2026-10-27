@@ -10,6 +10,7 @@ fn object_id() -> DfsObjectId {
 
 mod prepared_operation;
 mod stat_snapshot;
+mod selected_recovery_fence;
 
 fn assert_resident_snapshot_pending_preserves_fence<G>(
     mut backend: LocalSobjMetadataBackend,

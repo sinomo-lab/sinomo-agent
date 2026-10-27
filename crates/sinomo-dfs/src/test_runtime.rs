@@ -102,7 +102,7 @@ pub enum RpcPhase {
     Constructed,
     BeforeDispatch,
     AfterDispatch,
-    /// Normal Hosted decoder returned the actual namespace header.
+    /// Normal Hosted decoder returned an actual supported typed header.
     Decoded,
     Completed,
     EndedWithoutResponse,
@@ -112,7 +112,7 @@ pub struct RpcObservation {
     pub source: NodeId,
     pub target: NodeId,
     pub call_id: u64,
-    /// Actual inline repair or normally decoded namespace head; observation never reads a body.
+    /// Actual inline repair or normally decoded typed head; observation never reads a body.
     pub dfs_frame_id: Option<u64>,
     pub dfs_intent_id: Option<String>,
     pub dfs_request_id: Option<String>,
@@ -138,12 +138,40 @@ pub struct RpcObservation {
 struct NativeRpcCallContext {
     fabric: std::sync::Weak<Fabric>,
     observation: RpcObservation,
+    write_reply_capture: Option<Arc<Mutex<DecodedWriteReplyCapture>>>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturedWriteReplyKind {
+    Write,
+    Distributed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DecodedWriteReplyIdentity {
+    call_id: u64,
+    source: NodeId,
+    target: NodeId,
+    route: String,
+    outer_request_id: String,
+    frame_id: u64,
+    message_id: u64,
+    request_id: String,
+    object_id: DfsObjectId,
+    kind: CapturedWriteReplyKind,
+}
+
+#[derive(Default)]
+struct DecodedWriteReplyCapture {
+    identity: Option<DecodedWriteReplyIdentity>,
+    invalid: bool,
+}
+
 tokio::task_local! {
     static NATIVE_RPC_CALL_CONTEXT: NativeRpcCallContext;
 }
 
-/// Observe actual namespace/write-response identities after normal decoding and signer validation.
+/// Observe supported typed identities after normal decoding and signer validation.
 /// Streamed value bodies have already been consumed by that ordinary decoder;
 /// this observer copies only existing scalar identity fields.
 pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand) {
@@ -153,6 +181,68 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
             || context.observation.target != head.target_node_id
         {
             return;
+        }
+        if let Some(capture) = &context.write_reply_capture {
+            // Only the normal authenticated decoder sees the request. Copy
+            // scalar identity here; never poll/clone the request body again.
+            let identity = match &head.message {
+                DfsNetworkMessage::WriteRequest(write)
+                    if context.observation.route == DFS_DATA_WRITE_ROUTE =>
+                {
+                    Some((
+                        &write.request_id,
+                        &write.request.object_id,
+                        CapturedWriteReplyKind::Write,
+                    ))
+                }
+                DfsNetworkMessage::DistributedWriteRequest(write)
+                    if context.observation.route == DFS_DATA_DISTRIBUTED_WRITE_ROUTE =>
+                {
+                    Some((
+                        &write.request_id,
+                        &write.request.object_id,
+                        CapturedWriteReplyKind::Distributed,
+                    ))
+                }
+                _ => None,
+            };
+            if let Ok(mut capture) = capture.lock() {
+                if let Some((request_id, object_id, kind)) = identity {
+                    let identity = DecodedWriteReplyIdentity {
+                        call_id: context.observation.call_id,
+                        source: head.source_node_id.clone(),
+                        target: head.target_node_id.clone(),
+                        route: context.observation.route.clone(),
+                        outer_request_id: command.request_id.clone(),
+                        frame_id: head.frame_id,
+                        message_id: head.message_id,
+                        request_id: request_id.clone(),
+                        object_id: object_id.clone(),
+                        kind,
+                    };
+                    if capture
+                        .identity
+                        .as_ref()
+                        .is_some_and(|previous| previous != &identity)
+                    {
+                        capture.invalid = true;
+                    } else {
+                        if capture.identity.is_none()
+                            && let Some(fabric) = context.fabric.upgrade()
+                        {
+                            let mut observation = context.observation.clone();
+                            observation.phase = RpcPhase::Decoded;
+                            observation.dfs_frame_id = Some(identity.frame_id);
+                            observation.dfs_request_id = Some(identity.request_id.clone());
+                            observation.dfs_object_id = Some(identity.object_id.clone());
+                            fabric.record(observation);
+                        }
+                        capture.identity = Some(identity);
+                    }
+                } else {
+                    capture.invalid = true;
+                }
+            }
         }
         let Some(fabric) = context.fabric.upgrade() else {
             return;
@@ -181,12 +271,88 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
                     observation.dfs_version = Some(version.clone());
                 }
             }
+            crate::DfsNetworkMessage::RepairReplicaResponse(response)
+                if observation.route == crate::DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE =>
+            {
+                observation.dfs_request_id = Some(response.request_id.clone());
+                observation.dfs_intent_id = Some(response.intent_id.clone());
+                observation.dfs_file_system_id = Some(response.file_system_id.clone());
+                observation.dfs_object_id = Some(response.object_id.clone());
+                observation.dfs_version = Some(response.version.clone());
+            }
+            crate::DfsNetworkMessage::OriginalRepairHistoryRequest(request)
+                if observation.route == crate::DFS_DATA_READ_ROUTE =>
+            {
+                // This is the immutable original effect's identity. The actual
+                // decoded outer frame and call_id separately bind this query.
+                let original = &request.original_material.original.command;
+                observation.dfs_request_id = Some(original.request_id.clone());
+                observation.dfs_intent_id = Some(original.intent_id.clone());
+                observation.dfs_file_system_id = Some(original.file_system_id.clone());
+                observation.dfs_object_id = Some(original.object_id.clone());
+                observation.dfs_version = Some(original.version.clone());
+            }
             _ => return,
         }
         observation.phase = RpcPhase::Decoded;
         observation.dfs_frame_id = Some(head.frame_id);
         fabric.record(observation);
     });
+}
+
+/// Validate only correlation of a supplied completed response. This utility
+/// creates no receiver result or authority; the caller owns actual dispatch.
+fn captured_write_reply(
+    expected: &DecodedWriteReplyIdentity,
+    observation: &RpcObservation,
+    response: DfsMessageResponse,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let invalid = || NetworkError::Serialization {
+        detail: "completed write capture differs from its actual decoded call".into(),
+    };
+    if expected.call_id != observation.call_id
+        || expected.source != observation.source
+        || expected.target != observation.target
+        || expected.route != observation.route
+        || !observation
+            .signer
+            .as_ref()
+            .and_then(ServiceSigner::cluster_identity)
+            .is_some_and(|(node, _)| node == expected.source.as_str())
+        || response.request_id != expected.outer_request_id
+        || expected.outer_request_id != format!("dfs_message_{}", expected.frame_id)
+        || response.outbound_messages.len() != 1
+    {
+        return Err(invalid());
+    }
+    let routed = response
+        .outbound_messages
+        .into_iter()
+        .next()
+        .ok_or_else(invalid)?;
+    if routed.source_node_id != expected.target || routed.target_node_id != expected.source {
+        return Err(invalid());
+    }
+    let matched = match (&routed.message, expected.kind) {
+        (DfsNetworkMessage::WriteResponse(reply), CapturedWriteReplyKind::Write) => {
+            expected.route == DFS_DATA_WRITE_ROUTE
+                && reply.request_id == expected.request_id
+                && reply.object_id == expected.object_id
+        }
+        (
+            DfsNetworkMessage::DistributedWriteResponse(reply),
+            CapturedWriteReplyKind::Distributed,
+        ) => {
+            expected.route == DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                && reply.request_id == expected.request_id
+                && reply.object_id == expected.object_id
+        }
+        _ => false,
+    };
+    if !matched {
+        return Err(invalid());
+    }
+    Ok(routed)
 }
 
 /// Observe the normal decoded command after source authentication. No stream
@@ -199,7 +365,17 @@ pub(crate) async fn pause_decoded_write_commit_publication(
         let observation = &context.observation;
         let mut rules = fabric.faults.lock().unwrap();
         let Some(rule) = rules.iter_mut().find(|rule| {
-            matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+            (matches!(rule.action, FaultAction::PauseWriteCommitPublication { .. })
+                || matches!(&rule.action, FaultAction::PauseExactWriteCommitPublication { operation_id, .. }
+                    if operation_id.starts_with("write:")
+                        && observation.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                        && observation.signer.as_ref().and_then(ServiceSigner::cluster_identity)
+                            .is_some_and(|(node, _)| node == observation.source.as_str())
+                        && command.source_node_id.as_ref() == Some(&observation.source)
+                        && command.durable_replication.as_ref().is_some_and(|purpose| purpose.background_publication)
+                        && command.batch.decoded().is_ok_and(|batch| batch.entries.iter().any(|entry|
+                            matches!(&entry.mutation, crate::DfsMetadataMutation::CommitPreparedOperationV7 { operation_id: actual, digest, .. }
+                                if actual == operation_id && &digest.operation_id == operation_id)))))
                 && rule.source.as_ref().is_none_or(|id| id == &observation.source)
                 && rule.target.as_ref().is_none_or(|id| id == &observation.target)
                 && rule.route.as_ref().is_none_or(|route| route == &observation.route)
@@ -216,7 +392,14 @@ pub(crate) async fn pause_decoded_write_commit_publication(
             return Err(ServiceError::Service("bounded native publication pause exhausted".into()));
         }
         rule.remaining_hits -= 1;
-        let FaultAction::PauseWriteCommitPublication { gate, captured } = &rule.action else { unreachable!() };
+        let (gate, captured) = match &rule.action {
+            FaultAction::PauseWriteCommitPublication { gate, captured } => (gate, captured),
+            FaultAction::PauseExactWriteCommitPublication { gate, captured, .. } => {
+                if captured.lock().unwrap().len() >= 32 { return Err(ServiceError::Service("bounded exact write publication capture exhausted".into())); }
+                (gate, captured)
+            }
+            _ => unreachable!(),
+        };
         captured.lock().unwrap().push(command.clone());
         Ok(Some(Arc::clone(gate)))
     }).unwrap_or(Ok(None))?;
@@ -225,6 +408,56 @@ pub(crate) async fn pause_decoded_write_commit_publication(
             .acquire()
             .await
             .map_err(|_| ServiceError::Service("native publication pause closed".into()))?;
+        permit.forget();
+    }
+    Ok(())
+}
+
+/// Negative-only pause for the selected DATA page of one actual handoff. This
+/// receives the already decoded, source-authenticated command; it never reads
+/// the request stream or supplies a response, prefix proof or custody ACK.
+pub(crate) async fn pause_decoded_selected_original_custody(
+    command: &crate::DfsMetadataJournalBatchCommand,
+) -> Result<(), ServiceError> {
+    let selected = NATIVE_RPC_CALL_CONTEXT.try_with(|context| {
+        let Some(fabric) = context.fabric.upgrade() else { return Ok(None); };
+        let observation = &context.observation;
+        if observation.route != crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+            || command.source_node_id.as_ref() != Some(&observation.source)
+            || !command.verify_prefix_only
+            || command.authority_probe.is_some()
+            || command.durable_replication.is_some()
+            || !command.batch.journal_frames.is_empty()
+        { return Ok(None); }
+        let Some(probe) = command.prefix_probe.as_ref() else { return Ok(None); };
+        let Some(page) = probe.repair_custody.as_ref() else { return Ok(None); };
+        if page.cut.version != 2 || page.cut.selected_original_data.is_none() {
+            return Ok(None);
+        }
+        let mut rules = fabric.faults.lock().unwrap();
+        let Some(rule) = rules.iter_mut().find(|rule| {
+            matches!(&rule.action, FaultAction::PauseSelectedOriginalCustody { handoff_id, .. }
+                if !handoff_id.is_empty()
+                    && probe.primary_handoff_id.as_ref() == Some(handoff_id)
+                    && &page.cut.handoff.handoff_id == handoff_id)
+                && rule.source.as_ref().is_none_or(|id| id == &observation.source)
+                && rule.target.as_ref().is_none_or(|id| id == &observation.target)
+                && rule.route.as_ref().is_none_or(|route| route == &observation.route)
+                && rule.origin.is_none_or(|origin| origin == observation.origin)
+                && rule.call_id.is_none_or(|id| id == observation.call_id)
+        }) else { return Ok(None); };
+        if rule.remaining_hits == 0 {
+            fabric.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
+            return Err(ServiceError::Service("bounded selected custody pause exhausted".into()));
+        }
+        rule.remaining_hits -= 1;
+        let FaultAction::PauseSelectedOriginalCustody { gate, captured, .. } = &rule.action else { unreachable!() };
+        captured.lock().unwrap().push(command.clone());
+        Ok(Some(Arc::clone(gate)))
+    }).unwrap_or(Ok(None))?;
+    if let Some(gate) = selected {
+        let permit = gate.acquire().await
+            .map_err(|_| ServiceError::Service("selected custody pause closed".into()))?;
         permit.forget();
     }
     Ok(())
@@ -321,6 +554,20 @@ pub enum FaultAction {
         gate: Arc<Semaphore>,
         captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
     },
+    /// Negative-only hold of an actual decoded background write commit for
+    /// exactly this V7 operation. Unrelated writes/prepares spend no hits.
+    PauseExactWriteCommitPublication {
+        operation_id: String,
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
+    /// Pause only an already decoded selected-v2 custody prefix page for this
+    /// handoff. Ordinary journal/topology traffic consumes no fault hits.
+    PauseSelectedOriginalCustody {
+        handoff_id: String,
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsMetadataJournalBatchCommand>>>,
+    },
     /// Hold the actual receiver's response after its native execution completes.
     PauseAfterDispatch(Arc<Semaphore>),
     /// Retain the actual native read head while pausing its original body source.
@@ -352,6 +599,9 @@ pub enum FaultAction {
         intent_id: Option<String>,
         captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
     },
+    /// Capture the real completed client-facing write response, then lose its
+    /// delivery. The actual post-auth decoded request supplies correlation.
+    CaptureWriteReplyAndLoseAfterDispatch(Arc<Mutex<Vec<crate::DfsRoutedMessage>>>),
     /// Observe the real Stage head/reply and lose only its completed delivery.
     CaptureStageExchangeAndLoseAfterDispatch(Arc<Mutex<StageExchangeCapture>>),
     /// Observe the actual completed CommitVersion reply without changing it.
@@ -425,6 +675,24 @@ struct Fabric {
     transfers: Mutex<Vec<Transfer>>,
 }
 impl Fabric {
+    fn close_paused_faults_for_node(&self, node: &NodeId) {
+        for rule in self.faults.lock().unwrap().iter() {
+            if rule.target.as_ref().is_none_or(|id| id == node)
+                || rule.source.as_ref().is_none_or(|id| id == node)
+            {
+                if let FaultAction::PauseBeforeDispatch(gate)
+                | FaultAction::PauseWriteCommitPublication { gate, .. }
+                | FaultAction::PauseExactWriteCommitPublication { gate, .. }
+                | FaultAction::PauseSelectedOriginalCustody { gate, .. }
+                | FaultAction::PauseAfterDispatch(gate)
+                | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
+                {
+                    gate.close();
+                }
+            }
+        }
+    }
+
     fn record_returned_error(&self, call_id: u64, error: &NetworkError) {
         let detail = format!("{error:?}");
         let mut bounded = detail.chars().take(2048).collect::<String>();
@@ -480,7 +748,9 @@ impl Fabric {
                     FaultAction::AlterStatReplyAfterDispatch { .. } => false,
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
-                    FaultAction::PauseWriteCommitPublication { .. } => false,
+                    FaultAction::PauseWriteCommitPublication { .. }
+                    | FaultAction::PauseExactWriteCommitPublication { .. }
+                    | FaultAction::PauseSelectedOriginalCustody { .. } => false,
                     FaultAction::CaptureTransferReplyAndLoseAfterDispatch { intent_id, .. } => {
                         intent_id.as_ref().is_none_or(|expected| {
                             observation.dfs_intent_id.as_ref() == Some(expected)
@@ -501,7 +771,11 @@ impl Fabric {
             self.exhausted_budgets.fetch_add(1, Ordering::Relaxed);
             return Some(FaultAction::BudgetExhausted);
         }
-        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall) {
+        if matches!(rule.action, FaultAction::BudgetExhaustedForFirstCall
+            | FaultAction::CaptureWriteReplyAndLoseAfterDispatch(_))
+        {
+            // Bind this completed-reply loss to one actual carrier. An exact
+            // operation retry on a distinct call must not consume this rule.
             rule.call_id.get_or_insert(observation.call_id);
         }
         rule.remaining_hits -= 1;
@@ -591,6 +865,10 @@ impl Carrier {
                             repair.version,
                             repair.request_id,
                         )),
+                        crate::DfsNetworkMessage::SelectedOriginalRepair(selected) => {
+                            let repair = selected.material.original.command;
+                            Some((command.routed_message.frame_id, repair.intent_id, repair.file_system_id, repair.object_id, repair.version, repair.request_id))
+                        }
                         crate::DfsNetworkMessage::RepairRetainedBlob(repair) => Some((
                             command.routed_message.frame_id,
                             repair.intent_id,
@@ -694,6 +972,14 @@ impl Carrier {
         self.fabric.record(observation.clone());
         let fault = self.fabric.fault(&observation, &call.request);
         match &fault {
+            Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(_))
+                if observation.route != DFS_DATA_WRITE_ROUTE && observation.route != DFS_DATA_DISTRIBUTED_WRITE_ROUTE =>
+            {
+                return Err(NetworkError::delivery_failed(
+                    "shared DFS write capture scope", NetworkDeliveryState::DefinitelyNotSent,
+                    "write reply capture requires an actual write request route",
+                ));
+            }
             Some(FaultAction::BudgetExhausted) => {
                 return Err(NetworkError::delivery_failed(
                     "shared DFS test before-dispatch fault",
@@ -829,9 +1115,12 @@ impl Carrier {
             Box::new(ReplySink(response_tx)),
         );
         dispatch_started.store(true, Ordering::Release);
+        let write_reply_capture = matches!(&fault, Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(_)))
+            .then(|| Arc::new(Mutex::new(DecodedWriteReplyCapture::default())));
         let native_call = NativeRpcCallContext {
             fabric: Arc::downgrade(&self.fabric),
             observation: observation.clone(),
+            write_reply_capture: write_reply_capture.clone(),
         };
         NATIVE_RPC_CALL_CONTEXT
             .scope(
@@ -1018,6 +1307,37 @@ impl Carrier {
                 "shared DFS test lost captured Stage exchange response",
                 NetworkDeliveryState::PossiblyApplied,
                 "native Stage receiver completed before its original response delivery was discarded",
+            ));
+        }
+        if let Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(captured)) = &fault {
+            if outgoing.response.route != observation.route
+                || (!outgoing.response.body.is_empty() && !outgoing.body.is_empty())
+            {
+                return Err(NetworkError::Serialization { detail: "write capture requires its exact completed value response route, without a semantic attachment".into() });
+            }
+            let expected = {
+                let state = write_reply_capture.as_ref().expect("selected write capture")
+                    .lock().map_err(|_| NetworkError::Serialization { detail: "decoded write capture poisoned".into() })?;
+                if state.invalid { return Err(NetworkError::Serialization { detail: "write capture has conflicting or unsupported decoded request".into() }); }
+                state.identity.clone().ok_or_else(|| NetworkError::Serialization { detail: "write capture has no actual authenticated decoded request".into() })?
+            };
+            // The completed output is consumed exactly once and deliberately
+            // never forwarded or re-encoded: the selected fault loses it.
+            let value = if outgoing.response.body.is_empty() {
+                outgoing.body.collect_to_vec(64 * 1024).await?
+            } else {
+                if outgoing.response.body.len() > 64 * 1024 { return Err(NetworkError::Serialization { detail: "bounded completed write capture exceeded".into() }); }
+                outgoing.response.body.clone()
+            };
+            let response: DfsMessageResponse = sinomo_object_serde::from_bytes(&value)
+                .map_err(|error| NetworkError::Serialization { detail: error.to_string() })?;
+            let routed = captured_write_reply(&expected, &observation, response)?;
+            let mut records = captured.lock().map_err(|_| NetworkError::Serialization { detail: "completed write capture poisoned".into() })?;
+            if records.len() >= 32 { return Err(NetworkError::Serialization { detail: "bounded completed write capture count exceeded".into() }); }
+            records.push(routed);
+            return Err(NetworkError::delivery_failed(
+                "shared DFS test lost captured write response", NetworkDeliveryState::PossiblyApplied,
+                "native write receiver completed before its original response delivery was discarded",
             ));
         }
         if let Some(FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
@@ -1589,6 +1909,7 @@ struct Node {
     resources: sinomo_device::NodeResourceMonitor,
     reconciler: Option<ComponentReconciler>,
     mounted_context: Option<ComponentContext>,
+    selected_original_fixture: Option<crate::runtime_host::DfsSelectedOriginalDataFixture>,
 }
 
 /// Read-only copies of actual namespace read heads at native Main ingress.
@@ -2031,8 +2352,361 @@ pub(crate) fn observe_checkpointed_background_repairs(
     }
 }
 
+/// A negative completion scope and the original native DATA it actually saw.
+/// No scheduler guard, native DATA-owner Arc or publication permit is retained.
+#[cfg(test)]
+pub(crate) struct DeferredNativeGenesis {
+    data_root: std::path::PathBuf,
+    shard: DfsMetadataShardConfig,
+    original_record: DfsPreparedOperationRecord,
+    deferral: crate::default_cluster::genesis::NativeGenesisCompletionDeferral,
+}
+
+#[cfg(test)]
+impl DeferredNativeGenesis {
+    pub(crate) fn shard(&self) -> &DfsMetadataShardConfig {
+        &self.shard
+    }
+    pub(crate) fn original_record(&self) -> &DfsPreparedOperationRecord {
+        &self.original_record
+    }
+    pub(crate) fn deferral_hits(&self) -> usize {
+        self.deferral.hits()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retained_fixture;
+#[cfg(all(test, unix))]
+pub(crate) use retained_fixture::{RetainedNativeHealthyFixture, RetainedNativeHealthyShard};
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedNativeGenesisNode {
+    pub(crate) node_id: NodeId,
+    pub(crate) data_root: std::path::PathBuf,
+    pub(crate) data_identity: (u64, u64),
+    pub(crate) owner_identity: (u64, u64),
+    pub(crate) raft_root_identity: (u64, u64),
+    pub(crate) raft_lock_identity: (u64, u64),
+    pub(crate) cluster_state: sinomo_core::ClusterBootstrapState,
+    pub(crate) raft_term: u64,
+    pub(crate) raft_commit_index: u64,
+}
+
+/// Test-owned expectations captured before process death; not a native owner,
+/// transport signer, configuration proof or authorization to adopt old DATA.
+#[cfg(all(test, unix))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedNativeGenesisFixture {
+    pub(crate) format_version: u32,
+    pub(crate) fixture_root: std::path::PathBuf,
+    pub(crate) fixture_identity: (u64, u64),
+    pub(crate) primary: NodeId,
+    pub(crate) nodes: Vec<RetainedNativeGenesisNode>,
+    pub(crate) shard: DfsMetadataShardConfig,
+    pub(crate) shard_identity: (u64, u64),
+    pub(crate) original_record: DfsPreparedOperationRecord,
+    pub(crate) original_frame: Vec<u8>,
+}
+
+#[cfg(all(test, unix))]
+fn retained_native_path_identity(
+    path: &std::path::Path,
+    directory: bool,
+) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+    let before = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !path.is_absolute()
+        || path.canonicalize().map_err(|e| e.to_string())?.as_path() != path
+        || before.file_type().is_symlink()
+        || before.is_dir() != directory
+        || (!directory && !before.is_file())
+    {
+        return Err(format!(
+            "retained native source is missing, aliased or has the wrong physical type: {}",
+            path.display()
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    let after = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let expected = (opened.dev(), opened.ino());
+    if (before.dev(), before.ino()) != expected || (after.dev(), after.ino()) != expected {
+        return Err("retained native source changed while reading physical identity".into());
+    }
+    Ok(expected)
+}
+
+#[cfg(all(test, unix))]
+fn retained_native_original_data(
+    data: &SinomoDataDir,
+    shard: &DfsMetadataShardConfig,
+    expected: &DfsPreparedOperationRecord,
+) -> Result<Vec<u8>, String> {
+    expected.validate().map_err(|e| e.to_string())?;
+    if shard.epoch != 1
+        || !shard.replica_node_ids.is_empty()
+        || expected.status != DfsPreparedOperationStatus::Prepared
+        || expected.committed_entry.is_some()
+        || expected.digest.file_system_id != shard.file_system_id
+        || expected.digest.shard_id.0 != shard.shard_id
+        || expected.digest.owner_epoch != 1
+        || expected.digest.operation_id
+            != crate::default_cluster::genesis::genesis_operation_id(shard)
+    {
+        return Err(
+            "retained original is not the exact supported incomplete native singleton".into(),
+        );
+    }
+    let id = DfsMetadataShardId::new(&shard.shard_id);
+    let root = crate::local_dfs_metadata_shard_path(data, &id);
+    retained_native_path_identity(&root, true)?;
+    crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(&root)
+        .map_err(|e| e.to_string())?;
+    if crate::metadata_api::read_handoff_freeze_with_layout(
+        &root.join("journal/membership-handoff-write-freeze.sobj"),
+        None,
+    )
+    .map_err(|e| e.to_string())?
+    .is_some()
+    {
+        return Err("retained incomplete singleton has a cooperative or recovery marker".into());
+    }
+    let _guard = crate::metadata_lock::try_metadata_inspection_lock(
+        root.clone(),
+        crate::metadata_cursor::journal_write_lock_path(&root),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or("retained native original is busy or lacks its actual writer-lock file")?;
+    let backend = crate::LocalSobjMetadataBackend::open_for_inspection(id.clone(), root.clone())
+        .map_err(|e| e.to_string())?;
+    let actual = backend
+        .prepared_operation_record(&expected.digest.operation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("retained native original body is unavailable")?;
+    if actual != *expected {
+        return Err(
+            "retained native original body/digest/status differs from precrash DATA".into(),
+        );
+    }
+    let frames = crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+        &root,
+        &[expected.digest.prepare_sequence],
+    )
+    .map_err(|e| e.to_string())?;
+    let frame = frames
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or("retained native original exact prepare frame is unavailable")?;
+    if !matches!(&frame.entry().mutation,DfsMetadataMutation::PrepareOperationV7 { record,.. } if record.as_ref()==expected)
+    {
+        return Err(
+            "retained native original prepare frame differs from its materialized body".into(),
+        );
+    }
+    Ok(frame.exact_bytes().to_vec())
+}
+
+#[cfg(all(test, unix))]
+impl DfsTestRuntime {
+    pub(crate) fn capture_retained_genesis_fixture(
+        &self,
+        phase: &DeferredNativeGenesis,
+    ) -> Result<RetainedNativeGenesisFixture, String> {
+        if self.nodes.len() != 3
+            || !self.component_factories.is_empty()
+            || self
+                .nodes
+                .values()
+                .any(|node| node.selected_original_fixture.is_some() || node.reconciler.is_none())
+        {
+            return Err(
+                "retained restart captures only the actual three-node default P0 fixture".into(),
+            );
+        }
+        if self.read_deferred_native_genesis(phase)? != phase.original_record {
+            return Err("precrash native original changed".into());
+        }
+        let (fixture_root, nodes) = self.capture_retained_native_nodes()?;
+        let data = self.data_dir(&phase.shard.primary_node_id);
+        let result = RetainedNativeGenesisFixture {
+            format_version: 1,
+            fixture_identity: retained_native_path_identity(&fixture_root, true)?,
+            fixture_root,
+            primary: self.primary.clone(),
+            nodes,
+            shard: phase.shard.clone(),
+            shard_identity: retained_native_path_identity(
+                &crate::local_dfs_metadata_shard_path(
+                    data,
+                    &DfsMetadataShardId::new(&phase.shard.shard_id),
+                ),
+                true,
+            )?,
+            original_frame: retained_native_original_data(
+                data,
+                &phase.shard,
+                &phase.original_record,
+            )?,
+            original_record: phase.original_record.clone(),
+        };
+        if serde_json::to_vec(&result)
+            .map_err(|e| e.to_string())?
+            .len()
+            > 1024 * 1024
+        {
+            return Err("retained fixture expectation exceeds 1MiB".into());
+        }
+        Ok(result)
+    }
+
+    /// Validate expected DATA before a writable native opener. Parent has
+    /// already verified its own child's death/reap and saved raw files.
+    pub(crate) fn validate_retained_genesis_fixture(
+        expected: &RetainedNativeGenesisFixture,
+    ) -> Result<(), String> {
+        if expected.format_version != 1
+            || expected.nodes.len() != 3
+            || serde_json::to_vec(expected)
+                .map_err(|e| e.to_string())?
+                .len()
+                > 1024 * 1024
+            || retained_native_path_identity(&expected.fixture_root, true)?
+                != expected.fixture_identity
+        {
+            return Err("retained native fixture version/bounds/root identity differs".into());
+        }
+        if expected.shard.primary_node_id != expected.primary {
+            return Err("retained native fixture roster or original primary differs".into());
+        }
+        let _locks = Self::validate_retained_native_nodes(
+            &expected.fixture_root,
+            &expected.primary,
+            &expected.nodes,
+        )?;
+        let primary = expected
+            .nodes
+            .iter()
+            .find(|n| n.node_id == expected.primary)
+            .ok_or("retained primary missing")?;
+        let data = SinomoDataDir::new(&primary.data_root);
+        if retained_native_path_identity(
+            &crate::local_dfs_metadata_shard_path(
+                &data,
+                &DfsMetadataShardId::new(&expected.shard.shard_id),
+            ),
+            true,
+        )? != expected.shard_identity
+            || retained_native_original_data(&data, &expected.shard, &expected.original_record)?
+                != expected.original_frame
+        {
+            return Err("retained native genesis physical root or exact frame changed".into());
+        }
+        if retained_native_path_identity(
+            &crate::local_dfs_metadata_shard_path(
+                &data,
+                &DfsMetadataShardId::new(&expected.shard.shard_id),
+            ),
+            true,
+        )? != expected.shard_identity
+        {
+            return Err("retained native genesis root changed across original validation".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reopen_retained_genesis_fixture(
+        expected: RetainedNativeGenesisFixture,
+    ) -> Result<(Self, DeferredNativeGenesis, Result<(), String>), String> {
+        Self::validate_retained_genesis_fixture(&expected)?;
+        let (mut actual, primary_data) = Self::reconstruct_retained_native_fixture(
+            &expected.fixture_root,
+            &expected.primary,
+            &expected.nodes,
+        )?;
+        let primary = expected
+            .nodes
+            .iter()
+            .find(|n| n.node_id == expected.primary)
+            .expect("validated primary");
+        let deferral =
+            crate::default_cluster::genesis::NativeGenesisCompletionDeferral::restore_before_mount(
+                &primary_data,
+                &expected.shard,
+                &expected.original_record,
+                primary.data_identity,
+                primary.owner_identity,
+            )
+            .map_err(|e| e.to_string())?;
+        let phase = DeferredNativeGenesis {
+            data_root: primary_data.root(),
+            shard: expected.shard.clone(),
+            original_record: expected.original_record.clone(),
+            deferral,
+        };
+        actual.open_retained_native_raft(&expected.nodes)?;
+        let keys = vec![
+            crate::metadata_shard_key(&expected.shard.file_system_id, &expected.shard.shard_id),
+            crate::metadata_shard_membership_handoff_key(
+                &expected.shard.file_system_id,
+                &expected.shard.shard_id,
+            ),
+        ];
+        run_unit(Box::pin(async {
+            let read = tokio::time::timeout(
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                actual.authority.kv_get_authoritative_exact_set_async(keys),
+            )
+            .await
+            .map_err(|_| {
+                "retained fixture real ReadIndex reached its original five-second deadline"
+                    .to_string()
+            })?
+            .map_err(|e| e.to_string())?;
+            let [Some(assignment), None] = read.value.as_slice() else {
+                return Err(
+                    "retained fixture ReadIndex has no exact unhanded singleton assignment".into(),
+                );
+            };
+            if assignment
+                .decode::<DfsMetadataShardConfig>()
+                .map_err(|e| e.to_string())?
+                != expected.shard
+            {
+                return Err("retained fixture authoritative assignment changed".into());
+            }
+            Ok(())
+        }))?;
+        let ids = expected.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let startup = actual.start_nodes_after_projection(
+            ids,
+            crate::service_trace::DfsPhaseTimer::new("retained-native-genesis-restart"),
+        );
+        if startup.is_ok() {
+            let readback = actual.read_deferred_native_genesis(&phase).and_then(|record| {
+                if record == expected.original_record { Ok(()) } else {
+                    Err("retained native startup changed original genesis before explicit completion".into())
+                }
+            });
+            if let Err(error) = readback {
+                // Keep the negative hold alive through normal cleanup; an
+                // error must not release it first while mounted owners run.
+                let cleanup = actual.close_inner(None);
+                return Err(format!("{error}; native cleanup: {cleanup:?}"));
+            }
+        }
+        Ok((actual, phase, startup))
+    }
+}
+
 pub struct DfsTestRuntime {
     root: Option<sinomo_testdir::TestDir>,
+    #[cfg(test)]
+    retained_fixture_root: Option<std::path::PathBuf>,
     state: sinomo_core::ClusterBootstrapState,
     primary: NodeId,
     authority: Arc<dyn ClusterAccess>,
@@ -2406,10 +3080,13 @@ impl DfsTestRuntime {
                 resources: sinomo_device::NodeResourceMonitor::default(),
                 reconciler: None,
                 mounted_context: None,
+                selected_original_fixture: None,
             },
         );
         Ok(Self {
             root: Some(root),
+            #[cfg(test)]
+            retained_fixture_root: None,
             state,
             primary,
             authority,
@@ -2492,6 +3169,7 @@ impl DfsTestRuntime {
                 resources: sinomo_device::NodeResourceMonitor::default(),
                 reconciler: None,
                 mounted_context: None,
+                selected_original_fixture: None,
             },
         );
         Ok(())
@@ -2673,9 +3351,14 @@ impl DfsTestRuntime {
     fn node_component_factories(
         &self,
         dfs_enabled: bool,
+        node: &NodeId,
     ) -> Result<Vec<Arc<dyn sinomo_module::ComponentFactory>>, String> {
-        let dfs: Arc<dyn sinomo_module::ComponentFactory> =
-            Arc::new(crate::component_factory().map_err(|error| error.to_string())?);
+        let dfs: Arc<dyn sinomo_module::ComponentFactory> = if let Some(fixture) = &self.nodes[node].selected_original_fixture {
+            Arc::new(crate::service::component_factory_with_selected_original_data_fixture(fixture.clone())
+                .map_err(|error| error.to_string())?)
+        } else {
+            Arc::new(crate::component_factory().map_err(|error| error.to_string())?)
+        };
         let dfs_id = dfs.descriptor().component_id.clone();
         let catalog: Arc<dyn sinomo_module::ComponentFactory> = Arc::new(
             sinomo_module::cluster_service_catalog_publisher_component_factory()
@@ -2690,6 +3373,11 @@ impl DfsTestRuntime {
             factories.insert(0, dfs);
         }
         for supplied in &self.component_factories {
+            if self.nodes[node].selected_original_fixture.is_some()
+                && supplied.descriptor().component_id == dfs_id
+            {
+                return Err("selected native fixture cannot be replaced by a supplied DFS factory".into());
+            }
             if !dfs_enabled && supplied.descriptor().component_id == dfs_id {
                 continue;
             }
@@ -2713,7 +3401,7 @@ impl DfsTestRuntime {
         node: &NodeId,
         enabled: bool,
     ) -> Result<(), String> {
-        let factories = self.node_component_factories(enabled)?;
+        let factories = self.node_component_factories(enabled, node)?;
         let endpoint = self
             .fabric
             .nodes
@@ -2825,6 +3513,42 @@ impl DfsTestRuntime {
         Ok(())
     }
 
+    /// Explicit fresh physical representation before native mounting. Ordinary
+    /// fixtures keep their current factory and readers without modification.
+    pub(crate) fn select_original_data_fixture_before_start(&mut self, node: &NodeId) -> Result<(), String> {
+        let native = self.nodes.get_mut(node).ok_or("unknown selected fixture node")?;
+        if native.reconciler.is_some() || native.mounted_context.is_some() || native.selected_original_fixture.is_some() {
+            return Err("selected representation must be supplied once before native mounting".into());
+        }
+        native.selected_original_fixture = Some(crate::runtime_host::DfsSelectedOriginalDataFixture::default());
+        Ok(())
+    }
+
+    pub(crate) fn select_original_repair_fixture_before_start(&mut self, node: &NodeId) -> Result<(), String> {
+        let native = self.nodes.get_mut(node).ok_or("unknown original Repair fixture node")?;
+        if native.reconciler.is_some() || native.mounted_context.is_some() || native.selected_original_fixture.is_some() {
+            return Err("original Repair representation must be supplied once before native mounting".into());
+        }
+        native.selected_original_fixture = Some(crate::runtime_host::DfsSelectedOriginalDataFixture::with_original_repair());
+        Ok(())
+    }
+
+    pub(crate) fn select_original_repair_wire_target(&self, source: &NodeId, target: NodeId) -> Result<(), String> {
+        self.nodes[source].selected_original_fixture.as_ref().ok_or("original Repair fixture was not admitted before start")?
+            .select_original_repair_target(target).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn selected_original_data_layout(&self, node: &NodeId) -> Result<Arc<crate::DfsSelectedOriginalDataLayout>, String> {
+        self.nodes[node].selected_original_fixture.as_ref()
+            .ok_or("native fixture did not select original DATA representation")?
+            .layout().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn select_genuine_original_before_handoff(&self, node: &NodeId, request_id: &str, handoff: &crate::DfsMetadataShardMembershipHandoff) -> Result<(), String> {
+        self.selected_original_data_layout(node)?.select_original(node, request_id, handoff)
+            .map_err(|error| error.to_string())
+    }
+
     fn mount_node(&mut self, node: &NodeId) -> Result<(), String> {
         if self.nodes[node].reconciler.is_some() {
             return Err("duplicate live DFS test node".into());
@@ -2854,7 +3578,7 @@ impl DfsTestRuntime {
             .with_object_rpc_transport(carrier)
             .with_event_bus(ComponentEventBus::default());
         let mut reconciler = ComponentReconciler::new(context, ServiceRegistry::default());
-        let factories = self.node_component_factories(true)?;
+        let factories = self.node_component_factories(true, node)?;
         reconciler
             .reconcile(&factories)
             .map_err(|e| e.to_string())?;
@@ -2963,6 +3687,14 @@ impl DfsTestRuntime {
                 timing.mark("native-replica-projection-completed");
             }
         }
+        self.start_nodes_after_projection(ids, timing)
+    }
+
+    fn start_nodes_after_projection(
+        &mut self,
+        ids: Vec<NodeId>,
+        mut timing: crate::service_trace::DfsPhaseTimer,
+    ) -> Result<(), String> {
         for id in &ids {
             crate::dfs_perf_trace(format_args!(
                 "native-startup-node owner={} node={} phase=mount",
@@ -3529,6 +4261,254 @@ impl DfsTestRuntime {
         Ok(actual)
     }
 
+    /// Use the unchanged supported singleton bootstrap, but return only after
+    /// its actual prepare/CAS owner has deferred completion and released locks.
+    #[cfg(test)]
+    pub(crate) fn begin_deferred_native_genesis(
+        &self,
+        shard_id: &str,
+        prefix: &str,
+    ) -> Result<DeferredNativeGenesis, String> {
+        let shard = DfsMetadataShardConfig {
+            file_system_id: self.file_system().file_system_id,
+            shard_id: shard_id.to_owned(),
+            primary_node_id: self.primary.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: crate::posix_path::normalize_posix_path(prefix)
+                    .map_err(|e| e.to_string())?,
+            },
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let data = self.data_dir(&self.primary);
+        let deferral =
+            crate::default_cluster::genesis::NativeGenesisCompletionDeferral::install(data, &shard)
+                .map_err(|e| e.to_string())?;
+        let outcome = self.bootstrap_empty_metadata_prefix(shard_id, prefix);
+        let error = outcome
+            .err()
+            .ok_or("native genesis unexpectedly completed instead of reaching the selected cut")?;
+        if !error.contains(crate::default_cluster::genesis::NATIVE_GENESIS_COMPLETION_DEFERRED) {
+            return Err(error);
+        }
+        let original_record = deferral
+            .original_record()
+            .map_err(|e| e.to_string())?
+            .ok_or("native genesis deferral did not observe an original Prepared record")?;
+        original_record.validate().map_err(|e| e.to_string())?;
+        if original_record.status != DfsPreparedOperationStatus::Prepared
+            || original_record.committed_entry.is_some()
+            || deferral.hits() == 0
+        {
+            return Err("native genesis cut is not the actual incomplete original".into());
+        }
+        // Acquiring and releasing the SAME normal scheduler owner proves that
+        // the selected deferral did not park global admission across probes.
+        let scheduler =
+            crate::runtime_host::daemon_dfs_mutation_scheduler(data).map_err(|e| e.to_string())?;
+        run_unit(Box::pin(async move {
+            tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+                let guard = scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive).await.map_err(|e|e.to_string())?;
+                drop(guard); Ok(())
+            }).await.map_err(|_| "native genesis deferral did not release ordinary admission before its existing deadline".to_string())?
+        }))?;
+        for node in self.nodes.keys() {
+            if self.nodes[node].reconciler.is_some() {
+                self.wait_native_authority(node)?;
+            }
+        }
+        if self
+            .metadata_shards()?
+            .into_iter()
+            .find(|actual| actual.shard_id == shard_id)
+            .as_ref()
+            != Some(&shard)
+        {
+            return Err(
+                "native genesis assignment CAS does not retain the exact singleton scope".into(),
+            );
+        }
+        let phase = DeferredNativeGenesis {
+            data_root: data.root(),
+            shard,
+            original_record,
+            deferral,
+        };
+        if self.read_deferred_native_genesis(&phase)? != phase.original_record {
+            return Err(
+                "native genesis readback differs from its actual pre-commit original".into(),
+            );
+        }
+        Ok(phase)
+    }
+
+    /// Historical read only through the existing inspection owner. A live
+    /// matching DATA owner is required; this does not fake stopped-node readiness.
+    #[cfg(test)]
+    pub(crate) fn read_deferred_native_genesis(
+        &self,
+        phase: &DeferredNativeGenesis,
+    ) -> Result<DfsPreparedOperationRecord, String> {
+        let data = self.data_dir(&phase.shard.primary_node_id);
+        if data.root() != phase.data_root {
+            return Err("deferred genesis names another runtime root".into());
+        }
+        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+            &crate::runtime_host::DfsRuntimePaths::new(data),
+        )
+        .map_err(|e| e.to_string())?;
+        let layout = owner
+            .selected_original_data_layout()
+            .map_err(|e| e.to_string())?;
+        let shard = DfsMetadataShardId::new(&phase.shard.shard_id);
+        let root = crate::local_dfs_metadata_shard_path(data, &shard);
+        if let Some(layout) = &layout {
+            layout
+                .stage(&phase.shard.file_system_id, &shard, &root)
+                .map_err(|e| e.to_string())?;
+        }
+        let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "deferred genesis inspection remains unavailable at its existing deadline"
+                        .into(),
+                );
+            }
+            if let Some(_guard) = crate::metadata_lock::try_metadata_inspection_lock(
+                root.clone(),
+                crate::metadata_cursor::journal_write_lock_path(&root),
+            )
+            .map_err(|e| e.to_string())?
+            {
+                let backend = crate::LocalSobjMetadataBackend::open_for_inspection_with_layout(
+                    shard.clone(),
+                    root.clone(),
+                    layout
+                        .clone()
+                        .map(|layout| (phase.shard.file_system_id.clone(), layout)),
+                )
+                .map_err(|e| e.to_string())?;
+                let record = backend
+                    .prepared_operation_record(&phase.original_record.digest.operation_id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("original native genesis record is unavailable")?;
+                if record.digest != phase.original_record.digest
+                    || record.payload != phase.original_record.payload
+                {
+                    return Err(
+                        "retained native genesis changed its original digest or body".into(),
+                    );
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("deferred genesis inspection crossed its original deadline".into());
+                }
+                return Ok(record);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// One explicit owner completion attempt, not a user-write readiness probe.
+    #[cfg(test)]
+    pub(crate) fn complete_deferred_native_genesis(
+        &self,
+        phase: &DeferredNativeGenesis,
+    ) -> Result<DfsPreparedOperationRecord, String> {
+        let shards = self.metadata_shards()?;
+        if shards.iter().find(|s| s.shard_id == phase.shard.shard_id) != Some(&phase.shard) {
+            return Err("deferred genesis assignment changed before explicit completion".into());
+        }
+        self.read_deferred_native_genesis(phase)?;
+        let data = self.data_dir(&phase.shard.primary_node_id).clone();
+        let paths = ClusterPaths::new(&data);
+        let primary = phase.shard.primary_node_id.clone();
+        let file_system = self.file_system();
+        let nodes = self.nodes.keys().cloned().collect::<Vec<_>>();
+        let control = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+            &paths,
+            executor().handle(),
+        );
+        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+            &crate::runtime_host::DfsRuntimePaths::new(&data),
+        )
+        .map_err(|e| e.to_string())?;
+        let scheduler =
+            crate::runtime_host::daemon_dfs_mutation_scheduler(&data).map_err(|e| e.to_string())?;
+        run_unit(Box::pin(async move {
+            tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, async {
+                let scope = DfsMessageExecutionScope::GlobalExclusive;
+                let admission = scheduler.admit(&scope).await.map_err(|e|e.to_string())?;
+                let owners = crate::DfsPublicationExecutionOwners::from_runtime(data.root(), scope, admission, owner);
+                let mut host = DfsControlPlaneDefaultClusterAsyncBootstrapHost::new_with_resident_metadata_backend(
+                    data, paths, primary.clone(), Box::new(control), None, owners,
+                );
+                // Release only while this actual normal owner holds admission;
+                // no competing completion wins a hidden test-only bypass.
+                phase.deferral.release();
+                host.materialize_default_sifs_metadata_on_shards_async(file_system, shards, nodes, primary)
+                    .await.map_err(|e|e.to_string())
+            }).await.map_err(|_| "explicit native genesis completion reached its existing network deadline".to_string())?
+        }))?;
+        let record = self.read_deferred_native_genesis(phase)?;
+        if record.status != DfsPreparedOperationStatus::Committed
+            || record.committed_entry.is_none()
+        {
+            return Err("normal genesis owner did not complete the same original record".into());
+        }
+        Ok(record)
+    }
+
+    /// A separate explicit OrdinaryDurability operation for the exact actual
+    /// singleton assignment. Three mounted nodes do not turn {A} into fixed3.
+    #[cfg(test)]
+    pub(crate) fn sync_completed_native_genesis(
+        &self,
+        phase: &DeferredNativeGenesis,
+        actual_bootstrap_object_path: &str,
+    ) -> Result<DfsMetadataQuorumSyncCertificate, String> {
+        let record = self.read_deferred_native_genesis(phase)?;
+        if record.status != DfsPreparedOperationStatus::Committed
+            || record.committed_entry.is_none()
+        {
+            return Err("cannot sync an incomplete native genesis as committed".into());
+        }
+        let mut service = crate::runtime_host::open_dfs_runtime_service_on_shard(
+            self.data_dir(&phase.shard.primary_node_id),
+            Some(executor().handle()),
+            &phase.shard,
+        )
+        .map_err(|e| e.to_string())?;
+        let object = service
+            .metadata_backend()
+            .ok_or("normal genesis service has no backend")?
+            .get_object_by_path(&phase.shard.file_system_id, actual_bootstrap_object_path)
+            .map_err(|e| e.to_string())?
+            .ok_or("normal genesis did not create the requested bootstrap object")?;
+        let target = service
+            .capture_metadata_quorum_sync_target(&object)
+            .map_err(|e| e.to_string())?;
+        if target.expected_shard.as_ref() != Some(&phase.shard)
+            || target.authority_epoch != Some(1)
+            || !target.replica_node_ids.is_empty()
+        {
+            return Err(
+                "genesis durability target differs from the actual singleton assignment".into(),
+            );
+        }
+        let certificate = service
+            .sync_metadata_shard_to_quorum(&target, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .map_err(|e| e.to_string())?;
+        if certificate.target != target
+            || certificate.quorum_size != 1
+            || certificate.acknowledged_node_ids != vec![phase.shard.primary_node_id.clone()]
+        {
+            return Err("genesis OrdinaryDurability result does not cover the exact actual assigned set {A}".into());
+        }
+        Ok(certificate)
+    }
+
     /// Observe only the exact original completed native handoff, including
     /// its full proof and the retained retiring owner's activated freeze.
     /// Reuse an already-open control client so a deliberately withheld peer
@@ -3610,8 +4590,15 @@ impl DfsTestRuntime {
         {
             return Ok(None);
         }
+        // Carry only the explicit reader capability of this retained native
+        // owner. A marker/path must never opt a default observer into it.
+        let selected_layout = owner.selected_original_data_layout().map_err(|error| {
+            crate::DfsError::Metadata { message: error.to_string() }
+        })?;
         let Some(marker) =
-            crate::read_local_dfs_metadata_shard_write_freeze(context.data_dir(), &shard)?
+            crate::local_state::read_local_dfs_metadata_shard_write_freeze_with_layout(
+                context.data_dir(), &shard, selected_layout.as_deref(),
+            )?
         else {
             return Ok(None);
         };
@@ -3997,11 +4984,16 @@ impl DfsTestRuntime {
             .observation_checkpoints
             .lock()
             .map_err(|_| "observation checkpoints poisoned")?;
-        let path = self
-            .root
-            .as_ref()
-            .ok_or("fixture root was retained")?
-            .join(format!("rpc-observations-{:06}.json", checkpoints.len()));
+        let fixture_root = self.root.as_ref().map(|root| root.path().to_path_buf());
+        #[cfg(test)]
+        let fixture_root = fixture_root.or_else(|| self.retained_fixture_root.clone());
+        let checkpoint_name = format!("rpc-observations-{:06}.json", checkpoints.len());
+        #[cfg(test)]
+        let checkpoint_name = if self.retained_fixture_root.is_some() {
+            format!("rpc-observations-reopen-{}-{:06}.json", std::process::id(), checkpoints.len())
+        } else { checkpoint_name };
+        let path = fixture_root.ok_or("fixture root was retained")?
+            .join(checkpoint_name);
         // Debug includes every field, including the carrier's private timeout
         // and protection options. Do not replace it with a lossy route summary.
         let bytes = serde_json::to_vec(
@@ -4314,19 +5306,7 @@ impl DfsTestRuntime {
             endpoint.accepting.store(false, Ordering::Release);
             endpoint
         };
-        for rule in self.fabric.faults.lock().unwrap().iter() {
-            if rule.target.as_ref().is_none_or(|id| id == node)
-                || rule.source.as_ref().is_none_or(|id| id == node)
-            {
-                if let FaultAction::PauseBeforeDispatch(gate)
-                | FaultAction::PauseWriteCommitPublication { gate, .. }
-                | FaultAction::PauseAfterDispatch(gate)
-                | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
-                {
-                    gate.close()
-                }
-            }
-        }
+        self.fabric.close_paused_faults_for_node(node);
         let node_state = self
             .nodes
             .get_mut(node)
@@ -5350,6 +6330,451 @@ mod normal_native_kv_admission_tests {
         assert_eq!(std::fs::read(&wal).unwrap(), before);
         native.close().unwrap();
     }
+}
+
+#[cfg(test)]
+mod selected_custody_pause_tests {
+    use super::*;
+    use std::task::{Context, Poll, Waker};
+
+    struct FilterFixture {
+        fabric: Arc<Fabric>,
+        context: NativeRpcCallContext,
+        command: DfsMetadataJournalBatchCommand,
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<DfsMetadataJournalBatchCommand>>>,
+    }
+
+    fn filter_fixture() -> FilterFixture {
+        // Typed subtype-filter inputs only. No endpoint or receiver is mounted,
+        // and the page deliberately supplies no executable original/certificate.
+        // These tests cannot prove authentication, custody or native handoff.
+        let source = NodeId::from_legacy_named("selected-pause-source").unwrap();
+        let target = NodeId::from_legacy_named("selected-pause-target").unwrap();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(), shard_id: "services".into(),
+            primary_node_id: source.clone(), replica_node_ids: vec![target.clone()], epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let handoff_id = "selected-pause-exact-handoff".to_owned();
+        let handoff = DfsMetadataShardMembershipHandoff {
+            cause: DfsMetadataShardHandoffCause::Membership, handoff_id: handoff_id.clone(),
+            retiring_shard: shard.clone(), desired_shard: DfsMetadataShardConfig {
+                primary_node_id: target.clone(), replica_node_ids: vec![source.clone()], epoch: 2,
+                ..shard.clone()
+            },
+            required_prepared_sequence: 1, required_head_watermark: None,
+            retiring_primary_fence: Some(DfsMetadataShardMembershipHandoffFence {
+                handoff_id: handoff_id.clone(), primary_node_id: source.clone(),
+                journal_sequence: 1, state_fingerprint: "filter-only".into(),
+            }),
+        };
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: "selected-pause-probe".into(), source_node_id: Some(source.clone()),
+            file_system_id: Some(shard.file_system_id.clone()), authority_epoch: Some(1),
+            verify_prefix_only: true, authority_probe: None, durable_replication: None,
+            prefix_probe: Some(DfsMetadataPrefixProbe {
+                barrier_id: "selected-pause-barrier".into(),
+                file_system_id: Some(shard.file_system_id.clone()), authority_epoch: Some(1),
+                shard_id: DfsMetadataShardId::new(&shard.shard_id), journal_sequence: 1,
+                state_fingerprint: "filter-only".into(), primary_handoff_id: Some(handoff_id.clone()),
+                repair_custody: Some(DfsRepairHandoffPage {
+                    cut: DfsRepairHandoffCut {
+                        version: 2, handoff, queue_sequence: 1, page_count: 1, record_count: 0,
+                        digest: "0".repeat(64),
+                        selected_original_data: Some(crate::repair_handoff::SelectedRepairOriginalDataCut {
+                            source_queue_incarnation: "filter-only-incarnation".into(), producer: source.clone(),
+                            request_id: "filter-only-original".into(), original_digest: "0".repeat(64),
+                            captured_birth_digest: "0".repeat(64),
+                        }),
+                    },
+                    ordinal: 0, previous_digest: String::new(), records: Vec::new(), selected_original_data: None,
+                }),
+            }),
+            batch: DfsMetadataJournalFrameBatch {
+                shard_id: DfsMetadataShardId::new(&shard.shard_id), journal_frames: Vec::new(), next_after_sequence: 1,
+            },
+        };
+        let gate = Arc::new(Semaphore::new(0));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let fabric = Arc::new(Fabric {
+            dropped_observations: AtomicUsize::new(0), exhausted_budgets: AtomicUsize::new(0),
+            next_call: AtomicU64::new(1), nodes: Mutex::new(BTreeMap::new()),
+            faults: Mutex::new(vec![FaultRule {
+                source: Some(source.clone()), target: Some(target.clone()),
+                route: Some(crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.into()), call_id: None,
+                origin: Some(RpcOrigin::RegisteredHost), remaining_hits: 1,
+                action: FaultAction::PauseSelectedOriginalCustody {
+                    handoff_id, gate: Arc::clone(&gate), captured: Arc::clone(&captured),
+                },
+            }]),
+            observations: Mutex::new(Vec::new()), observation_checkpoints: Mutex::new(Vec::new()),
+            transfers: Mutex::new(Vec::new()),
+        });
+        let carrier = Carrier { host_identity: None, source, fabric: Arc::clone(&fabric), origin: RpcOrigin::RegisteredHost };
+        let call = ObjectRpcCall::value(ObjectRpcRequest::encode_body(
+            crate::DFS_METADATA_JOURNAL_BATCH_ROUTE, crate::DFS_RPC_CATEGORY, &command).unwrap());
+        let observation = carrier.observation(&target, &call, ClusterObjectRpcOptions::default(), true);
+        assert!(fabric.fault(&observation, &call.request).is_none(),
+            "the generic predecode fault path cannot consume this subtype rule");
+        let context = NativeRpcCallContext { fabric: Arc::downgrade(&fabric), observation, write_reply_capture: None };
+        FilterFixture { fabric, context, command, gate, captured }
+    }
+
+    #[test]
+    fn selected_custody_pause_filters_decoded_subtype_and_exact_handoff_without_spending_other_hits() {
+        let fixture = filter_fixture();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut negatives = Vec::new();
+        let mut ordinary = fixture.command.clone();
+        ordinary.verify_prefix_only = false; ordinary.prefix_probe = None;
+        negatives.push(ordinary);
+        let mut ordinary_probe = fixture.command.clone();
+        ordinary_probe.prefix_probe.as_mut().unwrap().repair_custody = None;
+        negatives.push(ordinary_probe);
+        let mut v1 = fixture.command.clone();
+        let cut = &mut v1.prefix_probe.as_mut().unwrap().repair_custody.as_mut().unwrap().cut;
+        cut.version = 1; cut.selected_original_data = None;
+        negatives.push(v1);
+        let mut other = fixture.command.clone();
+        let probe = other.prefix_probe.as_mut().unwrap();
+        probe.primary_handoff_id = Some("another-handoff".into());
+        probe.repair_custody.as_mut().unwrap().cut.handoff.handoff_id = "another-handoff".into();
+        negatives.push(other);
+        let mut mismatched = fixture.command.clone();
+        mismatched.prefix_probe.as_mut().unwrap().primary_handoff_id = Some("another-handoff".into());
+        negatives.push(mismatched);
+        let mut no_selected_material = fixture.command.clone();
+        no_selected_material.prefix_probe.as_mut().unwrap().repair_custody.as_mut().unwrap().cut.selected_original_data = None;
+        negatives.push(no_selected_material);
+        for command in &negatives {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+                pause_decoded_selected_original_custody(command)));
+            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        }
+        for observation in [
+            RpcObservation { origin: RpcOrigin::ExplicitFixtureRpc, ..fixture.context.observation.clone() },
+            RpcObservation { target: fixture.context.observation.source.clone(), ..fixture.context.observation.clone() },
+            RpcObservation { route: crate::DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE.into(), ..fixture.context.observation.clone() },
+        ] {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
+                NativeRpcCallContext { observation, ..fixture.context.clone() },
+                pause_decoded_selected_original_custody(&fixture.command)));
+            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        }
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 1);
+        assert!(fixture.captured.lock().unwrap().is_empty());
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        let mut exact = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+            pause_decoded_selected_original_custody(&fixture.command)));
+        assert!(matches!(exact.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 0);
+        assert_eq!(*fixture.captured.lock().unwrap(), vec![fixture.command.clone()]);
+        fixture.gate.add_permits(1);
+        assert!(matches!(exact.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        // Exhaustion belongs only to another exact selected call; unrelated
+        // commands remain unpaused even after the selected budget is spent.
+        for command in &negatives {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+                pause_decoded_selected_original_custody(command)));
+            assert!(matches!(pause.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+        }
+        let mut exhausted = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+            pause_decoded_selected_original_custody(&fixture.command)));
+        assert!(matches!(exhausted.as_mut().poll(&mut context), Poll::Ready(Err(_))));
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn selected_custody_pause_node_stop_closes_only_the_owned_pending_gate() {
+        let fixture = filter_fixture();
+        let mut context = Context::from_waker(Waker::noop());
+        let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(fixture.context.clone(),
+            pause_decoded_selected_original_custody(&fixture.command)));
+        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
+        let unrelated = NodeId::from_legacy_named("selected-pause-unrelated").unwrap();
+        fixture.fabric.close_paused_faults_for_node(&unrelated);
+        assert!(!fixture.gate.is_closed());
+        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
+        // Exercise the same close function used by stop_node_inner, without
+        // inventing an endpoint lifetime, response or native admission.
+        fixture.fabric.close_paused_faults_for_node(&fixture.context.observation.target);
+        assert!(fixture.gate.is_closed());
+        match pause.as_mut().poll(&mut context) {
+            Poll::Ready(Err(error)) => assert!(error.to_string().contains("selected custody pause closed")),
+            other => panic!("stopping the selected owner must release its waiter: {other:?}"),
+        }
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        assert_eq!(fixture.captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn exact_write_publication_pause_filters_operation_and_stops_without_spending_other_hits() {
+        // Codec/filter inputs only: these synthetic entries are never applied
+        // and establish no native commit, acknowledgement or authority.
+        let mut fixture = filter_fixture();
+        fixture.context.observation.signer = Some(ServiceSigner::Remote {
+            node_id: fixture.context.observation.source.to_string(),
+            public_key: "filter-input-only".into(),
+        });
+        let operation_id = "write:exact-filter-operation".to_owned();
+        fixture.fabric.faults.lock().unwrap()[0].action =
+            FaultAction::PauseExactWriteCommitPublication {
+                operation_id: operation_id.clone(),
+                gate: Arc::clone(&fixture.gate),
+                captured: Arc::clone(&fixture.captured),
+            };
+        fixture.command.verify_prefix_only = false;
+        fixture.command.prefix_probe = None;
+        fixture.command.durable_replication = Some(DfsMetadataDurableReplication {
+            confirmation_id: "filter-confirmation".into(),
+            background_publication: true,
+        });
+        let shard_id = fixture.command.batch.shard_id.clone();
+        let make_frame = |operation: &str| {
+            let digest = DfsPreparedOperationDigest {
+                protocol_version: 7,
+                file_system_id: crate::sifs_file_system_id(),
+                shard_id: shard_id.clone(),
+                owner_epoch: 1,
+                operation_id: operation.into(),
+                payload_digest: "0".repeat(64),
+                prepare_sequence: 1,
+            };
+            crate::metadata_journal::encode_metadata_journal_frame_record(
+                &DfsMetadataJournalEntry {
+                    shard_id: digest.shard_id.clone(),
+                    sequence: 2,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    mutation: DfsMetadataMutation::CommitPreparedOperationV7 {
+                        file_system_id: digest.file_system_id.clone(),
+                        operation_id: operation.into(),
+                        digest,
+                    },
+                },
+            )
+            .unwrap()
+        };
+        fixture.command.batch.journal_frames = vec![make_frame(&operation_id)];
+        fixture.command.batch.next_after_sequence = 2;
+        let mut other = fixture.command.clone();
+        other.batch.journal_frames = vec![make_frame("write:unrelated")];
+        let mut foreground = fixture.command.clone();
+        foreground
+            .durable_replication
+            .as_mut()
+            .unwrap()
+            .background_publication = false;
+        let mut source = fixture.command.clone();
+        source.source_node_id = Some(fixture.context.observation.target.clone());
+        let mut no_commit = fixture.command.clone();
+        no_commit.batch.journal_frames.clear();
+        let mut context = Context::from_waker(Waker::noop());
+        for command in [&other, &foreground, &source, &no_commit] {
+            let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
+                fixture.context.clone(),
+                pause_decoded_write_commit_publication(command),
+            ));
+            assert!(matches!(
+                pause.as_mut().poll(&mut context),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 1);
+        assert!(fixture.captured.lock().unwrap().is_empty());
+        let mut pause = Box::pin(NATIVE_RPC_CALL_CONTEXT.scope(
+            fixture.context.clone(),
+            pause_decoded_write_commit_publication(&fixture.command),
+        ));
+        assert!(matches!(pause.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(fixture.fabric.faults.lock().unwrap()[0].remaining_hits, 0);
+        assert_eq!(
+            *fixture.captured.lock().unwrap(),
+            vec![fixture.command.clone()]
+        );
+        fixture
+            .fabric
+            .close_paused_faults_for_node(&NodeId::generate());
+        assert!(!fixture.gate.is_closed());
+        fixture
+            .fabric
+            .close_paused_faults_for_node(&fixture.context.observation.target);
+        assert!(matches!(
+            pause.as_mut().poll(&mut context),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn write_reply_capture_correlates_only_exact_completed_response_data() {
+        // Rejected response DATA exercises the negative helper's correlation;
+        // no actual committed result or native receiver is manufactured.
+        let fixture = filter_fixture();
+        for kind in [
+            CapturedWriteReplyKind::Write,
+            CapturedWriteReplyKind::Distributed,
+        ] {
+            let route = match kind {
+                CapturedWriteReplyKind::Write => DFS_DATA_WRITE_ROUTE,
+                CapturedWriteReplyKind::Distributed => DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+            };
+            let object_id = DfsObjectId::generate();
+            let expected = DecodedWriteReplyIdentity {
+                call_id: fixture.context.observation.call_id,
+                source: fixture.context.observation.source.clone(),
+                target: fixture.context.observation.target.clone(),
+                route: route.into(),
+                outer_request_id: "dfs_message_11".into(),
+                frame_id: 11,
+                message_id: 22,
+                request_id: "actual-decoded-write-request".into(),
+                object_id: object_id.clone(),
+                kind,
+            };
+            let mut observation = fixture.context.observation.clone();
+            observation.route = route.into();
+            observation.signer = Some(ServiceSigner::Remote {
+                node_id: expected.source.to_string(),
+                public_key: "correlation-only".into(),
+            });
+            let message = match kind {
+                CapturedWriteReplyKind::Write => {
+                    DfsNetworkMessage::WriteResponse(DfsWriteResponse {
+                        request_id: expected.request_id.clone(),
+                        object_id: object_id.clone(),
+                        result: DfsWriteResult::Rejected {
+                            reason: "correlation-only".into(),
+                        },
+                    })
+                }
+                CapturedWriteReplyKind::Distributed => {
+                    DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                        request_id: expected.request_id.clone(),
+                        object_id: object_id.clone(),
+                        result: DfsDistributedWriteResult::Rejected {
+                            reason: "correlation-only".into(),
+                            current_primary_node_id: None,
+                        },
+                        metadata_journal_batches: Vec::new(),
+                    })
+                }
+            };
+            let routed = DfsRoutedMessage {
+                source_node_id: expected.target.clone(),
+                target_node_id: expected.source.clone(),
+                frame_id: 901,
+                message_id: 902,
+                message,
+            };
+            let response = DfsMessageResponse {
+                request_id: expected.outer_request_id.clone(),
+                outbound_messages: vec![routed.clone()],
+            };
+            assert_eq!(
+                captured_write_reply(&expected, &observation, response.clone()).unwrap(),
+                routed
+            );
+            let mut wrong = response.clone();
+            wrong.request_id.push_str("-other");
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut wrong = response.clone();
+            wrong.outbound_messages.push(routed.clone());
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut wrong = response.clone();
+            wrong.outbound_messages[0].source_node_id = expected.source.clone();
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut wrong = response.clone();
+            wrong.outbound_messages[0].message =
+                DfsNetworkMessage::RepairReplicaResponse(DfsRepairReplicaResponse {
+                    request_id: expected.request_id.clone(),
+                    intent_id: "not-a-write-result".into(),
+                    file_system_id: crate::sifs_file_system_id(),
+                    object_id: object_id.clone(),
+                    version: DfsVersion::generate(),
+                    replica_node_id: expected.target.clone(),
+                    result: DfsBlobTransferResult::Rejected {
+                        reason: "wrong-family".into(),
+                    },
+                });
+            assert!(captured_write_reply(&expected, &observation, wrong).is_err());
+            let mut foreign_call = observation.clone();
+            foreign_call.call_id += 1;
+            assert!(captured_write_reply(&expected, &foreign_call, response.clone()).is_err());
+            let mut foreign_request = expected.clone();
+            foreign_request.request_id.push_str("-other");
+            assert!(captured_write_reply(&foreign_request, &observation, response).is_err());
+        }
+    }
+
+    #[test]
+    fn write_reply_loss_binds_first_call_without_waiving_same_call_budget() {
+        // Selector/lifetime DATA only: no receiver or completed reply is
+        // manufactured, and the deliberate exhausted hit is asserted below.
+        let fixture = filter_fixture();
+        let captured = Arc::new(Mutex::new(Vec::<DfsRoutedMessage>::new()));
+        let mut observation = fixture.context.observation.clone();
+        observation.route = DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into();
+        observation.call_id = 41;
+        let request = ObjectRpcRequest::encode_body(
+            DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
+            crate::DFS_RPC_CATEGORY,
+            &"selector-only",
+        )
+        .unwrap();
+        *fixture.fabric.faults.lock().unwrap() = vec![FaultRule {
+            source: Some(observation.source.clone()),
+            target: Some(observation.target.clone()),
+            route: Some(observation.route.clone()),
+            call_id: None,
+            origin: Some(observation.origin),
+            remaining_hits: 1,
+            action: FaultAction::CaptureWriteReplyAndLoseAfterDispatch(Arc::clone(&captured)),
+        }];
+        let mut unrelated = observation.clone();
+        unrelated.route = DFS_DATA_READ_ROUTE.into();
+        assert!(fixture.fabric.fault(&unrelated, &request).is_none());
+        {
+            let rules = fixture.fabric.faults.lock().unwrap();
+            assert_eq!(rules[0].call_id, None);
+            assert_eq!(rules[0].remaining_hits, 1);
+        }
+        assert!(matches!(fixture.fabric.fault(&observation, &request),
+            Some(FaultAction::CaptureWriteReplyAndLoseAfterDispatch(actual)) if Arc::ptr_eq(&actual, &captured)));
+        {
+            let rules = fixture.fabric.faults.lock().unwrap();
+            assert_eq!(rules[0].call_id, Some(41));
+            assert_eq!(rules[0].remaining_hits, 0);
+        }
+        let mut retry = observation.clone();
+        retry.call_id = 42;
+        assert!(fixture.fabric.fault(&retry, &request).is_none());
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            fixture.fabric.fault(&observation, &request),
+            Some(FaultAction::BudgetExhausted)
+        ));
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
+        retry.call_id = 43;
+        assert!(fixture.fabric.fault(&retry, &request).is_none());
+        assert_eq!(fixture.fabric.exhausted_budgets.load(Ordering::Relaxed), 1);
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "selection cannot manufacture a completed reply"
+        );
+        fixture.fabric.faults.lock().unwrap().retain(|rule| !matches!(
+            &rule.action, FaultAction::CaptureWriteReplyAndLoseAfterDispatch(actual) if Arc::ptr_eq(actual, &captured)
+        ));
+        assert!(fixture.fabric.faults.lock().unwrap().is_empty());
+        assert_eq!(
+            Arc::strong_count(&captured),
+            1,
+            "removing the exact rule releases its capture owner"
+        );
+    }
+
 }
 
 #[cfg(test)]

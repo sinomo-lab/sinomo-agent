@@ -268,10 +268,17 @@ pub fn read_local_dfs_metadata_shard_write_freeze(
     data_dir: &SinomoDataDir,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataShardWriteFreeze>, DfsError> {
+    read_local_dfs_metadata_shard_write_freeze_with_layout(data_dir, shard_id, None)
+}
+
+pub(crate) fn read_local_dfs_metadata_shard_write_freeze_with_layout(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
+) -> Result<Option<DfsMetadataShardWriteFreeze>, DfsError> {
     let path = local_dfs_metadata_shard_path(data_dir, shard_id)
-        .join("journal")
-        .join("membership-handoff-write-freeze.sobj");
-    crate::metadata_io::read_sobj_optional(&path).map_err(Into::into)
+        .join("journal/membership-handoff-write-freeze.sobj");
+    crate::metadata_api::read_handoff_freeze_with_layout(&path, layout).map_err(Into::into)
 }
 
 pub fn open_local_metadata_shard_backend(

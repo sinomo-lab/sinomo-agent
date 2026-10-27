@@ -33,6 +33,64 @@ pub struct NativeHeldMetadataSnapshotV1 {
 }
 
 impl LocalSobjMetadataBackend {
+    /// Negative ingress observation from this actual resident writer's current
+    /// certified/materialized cut. It never opens a writer, recovers a suffix,
+    /// syncs, certifies readable bytes or clears uncertainty.
+    pub(crate) fn try_read_certified_prepared_record_for_ingress(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<Option<DfsPreparedOperationRecord>>> {
+        if self.consistent_read_snapshot_depth != 0
+            || !self.stat_read_snapshots.is_empty()
+            || self.replica_repair_only
+        {
+            return Ok(None);
+        }
+        let Some(_fence) = crate::metadata_lock::try_metadata_inspection_lock(
+            self.root.clone(),
+            self.journal_write_lock_path(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(prefix) = crate::metadata_journal::admission::current_owned_materialized_prefix(
+            &self.root,
+            &self.shard_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        let tables = self.current_tables_snapshot()?;
+        let (observed_prefix, materialized) = match &tables {
+            crate::metadata_tables::DfsMetadataTablesSnapshot::Borrowed(_) => (
+                self.prefix_proof.as_ref(),
+                Some(self.materialized_through_sequence),
+            ),
+            crate::metadata_tables::DfsMetadataTablesSnapshot::Shared {
+                prefix_proof,
+                materialized_through_sequence,
+                ..
+            } => (prefix_proof.as_ref(), *materialized_through_sequence),
+        };
+        if observed_prefix != Some(&prefix) || materialized != Some(prefix.journal_sequence) {
+            return Ok(None);
+        }
+        let record = tables.prepared_operations_v7.get(operation_id).cloned();
+        if let Some(record) = &record {
+            record.validate()?;
+        }
+        if crate::metadata_journal::admission::current_owned_materialized_prefix(
+            &self.root,
+            &self.shard_id,
+        )?
+        .as_ref()
+            != Some(&prefix)
+        {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
     pub(crate) fn held_prepared_operation_payload(
         &self,
         operation_id: &str,
@@ -482,6 +540,12 @@ impl LocalSobjMetadataBackend {
                 published: false,
             });
         }
+        #[cfg(test)]
+        crate::default_cluster::genesis::defer_native_genesis_commit_at_writer(
+            &self.root,
+            &record,
+        )
+        .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
         let source_family = commit_owner
             .source_witness()
             .map(|source| source.validate_for(&record.payload, digest))

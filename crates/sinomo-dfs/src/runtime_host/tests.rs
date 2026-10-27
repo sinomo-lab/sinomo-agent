@@ -1,6 +1,7 @@
 use super::*;
 mod effect_open_configuration;
 mod publish_generation_custody;
+mod incomplete_genesis;
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsMessageTransport, DfsPosixSyncKind,
@@ -4012,8 +4013,8 @@ fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapsh
     );
     assert_eq!(
         take_daemon_dfs_test_authoritative_prefix_call_count(&cluster_paths),
-        3,
-        "cold authority warmup must prove all three bounded configuration scopes on a 2 MiB worker"
+        crate::write_configuration_projection::DFS_WRITE_CONFIGURATION_PREFIXES.len(),
+        "cold authority warmup must prove all four bounded configuration scopes on a 2 MiB worker"
     );
 
     let client = DaemonDfsControlPlaneKvClient::new_on_runtime(&cluster_paths, runtime.handle());
@@ -17547,3 +17548,8 @@ fn actual_runtime_shutdown_cancels_running_maintenance_with_open_component_watch
         "runtime cancellation must wake its already-running blocking child independently of the component watch: {outcome:?}"
     );
 }
+
+mod exact_prefix_sync;
+
+#[cfg(unix)]
+mod native_prefix_return;

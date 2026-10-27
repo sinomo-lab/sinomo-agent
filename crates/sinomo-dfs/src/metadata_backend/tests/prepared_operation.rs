@@ -3,6 +3,7 @@ mod immutable_payload;
 mod checkpoint_cache;
 mod owned_namespace_plan;
 mod quiet_open;
+mod local_cursor;
 use super::*;
 use crate::DfsControlPlaneStore;
 use crate::test_support::{DfsTestRuntime, current_native_metadata_service};
@@ -326,6 +327,10 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
         .committed_prepared_operation(&digest)
         .unwrap()
         .unwrap();
+    assert_eq!(
+        fresh.entry, entry,
+        "the actual kernel return and retained commitment must be identical"
+    );
     let physical_root =
         crate::local_dfs_metadata_shard_path(runtime.data_dir(&config.primary_node_id), &shard);
     let anchor = service
@@ -338,8 +343,163 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
         crate::inspect_metadata_prefix_descendant(&physical_root, &shard, &anchor)
             .unwrap()
             .expect("actual committed current prefix");
+    let commit_batch = service
+        .metadata_backend()
+        .unwrap()
+        .journal_batch_for_shard_since_limited(
+            &shard,
+            entry.sequence - 1,
+            1,
+            crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(commit_batch.entries, vec![entry.clone()]);
+    let export_commit = |owner: &NativeService| {
+        owner
+            .metadata_backend()
+            .unwrap()
+            .journal_frames_for_batch(&commit_batch)
+            .unwrap()
+    };
+    let original_frames = export_commit(&service);
+    assert_eq!(original_frames.len(), 1);
+    assert_eq!(
+        crate::metadata_journal::decode_metadata_journal_frame_record(&original_frames[0]).unwrap(),
+        entry
+    );
+    let original_reference = service
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap()
+        .committed_entry
+        .unwrap();
+    assert_eq!(original_reference.created_at, entry.created_at);
+    assert_eq!(original_reference.journal_entry(), entry);
+    let raw_frame_path = runtime
+        .data_dir(&config.primary_node_id)
+        .root()
+        .join("boundary-diagnostic-v7-original-commit-frame.sobj");
+    std::fs::write(&raw_frame_path, original_frames[0].exact_bytes.as_ref()).unwrap();
+    let negative_file_evidence = {
+        // Existing publication exclusion keeps canonical writers out of these
+        // short negative probes. No commit/retry/stop occurs while it is held.
+        let _fence = service
+            .metadata_shard_fence_guard(&config.file_system_id, &config.shard_id)
+            .unwrap();
+        fn file_evidence(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            fn visit(
+                root: &std::path::Path,
+                path: &std::path::Path,
+                files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+            ) {
+                let metadata = match std::fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => {
+                        panic!("inspect exact-frame evidence {}: {error}", path.display())
+                    }
+                };
+                assert!(!metadata.file_type().is_symlink());
+                if metadata.is_dir() {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        visit(root, &entry.unwrap().path(), files);
+                    }
+                } else {
+                    assert!(metadata.is_file());
+                    files.push((
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(path).unwrap(),
+                    ));
+                }
+            }
+            let mut files = Vec::new();
+            for path in [
+                root.join("journal"),
+                crate::metadata_table_store::metadata_table_snapshot_path(root),
+                crate::metadata_table_store::metadata_table_checkpoint_log_path(root),
+                crate::metadata_table_store::metadata_table_path(root),
+            ] {
+                visit(root, &path, &mut files);
+            }
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        }
+        let files_before = file_evidence(&physical_root);
+        let mut restamped = commit_batch.clone();
+        restamped.entries[0].created_at += time::Duration::nanoseconds(1);
+        assert_eq!(
+            restamped.entries[0].mutation, entry.mutation,
+            "same actual digest/mutation, different timestamp only"
+        );
+        let error = service
+            .metadata_backend()
+            .unwrap()
+            .journal_frames_for_batch(&restamped)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from selected batch entry"),
+            "actual stored-frame mismatch required: {error}"
+        );
+        let stored =
+            crate::metadata_table_store::read_metadata_table_state_lenient(&physical_root).unwrap();
+        assert_eq!(
+            stored.tables.prepared_operations_v7[&digest.operation_id]
+                .committed_entry
+                .as_ref(),
+            Some(&original_reference)
+        );
+        let mut replay = stored.tables.clone();
+        replay
+            .apply_checked(DfsMetadataTableOp::CommitPreparedOperationV7 {
+                digest: digest.clone(),
+                committed_entry: original_reference.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            replay, stored.tables,
+            "actual exact retained commit replay remains idempotent"
+        );
+        let mut changed_reference = original_reference.clone();
+        changed_reference.created_at += time::Duration::nanoseconds(1);
+        changed_reference.validate(&digest).unwrap(); // Shape alone is not exact stored commitment.
+        let error = replay
+            .apply_checked(DfsMetadataTableOp::CommitPreparedOperationV7 {
+                digest: digest.clone(),
+                committed_entry: changed_reference,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changes its retained journal slot"),
+            "actual retained-reference mismatch required: {error}"
+        );
+        assert_eq!(
+            replay, stored.tables,
+            "rejected timestamp replay changes no rows or indexes"
+        );
+        assert_eq!(
+            file_evidence(&physical_root),
+            files_before,
+            "bounded fixture journal/table bytes must remain unchanged during negative probes; background checkpoint progress is a fixture-cut failure, not proof that timestamp rejection authored data"
+        );
+        assert_eq!(export_commit(&service), original_frames);
+        files_before.into_iter().map(|(path, bytes)| serde_json::json!({
+            "path": path, "bytes": bytes.len(), "blake3": blake3::hash(&bytes).to_hex().to_string(),
+        })).collect::<Vec<_>>()
+    };
     let recorded = service.commit_stored_prepared_operation(&digest).unwrap();
     assert!(!recorded.published);
+    assert_eq!(
+        export_commit(&service),
+        original_frames,
+        "exact retry must export the same stored frame bytes and timestamp"
+    );
     assert_eq!(
         service
             .metadata_backend()
@@ -371,6 +531,11 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
     }
     let retry = service.commit_stored_prepared_operation(&digest).unwrap();
     assert!(!retry.published);
+    assert_eq!(
+        export_commit(&service),
+        original_frames,
+        "recorded retry with peers stopped still authors no replacement frame"
+    );
     assert_eq!(entries(&service, &shard).len(), committed_count);
     assert_eq!(
         service
@@ -415,8 +580,23 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
             .unwrap()
             .committed_prepared_operation(&digest)
             .unwrap(),
-        Some(entry)
+        Some(entry.clone())
     );
+    assert_eq!(
+        export_commit(&reopened),
+        original_frames,
+        "actual owner stop/reopen preserves the same stored frame bytes"
+    );
+    let reopened_reference = reopened
+        .metadata_backend()
+        .unwrap()
+        .prepared_operation_record(&digest.operation_id)
+        .unwrap()
+        .unwrap()
+        .committed_entry
+        .unwrap();
+    assert_eq!(reopened_reference, original_reference);
+    assert_eq!(reopened_reference.created_at, entry.created_at);
     assert_eq!(
         reopened
             .metadata_backend()
@@ -425,6 +605,14 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
             .unwrap(),
         Some(committed)
     );
+    std::fs::write(runtime.data_dir(&config.primary_node_id).root()
+        .join("boundary-diagnostic-v7-exact-commit-frame.json"), serde_json::to_vec_pretty(&serde_json::json!({
+            "digest": digest, "actual_commit_reference": original_reference,
+            "stored_frame_bytes": original_frames[0].exact_bytes.len(),
+            "stored_frame_blake3": blake3::hash(original_frames[0].exact_bytes.as_ref()).to_hex().to_string(),
+            "raw_original_frame": raw_frame_path, "unchanged_negative_file_evidence": negative_file_evidence,
+            "qualification": "Actual native writer/export/exact retry and same-owner component stop/reopen. Same-digest timestamp mutations reject at stored-frame export and checked replay. No OS-crash proof or reconstruction of an unavailable A-only commit from B/C preparations."
+        })).unwrap()).unwrap();
     drop(reopened);
     runtime.close().unwrap();
 }

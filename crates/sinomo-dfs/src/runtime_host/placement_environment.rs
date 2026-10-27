@@ -519,7 +519,7 @@ fn prepare_daemon_dfs_storage_environment_refresh(
             // sampling; Pending retains the ordinary refresh retry without
             // installing a missing-layout health baseline.
             let _actual_owner = require_daemon_dfs_data_owner_lock(paths)?;
-            LocalContentStore::new(&content_root)?;
+            super::open_dfs_runtime_content_store(&data_dir)?;
         }
     }
     if with_placement_environment(&data_dir, &state.local_node_id, |environment| {

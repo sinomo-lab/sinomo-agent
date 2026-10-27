@@ -3,7 +3,11 @@
 //! This module owns the default distributed SIFS topology, shard layout, and
 //! service advertisements that make a cluster's DFS usable after bootstrap.
 
-mod genesis;
+pub(crate) mod genesis;
+#[cfg(test)]
+pub(crate) mod bootstrap_observation;
+#[cfg(test)]
+mod genesis_followup_tests;
 
 use serde::Serialize;
 use sinomo_core::local::SinomoDataDir;
@@ -189,8 +193,9 @@ fn request_default_materialization_immediate_retry(data_root: PathBuf) {
 /// Consume an edge requesting one immediate materialization generation.
 ///
 /// The edge is emitted when a bounded pass stops at its mutation cap or when
-/// a pass first establishes a dynamic replica-progress dependency. The
-/// daemon's sole reconciliation owner uses it to continue bounded work or
+/// a pass first establishes a dynamic replica-progress dependency, or an
+/// original native genesis is newly confirmed committed. The daemon's sole
+/// reconciliation owner uses it to continue bounded work or
 /// verify the new subscription against the resident snapshot without a
 /// polling timer.
 pub fn take_default_cluster_dfs_materialization_immediate_retry(data_dir: &SinomoDataDir) -> bool {
@@ -448,6 +453,9 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             .await?
             .map(|entry| entry.decode::<DfsMetadataShardConfig>())
             .transpose()?;
+        #[cfg(test)]
+        bootstrap_observation::record(&self.data_dir.root(), &self.local_node_id, "shard-current", ||
+            serde_json::json!({"current":current,"desired":desired}));
         validate_bootstrap_metadata_shard_transition(current.as_ref(), desired)?;
         if current.as_ref() == Some(desired) {
             return Ok(());
@@ -468,6 +476,9 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                     .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
                     .transpose()?,
             };
+            #[cfg(test)]
+            bootstrap_observation::record(&self.data_dir.root(), &self.local_node_id, "handoff-pending", ||
+                serde_json::json!({"current":current,"desired":desired,"pending":pending}));
             if let Some(pending) = pending {
                 return Err(DfsError::MetadataShardMembershipHandoffParked {
                     file_system_id: pending.retiring_shard.file_system_id.clone(),
@@ -519,16 +530,22 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         service_node_ids: Vec<NodeId>,
     ) -> DfsDefaultClusterBootstrapFuture<'a, Vec<NodeId>> {
         Box::pin(async move {
-            let entries = self
-                .control_plane
-                .range_prefix_async(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
-                .await
-                .unwrap_or_default();
-            Ok(discovered_metadata_service_node_ids(
-                state,
-                service_node_ids,
-                entries,
-            ))
+            let result = self.control_plane.range_prefix_async(
+                sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX).await;
+            #[cfg(test)]
+            bootstrap_observation::record(&self.data_dir.root(), &self.local_node_id, "provider-input", || {
+                serde_json::json!({"eligible":service_node_ids,
+                    "members":state.members.iter().take(16).map(|m|serde_json::json!({"node":m.node_id,"role":m.role,"state":m.state})).collect::<Vec<_>>(),
+                    "returned":result.as_ref().map(|entries|serde_json::json!({"count":entries.len(),
+                        "entries":entries.iter().take(48).map(|e|serde_json::json!({"key":e.key,"bytes":e.value.len(),"blake3":blake3::hash(&e.value).to_hex().to_string()})).collect::<Vec<_>>()
+                    })).map_err(|error|error.to_string())})
+            });
+            let entries = result.unwrap_or_default();
+            let selected = discovered_metadata_service_node_ids(state, service_node_ids, entries);
+            #[cfg(test)]
+            bootstrap_observation::record(&self.data_dir.root(), &self.local_node_id, "provider-selected", ||
+                serde_json::json!({"selected":selected}));
+            Ok(selected)
         })
     }
 
@@ -614,6 +631,13 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         current: DfsMetadataShardConfig,
     ) -> DfsDefaultClusterBootstrapFuture<'a, bool> {
         Box::pin(async move {
+            #[cfg(test)]
+            let input = current.clone();
+            #[cfg(test)]
+            let reader = if current.epoch != 1 || !current.replica_node_ids.is_empty() { "non-initial" }
+                else if current.primary_node_id != self.local_node_id { "actual-watermark-call" }
+                else if self.resident_metadata_backend.is_some() { "existing-resident-checkout" } else { "ordinary-owner-open" };
+            let result = async {
             if current.epoch != 1 || !current.replica_node_ids.is_empty() {
                 return Ok(true);
             }
@@ -624,7 +648,15 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     let backend = handle.checkout()?;
                     return genesis::native_genesis_committed(&backend, &current);
                 }
-                let backend = open_local_metadata_shard_backend(&self.data_dir, shard_id)?;
+                let backend = match self.publication_owners.selected_original_data_layout()? {
+                    Some(layout) => crate::LocalSobjMetadataBackend::new_with_selected_layout(
+                        current.file_system_id.clone(),
+                        shard_id.clone(),
+                        crate::local_dfs_metadata_shard_path(&self.data_dir, &shard_id),
+                        layout,
+                    )?,
+                    None => open_local_metadata_shard_backend(&self.data_dir, shard_id)?,
+                };
                 return genesis::native_genesis_committed(&backend, &current);
             }
             let watermark = DfsControlPlaneAsyncStore::new(self.control_plane.as_mut())
@@ -639,6 +671,11 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                         .acknowledged_node_ids
                         .contains(&current.primary_node_id)
             }))
+            }.await;
+            #[cfg(test)]
+            bootstrap_observation::record(&self.data_dir.root(), &self.local_node_id, "genesis-result", ||
+                serde_json::json!({"current":input,"reader":reader,"result":result.as_ref().map(|v|*v).map_err(|e:&DfsError|e.to_string())}));
+            result
         })
     }
 
@@ -658,7 +695,13 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
         &'a mut self,
         shard: DfsMetadataShardConfig,
     ) -> DfsDefaultClusterBootstrapFuture<'a, ()> {
-        Box::pin(async move { self.compare_and_put_metadata_shard(&shard).await })
+        Box::pin(async move {
+            let result = self.compare_and_put_metadata_shard(&shard).await;
+            #[cfg(test)]
+            bootstrap_observation::record(&self.data_dir.root(), &self.local_node_id, "shard-put-result", ||
+                serde_json::json!({"desired":shard,"result":result.as_ref().map(|_|()).map_err(|e|e.to_string())}));
+            result
+        })
     }
 
     fn current_node_advertisements_async<'a>(
@@ -787,16 +830,26 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     &tokio::runtime::Handle::current(),
                 )
                 .await?;
-            self.publish_current_bootstrap(
+            let mut confirmed_new_genesis_commit = false;
+            let result = self.publish_current_bootstrap(
                 publication_provider,
                 &file_system,
                 shards,
                 bootstrap_owner_node_ids,
                 fallback_owner_node_id,
                 evidence,
-            )?;
-            record_default_materialization(self.data_dir.root(), signature, false);
-            Ok(())
+                &mut confirmed_new_genesis_commit,
+            );
+            if result.is_ok() {
+                record_default_materialization(self.data_dir.root(), signature, false);
+            }
+            if confirmed_new_genesis_commit {
+                // The settled record above clears old retry state. Publish the
+                // actual semantic edge afterward, including after a later Err.
+                // The existing sole reconciliation owner consumes/notifies it.
+                request_default_materialization_immediate_retry(self.data_dir.root());
+            }
+            result
         })
     }
 }

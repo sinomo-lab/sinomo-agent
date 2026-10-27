@@ -157,6 +157,9 @@ fn metadata_backend_perf_trace(args: std::fmt::Arguments<'_>) {
 
 #[cfg(test)]
 thread_local! {
+    // A selected-only slow-boundary fault after real marker synchronization.
+    // The callback observes the existing clock; it cannot replace its deadline.
+    pub(crate) static SELECTED_INSTALL_AFTER_MARKER_SYNC: std::cell::RefCell<Option<(PathBuf, String, Box<dyn FnOnce(Instant)>)>> = const { std::cell::RefCell::new(None) };
     static METADATA_COMPACTION_BEFORE_SNAPSHOT_HOOK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_DURABLE_TABLE_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -406,6 +409,7 @@ fn content_root_catalog_page_from_snapshot(
 pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
+    selected_original_data_layout: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
     replica_progress: crate::DfsMetadataReplicaObserver,
     next_sequence: u64,
     tables: DfsMetadataTables,
@@ -504,14 +508,53 @@ impl LocalSobjMetadataBackend {
     /// journal entries not yet reflected in tables, and finishes interrupted
     /// namespace or visible-version commits.
     pub fn new(shard_id: DfsMetadataShardId, root: impl Into<PathBuf>) -> Result<Self> {
+        Self::new_with_expected_layout(shard_id, root.into(), None)
+    }
+
+    pub(crate) fn new_with_selected_layout(
+        filesystem: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        root: PathBuf,
+        layout: Arc<crate::DfsSelectedOriginalDataLayout>,
+    ) -> Result<Self> {
+        #[cfg(any(test, feature = "test-support"))]
+        layout.admit_stage(&filesystem, &shard_id, &root)?;
+        Self::new_with_expected_layout(shard_id, root, Some((filesystem, layout)))
+    }
+
+    fn validate_expected_layout(
+        shard_id: &DfsMetadataShardId,
+        root: &Path,
+        selected: &Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
+    ) -> Result<()> {
+        if let Some((filesystem, layout)) = selected {
+            layout.stage(filesystem, shard_id, root)?;
+        } else {
+            crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(root)
+                .map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other,
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn new_with_expected_layout(
+        shard_id: DfsMetadataShardId,
+        root: PathBuf,
+        selected_original_data_layout: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
+    ) -> Result<Self> {
+        Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
         #[cfg(test)]
         METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
         let trace_started = Instant::now();
-        let root = root.into();
         crate::storage_preparation::prepare_storage_root_before_open(
             &root,
             &crate::DfsStoragePreparationScope::Metadata(shard_id.clone()),
         )?;
+        if selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
+        }
         let create_dirs_started = Instant::now();
         create_dir_all(root.join("records"))?;
         create_dir_all(root.join("journal"))?;
@@ -532,6 +575,7 @@ impl LocalSobjMetadataBackend {
             #[cfg(any(test, feature = "test-support"))]
             native_observed_exact_frame: None,
             instance_authority_epoch: None,
+            selected_original_data_layout,
             table_snapshot_fingerprint: None,
             table_storage_generation: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -550,7 +594,13 @@ impl LocalSobjMetadataBackend {
         };
         let local_recovery_started = Instant::now();
         {
+            if backend.selected_original_data_layout.is_some() {
+                Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
+            }
             let _lock = backend.metadata_write_lock()?;
+            if backend.selected_original_data_layout.is_some() {
+                Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
+            }
             backend.next_sequence = crate::metadata_journal::admission::certify_for_write(
                 &backend.root,
                 &backend.shard_id,
@@ -599,13 +649,20 @@ impl LocalSobjMetadataBackend {
             total_ms = trace_started.elapsed().as_millis(),
             "metadata-backend-open"
         );
-        metadata_table_apply::schedule_metadata_table_checkpoint_if_needed(
+        if backend.selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
+        }
+        metadata_table_apply::schedule_metadata_table_checkpoint_with_layout(
             &backend.root,
             &backend.tables,
             DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES,
             backend.table_log_offset,
             Some(&backend.read_snapshot_cache),
+            backend.selected_original_data_layout.as_ref().map(|(_, layout)| Arc::clone(layout)),
         )?;
+        if backend.selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
+        }
         Ok(backend)
     }
 
@@ -618,9 +675,17 @@ impl LocalSobjMetadataBackend {
         shard_id: DfsMetadataShardId,
         root: impl Into<PathBuf>,
     ) -> Result<Self> {
+        Self::open_for_inspection_with_layout(shard_id, root.into(), None)
+    }
+
+    pub(crate) fn open_for_inspection_with_layout(
+        shard_id: DfsMetadataShardId,
+        root: PathBuf,
+        selected_original_data_layout: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
+    ) -> Result<Self> {
+        Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
         #[cfg(test)]
         METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(1));
-        let root = root.into();
         let storage_generation_before = metadata_table_storage_generation(&root)?;
         let state = read_metadata_table_state_lenient(&root)?;
         let storage_generation_after = metadata_table_storage_generation(&root)?;
@@ -631,6 +696,9 @@ impl LocalSobjMetadataBackend {
         let next_sequence = read_next_journal_sequence_lenient(&root)?
             .max(materialized_through_sequence.saturating_add(1))
             .max(1);
+        if selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
+        }
         Ok(Self {
             shard_id,
             replica_progress: crate::metadata_replica_observer::subscribe(&root),
@@ -646,6 +714,7 @@ impl LocalSobjMetadataBackend {
             #[cfg(any(test, feature = "test-support"))]
             native_observed_exact_frame: None,
             instance_authority_epoch: None,
+            selected_original_data_layout,
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             table_storage_generation,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -721,13 +790,28 @@ impl LocalSobjMetadataBackend {
         shard_id: DfsMetadataShardId,
         root: impl Into<PathBuf>,
     ) -> Result<Self> {
-        let root = root.into();
+        Self::open_for_replica_repair_with_layout(shard_id, root.into(), None)
+    }
+
+    pub(crate) fn open_for_replica_repair_with_layout(
+        shard_id: DfsMetadataShardId,
+        root: PathBuf,
+        selected_original_data_layout: Option<(DfsFileSystemId, Arc<crate::DfsSelectedOriginalDataLayout>)>,
+    ) -> Result<Self> {
+        Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
+        let root = root;
         create_dir_all(root.join("records"))?;
         create_dir_all(root.join("journal").join("segments"))?;
+        if selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
+        }
         let _lock = metadata_write_lock(
             root.clone(),
             metadata_cursor::journal_write_lock_path(&root),
         )?;
+        if selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&shard_id, &root, &selected_original_data_layout)?;
+        }
         let state = match read_metadata_table_state_lenient(&root) {
             Ok(state) => state,
             Err(error) => {
@@ -760,6 +844,7 @@ impl LocalSobjMetadataBackend {
             #[cfg(any(test, feature = "test-support"))]
             native_observed_exact_frame: None,
             instance_authority_epoch: None,
+            selected_original_data_layout,
             table_snapshot_fingerprint: state.snapshot_fingerprint,
             table_storage_generation: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -776,9 +861,15 @@ impl LocalSobjMetadataBackend {
             #[cfg(test)]
             content_root_catalog_snapshot_builds: Arc::new(AtomicUsize::new(0)),
         };
+        if backend.selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
+        }
         backend.ensure_local_materialization_cursor()?;
         backend.reconcile_local_materialization_cursor(materialized_through_sequence)?;
         backend.ensure_metadata_prefix_proof_checkpoint_unlocked()?;
+        if backend.selected_original_data_layout.is_some() {
+            Self::validate_expected_layout(&backend.shard_id, &backend.root, &backend.selected_original_data_layout)?;
+        }
         Ok(backend)
     }
 
@@ -952,6 +1043,7 @@ impl LocalSobjMetadataBackend {
             #[cfg(any(test, feature = "test-support"))]
             native_observed_exact_frame: None,
             instance_authority_epoch: None,
+            selected_original_data_layout: None,
             table_snapshot_fingerprint: None,
             table_storage_generation: None,
             read_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -2235,6 +2327,7 @@ impl LocalSobjMetadataBackend {
 
     fn table_materialization_state(&mut self) -> TableMaterializationState<'_> {
         TableMaterializationState {
+            selected_original_data_layout: self.selected_original_data_layout.as_ref().map(|(_, layout)| Arc::clone(layout)),
             read_snapshot_cache: Some(&self.read_snapshot_cache),
             tables: &mut self.tables,
             table_log_offset: &mut self.table_log_offset,
@@ -3201,6 +3294,8 @@ mod tests;
 mod replay;
 
 mod handoff;
+#[cfg(test)]
+pub(crate) mod native_prefix_history;
 
 mod source_adoption;
 pub(crate) use source_adoption::DfsSourceAdoptionWriterCustody;

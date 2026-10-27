@@ -49,6 +49,144 @@ use crate::{
 };
 
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
+
+/// Pure DATA correlation only. Remote paths and physical identifiers are
+/// claims; this validator never opens them or mints an authenticated return.
+#[cfg(test)]
+pub(crate) fn validate_selected_local_recovery_fence_rpc_return(
+    expected: &DfsMessageCommand,
+    response: DfsMessageResponse,
+) -> Result<crate::DfsSelectedLocalRecoveryFenceRpcData, NetworkError> {
+    let invalid = |detail: &str| NetworkError::Serialization {
+        detail: format!("selected local-fence return: {detail}"),
+    };
+    let carrier = &expected.routed_message;
+    let DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(request) = &carrier.message else {
+        return Err(invalid("not the selected request family"));
+    };
+    let canonical = crate::control_plane::DfsMetadataShardRecoveryBallotRequest::prepare(
+        &request.reservation.serving_shard,
+        &request.reservation.ballot.candidate_node_id,
+        request.reservation.expected_attempt_floor,
+    )
+    .map_err(|_| invalid("invalid full reservation"))?;
+    if canonical != request.reservation {
+        return Err(invalid("full reservation differs from canonical request"));
+    }
+    if carrier.source_node_id != request.reservation.ballot.candidate_node_id
+        || carrier.target_node_id != request.expected_target
+        || carrier.source_node_id == carrier.target_node_id
+        || expected.request_id.is_empty()
+        || response.request_id != expected.request_id
+        || response.outbound_messages.len() != 1
+    {
+        return Err(invalid("carrier or outer request/count differs"));
+    }
+    let returned = response
+        .outbound_messages
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid("missing returned frame"))?;
+    if returned.source_node_id != carrier.target_node_id
+        || returned.target_node_id != carrier.source_node_id
+        || returned.frame_id != carrier.frame_id
+        || returned.message_id != carrier.message_id
+    {
+        return Err(invalid("returned route or carrier identity differs"));
+    }
+    let DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(reply) = returned.message else {
+        return Err(invalid("unrelated reply family"));
+    };
+    if reply.reservation != request.reservation || reply.acceptor_node_id != request.expected_target
+    {
+        return Err(invalid("full reservation or acceptor differs"));
+    }
+    let crate::DfsSelectedLocalRecoveryFenceRpcOutcome::Fenced { data } = reply.outcome else {
+        return Err(invalid("remote result is not verified Fenced DATA"));
+    };
+    data.fence
+        .validate()
+        .map_err(|_| invalid("malformed reported fence/inventory"))?;
+    if data.fence.reservation != request.reservation
+        || data.fence.acceptor_node_id != request.expected_target
+        || data.marker_bytes == 0
+        || data.marker_bytes > 1024 * 1024
+        || data.marker_digest.len() != 64
+        || !data
+            .marker_digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("reported fence or BLAKE3 marker bound differs"));
+    }
+    Ok(data)
+}
+
+/// Pure correlation validation returns DATA, not an authenticated capability.
+/// Only the actual native RPC owner wraps its successful output.
+pub(crate) fn validate_original_history_rpc_return(command: &DfsMessageCommand, response: DfsMessageResponse) -> Result<DfsRoutedMessage, NetworkError> {
+    let invalid = |detail: &str| NetworkError::Serialization { detail: detail.to_owned() };
+    let DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &command.routed_message.message else {
+        return Err(invalid("history return has no exact request family"));
+    };
+    request.validate().map_err(|error| invalid(&error.to_string()))?;
+    if command.routed_message != request.routed() { return Err(invalid("history request carrier differs")); }
+    if response.request_id != command.request_id || response.outbound_messages.len() != 1 {
+        return Err(invalid("history RPC must return exactly one response for its outer request"));
+    }
+    let returned = response.outbound_messages.into_iter().next().ok_or_else(|| invalid("history response missing"))?;
+    if returned.source_node_id != request.carrier.target || returned.target_node_id != request.carrier.source {
+        return Err(invalid("history return route differs from its actual query"));
+    }
+    let DfsNetworkMessage::OriginalRepairHistoryResponse(response) = &returned.message else {
+        return Err(invalid("history RPC returned an unrelated message family"));
+    };
+    response.validate_for_request(request).map_err(|error| invalid(&error.to_string()))?;
+    Ok(returned)
+}
+
+/// Only the native one-call decoder can construct this non-effect return.
+pub(crate) struct VerifiedOriginalRepairHistoryReturn {
+    returned: DfsRoutedMessage,
+}
+impl VerifiedOriginalRepairHistoryReturn {
+    pub(crate) fn into_routed(self) -> DfsRoutedMessage { self.returned }
+}
+
+/// Correlation only. The caller must own the actual native RPC return before
+/// wrapping this DATA in an opaque transport capability. Generic senders and
+/// decoded inbox frames cannot establish that provenance.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn validate_original_repair_owned_rpc_return(
+    expected: &DfsMessageCommand,
+    response: DfsMessageResponse,
+) -> Result<DfsRoutedMessage, NetworkError> {
+    let invalid = |detail: &str| NetworkError::Serialization {
+        detail: format!("native original Repair completion {detail}"),
+    };
+    if response.request_id != expected.request_id || response.outbound_messages.len() != 1 {
+        return Err(invalid(
+            "does not contain one response for the actual outer request",
+        ));
+    }
+    let returned = response
+        .outbound_messages
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid("has no returned frame"))?;
+    if !all_background_replica_response_identity_matches(
+        &expected.routed_message.source_node_id,
+        &expected.routed_message,
+        &returned,
+    ) {
+        return Err(invalid(
+            "differs from its actual carrier identity or result hash",
+        ));
+    }
+    // The remote response owns its own frame/message IDs. Only the outbound
+    // carrier's IDs select the persisted attempt and outer request.
+    Ok(returned)
+}
 /// Refinement of `PromotionFanoutCap` in `replica_quorum_fanout.qnt`.
 const DFS_COMMIT_PROMOTION_MAX_INFLIGHT: usize = 2;
 /// Process-local terminal promotion identities suppress redundant hydration
@@ -255,6 +393,161 @@ impl Default for DfsObjectRpcSendOptions {
     }
 }
 
+/// Per-call producer correlation DATA. Private fields prevent an injectable
+/// peer from manufacturing the producer's next attempt; this is NOT proof.
+#[derive(Debug)]
+pub struct DfsMetadataPrefixProbeAttempt {
+    id: String,
+    peer: NodeId,
+    command: DfsMetadataJournalBatchCommand,
+    deadline: Instant,
+}
+
+impl DfsMetadataPrefixProbeAttempt {
+    pub fn attempt_id(&self) -> &str {
+        &self.id
+    }
+    pub fn peer(&self) -> &NodeId {
+        &self.peer
+    }
+    pub fn command(&self) -> &DfsMetadataJournalBatchCommand {
+        &self.command
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+#[derive(Debug)]
+pub enum DfsMetadataPrefixEvidence {
+    NoNativeProof,
+    Native(crate::runtime_host::OwnedNativeMetadataPrefixReturn),
+}
+
+#[derive(Debug)]
+pub struct DfsMetadataPrefixProbeReturn {
+    pub response: DfsMetadataJournalBatchResponse,
+    pub evidence: DfsMetadataPrefixEvidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DfsNativePrefixRoundPeerStatus {
+    Unattempted,
+    NativeCaptured,
+    NoNativeProof,
+    Failed,
+    NativeBindingRejected,
+}
+
+/// One fixed slot in one round. Attempted means the R63 producer was invoked,
+/// not that a wire effect is known to have happened. Unknown stays unknown.
+#[derive(Debug)]
+pub(crate) struct DfsNativePrefixRoundPeer {
+    peer: NodeId,
+    command: DfsMetadataJournalBatchCommand,
+    status: DfsNativePrefixRoundPeerStatus,
+    attempted: bool,
+    response: Option<DfsMetadataJournalBatchResponse>,
+    native_return: Option<crate::runtime_host::OwnedNativeMetadataPrefixReturn>,
+    error: Option<NetworkError>,
+    unattempted_reason: Option<String>,
+}
+
+impl DfsNativePrefixRoundPeer {
+    pub(crate) fn peer(&self) -> &NodeId {
+        &self.peer
+    }
+    pub(crate) fn command(&self) -> &DfsMetadataJournalBatchCommand {
+        &self.command
+    }
+    pub(crate) fn status(&self) -> DfsNativePrefixRoundPeerStatus {
+        self.status
+    }
+    pub(crate) fn attempted(&self) -> bool {
+        self.attempted
+    }
+    pub(crate) fn response(&self) -> Option<&DfsMetadataJournalBatchResponse> {
+        self.response.as_ref()
+    }
+    pub(crate) fn native_return(
+        &self,
+    ) -> Option<&crate::runtime_host::OwnedNativeMetadataPrefixReturn> {
+        self.native_return.as_ref()
+    }
+    pub(crate) fn error(&self) -> Option<&NetworkError> {
+        self.error.as_ref()
+    }
+    pub(crate) fn delivery_state(&self) -> Option<sinomo_core::network::NetworkDeliveryState> {
+        self.error.as_ref().and_then(NetworkError::delivery_state)
+    }
+    pub(crate) fn unattempted_reason(&self) -> Option<&str> {
+        self.unattempted_reason.as_deref()
+    }
+}
+
+/// The common LOCAL source DATA observed by both genuine native returns. This
+/// is neither an invented self acknowledgement nor current serving authority.
+#[derive(Debug)]
+pub(crate) struct DfsNativePrefixRoundSourceObservation {
+    assignment: crate::DfsMetadataShardConfig,
+    prefix: crate::DfsMetadataPrefixProof,
+    physical: crate::runtime_host::NativeMetadataPrefixPhysicalOwner,
+}
+
+impl DfsNativePrefixRoundSourceObservation {
+    pub(crate) fn assignment(&self) -> &crate::DfsMetadataShardConfig {
+        &self.assignment
+    }
+    pub(crate) fn prefix(&self) -> &crate::DfsMetadataPrefixProof {
+        &self.prefix
+    }
+    pub(crate) fn physical_owner(&self) -> &crate::runtime_host::NativeMetadataPrefixPhysicalOwner {
+        &self.physical
+    }
+    pub(crate) fn source_node_id(&self) -> &NodeId {
+        &self.assignment.primary_node_id
+    }
+}
+
+/// Private, call-local complete/incomplete observation. No Clone, serde, raw
+/// constructor or merge/adopt operation; retained values own no native lease.
+#[derive(Debug)]
+pub(crate) struct OwnedNativeMetadataPrefixRound {
+    round_id: String,
+    target: crate::DfsMetadataQuorumSyncTarget,
+    deadline: Instant,
+    peers: Vec<DfsNativePrefixRoundPeer>,
+    common_source: Option<DfsNativePrefixRoundSourceObservation>,
+    finalization_error: Option<NetworkError>,
+}
+
+impl OwnedNativeMetadataPrefixRound {
+    pub(crate) fn round_id(&self) -> &str {
+        &self.round_id
+    }
+    pub(crate) fn target(&self) -> &crate::DfsMetadataQuorumSyncTarget {
+        &self.target
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.common_source.is_some() && self.finalization_error.is_none()
+    }
+    pub(crate) fn peer_outcomes(&self) -> &[DfsNativePrefixRoundPeer] {
+        &self.peers
+    }
+    pub(crate) fn common_source_observation(
+        &self,
+    ) -> Option<&DfsNativePrefixRoundSourceObservation> {
+        self.common_source.as_ref()
+    }
+    /// Local round eligibility error, separate from preserved peer errors.
+    pub(crate) fn finalization_error(&self) -> Option<&NetworkError> {
+        self.finalization_error.as_ref()
+    }
+}
+
 /// Size-independent DFS peer RPC. Ordinary encoded values and explicit
 /// attachments share this one transport contract.
 pub trait DfsPeerTransport: Send + Sync {
@@ -270,6 +563,133 @@ pub trait DfsPeerTransport: Send + Sync {
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError>;
+
+    /// Generic/injectable peers retain response DATA only. The native runtime
+    /// override owns its ONE actual call; no matcher/trace may construct proof.
+    fn call_metadata_prefix_probe(
+        &self,
+        attempt: &DfsMetadataPrefixProbeAttempt,
+        mut options: DfsObjectRpcSendOptions,
+    ) -> Result<DfsMetadataPrefixProbeReturn, DfsPeerTransportError> {
+        validate_ordinary_metadata_prefix_command(attempt.command())?;
+        let call = crate::dfs_metadata_journal_batch_rpc_call(attempt.command())
+            .map_err(DfsPeerTransportError::from_network)?;
+        let remaining = attempt
+            .deadline()
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                DfsPeerTransportError::new("metadata prefix attempt expired before dispatch")
+            })?;
+        options.overall_timeout = Some(
+            options
+                .overall_timeout
+                .map_or(remaining, |old| old.min(remaining)),
+        );
+        let result = self.call_object_rpc(attempt.peer(), call, options)?;
+        let response = collect_metadata_prefix_probe_return(result, attempt)?;
+        Ok(DfsMetadataPrefixProbeReturn {
+            response,
+            evidence: DfsMetadataPrefixEvidence::NoNativeProof,
+        })
+    }
+}
+
+pub(crate) fn validate_ordinary_metadata_prefix_command(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<(), DfsPeerTransportError> {
+    let probe = command.prefix_probe.as_ref().ok_or_else(|| {
+        DfsPeerTransportError::new("native prefix capture requires an ordinary PREFIX probe")
+    })?;
+    if !command.verify_prefix_only
+        || !command.batch.journal_frames.is_empty()
+        || command.authority_probe.is_some()
+        || command.durable_replication.is_some()
+        || probe.primary_handoff_id.is_some()
+        || probe.repair_custody.is_some()
+        || command.request_id.is_empty()
+        || command.source_node_id.is_none()
+        || command.file_system_id.is_none()
+        || command.authority_epoch.is_none()
+        || probe.file_system_id != command.file_system_id
+        || probe.authority_epoch != command.authority_epoch
+        || probe.shard_id != command.batch.shard_id
+        || probe.journal_sequence != command.batch.next_after_sequence
+        || probe.barrier_id.is_empty()
+        || probe.state_fingerprint.is_empty()
+    {
+        return Err(DfsPeerTransportError::new(
+            "native prefix capture refuses nonordinary, incomplete, handoff, custody, authority or backfill input",
+        ));
+    }
+    Ok(())
+}
+
+/// Pure response decoding/correlation returns DATA only, never provenance.
+pub(crate) fn collect_metadata_prefix_probe_return(
+    result: ObjectRpcResult,
+    attempt: &DfsMetadataPrefixProbeAttempt,
+) -> Result<DfsMetadataJournalBatchResponse, DfsPeerTransportError> {
+    let streamed = result.has_streamed_value();
+    let (mut response, body) = result.into_parts();
+    if response.route != crate::DFS_METADATA_JOURNAL_BATCH_ROUTE || (!streamed && !body.is_empty())
+    {
+        return Err(DfsPeerTransportError::new(
+            "metadata prefix return has a wrong route or semantic attachment",
+        ));
+    }
+    response
+        .error_detail()
+        .map_err(DfsPeerTransportError::from_network)?;
+    if streamed {
+        let deadline = attempt.deadline();
+        let collect = async move {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                body.collect_to_vec(64 * 1024),
+            )
+            .await
+            .map_err(|_| {
+                DfsPeerTransportError::new("metadata prefix return exceeded its original deadline")
+            })?
+            .map_err(DfsPeerTransportError::from_network)
+        };
+        response.body = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if !matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return Err(DfsPeerTransportError::new(
+                    "metadata prefix sync return requires a blocking-capable runtime",
+                ));
+            }
+            tokio::task::block_in_place(|| runtime.block_on(collect))?
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+            let value = runtime.block_on(collect);
+            runtime.shutdown_timeout(Duration::from_millis(250));
+            value?
+        };
+    }
+    if response.body.len() > 64 * 1024 || Instant::now() >= attempt.deadline() {
+        return Err(DfsPeerTransportError::new(
+            "metadata prefix return exceeds its value/deadline bound",
+        ));
+    }
+    let actual = decode_dfs_metadata_journal_batch_rpc_response(&response)
+        .map_err(DfsPeerTransportError::from_network)?;
+    if actual.request_id != attempt.command.request_id
+        || actual.shard_id != attempt.command.batch.shard_id
+        || actual.next_after_sequence != attempt.command.batch.next_after_sequence
+    {
+        return Err(DfsPeerTransportError::new(
+            "metadata prefix return differs from its actual request/shard/sequence",
+        ));
+    }
+    Ok(actual)
 }
 
 fn collect_dfs_attachment_source_sync(
@@ -445,10 +865,17 @@ pub fn dfs_routed_call_rpc_call(
     let DfsRoutedCall {
         message,
         attachment,
+        original_repair,
     } = call;
-    let command = DfsMessageCommand {
+    let expected = DfsMessageCommand {
         request_id: format!("dfs_message_{}", message.frame_id),
         routed_message: message,
+    };
+    let command = DfsMessageCommand {
+        request_id: expected.request_id.clone(),
+        routed_message: crate::message_transport::selected_original_repair_wire_message(
+            expected.routed_message.clone(), original_repair,
+        )?,
     };
     let rpc_call = match attachment {
         Some(attachment) if attachment.descriptor.total_size_bytes == 0 => {
@@ -465,7 +892,7 @@ pub fn dfs_routed_call_rpc_call(
                 Vec::new(),
             )?;
             let rpc_call = dfs_message_rpc_call(&command)?;
-            return Ok((command, rpc_call));
+            return Ok((expected, rpc_call));
         }
         Some(attachment) => {
             let request = dfs_message_rpc_request(&command)?;
@@ -478,7 +905,7 @@ pub fn dfs_routed_call_rpc_call(
         }
         None => dfs_message_rpc_call(&command)?,
     };
-    Ok((command, rpc_call))
+    Ok((expected, rpc_call))
 }
 
 pub(crate) fn value_response_from_rpc_result(
@@ -652,6 +1079,8 @@ struct DeferredDfsPeerSend {
     // content custody and current authority on every attempt. The shared outbox
     // retains it across worker replacement; durable intent recovery owns restart.
     pending_local_responses: VecDeque<DfsRoutedMessage>,
+    #[cfg(any(test, feature = "test-support"))]
+    native_completion: Option<Arc<crate::runtime_host::OwnedOriginalRepairCompletion>>,
     // Process-local pacing only. Durable intent/receipt hydration reconstructs
     // outstanding promotions at tier zero after restart.
     retry_attempts: u32,
@@ -831,6 +1260,12 @@ impl DfsCommitPromotionIdentity {
 
 impl DeferredDfsPeerSend {
     fn eligible_for_target_policy(&self, deferred_target_node_ids: &BTreeSet<NodeId>) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.sender.is_none() && self.native_completion.is_some() {
+            // The peer has already returned. This is local physical custody,
+            // so an offline C cannot turn it into a parked network attempt.
+            return true;
+        }
         // Required content fetches and completed write replies are protocol
         // progress for an existing operation, even in Main's detached owner.
         // Advisory maintenance exclusion must not park them. The ordinary RPC
@@ -896,7 +1331,7 @@ fn all_commit_version_response_identity_matches(
         && response.replica_node_id == send.target_node_id
 }
 
-fn all_background_replica_response_identity_matches(
+pub(crate) fn all_background_replica_response_identity_matches(
     local_node_id: &NodeId,
     original: &DfsRoutedMessage,
     message: &DfsRoutedMessage,
@@ -1380,7 +1815,7 @@ impl DfsNodeDetachedSendWorker {
                 return Err(error);
             }
         };
-        let (requests, observed): (Vec<_>, Vec<_>) = requests
+        let (mut requests, mut observed): (Vec<_>, Vec<_>) = requests
             .into_iter()
             .zip(observed)
             .filter_map(|(request, observation)| match observation {
@@ -1388,6 +1823,52 @@ impl DfsNodeDetachedSendWorker {
                 DfsBackgroundReplicaDispatch::Fenced => None,
             })
             .unzip();
+        let mut first_error = None;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let mut ordinary = Vec::new();
+            let mut ordinary_observed = Vec::new();
+            for (mut request, before) in requests.into_iter().zip(observed) {
+                let Some(prepared) = request.request.native_repair_custody.take() else {
+                    ordinary.push(request);
+                    ordinary_observed.push(before);
+                    continue;
+                };
+                let original = request.request.call.message.clone();
+                let producer = request.producer_delivery.get().copied();
+                // Only an admitted producer's private preparation reaches this
+                // concrete native call. It consumes that SAME owned body and
+                // returns before any generic inbox/ordinary local application.
+                let returned = self.transport.current_send_options("send admitted native Repair custody")
+                    .map_err(DfsError::from_network)
+                    .and_then(|options| crate::runtime_host::send_prepared_native_repair_custody(
+                        prepared, request.request.call, options,
+                    ));
+                match returned {
+                    Ok(completion) => {
+                        let completion = Arc::new(completion);
+                        if let Err(error) = crate::runtime_host::defer_native_owned_repair_completion(&completion) {
+                            first_error.get_or_insert(error);
+                            if let Err(error) = self.transport.retain_native_repair_completion(completion) {
+                                first_error.get_or_insert_with(|| DfsError::from_network(error));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let delivery_state = match &error { DfsError::NetworkDelivery { delivery_state, .. } => Some(*delivery_state), _ => None };
+                        let last_error = error.to_string();
+                        first_error.get_or_insert(error);
+                        if let (Some(handler), Some(producer), Some(before)) = (&delivery_handler, producer, before)
+                            && let Err(error) = handler(DfsBackgroundReplicaDeliveryEvent::Failed {
+                                message: original, before, producer, delivery_state, last_error,
+                            })
+                        { first_error.get_or_insert(error); }
+                    }
+                }
+            }
+            requests = ordinary;
+            observed = ordinary_observed;
+        }
         let expected = requests
             .iter()
             .zip(observed)
@@ -1407,7 +1888,6 @@ impl DfsNodeDetachedSendWorker {
                 .collect(),
             crate::service_outbound::DFS_REPLICA_BODY_FANOUT_CAP,
         );
-        let mut first_error = None;
         let returned = match self.transport.drain_incoming_messages() {
             Ok(returned) => returned,
             Err(error) => {
@@ -2306,6 +2786,41 @@ impl DfsNodeTransport {
         Ok(page)
     }
 
+    /// One explicit RPC owns its entire return. This path never touches the
+    /// generic incoming queue, detached outbox, retry helper or frame counter.
+    pub(crate) fn request_original_repair_history_direct(
+        &self, target: &NodeId, carrier: &DfsRoutedMessage, deadline: Instant,
+    ) -> Result<VerifiedOriginalRepairHistoryReturn, NetworkError> {
+        let invalid = |detail: &str| NetworkError::Serialization { detail: detail.to_owned() };
+        let DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &carrier.message else {
+            return Err(invalid("direct history call requires its exact typed query"));
+        };
+        request.validate().map_err(|error| invalid(&error.to_string()))?;
+        if carrier != &request.routed() || carrier.source_node_id != self.local_node_id
+            || &carrier.target_node_id != target || target == &self.local_node_id
+            || !self.known_remote_nodes.contains(target)
+        { return Err(invalid("direct history call changed its actual native carrier")); }
+        let peer = self.peer_transport.as_ref().ok_or_else(|| invalid("history query requires an actual native peer transport"))?;
+        let command = DfsMessageCommand { request_id: format!("dfs_message_{}", carrier.frame_id), routed_message: carrier.clone() };
+        let call = dfs_message_rpc_call(&command)?;
+        let deadline = self.operation_deadline.map_or(deadline, |earlier| earlier.min(deadline));
+        let options = Self::clamp_send_options_to_operation_deadline(
+            DfsObjectRpcSendOptions::new(self.connect_timeout).with_observe_connectivity(false),
+            Some(deadline), "query retained original Repair history",
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        let mut native_attempt = crate::native_shard_trace::begin_rpc_attempt(target, &command);
+        let returned = peer.call_object_rpc(target, call, options)
+            .and_then(|result| value_response_from_rpc_result(result)
+                .and_then(|response| decode_dfs_message_rpc_response(&response).map_err(|error| DfsPeerTransportError::new(error.to_string()))));
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(attempt) = native_attempt.as_mut() { attempt.returned(&returned); }
+        let response = returned.map_err(|error| dfs_peer_transport_network_error("query retained original Repair history".into(), error))?;
+        if Instant::now() >= deadline { return Err(invalid("history query returned after its original caller deadline")); }
+        let returned = validate_original_history_rpc_return(&command, response)?;
+        Ok(VerifiedOriginalRepairHistoryReturn { returned })
+    }
+
     #[cfg(test)]
     fn detached_send_count(&self) -> usize {
         let outbox = self
@@ -2611,41 +3126,23 @@ impl DfsNodeTransport {
         Ok(())
     }
 
-    fn send_routed_message_attachment_to_peer(
+    fn send_routed_attachment_call_to_peer(
         &mut self,
         target_node_id: &NodeId,
-        routed_message: DfsRoutedMessage,
-        attachment: DfsOutboundAttachment,
+        call: DfsRoutedCall,
         require_local_source: bool,
         #[cfg(any(test, feature = "test-support"))] native_context: Option<
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
         if target_node_id == &self.local_node_id
-            && !self.routes_local_request_to_main(target_node_id, &routed_message.message)
+            && !self.routes_local_request_to_main(target_node_id, &call.message.message)
         {
-            let max_bytes =
-                usize::try_from(attachment.descriptor.total_size_bytes).map_err(|_| {
-                    NetworkError::ResourceExhausted {
-                        operation: "materialize loopback DFS attachment".to_string(),
-                        requested_bytes: usize::MAX,
-                    }
-                })?;
-            let bytes = collect_dfs_attachment_source_sync(attachment.source, max_bytes).map_err(
-                |source| NetworkError::Io {
-                    operation: "collect loopback DFS request attachment".to_string(),
-                    detail: source.to_string(),
-                },
-            )?;
-            let message = crate::body_rpc::attach_dfs_routed_message_attachment(
-                routed_message,
-                attachment.descriptor,
-                bytes,
-            )?;
+            let message = crate::materialize_dfs_routed_call_sync(call)?;
             self.incoming_messages.push_back(message);
             return Ok(());
         }
-        self.validate_routed_message_target(target_node_id, &routed_message, require_local_source)?;
+        self.validate_routed_message_target(target_node_id, &call.message, require_local_source)?;
         let Some(peer_transport) = self.peer_transport.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS attachment to {target_node_id}"),
@@ -2653,8 +3150,7 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let (command, call) =
-            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(routed_message, attachment))?;
+        let (command, call) = dfs_routed_call_rpc_call(call)?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         #[cfg(any(test, feature = "test-support"))]
@@ -2708,18 +3204,20 @@ impl DfsNodeTransport {
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
-        match call.attachment {
-            Some(attachment) => self.send_routed_message_attachment_to_peer(
+        if call.attachment.is_some() {
+            self.send_routed_attachment_call_to_peer(
                 target_node_id,
-                call.message,
-                attachment,
+                call,
                 require_local_source,
                 #[cfg(any(test, feature = "test-support"))]
                 native_context.clone(),
-            ),
-            None => {
-                self.send_routed_message_to_peer(target_node_id, call.message, require_local_source)
-            }
+            )
+        } else if call.original_repair.is_some() {
+            Err(NetworkError::Serialization {
+                detail: "selected Repair call lost its owned attachment".into(),
+            })
+        } else {
+            self.send_routed_message_to_peer(target_node_id, call.message, require_local_source)
         }
     }
 
@@ -2909,6 +3407,8 @@ impl DfsNodeTransport {
             routed_message,
             promotion_sequence: None,
             pending_local_responses: VecDeque::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            native_completion: None,
             retry_attempts: 0,
         };
         let promotion_identity = send.commit_version_promotion_identity();
@@ -3147,6 +3647,23 @@ impl DfsNodeTransport {
                 }
 
                 let mut send = sends.pop_front().expect("detached send front");
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(completion) = send.native_completion.as_ref().cloned() {
+                    let result = if send.sender.is_some() || !send.pending_local_responses.is_empty() {
+                        Err(DfsError::Metadata { message: "typed native completion cannot mix a sender or raw returns".into() })
+                    } else {
+                        crate::runtime_host::defer_native_owned_repair_completion(&completion).map(|_| ())
+                    };
+                    if let Err(error) = result {
+                        replay_retries.push_back(send);
+                        first_replay_error.get_or_insert_with(|| NetworkError::Io {
+                            operation: "defer native Repair completion custody".into(), detail: error.to_string(),
+                        });
+                    }
+                    // A successful typed defer consumed only this local outbox
+                    // obligation. Never reinterpret it as an ordinary response.
+                    continue;
+                }
                 let attempted_replay = send
                     .is_replay_safe_completed_write_response()
                     .then(|| send.clone());
@@ -3213,6 +3730,10 @@ impl DfsNodeTransport {
         send: DeferredDfsPeerSend,
         current_operation_deadline: Option<Instant>,
     ) -> Result<Vec<DfsRoutedMessage>, NetworkError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if send.native_completion.is_some() {
+            return Err(NetworkError::Serialization { detail: "typed native completion has no network resend path".into() });
+        }
         let operation_deadline =
             Self::earlier_operation_deadline(send.operation_deadline, current_operation_deadline);
         let options = Self::clamp_send_options_to_operation_deadline(
@@ -3369,6 +3890,8 @@ impl DfsNodeTransport {
             routed_message: original,
             promotion_sequence: None,
             pending_local_responses: VecDeque::from([response]),
+            #[cfg(any(test, feature = "test-support"))]
+            native_completion: None,
             retry_attempts: 0,
         };
         // The first local attempt already failed. Reuse the existing shared
@@ -3378,6 +3901,21 @@ impl DfsNodeTransport {
             VecDeque::from([completion]),
             Instant::now(),
         )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn retain_native_repair_completion(
+        &mut self, completion: Arc<crate::runtime_host::OwnedOriginalRepairCompletion>,
+    ) -> Result<(), NetworkError> {
+        if completion.carrier().source_node_id != self.local_node_id {
+            return Err(NetworkError::Serialization { detail: "native completion belongs to another local producer".into() });
+        }
+        let send = DeferredDfsPeerSend {
+            sender: None, options: DfsObjectRpcSendOptions::new(self.connect_timeout), operation_deadline: None,
+            target_node_id: completion.carrier().target_node_id.clone(), routed_message: completion.carrier().clone(),
+            promotion_sequence: None, pending_local_responses: VecDeque::new(), native_completion: Some(completion), retry_attempts: 0,
+        };
+        self.restore_detached_peer_send_work(VecDeque::new(), VecDeque::from([send]), Instant::now())
     }
 
     fn deliver_detached_local_responses(
@@ -3634,36 +4172,23 @@ impl DfsNodeTransport {
         Ok(())
     }
 
-    async fn send_routed_message_attachment_to_peer_async(
+    async fn send_routed_attachment_call_to_peer_async(
         &mut self,
         target_node_id: &NodeId,
-        routed_message: DfsRoutedMessage,
-        attachment: DfsOutboundAttachment,
+        call: DfsRoutedCall,
         require_local_source: bool,
         #[cfg(any(test, feature = "test-support"))] native_context: Option<
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
         if target_node_id == &self.local_node_id
-            && !self.routes_local_request_to_main(target_node_id, &routed_message.message)
+            && !self.routes_local_request_to_main(target_node_id, &call.message.message)
         {
-            let max_bytes =
-                usize::try_from(attachment.descriptor.total_size_bytes).map_err(|_| {
-                    NetworkError::ResourceExhausted {
-                        operation: "materialize async loopback DFS attachment".to_string(),
-                        requested_bytes: usize::MAX,
-                    }
-                })?;
-            let bytes = attachment.source.collect_to_vec(max_bytes).await?;
-            let message = crate::body_rpc::attach_dfs_routed_message_attachment(
-                routed_message,
-                attachment.descriptor,
-                bytes,
-            )?;
+            let message = crate::message_transport::materialize_dfs_routed_call(call).await?;
             self.incoming_messages.push_back(message);
             return Ok(());
         }
-        self.validate_routed_message_target(target_node_id, &routed_message, require_local_source)?;
+        self.validate_routed_message_target(target_node_id, &call.message, require_local_source)?;
         let Some(peer_transport) = self.async_peer_transport.as_ref().cloned() else {
             return Err(NetworkError::Io {
                 operation: format!("send DFS attachment to {target_node_id}"),
@@ -3671,8 +4196,7 @@ impl DfsNodeTransport {
                     .to_string(),
             });
         };
-        let (command, call) =
-            dfs_routed_call_rpc_call(DfsRoutedCall::with_attachment(routed_message, attachment))?;
+        let (command, call) = dfs_routed_call_rpc_call(call)?;
         let options =
             self.current_send_options(format!("send DFS attachment to {target_node_id}"))?;
         #[cfg(any(test, feature = "test-support"))]
@@ -3729,26 +4253,26 @@ impl DfsNodeTransport {
             crate::native_shard_trace::NativeRpcAttemptContext,
         >,
     ) -> Result<(), NetworkError> {
-        match call.attachment {
-            Some(attachment) => {
-                self.send_routed_message_attachment_to_peer_async(
-                    target_node_id,
-                    call.message,
-                    attachment,
-                    require_local_source,
-                    #[cfg(any(test, feature = "test-support"))]
-                    native_context.clone(),
-                )
-                .await
-            }
-            None => {
-                self.send_routed_message_to_peer_async(
-                    target_node_id,
-                    call.message,
-                    require_local_source,
-                )
-                .await
-            }
+        if call.attachment.is_some() {
+            self.send_routed_attachment_call_to_peer_async(
+                target_node_id,
+                call,
+                require_local_source,
+                #[cfg(any(test, feature = "test-support"))]
+                native_context.clone(),
+            )
+            .await
+        } else if call.original_repair.is_some() {
+            Err(NetworkError::Serialization {
+                detail: "selected Repair call lost its owned attachment".into(),
+            })
+        } else {
+            self.send_routed_message_to_peer_async(
+                target_node_id,
+                call.message,
+                require_local_source,
+            )
+            .await
         }
     }
 }
@@ -4172,6 +4696,10 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
         max_inflight: usize,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         #[cfg(any(test, feature = "test-support"))]
+        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+            return Box::pin(async { Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() }) });
+        }
+        #[cfg(any(test, feature = "test-support"))]
         let native_context = crate::native_shard_trace::rpc_attempt_context();
         if self.served_message.is_some() {
             self.send_served_calls_bounded_async(
@@ -4523,6 +5051,286 @@ fn send_direct_metadata_journal_fanout_blocking(
 }
 
 impl DfsNodeTransport {
+    /// One explicit round over an already initialized three-member scope.
+    /// Both commands precede dispatch; every invoked peer gets exactly one R63
+    /// call under the SAME absolute deadline. No input partial can be adopted.
+    pub(crate) fn capture_metadata_prefix_full_assignment_round(
+        &mut self,
+        target: &crate::DfsMetadataQuorumSyncTarget,
+    ) -> Result<OwnedNativeMetadataPrefixRound, NetworkError> {
+        let invalid = |detail: &str| NetworkError::Serialization {
+            detail: format!("native prefix round: {detail}"),
+        };
+        let assignment = target
+            .expected_shard
+            .as_ref()
+            .ok_or_else(|| invalid("missing exact assignment"))?;
+        let expected = assignment
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let supplied = target
+            .replica_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if target.primary_node_id != self.local_node_id
+            || assignment.primary_node_id != self.local_node_id
+            || assignment.file_system_id != target.file_system_id
+            || assignment.shard_id != target.shard_id.0
+            || assignment.epoch == 0
+            || target.authority_epoch != Some(assignment.epoch)
+            || target.barrier_id.is_empty()
+            || target.state_fingerprint.is_empty()
+            || target.checkpoint_snapshot.is_some()
+            || assignment.replica_node_ids.len() != 2
+            || target.replica_node_ids.len() != 2
+            || expected.len() != 2
+            || supplied != expected
+            || expected.contains(&self.local_node_id)
+        {
+            return Err(invalid(
+                "unsupported, duplicate, subset or inconsistent three-member target",
+            ));
+        }
+        for peer in &expected {
+            if !self.known_remote_nodes.contains(peer) {
+                return Err(NetworkError::UnknownNode {
+                    node_id: peer.clone(),
+                });
+            }
+        }
+        let deadline = self
+            .operation_deadline
+            .filter(|deadline| *deadline > Instant::now())
+            .ok_or_else(|| invalid("missing or expired original operation deadline"))?;
+        let round_id = sinomo_core::Id::generate().to_string();
+        let peers = expected
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| DfsNativePrefixRoundPeer {
+                peer: peer.clone(),
+                command: DfsMetadataJournalBatchCommand {
+                    request_id: format!("dfs_native_prefix_round_{round_id}_{index}"),
+                    source_node_id: Some(self.local_node_id.clone()),
+                    file_system_id: Some(target.file_system_id.clone()),
+                    authority_epoch: target.authority_epoch,
+                    verify_prefix_only: true,
+                    prefix_probe: Some(crate::DfsMetadataPrefixProbe {
+                        barrier_id: format!("{}-{round_id}", target.barrier_id),
+                        file_system_id: Some(target.file_system_id.clone()),
+                        authority_epoch: target.authority_epoch,
+                        shard_id: target.shard_id.clone(),
+                        journal_sequence: target.journal_sequence,
+                        state_fingerprint: target.state_fingerprint.clone(),
+                        primary_handoff_id: None,
+                        repair_custody: None,
+                    }),
+                    authority_probe: None,
+                    durable_replication: None,
+                    batch: crate::DfsMetadataJournalFrameBatch {
+                        shard_id: target.shard_id.clone(),
+                        journal_frames: Vec::new(),
+                        next_after_sequence: target.journal_sequence,
+                    },
+                },
+                status: DfsNativePrefixRoundPeerStatus::Unattempted,
+                attempted: false,
+                response: None,
+                native_return: None,
+                error: None,
+                unattempted_reason: Some("peer invocation has not begun".into()),
+            })
+            .collect::<Vec<_>>();
+        let mut round = OwnedNativeMetadataPrefixRound {
+            round_id,
+            target: target.clone(),
+            deadline,
+            peers,
+            common_source: None,
+            finalization_error: None,
+        };
+        let mut native_attempts = BTreeSet::new();
+        for slot in &mut round.peers {
+            if Instant::now() >= deadline {
+                slot.unattempted_reason =
+                    Some("original round deadline expired before this peer invocation".into());
+                continue;
+            }
+            slot.attempted = true;
+            slot.unattempted_reason = None;
+            match self.capture_metadata_prefix_probe_direct(&slot.peer, &slot.command) {
+                Err(error) => {
+                    slot.status = DfsNativePrefixRoundPeerStatus::Failed;
+                    slot.error = Some(error);
+                }
+                Ok(returned) => {
+                    slot.response = Some(returned.response);
+                    match returned.evidence {
+                        DfsMetadataPrefixEvidence::NoNativeProof => {
+                            slot.status = DfsNativePrefixRoundPeerStatus::NoNativeProof
+                        }
+                        DfsMetadataPrefixEvidence::Native(value) => {
+                            let valid = value.peer() == &slot.peer
+                                && value.command() == &slot.command
+                                && value.response()
+                                    == slot.response.as_ref().expect("actual response retained")
+                                && value.source_assignment() == assignment
+                                && value.source_prefix().is_well_formed()
+                                && value.source_prefix().journal_sequence
+                                    == target.journal_sequence
+                                && value.source_prefix().digest == target.state_fingerprint
+                                && native_attempts.insert(value.attempt_id().to_owned());
+                            slot.status = if valid {
+                                DfsNativePrefixRoundPeerStatus::NativeCaptured
+                            } else {
+                                DfsNativePrefixRoundPeerStatus::NativeBindingRejected
+                            };
+                            if !valid {
+                                slot.error = Some(invalid(
+                                    "native value differs from its fixed peer/command/source or duplicates another attempt",
+                                ));
+                            }
+                            // Preserve genuine captured DATA even if it cannot
+                            // qualify this slot or a later whole-round check.
+                            slot.native_return = Some(value);
+                        }
+                    }
+                }
+            }
+        }
+        let completed = (|| -> Result<DfsNativePrefixRoundSourceObservation, NetworkError> {
+            if Instant::now() >= deadline {
+                return Err(invalid(
+                    "original whole-round deadline expired; observations retained",
+                ));
+            }
+            let actual = round
+                .peers
+                .iter()
+                .map(|slot| slot.peer.clone())
+                .collect::<BTreeSet<_>>();
+            if actual != expected
+                || round.peers.len() != expected.len()
+                || round.peers.iter().any(|slot| {
+                    slot.status != DfsNativePrefixRoundPeerStatus::NativeCaptured
+                        || slot.error.is_some()
+                })
+            {
+                return Err(invalid(
+                    "not every configured remote peer supplied qualifying native evidence in this round",
+                ));
+            }
+            let first = round.peers[0]
+                .native_return
+                .as_ref()
+                .expect("qualified native slot");
+            let common = DfsNativePrefixRoundSourceObservation {
+                assignment: first.source_assignment().clone(),
+                prefix: first.source_prefix().clone(),
+                physical: first.local_physical_owner().clone(),
+            };
+            for slot in &round.peers {
+                let value = slot.native_return.as_ref().expect("qualified native slot");
+                if value.source_assignment() != &common.assignment
+                    || value.source_prefix() != &common.prefix
+                    || value.local_physical_owner() != &common.physical
+                {
+                    return Err(invalid(
+                        "native peer returns have mixed source assignment/prefix/physical observations",
+                    ));
+                }
+                value.validate_binding(&slot.peer, &slot.command, &common.physical.data_root)?;
+            }
+            if Instant::now() >= deadline {
+                return Err(invalid(
+                    "final binding checks crossed the original whole-round deadline",
+                ));
+            }
+            Ok(common)
+        })();
+        match completed {
+            Ok(common) => round.common_source = Some(common),
+            Err(error) => round.finalization_error = Some(error),
+        }
+        Ok(round)
+    }
+
+    /// Opt-in, one-call direct PREFIX producer. Routed/fanout output remains
+    /// DATA; no second RPC is issued to obtain provenance for an earlier call.
+    pub(crate) fn capture_metadata_prefix_probe_direct(
+        &mut self,
+        peer: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+    ) -> Result<DfsMetadataPrefixProbeReturn, NetworkError> {
+        validate_ordinary_metadata_prefix_command(command).map_err(|error| {
+            NetworkError::Serialization {
+                detail: error.to_string(),
+            }
+        })?;
+        if peer == &self.local_node_id
+            || !self.known_remote_nodes.contains(peer)
+            || command.source_node_id.as_ref() != Some(&self.local_node_id)
+        {
+            return Err(NetworkError::Serialization {
+                detail: "metadata prefix attempt has a foreign local source or target peer".into(),
+            });
+        }
+        let deadline = self
+            .operation_deadline
+            .filter(|deadline| *deadline > Instant::now())
+            .ok_or_else(|| NetworkError::Serialization {
+                detail: "metadata prefix capture requires its existing operation deadline".into(),
+            })?;
+        let options = self.current_send_options("capture one native metadata prefix return")?;
+        let transport =
+            self.peer_transport
+                .as_ref()
+                .ok_or_else(|| NetworkError::Serialization {
+                    detail: "metadata prefix capture has no direct peer transport".into(),
+                })?;
+        let attempt = DfsMetadataPrefixProbeAttempt {
+            id: sinomo_core::Id::generate().to_string(),
+            peer: peer.clone(),
+            command: command.clone(),
+            deadline,
+        };
+        let result = transport
+            .call_metadata_prefix_probe(&attempt, options)
+            .map_err(|error| match error.delivery_state() {
+                Some(state) => NetworkError::delivery_failed(
+                    "capture direct metadata prefix return",
+                    state,
+                    error.to_string(),
+                ),
+                None => NetworkError::Io {
+                    operation: "capture direct metadata prefix return".into(),
+                    detail: error.to_string(),
+                },
+            })?;
+        if Instant::now() >= deadline {
+            return Err(NetworkError::delivery_failed(
+                "capture direct metadata prefix return",
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                "metadata prefix capture completed after its original deadline",
+            ));
+        }
+        if result.response.request_id != command.request_id
+            || result.response.shard_id != command.batch.shard_id
+            || result.response.next_after_sequence != command.batch.next_after_sequence
+        {
+            return Err(NetworkError::Serialization {
+                detail: "metadata prefix producer received response DATA for another attempt"
+                    .into(),
+            });
+        }
+        if let DfsMetadataPrefixEvidence::Native(value) = &result.evidence {
+            value.validate_attempt_binding(&attempt, &result.response)?;
+        }
+        Ok(result)
+    }
+
     fn send_metadata_journal_batches_direct_inner(
         &mut self,
         requests: &[(NodeId, DfsMetadataJournalBatchCommand)],
@@ -4902,6 +5710,10 @@ impl DfsMessageTransport for DfsNodeTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if requests.iter().any(|request| request.native_repair_custody.is_some()) {
+            return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
+        }
         if self.served_message.is_some() {
             self.send_served_calls_bounded(requests, max_inflight)
         } else {
@@ -5489,6 +6301,478 @@ mod tests {
                 DfsOutboundAttachment::from_bytes(bytes, content_hash),
             ),
         )
+    }
+
+    #[derive(Default)]
+    struct CapturingOriginalRepairPeer {
+        calls: Mutex<
+            Vec<(
+                DfsMessageCommand,
+                crate::DfsRpcAttachmentDescriptor,
+                Vec<u8>,
+            )>,
+        >,
+    }
+
+    impl CapturingOriginalRepairPeer {
+        fn capture(
+            &self,
+            target: &NodeId,
+            call: ObjectRpcCall,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&call.request)
+                .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+            assert_eq!(&head.command.routed_message.target_node_id, target);
+            let max_bytes = usize::try_from(head.attachment.total_size_bytes).unwrap();
+            let bytes = collect_dfs_attachment_source_sync(call.body, max_bytes)?;
+            assert_eq!(bytes.len(), max_bytes);
+            assert_eq!(
+                head.attachment.content_hash.as_deref(),
+                Some(crate::content_hash(&bytes).as_str())
+            );
+            let replies = match &head.command.routed_message.message {
+                DfsNetworkMessage::SelectedOriginalRepair(selected) => {
+                    assert!(
+                        selected.bytes.is_empty(),
+                        "the body is owned by the actual RPC attachment"
+                    );
+                    let command = &selected.material.original.command;
+                    vec![DfsRoutedMessage {
+                        source_node_id: target.clone(),
+                        target_node_id: head.command.routed_message.source_node_id.clone(),
+                        frame_id: head.command.routed_message.frame_id,
+                        message_id: head.command.routed_message.message_id,
+                        message: DfsNetworkMessage::RepairReplicaResponse(
+                            crate::DfsRepairReplicaResponse {
+                                request_id: command.request_id.clone(),
+                                intent_id: command.intent_id.clone(),
+                                file_system_id: command.file_system_id.clone(),
+                                object_id: command.object_id.clone(),
+                                version: command.version.clone(),
+                                replica_node_id: target.clone(),
+                                // Correlation fixture only: this peer makes no content/Terminal claim.
+                                result: DfsBlobTransferResult::Rejected {
+                                    reason: "wire capture fixture has no receiver effect".into(),
+                                },
+                            },
+                        ),
+                    }]
+                }
+                DfsNetworkMessage::StageBlob(_) => Vec::new(),
+                other => {
+                    return Err(DfsPeerTransportError::new(format!(
+                        "unexpected captured attachment {other:?}"
+                    )));
+                }
+            };
+            let route = call.request.route;
+            let request_id = head.command.request_id.clone();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((head.command, head.attachment, bytes));
+            ObjectRpcResponse::encode_body(
+                &route,
+                &DfsMessageResponse {
+                    request_id,
+                    outbound_messages: replies,
+                },
+            )
+            .map(ObjectRpcResult::value)
+            .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+        }
+    }
+
+    impl DfsPeerTransport for CapturingOriginalRepairPeer {
+        fn call_object_rpc(
+            &self,
+            target: &NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.capture(target, call)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for CapturingOriginalRepairPeer {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            target: &'a NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            Box::pin(async move { self.capture(target, call) })
+        }
+    }
+
+    fn file_backed_original_attachment(
+        root: &std::path::Path,
+    ) -> (DfsRoutedCall, crate::DfsOriginalRepairMaterial, Vec<u8>) {
+        let (queue, content, message, descriptor, payload, _identity) =
+            crate::repair_queue_store::tests::selected_original_fixture(&root.join("source"));
+        queue
+            .enroll_original_repair(&message, &descriptor, &payload)
+            .unwrap();
+        queue.record_original_repair_attempt(&message).unwrap();
+        let material = queue
+            .original_repair(&message)
+            .unwrap()
+            .unwrap()
+            .original_wire_material()
+            .unwrap();
+        let bytes = content
+            .read_object_version(
+                material.original.command.object_id.as_str(),
+                material.original.command.version.as_str(),
+            )
+            .unwrap()
+            .1;
+        // A renewed transport attempt keeps the durable original head intact.
+        let mut carrier = message;
+        carrier.frame_id = carrier.frame_id.checked_add(100).unwrap();
+        carrier.message_id = carrier.message_id.checked_add(200).unwrap();
+        queue.record_original_repair_attempt(&carrier).unwrap();
+        assert_eq!(
+            queue
+                .original_repair(&carrier)
+                .unwrap()
+                .unwrap()
+                .original_wire_material()
+                .unwrap(),
+            material
+        );
+        let (_, reader) = payload.into_parts();
+        let call = DfsRoutedCall::with_attachment(
+            carrier,
+            DfsOutboundAttachment::from_reader(
+                reader,
+                descriptor.total_size_bytes,
+                descriptor.content_hash.as_deref().unwrap(),
+            ),
+        )
+        .with_original_repair(material.clone())
+        .unwrap();
+        (call, material, bytes)
+    }
+
+    fn assert_original_attachment_capture(
+        peer: &CapturingOriginalRepairPeer,
+        carrier: &DfsRoutedMessage,
+        material: &crate::DfsOriginalRepairMaterial,
+        bytes: &[u8],
+    ) {
+        let calls = peer.calls.lock().unwrap();
+        let (head, descriptor, captured_bytes) = &calls[0];
+        assert_eq!(head.routed_message.source_node_id, carrier.source_node_id);
+        assert_eq!(head.routed_message.target_node_id, carrier.target_node_id);
+        assert_eq!(head.request_id, format!("dfs_message_{}", carrier.frame_id));
+        assert_eq!(head.routed_message.frame_id, carrier.frame_id);
+        assert_eq!(head.routed_message.message_id, carrier.message_id);
+        let DfsNetworkMessage::SelectedOriginalRepair(selected) = &head.routed_message.message
+        else {
+            panic!("actual peer must receive the selected envelope");
+        };
+        assert_eq!(selected.material, *material);
+        assert_ne!(
+            head.routed_message.frame_id,
+            selected.material.original.frame_id
+        );
+        assert_ne!(
+            head.routed_message.message_id,
+            selected.material.original.message_id
+        );
+        assert_eq!(descriptor, &material.attachment);
+        assert_eq!(captured_bytes, bytes);
+    }
+
+    fn original_repair_return_correlation_fixture(
+        root: &std::path::Path,
+    ) -> (DfsMessageCommand, DfsMessageResponse) {
+        let (call, material, _) = file_backed_original_attachment(root);
+        let expected = DfsMessageCommand {
+            request_id: format!("dfs_message_{}", call.message.frame_id),
+            routed_message: call.message.clone(),
+        };
+        let command = &material.original.command;
+        let returned = DfsRoutedMessage {
+            source_node_id: call.message.target_node_id.clone(),
+            target_node_id: call.message.source_node_id.clone(),
+            frame_id: call.message.frame_id + 1000,
+            message_id: call.message.message_id + 2000,
+            message: DfsNetworkMessage::RepairReplicaResponse(crate::DfsRepairReplicaResponse {
+                request_id: command.request_id.clone(),
+                intent_id: command.intent_id.clone(),
+                file_system_id: command.file_system_id.clone(),
+                object_id: command.object_id.clone(),
+                version: command.version.clone(),
+                replica_node_id: call.message.target_node_id.clone(),
+                // Synthetic input exercises correlation only. It never enters
+                // the private native completion constructor.
+                result: DfsBlobTransferResult::Rejected {
+                    reason: "correlation DATA only".into(),
+                },
+            }),
+        };
+        let response = DfsMessageResponse {
+            request_id: expected.request_id.clone(),
+            outbound_messages: vec![returned],
+        };
+        (expected, response)
+    }
+
+    #[test]
+    fn owned_original_repair_return_correlation_preserves_remote_carrier_ids() {
+        let root = sinomo_testdir::TestDir::new("owned-repair-return-correlation");
+        let (expected, response) = original_repair_return_correlation_fixture(root.path());
+        let returned =
+            validate_original_repair_owned_rpc_return(&expected, response.clone()).unwrap();
+        assert_eq!(returned, response.outbound_messages[0]);
+        assert_ne!(returned.frame_id, expected.routed_message.frame_id);
+        assert_ne!(returned.message_id, expected.routed_message.message_id);
+        let DfsNetworkMessage::RepairReplica(command) = &expected.routed_message.message else {
+            panic!("original Repair");
+        };
+        for result in [
+            DfsBlobTransferResult::Durable {
+                content_hash: command.content_hash.clone(),
+            },
+            DfsBlobTransferResult::Committed {
+                content_hash: command.content_hash.clone(),
+            },
+        ] {
+            let mut candidate = response.clone();
+            let DfsNetworkMessage::RepairReplicaResponse(reply) =
+                &mut candidate.outbound_messages[0].message
+            else {
+                unreachable!()
+            };
+            reply.result = result;
+            assert_eq!(
+                validate_original_repair_owned_rpc_return(&expected, candidate.clone()).unwrap(),
+                candidate.outbound_messages[0]
+            );
+        }
+    }
+
+    #[test]
+    fn owned_original_repair_return_correlation_rejects_unmatched_scope_and_count() {
+        let root = sinomo_testdir::TestDir::new("owned-repair-return-rejection");
+        let (expected, response) = original_repair_return_correlation_fixture(root.path());
+        let mut invalid = Vec::new();
+        let mut changed = response.clone();
+        changed.request_id.push_str("-other");
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages.clear();
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed
+            .outbound_messages
+            .push(response.outbound_messages[0].clone());
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages[0].message = expected.routed_message.message.clone();
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages[0].source_node_id =
+            expected.routed_message.source_node_id.clone();
+        invalid.push(changed);
+        let mut changed = response.clone();
+        changed.outbound_messages[0].target_node_id =
+            expected.routed_message.target_node_id.clone();
+        invalid.push(changed);
+        for field in 0..7 {
+            let mut changed = response.clone();
+            let DfsNetworkMessage::RepairReplicaResponse(reply) =
+                &mut changed.outbound_messages[0].message
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => reply.request_id.push_str("-other"),
+                1 => reply.intent_id.push_str("-other"),
+                2 => reply.file_system_id = crate::DfsFileSystemId::generate(),
+                3 => reply.object_id = crate::DfsObjectId::generate(),
+                4 => reply.version = crate::DfsVersion::generate(),
+                5 => reply.replica_node_id = expected.routed_message.source_node_id.clone(),
+                _ => {
+                    reply.result = DfsBlobTransferResult::Committed {
+                        content_hash: "wrong-hash".into(),
+                    }
+                }
+            }
+            invalid.push(changed);
+        }
+        for candidate in invalid {
+            assert!(validate_original_repair_owned_rpc_return(&expected, candidate).is_err());
+        }
+        let mut foreground = expected.clone();
+        let DfsNetworkMessage::RepairReplica(command) = &mut foreground.routed_message.message
+        else {
+            unreachable!()
+        };
+        command.background_repair = false;
+        assert!(validate_original_repair_owned_rpc_return(&foreground, response).is_err());
+    }
+
+    #[test]
+    fn native_sync_attachment_sender_preserves_selected_original_and_ordinary_correlation() {
+        let root = sinomo_testdir::TestDir::new("selected-original-sync-peer");
+        let (call, material, bytes) = file_backed_original_attachment(root.path());
+        let original = call.message.clone();
+        let peer = Arc::new(CapturingOriginalRepairPeer::default());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            Duration::from_secs(1),
+            sync_peer,
+            async_peer,
+        );
+        transport
+            .send_routed_call(&original.target_node_id, call)
+            .unwrap();
+        assert_original_attachment_capture(&peer, &original, &material, &bytes);
+        let returned = transport.drain_incoming_messages().unwrap();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].frame_id, original.frame_id);
+        assert_eq!(returned[0].message_id, original.message_id);
+        assert!(all_background_replica_response_identity_matches(
+            &original.source_node_id,
+            &original,
+            &returned[0]
+        ));
+        transport
+            .send_routed_call(
+                &original.target_node_id,
+                test_stage_attachment_send(
+                    &original.source_node_id,
+                    &original.target_node_id,
+                    20,
+                    "ordinary-sync",
+                )
+                .call,
+            )
+            .unwrap();
+        assert!(matches!(
+            &peer.calls.lock().unwrap()[1].0.routed_message.message,
+            DfsNetworkMessage::StageBlob(_)
+        ));
+        // A message-only sender may not silently downgrade the selected call.
+        let sent = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&sent);
+        let sender: DfsMessageSender = Arc::new(move |_, command, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut unsupported = DfsNodeTransport::new_with_message_sender_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            sender,
+            None,
+            Duration::from_secs(1),
+        );
+        let more = sinomo_testdir::TestDir::new("selected-original-unsupported-sync");
+        let (call, _, _) = file_backed_original_attachment(more.path());
+        assert!(
+            unsupported
+                .send_routed_call(&original.target_node_id, call)
+                .is_err()
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        let missing = sinomo_testdir::TestDir::new("selected-original-missing-attachment-sync");
+        let (mut call, _, _) = file_backed_original_attachment(missing.path());
+        call.attachment = None;
+        assert!(
+            matches!(transport.send_routed_call(&original.target_node_id, call),
+            Err(NetworkError::Serialization { detail }) if detail == "selected Repair call lost its owned attachment")
+        );
+        assert_eq!(peer.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_async_attachment_sender_preserves_selected_original_and_ordinary_correlation() {
+        let root = sinomo_testdir::TestDir::new("selected-original-async-peer");
+        let (call, material, bytes) = file_backed_original_attachment(root.path());
+        let original = call.message.clone();
+        let peer = Arc::new(CapturingOriginalRepairPeer::default());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::with_peer_transports_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            Duration::from_secs(1),
+            sync_peer,
+            async_peer,
+        );
+        transport
+            .send_routed_call_async(&original.target_node_id, call)
+            .await
+            .unwrap();
+        assert_original_attachment_capture(&peer, &original, &material, &bytes);
+        let returned = transport.drain_incoming_messages().unwrap();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0].frame_id, original.frame_id);
+        assert_eq!(returned[0].message_id, original.message_id);
+        assert!(all_background_replica_response_identity_matches(
+            &original.source_node_id,
+            &original,
+            &returned[0]
+        ));
+        transport
+            .send_routed_call_async(
+                &original.target_node_id,
+                test_stage_attachment_send(
+                    &original.source_node_id,
+                    &original.target_node_id,
+                    20,
+                    "ordinary-async",
+                )
+                .call,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            &peer.calls.lock().unwrap()[1].0.routed_message.message,
+            DfsNetworkMessage::StageBlob(_)
+        ));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&sent);
+        let sender: DfsMessageSender = Arc::new(move |_, command, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            })
+        });
+        let mut unsupported = DfsNodeTransport::new_with_message_sender_for_nodes(
+            original.source_node_id.clone(),
+            [original.target_node_id.clone()],
+            sender,
+            None,
+            Duration::from_secs(1),
+        );
+        let more = sinomo_testdir::TestDir::new("selected-original-unsupported-async");
+        let (call, _, _) = file_backed_original_attachment(more.path());
+        assert!(
+            unsupported
+                .send_routed_call_async(&original.target_node_id, call)
+                .await
+                .is_err()
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        let missing = sinomo_testdir::TestDir::new("selected-original-missing-attachment-async");
+        let (mut call, _, _) = file_backed_original_attachment(missing.path());
+        call.attachment = None;
+        assert!(
+            matches!(transport.send_routed_call_async(&original.target_node_id, call).await,
+            Err(NetworkError::Serialization { detail }) if detail == "selected Repair call lost its owned attachment")
+        );
+        assert_eq!(peer.calls.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -7361,6 +8645,7 @@ impl DfsNodeTransport {
         let DfsRoutedCall {
             message,
             attachment,
+            original_repair,
         } = call;
         if &message.target_node_id != target_node_id {
             return Err(NetworkError::FrameTargetMismatch {
@@ -7391,6 +8676,7 @@ impl DfsNodeTransport {
             let message = crate::materialize_dfs_routed_call_sync(DfsRoutedCall {
                 message,
                 attachment,
+                original_repair,
             })?;
             self.served_mut().inbound_messages.push_back(message);
             return Ok(());
@@ -7407,6 +8693,7 @@ impl DfsNodeTransport {
             DfsRoutedCall {
                 message,
                 attachment,
+                original_repair,
             },
             true,
             #[cfg(any(test, feature = "test-support"))]
@@ -7425,6 +8712,7 @@ impl DfsNodeTransport {
             let DfsRoutedCall {
                 message,
                 attachment,
+                original_repair,
             } = call;
             if &message.target_node_id != target_node_id {
                 return Err(NetworkError::FrameTargetMismatch {
@@ -7456,6 +8744,7 @@ impl DfsNodeTransport {
                     crate::message_transport::materialize_dfs_routed_call(DfsRoutedCall {
                         message,
                         attachment,
+                        original_repair,
                     })
                     .await?;
                 self.served_mut().inbound_messages.push_back(message);
@@ -7471,6 +8760,7 @@ impl DfsNodeTransport {
                 DfsRoutedCall {
                     message,
                     attachment,
+                    original_repair,
                 },
                 true,
                 #[cfg(any(test, feature = "test-support"))]
@@ -7890,6 +9180,33 @@ fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) 
 }
 
 impl NetworkedDfsService<DfsNodeTransport> {
+    /// Purpose-specific read processing, with no generic inbox/flush/followup
+    /// calls. The actual native host supplies this one-call capability.
+    pub(crate) fn process_verified_original_history_report(
+        &mut self, command: DfsMessageCommand,
+        verified: crate::publication_guard::VerifiedOriginalRepairHistoryRead,
+    ) -> DfsMessageProcessReport {
+        let outcome = (|| {
+            let DfsNetworkMessage::OriginalRepairHistoryRequest(request) = &command.routed_message.message else {
+                return Err(DfsError::Metadata { message: "history read proof used for another family".into() });
+            };
+            if command.routed_message != request.routed() || request.carrier.target != self.node_id {
+                return Err(DfsError::Metadata { message: "history request carrier is not the local verified invocation".into() });
+            }
+            verified.revalidate(request)?;
+            let result = self.content.certified_original_repair_terminal(request, &verified)?;
+            verified.revalidate(request)?;
+            let response = crate::DfsOriginalRepairHistoryResponse { version: 1, query_ref: request.query_ref.clone(),
+                import_ref: request.import_ref.clone(), original_command_digest: request.original_material.command_digest.clone(),
+                query_carrier: request.carrier.clone(), result };
+            response.validate_for_request(request)?;
+            let routed = self.next_dfs_routed_message(&request.carrier.source, DfsNetworkMessage::OriginalRepairHistoryResponse(response));
+            Ok(DfsMessageProcessResult { response: DfsMessageResponse { request_id: command.request_id, outbound_messages: vec![routed] },
+                attachment: None, events: Vec::new() })
+        })();
+        DfsMessageProcessReport { outcome, committed_work: Default::default(), committed_repair_records: Vec::new() }
+    }
+
     pub(crate) fn set_background_replica_dispatch(&mut self, enabled: bool) {
         let Some(served) = self.transport.served_message.as_deref_mut() else {
             return;

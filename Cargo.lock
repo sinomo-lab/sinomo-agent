@@ -10021,6 +10021,7 @@ dependencies = [
  "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
+ "sinomo-daemon",
  "sinomo-device",
  "sinomo-module",
  "sinomo-testdir",

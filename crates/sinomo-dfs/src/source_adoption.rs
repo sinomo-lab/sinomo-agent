@@ -1775,6 +1775,7 @@ impl RemoteTargetNamespacePhase {
         let (envelope, call) = crate::dfs_routed_call_rpc_call(crate::DfsRoutedCall {
             message,
             attachment: None,
+            original_repair: None,
         })
         .map_err(crate::DfsError::from_network)?;
         #[cfg(any(test, feature = "test-support"))]

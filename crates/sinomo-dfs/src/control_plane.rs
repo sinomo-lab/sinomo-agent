@@ -32,6 +32,15 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+#[cfg(test)]
+mod recovery_ballot;
+#[cfg(test)]
+pub(crate) use recovery_ballot::{
+    DfsMetadataShardRecoveryBallot, DfsMetadataShardRecoveryBallotRequest,
+    DfsRecoveryBallotBegin, DfsRecoveryBallotFloorView, DfsRecoveryBallotRefusal,
+    DfsRecoveryBallotVerify, metadata_shard_recovery_ballot_key,
+};
+
 const DFS_KV_PREFIX: &str = "/dfs";
 const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
 const METADATA_OPERATION_FLOOR_PUBLISH_RETRIES: usize = 4;
@@ -12443,6 +12452,7 @@ mod tests {
         ));
     }
     mod placement_update_retry;
+    mod recovery_ballot_reservation;
 }
 
 impl DfsMetadataOperationPermit {

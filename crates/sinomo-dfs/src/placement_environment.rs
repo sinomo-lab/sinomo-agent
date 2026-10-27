@@ -17,6 +17,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use time::OffsetDateTime;
 
+#[cfg(test)]
+mod fresh_admission_tests;
+
 pub use sinomo_api::dfs::placement_environment::DFS_PLACEMENT_SNAPSHOT_SCHEMA_VERSION;
 pub const DFS_NODE_HEALTH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// A bounded safety audit for capacity changes made outside Sinomo. Normal
@@ -778,6 +781,260 @@ pub(crate) fn plan_replicas_with_placement_snapshot(
         OffsetDateTime::now_utc(),
     )
     .map(|selected| selected.plan)
+}
+
+/// A fresh background write's desired placement and separate current transfer
+/// observations. No field is a receipt, holder or effect-authority capability.
+#[derive(Debug)]
+pub(crate) struct DfsFreshContentAdmissionPlan {
+    pub(crate) placement: DfsReplicaPlacementPlan,
+    pub(crate) attemptable_node_ids: Vec<NodeId>,
+    pub(crate) observed_ready_node_ids: Vec<NodeId>,
+    pub(crate) deferred_desired_node_ids: Vec<NodeId>,
+    pub(crate) configuration_revision: sinomo_core::kv::KvRevision,
+}
+
+/// Pure selector for a caller which has already proved a genuine fresh,
+/// background ReplicatedEventual creation. Other callers retain the strict
+/// selector above. Candidate hints/current locations cannot enlarge inventory.
+pub(crate) fn plan_fresh_eventual_replicas_with_admitted_targets(
+    request: &DfsReplicaPlacementRequest,
+    inventory: &crate::write_configuration_inputs::DfsAdmittedContentTargets,
+    snapshot: Option<&DfsPlacementSnapshot>,
+    current_replica_node_ids: &[NodeId],
+    pinned_replica_node_ids: &[NodeId],
+) -> Result<DfsFreshContentAdmissionPlan, DfsDistributedError> {
+    request.policy.validate()?;
+    if request.policy.min_commit_replicas >= request.policy.desired_replicas {
+        return Err(DfsDistributedError::InvalidReplicaSet {
+            reason: "fresh deferred placement requires eventual W<N".into(),
+        });
+    }
+    for target in &inventory.targets {
+        if target.advertisement.zone.as_ref()
+            != request.policy.node_zones.get(&target.advertisement.node_id)
+        {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: "fresh placement zone evidence differs from its persisted policy".into(),
+            });
+        }
+    }
+    let now = OffsetDateTime::now_utc();
+    let observations = inventory
+        .targets
+        .iter()
+        .map(|target| DfsPlacementNodeObservation::from_advertisement(&target.advertisement))
+        .collect::<Vec<_>>();
+    let mut canonical = request.clone();
+    canonical.candidates = inventory
+        .targets
+        .iter()
+        .map(|target| {
+            let advertisement = &target.advertisement;
+            DfsReplicaCandidate::weighted(
+                advertisement.node_id.clone(),
+                advertisement.capacity_weight.max(1),
+            )
+            .map(|candidate| candidate.with_zone(advertisement.zone.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::distributed::validate_candidate_set(&canonical.candidates, &canonical.policy)?;
+    let current = current_replica_node_ids.iter().collect::<BTreeSet<_>>();
+    let pinned = pinned_replica_node_ids.iter().collect::<BTreeSet<_>>();
+    let provider_readiness = inventory
+        .targets
+        .iter()
+        .map(|target| {
+            (
+                &target.advertisement.node_id,
+                target.provider_observed_ready,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let attemptable = |candidate: CandidateEvidence<'_>| {
+        let provider_ready = provider_readiness
+            .get(&candidate.candidate.node_id)
+            .copied()
+            .unwrap_or(false);
+        // Unknown is not a failed node route. The network layer still gets to
+        // realize a duplex/relayed path; actual receipt validation owns W.
+        let path_not_known_failed = candidate.path.is_none_or(|path| {
+            path.freshness_at(now) != DfsObservationFreshness::Fresh
+                || path.state != DfsPlacementPathState::Unreachable
+        });
+        // Stale storage observations remain unknown. Admission comes from the
+        // current inventory; this observation never substitutes for a receipt.
+        provider_ready && path_not_known_failed
+    };
+    let observed_ready = |candidate: CandidateEvidence<'_>| {
+        attemptable(candidate)
+            && candidate.node.is_some_and(|node| {
+                node.freshness_at(now) == DfsObservationFreshness::Fresh
+                    && matches!(
+                        node.storage_health,
+                        DfsHealthState::Healthy | DfsHealthState::Degraded
+                    )
+            })
+            && (candidate.candidate.node_id == canonical.coordinator_node_id
+                || candidate.path.is_some_and(|path| {
+                    path.freshness_at(now) == DfsObservationFreshness::Fresh
+                        && matches!(
+                            path.state,
+                            DfsPlacementPathState::Healthy | DfsPlacementPathState::Degraded
+                        )
+                }))
+    };
+    let mut eligible = canonical
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            !canonical
+                .policy
+                .forbidden_node_ids
+                .contains(&candidate.node_id)
+        })
+        .map(|(index, candidate)| CandidateEvidence {
+            candidate,
+            node: observations.get(index),
+            path: snapshot
+                .and_then(|snapshot| placement_candidate_path(&canonical, snapshot, candidate)),
+            current: current.contains(&candidate.node_id),
+            pinned: pinned.contains(&candidate.node_id),
+        })
+        .filter(|candidate| {
+            // Current storage refusal remains hard. A failed optional path can
+            // defer delivery while preserving an otherwise admitted desired node.
+            candidate.node.is_some_and(|node| node.accepts_new_content)
+                && candidate_is_eligible(
+                    CandidateEvidence {
+                        path: None,
+                        ..*candidate
+                    },
+                    now,
+                )
+        })
+        .collect::<Vec<_>>();
+    eligible.sort_by(|left, right| {
+        attemptable(*right)
+            .cmp(&attemptable(*left))
+            .then_with(|| compare_candidate_evidence(&canonical, *left, *right, now))
+    });
+    for required in canonical
+        .policy
+        .required_node_ids
+        .iter()
+        .chain(pinned_replica_node_ids)
+    {
+        if !eligible
+            .iter()
+            .any(|candidate| &candidate.candidate.node_id == required && attemptable(*candidate))
+        {
+            return Err(DfsDistributedError::InvalidReplicaSet {
+                reason: format!(
+                    "required or pinned node {required} is currently unavailable in admitted fresh placement"
+                ),
+            });
+        }
+    }
+    let mut selected = eligible
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            canonical
+                .policy
+                .required_node_ids
+                .contains(&candidate.candidate.node_id)
+                || candidate.pinned
+        })
+        .collect::<Vec<_>>();
+    if selected.len() > canonical.policy.desired_replicas {
+        return Err(DfsDistributedError::InvalidReplicaSet {
+            reason: "required and pinned node count exceeds desired replicas".into(),
+        });
+    }
+    while selected.len() < canonical.policy.desired_replicas {
+        let zones = selected
+            .iter()
+            .filter_map(|candidate| candidate_zone(&canonical, candidate.candidate))
+            .collect::<BTreeSet<_>>();
+        let need_zone = zones.len() < canonical.policy.min_distinct_zones;
+        let available = |candidate: &&CandidateEvidence<'_>| {
+            !selected
+                .iter()
+                .any(|chosen| chosen.candidate.node_id == candidate.candidate.node_id)
+        };
+        let next = eligible
+            .iter()
+            .filter(available)
+            .find(|candidate| {
+                !need_zone
+                    || candidate_zone(&canonical, candidate.candidate)
+                        .is_some_and(|zone| !zones.contains(zone))
+            })
+            .or_else(|| eligible.iter().find(available));
+        let Some(next) = next else {
+            break;
+        };
+        selected.push(*next);
+    }
+    // Preserve the selected hard-constraint set while placing actual preferred
+    // W attempts before optional deferred targets for the existing stage budget.
+    selected.sort_by(|left, right| {
+        attemptable(*right)
+            .cmp(&attemptable(*left))
+            .then_with(|| {
+                let required = |candidate: &CandidateEvidence<'_>| {
+                    candidate.pinned
+                        || canonical
+                            .policy
+                            .required_node_ids
+                            .contains(&candidate.candidate.node_id)
+                };
+                required(right).cmp(&required(left))
+            })
+            .then_with(|| compare_candidate_evidence(&canonical, *left, *right, now))
+    });
+    let desired_replica_nodes = selected
+        .iter()
+        .map(|candidate| candidate.candidate.node_id.clone())
+        .collect::<Vec<_>>();
+    crate::validate_replication_plan(&desired_replica_nodes, &canonical.policy)?;
+    let attemptable_node_ids = selected
+        .iter()
+        .filter(|candidate| attemptable(**candidate))
+        .map(|candidate| candidate.candidate.node_id.clone())
+        .collect::<Vec<_>>();
+    if attemptable_node_ids.len() < canonical.policy.min_commit_replicas {
+        return Err(DfsDistributedError::InvalidReplicaSet {
+            reason: "admitted fresh placement has fewer attemptable targets than W".into(),
+        });
+    }
+    let deferred_desired_node_ids = selected
+        .iter()
+        .filter(|candidate| !attemptable(**candidate))
+        .map(|candidate| candidate.candidate.node_id.clone())
+        .collect();
+    let observed_ready_node_ids = selected
+        .iter()
+        .filter(|candidate| observed_ready(**candidate))
+        .map(|candidate| candidate.candidate.node_id.clone())
+        .collect();
+    let preferred_commit_nodes = attemptable_node_ids
+        .iter()
+        .take(canonical.policy.min_commit_replicas)
+        .cloned()
+        .collect();
+    Ok(DfsFreshContentAdmissionPlan {
+        placement: DfsReplicaPlacementPlan {
+            desired_replica_nodes,
+            preferred_commit_nodes,
+        },
+        attemptable_node_ids,
+        observed_ready_node_ids,
+        deferred_desired_node_ids,
+        configuration_revision: inventory.configuration_revision,
+    })
 }
 
 fn select_snapshot_replicas<'a>(

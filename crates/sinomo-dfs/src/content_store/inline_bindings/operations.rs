@@ -48,6 +48,98 @@ pub(in crate::content_store) fn open_verified_inline_payload(
 }
 
 impl LocalContentStore {
+    pub(in crate::content_store) fn inline_owned_repair_payload(
+        &self,
+        subject: &RepairPayloadSubject,
+        sentinel: &ContentStoreReservationBatchSentinel,
+    ) -> Result<Option<InlineRepairPayloadState>> {
+        self.validate_repair_payload_owner(sentinel)?;
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        // Readability of an uncertain tail is not acknowledged root durability.
+        ensure_writer(
+            &self.inline_store.owner.root,
+            &sentinel.store_incarnation,
+            &mut state,
+        )?;
+        Ok(state.view.repair_payloads.get(subject).cloned())
+    }
+
+    pub(in crate::content_store) fn inline_owned_repair_for_slot(
+        &self,
+        producer: &str,
+        target: &str,
+        intent: &str,
+        sentinel: &ContentStoreReservationBatchSentinel,
+    ) -> Result<Option<RepairPayloadRoot>> {
+        self.validate_repair_payload_owner(sentinel)?;
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        ensure_writer(
+            &self.inline_store.owner.root,
+            &sentinel.store_incarnation,
+            &mut state,
+        )?;
+        let key = (producer.to_owned(), target.to_owned(), intent.to_owned());
+        Ok(state
+            .view
+            .repair_slots
+            .get(&key)
+            .and_then(|subject| state.view.repair_payloads.get(subject))
+            .map(|entry| entry.root.clone()))
+    }
+
+    pub(in crate::content_store) fn inline_retain_repair_payload_unlocked(
+        &self,
+        root: &RepairPayloadRoot,
+        sentinel: &ContentStoreReservationBatchSentinel,
+    ) -> Result<()> {
+        self.validate_repair_payload_owner(sentinel)?;
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        append_operation(
+            &self.inline_store.owner.root,
+            sentinel,
+            &mut state,
+            InlineOperation::RetainRepairPayload(root.clone()),
+            &[],
+        )?;
+        Ok(())
+    }
+
+    pub(in crate::content_store) fn inline_release_repair_payload_unlocked(
+        &self,
+        root: &RepairPayloadRoot,
+        sentinel: &ContentStoreReservationBatchSentinel,
+    ) -> Result<()> {
+        let mut state = self
+            .inline_store
+            .owner
+            .state
+            .lock()
+            .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+        append_operation(
+            &self.inline_store.owner.root,
+            sentinel,
+            &mut state,
+            InlineOperation::ReleaseRepairPayload(root.clone()),
+            &[],
+        )?;
+        Ok(())
+    }
+
     pub(in crate::content_store) fn inline_sentinel_unlocked(
         &self,
     ) -> Result<Option<ContentStoreReservationBatchSentinel>> {
@@ -76,8 +168,11 @@ impl LocalContentStore {
             Err(source) => return Err(ContentStoreError::Io { path, source }),
         };
         let sentinel = decode_content_reservation_batch_sentinel(&bytes)?;
-        validate_content_reservation_batch_sentinel(&sentinel)?;
-        Ok((sentinel.content_binding_layout == INLINE_BINDING_LAYOUT).then_some(sentinel))
+        self.validate_owner_sentinel(&sentinel)?;
+        Ok(
+            (sentinel.content_binding_layout == self.inline_store.expected_layout())
+                .then_some(sentinel),
+        )
     }
 
     pub(in crate::content_store) fn inline_binding_view(
@@ -399,10 +494,35 @@ impl LocalContentStore {
         version: &str,
         bytes: &[u8],
     ) -> Result<Option<ContentManifest>> {
+        self.try_write_inline_binding_with_prepared(object_id, version, bytes, None)
+    }
+
+    pub(in crate::content_store) fn try_write_inline_binding_with_prepared(
+        &self,
+        object_id: &str,
+        version: &str,
+        bytes: &[u8],
+        prepared: Option<&PreparedReceivedRepairRef>,
+    ) -> Result<Option<ContentManifest>> {
+        self.try_write_inline_binding_with_phase(object_id, version, bytes, prepared.map(RepairBindingPrepared::Decoded))
+    }
+
+    pub(super) fn try_write_inline_binding_for_original(&self, prepared: &original_repair::PreparedOriginalRepairRef, bytes: &[u8]) -> Result<Option<ContentManifest>> {
+        let (object, version) = prepared.exact_version();
+        self.try_write_inline_binding_with_phase(object, version, bytes, Some(RepairBindingPrepared::Original(prepared)))
+    }
+
+    fn try_write_inline_binding_with_phase(&self, object_id: &str, version: &str, bytes: &[u8], prepared: Option<RepairBindingPrepared<'_>>) -> Result<Option<ContentManifest>> {
         if bytes.len() as u64 > INLINE_BLOB_SMALL_LIMIT_BYTES {
             return Ok(None);
         }
         let _owner = self.content_mutation_guard()?;
+        if let Some(reference) = prepared {
+            match reference {
+                RepairBindingPrepared::Decoded(reference) => self.check_received_repair_reference(reference, bytes)?,
+                RepairBindingPrepared::Original(reference) => self.check_original_repair_reference(reference, bytes)?,
+            }
+        }
         let Some(_) = self.inline_sentinel_unlocked()? else {
             return Ok(None);
         };
@@ -504,12 +624,45 @@ impl LocalContentStore {
                 .state
                 .lock()
                 .map_err(|_| inline_error("resident binding mutex poisoned"))?;
+            let operation = if let Some(reference) = prepared {
+                ensure_writer(
+                    &self.inline_store.owner.root,
+                    &reservation_guard.sentinel.store_incarnation,
+                    &mut state,
+                )?;
+                let sequence = state
+                    .view
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| inline_error("bound Repair identity exhausted"))?;
+                let reservation = match operation {
+                        InlineOperation::Bind { reservation, .. }
+                        | InlineOperation::Link { reservation, .. } => reservation,
+                        _ => unreachable!("ordinary inline binding shape"),
+                    };
+                match reference {
+                    RepairBindingPrepared::Decoded(reference) => InlineOperation::ReceivedRepairBound {
+                        binding: received_repair::binding_for_reference(reference, manifest.clone(), sequence),
+                        published_at_unix_nanos: published_at, reservation,
+                    },
+                    RepairBindingPrepared::Original(reference) => InlineOperation::OriginalRepairBound {
+                        binding: original_repair::binding_for_reference(reference, manifest.clone(), sequence),
+                        published_at_unix_nanos: published_at, reservation,
+                    },
+                }
+            } else {
+                operation
+            };
             append_operation(
                 &self.inline_store.owner.root,
                 &reservation_guard.sentinel,
                 &mut state,
                 operation,
-                if reuse_payload { &[] } else { bytes },
+                if reuse_payload || prepared.is_some() {
+                    &[]
+                } else {
+                    bytes
+                },
             )?;
         }
         self.quota_stats_initialized.store(false, Ordering::Release);
@@ -526,7 +679,8 @@ impl LocalContentStore {
         record: &ContentStoreReservationRecord,
         sentinel: &ContentStoreReservationBatchSentinel,
     ) -> Result<bool> {
-        if sentinel.content_binding_layout != INLINE_BINDING_LAYOUT {
+        self.validate_owner_sentinel(sentinel)?;
+        if sentinel.content_binding_layout != self.inline_store.expected_layout() {
             return Ok(false);
         }
         let mut state = self

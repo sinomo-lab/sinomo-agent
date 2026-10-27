@@ -50,6 +50,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+sinomo-daemon = { path = "../sinomo-daemon" }
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }
 sinomo-testdir.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
@@ -77,4 +78,8 @@ required-features = ["test-support"]
 
 [[test]]
 name = "posix_regressions"
+required-features = ["test-support"]
+
+[[test]]
+name = "degraded_content_placement"
 required-features = ["test-support"]

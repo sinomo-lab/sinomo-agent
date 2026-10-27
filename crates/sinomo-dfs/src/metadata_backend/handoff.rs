@@ -3,6 +3,99 @@
 use super::*;
 
 impl LocalSobjMetadataBackend {
+    pub(super) fn selected_local_recovery_fence_present(&self) -> Result<bool> {
+        crate::metadata_api::selected_local_recovery_fence_present(
+            &self.membership_handoff_write_freeze_path(),
+            self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+        )
+    }
+
+    pub(super) fn require_no_selected_local_recovery_fence(&self) -> Result<()> {
+        crate::metadata_api::require_no_selected_local_recovery_fence(
+            &self.membership_handoff_write_freeze_path(),
+            self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_local_recovery_fence(
+        &mut self,
+        reservation: &crate::control_plane::DfsMetadataShardRecoveryBallotRequest,
+        context: &crate::metadata_api::DfsSelectedLocalRecoveryContext,
+    ) -> Result<crate::metadata_api::DfsSelectedLocalRecoveryFenceData> {
+        use crate::metadata_api::{DfsLocalRecoveryInventoryKind, DfsSelectedLocalRecoveryFence, SELECTED_LOCAL_RECOVERY_PREPARE_LIMIT};
+        let invalid = |message: &str| MetadataBackendError::Rejected { code: crate::DfsMetadataRejectionCode::Other, message: message.into() };
+        let canonical = crate::control_plane::DfsMetadataShardRecoveryBallotRequest::prepare(
+            &reservation.serving_shard, &reservation.ballot.candidate_node_id, reservation.expected_attempt_floor,
+        ).map_err(|reason| invalid(&format!("invalid selected recovery reservation: {reason:?}")))?;
+        if &canonical != reservation || reservation.serving_shard.shard_id != self.shard_id.0 {
+            return Err(invalid("selected recovery reservation differs from this shard"));
+        }
+        let (filesystem, layout) = self.selected_original_data_layout.as_ref()
+            .ok_or_else(|| invalid("default metadata handle cannot install a selected recovery fence"))?;
+        if filesystem != &reservation.serving_shard.file_system_id || !Arc::ptr_eq(layout, context.layout()) {
+            return Err(invalid("selected recovery context belongs to another physical layout"));
+        }
+        let layout = Arc::clone(layout);
+        let physical = context.physical_identity(filesystem, &self.shard_id, &self.root)?;
+        if context.local_node_id() != &reservation.serving_shard.primary_node_id
+            && !reservation.serving_shard.replica_node_ids.contains(context.local_node_id())
+        { return Err(invalid("selected recovery acceptor is not an assigned member")); }
+        // Do not enter an ordinary handoff reader while holding this lock:
+        // recovery markers deliberately make that reader reject.
+        let _lock = self.metadata_write_lock()?;
+        let path = self.membership_handoff_write_freeze_path();
+        let previous = crate::metadata_api::read_selected_local_recovery_fence(&path, &layout)?;
+        if previous.is_none() && path.exists() {
+            return Err(invalid("selected recovery refuses every cooperative handoff marker, including activated"));
+        }
+        if let Some(previous) = &previous {
+            let old = &previous.fence;
+            if old.physical != physical || &old.acceptor_node_id != context.local_node_id() {
+                return Err(invalid("selected recovery marker has a foreign physical acceptor"));
+            }
+            if old.reservation != *reservation
+                && (reservation.ballot.attempt <= old.reservation.ballot.attempt
+                    || reservation.ballot.epoch < old.reservation.ballot.epoch
+                    || reservation.serving_shard.epoch < old.reservation.serving_shard.epoch)
+            { return Err(invalid("selected recovery request conflicts with or regresses the retained ballot")); }
+        }
+        self.refresh_after_metadata_write_lock()?;
+        let prefix = self.prefix_proof.clone().ok_or_else(|| invalid("selected recovery has no exact materialized prefix"))?;
+        if !prefix.is_well_formed() || prefix.journal_sequence != self.journal_last_sequence()
+            || prefix.journal_sequence != self.materialized_through_sequence
+        { return Err(invalid("selected recovery cut is not the complete certified local prefix")); }
+        let mut unresolved_prepares = Vec::new();
+        for record in self.tables.prepared_operations_v7.values().filter(|record| record.status == DfsPreparedOperationStatus::Prepared) {
+            if unresolved_prepares.len() == SELECTED_LOCAL_RECOVERY_PREPARE_LIMIT {
+                return Err(invalid("selected recovery unresolved prepare inventory exceeds its bound"));
+            }
+            record.validate()?;
+            if record.file_system_id != reservation.serving_shard.file_system_id || record.shard_id != self.shard_id {
+                return Err(invalid("selected recovery inventory contains a foreign prepared operation"));
+            }
+            unresolved_prepares.push(record.digest.clone());
+        }
+        if let Some(previous) = &previous {
+            // No accepted/head-changing API exists in this first slice. Even
+            // a higher reservation must preserve the immutable fenced cut.
+            if previous.fence.prefix != prefix || previous.fence.unresolved_prepares != unresolved_prepares {
+                return Err(invalid("selected recovery canonical cut changed while fenced"));
+            }
+        }
+        let fence = DfsSelectedLocalRecoveryFence {
+            reservation: reservation.clone(), acceptor_node_id: context.local_node_id().clone(), physical,
+            prefix, unresolved_prepares, inventory_kind: DfsLocalRecoveryInventoryKind::LegacyPrimaryAuthoredV7,
+        };
+        fence.validate()?;
+        // A visible but uncertified publication stays fail-closed. Do not
+        // restore an instance binding when a later namespace/post-check fails.
+        self.instance_authority_epoch = None;
+        let data = crate::metadata_api::write_selected_local_recovery_fence(&path, &fence, &layout)?;
+        context.check()?;
+        Ok(data)
+    }
+
     pub(super) fn membership_handoff_write_freeze_path(&self) -> PathBuf {
         self.root
             .join("journal")
@@ -12,7 +105,10 @@ impl LocalSobjMetadataBackend {
     pub(super) fn membership_handoff_write_freeze(
         &self,
     ) -> Result<Option<DfsMetadataShardWriteFreeze>> {
-        read_sobj_optional(&self.membership_handoff_write_freeze_path())
+        crate::metadata_api::read_handoff_freeze_with_layout(
+            &self.membership_handoff_write_freeze_path(),
+            self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+        )
     }
 
     pub(super) fn freeze_for_membership_handoff(
@@ -86,7 +182,10 @@ impl LocalSobjMetadataBackend {
                 .filter(|freeze| freeze.handoff_id == handoff_id)
                 .and_then(|freeze| freeze.repair_custody.clone()),
         };
-        write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
+        crate::metadata_api::write_handoff_freeze_with_layout(
+                &self.membership_handoff_write_freeze_path(), &freeze,
+                self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+            )?;
         self.instance_authority_epoch = None;
         Ok(freeze)
     }
@@ -95,6 +194,23 @@ impl LocalSobjMetadataBackend {
         &mut self,
         cut: &crate::DfsRepairHandoffCut,
     ) -> Result<()> {
+        if cut.version == 2 {
+            let (filesystem, layout) = self.selected_original_data_layout.as_ref().ok_or_else(|| MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected cut has no admitted native backend reader".into(),
+            })?;
+            layout.stage(filesystem, &self.shard_id, &self.root)?;
+            if filesystem != &cut.handoff.retiring_shard.file_system_id {
+                return Err(MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other,
+                    message: "selected cut belongs to another filesystem".into(),
+                });
+            }
+            cut.validate_selected_original_data()
+                .map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?;
+        }
         let _lock = self.begin_metadata_write_allow_frozen()?;
         let mut freeze = self.membership_handoff_write_freeze()?.ok_or_else(|| {
             MetadataBackendError::Serde(
@@ -120,7 +236,10 @@ impl LocalSobjMetadataBackend {
         }
         if freeze.repair_custody.is_none() {
             freeze.repair_custody = Some(cut.clone());
-            write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &freeze)?;
+            crate::metadata_api::write_handoff_freeze_with_layout(
+                &self.membership_handoff_write_freeze_path(), &freeze,
+                self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+            )?;
         }
         Ok(())
     }
@@ -200,8 +319,12 @@ impl LocalSobjMetadataBackend {
             }
             activated.rebind_prefix_proof = rebound_prefix_proof.clone();
         }
-        if activated != existing {
-            write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
+        if activated != existing || (self.selected_original_data_layout.is_some()
+            && activated.repair_custody.as_ref().is_some_and(|cut| cut.version == 2)) {
+            crate::metadata_api::write_handoff_freeze_with_layout(
+                &self.membership_handoff_write_freeze_path(), &activated,
+                self.selected_original_data_layout.as_ref().map(|(_, layout)| layout.as_ref()),
+            )?;
         }
         Ok(true)
     }
@@ -225,6 +348,11 @@ impl LocalSobjMetadataBackend {
         active_shard: &DfsMetadataShardConfig,
         checked_prefix: &DfsMetadataPrefixProof,
     ) -> Result<bool> {
+        // NEW selected install-owner processing clock, distinct from A's
+        // transport window and the earlier receiver RPC. V1 ignores it.
+        let selected_install_clock = self.selected_original_data_layout.as_ref()
+            .map(|_| std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let mut selected_install_deadline = None;
         let lock = self.begin_metadata_write_allow_frozen()?;
         let rebound_prefix_proof = self.prefix_proof.clone().ok_or_else(|| {
             MetadataBackendError::Serde(format!(
@@ -261,11 +389,24 @@ impl LocalSobjMetadataBackend {
                     "activated repair custody differs from the exact successor assignment".into(),
                 ));
             }
-            if !crate::repair_handoff::install_next_page(&self.root, &cut)
-                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
-            {
-                return Ok(false);
-            }
+            let complete = if let Some((_, layout)) = &self.selected_original_data_layout {
+                if cut.version == 2 { selected_install_deadline = selected_install_clock; }
+                crate::repair_handoff::install_native_layout(
+                    &self.root, layout, &cut, selected_install_deadline,
+                ).map_err(|error| MetadataBackendError::Rejected {
+                    code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+                })?
+            } else {
+                crate::repair_handoff::install_next_page(&self.root, &cut)
+                    .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+            };
+            if !complete { return Ok(false); }
+        }
+        if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected install processing budget expired before activation; DATA retained".into(),
+            });
         }
         let previous_instance_authority_epoch =
             self.instance_authority_epoch.replace(active_shard.epoch);
@@ -285,6 +426,23 @@ impl LocalSobjMetadataBackend {
                 return Err(error);
             }
         }
+        #[cfg(test)]
+        if let Some(deadline) = selected_install_deadline {
+            let hook = SELECTED_INSTALL_AFTER_MARKER_SYNC.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.as_ref().is_some_and(|(root, expected, _)| root == &self.root && expected == handoff_id) {
+                    slot.take().map(|(_, _, hook)| hook)
+                } else { None }
+            });
+            if let Some(hook) = hook { hook(deadline); }
+        }
+        if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.instance_authority_epoch = previous_instance_authority_epoch;
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected install processing budget expired after marker sync; durable marker retained, readiness withheld".into(),
+            });
+        }
         // Rebind owns the actual writer while replaying durable current
         // decisions. It never authors a new terminal operation for a hidden
         // prepare, and independently opened retiring instances stay fenced.
@@ -292,6 +450,13 @@ impl LocalSobjMetadataBackend {
         if let Err(error) = recovery {
             self.instance_authority_epoch = previous_instance_authority_epoch;
             return Err(error);
+        }
+        if selected_install_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            self.instance_authority_epoch = previous_instance_authority_epoch;
+            return Err(MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other,
+                message: "selected install processing budget expired after replay; durable progress retained, readiness withheld".into(),
+            });
         }
         drop(lock);
         Ok(true)

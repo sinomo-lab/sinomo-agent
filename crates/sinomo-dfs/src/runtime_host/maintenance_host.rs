@@ -369,7 +369,7 @@ pub(super) fn refresh_daemon_dfs_repair_queue_nonempty(
     data_dir: &SinomoDataDir,
 ) -> Result<bool, sinomo_dfs::DfsError> {
     let nonempty =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(data_dir))?
+        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(data_dir)?
             .is_some_and(|snapshot| !snapshot.records.is_empty());
     record_daemon_dfs_repair_queue_nonempty(data_dir, nonempty);
     Ok(nonempty)
@@ -526,12 +526,75 @@ pub(super) fn persist_daemon_dfs_repair_queue_records(
     data_dir: &SinomoDataDir,
     committed_records: Vec<DfsRepairAttemptRecord>,
 ) -> Result<usize, sinomo_dfs::DfsError> {
-    let appended =
-        sinomo_dfs::persist_default_dfs_repair_queue_records(data_dir, committed_records)?;
+    if committed_records.is_empty() {
+        return Ok(0);
+    }
+    let appended = if let Some(layout) =
+        sinomo_dfs::maintenance::selected_native_layout_for_maintenance(data_dir)?
+    {
+        layout.queue()?.append_enqueues(committed_records)?
+    } else {
+        sinomo_dfs::persist_default_dfs_repair_queue_records(data_dir, committed_records)?
+    };
     if appended > 0 {
         record_daemon_dfs_repair_queue_nonempty(data_dir, true);
     }
     Ok(appended)
+}
+
+#[cfg(test)]
+mod selected_queue_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn selected_native_checkpoint_uses_owned_reader_and_preserves_retry() {
+        let root = sinomo_testdir::TestDir::new("selected-native-queue-checkpoint");
+        let data = SinomoDataDir::new(root.path());
+        assert_eq!(persist_daemon_dfs_repair_queue_records(&data, Vec::new()).unwrap(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        let paths = DfsRuntimePaths::new(&data);
+        let mut owner = DfsDataOwnerLock::acquire(&paths).unwrap();
+        let layout = owner.admit_selected_original_fixture(None).unwrap();
+        let owner = Arc::new(owner);
+        register_daemon_dfs_data_owner_lock(&paths, &owner).unwrap();
+        let queue = layout.queue().unwrap();
+        let ordinary = crate::LocalDfsRepairQueueStore::new(
+            crate::default_dfs_repair_attempt_snapshot_path(&data),
+        );
+        assert!(ordinary.view().is_err(), "default reader must remain rejected");
+        let record = DfsRepairAttemptRecord {
+            intent_id: "selected-checkpoint-advisory-intent".into(),
+            object_id: crate::DfsObjectId::from_legacy_named("selected-checkpoint-object").unwrap(),
+            version: crate::DfsVersion::from_legacy_named("selected-checkpoint-version").unwrap(),
+            content_hash: "blake3:selected-checkpoint-test".into(),
+            missing_replica_node_id: NodeId::from_legacy_named("selected-checkpoint-target").unwrap(),
+            attempts: 3,
+            in_flight: false,
+            last_attempt_unix_nanos: 10,
+            next_retry_unix_nanos: 100,
+            transfer_request_id: None,
+            completed_transfer_request_id: None,
+            transfer_kind: Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair),
+            transfer_delivery_state: Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent),
+            last_error: Some("retained advisory retry".into()),
+        };
+        assert_eq!(persist_daemon_dfs_repair_queue_records(&data, vec![record.clone()]).unwrap(), 1);
+        assert_eq!(queue.view().unwrap().records, vec![record.clone()]);
+        let before = queue.view().unwrap();
+        let mut stale = record;
+        stale.attempts = 0;
+        stale.next_retry_unix_nanos = 0;
+        stale.last_error = None;
+        assert_eq!(persist_daemon_dfs_repair_queue_records(&data, vec![stale]).unwrap(), 0);
+        assert_eq!(queue.view().unwrap(), before, "checkpoint cannot reset retained retry state");
+        assert!(ordinary.view().is_err());
+        assert!(daemon_dfs_repair_queue_work_is_known(&paths));
+        drop(ordinary);
+        drop(queue);
+        drop(layout);
+        drop(owner);
+    }
 }
 
 /// Transfer a completed local recovery scan to durable queue ownership before
@@ -696,12 +759,9 @@ pub(super) fn daemon_dfs_completed_local_primary_handoff_rebind_count(
     active_shards: &[DfsMetadataShardConfig],
     authority_entries: &[KvEntry],
 ) -> Result<usize, DaemonError> {
-    sinomo_dfs::dfs_completed_local_primary_handoff_rebind_count(
-        data_dir,
-        local_node_id,
-        pending_handoffs,
-        active_shards,
-        authority_entries,
+    sinomo_dfs::maintenance::dfs_completed_local_primary_handoff_rebind_count_with_layout(
+        data_dir, local_node_id, pending_handoffs, active_shards, authority_entries,
+        sinomo_dfs::maintenance::selected_native_layout_for_maintenance(data_dir)?.as_deref(),
     )
     .map_err(Into::into)
 }
@@ -731,7 +791,7 @@ pub(super) fn daemon_dfs_pending_reactive_maintenance_work_from_authority_entrie
         return daemon_dfs_mounted_mutation_pending_work(&data_dir, now_unix_nanos);
     }
     let repair_attempt_records =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(&data_dir)?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
     record_daemon_dfs_repair_queue_nonempty(&data_dir, !repair_attempt_records.is_empty());
@@ -897,7 +957,7 @@ fn daemon_dfs_pending_maintenance_work_with_topology(
             &authority_entries,
         )?;
     let repair_attempt_records =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
+        sinomo_dfs::maintenance::read_native_repair_attempt_snapshot(&data_dir)?
             .map(|snapshot| snapshot.records)
             .unwrap_or_default();
     let placement_prefix =

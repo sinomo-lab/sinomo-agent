@@ -393,9 +393,9 @@ pub use discovery::{
     metadata_service_key, metadata_services_prefix,
 };
 pub use distributed::{
-    DfsDistributedError, DfsReplicaCandidate, DfsReplicaPlacementDecision,
-    DfsReplicaPlacementExplanation, DfsReplicaPlacementPlan, DfsReplicaPlacementRequest,
-    DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
+    DfsDistributedError, DfsIntentReplicaAvailability, DfsReplicaCandidate,
+    DfsReplicaPlacementDecision, DfsReplicaPlacementExplanation, DfsReplicaPlacementPlan,
+    DfsReplicaPlacementRequest, DfsReplicaReceiptState, DfsReplicationPolicy, DfsWriteIntentState,
     DistributedEventualCoordinator, DistributedRepairJob, DistributedReplicaReceipt,
     DistributedWriteIntent, explain_replicas, plan_replicas, validate_replication_plan,
 };
@@ -511,6 +511,7 @@ pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,
     DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
+    DfsSelectedOriginalDataLayout,
     DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{
@@ -693,6 +694,7 @@ pub(crate) use node_transport::{
 pub use node_transport::{
     AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker, DfsNodeTransport,
     DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
+    DfsMetadataPrefixProbeAttempt, DfsMetadataPrefixProbeReturn, DfsMetadataPrefixEvidence,
     dfs_message_response_from_rpc_result, dfs_message_response_from_rpc_result_sync,
     dfs_routed_call_rpc_call,
 };
@@ -746,6 +748,11 @@ pub use posix_model::{
     DfsPosixFileSyncEvidence, DfsPosixFileSyncTarget, DfsPosixRemoteFileRangeReadStream,
     DfsPosixRemoteFileReadStream, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
+#[cfg(test)]
+pub use protocol::{
+    DfsSelectedLocalRecoveryFenceRpcData, DfsSelectedLocalRecoveryFenceRpcOutcome,
+    DfsSelectedLocalRecoveryFenceRpcRequest, DfsSelectedLocalRecoveryFenceRpcResponse,
+};
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
     DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,
@@ -753,6 +760,10 @@ pub use protocol::{
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof,
     DfsMessageCommand, DfsMessageResponse, DfsMetadataAuthorityOperation,
+    DfsOriginalRepairHead, DfsOriginalRepairMaterial, DfsSelectedOriginalRepairCommand,
+    DfsImportedRepairHistoryRef, DfsOriginalRepairHistoryQueryRef, DfsOriginalRepairHistoryCarrier,
+    DfsOriginalRepairHistoryRequest, DfsOriginalRepairHistoryResponse, DfsOriginalRepairHistoryResult,
+    DfsOriginalRepairHistoryPending, DfsOriginalRepairHistoryCertificate, DfsOriginalRepairHistoryRejection,
     DfsMetadataAuthorityProbe, DfsMetadataDurableReplication, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalFrameBatch,
     DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,

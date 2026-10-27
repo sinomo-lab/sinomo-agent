@@ -175,6 +175,12 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::DistributedWriteResponse(_) => DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationRequest(_) => DFS_DATA_READ_ROUTE,
         DfsNetworkMessage::StableWriteReconciliationResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
+        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => DFS_DATA_READ_ROUTE,
+        DfsNetworkMessage::OriginalRepairHistoryResponse(_) => DFS_DATA_READ_RESPONSE_ROUTE,
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => DFS_DATA_METADATA_JOURNAL_BATCH_RESPONSE_ROUTE,
         DfsNetworkMessage::NamespaceRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
         DfsNetworkMessage::NamespaceResponse(_) => DFS_DATA_NAMESPACE_RESPONSE_ROUTE,
         DfsNetworkMessage::StableNamespaceReconciliationRequest(_) => DFS_DATA_NAMESPACE_ROUTE,
@@ -188,7 +194,7 @@ fn dfs_message_route_for_network_message(message: &DfsNetworkMessage) -> &'stati
         DfsNetworkMessage::StageBlobResponse(_) => DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
         DfsNetworkMessage::CommitVersion(_) => DFS_DATA_COMMIT_VERSION_ROUTE,
         DfsNetworkMessage::CommitVersionResponse(_) => DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE,
-        DfsNetworkMessage::RepairReplica(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
+        DfsNetworkMessage::RepairReplica(_) | DfsNetworkMessage::SelectedOriginalRepair(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
         DfsNetworkMessage::RepairRetainedBlob(_) => DFS_DATA_REPAIR_REPLICA_ROUTE,
         DfsNetworkMessage::RepairReplicaResponse(_) => DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE,
         DfsNetworkMessage::FetchBlob(_) => DFS_DATA_FETCH_BLOB_ROUTE,
@@ -306,9 +312,15 @@ pub fn dfs_metadata_snapshot_install_execution_scope(
 
 fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessageExecutionScope {
     match message {
+        // This conservative classification grants no generic execution path;
+        // both variants are rejected before ordinary host/service execution.
+        #[cfg(test)]
+        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_)
+        | DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => DfsMessageExecutionScope::GlobalExclusive,
         DfsNetworkMessage::ReadRequest(_)
         | DfsNetworkMessage::BulkReadRequest(_)
         | DfsNetworkMessage::StableWriteReconciliationRequest(_)
+        | DfsNetworkMessage::OriginalRepairHistoryRequest(_)
         | DfsNetworkMessage::ContentRootCatalogPageRequest(_) => DfsMessageExecutionScope::ReadOnly,
         DfsNetworkMessage::StableNamespaceReconciliationRequest(request) => {
             authority_shard_execution_scope(
@@ -392,6 +404,7 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         | DfsNetworkMessage::StagePatch(_)
         | DfsNetworkMessage::CommitVersion(_)
         | DfsNetworkMessage::RepairReplica(_)
+        | DfsNetworkMessage::SelectedOriginalRepair(_)
         | DfsNetworkMessage::FetchBlob(_) => DfsMessageExecutionScope::GlobalExclusive,
         DfsNetworkMessage::MetadataJournalBatch(command) => {
             dfs_metadata_journal_batch_execution_scope(command)
@@ -405,6 +418,7 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
         | DfsNetworkMessage::WriteResponse(_)
         | DfsNetworkMessage::DistributedWriteResponse(_)
         | DfsNetworkMessage::StableWriteReconciliationResponse(_)
+        | DfsNetworkMessage::OriginalRepairHistoryResponse(_)
         | DfsNetworkMessage::NamespaceResponse(_)
         | DfsNetworkMessage::StableNamespaceReconciliationResponse(_)
         | DfsNetworkMessage::StageBlobResponse(_)
@@ -432,6 +446,7 @@ fn dfs_network_message_is_read_only_request(message: &DfsNetworkMessage) -> bool
             | DfsNetworkMessage::BulkReadRequest(_)
             | DfsNetworkMessage::ContentRootCatalogPageRequest(_)
             | DfsNetworkMessage::StableWriteReconciliationRequest(_)
+            | DfsNetworkMessage::OriginalRepairHistoryRequest(_)
             | DfsNetworkMessage::StableNamespaceReconciliationRequest(_)
             | DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
                 operation: DfsNamespaceOperation::LookupPath { .. }

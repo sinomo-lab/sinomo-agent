@@ -203,6 +203,7 @@ impl MetadataTableCheckpointTrigger {
 
 #[derive(Clone, Debug)]
 struct MetadataTableCheckpointWorkerState {
+    selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     // Reuse the current backend's existing read image. A weak reference owns
     // neither the backend, DATA custody nor any publication/admission permit.
     read_snapshot_cache: Option<Weak<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
@@ -227,8 +228,9 @@ struct MetadataTableCheckpointWorkerRegistry {
     changed: Condvar,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MetadataTableCheckpointWorkerRequest {
+    selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     revision: u64,
     requested_at: Instant,
     eligible_at: Instant,
@@ -554,6 +556,7 @@ fn preserve_metadata_table_logical_checkpoint_deadline(
 }
 
 pub(crate) struct TableMaterializationState<'a> {
+    pub(crate) selected_original_data_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
     pub(crate) read_snapshot_cache: Option<&'a Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
     pub(crate) tables: &'a mut DfsMetadataTables,
     pub(crate) table_log_offset: &'a mut u64,
@@ -591,6 +594,7 @@ pub(crate) fn compact_metadata_table_log_if_needed(
     state: TableMaterializationState<'_>,
     max_log_bytes: u64,
 ) -> Result<()> {
+    validate_checkpoint_layout(root, state.selected_original_data_layout.as_deref())?;
     let path = metadata_table_path(root);
     let has_rotated_checkpoint = metadata_table_checkpoint_log_path(root).is_file();
     let len = match fs::metadata(&path) {
@@ -629,7 +633,7 @@ pub(crate) fn compact_metadata_table_log_if_needed(
             root.display()
         ))
     })?;
-    advance_activated_handoff_rebind_checkpoint(root, checkpoint_proof)?;
+    advance_activated_handoff_rebind_checkpoint(root, checkpoint_proof, state.selected_original_data_layout.as_deref())?;
     // Snapshot publication and table-log truncation are durable before any
     // source history disappears. Lagging replicas observe the retained
     // checkpoint segment as a discontinuity and use snapshot repair.
@@ -654,6 +658,18 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     table_log_offset: u64,
     read_snapshot_cache: Option<&Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
 ) -> Result<()> {
+    schedule_metadata_table_checkpoint_with_layout(root, tables, max_log_bytes, table_log_offset, read_snapshot_cache, None)
+}
+
+pub(crate) fn schedule_metadata_table_checkpoint_with_layout(
+    root: &Path,
+    tables: &DfsMetadataTables,
+    max_log_bytes: u64,
+    table_log_offset: u64,
+    read_snapshot_cache: Option<&Arc<Mutex<Option<MetadataTableReadSnapshotCache>>>>,
+    selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+) -> Result<()> {
+    validate_checkpoint_layout(root, selected_layout.as_deref())?;
     let logical_pressure =
         metadata_table_logical_checkpoint_pressure(table_log_offset, max_log_bytes);
     let replay_pressure_exceeded = logical_pressure.is_some();
@@ -691,6 +707,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(worker) = workers.get_mut(root) {
+                require_same_checkpoint_layout(&worker.selected_original_data_layout, &selected_layout)?;
                 if let Some(cache) = read_snapshot_cache {
                     worker.read_snapshot_cache = Some(Arc::downgrade(cache));
                 }
@@ -711,6 +728,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(worker) = workers.get_mut(&root) {
+            require_same_checkpoint_layout(&worker.selected_original_data_layout, &selected_layout)?;
             if let Some(cache) = read_snapshot_cache {
                 worker.read_snapshot_cache = Some(Arc::downgrade(cache));
             }
@@ -771,6 +789,7 @@ pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
         let initial_physical_checkpoint_required =
             checkpoint_generation_present || physical_checkpoint_required;
         let mut worker = MetadataTableCheckpointWorkerState {
+            selected_original_data_layout: selected_layout,
             read_snapshot_cache: read_snapshot_cache.map(Arc::downgrade),
             revision: 1,
             requested_at,
@@ -1002,6 +1021,7 @@ fn next_metadata_table_checkpoint_worker_request(
             let now = Instant::now();
             if now >= worker.physical_checkpoint_not_before {
                 return Some(MetadataTableCheckpointWorkerRequest {
+                    selected_original_data_layout: worker.selected_original_data_layout.clone(),
                     revision: worker.revision,
                     requested_at: worker.requested_at,
                     eligible_at: worker.physical_checkpoint_not_before,
@@ -1055,6 +1075,7 @@ fn next_metadata_table_checkpoint_worker_request(
         let now = Instant::now();
         if now >= eligible_at {
             return Some(MetadataTableCheckpointWorkerRequest {
+                    selected_original_data_layout: worker.selected_original_data_layout.clone(),
                 revision: worker.revision,
                 requested_at: worker.requested_at,
                 eligible_at,
@@ -1090,6 +1111,7 @@ fn claim_metadata_table_checkpoint_worker_request(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let worker = workers.get_mut(root)?;
+    require_same_checkpoint_layout(&worker.selected_original_data_layout, &request.selected_original_data_layout).ok()?;
     if worker.physical_checkpoint_required {
         if request.trigger != MetadataTableCheckpointTrigger::Physical {
             return None;
@@ -1102,6 +1124,7 @@ fn claim_metadata_table_checkpoint_worker_request(
         // keeps this worker alive for one more immediate fold.
         worker.physical_checkpoint_required = false;
         return Some(MetadataTableCheckpointWorkerRequest {
+                    selected_original_data_layout: worker.selected_original_data_layout.clone(),
             revision: worker.revision,
             requested_at: worker.requested_at,
             eligible_at: worker.physical_checkpoint_not_before,
@@ -1138,6 +1161,7 @@ fn claim_metadata_table_checkpoint_worker_request(
         return None;
     }
     Some(MetadataTableCheckpointWorkerRequest {
+                    selected_original_data_layout: worker.selected_original_data_layout.clone(),
         revision: worker.revision,
         requested_at: worker.requested_at,
         eligible_at,
@@ -1380,7 +1404,7 @@ fn run_coordinated_metadata_table_checkpoint_worker(
         ));
         #[cfg(test)]
         let _fold_observation = MetadataTableCheckpointFoldObservation::enter();
-        let mut result = run_metadata_table_checkpoint_worker(root, max_log_bytes, request);
+        let mut result = run_metadata_table_checkpoint_worker(root, max_log_bytes, request.clone());
         #[cfg(test)]
         drop(_fold_observation);
         let should_trim = result.as_ref().map_or(true, |run| run.snapshot_bytes > 0);
@@ -1519,6 +1543,7 @@ fn run_metadata_table_checkpoint_worker(
     max_log_bytes: u64,
     request: MetadataTableCheckpointWorkerRequest,
 ) -> Result<MetadataTableCheckpointRun> {
+    validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
     let total_started = Instant::now();
     let rotate_started = Instant::now();
     let activity_before_lock = metadata_write_activity(root);
@@ -1536,8 +1561,11 @@ fn run_metadata_table_checkpoint_worker(
     let (snapshot_fingerprint, checkpoint_fingerprint) = {
         let _write_lock =
             metadata_checkpoint_write_lock(root.to_path_buf(), journal_write_lock_path(root))?;
+        if request.selected_original_data_layout.is_some() {
+            validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
+        }
         if let Some(reason) =
-            metadata_table_checkpoint_preemption_reason(root, request, activity_before_lock)
+            metadata_table_checkpoint_preemption_reason(root, request.clone(), activity_before_lock)
         {
             return Ok(MetadataTableCheckpointRun {
                 preempted: true,
@@ -1572,6 +1600,9 @@ fn run_metadata_table_checkpoint_worker(
     // holding the shard writer lock. Checkpointing must preserve the exact
     // journal-materialized tables; history compaction is a journal mutation.
     let decode_started = Instant::now();
+    if request.selected_original_data_layout.is_some() {
+        validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
+    }
     let state = read_metadata_table_checkpoint_state(root)?;
     let decode_ms = decode_started.elapsed().as_millis();
     let checkpoint_sequence = state.materialized_through_sequence.unwrap_or(0);
@@ -1591,12 +1622,18 @@ fn run_metadata_table_checkpoint_worker(
     }
     let tables = state.tables;
     let encode_started = Instant::now();
+    if request.selected_original_data_layout.is_some() {
+        validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
+    }
     let staged = crate::metadata_snapshot::stage_snapshot(
         root,
         &tables,
         checkpoint_sequence,
         &prefix_proof,
     )?;
+    if request.selected_original_data_layout.is_some() {
+        validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
+    }
     let encode_ms = encode_started.elapsed().as_millis();
     let snapshot_len = usize::try_from(staged.len).unwrap_or(usize::MAX);
     let stage_ms = 0;
@@ -1605,6 +1642,9 @@ fn run_metadata_table_checkpoint_worker(
     let _write_lock =
         metadata_checkpoint_write_lock(root.to_path_buf(), journal_write_lock_path(root))?;
     let install_lock_wait_ms = install_lock_started.elapsed().as_millis();
+    if request.selected_original_data_layout.is_some() {
+        validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
+    }
     let publish_started = Instant::now();
     if metadata_table_snapshot_fingerprint(root)? != snapshot_fingerprint
         || crate::metadata_table_store::metadata_table_checkpoint_fingerprint(root)?
@@ -1627,8 +1667,11 @@ fn run_metadata_table_checkpoint_worker(
     let journal_admission =
         crate::metadata_journal::admission::capture_owned_checkpoint_admission(root)?;
     staged.install(root)?;
+    if request.selected_original_data_layout.is_some() {
+        validate_checkpoint_layout(root, request.selected_original_data_layout.as_deref())?;
+    }
     remove_metadata_table_checkpoint_log(root)?;
-    advance_activated_handoff_rebind_checkpoint(root, &prefix_proof)?;
+    advance_activated_handoff_rebind_checkpoint(root, &prefix_proof, request.selected_original_data_layout.as_deref())?;
     // The installed snapshot and newer table-log suffix are durable before
     // source history is pruned. Retaining the checkpoint journal segment
     // leaves a discontinuity that forces lagging replicas through snapshot
@@ -1705,6 +1748,33 @@ fn run_metadata_table_checkpoint_worker(
     })
 }
 
+fn require_same_checkpoint_layout(
+    expected: &Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+    actual: &Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+) -> Result<()> {
+    let same = match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+        _ => false,
+    };
+    if !same { return Err(MetadataBackendError::Rejected {
+        code: crate::DfsMetadataRejectionCode::Other,
+        message: "checkpoint request changed its explicit selected reader".into(),
+    }); }
+    Ok(())
+}
+
+fn validate_checkpoint_layout(root: &Path, selected: Option<&crate::DfsSelectedOriginalDataLayout>) -> Result<()> {
+    if let Some(layout) = selected {
+        crate::metadata_api::validate_handoff_layout_root(layout, root)
+    } else {
+        crate::repair_queue_store::SelectedOriginalFixtureIdentity::reject_default_root(root)
+            .map_err(|error| MetadataBackendError::Rejected {
+                code: crate::DfsMetadataRejectionCode::Other, message: error.to_string(),
+            })
+    }
+}
+
 fn membership_handoff_write_freeze_path(root: &Path) -> PathBuf {
     root.join("journal")
         .join("membership-handoff-write-freeze.sobj")
@@ -1720,9 +1790,10 @@ fn membership_handoff_write_freeze_path(root: &Path) -> PathBuf {
 fn advance_activated_handoff_rebind_checkpoint(
     root: &Path,
     checkpoint: &DfsMetadataPrefixProof,
+    selected_layout: Option<&crate::DfsSelectedOriginalDataLayout>,
 ) -> Result<()> {
     let path = membership_handoff_write_freeze_path(root);
-    let Some(mut freeze) = read_sobj_optional::<DfsMetadataShardWriteFreeze>(&path)? else {
+    let Some(mut freeze) = crate::metadata_api::read_handoff_freeze_with_layout(&path, selected_layout)? else {
         return Ok(());
     };
     if freeze.activated_epoch.is_none() {
@@ -1853,7 +1924,7 @@ fn advance_activated_handoff_rebind_checkpoint(
 
     if &freeze.rebind_prefix_proof != checkpoint {
         freeze.rebind_prefix_proof = checkpoint.clone();
-        write_sobj_atomic(&path, &freeze)?;
+        crate::metadata_api::write_handoff_freeze_with_layout(&path, &freeze, selected_layout)?;
     }
     Ok(())
 }
@@ -1903,6 +1974,12 @@ fn append_table_batch(
     max_log_bytes: u64,
     mut rollback: Option<DfsMetadataTableRollback>,
 ) -> Result<()> {
+    if let Err(error) = validate_checkpoint_layout(root, state.selected_original_data_layout.as_deref()) {
+        if let Some(rollback) = rollback.take() {
+            rollback.rollback(state.tables);
+        }
+        return Err(error);
+    }
     if let Err(error) = reconcile_table_log_generation_after_background_checkpoint(root, &mut state)
     {
         if let Some(rollback) = rollback.take() {
@@ -1994,12 +2071,13 @@ fn append_table_batch(
         }
     }
     *state.materialized_through_sequence = (*state.materialized_through_sequence).max(sequence);
-    schedule_metadata_table_checkpoint_if_needed(
+    schedule_metadata_table_checkpoint_with_layout(
         root,
         state.tables,
         max_log_bytes,
         *state.table_log_offset,
         state.read_snapshot_cache,
+        state.selected_original_data_layout.clone(),
     )
 }
 
@@ -2183,6 +2261,7 @@ mod tests {
         max_log_bytes: u64,
     ) -> MetadataTableCheckpointWorkerState {
         let mut worker = MetadataTableCheckpointWorkerState {
+            selected_original_data_layout: None,
             read_snapshot_cache: None,
             revision: 1,
             requested_at,
@@ -2456,7 +2535,7 @@ mod tests {
             worker.last_activity_at = Instant::now();
         }
         assert!(
-            claim_metadata_table_checkpoint_worker_request(root.path(), request).is_some(),
+            claim_metadata_table_checkpoint_worker_request(root.path(), request.clone()).is_some(),
             "the bounded restart-cost valve must not be starved by a stuck prepare or new revisions"
         );
         assert_eq!(
@@ -2650,7 +2729,7 @@ mod tests {
         )
         .unwrap();
         crate::metadata_journal::reset_metadata_journal_exact_read_counters();
-        advance_activated_handoff_rebind_checkpoint(copy.path(), &target).unwrap();
+        advance_activated_handoff_rebind_checkpoint(copy.path(), &target, None).unwrap();
         let segment_opens = crate::metadata_journal::metadata_journal_exact_segment_opens();
         let frame_decodes = crate::metadata_journal::metadata_journal_exact_frame_decodes();
         let marker = read_sobj_optional::<DfsMetadataShardWriteFreeze>(
@@ -2723,6 +2802,7 @@ mod tests {
         // Force only this copied native source's existing storage checkpoint.
         // The production threshold and the original700-file case stay unchanged.
         let request = MetadataTableCheckpointWorkerRequest {
+                    selected_original_data_layout: None,
             revision: 0,
             requested_at: now,
             eligible_at: now,
@@ -2801,6 +2881,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -2833,7 +2914,7 @@ mod tests {
             .insert(root.path().to_path_buf(), worker);
         let request =
             next_metadata_table_checkpoint_worker_request(root.path()).expect("soft request");
-        let request = claim_metadata_table_checkpoint_worker_request(root.path(), request)
+        let request = claim_metadata_table_checkpoint_worker_request(root.path(), request.clone())
             .expect("claim soft request");
 
         let foreground_lock = crate::metadata_lock::metadata_write_lock(
@@ -2842,8 +2923,9 @@ mod tests {
         )
         .expect("hold shard writer lock");
         let worker_root = root.path().to_path_buf();
+        let worker_request = request.clone();
         let handle = std::thread::spawn(move || {
-            run_metadata_table_checkpoint_worker(&worker_root, 100, request)
+            run_metadata_table_checkpoint_worker(&worker_root, 100, worker_request)
                 .expect("soft checkpoint attempt")
         });
         std::thread::sleep(Duration::from_millis(10));
@@ -2963,6 +3045,7 @@ mod tests {
             .insert(
                 root.path().to_path_buf(),
                 MetadataTableCheckpointWorkerState {
+                    selected_original_data_layout: None,
                     read_snapshot_cache: None,
                     revision: 1,
                     requested_at,
@@ -2992,7 +3075,7 @@ mod tests {
         }
 
         assert!(
-            claim_metadata_table_checkpoint_worker_request(root.path(), request).is_some(),
+            claim_metadata_table_checkpoint_worker_request(root.path(), request.clone()).is_some(),
             "monotonic physical pressure must not starve behind newer foreground revisions"
         );
         let worker = registry
@@ -3017,6 +3100,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3093,6 +3177,7 @@ mod tests {
         let error = append_table_batch(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3117,6 +3202,34 @@ mod tests {
     }
 
     #[test]
+    fn preapplied_batch_rolls_back_when_default_layout_rejects_selected_root() {
+        let root = sinomo_testdir::TestDir::new("dfs-preapply-selected-layout-rejection");
+        let (_, identity) = crate::repair_queue_store::LocalDfsRepairQueueStore::new_selected_original_fixture(
+            root.join("selected")).unwrap();
+        let before = DfsMetadataTables::default();
+        let mut tables = before.clone();
+        let op = namespace_transaction_op("txn_preapply_selected_layout");
+        let mut rollback = DfsMetadataTableRollback::default();
+        tables.apply_with_rollback(op.clone(), &mut rollback);
+        assert_ne!(tables, before);
+        let mut offset = 0;
+        let mut sequence = 0;
+        let mut fingerprint = None;
+        let mut prefix = None;
+        let error = append_preapplied_table_ops(identity.root(), TableMaterializationState {
+            selected_original_data_layout: None, read_snapshot_cache: None,
+            tables: &mut tables, table_log_offset: &mut offset,
+            materialized_through_sequence: &mut sequence,
+            table_snapshot_fingerprint: &mut fingerprint, prefix_proof: &mut prefix,
+        }, 1, vec![op], u64::MAX, rollback).unwrap_err();
+        assert!(matches!(error, MetadataBackendError::Rejected { code: crate::DfsMetadataRejectionCode::Other, .. }));
+        assert_eq!(tables, before);
+        assert_eq!(offset, 0);
+        assert_eq!(sequence, 0);
+        assert!(!metadata_table_path(identity.root()).exists());
+    }
+
+    #[test]
     fn preapplied_batch_rolls_back_without_prefix_proof() {
         let root = sinomo_testdir::TestDir::new("sinomo-dfs-table-preapply-no-proof");
         let before = DfsMetadataTables::default();
@@ -3134,6 +3247,7 @@ mod tests {
         let error = append_preapplied_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3180,6 +3294,7 @@ mod tests {
         append_preapplied_table_ops(
             &blocked_root,
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3216,6 +3331,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3276,6 +3392,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3382,6 +3499,7 @@ mod tests {
             append_and_apply_table_ops(
                 root,
                 TableMaterializationState {
+                selected_original_data_layout: None,
                     read_snapshot_cache: None,
                     tables: &mut tables,
                     table_log_offset: &mut table_log_offset,
@@ -3474,6 +3592,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,
@@ -3504,6 +3623,7 @@ mod tests {
         append_and_apply_table_ops(
             root.path(),
             TableMaterializationState {
+                selected_original_data_layout: None,
                 read_snapshot_cache: None,
                 tables: &mut tables,
                 table_log_offset: &mut table_log_offset,

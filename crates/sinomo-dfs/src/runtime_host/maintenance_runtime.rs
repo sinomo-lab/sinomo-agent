@@ -857,7 +857,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                     let recovery_shards = crate::metadata_shards_from_authority_projection(
                         &authoritative_topology, &crate::sifs_file_system_id(),
                     ).map_err(DaemonError::from)?;
-                    match maintenance_service.reconcile_pending_metadata_shard_membership_handoffs_until_cancelled(
+                    let handoff_result = maintenance_service.reconcile_pending_metadata_shard_membership_handoffs_until_cancelled(
                         &recovery_shards, recovery_options.metadata_replication.target_timeout,
                         &|| {
                             _foreground_preemption.is_requested()
@@ -867,7 +867,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                                     )
                                     .is_none()
                         },
-                    ) {
+                    );
+                    #[cfg(test)]
+                    crate::default_cluster::bootstrap_observation::record(&data_dir.root(), &cluster_state.local_node_id, "maintenance-handoff-result", ||
+                        serde_json::json!({"admitted_generation":authority_generation_before_maintenance,"shards":recovery_shards,
+                            "result":handoff_result.as_ref().map(|v|*v).map_err(|e|e.to_string())}));
+                    match handoff_result {
                         Ok(Some(_)) => {},
                         Ok(None) => return Ok(None),
                         Err(crate::DfsError::MetadataShardMembershipHandoffParked { .. }) => return Ok(None),

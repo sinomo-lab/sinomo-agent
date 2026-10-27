@@ -1611,6 +1611,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.ensure_retained_write_object(&command).map(|()| false)
                 };
                 admitted.and_then(|created| {
+                    // The ordinary replay check ran before this actual native
+                    // namespace result; no incoming wire bit grants freshness.
+                    let creation = DfsWriteCreation::from_namespace_resolution(
+                        command.exclusive_create,
+                        created
+                            && command.publication.is_current()
+                            && command.patch.is_none()
+                            && command.expected_base_version.is_none()
+                            && !foreground_replica_repair,
+                    );
                     injected_transient_metadata = created;
                     if created && touch_parent_on_create {
                         created_object_path = routed_object_path;
@@ -1651,11 +1661,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 DfsDistributedWriteOptions {
                                     publication: command.publication.clone(),
                                     touch_parent_on_create: created_object_path.is_some(),
-                                    creation: if command.exclusive_create {
-                                        DfsWriteCreation::Exclusive
-                                    } else {
-                                        DfsWriteCreation::Upsert
-                                    },
+                                    creation,
                                     repair: if write_foreground_replica_repair {
                                         DfsWriteRepair::Foreground
                                     } else {
@@ -1675,11 +1681,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 DfsDistributedWriteOptions {
                                     publication: command.publication.clone(),
                                     touch_parent_on_create: created_object_path.is_some(),
-                                    creation: if command.exclusive_create {
-                                        DfsWriteCreation::Exclusive
-                                    } else {
-                                        DfsWriteCreation::Upsert
-                                    },
+                                    creation,
                                     repair: if write_foreground_replica_repair {
                                         DfsWriteRepair::Foreground
                                     } else {
@@ -1700,11 +1702,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 DfsDistributedWriteOptions {
                                     publication: command.publication.clone(),
                                     touch_parent_on_create: created_object_path.is_some(),
-                                    creation: if command.exclusive_create {
-                                        DfsWriteCreation::Exclusive
-                                    } else {
-                                        DfsWriteCreation::Upsert
-                                    },
+                                    creation,
                                     repair: if write_foreground_replica_repair {
                                         DfsWriteRepair::Foreground
                                     } else {
@@ -1735,11 +1733,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             DfsDistributedWriteOptions {
                                 publication: command.publication.clone(),
                                 touch_parent_on_create: created_object_path.is_some(),
-                                creation: if command.exclusive_create {
-                                    DfsWriteCreation::Exclusive
-                                } else {
-                                    DfsWriteCreation::Upsert
-                                },
+                                creation,
                                 repair: if write_foreground_replica_repair {
                                     DfsWriteRepair::Foreground
                                 } else {
@@ -1758,11 +1752,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             DfsDistributedWriteOptions {
                                 publication: command.publication.clone(),
                                 touch_parent_on_create: created_object_path.is_some(),
-                                creation: if command.exclusive_create {
-                                    DfsWriteCreation::Exclusive
-                                } else {
-                                    DfsWriteCreation::Upsert
-                                },
+                                creation,
                                 repair: if write_foreground_replica_repair {
                                     DfsWriteRepair::Foreground
                                 } else {

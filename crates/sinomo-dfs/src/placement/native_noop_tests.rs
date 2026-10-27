@@ -1461,6 +1461,108 @@ fn native_unfinished_placement_repair(
             })
         })
         .collect();
+    // Verdict inputs above are final. These observations cannot drive recovery,
+    // change the verdict, or prevent the existing close/drain and assertions.
+    let nonrecovery_diagnostic = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || {
+            let mut observations = Vec::new();
+            for node in [&old_primary, &promoted, &replica] {
+                let data_dir = case.runtime.data_dir(node);
+                let queue = crate::repair_queue_store::LocalDfsRepairQueueStore::observe_registered_original_for_slot(
+                &crate::default_dfs_repair_attempt_snapshot_path(data_dir),
+                &crate::repair_queue_store::DfsRepairQueueKey {
+                    intent_id: intent_id.clone(), missing_replica_node_id: replica.clone(),
+                },
+                crate::DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT as u64,
+            );
+                let marker = crate::read_local_dfs_metadata_shard_write_freeze(
+                    data_dir,
+                    &DfsMetadataShardId::new("services"),
+                );
+                let content_path = data_dir.dfs_dir().join("content");
+                let content = crate::LocalContentStore::open_for_inspection(&content_path);
+                let readable = match object
+                    .content_hash
+                    .as_deref()
+                    .map(|hash| content.read_blob_range(hash, 0, 4097))
+                {
+                    None => {
+                        serde_json::json!({"unavailable": "fixture object has no captured content hash"})
+                    }
+                    Some(Ok(bytes)) => serde_json::json!({
+                        "bytes": bytes.len(), "exact_4096": bytes.len() == 4096,
+                        "observed_hash": format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+                        "expected_hash": object.content_hash,
+                        "qualification": "bounded readable content only, not original body/custody/Terminal evidence"
+                    }),
+                    Some(Err(error)) => serde_json::json!({"unavailable": error.to_string()}),
+                };
+                let aggregate = match content.content_reservation_roots() {
+                    Ok(roots) => serde_json::json!({"roots": roots,
+                    "qualification": "aggregate hash/version protection, not original-subject enumeration"}),
+                    Err(error) => serde_json::json!({"unavailable": error.to_string()}),
+                };
+                let root_observation = match queue.birth.as_ref() {
+                    Some(birth) => match nodes
+                        .iter()
+                        .find(|owner| owner.to_string() == birth.root.subject.producer)
+                    {
+                        Some(owner) => {
+                            let path = case.runtime.data_dir(owner).dfs_dir().join("content");
+                            let physical = match std::fs::symlink_metadata(&path) {
+                                Ok(metadata) => {
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::MetadataExt as _;
+                                        serde_json::json!({"device": metadata.dev(), "inode": metadata.ino(),
+                                        "symlink": metadata.file_type().is_symlink()})
+                                    }
+                                    #[cfg(not(unix))]
+                                    {
+                                        serde_json::json!({"unavailable": "Unix physical identifiers"})
+                                    }
+                                }
+                                Err(error) => serde_json::json!({"unavailable": error.to_string()}),
+                            };
+                            let owner_content =
+                                crate::LocalContentStore::open_for_inspection(&path);
+                            let result = match owner_content
+                                .inspect_repair_payload_root(&birth.root)
+                            {
+                                Ok(()) => serde_json::json!({"matching_readable_root": true}),
+                                Err(error) => serde_json::json!({"unavailable": error.to_string()}),
+                            };
+                            serde_json::json!({"producer_node": owner, "physical_path": path,
+                            "physical": physical, "given_root": birth.root, "result": result,
+                            "qualification": "genuinely supplied birth root on named producer; no renewed durability/ACK or successor authority"})
+                        }
+                        None => {
+                            serde_json::json!({"unavailable": "given birth producer is outside this fixture"})
+                        }
+                    },
+                    None => {
+                        serde_json::json!({"unavailable": "no genuine indexed birth root supplied; orphan-root inventory unresolved"})
+                    }
+                };
+                observations.push(serde_json::json!({
+                    "node": node, "data_path": data_dir.root(), "content_path": content_path,
+                    "queue": queue, "marker": match marker {
+                        Ok(marker) => serde_json::json!({"observed": marker}),
+                        Err(error) => serde_json::json!({"unavailable": error.to_string()}),
+                    },
+                    "readable_content": readable, "aggregate_protection": aggregate,
+                    "named_root": root_observation,
+                }));
+            }
+            serde_json::json!({"status": "observed", "nodes": observations,
+            "qualification": "per-call diagnostic DATA; no atomic queue/content snapshot or durable authority"})
+        },
+    )) {
+        Ok(observed) => observed,
+        Err(_) => {
+            serde_json::json!({"unavailable": "diagnostic panicked; original verdict and close/drain preserved"})
+        }
+    };
     std::fs::write(
         case.runtime
             .data_dir(&promoted)
@@ -1477,6 +1579,7 @@ fn native_unfinished_placement_repair(
             "lost_reply": lose_reply,
             "restart_after_handoff": restart_after_handoff,
             "completed": completed, "binding_observations": binding_observations, "maintenance": maintenance,
+            "nonrecovery_diagnostic": nonrecovery_diagnostic,
             "all_rpc_observation_count": calls.len(), "selected_dfs_rpc_observations": selected,
             "qualification": "Actual fresh native fixture; selected DFS RPCs only. Full call count states omitted other routes. No supplied success, receipt or replacement authority."
         }))
