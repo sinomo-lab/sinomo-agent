@@ -26,38 +26,63 @@ fn outsider_fixture_observes_completed_assignment_after_a_withheld_native_delta(
     // The general runtime.client() fixture opener waits for every node's
     // configuration readiness, including the rebuild deliberately paused here.
     let observation_deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
-    DfsControlPlaneStore::new(cluster.primary.control_plane.as_mut().unwrap().as_mut())
-        .begin_metadata_shard_membership_handoff(current, &desired)
-        .expect("submit the actual native outsider handoff")
-        .expect("the source assignment is unchanged");
-    cluster
-        .primary
-        .reconcile_pending_metadata_shard_membership_handoffs(&configs, Duration::from_secs(5))
-        .expect("complete the actual native outsider handoff");
-    let active = cluster
-        ._runtime
-        .metadata_shards()
-        .unwrap()
-        .into_iter()
-        .find(|config| config.shard_id == "users")
-        .unwrap();
-    assert_eq!(
-        active, desired,
-        "the requested native handoff really activated"
-    );
-    // Owner activation does not imply delivery to this replica's observer.
-    // Observe the actual negative hook under the existing fixture bound;
-    // do not drive maintenance or release it before the delta was withheld.
+    let requested =
+        DfsControlPlaneStore::new(cluster.primary.control_plane.as_mut().unwrap().as_mut())
+            .begin_metadata_shard_membership_handoff(current, &desired)
+            .expect("submit the actual native outsider handoff")
+            .expect("the source assignment is unchanged");
+    // The existing native maintenance owner completes this request. Driving a
+    // second reconciliation through the retained service can lose its owner
+    // binding after the real activation and correctly report StaleOwnerEpoch.
+    // Observe the committed delta instead, under the original five-second
+    // completion bound and the already-established overall observation bound.
+    let completion_deadline = observation_deadline.min(Instant::now() + Duration::from_secs(5));
     let dropped = loop {
         if let Some(delta) = fault.dropped_delta() {
             break delta;
         }
         assert!(
-            Instant::now() < observation_deadline,
-            "control did not observe the actual committed users assignment"
+            Instant::now() < completion_deadline,
+            "native owner did not complete the requested users assignment"
         );
         std::thread::sleep(Duration::from_millis(1));
     };
+    // Read through the retained primary client: runtime fixture openers wait
+    // for all configuration observers, including the replica paused above.
+    let keys = vec![
+        crate::metadata_shard_key(&fs, "users"),
+        crate::control_plane::metadata_shard_membership_handoff_proof_key(&fs, "users"),
+        crate::control_plane::metadata_shard_membership_handoff_key(&fs, "users"),
+    ];
+    let observed = cluster
+        .primary
+        .control_plane
+        .as_mut()
+        .unwrap()
+        .get_authoritative_consistent_before(&keys, observation_deadline)
+        .expect("observe the exact completed handoff without waiting for the paused replica");
+    assert_eq!(observed.len(), keys.len());
+    let active = observed[0]
+        .as_ref()
+        .expect("active users assignment")
+        .decode::<DfsMetadataShardConfig>()
+        .unwrap();
+    let proof = observed[1]
+        .as_ref()
+        .expect("actual native handoff completion proof")
+        .decode::<crate::control_plane::DfsMetadataShardMembershipHandoffProof>()
+        .unwrap();
+    let pending = observed[2].as_ref();
+    assert_eq!(
+        active, desired,
+        "the requested native handoff really activated"
+    );
+    assert_eq!(proof.handoff_id, requested.handoff_id);
+    assert_eq!(proof.cause, requested.cause);
+    assert_eq!(proof.retiring_shard, requested.retiring_shard);
+    assert_eq!(proof.desired_shard, requested.desired_shard);
+    assert!(proof.journal_sequence >= requested.required_prepared_sequence);
+    assert!(pending.is_none(), "the exact handoff must be complete");
     fault.release();
     drop(fault);
 
@@ -76,6 +101,8 @@ fn outsider_fixture_observes_completed_assignment_after_a_withheld_native_delta(
         cluster.root.join("boundary-diagnostic-outsider-configuration.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "actual_withheld_delta": dropped,
+            "requested_handoff": requested,
+            "committed_handoff_proof": proof,
             "installed": active,
             "requests": requests,
             "result": format!("{result:?}"),
