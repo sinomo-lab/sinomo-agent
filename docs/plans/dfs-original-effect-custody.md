@@ -171,6 +171,47 @@ contain only descriptors. They are not that certificate. The multi-slot protocol
 must define root creation, continuation after new work and survival of compaction;
 this document supplies no replacement majority protocol.
 
+### Recovery-state obligations
+
+These states name obligations; they introduce no second production queue or
+parallel protocol. The actual storage/wire versions and owning writer gates need
+review before implementation.
+
+| State | Evidence that must remain recoverable |
+|---|---|
+| Recorded and definitely unsent | Exact identity/body ownership and evidence that no attempt crossed dispatch. Absence from a local queue or one recent send failure is insufficient. |
+| Locally recorded | Complete local head/dependency/result material is synced for same-producer restart. This is not survivor coverage and cannot satisfy an abrupt-loss activation gate. |
+| Custody ready | Complete material required for this original request is durably recoverable from the surviving set under the reviewed recovery protocol. Its immutable root binds identity, body, payload dependencies and destination. |
+| Dispatched and unresolved | The same custody plus all unresolved delivery identities/uncertainty. Cancellation or sender loss does not release it. |
+| Receiver terminal, observed locally | An exact correlated terminal result exists, but survivors may still know only the unresolved request. Raw-body release remains forbidden. |
+| Survivor terminal | The exact terminal identity/result/evidence and dependency state are durably recoverable under the recovery protocol. |
+| Compacted terminal | Raw material may be released only after installing the retained exact replay/rejection witness and satisfying every dependent reference. |
+
+Dispatch must consume custody-ready evidence. The protocol must define how
+receiver epoch checks, distributed fencing and already-issued permits/messages
+order effects. A local writer gate alone cannot revoke A across a partition.
+Any permitted late original effect still needs complete custody and preserved
+history, consistent with delayed old proof in the accepted-bundle target. The
+receipt that proves body durability must not be confused with evidence that the
+effect itself completed. A timeout can schedule reconciliation; it grants neither
+promotion nor a new request identity.
+
+A surviving terminal certificate is a possible compaction boundary, not an
+exception to custody before dispatch. It must bind the complete-body digest,
+original identity, receiver/target, effect kind, relevant content/version identity,
+canonical result, sufficient surviving result material for exact replay, and
+actual terminal evidence. An output hash naming A-only result bytes is insufficient
+when the promised response requires those bytes. A terminal rejection must settle
+the original effect; a stale-epoch or retryable rejection of a later envelope
+cannot clear an earlier possibly-applied attempt. A locally observed response on A
+does not become survivor-terminal merely because A intends to replicate it.
+
+Each effect kind needs a settlement rule. For example, terminal durable staging
+can settle a particular Stage command without settling a distinct CommitVersion
+command or proving caller-local Live publication. A metadata commit does not
+settle every later repair, promotion or detached response. An effect may remain
+unresolved after another effect in the same operation has settled.
+
 ## Crash-safe compaction and bounded activation
 
 The proposed release ordering is:
