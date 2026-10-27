@@ -15,7 +15,60 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-26 R85 / native formation observation
+## Current development checkpoint — 2026-10-27 R90
+
+The native per-node slice has executed actual A-only SIGKILL/reap with B/C
+remaining the same live processes and making fresh authenticated calls; R82
+also qualified retained same-root/key/listener A restart. These are concrete
+endpoint/process observations, not survivor metadata serving. All earlier
+source-specific evidence and failures remain preserved.
+
+R87 source `456bb20c` executed1PASS/1FAIL/256otherUNRUN. The carrier regression
+passed with real wrong-peer and unknown-endpoint-ID refusals, followed by a
+valid call; full3 formation refused actual epoch1 singleton assignments. R88
+source `2a0845f4` failed earlier during endpoint baseline, leaving its new
+existing-owner genesis observer unreached. R89 source `b2740e9b` executed
+0PASS/2FAIL/256otherUNRUN: same merged-view selection lost numeric held endpoints,
+but the formation case reached the read-only observer. It saw genuine retained
+genesis originals/statusCommitted/exact commit sequence2 on root/services/users.
+Those observations are DATA, not current serving authority or renewed ACKs.
+
+Mechanism review found that the adapter's new merged endpoint-list equality
+conflated membership authorization with discovery. Existing native
+`ClusterObjectRpcClient::call_endpoint` combines authorized member records with
+the exact supplied contact, then authenticates the target key and validates the
+endpoint ID at the actual receiver. R90 `f6808c68` removes only that added wrapper
+predicate; native authentication, no-retarget contact binding, receiver checks,
+all DFS source/physical/authority/fullparticipant gates and deadlines stay intact.
+No endpoint privacy or host configuration changes were made. Generic carriers
+still refuse rather than fall back or manufacture provenance.
+
+R90 source `756738b2` /4,934 inputs passed fresh check/build/seal and full DFS/KV
+boundary11UI/three libraries. Native **1PASS/1FAIL/256 other inventory controls
+UNRUN**: registered carrier proved wrong live peer refusal, unknown endpoint-ID
+refusal at the same live C address, a valid C response afterward, actual A-only
+kill and same-process B/C responses. Native wire errors retained unavailable
+delivery state. The independent full3 positive still failed after its original
+60s window with committed local genesis records and singleton assignments; no
+PREFIX peer send or A kill occurred in that failed case. Combined receipt
+`34296b5b` retains401-file equal archives, exact ELF/source/commands and42 known
+identity/group/scope/cgroup/root drains. R86's compile failure and R84's partial
+post-run lint qualification remain explicit; no old pass transfers.
+
+The next finite implementation candidate reuses the existing reconciliation
+owner: retain one memory-only continuation after an actual confirmed new genesis
+publication, after recording the settled materialization signature, including
+confirmed progress before a later Result error. Already-committed/no-change
+passes must not self-wake or write; unknown outcomes cannot invent a publication.
+This is a candidate semantic missing-edge fix, not yet executed, and grants no
+authority or activation. Existing topology/genesis/participant/fencing gates
+still decide every effect. No timer, second queue/owner, new original identity,
+serving/C1 permission or quorum reduction is introduced. Full metadata/WN
+availability, control f1, original-effect custody, bounded reconnection under
+activity and absolute-zero quietness remain open; this lane stays nonblocking
+for main rollout.
+
+## Historical development checkpoint — 2026-10-26 R85 / native formation observation
 
 R84 source `67936e50` actually exercised the unchanged60s window: **0PASS/1FAIL,
 257 other inventory controlsUNRUN**. Thirty rounds retained90 source refusals;
