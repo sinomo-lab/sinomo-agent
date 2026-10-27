@@ -103,7 +103,7 @@ fn assert_complete(
     expected: &crate::DfsMetadataQuorumSyncTarget,
     fixture: &Fixture,
 ) {
-    assert!(round.is_complete());
+    assert!(round.is_complete(), "actual native PREFIX round: {}", observed(round));
     assert_eq!(round.target(), expected);
     assert!(round.finalization_error().is_none());
     let remotes = fixture

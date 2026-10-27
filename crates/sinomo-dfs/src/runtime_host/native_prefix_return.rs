@@ -243,14 +243,16 @@ fn capture_source(
     }
     // Borrow only the already published native owner generation. Creating or
     // warming an authority observer here would be a forbidden proof fallback.
+    // This required call uses normal short cache ownership, not a status peek.
+    // Recheck the original deadline after waiting; never dispatch an old attempt.
     let slot = message_host::daemon_dfs_message_service_cache()
-        .try_existing_root(&context.data_dir.root())
+        .existing_root(&context.data_dir.root())
         .map_err(invalid)?
         .ok_or_else(|| invalid("no existing native source authority cache"))?;
     let (authority, generation) = {
         let cache = slot
-            .try_lock()
-            .map_err(|_| invalid("native source authority cache is busy"))?;
+            .lock()
+            .map_err(|_| invalid("native source authority cache is poisoned"))?;
         let entry = cache
             .as_ref()
             .ok_or_else(|| invalid("native source authority generation is unavailable"))?;
@@ -266,6 +268,7 @@ fn capture_source(
             entry.signature.metadata_authority_generation,
         )
     };
+    remaining(attempt)?;
     message_host::daemon_dfs_require_retained_authority(&authority, generation)
         .map_err(|e| invalid(e.into_dfs_error()))?;
     let projection = authority
