@@ -4,6 +4,13 @@
 //! selection, object-shard indexes, cross-shard moves, and merged scans.
 //! Durable table and journal storage stays in `metadata_backend`.
 
+// Negative scheduling seam only; no return value, DATA or authority is supplied.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static GENESIS_PREPARATION_OBSERVER: std::cell::RefCell<Option<Box<dyn Fn(u8)>>> =
+        std::cell::RefCell::new(None);
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -1076,10 +1083,18 @@ impl ResidentLocalMetadataShardHandle {
         }
         // Existing storage-owner preparation certifies/replays already durable
         // frames. It cannot author a CommitV7 or run Core namespace recovery.
+        #[cfg(test)]
+        GENESIS_PREPARATION_OBSERVER.with(|observer| {
+            if let Some(observe) = observer.borrow().as_ref() { observe(0); }
+        });
         lease.begin_consistent_read_snapshot()?;
         lease.end_consistent_read_snapshot();
+        #[cfg(test)]
+        GENESIS_PREPARATION_OBSERVER.with(|observer| {
+            if let Some(observe) = observer.borrow().as_ref() { observe(1); }
+        });
         let record = lease
-            .try_read_certified_prepared_record_for_ingress(operation_id)?
+            .read_certified_prepared_record_for_ingress(operation_id)?
             .ok_or_else(|| {
                 MetadataBackendError::Serde(
                     "strict genesis ingress preparation has no current certified materialized cut"

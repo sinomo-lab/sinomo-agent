@@ -278,3 +278,102 @@ fn required_genesis_check_waits_for_inspection_fence_without_blocking_status() {
 fn required_genesis_check_waits_for_shard_checkout_without_blocking_status() {
     required_genesis_lookup_waits_for_cache_ownership(3);
 }
+
+#[test]
+fn prepared_genesis_cut_waits_for_inspection_fence_after_actual_preparation() {
+    let _control = CONTENTION_CONTROL.lock().unwrap();
+    let (native, nodes) =
+        crate::test_support::DfsTestRuntime::start_cluster("genesis-post-preparation-fence", 1)
+            .unwrap();
+    let data = native.data_dir(&nodes[0]).clone();
+    let mut client = native.client(&nodes[0]).unwrap();
+    client.posix_mkdir("/prepared-genesis-fence").unwrap();
+    drop(client);
+    let shard = native.root_shard().unwrap();
+    let runtime = native.runtime_handle();
+    let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
+    let admission = runtime
+        .block_on(scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive))
+        .unwrap();
+    let slot = daemon_dfs_message_service_cache()
+        .existing_root(&data.root())
+        .unwrap()
+        .unwrap();
+    let resident = slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .resident_metadata_backend
+        .clone()
+        .unwrap();
+    let id = crate::DfsMetadataShardId::new(&shard.shard_id);
+    let handle = resident.scope_shard(&shard.file_system_id, &id).unwrap();
+    let root = crate::local_dfs_metadata_shard_path(&data, &id);
+    let lock = || {
+        crate::metadata_lock::metadata_write_lock(
+            root.clone(),
+            crate::metadata_cursor::journal_write_lock_path(&root),
+        )
+        .unwrap()
+    };
+    let initial = lock();
+    let (phase_tx, phase_rx) = mpsc::sync_channel(2);
+    let (continue_tx, continue_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let worker = std::thread::spawn(move || {
+        let _entered = runtime.enter();
+        crate::metadata_sharded_backend::GENESIS_PREPARATION_OBSERVER.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                phase_tx.send(phase).unwrap();
+                if phase == 1 {
+                    continue_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .unwrap();
+                }
+            }));
+        });
+        let operation = crate::default_cluster::genesis::genesis_operation_id(&shard);
+        let result = handle
+            .try_prepare_genesis_record_for_ingress(&shard, &operation)
+            .map_err(|e| e.to_string());
+        crate::metadata_sharded_backend::GENESIS_PREPARATION_OBSERVER.with(|hook| {
+            hook.borrow_mut().take();
+        });
+        result_tx.send(result).unwrap();
+    });
+    // Force a real initial inspection miss, then let real preparation finish.
+    let first = phase_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    drop(initial);
+    let prepared = phase_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let held = lock();
+    let released_observer = continue_tx.send(());
+    let early = result_rx.recv_timeout(Duration::from_millis(100));
+    let waited = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+    drop(held); // Always release actual fences before assertion/unwind.
+    let result = match early {
+        Ok(r) => r,
+        Err(_) => result_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap(),
+    };
+    worker.join().unwrap();
+    std::fs::write(data.root().join("boundary-diagnostic-genesis-post-preparation.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"first":format!("{first:?}"),"prepared":format!("{prepared:?}"),"waited":waited,"result":format!("{result:?}"),"original_deadline_met":Instant::now()<deadline})).unwrap()).unwrap();
+    drop(resident);
+    drop(slot);
+    drop(admission);
+    native.close().unwrap();
+    assert_eq!(first.unwrap(), 0);
+    assert_eq!(prepared.unwrap(), 1);
+    released_observer.unwrap();
+    assert!(
+        waited,
+        "required post-preparation observation must wait for its actual fence: {result:?}"
+    );
+    assert!(
+        matches!(result, Ok(Some(_))),
+        "actual prepared cut must remain available: {result:?}"
+    );
+}
