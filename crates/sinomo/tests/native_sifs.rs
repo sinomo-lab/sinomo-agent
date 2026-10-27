@@ -131,11 +131,48 @@ impl Node {
                         std::thread::sleep(Duration::from_millis(50));
                         continue;
                     }
+                    // Published capability is distinct from the resident
+                    // metadata generation completing bootstrap. Status reads
+                    // do not initialize stores or grant serving authority.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(!remaining.is_zero(), "isolated DFS bootstrap timed out");
+                    let request = sinomo_runtime::dfs::dfs_inspection_rpc_request(
+                        &sinomo_runtime::dfs::DaemonDfsInspectionRequest::Status,
+                    )
+                    .unwrap();
+                    let response = client
+                        .with_timeout(remaining.min(Duration::from_millis(300)))
+                        .call_request(&request)
+                        .expect("observe owned DFS bootstrap status");
+                    let sinomo_runtime::dfs::DaemonDfsInspectionResponse::Status {
+                        status: dfs_status,
+                    } = sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
+                        .expect("decode owned DFS bootstrap status")
+                    else {
+                        panic!("DFS status returned a different response contract");
+                    };
+                    if !dfs_status.incomplete_reasons.is_empty()
+                        || dfs_status.file_system_count == 0
+                        || dfs_status.object_count == 0
+                        || dfs_status.metadata_shards.is_empty()
+                        || dfs_status.metadata_shards.iter().any(|shard| {
+                            shard.primary_node_id.as_ref() != Some(&cluster.node_id)
+                                || shard.journal_last_sequence == 0
+                        })
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "owned DFS bootstrap is incomplete: {dfs_status:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                     node.sifs_readiness = Some(serde_json::json!({
                         "pid": status.pid, "launch_id": status.app_launch_id,
                         "node_id": cluster.node_id, "catalog_revision": read.revision.0,
                         "observed_term": read.observed_term, "applied_index": read.applied_index,
                         "providers": providers,
+                        "dfs_status": dfs_status,
                         "authority": "observational prerequisite only; normal route checks remain required"
                     }));
                 }
