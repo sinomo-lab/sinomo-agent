@@ -15,7 +15,50 @@ delegated work, network and writeback. Whole-host activity is diagnostic. Missin
 ownership or final-I/O coverage remains blocked. This instruction changes no
 rollout permission, resource limit, accounting setup or production scope.
 
-## Current development checkpoint — 2026-10-27 R93
+## Integration hold — 2026-10-27 R98
+
+The user requested central synchronization through `main` and back to the dev
+branches. The main owner alone coordinates those merges; this DFS owner holds
+feature edits and new validation until the integration identity is supplied.
+No deployment, push, serving activation or quietness waiver follows.
+
+Since R93, actual bootstrap-owner capture showed all three eligible providers
+selected and genuine committed genesis, followed by guarded handoffs parked at
+catch-up. Bounded first-error retention exposed `UnknownNode` before dispatch.
+The per-process fixture lacked the existing lifecycle service-catalog publisher
+used by Main and NativeDfsRuntime. Fixture commit `d8521bf2` adds that same owner;
+no discovery, participant, authority or deadline check was weakened.
+
+R97 source `3dd9f0e0` /4,937 inputs and ELF `3984e532` executed three distinct
+controls: **1PASS/2FAIL/261otherUNRUN**. The full3 control actually completed a
+root epoch2/seq2 native PREFIX round with both genuine target-bound returns, then
+killed/reaped A. The whole case nevertheless FAILED when B lacked C's held
+listener descriptor. The separate registered-endpoint identity regression passed;
+the ordinary target-addressed control failed its original startup baseline.
+Full DFS/KV boundary passed11UI/three-library analysis. All failures remain failed.
+
+R98 code `852e30e5afb3c9ec02b40763e16d07e92b1a103c` piggybacks a source's actual
+held-listener descriptor from state already read by an existing fixture probe.
+The parent binds this route DATA to that same owned process; the registered
+native carrier must still authenticate the intended peer and validate the current
+endpoint ID. Foreign-owner and changed-ID negative assertions were added. There
+is no route retry/fallback, endpoint synthesis, private provenance from DATA,
+new query, warming, authority mutation or production wire change.
+
+R98 source `d1e9a958` /4,937 inputs passed fresh typecheck12.767612s,
+codegen349.494322s and artifact seal3.610858s. **All264runtime controls and the
+current-source full boundary gate remain UNRUN** because the integration hold
+arrived during this existing build. R97 results do not transfer. I319 receipt
+`a1e5a35b` preserves exact source/ELF, commands, resources, archive and completed
+owned cleanup. R74 onward sources/results and original unknown effects remain
+immutable. After coordinated integration, qualify the actual merged source
+before interpreting the prepared I320/I321 scopes; do not reuse a stale binding.
+
+The original survivor-read/write, majority history/fencing/custody, rejoin and
+absolute-zero stabilized-maintenance acceptance remain open. Full3 baseline
+observation is not serving authority or completed abrupt-loss availability.
+
+## Historical development checkpoint — 2026-10-27 R93
 
 The original per-node process gap is implemented and has actual native evidence:
 R81/R90/R92 killed and reaped only A while B/C retained their exact PID/start
