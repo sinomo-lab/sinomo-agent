@@ -544,6 +544,7 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
             Option<DfsMetadataShardMembershipHandoff>,
             Option<DfsMetadataShardMembershipHandoffProof>,
         )>,
+        confirmed_new_genesis_commit: &mut bool,
     ) -> Result<(), DfsError> {
         let runtime = tokio::runtime::Handle::current();
         let transport = crate::runtime_host::daemon_dfs_node_transport_on_runtime(
@@ -628,7 +629,10 @@ impl DfsControlPlaneDefaultClusterAsyncBootstrapHost {
                     }
                     #[cfg(test)]
                     defer_native_genesis_completion(&self.data_dir, shard, &record)?;
-                    service.commit_stored_prepared_operation(&record.digest)?;
+                    let publication = service.commit_stored_prepared_operation(&record.digest)?;
+                    // Keep only confirmed semantic progress across a later
+                    // shard/object error. Unknown outcomes never set this bit.
+                    *confirmed_new_genesis_commit |= publication.published;
                 }
             } else if service
                 .metadata_backend

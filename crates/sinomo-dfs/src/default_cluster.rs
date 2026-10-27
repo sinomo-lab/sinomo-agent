@@ -4,6 +4,8 @@
 //! service advertisements that make a cluster's DFS usable after bootstrap.
 
 pub(crate) mod genesis;
+#[cfg(test)]
+mod genesis_followup_tests;
 
 use serde::Serialize;
 use sinomo_core::local::SinomoDataDir;
@@ -189,8 +191,9 @@ fn request_default_materialization_immediate_retry(data_root: PathBuf) {
 /// Consume an edge requesting one immediate materialization generation.
 ///
 /// The edge is emitted when a bounded pass stops at its mutation cap or when
-/// a pass first establishes a dynamic replica-progress dependency. The
-/// daemon's sole reconciliation owner uses it to continue bounded work or
+/// a pass first establishes a dynamic replica-progress dependency, or an
+/// original native genesis is newly confirmed committed. The daemon's sole
+/// reconciliation owner uses it to continue bounded work or
 /// verify the new subscription against the resident snapshot without a
 /// polling timer.
 pub fn take_default_cluster_dfs_materialization_immediate_retry(data_dir: &SinomoDataDir) -> bool {
@@ -795,16 +798,26 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
                     &tokio::runtime::Handle::current(),
                 )
                 .await?;
-            self.publish_current_bootstrap(
+            let mut confirmed_new_genesis_commit = false;
+            let result = self.publish_current_bootstrap(
                 publication_provider,
                 &file_system,
                 shards,
                 bootstrap_owner_node_ids,
                 fallback_owner_node_id,
                 evidence,
-            )?;
-            record_default_materialization(self.data_dir.root(), signature, false);
-            Ok(())
+                &mut confirmed_new_genesis_commit,
+            );
+            if result.is_ok() {
+                record_default_materialization(self.data_dir.root(), signature, false);
+            }
+            if confirmed_new_genesis_commit {
+                // The settled record above clears old retry state. Publish the
+                // actual semantic edge afterward, including after a later Err.
+                // The existing sole reconciliation owner consumes/notifies it.
+                request_default_materialization_immediate_retry(self.data_dir.root());
+            }
+            result
         })
     }
 }
