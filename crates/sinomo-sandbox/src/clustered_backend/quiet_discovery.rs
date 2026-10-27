@@ -70,7 +70,28 @@ fn empty_recovery_discovery_does_not_rebind_a_current_primary() {
         Some(native.runtime_handle()),
     );
     drop(context);
+    #[cfg(unix)]
+    let content_shard = backend
+        .data_dir
+        .dfs_dir()
+        .join("content/content-reservations/00");
+    #[cfg(unix)]
+    let content_mark = {
+        std::fs::File::open(&content_shard)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        std::fs::metadata(&content_shard)
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
     let result = backend.run_lifecycle_recovery_scan(BTreeSet::new());
+    #[cfg(unix)]
+    let content_after = std::fs::metadata(&content_shard)
+        .unwrap()
+        .modified()
+        .unwrap();
     let after = std::fs::read(&marker).unwrap();
     let after_mark = std::fs::metadata(&marker).unwrap().modified().unwrap();
     eprintln!(
@@ -102,6 +123,11 @@ fn empty_recovery_discovery_does_not_rebind_a_current_primary() {
         "empty discovery must not advance an already activated primary's durable rebind checkpoint"
     );
     assert_eq!(after_mark, before_mark);
+    #[cfg(unix)]
+    assert_eq!(
+        content_after, content_mark,
+        "empty recovery discovery must not stage a redundant content sentinel"
+    );
 }
 
 #[test]
