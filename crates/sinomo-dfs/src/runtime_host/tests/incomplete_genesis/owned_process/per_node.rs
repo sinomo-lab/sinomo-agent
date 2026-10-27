@@ -78,7 +78,10 @@ enum ProbeKind {
     RegisteredEndpointWrongPeer,
     RegisteredEndpointWrongId,
     RequestMetadataMembers,
+    PreparePrefixBaseline,
+    ObserveOwnedEndpoint,
     PrefixRound,
+    PrefixRoundWrongKey,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProbePath {
@@ -96,8 +99,8 @@ impl ProbeKind {
             | Self::FormationEndpointPing
             | Self::RegisteredEndpointWrongPeer
             | Self::RegisteredEndpointWrongId => ProbePath::RegisteredNativeEndpoint,
-            Self::PrefixRound => ProbePath::NativePrefixOwner,
-            Self::RequestMetadataMembers => ProbePath::NativeMetadataConfiguration,
+            Self::PrefixRound | Self::PrefixRoundWrongKey => ProbePath::NativePrefixOwner,
+            Self::RequestMetadataMembers | Self::PreparePrefixBaseline | Self::ObserveOwnedEndpoint => ProbePath::NativeMetadataConfiguration,
             _ => ProbePath::AuthenticatedEndpoint,
         }
     }
@@ -672,7 +675,7 @@ fn probe_with_routes(
                 assert_eq!(&ping.responder_node_id, target);
                 assert_eq!(reply.responder_node_id.as_deref(), Some(target.as_str()));
             }
-            ProbeKind::PrefixRound => {
+            ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey => {
                 assert_eq!(reply.route, DRIVER_ROUTE);
                 assert_eq!(target, &node.input.node_id);
                 let data: serde_json::Value =
@@ -681,6 +684,21 @@ fn probe_with_routes(
                 assert_eq!(data["family"], "native-prefix-full-assignment");
                 // This is DATA describing checks inside the actual owner. No
                 // private round/capability can be reconstructed in the parent.
+            }
+            ProbeKind::ObserveOwnedEndpoint => {
+                assert_eq!(reply.route, DRIVER_ROUTE);
+                assert_eq!(target, &node.input.node_id);
+                let endpoint: sinomo_core::ClusterEndpointRecord = sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
+                assert_eq!(endpoint.node_id, node.input.node_id);
+                assert_eq!(endpoint.address, node.hello.as_ref().unwrap().address);
+            }
+            ProbeKind::PreparePrefixBaseline => {
+                assert_eq!(reply.route, DRIVER_ROUTE);
+                assert_eq!(target, &node.input.node_id);
+                let data: serde_json::Value = sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
+                assert!(matches!(data["state"].as_str(), Some("Waiting" | "FullAssignmentSynchronized")));
+                assert_eq!(data["sync_attempted"], data["state"] == "FullAssignmentSynchronized");
+                assert_eq!(data["classification"], "fixture-startup-activity-data-only");
             }
             ProbeKind::RequestMetadataMembers => {
                 assert_eq!(reply.route, DRIVER_ROUTE);
@@ -737,6 +755,7 @@ fn observed_owned_contact(
     let entry = report["probes"].as_array().unwrap().iter().rev().find(|entry| {
         entry["source"] == node.input.node_id.as_str()
             && entry["source_pid"] == identity.pid
+            && entry["phase"] == "target-owned-native-directory-observation"
             && !entry["source_contact"].is_null()
     }).ok_or("same owned process has no actual observed local endpoint; no synthesis")?;
     let endpoint: sinomo_core::ClusterEndpointRecord =
@@ -745,6 +764,20 @@ fn observed_owned_contact(
     assert_eq!(endpoint.address, node.hello.as_ref().unwrap().address);
     Ok(endpoint) // Route DATA only; the native carrier still checks current identity.
 }
+// Query the SAME directory composition used by this actual native receiver's
+// authenticated routed handshake. A bootstrap file alone is not that view.
+fn current_owned_contact(
+    node: &mut NativeNode, deadline: Instant, root: &Path, report: &mut serde_json::Value,
+) -> TestResult<sinomo_core::ClusterEndpointRecord> {
+    let target = node.input.node_id.clone();
+    let result = probe(node, &target, ProbeKind::ObserveOwnedEndpoint,
+        format!("owned-endpoint-{}", sinomo_core::Id::generate()),
+        OP_CAP.min(deadline.saturating_duration_since(Instant::now())));
+    record_probe(root, report, "target-owned-native-directory-observation", &result)?;
+    let reply = result?.result.map_err(|e| e.error)?;
+    Ok(sinomo_core::object::serde_ext::from_bytes(&reply.body)?)
+}
+
 fn owned_prefix_route_hints(nodes: &mut [NativeNode], report: &serde_json::Value)
     -> TestResult<PrefixRouteHints>
 {
@@ -770,13 +803,13 @@ fn wait_for_native_ping(
         }
         let target_id = nodes[target].input.node_id.clone();
         let nonce = format!("baseline-{source}-{target}-{}", sinomo_core::Id::generate());
-        let result = probe(
-            &mut nodes[source],
-            &target_id,
-            kind,
-            nonce,
-            OP_CAP.min(deadline.saturating_duration_since(Instant::now())),
-        );
+        let result = (|| {
+            let hint = if matches!(kind, ProbeKind::RegisteredEndpointPing | ProbeKind::FormationEndpointPing) {
+                Some(current_owned_contact(&mut nodes[target], deadline, root, report)?)
+            } else { None };
+            probe_with_contact(&mut nodes[source], &target_id, kind, nonce,
+                OP_CAP.min(deadline.saturating_duration_since(Instant::now())), hint)
+        })();
         record_probe(root, report, "baseline-native-ping", &result)?;
         if matches!(&result,Ok(value) if value.result.is_ok()) {
             if Instant::now() >= deadline {
@@ -1127,6 +1160,7 @@ fn run_native_process_case(
             let mut observations = Vec::new();
             let mut rounds = 0;
             let mut membership_request_done = false;
+            let mut prefix_setup_done = false;
             // Listener/ping readiness is not DFS-owner readiness. Observe the
             // existing owner within the ORIGINAL startup deadline, without
             // warming/reopening it or replacing an expected generation.
@@ -1163,6 +1197,29 @@ fn run_native_process_case(
                             .min(deadline.saturating_duration_since(Instant::now())));
                         continue;
                     }
+                }
+                if !prefix_setup_done {
+                    // Configuration and quorum durability are not all-member
+                    // readiness. Perform ONE explicit native setup operation;
+                    // an error/timeout is retained and never resubmitted.
+                    let source = nodes[0].input.node_id.clone();
+                    let result = probe(&mut nodes[0], &source, ProbeKind::PreparePrefixBaseline,
+                        format!("fixture-prefix-setup-{}", sinomo_core::Id::generate()),
+                        OP_CAP.min(deadline.saturating_duration_since(Instant::now())));
+                    record_probe(&root, &mut report, "explicit-full-assignment-startup-sync", &result)?;
+                    let reply = result?.result.map_err(|e| e.error)?;
+                    let setup: serde_json::Value = sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
+                    if setup["state"] == "Waiting" && setup["sync_attempted"] == false {
+                        // Same existing startup deadline/wait; no sync was sent.
+                        std::thread::sleep(Duration::from_secs(2)
+                            .min(deadline.saturating_duration_since(Instant::now())));
+                        continue;
+                    }
+                    if setup["state"] != "FullAssignmentSynchronized" || setup["sync_attempted"] != true {
+                        return Err("native prefix setup returned no explicit completed operation".into());
+                    }
+                    report["prefix_startup_sync"] = setup;
+                    prefix_setup_done = true;
                 }
                 let hints = owned_prefix_route_hints(&mut nodes, &report)?;
                 for node in &mut nodes {
@@ -1206,6 +1263,18 @@ fn run_native_process_case(
             Some(owned_prefix_route_hints(&mut nodes, &report)?)
         } else { None };
         if let Some(hints) = &prefix_hints {
+            let source = nodes[0].input.node_id.clone();
+            let key_control = probe_with_routes(&mut nodes[0], &source, ProbeKind::PrefixRoundWrongKey,
+                format!("prefix-wrong-held-key-{}", sinomo_core::Id::generate()), OP_CAP, None, Some(hints.clone()));
+            record_probe(&root, &mut report, "PREFIX-current-member-key-refusal", &key_control)?;
+            let reply = key_control?.result.map_err(|e| e.error)?;
+            let key_control: serde_json::Value = sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
+            assert_eq!(key_control["complete"], false);
+            assert!(key_control["peers"].as_array().unwrap().iter().any(|p|
+                p["native_present"] == false && p["error"].as_str().is_some_and(|e|
+                    e.contains("no matching current member/key"))));
+            assert!(key_control["peers"].as_array().unwrap().iter().any(|p|
+                p["native_present"] == true && p["binding_valid"] == true));
             let wrong_peer = nodes[2].input.node_id.clone();
             let other_peer = nodes[1].input.node_id.clone();
             let mut foreign = hints.clone();

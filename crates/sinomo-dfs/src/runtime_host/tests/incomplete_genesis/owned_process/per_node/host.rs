@@ -134,22 +134,54 @@ async fn probe(
     selected: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
     observed_source: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
 ) -> Result<ProbeReply, NetworkError> {
-    if request.prefix_contact_hints.is_some() && !matches!(request.kind, ProbeKind::PrefixRound) {
+    if request.prefix_contact_hints.is_some() && !matches!(request.kind, ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey) {
         return Err(invalid("PREFIX route hints are not admitted for this probe kind"));
     }
     if request.owned_contact_hint.is_some()
-        && !matches!(request.kind, ProbeKind::RegisteredEndpointPing
+        && !matches!(request.kind, ProbeKind::RegisteredEndpointPing | ProbeKind::FormationEndpointPing
             | ProbeKind::RegisteredEndpointWrongId)
     {
         return Err(invalid("owned route hint is not admitted for this probe kind"));
     }
-    if matches!(request.kind, ProbeKind::PrefixRound) {
+    if matches!(request.kind, ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey) {
         return prefix::probe(
             request, deadline, root, runtime, source, cluster, peers, contacts,
         );
     }
     if matches!(request.kind, ProbeKind::RequestMetadataMembers) {
         return membership::request(request, deadline, root, runtime, source, cluster, peers).await;
+    }
+    if matches!(request.kind, ProbeKind::PreparePrefixBaseline) {
+        return membership::prepare_prefix_baseline(request, deadline, root, runtime, source, cluster, peers).await;
+    }
+    if matches!(request.kind, ProbeKind::ObserveOwnedEndpoint) {
+        if request.target != *source {
+            return Err(invalid("owned endpoint observation must execute at its actual target"));
+        }
+        let data = SinomoDataDir::new(root);
+        let paths = ClusterPaths::new(&data);
+        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
+            &crate::runtime_host::DfsRuntimePaths::new(&data),
+        ).map_err(|e| invalid(e.to_string()))?;
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
+        if owner.physical_data_root() != root || state.local_node_id != *source || state.cluster_id != *cluster {
+            return Err(invalid("owned endpoint observation changed actual source/root/cluster"));
+        }
+        // This is exactly the receiver's resolve_authenticated_transport_peer
+        // composition, read only. It supplies no authentication or grant.
+        let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+            sinomo_core::network::cluster_directory_for(&paths), &state,
+        ).snapshot()?;
+        let (address, key) = contacts.get(source).ok_or_else(|| invalid("actual held listener missing"))?;
+        let member = directory.node(source).filter(|m| &m.public_key == key)
+            .ok_or_else(|| invalid("receiver directory lacks its current owner/key"))?;
+        let endpoint = member.endpoints.iter().find(|e| &e.node_id == source
+            && &e.address == address && matches!(e.transport,
+                sinomo_core::ClusterTransportKind::Loopback | sinomo_core::ClusterTransportKind::LanTcp))
+            .ok_or_else(|| invalid(format!("receiver directory has no current descriptor for its held listener; observed endpoints: {:?}", member.endpoints)))?;
+        *observed_source.lock().unwrap() = Some(endpoint.clone());
+        return Ok(ProbeReply { responder_node_id: None, route: DRIVER_ROUTE.into(),
+            body: crate::metadata_io::encode_sobj(endpoint).map_err(|e| invalid(e.to_string()))? });
     }
     let wire = match request.kind {
         ProbeKind::Ping
@@ -164,7 +196,7 @@ async fn probe(
         ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
             ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())?
         }
-        ProbeKind::PrefixRound | ProbeKind::RequestMetadataMembers => unreachable!("native owner call dispatched above"),
+        ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey | ProbeKind::RequestMetadataMembers | ProbeKind::PreparePrefixBaseline | ProbeKind::ObserveOwnedEndpoint => unreachable!("native owner call dispatched above"),
     };
     let route = wire.route.clone();
     let remaining = deadline
@@ -365,7 +397,7 @@ async fn probe(
             // Preserve only an actual native header, never copy the target.
             header_responder
         }
-        ProbeKind::PrefixRound | ProbeKind::RequestMetadataMembers => unreachable!("native owner call dispatched above"),
+        ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey | ProbeKind::RequestMetadataMembers | ProbeKind::PreparePrefixBaseline | ProbeKind::ObserveOwnedEndpoint => unreachable!("native owner call dispatched above"),
     };
     if Instant::now() >= deadline {
         return Err(NetworkError::timeout(
