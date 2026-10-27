@@ -80,7 +80,7 @@ fn validate_configuration(
         let endpoint = &member.endpoints[0];
         let address: SocketAddr = endpoint.address.parse()?;
         if endpoint.node_id != member.node_id
-            || address.ip() != Ipv4Addr::LOCALHOST
+            || !matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_private())
             || address.port() == 0
             || !endpoints.insert(address)
             || !matches!(
@@ -179,6 +179,20 @@ async fn probe(
             && &e.address == address && matches!(e.transport,
                 sinomo_core::ClusterTransportKind::Loopback | sinomo_core::ClusterTransportKind::LanTcp))
             .ok_or_else(|| invalid(format!("receiver directory has no current descriptor for its held listener; observed endpoints: {:?}", member.endpoints)))?;
+        // Do not run a positive baseline on the parent-supplied bootstrap LAN
+        // hint. Require the actual native listener producer's local projection
+        // (including its real loopback control endpoint) to match this receiver
+        // descriptor. Publication/readiness may wait only in the original cap.
+        let local = state.members.iter().find(|m| &m.node_id == source
+            && m.state.is_authorized() && &m.node_public_key == key)
+            .ok_or_else(|| invalid("native listener owner/member key unavailable"))?;
+        let port = address.parse::<SocketAddr>().map_err(|e| invalid(e.to_string()))?.port();
+        if !local.endpoints.iter().any(|e| e == endpoint)
+            || !local.endpoints.iter().any(|e| e.node_id == *source
+                && e.transport == sinomo_core::ClusterTransportKind::Loopback
+                && e.address == format!("127.0.0.1:{port}")) {
+            return Err(invalid("actual native listener advertisement has not replaced bootstrap hints"));
+        }
         *observed_source.lock().unwrap() = Some(endpoint.clone());
         return Ok(ProbeReply { responder_node_id: None, route: DRIVER_ROUTE.into(),
             body: crate::metadata_io::encode_sobj(endpoint).map_err(|e| invalid(e.to_string()))? });
@@ -557,11 +571,18 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
     let identity = sinomo_core::node::load_or_create_main_node_identity(&data.root())?;
     // Keep an owned ephemeral conflict alive while the maintained helper
     // chooses and retains a real fallback listener with a reported port.
-    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    // A peer's loopback listener is LocalOnly and is correctly withdrawn from
+    // remote directory publication. Use the normal native wildcard listener
+    // with an ACTUAL private interface for peer calls, and loopback for parent
+    // control. No host/interface configuration or authentication is changed.
+    let peer_ip = sinomo_core::network::discover_default_lan_ip_candidates().into_iter()
+        .find_map(|ip| match ip { std::net::IpAddr::V4(ip) if ip.is_private() => Some(ip), _ => None })
+        .ok_or("native peer fixture requires an existing private IPv4 interface")?;
+    let occupied = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     let occupied_port = occupied.local_addr()?.port();
     let listener =
         sinomo_daemon::prepare_daemon_control_listener(sinomo_daemon::DaemonRunOptions {
-            host: Ipv4Addr::LOCALHOST.to_string(),
+            host: Ipv4Addr::UNSPECIFIED.to_string(),
             port: occupied_port,
             port_fallback: true,
         })?;
@@ -573,7 +594,7 @@ pub(super) fn run_node(input: NodeInput) -> TestResult<()> {
         pid: std::process::id(),
         invocation: input.invocation.clone(),
         node_id: input.node_id.clone(),
-        address: format!("127.0.0.1:{}", listener.options().port),
+        address: format!("{peer_ip}:{}", listener.options().port),
         public_key: identity.public_key,
     };
     write_data(&input.owned_root.join("hello.sobj"), &hello)?;
@@ -872,8 +893,9 @@ fn run_retained_node(input: &NodeInput, expected: &RetainedNodeStart) -> TestRes
     }
     previous_owned_process_absent(expected)?;
     let address: SocketAddr = expected.address.parse()?;
-    if address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 {
-        return Err("retained native listener is not its exact original loopback contact".into());
+    if !matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_private()) || address.port() == 0
+        || !sinomo_core::network::discover_default_lan_ip_candidates().contains(&address.ip()) {
+        return Err("retained native listener lacks its exact original private interface contact".into());
     }
     let hello_path = input.owned_root.join("restart-hello.sobj");
     match fs::symlink_metadata(&hello_path) {
@@ -883,7 +905,7 @@ fn run_retained_node(input: &NodeInput, expected: &RetainedNodeStart) -> TestRes
     }
     let listener =
         sinomo_daemon::prepare_daemon_control_listener(sinomo_daemon::DaemonRunOptions {
-            host: Ipv4Addr::LOCALHOST.to_string(),
+            host: Ipv4Addr::UNSPECIFIED.to_string(),
             port: address.port(),
             port_fallback: false,
         })?;

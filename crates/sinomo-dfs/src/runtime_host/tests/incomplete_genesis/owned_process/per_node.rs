@@ -272,7 +272,7 @@ fn read_hello(node: &mut NativeNode, deadline: Instant) -> TestResult<NodeHello>
                 assert_eq!(hello.node_id, node.input.node_id);
                 assert_eq!(hello.invocation, node.input.invocation);
                 let address: std::net::SocketAddr = hello.address.parse()?;
-                assert!(address.ip().is_loopback() && address.port() != 0);
+                assert!(matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_private()) && address.port() != 0);
                 assert!(
                     !hello.public_key.is_empty()
                         && hello.public_key.len() <= 128
@@ -536,14 +536,18 @@ fn local_rpc(
         sinomo_daemon::DaemonObjectRpcAsyncHost::new(runtime.handle(), false).with_paths(&paths);
     let key = sinomo_core::network::cached_daemon_signing_public_key(&data)?;
     let endpoint = NodeId::derived("sinomo.network.local-object-rpc-call", &key);
-    let pool_scope = format!("local-object-rpc:{}:{endpoint}", hello.address);
+    // Parent control stays on the same actual listener's loopback address;
+    // peer calls use its separately observed private-interface descriptor.
+    let port = hello.address.parse::<std::net::SocketAddr>()?.port();
+    let control_address = format!("127.0.0.1:{port}");
+    let pool_scope = format!("local-object-rpc:{control_address}:{endpoint}");
     let deadline = Instant::now() + budget;
     let result = runtime.block_on(async {
         let response = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
             ClusterObjectRpcClient::endpoint_only(&mut host)
                 .call_loopback(
                     &data,
-                    &hello.address,
+                    &control_address,
                     ObjectRpcCall::value(request),
                     ClusterObjectRpcOptions::new(DaemonRpcTimeouts::connect_and_idle(budget))
                         .with_overall_timeout(budget),
