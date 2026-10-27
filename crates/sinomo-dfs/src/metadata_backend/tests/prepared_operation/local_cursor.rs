@@ -156,6 +156,42 @@ fn write_hint(root: &Path, shard: &DfsMetadataShardId, sequence: u64) {
 #[test]
 fn strict_reopen_preserves_lagging_local_cursor_and_all_existing_bytes() {
     let cut = native_cuts("strict-local-cursor-idle");
+    let sequences = (1..=cut.base.journal_sequence).collect::<Vec<_>>();
+    let frames = || {
+        crate::metadata_journal::read_segmented_journal_frames_at_sequences(
+            cut.root.path(),
+            &sequences,
+        )
+        .unwrap()
+        .into_iter()
+        .zip(&sequences)
+        .map(|(frame, sequence)| {
+            let frame = frame.expect("actual native base frame");
+            assert_eq!(frame.entry().shard_id, cut.shard);
+            assert_eq!(frame.entry().sequence, *sequence);
+            frame.exact_bytes().to_vec()
+        })
+        .collect::<Vec<_>>()
+    };
+    let before_admission = frames();
+    // The copied physical root has not yet been admitted. Its real strict
+    // owner must certify the existing frames and repair derived head/tail
+    // locators before this control can measure unchanged-owner reconstruction.
+    let admitted = LocalSobjMetadataBackend::new(cut.shard.clone(), cut.root.path()).unwrap();
+    assert_eq!(admitted.metadata_prefix_proof().unwrap(), cut.base);
+    assert_eq!(admitted.next_sequence, cut.base.journal_sequence + 1);
+    let head: crate::metadata_journal::DfsMetadataJournalHead =
+        crate::metadata_io::read_sobj(&crate::metadata_cursor::journal_head_path(cut.root.path()))
+            .unwrap();
+    assert_eq!(head.next_sequence, cut.base.journal_sequence + 1);
+    assert_eq!(
+        frames(),
+        before_admission,
+        "admission retains exact native frames"
+    );
+    drop(admitted);
+    // Reintroduce lag AFTER real admission, so the unchanged-file assertion
+    // still catches the original redundant local-cursor persistence bug.
     // This negative scheduling hint cannot change the real native table cut.
     write_hint(cut.root.path(), &cut.shard, cut.base.journal_sequence - 1);
     let before = files(cut.root.path());
