@@ -951,7 +951,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // unfinished prepares. The successor's normal epoch recovery
             // re-certifies those exact bodies and retires their old reservations;
             // deleting this proposal would lose an explicit operator request.
-            if self.reconcile_metadata_shard_membership_handoff(&handoff, timeout)? {
+            #[cfg(test)]
+            if let Some((root, _)) = self.native_publication_owner_for_observation() {
+                crate::default_cluster::bootstrap_observation::record(&root, &self.node_id, "handoff-executor-start", ||
+                    serde_json::json!({"handoff":handoff,"timeout_millis":timeout.as_millis()}));
+            }
+            let outcome = self.reconcile_metadata_shard_membership_handoff(&handoff, timeout);
+            #[cfg(test)]
+            if let Some((root, _)) = self.native_publication_owner_for_observation() {
+                crate::default_cluster::bootstrap_observation::record(&root, &self.node_id, "handoff-executor-result", ||
+                    serde_json::json!({"handoff_id":handoff.handoff_id,"result":outcome.as_ref().map(|v|*v).map_err(|e|e.to_string())}));
+            }
+            if outcome? {
                 completed += 1;
                 // An actual activation can invalidate the admitted owner cut.
                 // Keep later proposals durable for normal release/readmission.
@@ -1873,6 +1884,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         );
         self.transport.set_operation_deadline(previous_deadline);
         self.clear_pending_metadata_sync_replications_for_barrier(&probe_barrier_id);
+        #[cfg(test)]
+        if let Some((root, _)) = self.native_publication_owner_for_observation() {
+            crate::default_cluster::bootstrap_observation::record(&root, &self.node_id, "handoff-sync-result", ||
+                serde_json::json!({"target":target,"barrier":probe_barrier_id,"purpose":format!("{purpose:?}"),
+                    "required_intersection":required_intersection,"result":result.as_ref().map(|v|v).map_err(|e|e.to_string())}));
+        }
         result
     }
 

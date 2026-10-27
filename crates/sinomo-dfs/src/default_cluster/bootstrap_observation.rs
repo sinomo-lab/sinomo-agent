@@ -77,7 +77,7 @@ impl Drop for CaptureGuard {
         }
     }
 }
-pub(super) fn record(
+pub(crate) fn record(
     root: &Path,
     node: &NodeId,
     stage: &'static str,
