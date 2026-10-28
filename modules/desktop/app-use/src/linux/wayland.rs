@@ -84,7 +84,14 @@ pub fn capabilities() -> DesktopCapabilities {
     };
     match std::thread::spawn(|| portal::runtime()?.block_on(portal::capabilities())).join() {
         Ok(Ok((capture, input))) => {
-            caps.capture = capture;
+            if capture {
+                match pipewire::check_available() {
+                    Ok(()) => caps.capture = true,
+                    Err(error) => caps
+                        .limitations
+                        .push(format!("PipeWire capture client unavailable: {error}")),
+                }
+            }
             caps.keyboard_mouse = input;
         }
         Ok(Err(error)) => caps.limitations.push(error.to_string()),
@@ -263,8 +270,11 @@ pub fn capture(
     stop: mpsc::Receiver<()>,
     ready: mpsc::SyncSender<DesktopResult<()>>,
 ) -> DesktopResult<()> {
-    let result = Lease::acquire(&config.target, &permissions, false)
-        .and_then(|lease| lease.remote().map(|fd| (lease, fd)));
+    let result = Lease::acquire(&config.target, &permissions, false).and_then(|lease| {
+        pipewire::check_available()
+            .map_err(|error| unsupported(&format!("PipeWire client unavailable: {error}")))?;
+        lease.remote().map(|fd| (lease, fd))
+    });
     let (lease, fd) = match result {
         Ok(pair) => pair,
         Err(error) => {

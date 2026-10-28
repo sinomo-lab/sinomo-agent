@@ -308,6 +308,12 @@ pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
     // Drop all OS handles and join workers before releasing callback code.
     *state().lock().unwrap_or_else(|e| e.into_inner()) = State::default();
     device::shutdown();
+    // Lifecycle admission is closed, and device/portal capture workers have
+    // joined. No PipeWire object or callback can outlive its optional library.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        pipewire::release_optional_runtime();
+    }
     *HOST.lock().unwrap_or_else(|e| e.into_inner()) = None;
     SINOMO_MODULE_STATUS_OK
 }

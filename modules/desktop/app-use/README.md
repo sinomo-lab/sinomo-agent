@@ -53,10 +53,12 @@ for recorded real-agent tests of both modes through the same tools.
 
 ## Linux X11
 
-Building the Linux provider requires PipeWire development headers, pkg-config
-and libclang (for the native bindings). The resulting `.so` requires
-`libpipewire-0.3.so.0` at runtime on both X11 and Wayland. These dependencies stay
-in the external provider package, outside the daemon's linked implementation.
+The Linux provider builds with bundled PipeWire/SPA ABI headers and ordinary C
+and libclang build tools. Loading or installing the provider does not require
+GUI client libraries. X11 uses its existing Rust protocol client. Wayland capture
+loads the optional `libpipewire-0.3.so.0` API only when needed; missing or
+incompatible symbols make capture unavailable without preventing headless use.
+Portal-based input remains independently available when its portal supports it.
 
 Run the daemon in the user's local X11 session with its `DISPLAY` and
 `XAUTHORITY`. The target monitor is the X screen's complete virtual desktop.
@@ -82,8 +84,9 @@ window, checks pixels and input delivery, and checks revocation and cleanup.
 ## Linux Wayland
 
 Run the provider in the desktop user's session with its `WAYLAND_DISPLAY` (or
-`XDG_SESSION_TYPE=wayland`), session D-Bus and `XDG_RUNTIME_DIR`. Install
-`xdg-desktop-portal` and the desktop's ScreenCast/RemoteDesktop portal backend.
+`XDG_SESSION_TYPE=wayland`), session D-Bus and `XDG_RUNTIME_DIR`. The desktop must
+provide its ScreenCast/RemoteDesktop portal backend for these optional functions.
+Sinomo installation does not install or configure a GUI stack on a server.
 Capture uses native PipeWire buffers from the [ScreenCast portal's restricted
 descriptor](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html);
 input uses the [RemoteDesktop portal's keyboard/pointer notification

@@ -1,0 +1,32 @@
+{
+  "source": "https://github.com/PipeWire/pipewire",
+  "revision": "9558a5d5e0360d8af822431c76ee858a8c7495ac",
+  "version": "0.3.65",
+  "selection": "PipeWire and SPA public C headers only; SPA inline functions compile into the module. No shared PipeWire library or daemon is required to build/load the module.",
+  "rust_crates": {
+    "source": "https://gitlab.freedesktop.org/pipewire/pipewire-rs",
+    "versions": {
+      "pipewire": "0.10.1",
+      "pipewire-sys": "0.10.1",
+      "libspa": "0.10.1",
+      "libspa-sys": "0.10.1"
+    },
+    "registry_checksums": {
+      "libspa": "882f7427e7989dcc9d388b7f05c4630390a1d7696f9ffa469cd4a7a48f0b4c40",
+      "libspa-sys": "3b6e17bdaf63ed0d5e4144022624032b41fd9733112e8c74ac26fc9bf1291924",
+      "pipewire": "bde71084c4e25959d68f1ea54daa75e5ecdb338e5caf0b5510143b79baa32d5c",
+      "pipewire-sys": "9ce653f53e63e5b93853218092ee9a8906a5d082c92f3f1db26316955dd63ce0"
+    }
+  },
+  "local_changes": "Vendored ABI headers replace system-deps probing; SPA inline glue is linked statically. The private PipeWire client binding exposes and requires its referenced C symbol surface through runtime-optional loading. Initialization/library handles are released after module workers drain. Raw C varargs are called through checked function pointers. No portal FD or consent changes.",
+  "header_backports": [
+    {
+      "symbol": "SPA_MEDIA_SUBTYPE_opus",
+      "value": "0x10010",
+      "introduced": "0.3.68",
+      "reference_revision": "8fa27cabdc6c0c1350c69c026af5850ef0af1e26",
+      "reference_path": "spa/include/spa/param/format.h",
+      "effect": "Enum discriminant only; no host codec support or newer C layout/function required."
+    }
+  ]
+}

@@ -141,7 +141,7 @@ fn run(
     stop: mpsc::Receiver<()>,
     ready: &mut Option<mpsc::SyncSender<DesktopResult<()>>>,
 ) -> DesktopResult<()> {
-    pw::init();
+    pw::try_init().map_err(|error| unsupported(&format!("PipeWire client unavailable: {error}")))?;
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(platform)?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(platform)?;
     let core = context.connect_fd_rc(fd, None).map_err(platform)?;
