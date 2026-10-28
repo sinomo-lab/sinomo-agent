@@ -1343,6 +1343,42 @@ impl DaemonClusterControlServiceHost {
 }
 
 impl sinomo_core::cluster::ClusterControlServiceHost for DaemonClusterControlServiceHost {
+    fn recover_endpoint(
+        &self,
+        request: sinomo_core::cluster::EndpointRecoveryRequest,
+    ) -> sinomo_core::cluster::ClusterControlServiceFuture<
+        '_,
+        sinomo_core::cluster::EndpointRecoveryResponse,
+    > {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let runtime = require_service_runtime(runtime.as_ref(), "endpoint recovery")?.clone();
+            run_blocking_service_task(
+                sinomo_core::cluster::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
+                "endpoint recovery",
+                move || {
+                    let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(&paths)
+                        .map_err(daemon_error)?;
+                    let mut host =
+                        crate::endpoint_recovery::DaemonEndpointRecoveryHost::new(&paths, &runtime);
+                    let response = sinomo_core::cluster::recover_endpoint(
+                        &cluster_paths,
+                        &request,
+                        &mut host,
+                    )?;
+                    if response.needs_transport_refresh {
+                        host.record_validated_read(&request.spec)?;
+                        crate::control::request_daemon_cluster_maintenance(
+                            crate::control::DaemonClusterMaintenanceReason::ManualBroad,
+                        );
+                    }
+                    Ok(response)
+                },
+            )
+            .await
+        })
+    }
     fn state_authority(
         &self,
         request: sinomo_core::cluster::ClusterControlStateAuthorityRequest,

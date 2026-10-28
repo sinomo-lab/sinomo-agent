@@ -39,6 +39,7 @@ pub const CLUSTER_CONTROL_ADMIN_CAPABILITY: &str = sinomo_node::CLUSTER_CONTROL_
 
 /// Every cluster-control object-RPC route.
 pub const CLUSTER_CONTROL_RPC_ROUTES: &[&str] = &[
+    crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
     CLUSTER_CONTROL_INIT_ROUTE,
     CLUSTER_CONTROL_JOIN_ROUTE,
     CLUSTER_CONTROL_INVITE_ROUTE,
@@ -76,6 +77,7 @@ const fn cluster_control_mutation_policy(
 /// operations remain node-local consent decisions; replicated administration
 /// may also be requested by a freshly authorized Raft voter.
 pub const CLUSTER_CONTROL_RPC_ROUTE_POLICIES: &[ClusterControlRoutePolicy] = &[
+    cluster_control_mutation_policy(crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE, ClusterKvRouteAuth::LocalOnly),
     cluster_control_mutation_policy(CLUSTER_CONTROL_INIT_ROUTE, ClusterKvRouteAuth::LocalOnly),
     cluster_control_mutation_policy(CLUSTER_CONTROL_JOIN_ROUTE, ClusterKvRouteAuth::LocalOnly),
     cluster_control_mutation_policy(

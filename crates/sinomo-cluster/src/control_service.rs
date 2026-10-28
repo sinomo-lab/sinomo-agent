@@ -29,6 +29,16 @@ pub type ClusterControlServiceFuture<'a, T> =
 
 /// Process operations required by the cluster-owned control service.
 pub trait ClusterControlServiceHost: Send + Sync + 'static {
+    fn recover_endpoint(
+        &self,
+        _request: crate::EndpointRecoveryRequest,
+    ) -> ClusterControlServiceFuture<'_, crate::EndpointRecoveryResponse> {
+        Box::pin(async {
+            Err(ServiceError::UnknownRoute(
+                crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE.into(),
+            ))
+        })
+    }
     fn authoritative_snapshot(
         &self,
     ) -> ClusterControlServiceFuture<'_, KvAuthoritativeRead<KvSnapshot>>;
@@ -245,6 +255,10 @@ impl Service for HostedClusterControlService {
             let route = request.route.clone();
             let authority = authorize_request(host.as_ref(), &route, &ctx.signer).await?;
             match route.as_str() {
+                crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE => {
+                    let payload = ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(&route, host.recover_endpoint(payload).await?)?;
+                }
                 CLUSTER_CONTROL_INIT_ROUTE => {
                     let payload: ClusterControlInitRequest =
                         ctx.decode_request_body(&request).await?;
@@ -412,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_changing_routes_are_local_only_before_host_dispatch() {
+    fn local_only_control_routes_reject_remote_before_host_dispatch() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -423,6 +437,7 @@ mod tests {
             public_key: "remote-key".to_string(),
         };
         for route in [
+            crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
             CLUSTER_CONTROL_INIT_ROUTE,
             CLUSTER_CONTROL_JOIN_ROUTE,
             CLUSTER_CONTROL_LEAVE_ROUTE,

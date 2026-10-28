@@ -39,6 +39,7 @@ pub(crate) enum ClusterCliCommand {
     Role(ClusterRoleOptions),
     StateAuthority(ClusterStateAuthorityOptions),
     RepairMembers(ClusterRepairMembersOptions),
+    RecoverEndpoint { action: cluster::EndpointRecoveryAction, request_file: String },
     Remove(ClusterRemoveOptions),
     CleanupLegacyShadowMembers,
     Status,
@@ -200,6 +201,14 @@ fn cluster_cli_spec() -> CliCommandSpec {
                 )
                 .repeatable(),
             ]),
+            CliCommandSpec::new(
+                "recover-endpoint",
+                "recover one existing peer route without membership changes",
+            )
+            .with_positionals([
+                positional("action", "apply|status|rollback"),
+                positional("request", "immutable endpoint recovery JSON request file"),
+            ]),
             CliCommandSpec::new("join", "join an existing cluster")
                 .with_options([
                     option("--name", "local node name", "name"),
@@ -290,6 +299,22 @@ fn parse_cluster_matches(matches: &CliCommandMatches) -> Result<ClusterCliComman
         })
     };
     match path.as_slice() {
+        ["cluster", "recover-endpoint"] => {
+            let action = match required_positional(matches, 0)? {
+                "apply" => cluster::EndpointRecoveryAction::Apply,
+                "status" => cluster::EndpointRecoveryAction::Status,
+                "rollback" => cluster::EndpointRecoveryAction::Rollback,
+                _ => {
+                    return Err(CliParseError::Parse {
+                        detail: "expected apply, status or rollback".into(),
+                    });
+                }
+            };
+            Ok(ClusterCliCommand::RecoverEndpoint {
+                action,
+                request_file: required_positional(matches, 1)?.to_owned(),
+            })
+        }
         ["cluster", "init"] => {
             let defaults = ClusterInitOptions::default();
             Ok(ClusterCliCommand::Init(ClusterInitOptions {
@@ -760,6 +785,27 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Role(options) => cluster_role(options),
         ClusterCliCommand::StateAuthority(options) => cluster_state_authority_role(options),
         ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
+        ClusterCliCommand::RecoverEndpoint {
+            action,
+            request_file,
+        } => {
+            let bytes = std::fs::read(&request_file).map_err(|e| CliError::Parse {
+                detail: format!("read recovery request: {e}"),
+            })?;
+            let spec: cluster::EndpointRecoverySpec =
+                serde_json::from_slice(&bytes).map_err(|e| CliError::Parse {
+                    detail: format!("decode recovery request: {e}"),
+                })?;
+            let response = cluster_control_daemon_client("recover-endpoint")?
+                .cluster_recover_endpoint(cluster::EndpointRecoveryRequest { spec, action })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response).map_err(|e| CliError::Parse {
+                    detail: e.to_string()
+                })?
+            );
+            Ok(())
+        }
         ClusterCliCommand::Remove(options) => cluster_remove(options),
         ClusterCliCommand::CleanupLegacyShadowMembers => cluster_cleanup_legacy_shadow_members(),
         ClusterCliCommand::Status => cluster_status(),

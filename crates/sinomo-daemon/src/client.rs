@@ -1480,7 +1480,7 @@ impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonObjectRpcAsyncHos
     }
 }
 
-fn daemon_rpc_observation_coordinator()
+pub(crate) fn daemon_rpc_observation_coordinator()
 -> &'static Arc<sinomo_core::cluster::ClusterCommandObservationCoordinator> {
     DAEMON_RPC_OBSERVATION_COORDINATOR.get_or_init(|| {
         Arc::new(sinomo_core::cluster::ClusterCommandObservationCoordinator::production())

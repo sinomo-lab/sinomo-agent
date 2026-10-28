@@ -13,6 +13,7 @@ mod auth;
 mod client;
 mod cluster;
 mod control;
+mod endpoint_recovery;
 mod error;
 mod observe;
 mod paths;

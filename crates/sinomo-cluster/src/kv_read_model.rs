@@ -23,6 +23,11 @@ use time::OffsetDateTime;
 const MAX_CLUSTER_DIRECTORY_PROJECTION_CACHE_ENTRIES: usize = 128;
 
 static CLUSTER_DIRECTORY_PROJECTION_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+// Local route recovery changes routing without advancing KV authority. These
+// process-local cache generations fence cold captures and prepared connectors;
+// they are never exposed as KvRevision or used for membership authorization.
+static ENDPOINT_RECOVERY_CAPTURE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static ENDPOINT_RECOVERY_ROUTING_CLOCK: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_DIRECTORY_PROJECTIONS: LazyLock<
     Mutex<HashMap<PathBuf, ClusterDirectoryProjectionCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -168,6 +173,28 @@ pub(crate) fn invalidate_cluster_directory_projection(paths: &ClusterPaths) {
     }
 }
 
+pub(crate) fn invalidate_endpoint_recovery_routes(paths: &ClusterPaths) {
+    ENDPOINT_RECOVERY_CAPTURE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    invalidate_cluster_directory_projection(paths);
+    sinomo_network::invalidate_cluster_route_graph_cache(paths);
+}
+
+fn recovery_routing_version(minimum: u64) -> sinomo_network::DirectoryVersion {
+    let mut current = ENDPOINT_RECOVERY_ROUTING_CLOCK.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_add(1).max(minimum);
+        match ENDPOINT_RECOVERY_ROUTING_CLOCK.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return sinomo_network::DirectoryVersion(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn cluster_directory_projection_mark(
     snapshot: &KvSnapshot,
 ) -> Result<ClusterDirectoryProjectionMark, NetworkError> {
@@ -267,6 +294,7 @@ fn read_cluster_directory_projection_at_module_generation(
     snapshot: Arc<KvSnapshot>,
     module_routing_generation: u64,
 ) -> Result<Arc<ClusterDirectoryProjection>, NetworkError> {
+    let recovery_epoch = ENDPOINT_RECOVERY_CAPTURE_EPOCH.load(Ordering::Acquire);
     if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
         && let Some(entry) = cache.get_mut(&paths.root)
         && Arc::ptr_eq(&entry.snapshot, &snapshot)
@@ -279,7 +307,7 @@ fn read_cluster_directory_projection_at_module_generation(
     // Unrelated KV writes reuse the payload. Renewal/latency observations must
     // replace the decoded records, while retaining the semantic route generation
     // so existing carriers are not invalidated by observation-only changes.
-    let mark = cluster_directory_projection_mark(snapshot.as_ref())?;
+    let mut mark = cluster_directory_projection_mark(snapshot.as_ref())?;
     if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
         && let Some(entry) = cache.get_mut(&paths.root)
         && entry.mark == mark
@@ -290,16 +318,48 @@ fn read_cluster_directory_projection_at_module_generation(
         return Ok(Arc::clone(&entry.projection));
     }
 
-    let members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
+    let mut members = read_cluster_members_from_snapshot(snapshot.as_ref())?;
+    let local_recovery_root = paths.root.join("endpoint-recovery").is_dir();
+    let hints = if local_recovery_root {
+        match crate::local_state_store::read_cluster_state_without_kv_cached_shared(paths) {
+            Ok(stored) => crate::endpoint_recovery::preserve_verified_recovery_routes(
+                paths,
+                &stored,
+                &mut members,
+                snapshot.revision,
+            )?,
+            Err(NetworkError::ClusterOrphan) => Vec::new(),
+            Err(error) => return Err(error),
+        }
+    } else {
+        Vec::new()
+    };
+    if !hints.is_empty() {
+        let encoded = sinomo_kv::encode_kv_value(&hints).map_err(kv_err)?;
+        let mix = |original: blake3::Hash| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(original.as_bytes());
+            hash.update(&encoded);
+            hash.finalize()
+        };
+        mark.payload = mix(mark.payload);
+        mark.routing = mix(mark.routing);
+    }
     let (endpoint_map, endpoint_freshness) =
         read_cluster_endpoints_with_freshness_from_snapshot(snapshot.as_ref())?;
-    let endpoints = endpoint_map.into_values().flatten().collect();
+    let mut endpoints: Vec<_> = endpoint_map.into_values().flatten().collect();
+    endpoints.extend(hints);
     let connectivity_records =
         // Keep the decoded records, not their time-dependent live view. Route
         // capture filters lease expiry on every call below.
         read_all_cluster_connectivity_records_from_snapshot(snapshot.as_ref())?;
 
     let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() else {
+        if local_recovery_root {
+            return Err(NetworkError::directory(
+                "endpoint recovery routing cache is unavailable",
+            ));
+        }
         return Ok(Arc::new(ClusterDirectoryProjection {
             routing_version: sinomo_network::DirectoryVersion(snapshot.revision.0),
             members,
@@ -308,6 +368,13 @@ fn read_cluster_directory_projection_at_module_generation(
             connectivity_records,
         }));
     };
+    if recovery_epoch != ENDPOINT_RECOVERY_CAPTURE_EPOCH.load(Ordering::Acquire)
+        && (local_recovery_root || paths.root.join("endpoint-recovery").is_dir())
+    {
+        return Err(NetworkError::directory(
+            "local endpoint recovery changed during routing capture",
+        ));
+    }
     // Another reader may have populated this exact generation while the
     // projection was decoded outside the cache lock. Reuse its allocation.
     if let Some(entry) = cache.get_mut(&paths.root)
@@ -318,7 +385,7 @@ fn read_cluster_directory_projection_at_module_generation(
         entry.last_used = cluster_directory_projection_cache_tick();
         return Ok(Arc::clone(&entry.projection));
     }
-    let routing_version = cache
+    let mut routing_version = cache
         .get(&paths.root)
         .map(|entry| {
             if entry.mark.routing == mark.routing
@@ -336,6 +403,9 @@ fn read_cluster_directory_projection_at_module_generation(
             )
         })
         .unwrap_or(sinomo_network::DirectoryVersion(snapshot.revision.0));
+    if local_recovery_root {
+        routing_version = recovery_routing_version(routing_version.0.saturating_add(1));
+    }
     let projection = Arc::new(ClusterDirectoryProjection {
         routing_version,
         members,

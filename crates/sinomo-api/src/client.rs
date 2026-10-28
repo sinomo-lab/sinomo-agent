@@ -725,6 +725,17 @@ impl DaemonApiClient {
         self.call_control_value(CLUSTER_CONTROL_INIT_ROUTE, request)
     }
 
+    /// Recover one missing peer route through the authenticated local daemon.
+    pub fn cluster_recover_endpoint(
+        &self,
+        request: sinomo_core::cluster::EndpointRecoveryRequest,
+    ) -> Result<sinomo_core::cluster::EndpointRecoveryResponse, DaemonApiError> {
+        self.call_control_value(
+            sinomo_core::cluster::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
+            request,
+        )
+    }
+
     /// Joins an existing cluster from an invite.
     pub fn cluster_join(
         &self,

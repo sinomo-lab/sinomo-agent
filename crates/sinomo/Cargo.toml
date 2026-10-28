@@ -28,6 +28,7 @@ sinomo-cli = { path = "../sinomo-cli", default-features = false }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
+tokio.workspace = true
 blake3.workspace = true
 serde_json.workspace = true
 sinomo-dfs-fuse = { path = "../sinomo-dfs-fuse" }
