@@ -1761,13 +1761,29 @@ fn resolve_authenticated_transport_peer(
     metadata: &sinomo_core::network::AuthenticatedTransportMetadata,
     local_node_id: &NodeId,
     identity: &dyn sinomo_core::network::RoutedSessionIdentity,
-) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot), DaemonError> {
+) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot, [String; 2]), DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+    let records = sinomo_core::network::cluster_directory_with_bootstrap_state(
         sinomo_core::network::cluster_directory_for(&cluster_paths),
         state,
     )
-    .snapshot()?;
+    .records_snapshot()?;
+    let (version, members, endpoints) = records.into_parts();
+    let directory = sinomo_core::network::DirectorySnapshot::try_from_records(
+        version,
+        members.clone(),
+        endpoints,
+    )?;
+    let scopes = |peer: &NodeId| -> Result<[String; 2], DaemonError> {
+        let key = &directory
+            .node(peer)
+            .ok_or(DaemonError::AuthDenied)?
+            .public_key;
+        sinomo_core::network::cluster_routed_stream_pool_scopes_for_authenticated_directory(
+            state, &members, peer, key,
+        )
+        .map_err(Into::into)
+    };
     if matches!(
         metadata.transport,
         sinomo_core::base::ClusterTransportKind::Loopback
@@ -1779,7 +1795,8 @@ fn resolve_authenticated_transport_peer(
             &directory,
             identity,
         )?;
-        return Ok((peer_node_id, directory));
+        let bound = scopes(&peer_node_id)?;
+        return Ok((peer_node_id, directory, bound));
     }
     let mut matching_nodes = BTreeSet::new();
     for node in directory.nodes().values() {
@@ -1799,13 +1816,12 @@ fn resolve_authenticated_transport_peer(
         );
         return Err(DaemonError::AuthDenied);
     }
-    Ok((
-        matching_nodes
-            .into_iter()
-            .next()
-            .expect("one authenticated transport node"),
-        directory,
-    ))
+    let peer = matching_nodes
+        .into_iter()
+        .next()
+        .expect("one authenticated transport node");
+    let bound = scopes(&peer)?;
+    Ok((peer, directory, bound))
 }
 
 struct DaemonRoutedConnectivityFailureSink<'a> {
@@ -1877,7 +1893,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
         local_node_id.clone(),
         data_dir,
     )?);
-    let (peer_node_id, directory) = resolve_authenticated_transport_peer(
+    let (peer_node_id, directory, admitted_pool_scopes) = resolve_authenticated_transport_peer(
         &paths,
         &state,
         &metadata,
@@ -1912,12 +1928,11 @@ async fn handle_daemon_authenticated_transport_stream_async(
         state: &state,
         directory: &directory,
     };
-    let routed_pool_scopes =
-        sinomo_core::network::cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(
-            &state,
-        )?
-        .into_iter()
-        .collect::<Vec<_>>();
+    // Reuse is fenced to the same coherent membership/key view that admitted
+    // this carrier. The raw bootstrap role projection can lag a committed
+    // promotion, and must not label this connection with a different scope.
+    // This only selects cache labels; all RPC authorization remains unchanged.
+    let routed_pool_scopes = admitted_pool_scopes.into_iter().collect::<Vec<_>>();
     let disposition = sinomo_core::network::accept_or_relay_routed_session_or_closed(
         direct_stream,
         &directory,

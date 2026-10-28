@@ -1126,6 +1126,45 @@ pub fn cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(
     ])
 }
 
+/// Scopes for an accepted carrier, bound to the exact membership records used
+/// to authenticate its peer. Scope labels fence reuse; they grant no RPC rights.
+pub fn cluster_routed_stream_pool_scopes_for_authenticated_directory(
+    bootstrap: &ClusterBootstrapState,
+    admitted_members: &[sinomo_base::ClusterMemberRecord],
+    peer_node_id: &NodeId,
+    peer_public_key: &str,
+) -> Result<[String; 2], NetworkError> {
+    let authorized = admitted_members
+        .iter()
+        .filter(|member| member.state.is_authorized())
+        .collect::<Vec<_>>();
+    let mut identities = std::collections::BTreeSet::new();
+    if authorized.iter().any(|member| {
+        member.cluster_id != bootstrap.cluster_id || !identities.insert(member.node_id.clone())
+    }) {
+        return Err(NetworkError::AuthDenied);
+    }
+    let local = authorized
+        .iter()
+        .find(|member| member.node_id == bootstrap.local_node_id)
+        .ok_or(NetworkError::AuthDenied)?;
+    let original_local = bootstrap
+        .members
+        .iter()
+        .find(|member| member.node_id == bootstrap.local_node_id && member.state.is_authorized())
+        .ok_or(NetworkError::AuthDenied)?;
+    if local.node_public_key != original_local.node_public_key
+        || !authorized.iter().any(|member| {
+            &member.node_id == peer_node_id && member.node_public_key == peer_public_key
+        })
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let mut bound = bootstrap.clone();
+    bound.members = admitted_members.to_vec();
+    cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&bound)
+}
+
 impl ClusterObjectRpcRouteContext<'_> {
     fn directory(
         &self,
@@ -2664,5 +2703,144 @@ mod tests {
         assert!(call.request.traceparent().is_some());
         assert!(call.request.observe_sampled());
         crate::stop_network_timeline_capture().expect("stop timeline capture");
+    }
+}
+
+#[cfg(test)]
+mod accepted_scope_tests {
+    use super::*;
+    use sinomo_base::{ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, Id};
+    fn views() -> (ClusterBootstrapState, ClusterBootstrapState, NodeId) {
+        let now = time::OffsetDateTime::now_utc();
+        let local = Id::generate();
+        let peer = Id::generate();
+        let promoted = Id::generate();
+        let cluster = Id::generate();
+        let mut admitted = ClusterBootstrapState::initialized_locally(
+            cluster.clone(),
+            "scope",
+            local,
+            "receiver",
+            "receiver-key",
+            now,
+        );
+        admitted.members.push(ClusterMemberRecord::local_voter(
+            cluster.clone(),
+            promoted,
+            "promoted",
+            "promoted-key",
+            now,
+        ));
+        let mut client =
+            ClusterMemberRecord::local_voter(cluster, peer.clone(), "peer", "peer-key", now);
+        client.role = ClusterMemberRole::Learner;
+        client.state = ClusterMemberState::Learner;
+        admitted.members.push(client);
+        let mut raw = admitted.clone();
+        raw.members[1].role = ClusterMemberRole::Learner;
+        raw.members[1].state = ClusterMemberState::Learner;
+        (raw, admitted, peer)
+    }
+    #[test]
+    fn accepted_carrier_scope_uses_admitted_role_view_not_stale_bootstrap() {
+        let (raw, admitted, peer) = views();
+        let expected =
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&admitted).unwrap();
+        assert_ne!(
+            expected,
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&raw).unwrap()
+        );
+        assert_eq!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            raw.members[1].role,
+            ClusterMemberRole::Learner,
+            "scope selection cannot mutate bootstrap membership"
+        );
+    }
+    #[test]
+    fn accepted_carrier_scope_rejects_stale_authenticated_key() {
+        let (raw, mut admitted, peer) = views();
+        admitted.members[2].node_public_key = "new-peer-key".into();
+        assert!(matches!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            ),
+            Err(NetworkError::AuthDenied)
+        ));
+    }
+    #[test]
+    fn accepted_carrier_scope_rejects_revoked_or_missing_peer() {
+        let (raw, mut admitted, peer) = views();
+        admitted.members[2].state = ClusterMemberState::Removed;
+        assert!(matches!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            ),
+            Err(NetworkError::AuthDenied)
+        ));
+        admitted.members.pop();
+        assert!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn accepted_carrier_scope_rejects_foreign_or_duplicate_members() {
+        let (raw, mut admitted, peer) = views();
+        admitted.members[1].cluster_id = Id::generate();
+        assert!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            )
+            .is_err()
+        );
+        let (raw, mut admitted, peer) = views();
+        admitted.members.push(admitted.members[2].clone());
+        assert!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn accepted_carrier_scope_rejects_local_identity_change() {
+        let (raw, mut admitted, peer) = views();
+        admitted.members[0].node_public_key = "other-local-key".into();
+        assert!(
+            cluster_routed_stream_pool_scopes_for_authenticated_directory(
+                &raw,
+                &admitted.members,
+                &peer,
+                "peer-key"
+            )
+            .is_err()
+        );
     }
 }

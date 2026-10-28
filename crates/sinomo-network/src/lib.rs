@@ -294,6 +294,7 @@ pub use route::{
     ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcFuture,
     ClusterObjectRpcObservation, ClusterObjectRpcOptions,
     cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state,
+    cluster_routed_stream_pool_scopes_for_authenticated_directory,
     stream_native_service_route_constraints,
 };
 #[cfg(any(test, feature = "test-support"))]
