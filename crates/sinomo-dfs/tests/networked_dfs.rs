@@ -3076,7 +3076,13 @@ fn native_unknown_adoption_retains_source_owner_until_exact_reopen_reconciliatio
         "old native custody must still fence its physical volume"
     );
     runtime.clear_faults();
-    runtime.reopen_node(source.clone()).unwrap();
+    runtime.reopen_node(source.clone()).unwrap_or_else(|error| {
+        panic!(
+            "native custody reopen failed: operation={operation} source={source} target={target} original={}/{} committed={}/{} error={error}; rpc_observations={:#?}; dropped={}",
+            original.object_id, original.version, committed.object_id, committed.version,
+            runtime.rpc_observations(), runtime.observation_dropped_count(),
+        )
+    });
     let mut resumed = runtime.client(&nodes[0]).unwrap();
     let actual = resumed
         .posix_rename_with_operation_id(from, to, &operation)

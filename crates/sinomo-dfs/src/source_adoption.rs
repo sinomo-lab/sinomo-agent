@@ -532,6 +532,11 @@ impl DfsSourceAdoptionActor {
                 .iter()
                 .find(|cfg| cfg.shard_id == scope.shard_id.0)
                 .ok_or_else(|| error("native target outcome scope missing"))?;
+            tracing::trace!(target: "sinomo.dfs.source-adoption",
+                node = %self.node, root = %self.data_root.display(),
+                session = %session.offer.session_id, job = %session.offer.job_id,
+                operation = %scope.operation_id, target = %target.primary_node_id,
+                "native source custody outcome query");
             let reply = match self.call(
                 &target.primary_node_id,
                 &DfsSourceAdoptionRequest::InspectOutcome {
@@ -542,8 +547,25 @@ impl DfsSourceAdoptionActor {
                 },
             ) {
                 Ok(reply) => reply,
-                Err(_) => continue,
+                Err(error) => {
+                    tracing::trace!(target: "sinomo.dfs.source-adoption",
+                        node = %self.node, session = %session.offer.session_id,
+                        operation = %scope.operation_id, target = %target.primary_node_id,
+                        %error, "native source custody outcome query failed");
+                    continue;
+                }
             };
+            tracing::trace!(target: "sinomo.dfs.source-adoption",
+                node = %self.node, session = %session.offer.session_id,
+                operation = %scope.operation_id, target = %target.primary_node_id,
+                outcome = match reply.outcome.as_ref() {
+                    Some(DfsSourceAdoptionOutcome::Unavailable) => "unavailable",
+                    Some(DfsSourceAdoptionOutcome::Active) => "active",
+                    Some(DfsSourceAdoptionOutcome::Committed { .. }) => "committed",
+                    Some(DfsSourceAdoptionOutcome::Inactive { .. }) => "inactive",
+                    None => "missing",
+                },
+                "native source custody outcome received");
             if reply.offer != session.offer
                 || reply.target_scope != scope
                 || reply.payload_digest != hash
@@ -617,6 +639,10 @@ impl DfsSourceAdoptionActor {
                     .map_err(|_| error("source custody registry poisoned"))?
                     .remove(&(self.data_root.clone(), session.offer.session_id.clone()));
                 released += 1;
+                tracing::trace!(target: "sinomo.dfs.source-adoption",
+                    node = %self.node, session = %session.offer.session_id,
+                    job = %session.offer.job_id, operation = %scope.operation_id,
+                    "native source custody released after verified terminal outcome");
             }
         }
         Ok(released)

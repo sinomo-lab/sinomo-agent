@@ -9637,7 +9637,7 @@ mod cursor_update_tests {
                     crate::DfsOperatorStatusOmission::NonPrimaryResidentMetadataNotHydrated {
                         file_system_id, shard_id: unavailable
                     } if file_system_id == &shard.file_system_id && unavailable == &shard_id)),
-                        "corrupt replica status cannot become an invented complete projection"
+                        "corrupt replica status cannot become an invented complete projection: {status:?}"
                     );
                     let remaining = remaining.saturating_sub(began.elapsed());
                     assert!(

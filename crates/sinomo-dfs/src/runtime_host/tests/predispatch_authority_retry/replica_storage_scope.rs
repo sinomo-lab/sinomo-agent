@@ -538,7 +538,10 @@ fn exercise_replica_storage_scope(
     assert_eq!(response.verified_authority_probe_id, Some(confirmation));
     assert_eq!(response.next_after_sequence, prefix.journal_sequence);
     if first_ingest {
-        assert!(first_ingest_source_owned, "the source publisher stayed ordered behind the first ingest");
+        assert!(
+            first_ingest_source_owned,
+            "the source publisher stayed ordered behind the first ingest"
+        );
         assert_eq!(
             response.applied_entries, 1,
             "the new prepare was actually persisted"

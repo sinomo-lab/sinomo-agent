@@ -3119,10 +3119,15 @@ pub(crate) fn dfs_runtime_message_cache_root(
     let owners = if nonblocking {
         match owners.try_lock() {
             Ok(owners) => owners,
-            Err(std::sync::TryLockError::WouldBlock) => return Err(DfsRuntimeError::Network {
-                address: "DFS message cache root identity".into(),
-                detail: "bounded DFS status unavailable while the resident generation cache is being updated".into(),
-            }),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::trace!(target: "sinomo.dfs.cache_diagnostic",
+                    data_root = %data_root.display(), branch = "physical-owner-registry",
+                    "bounded status cache busy");
+                return Err(DfsRuntimeError::Network {
+                    address: "DFS message cache root identity".into(),
+                    detail: "bounded DFS status unavailable while the resident generation cache is being updated".into(),
+                });
+            }
             Err(std::sync::TryLockError::Poisoned(_)) => return Err(DfsRuntimeError::Parse {
                 detail: "DFS data-owner lock registry is poisoned".into(),
             }),

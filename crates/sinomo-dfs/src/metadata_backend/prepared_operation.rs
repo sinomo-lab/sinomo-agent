@@ -1473,18 +1473,15 @@ fn validate_committed_intent_content(
         })
         .map(|(_, version)| version)
         .filter(|version| {
-            version
-                .content_durability
-                .as_ref()
-                .is_some_and(|plan| {
-                    plan.source_version == intent.target_version
+            version.content_durability.as_ref().is_some_and(|plan| {
+                plan.source_version == intent.target_version
                         // Placement repairs the current metadata revision,
                         // which may be a same-byte successor after rename.
                         // Its base/target must name that exact recorded head;
                         // W remains tied to the original data generation below.
                         || (version.version == intent.target_version
                             && intent.base_version.as_ref() == Some(&version.version))
-                })
+            })
         });
     let retained = if intent.publication.is_retained_repair() {
         let version = if let Some(source) = source {
