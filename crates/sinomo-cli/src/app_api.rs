@@ -9253,7 +9253,7 @@ impl RemoteSifsBrowser {
         if let Some(rpc) = &self.test_rpc {
             return rpc(request, timeout);
         }
-        if let Some((data_dir, target_node_id)) = &self.target {
+        if self.target.is_some() {
             if self.direct_main_owner {
                 return self.rpc_main_owner_value(request, timeout, |result| async move {
                     let response = result
@@ -9264,15 +9264,7 @@ impl RemoteSifsBrowser {
                     Ok(response)
                 });
             }
-            return sinomo_runtime::api::DaemonApiClient::at_address(self.address.clone())
-                .with_timeout(self.timeout.min(timeout))
-                .object_rpc_to_target_from_data_dir_with_affinity(
-                    data_dir,
-                    target_node_id,
-                    request,
-                    timeout,
-                    sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
-                );
+            return self.rpc_target_response(request, timeout);
         }
         if let Some(runtime) = &self.runtime {
             sinomo_runtime::api::send_daemon_rpc_on_runtime(
@@ -9284,6 +9276,64 @@ impl RemoteSifsBrowser {
         } else {
             sinomo_runtime::api::send_daemon_rpc(&self.address, &request, timeout)
         }
+    }
+
+    fn rpc_target_response(
+        &self,
+        request: ObjectRpcRequest,
+        remaining: Duration,
+    ) -> Result<sinomo_runtime::network::ObjectRpcResponse, sinomo_runtime::api::DaemonApiError>
+    {
+        let (data_dir, target_node_id) = self.target.as_ref().expect("node-scoped browser target");
+        let health = self.timeout.min(remaining);
+        // A catalog-selected provider keeps the same main-only forwarding and
+        // signer/data binding. Transport health is not an operation deadline:
+        // only the caller's explicit absolute deadline bounds the whole call,
+        // including materializing its returned value.
+        sinomo_runtime::api::transport::block_on_daemon_client(Box::pin(async move {
+            let overall =
+                self.operation_deadline
+                    .map(|deadline| {
+                        deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or_else(|| sinomo_runtime::api::DaemonApiError::NetworkDelivery {
+                            detail: "SIFS operation deadline expired before the node-target request"
+                                .into(),
+                            delivery_state:
+                                sinomo_runtime::network::NetworkDeliveryState::DefinitelyNotSent,
+                        })
+                    })
+                    .transpose()?;
+            let deadline = sinomo_runtime::api::transport::daemon_api_overall_deadline(overall);
+            sinomo_runtime::api::transport::run_daemon_api_with_overall_deadline(
+                "SIFS node-target value call",
+                deadline,
+                Box::pin(async move {
+                    let runtime = tokio::runtime::Handle::current();
+                    let result =
+                        sinomo_runtime::api::transport::send_daemon_object_rpc_call_with_affinity_async(
+                            data_dir.clone(),
+                            &self.address,
+                            sinomo_runtime::api::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                            target_node_id,
+                            sinomo_runtime::network::ObjectRpcCall::value(request),
+                            health,
+                            None,
+                            overall,
+                            false,
+                            sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                            sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(health),
+                            None,
+                            None,
+                            &runtime,
+                        )
+                        .await?;
+                    sinomo_runtime::api::transport::decode_object_rpc_value_response(result).await
+                }),
+            )
+            .await
+        }))
     }
 
     fn rpc_timeout(&self) -> Result<Duration, sinomo_runtime::api::DaemonApiError> {
@@ -10307,6 +10357,10 @@ fn parent_sifs_browser_path(path: &str) -> Option<String> {
         parent.to_string()
     })
 }
+
+#[cfg(test)]
+#[path = "app_api/node_scoped_rpc_tests.rs"]
+mod node_scoped_rpc_tests;
 
 #[cfg(test)]
 mod tests {
