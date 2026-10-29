@@ -240,6 +240,165 @@ fn sifs_posix_nonexclusive_create_follows_a_dangling_symlink() {
 }
 
 #[test]
+fn native_warm_remote_client_recreates_unlinked_dangling_symlink() {
+    let SifsPosixCluster {
+        _runtime: runtime,
+        primary_node,
+        writer_node,
+        mut writer,
+        primary,
+        observer,
+        ..
+    } = sifs_posix_cluster("native-warm-symlink-recreate", "/");
+    drop(primary);
+    drop(observer);
+    // Use the actual mounted opener, not the native owning service shell. The
+    // adapters and configuration still belong to this registered Main runtime.
+    let control_plane = writer.control_plane.take();
+    drop(writer);
+    let (sync_transport, async_transport) = runtime.peer_transports(&writer_node).unwrap();
+    let mut writer = crate::open_mounted_sifs_service_with_peer_transports(
+        runtime.data_dir(&writer_node).clone(),
+        sync_transport,
+        async_transport,
+        control_plane,
+    )
+    .expect("ordinary mounted service over native Main adapters")
+    .service;
+    assert_ne!(primary_node, writer_node);
+    assert!(writer.transport.delegates_local_namespace_authority());
+    let parent = "/native-warm-symlink-recreate";
+    let link = "/native-warm-symlink-recreate/link";
+    let target = "/native-warm-symlink-recreate/absent-target";
+    writer.posix_mkdir(parent).expect("native parent creation");
+    let options =
+        DfsWriteOptions::replicated_eventual(vec![primary_node.clone(), writer_node.clone()]);
+    writer
+        .posix_symlink("absent-target", link, options.clone())
+        .expect("native initial dangling symlink");
+    let mut previous = writer
+        .posix_lstat_distributed(link)
+        .expect("actual initial namespace entry");
+    let mut recreate_failure = None;
+    for round in 0..2 {
+        assert_eq!(previous.kind, DfsObjectKind::Symlink);
+        assert!(matches!(
+            writer.posix_stat_distributed(target),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(matches!(
+            writer.posix_symlink("other-target", link, options.clone()),
+            Err(DfsPosixError::AlreadyExists { .. })
+        ));
+        assert_eq!(
+            writer.posix_readlink_distributed(link).unwrap(),
+            "absent-target",
+            "a rejected duplicate must preserve the real dangling link"
+        );
+        let capture = runtime
+            .capture_namespace_requests(&primary_node, 32)
+            .expect("capture actual unlink request");
+        let observations_before = runtime.rpc_observations().len();
+        let removed = writer.posix_unlink(link).expect("native unlink");
+        // Recreate immediately on the SAME mounted client. Even an observational
+        // owner open or lstat here could refresh a shared view and hide the bug.
+        let recreated = writer.posix_symlink("absent-target", link, options.clone());
+        let calls = runtime.rpc_observations();
+        let request = capture
+            .records()
+            .into_iter()
+            .find_map(|message| match message.message {
+                DfsNetworkMessage::NamespaceRequest(command)
+                    if matches!(&command.operation,
+                        DfsNamespaceOperation::ConditionalUnlink { path, .. } if path == link) =>
+                {
+                    Some(command)
+                }
+                _ => None,
+            })
+            .expect("unlink entered the real remote Main");
+        drop(capture);
+        assert_eq!(removed.kind, DfsObjectKind::Tombstone);
+        assert_eq!(removed.object_id, previous.object_id);
+        let local_after = writer.lookup_sifs_path(link).unwrap();
+        let old_transient_after = writer
+            .transient_metadata_object_ids
+            .contains(&previous.object_id);
+        let mut owner = runtime
+            .metadata_primary_service(link)
+            .expect("actual root metadata owner");
+        let shard = runtime.root_shard().expect("actual root assignment");
+        assert_eq!(shard.primary_node_id, primary_node);
+        let shard_id = DfsMetadataShardId::new(shard.shard_id);
+        let backend = owner.metadata_backend_mut().unwrap();
+        let tombstone = backend
+            .get_object_on_shard(&shard_id, &previous.object_id)
+            .unwrap()
+            .expect("old object's durable unlink tombstone survives recreation");
+        assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
+        assert_eq!(tombstone.object_id, previous.object_id);
+        assert_eq!(tombstone.version, removed.version);
+        let admission = backend
+            .namespace_request_admission_snapshot(
+                &shard_id,
+                &request.requesting_node_id,
+                &request.request_id,
+            )
+            .expect("original native unlink outcome");
+        let digest = namespace_command_digest(&request).unwrap();
+        if let Some(receipt) = admission.receipt {
+            assert_eq!(receipt.command_digest, digest);
+            assert_eq!(receipt.result, DfsNamespaceResult::Applied);
+        } else {
+            let recorded = admission.request.expect("original unlink retained outcome");
+            assert_eq!(recorded.command_digest, digest);
+            assert_eq!(recorded.status, DfsNamespaceRequestStatus::Completed);
+            assert_eq!(recorded.result, Some(DfsNamespaceResult::Applied));
+        }
+        drop(owner);
+        let write_calls = calls[observations_before..]
+            .iter()
+            .filter(|call| {
+                call.source == writer_node
+                    && matches!(
+                        call.route.as_str(),
+                        DFS_DATA_WRITE_ROUTE | DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                    )
+                    && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "MOUNTED_SYMLINK_RECREATE round={round} writer={writer_node} primary={primary_node} unlink_request={} tombstone={tombstone:?} local_after={local_after:?} old_transient_after={old_transient_after} recreate={recreated:?} write_calls={write_calls:?} omitted={}",
+            request.request_id,
+            runtime.observation_dropped_count()
+        );
+        match recreated {
+            Ok(_) => {
+                let current = writer.posix_lstat_distributed(link).unwrap();
+                assert_eq!(current.kind, DfsObjectKind::Symlink);
+                assert_ne!(current.object_id, previous.object_id);
+                assert_eq!(
+                    writer.posix_readlink_distributed(link).unwrap(),
+                    "absent-target"
+                );
+                previous = current;
+            }
+            Err(error) => {
+                recreate_failure = Some(format!("round {round}: {error}"));
+                break;
+            }
+        }
+    }
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(writer);
+    runtime.close().expect("native owners drain");
+    assert!(
+        recreate_failure.is_none(),
+        "the same warm native non-primary writer must recreate its authoritatively unlinked dangling symlink: {recreate_failure:?}"
+    );
+}
+
+#[test]
 fn sifs_posix_create_attrs_are_installed_atomically_and_only_on_create() {
     let root = temp_root("sifs-posix-create-attrs");
     let node_id = NodeId::from_legacy_named("node_sifs_create_attrs").expect("node");
