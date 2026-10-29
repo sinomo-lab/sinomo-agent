@@ -9,7 +9,7 @@ fn span(kind: &'static str) -> tracing::Span {
         io_kind = kind, io_bytes = tracing::field::Empty, outcome = "error")
 }
 
-pub fn read(file: &mut File, bytes: &mut [u8]) -> io::Result<usize> {
+pub fn read<R: Read + ?Sized>(file: &mut R, bytes: &mut [u8]) -> io::Result<usize> {
     let span = span("disk.read");
     let _entered = span.enter();
     let result = file.read(bytes);
