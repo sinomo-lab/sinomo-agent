@@ -350,6 +350,12 @@ const STORAGE_CONTRACT_OBJECT_VERSION: u16 = 1;
 
 /// Registers the durable storage paths owned by the cluster control plane.
 pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageContractError> {
+    layout.register_escape_path(
+        "sinomo-cluster",
+        StorageRing::R1,
+        "cluster/migrations",
+        "retained single-node migration receipts and quarantined original cluster storage",
+    )?;
     layout.register_sinomo_object(
         "sinomo-cluster",
         StorageRing::R1,
