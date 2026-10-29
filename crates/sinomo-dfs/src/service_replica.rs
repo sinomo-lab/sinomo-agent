@@ -272,6 +272,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 prepare_sequence: prepared_batch.next_after_sequence,
             });
         }
+        // Retain the exact failed proof scope, not just a participant count.
+        // This is failure-only opt-in tracing and holds no additional custody.
+        dfs_perf_trace(format_args!(
+            "metadata-authority-incomplete operation={operation:?} primary={} missing={:?} acknowledged={acknowledged_node_ids:?} probe_ms={trace_probe_ms}",
+            self.node_id,
+            required_node_ids
+                .difference(&acknowledged_node_ids)
+                .collect::<Vec<_>>(),
+        ));
         Err(DfsError::MetadataRecoveryQuorumUnavailable {
             file_system_id: shard.file_system_id.clone(),
             shard_id: shard.shard_id.clone(),
@@ -588,6 +597,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // to materialize one command per target, each with a unique wire
             // identity. Move the last command in each group to avoid retaining
             // an otherwise unused extra copy even on this compatibility path.
+            self.check_cancelled("metadata authority fallback")?;
             let mut authority_requests = Vec::with_capacity(required_acknowledgements - 1);
             for group in authority_groups {
                 let unresolved_target_node_ids = group
@@ -622,10 +632,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     authority_requests.push((target_node_id, command));
                 }
             }
-            let response_deadline = Instant::now()
-                .checked_add(timeout)
-                .unwrap_or_else(Instant::now)
-                .min(operation_deadline);
+            // The short direct probe is an accelerator, not a second semantic
+            // deadline. Its routed continuation still owns the same original
+            // operation budget; do not abandon a real missing ACK early or
+            // restart that budget after local preparation/direct dispatch.
+            let response_deadline = operation_deadline;
             if Instant::now() >= response_deadline {
                 return Ok(acknowledged_node_ids);
             }
@@ -680,6 +691,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     request_targets.push((request_id, target_node_id));
                 }
                 loop {
+                    self.check_cancelled("metadata authority acknowledgement")?;
                     self.process_incoming()?;
                     let mut unresolved = false;
                     for (request_id, target_node_id) in &request_targets {

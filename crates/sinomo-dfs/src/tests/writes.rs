@@ -3,6 +3,86 @@
 use super::*;
 
 #[test]
+fn native_six_member_writes_keep_exact_completion_and_policy() {
+    let name = "native-six-member-write-completion";
+    let (runtime, initial, shard) =
+        crate::test_support::current_native_metadata_service(name, 6, "/services").unwrap();
+    assert_eq!(
+        shard.replica_node_ids.len(),
+        5,
+        "actual six-member assignment"
+    );
+    drop(initial);
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(name, 6);
+    let origin = nodes
+        .iter()
+        .find(|node| **node != shard.primary_node_id)
+        .unwrap();
+    for (w, n) in [(1, 2), (2, 3)] {
+        runtime
+            .apply_placement_policy(
+                origin,
+                "/services",
+                DfsPlacementScope::Subtree,
+                DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, w, n).unwrap(),
+            )
+            .unwrap();
+        runtime.checkpoint_rpc_observation_window().unwrap();
+        let mut writer = runtime.client(origin).unwrap();
+        let mut reader = runtime.client(&shard.primary_node_id).unwrap();
+        let options = DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(w, n).unwrap(),
+            replica_candidates: nodes.clone(),
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        };
+        for index in 0..100 {
+            let path = format!("/services/six-member-w{w}-{index}.bin");
+            for (operation, value) in [("create", 0x41), ("overwrite", 0x62)] {
+                let operation_id = format!("six-member-w{w}-{operation}-{index}");
+                let bytes = vec![value; 4096];
+                let outcome = writer
+                    .posix_write_file_with_operation_id(
+                        &path,
+                        &bytes,
+                        options.clone(),
+                        &operation_id,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("exact operation {operation_id} on {path}: {error}")
+                    });
+                runtime.checkpoint_rpc_observation_window().unwrap();
+                assert_eq!(reader.posix_read_file_distributed(&path).unwrap(), bytes);
+                runtime.checkpoint_rpc_observation_window().unwrap();
+                let reconciled = writer
+                    .reconcile_stable_write_operation(
+                        &path,
+                        &outcome.object_id,
+                        &operation_id,
+                        outcome.content_hash.as_deref().unwrap(),
+                        4096,
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(
+                        reconciled,
+                        DfsStableWriteOperationReconciliation::Applied { .. }
+                    ),
+                    "exact operation {operation_id}: {reconciled:?}"
+                );
+                // Each public operation may include bounded catch-up traffic;
+                // seal it before the next operation instead of dropping DATA.
+                runtime.checkpoint_rpc_observation_window().unwrap();
+            }
+        }
+        drop(reader);
+        drop(writer);
+    }
+    runtime.close().unwrap();
+}
+
+#[test]
 fn node_transport_completes_synchronous_replica_write() {
     let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids("sync-replica-write", 2);
     let mut runtime = crate::test_runtime::DfsTestRuntime::new(
