@@ -421,6 +421,7 @@ pub(crate) mod prelude {
     pub(crate) use time::OffsetDateTime;
 }
 
+pub use connectivity_publish::cluster_connectivity_full_sync_batch_ops_from_snapshot;
 // test-support re-exports (crate internals for sibling integration tests)
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity_publish::cluster_network_expiry_delete_ops;
