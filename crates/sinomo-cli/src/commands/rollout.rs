@@ -6153,6 +6153,71 @@ mod rollout_authority_readiness_tests {
         validate_rollout_runtime_source_identity("target", expected, &status).unwrap();
         status.commit = Some("ffffffffffffffffffffffffffffffffffffffff".into());
         assert!(validate_rollout_runtime_source_identity("target", expected, &status).is_err());
+        status.commit = Some("0123456789abcdef0123456789abcdef01234568".into());
+        assert!(validate_rollout_runtime_source_identity("target", expected, &status).is_err());
+        status.commit = Some(revision[..12].into());
+        assert!(validate_rollout_runtime_source_identity("target", expected, &status).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires actual sealed daemon status, independent full revision, absent checkout and Git"]
+    fn compiled_runtime_source_verification_without_checkout() {
+        let status_path = PathBuf::from(
+            std::env::var_os("SINOMO_VERIFY_RUNTIME_STATUS").expect("actual runtime status path"),
+        );
+        let revision = std::env::var("SINOMO_VERIFY_EXPECTED_REVISION")
+            .expect("independently sealed full source revision");
+        assert!(matches!(revision.len(), 40 | 64));
+        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let repo = PathBuf::from(
+            std::env::var_os("SINOMO_VERIFY_MISSING_REPO").expect("absent managed-source fixture"),
+        );
+        assert!(repo.is_absolute(), "the missing checkout must be explicit");
+        assert_eq!(
+            fs::symlink_metadata(&repo)
+                .expect_err("the checkout must be absent")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let path = std::env::var_os("PATH").expect("explicit PATH without Git");
+        assert!(
+            std::env::split_paths(&path).all(|entry| entry.is_absolute() && !entry.exists()),
+            "run this test executable with PATH containing only absent absolute directories"
+        );
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&status_path).expect("read actual status"))
+                .expect("decode actual status JSON");
+        // Retained rollout diagnostics wrap the unchanged DaemonStatus in a target entry.
+        // Native process captures may supply that DaemonStatus directly.
+        let runtime = if let Some(targets) = document.get("targets") {
+            assert_eq!(document["failed_targets"], serde_json::json!([]));
+            let targets = targets.as_array().expect("diagnostic targets array");
+            assert_eq!(targets.len(), 1, "exactly one observed target is required");
+            assert_eq!(targets[0]["errors"], serde_json::json!([]));
+            targets[0]["runtime"].clone()
+        } else {
+            document
+        };
+        let status: DaemonStatus =
+            serde_json::from_value(runtime).expect("decode unmodified actual DaemonStatus");
+        eprintln!(
+            "runtime-source-control status={} pid={} observed={:?} expected={revision} repo={}",
+            status_path.display(),
+            status.pid,
+            status.commit,
+            repo.display()
+        );
+        validate_rollout_runtime_source_identity(
+            "actual compiled runtime",
+            RolloutRuntimeSourceIdentity {
+                repo: &repo,
+                revision: &revision,
+            },
+            &status,
+        )
+        .expect("the actual compiled full identity must verify without Git or its checkout");
+        assert_eq!(status.commit.as_deref(), Some(revision.as_str()));
     }
 
     #[test]
