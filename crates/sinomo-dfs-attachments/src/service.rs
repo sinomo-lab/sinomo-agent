@@ -536,6 +536,7 @@ pub fn component_factory()
         scope.set_services(ServiceRegistryBuilder::default().register(service).build());
         Ok(())
     })
+    .map(|factory| factory.with_storage_paths(register_storage_paths))
 }
 pub fn register_storage_paths(
     layout: &mut sinomo_core::storage::StorageLayout,

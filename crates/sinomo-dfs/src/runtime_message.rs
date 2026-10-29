@@ -204,6 +204,9 @@ impl DfsRuntimeMessageCache {
         let roots = match self.roots.try_lock() {
             Ok(roots) => roots,
             Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::trace!(target: "sinomo.dfs.cache_diagnostic",
+                    data_root = %root.display(), branch = "root-registry",
+                    "bounded status cache busy");
                 return Err(crate::DfsError::Network {
                     message: "bounded DFS status unavailable while the resident generation cache is being updated".into(),
                 });

@@ -4153,7 +4153,7 @@ where
     }
     if local_admission_busy {
         let keys_for_read = keys.clone();
-        if let Ok(Some(retry)) = retry_local_read_index_after_busy_forward(
+        let local_retry = retry_local_read_index_after_busy_forward(
             runtime,
             paths,
             &mut consensus_state,
@@ -4165,24 +4165,46 @@ where
             move |storage| storage.read_index_entries(&keys_for_read),
             host,
         )
-        .await
-        {
+        .await;
+        if tracing::enabled!(target: "sinomo.cluster.formation", tracing::Level::TRACE) {
+            let retry_outcome = match &local_retry {
+                Ok(Some(ClusterRaftReadIndexAttempt::Confirmed(_))) => "confirmed",
+                Ok(Some(ClusterRaftReadIndexAttempt::NeedsBarrier(_))) => "needs-barrier",
+                Ok(Some(ClusterRaftReadIndexAttempt::NotLeader)) => "not-leader",
+                Ok(Some(ClusterRaftReadIndexAttempt::ForwardOnly(_))) => "forward-only",
+                Ok(Some(ClusterRaftReadIndexAttempt::LocalAdmissionBusy)) => "local-admission-busy",
+                Ok(None) => "no-retry",
+                Err(_) => "error",
+            };
+            tracing::trace!(target: "sinomo.cluster.formation",
+                root = %paths.root.display(), node = %state.local_node_id,
+                key_count = keys.len(), retry_outcome,
+                retry_error = ?local_retry.as_ref().err().map(ToString::to_string),
+                "authoritative exact-key-set local retry outcome");
+        }
+        if let Ok(Some(retry)) = local_retry {
             let read = match retry {
                 ClusterRaftReadIndexAttempt::Confirmed(read) => Some(read),
                 ClusterRaftReadIndexAttempt::NeedsBarrier(fence) => {
                     let keys_for_read = keys.clone();
-                    commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence(
-                        runtime,
-                        paths,
-                        &mut consensus_state,
-                        options,
-                        deadline,
-                        Some(fence.into()),
-                        move |storage| storage.read_index_entries(&keys_for_read),
-                        host,
-                    )
-                    .await
-                    .ok()
+                    let barrier_retry =
+                        commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence(
+                            runtime,
+                            paths,
+                            &mut consensus_state,
+                            options,
+                            deadline,
+                            Some(fence.into()),
+                            move |storage| storage.read_index_entries(&keys_for_read),
+                            host,
+                        )
+                        .await;
+                    tracing::trace!(target: "sinomo.cluster.formation",
+                        root = %paths.root.display(), node = %state.local_node_id,
+                        succeeded = barrier_retry.is_ok(),
+                        retry_error = ?barrier_retry.as_ref().err().map(ToString::to_string),
+                        "authoritative exact-key-set fallback barrier outcome");
+                    barrier_retry.ok()
                 }
                 ClusterRaftReadIndexAttempt::ForwardOnly(reason) => {
                     reason.apply_forwarding_floor(&mut consensus_state)?;
@@ -8469,6 +8491,83 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct ReadRetryTrace {
+        rows: std::sync::Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+        omitted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        next_span: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl ReadRetryTrace {
+        fn install(&self) -> (tracing::Dispatch, tracing::subscriber::DefaultGuard) {
+            // Keep both observed and unobserved dispatchers registered. With just
+            // one registered dispatcher, tracing-core initializes a new callsite
+            // from the thread that first reaches it; another test thread with no
+            // subscriber can otherwise cache `never` for this capture's event.
+            let unobserved = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let observed = tracing::subscriber::set_default(self.clone());
+            (unobserved, observed)
+        }
+    }
+    impl tracing::Subscriber for ReadRetryTrace {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "sinomo.cluster.formation"
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(
+                1 + self
+                    .next_span
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fields(std::collections::BTreeMap<String, String>);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+            }
+            let mut fields = Fields(Default::default());
+            event.record(&mut fields);
+            let mut rows = self.rows.lock().unwrap();
+            if rows.len() < 16 {
+                rows.push(fields.0);
+            } else {
+                self.omitted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn read_retry_trace_keeps_callsite_registered_on_an_unobserved_thread() {
+        fn emit() {
+            tracing::trace!(target: "sinomo.cluster.formation",
+                retry_outcome = "registration-control",
+                "read retry capture cross-thread registration control");
+        }
+        let trace = ReadRetryTrace::default();
+        let _trace_guard = trace.install();
+        std::thread::spawn(emit)
+            .join()
+            .expect("unobserved registration thread");
+        emit();
+        assert_eq!(trace.omitted.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            trace.rows.lock().unwrap().len(),
+            1,
+            "only the observed thread event must be retained after another thread registers its callsite"
+        );
+    }
+
     #[test]
     fn busy_local_exact_read_preserves_failed_mixed_version_fallback_when_retry_stays_busy() {
         let fixture =
@@ -8492,6 +8591,8 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
+        let trace = ReadRetryTrace::default();
+        let _trace_guard = trace.install();
         let started = Instant::now();
 
         let error = runtime
@@ -8517,6 +8618,23 @@ mod tests {
             preparations_before,
             crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root),
             "mixed-version failure",
+        );
+        assert_eq!(trace.omitted.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            trace.rows.lock().unwrap().iter().any(|row| {
+                row.get("retry_outcome")
+                    .is_some_and(|value| value.contains("local-admission-busy"))
+                    && row.get("root").is_some_and(|value| {
+                        value.contains(&fixture.paths.root.display().to_string())
+                    })
+                    && row
+                        .get("node")
+                        .is_some_and(|value| value.contains(fixture.local.as_str()))
+            }),
+            "real retained operation owner must produce the actual bounded retry branch; rows={:?}, omitted={}, error={error}, elapsed={:?}",
+            trace.rows.lock().unwrap(),
+            trace.omitted.load(std::sync::atomic::Ordering::Relaxed),
+            started.elapsed(),
         );
         drop(held);
         assert_eq!(

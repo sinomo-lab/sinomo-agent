@@ -34,6 +34,11 @@ pub fn register_storage_paths(
     layout.register_binary(
         "sinomo-dfs-migration",
         StorageRing::R1,
+        "dfs/local-state-converted-v8",
+    )?;
+    layout.register_binary(
+        "sinomo-dfs-migration",
+        StorageRing::R1,
         "dfs/content/legacy-readers.lock",
     )?;
     layout.register_escape_path(

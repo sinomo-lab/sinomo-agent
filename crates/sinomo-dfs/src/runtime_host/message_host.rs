@@ -183,6 +183,9 @@ pub(crate) fn daemon_dfs_bounded_status_resident(
     let cache = match slot.try_lock() {
         Ok(cache) => cache,
         Err(std::sync::TryLockError::WouldBlock) => {
+            tracing::trace!(target: "sinomo.dfs.cache_diagnostic",
+                data_root = %data_dir.root().display(), branch = "root-entry",
+                "bounded status cache busy");
             return Err(sinomo_dfs::DfsError::Network {
                 message: "bounded DFS status unavailable while the resident generation cache is being updated"
                     .to_string(),

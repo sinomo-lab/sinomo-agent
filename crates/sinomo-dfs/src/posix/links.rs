@@ -72,7 +72,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::InvalidPath { path: link_path });
         }
         self.ensure_parent_directory(&link_path)?;
-        let mut object = match self.lookup_sifs_path(&link_path)? {
+        // Resolving parent links deliberately skips the final entry. Its local
+        // replica may still precede an acknowledged unlink, so select that
+        // exact entry from its authority without following a dangling target.
+        let mut object = match self.lookup_sifs_path_direct_distributed_synced(&link_path)? {
             Some(object) if object.kind != DfsObjectKind::Tombstone => {
                 return Err(DfsPosixError::AlreadyExists { path: link_path });
             }

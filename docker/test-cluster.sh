@@ -3267,7 +3267,7 @@ prepare_pjdfstest_zero_byte_placement() {
 }
 
 run_pjdfstest_compatibility_probe() {
-  local command_timeout runner_rc=0 result_file harness_status compatibility_status
+  local command_timeout runner_rc=0 result_file harness_status harness_reason compatibility_status
   local result_run_id result_profile result_mode cleanup_status sentinel_status
   local result_schema result_patchset control_unresolved sifs_unresolved
   local zero_byte_status zero_byte_o_creat_path zero_byte_o_excl_path
@@ -3312,6 +3312,10 @@ run_pjdfstest_compatibility_probe() {
   fi
   harness_status="$(pjdfstest_result_value "$result_file" harness_status)" || {
     log "pjdfstest: result.env has no unique harness_status"
+    return 20
+  }
+  harness_reason="$(pjdfstest_result_value "$result_file" harness_reason)" || {
+    log "pjdfstest: result.env has no unique harness_reason"
     return 20
   }
   compatibility_status="$(pjdfstest_result_value "$result_file" compatibility_status)" || {
@@ -3409,6 +3413,12 @@ run_pjdfstest_compatibility_probe() {
     log "pjdfstest: unresolved platform directives remain (control=$control_unresolved sifs=$sifs_unresolved)"
     return 20
   fi
+  # Setup can fail before the zero-byte syscalls assign paths or results.
+  # Preserve that failure instead of relabeling not_run as an identity mismatch.
+  if [ "$harness_status" != passed ]; then
+    log "pjdfstest: harness failed (reason=$harness_reason, runner exit=$runner_rc, compatibility=$compatibility_status)"
+    return 20
+  fi
   if [ "$zero_byte_status" != "$sentinel_status" ] \
     || { [ "$zero_byte_status" != passed ] && [ "$zero_byte_status" != failed ]; } \
     || [ "$zero_byte_o_creat_path" != "$PJDFSTEST_ZERO_BYTE_PREFIX/$RUN_ID/o-creat-empty" ] \
@@ -3432,10 +3442,6 @@ run_pjdfstest_compatibility_probe() {
       return 20
       ;;
   esac
-  if [ "$harness_status" != passed ]; then
-    log "pjdfstest: harness failed (runner exit=$runner_rc, compatibility=$compatibility_status)"
-    return 20
-  fi
   case "$compatibility_status" in
     compatible)
       if [ "$runner_rc" -ne 0 ]; then

@@ -1784,19 +1784,101 @@ fn sync_connectivity_fixture_to_quorum(
         records,
     )
     .map_err(|error| SinomoTestError::failed(format!("cannot prepare to {action}: {error}")))?;
-    let mut driver = super::cli_cluster_control_plane_driver(cluster_paths);
-    let snapshot = cluster::sync_cluster_connectivity_records_to_quorum_with_host(
-        cluster_paths,
-        source_node_id,
-        records,
-        &mut driver,
-    )
-    .map_err(|error| SinomoTestError::failed(format!("cannot {action}: {error}")))?;
-    if let Some(snapshot) = snapshot {
-        super::write_imported_cluster_kv_snapshot(cluster_paths, &snapshot)
-            .map_err(|error| SinomoTestError::failed(format!("cannot cache {action}: {error}")))?;
+    // A live daemon owns the Raft store. Use its existing authenticated RPCs
+    // for both the planning cut and quorum commit instead of opening that store
+    // in this CLI process. No local snapshot or fixture value grants authority.
+    use sinomo_runtime::kv;
+    let data_root = cluster_paths
+        .root
+        .parent()
+        .ok_or_else(|| SinomoTestError::failed("connectivity fixture has no data root"))?;
+    let daemon = DaemonApiClient::connect_for_paths(&sinomo_runtime::daemon::DaemonPaths::new(
+        &SinomoDataDir::new(data_root),
+    ))
+    .map_err(|error| SinomoTestError::failed(format!("cannot connect to {action}: {error}")))?;
+    let call = |payload: kv::ClusterKvRpcPayload| {
+        daemon
+            .call_request(&network::ObjectRpcRequest::from_encoded_body(
+                payload.route,
+                payload.category,
+                payload.body,
+            ))
+            .map_err(|error| SinomoTestError::failed(format!("cannot {action}: {error}")))
+    };
+    network::write_local_cluster_connectivity_record_set(cluster_paths, source_node_id, &records)
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+    let mut previous_ops = None;
+    // Each successful batch removes at least one remaining semantic difference.
+    // Concurrent nonprogress is a fixture failure, never a successful seed.
+    for _ in 0..=network::MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS * 2 {
+        let response = call(
+            kv::cluster_kv_authoritative_snapshot_rpc_payload()
+                .map_err(|error| SinomoTestError::failed(error.to_string()))?,
+        )?;
+        let snapshot = kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
+            .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+        let current = network::read_local_cluster_connectivity_records_for_source(
+            cluster_paths,
+            source_node_id,
+        )
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+        let ops = cluster::cluster_connectivity_full_sync_batch_ops_from_snapshot(
+            &snapshot.value,
+            source_node_id,
+            &current,
+            OffsetDateTime::now_utc(),
+            kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        )
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+        if ops.is_empty() {
+            daemon.reload_local_connectivity().map_err(|error| {
+                SinomoTestError::failed(format!("cannot reload {action}: {error}"))
+            })?;
+            return Ok(());
+        }
+        if previous_ops.as_ref() == Some(&ops) {
+            return Err(SinomoTestError::failed(format!(
+                "no quorum publication progress while trying to {action}"
+            )));
+        }
+        previous_ops = Some(ops.clone());
+        let request = kv::KvTxnRequest::generated(kv::KvTxn {
+            compares: Vec::new(),
+            success: ops,
+            failure: Vec::new(),
+        });
+        let digest = kv::kv_command_digest(&kv::KvCommand::Txn(request.txn.clone()))
+            .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+        let response = call(
+            kv::cluster_kv_txn_rpc_payload(&request)
+                .map_err(|error| SinomoTestError::failed(error.to_string()))?,
+        )
+        .map_err(|error| {
+            SinomoTestError::failed(format!("{action} request {}: {error}", request.request_id))
+        })?;
+        let committed = kv::decode_cluster_kv_txn_rpc_body(&response.body)
+            .map_err(|error| SinomoTestError::failed(error.to_string()))?;
+        let txn = committed.txn_response.as_ref().ok_or_else(|| {
+            SinomoTestError::failed("connectivity fixture received no transaction result")
+        })?;
+        if committed.request_id != request.request_id
+            || committed.submitted_command_digest != Some(digest)
+            || !txn.succeeded
+        {
+            return Err(SinomoTestError::failed(
+                "connectivity fixture commit did not bind its exact successful request",
+            ));
+        }
+        kv::validate_cluster_kv_txn_authority_proof(
+            &committed.authority,
+            committed.replayed_committed_request,
+            txn.revision,
+        )
+        .map_err(|error| SinomoTestError::failed(error.to_string()))?;
     }
-    Ok(())
+    Err(SinomoTestError::failed(format!(
+        "connectivity fixture publication remained incomplete: {action}"
+    )))
 }
 
 fn refresh_connectivity_fixture_records(
@@ -3351,6 +3433,40 @@ mod tests {
             now,
             network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
         )
+    }
+
+    #[test]
+    fn connectivity_fixture_plans_from_owner_snapshot_and_rejects_foreign_source() {
+        let state = test_state();
+        let endpoint = test_endpoint(
+            &state.members[1].node_id,
+            "endpoint_fixture_owned_snapshot",
+            "peer.example.test:21353",
+        );
+        let mut record = test_connectivity_record(&state, &endpoint);
+        let snapshot = sinomo_runtime::kv::InProcessKvStore::new()
+            .snapshot()
+            .unwrap();
+        let ops = cluster::cluster_connectivity_full_sync_batch_ops_from_snapshot(
+            &snapshot,
+            &state.local_node_id,
+            std::slice::from_ref(&record),
+            OffsetDateTime::now_utc(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(ops.len(), 1);
+        record.source_node_id = state.members[1].node_id.clone();
+        assert!(
+            cluster::cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                &snapshot,
+                &state.local_node_id,
+                &[record],
+                OffsetDateTime::now_utc(),
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

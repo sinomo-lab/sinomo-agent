@@ -17,12 +17,11 @@ pub fn rollout_binary_rpc_call(
         .ok_or_else(|| RolloutError::MissingArtifact {
             artifact: request.artifact_id.clone(),
         })?;
-    let attachment = ObjectRpcBodySource::file(attachment_path.to_path_buf()).map_err(|error| {
-        RolloutError::Io {
+    let attachment = ObjectRpcBodySource::file_with_streaming_cache(attachment_path.to_path_buf())
+        .map_err(|error| RolloutError::Io {
             path: attachment_path.display().to_string(),
             detail: error.to_string(),
-        }
-    })?;
+        })?;
     if attachment.total_bytes() != Some(artifact.total_bytes) {
         return Err(RolloutError::Io {
             path: attachment_path.display().to_string(),

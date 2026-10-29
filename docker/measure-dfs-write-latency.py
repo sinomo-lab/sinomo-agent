@@ -29,6 +29,34 @@ POLICIES = {"w1-n2": {"consistency": "replicated-eventual", "min_commit_replicas
             "w2-n3": {"consistency": "replicated-eventual", "min_commit_replicas": 2,
                       "desired_replicas": 3}}
 
+# The work deadline runs inside the container. Killing docker exec on the host
+# does not cancel its target process. Extra host time permits only signal/drain,
+# never more probe work; a timeout still stops this matrix with unknown effects.
+PROBE_KILL_GRACE_SECONDS = 5
+PROBE_EXEC_DRAIN_SECONDS = 10
+
+
+def bounded_probe_command(argv, timeout):
+    return ["timeout", "--signal=TERM", f"--kill-after={PROBE_KILL_GRACE_SECONDS}s",
+            f"{timeout}s", *argv]
+
+
+def probe_failure_allows_continuation(group, iterations, warmup):
+    """Only complete verified operations permit measuring an independent case."""
+    if group.get("command_timed_out"):
+        return False
+    key = (group["replication_scenario"], group["origin"], group["shard"])
+    try:
+        validate_fixture(group, key)
+        # Reuse the strict validator with only its latency/status gates removed.
+        # Missing samples, wrong W/N, failed writes and policy observations still
+        # stop the matrix; threshold-only misses need not hide later coverage.
+        validate_report({"status": "passed", "diagnostics": group["probe_diagnostics"]},
+                        iterations, warmup, 0, key[0])
+    except (ValueError, KeyError, TypeError, RuntimeError):
+        return False
+    return True
+
 
 def fixture_index(fixtures, project):
     """Validate retained matrix identity before considering any fixture."""
@@ -206,6 +234,10 @@ def main():
               "timing_scope": "public daemon DFS write_file API through committed response; client RPC included",
               "fixtures_retained": True, "groups": [], "errors": [],
               "initial_identity_verified": False, "final_identity_verified": False}
+    result["planned_cases"] = [
+        {"origin": origin, "replication_scenario": scenario, "shard": shard}
+        for origin in args.origins for scenario, shard in product(args.policies, args.shards)
+    ]
     result["acceptance_scope"] = (args.iterations >= 100 and args.payload_bytes == 4096
                                   and args.max_p95_us == 100_000
                                   and set(args.origins) == set(PEERS)
@@ -238,8 +270,8 @@ def main():
                          "origin": origin, "shard": shard, "peer": PEERS[origin], "passed": False,
                          "command_timed_out": False}
                 result["groups"].append(group)
-                argv = [*run.compose, "exec", "-T", origin, "sinomo", "test", "run",
-                        "cluster.dfs.write-latency", "--require-cluster", "--json"]
+                probe_argv = ["sinomo", "test", "run", "cluster.dfs.write-latency",
+                              "--require-cluster", "--json"]
                 parameters = {"base": BASES[shard], "replication": scenario,
                               "iterations": args.iterations,
                               "warmup-iterations": args.warmup, "payload-bytes": args.payload_bytes,
@@ -248,10 +280,13 @@ def main():
                     parameters.pop("base")
                     parameters["prepared-base"] = fixture_groups[(scenario, origin, shard)]["base"]
                 for name, value in parameters.items():
-                    argv += ["--param", f"{name}={value}"]
+                    probe_argv += ["--param", f"{name}={value}"]
+                argv = [*run.compose, "exec", "-T", origin,
+                        *bounded_probe_command(probe_argv, args.command_timeout)]
                 probe_stem = run.artifacts / f"{run.index + 1:03d}-{label}"
                 try:
-                    raw = run.run(label, argv, timeout=args.command_timeout)
+                    raw = run.run(label, argv,
+                                  timeout=args.command_timeout + PROBE_EXEC_DRAIN_SECONDS)
                     probe = record_probe_evidence(group, raw)
                     group["summary"] = validate_report(
                         probe, args.iterations, args.warmup, args.max_p95_us, scenario)
@@ -263,6 +298,11 @@ def main():
                     group["passed"] = True
                 except Exception as error:
                     group["command_timed_out"] = isinstance(error, subprocess.TimeoutExpired)
+                    timing_path = probe_stem.with_suffix(".timing.json")
+                    if timing_path.is_file():
+                        timing = json.loads(timing_path.read_text())
+                        group["target_returncode"] = timing.get("returncode")
+                        group["command_timed_out"] |= timing.get("returncode") in (124, 137)
                     # Even a failed threshold exits nonzero. Keep its samples
                     # in the aggregate as well as the immutable raw stdout.
                     try:
@@ -271,6 +311,15 @@ def main():
                         group["probe_evidence_error"] = str(evidence_error)
                     group["error"] = f"{type(error).__name__}: {error}"
                     result["errors"].append(f"{label}: {group['error']}")
+                    if not probe_failure_allows_continuation(group, args.iterations, args.warmup):
+                        result["blocked_after"] = label
+                        result["unrun_cases"] = result["planned_cases"][len(result["groups"]):]
+                        result["remaining_cases_unrun"] = bool(result["unrun_cases"])
+                        result["stage_profile_passed"] = False
+                        raise RuntimeError(
+                            f"{label}: write completion/verification is incomplete; "
+                            "retain original operations and stop before later cases or profiling"
+                        ) from error
                 finally:
                     (run.artifacts / "write-latency.json").write_text(json.dumps(result, indent=2) + "\n")
         for node in [f"node{i}" for i in range(1, 7)]:

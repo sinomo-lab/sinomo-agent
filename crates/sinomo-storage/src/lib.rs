@@ -10,6 +10,7 @@ pub mod durable_file;
 pub mod io_trace;
 pub mod migration;
 pub mod scratch;
+pub mod streaming_file;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -306,6 +307,11 @@ impl StorageLayout {
             .files
             .iter()
             .find(|file| file.relative_path.as_ref() == relative)
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .find(|file| file_path_matches(&relative, &file.relative_path))
+            })
         {
             return Some(StoragePathOwner::File(file));
         }
@@ -570,6 +576,40 @@ fn normalize_relative_path(path: &Path) -> Result<String, StorageContractError> 
     Ok(parts.join("/"))
 }
 
+// File contracts already name dynamic fields such as `{operation_id}.sobj`.
+// Match one nonempty field per path component, bounded by its literal prefix
+// and suffix; it must never consume a separator or cover a whole subtree.
+fn file_path_matches(relative_path: &str, contract: &str) -> bool {
+    let mut actual = relative_path.split('/');
+    for component in contract.split('/') {
+        let Some(value) = actual.next() else {
+            return false;
+        };
+        if component == value {
+            continue;
+        }
+        let Some((prefix, field)) = component.split_once('{') else {
+            return false;
+        };
+        let Some((name, suffix)) = field.split_once('}') else {
+            return false;
+        };
+        if name.is_empty() || name.contains(['{', '}']) || suffix.contains(['{', '}']) {
+            return false;
+        }
+        let Some(value) = value
+            .strip_prefix(prefix)
+            .and_then(|v| v.strip_suffix(suffix))
+        else {
+            return false;
+        };
+        if value.is_empty() {
+            return false;
+        }
+    }
+    actual.next().is_none()
+}
+
 fn path_has_prefix(relative_path: &str, prefix: &str) -> bool {
     relative_path == prefix
         || relative_path
@@ -696,6 +736,49 @@ mod tests {
             path.relative_path == "cluster/iroh/01.secret.sobj"
                 && path.coverage == StorageCoverage::Escape
         }));
+    }
+
+    #[test]
+    fn dynamic_file_contracts_keep_component_and_suffix_boundaries() {
+        let mut layout = StorageLayout::new();
+        layout
+            .register_binary(
+                "owner",
+                StorageRing::R1,
+                "dfs/.dfs-content-initialization-{identity}.lock",
+            )
+            .unwrap();
+        layout
+            .register_binary(
+                "owner",
+                StorageRing::R1,
+                "cluster/endpoint-recovery/{operation_id}.sobj",
+            )
+            .unwrap();
+        let report = layout
+            .verify_relative_paths([
+                "dfs/.dfs-content-initialization-0123.lock",
+                "cluster/endpoint-recovery/operation-1.sobj",
+                "dfs/.dfs-content-initialization-.lock",
+                "dfs/.dfs-content-initialization-0123.lock.backup",
+                "dfs/.dfs-content-initialization-0123/other.lock",
+                "cluster/endpoint-recovery/nested/operation-1.sobj",
+                "dfs/unrelated.lock",
+            ])
+            .unwrap();
+        assert_eq!(report.covered.len(), 2);
+        assert_eq!(report.unregistered.len(), 5);
+        layout
+            .register_binary(
+                "specific-owner",
+                StorageRing::R1,
+                "cluster/endpoint-recovery/operation-1.sobj",
+            )
+            .unwrap();
+        assert!(
+            matches!(layout.owner_for("cluster/endpoint-recovery/operation-1.sobj"),
+            Some(StoragePathOwner::File(contract)) if contract.module == "specific-owner")
+        );
     }
 
     #[test]

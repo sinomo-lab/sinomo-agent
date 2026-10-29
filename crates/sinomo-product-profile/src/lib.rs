@@ -824,6 +824,21 @@ mod tests {
             sinomo_runtime::core::Id::generate()
         )));
         let catalog = base_component_catalog(&root, ProductComponentProfile::main(true)).unwrap();
+        let active_layout =
+            sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&catalog).unwrap();
+        let covered = active_layout
+            .verify_relative_paths([
+                "dfs/.dfs-content-initialization-0123456789abcdef.lock",
+                "dfs/local-state-converted-v8",
+                "dfs/attachment-maintenance.sobj",
+                "cluster/migrations/original-operation/source/cluster/kv-raft/node/wal.sobjlog",
+            ])
+            .unwrap();
+        assert!(covered.is_complete(), "{covered:?}");
+        assert!(active_layout.owner_for("dfs/unowned-state.sobj").is_none());
+        assert!(
+            matches!(active_layout.owner_for("dfs/attachment-maintenance.sobj"), Some(sinomo_runtime::storage::StoragePathOwner::Escape(owner)) if owner.module == "sinomo-dfs-attachments")
+        );
         for id in ["module.dfs.attachments", "module.dfs.history"] {
             let id = sinomo_runtime::module::ModuleId::from_legacy_named(id).unwrap();
             let registration = catalog.modules().get(&id).unwrap();

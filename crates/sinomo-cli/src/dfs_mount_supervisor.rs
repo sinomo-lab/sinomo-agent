@@ -216,16 +216,9 @@ fn run_supervisor(
             return;
         }
     };
-    let _lease = match SifsMountLease::try_acquire(&data_dir, "managed daemon component") {
-        Ok(lease) => lease,
-        Err(error) => {
-            publish_observed(
-                &inner,
-                error_status(&SifsMountConfig::default(), None, error),
-            );
-            return;
-        }
-    };
+    // An inactive supervisor observes configuration; it owns no mount. Acquire
+    // the shared foreground/managed fence only before starting a provider.
+    let mut lease: Option<SifsMountLease> = None;
     let config_watcher = match start_config_watcher(&data_dir, Arc::clone(&inner)) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
@@ -272,6 +265,17 @@ fn run_supervisor(
                 &mut active,
                 ActiveMountStopDisposition::UnregisterPreservingState,
             );
+            if let Some(ActiveMount::UnconfirmedStop(error)) = active.as_ref() {
+                publish(
+                    &store,
+                    &data_dir,
+                    &inner,
+                    error_status(&config, None, error.clone()),
+                );
+                inner.wake.wait(None);
+                continue;
+            }
+            lease.take();
             active_config = None;
             publish(
                 &store,
@@ -300,6 +304,31 @@ fn run_supervisor(
         if needs_start {
             let stop_disposition = replacement_stop_disposition(active_config.as_ref(), &config);
             stop_active(&mut active, stop_disposition);
+            if let Some(ActiveMount::UnconfirmedStop(error)) = active.as_ref() {
+                publish(
+                    &store,
+                    &data_dir,
+                    &inner,
+                    error_status(&config, None, error.clone()),
+                );
+                inner.wake.wait(None);
+                continue;
+            }
+            if lease.is_none() {
+                match SifsMountLease::try_acquire(&data_dir, "managed daemon component") {
+                    Ok(acquired) => lease = Some(acquired),
+                    Err(error) => {
+                        publish(
+                            &store,
+                            &data_dir,
+                            &inner,
+                            error_status(&config, Some(&mount_point), error),
+                        );
+                        inner.wake.wait(Some(RETRY_DELAY));
+                        continue;
+                    }
+                }
+            }
             restart_count = restart_count.saturating_add(1);
             publish(
                 &store,
@@ -474,6 +503,9 @@ impl Drop for SifsMountLease {
 }
 
 enum ActiveMount {
+    // A consumed provider handle may fail to confirm unmount. Keep its fence
+    // until the supervisor ends; neither disable nor replacement implies exit.
+    UnconfirmedStop(String),
     #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
     Fuse {
         handle: Option<sinomo_dfs_fuse::DfsFuseMountHandle>,
@@ -512,6 +544,7 @@ fn replacement_stop_disposition(
 impl ActiveMount {
     fn health_poll_interval(&self) -> Option<Duration> {
         match self {
+            Self::UnconfirmedStop(_) => None,
             #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
             Self::Fuse { .. } => Some(RETRY_DELAY),
             #[cfg(windows)]
@@ -565,6 +598,7 @@ impl ActiveMount {
         #[cfg(not(any(all(target_os = "linux", feature = "dfs-fuse"), windows)))]
         let _ = (daemon_pid, restart_count);
         match self {
+            Self::UnconfirmedStop(error) => Err(error.clone()),
             #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
             Self::Fuse {
                 handle,
@@ -593,6 +627,7 @@ impl ActiveMount {
         #[cfg(not(windows))]
         let _ = disposition;
         match self {
+            Self::UnconfirmedStop(error) => Err(error.clone()),
             #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
             Self::Fuse { handle, .. } => match handle.take() {
                 Some(handle) => handle.shutdown().map_err(|error| error.to_string()),
@@ -757,6 +792,7 @@ fn stop_active(active: &mut Option<ActiveMount>, disposition: ActiveMountStopDis
         && let Err(error) = mount.stop(disposition)
     {
         tracing::warn!("stop SIFS host mount: {error}");
+        *active = Some(ActiveMount::UnconfirmedStop(error));
     }
 }
 
@@ -956,6 +992,62 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_supervisor_leaves_foreground_mount_lease_available() {
+        let root = sinomo_testdir::TestDir::new("disabled-supervisor-mount-lease");
+        let data = SinomoDataDir::new(&root);
+        data.ensure_root_layout().unwrap();
+        let service = SifsMountSupervisorService::new(data.clone(), DaemonPaths::new(&data), 123);
+        // Always drain this actual worker, including on an assertion failure.
+        struct Stop(SifsMountSupervisorService);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.inner.shutdown.store(true, Ordering::Release);
+                self.0.inner.wake.signal();
+                if let Some(worker) = self.0.inner.worker.lock().unwrap().take() {
+                    worker.join().unwrap();
+                }
+            }
+        }
+        let stopped = Stop(service);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = stopped.0.status();
+            if status.daemon_pid == Some(123) && status.phase == SifsMountRuntimePhase::Disabled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disabled status: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let foreground = SifsMountLease::try_acquire(&data, "test foreground")
+            .expect("a disabled supervisor owns no mount");
+        assert!(SifsMountLease::try_acquire(&data, "competing foreground").is_err());
+        drop(foreground);
+        assert!(SifsMountLease::try_acquire(&data, "next foreground").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unconfirmed_mount_stop_retains_exclusion_through_repeated_disable() {
+        let root = sinomo_testdir::TestDir::new("unconfirmed-supervisor-stop");
+        let data = SinomoDataDir::new(&root);
+        let lease = SifsMountLease::try_acquire(&data, "managed mount").unwrap();
+        let mut active = Some(ActiveMount::UnconfirmedStop("unmount not confirmed".into()));
+        for _ in 0..2 {
+            stop_active(
+                &mut active,
+                ActiveMountStopDisposition::UnregisterPreservingState,
+            );
+            assert!(matches!(active, Some(ActiveMount::UnconfirmedStop(_))));
+            assert!(SifsMountLease::try_acquire(&data, "replacement").is_err());
+        }
+        drop(lease);
+    }
 
     #[test]
     fn component_registers_provider_neutral_status_routes() {

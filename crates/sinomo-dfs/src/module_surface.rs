@@ -43,6 +43,12 @@ pub fn register_storage_paths(
 ) -> Result<(), sinomo_core::storage::StorageContractError> {
     use sinomo_core::storage::StorageRing;
 
+    layout.register_binary(
+        "sinomo-dfs",
+        StorageRing::R1,
+        "dfs/.dfs-content-initialization-{root_identity}.lock",
+    )?;
+
     for (relative_path, reason) in [
         ("dfs/content/blobs", "content-addressed DFS blob bytes"),
         (

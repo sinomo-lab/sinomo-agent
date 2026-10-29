@@ -163,7 +163,9 @@ impl RetryFixture {
                     | DaemonDfsPreDispatchTestPoint::BeforeContentCopyStep { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeCompletedPrimaryRebind { .. }
                     | DaemonDfsPreDispatchTestPoint::BeforeReplicaContextComparison
-                    | DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested { .. }
+                    | DaemonDfsPreDispatchTestPoint::PublishGenerationAdmissionRequested {
+                        ..
+                    }
                     | DaemonDfsPreDispatchTestPoint::PublishGenerationWorkerStarted { .. }
                     | DaemonDfsPreDispatchTestPoint::AfterReport { .. } => {}
                     DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess
@@ -465,7 +467,10 @@ fn configure_native_provider_zone(
     zone: &Option<String>,
 ) -> Result<(), crate::DfsError> {
     let data_dir = SinomoDataDir::new(
-        paths.root.parent().ok_or_else(|| test_error("native fixture DATA root"))?,
+        paths
+            .root
+            .parent()
+            .ok_or_else(|| test_error("native fixture DATA root"))?,
     );
     let host = registered_dfs_runtime_host(&data_dir)
         .map_err(|error| test_error(error.to_string()))?

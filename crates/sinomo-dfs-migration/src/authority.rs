@@ -1789,6 +1789,7 @@ fn shared_runtime(
 pub fn staged_import_component_factory()
 -> std::result::Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     staged_service::factory()
+        .map(|factory| factory.with_storage_paths(crate::register_storage_paths))
 }
 
 /// Built after the component factory has retained its real data-owner lease.

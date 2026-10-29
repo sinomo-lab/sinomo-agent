@@ -8273,7 +8273,15 @@ fn daemon_dfs_reactive_probe_retains_completed_promoted_primary_rebind_until_mai
         0
     );
     drop(preflight);
-    let mut promoted = native.client(&nodes[1]).unwrap();
+    let mut promoted = native.client(&nodes[1]).unwrap_or_else(|error| {
+        panic!(
+            "native promoted client boundary: node={} root={} previously_observed_activated_epoch={:?} expected_epoch={} error={error}",
+            nodes[1],
+            promoted_data.root().display(),
+            marker.activated_epoch,
+            desired.epoch,
+        )
+    });
     assert!(promoted.posix_stat("/native-rebind-source-cut").is_ok());
     promoted.posix_mkdir("/native-rebind-new-author").unwrap();
     drop(promoted);
@@ -11192,7 +11200,8 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
             let opens_before = daemon_dfs_test_message_service_lane_open_count(&data_dir);
             let select = |kind| {
                 let rollover = matches!(&kind, DaemonDfsMessageLaneKind::MutationGlobal);
-                daemon_dfs_message_lane_with_typed_preflight_for_test(
+                let selected_kind = format!("{kind:?}");
+                let result = daemon_dfs_message_lane_with_typed_preflight_for_test(
                     &data_dir,
                     &cluster_paths,
                     &peer_snapshot,
@@ -11200,7 +11209,17 @@ fn daemon_dfs_resident_mutation_lanes_are_scoped_by_exact_shard() {
                     kind,
                     rollover,
                     &preflight,
-                )
+                );
+                if let Err(error) = &result {
+                    eprintln!(
+                        "native exact-shard selection boundary: root={} lane={} rollover={} preflight_storage_generation={} error={error:?}",
+                        data_dir.root().display(),
+                        selected_kind,
+                        rollover,
+                        preflight.authority.storage_generation(),
+                    );
+                }
+                result
             };
             let root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()))?;
             let same_root_lane = select(DaemonDfsMessageLaneKind::MutationExact(root_key.clone()))?;

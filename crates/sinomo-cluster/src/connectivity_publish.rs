@@ -541,13 +541,16 @@ pub fn cluster_connectivity_full_sync_batch_ops(
     )
 }
 
-pub(crate) fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
+/// Plan a source-owned publication from a caller's already verified snapshot.
+/// External clients use the resident owner's read/commit RPCs, not its Raft lock.
+pub fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
     snapshot: &KvSnapshot,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
     _now: OffsetDateTime,
     max_ops: usize,
 ) -> Result<Vec<KvOp>, NetworkError> {
+    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let max_ops = max_ops
         .min(sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH)
         .min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);

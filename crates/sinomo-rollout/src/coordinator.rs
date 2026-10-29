@@ -139,7 +139,33 @@ pub fn cache_rollout_coordinator_artifact(
             .write(true)
             .open(&temporary)
             .map_err(|error| io_error(&temporary, error))?;
-        std::io::copy(&mut input, &mut output).map_err(|error| io_error(&temporary, error))?;
+        // Independent replay custody must not retain an artifact-sized dirty
+        // cache beside the live main/shadow processes. Sync completed ranges
+        // before advising their cache away; the immutable bytes and final
+        // durability/validation checks remain unchanged.
+        let mut copied_offset = 0_u64;
+        loop {
+            // Keep std's file-copy specialization, including filesystem clone
+            // support, while bounding each range's cache/writeback lifetime.
+            let copied = std::io::copy(
+                &mut std::io::Read::take(&mut input, 64 * 1024 * 1024),
+                &mut output,
+            )
+            .map_err(|error| io_error(&temporary, error))?;
+            if copied == 0 {
+                break;
+            }
+            output
+                .sync_data()
+                .map_err(|error| io_error(&temporary, error))?;
+            sinomo_core::storage::streaming_file::release_file_pages(&input, copied_offset, copied);
+            sinomo_core::storage::streaming_file::release_file_pages(
+                &output,
+                copied_offset,
+                copied,
+            );
+            copied_offset += copied;
+        }
         output
             .sync_all()
             .map_err(|error| io_error(&temporary, error))?;
@@ -244,6 +270,45 @@ fn io_error(path: &Path, error: std::io::Error) -> RolloutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_capture_rejects_changed_source_and_corrupt_retained_copy() {
+        let root = sinomo_testdir::TestDir::new("rollout-coordinator-capture-integrity");
+        let paths = SelfRolloutPaths::new(&root);
+        let source = root.join("candidate");
+        let original = b"original immutable bytes";
+        fs::write(&source, original).unwrap();
+        let spec = crate::ClusterRolloutUploadArtifactSpec {
+            artifact_id: "binary".into(),
+            total_bytes: original.len() as u64,
+            blake3: blake3::hash(original).as_bytes().to_vec(),
+        };
+        // A same-length input mutation after preparation must never publish a
+        // digest-addressed replay copy or leave an abandoned partial capture.
+        fs::write(&source, vec![b'x'; original.len()]).unwrap();
+        assert!(matches!(
+            cache_rollout_coordinator_artifact(&paths, &source, &spec),
+            Err(RolloutError::InvalidArtifact { .. })
+        ));
+        assert_eq!(
+            fs::read_dir(paths.root.join("coordinator/artifacts"))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        fs::write(&source, original).unwrap();
+        let retained = cache_rollout_coordinator_artifact(&paths, &source, &spec).unwrap();
+        fs::write(&source, b"a later operator build").unwrap();
+        assert_eq!(fs::read(&retained).unwrap(), original);
+        fs::write(&retained, vec![b'y'; original.len()]).unwrap();
+        assert!(matches!(
+            cache_rollout_coordinator_artifact(&paths, &source, &spec),
+            Err(RolloutError::InvalidArtifact { .. })
+        ));
+        assert_eq!(fs::read(&retained).unwrap(), vec![b'y'; original.len()]);
+    }
+
     #[test]
     fn coordinator_checkpoint_survives_interrupt_with_original_operation_identity() {
         let root = sinomo_testdir::TestDir::new("rollout-coordinator-checkpoint");

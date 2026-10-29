@@ -353,6 +353,7 @@ struct ReplayableRepeatedBytes {
 struct ReplayableFile {
     path: PathBuf,
     total_bytes: u64,
+    streaming_cache: bool,
 }
 
 struct OnePassReader {
@@ -1042,6 +1043,7 @@ impl ObjectRpcBodySource {
             kind: ObjectRpcBodySourceKind::File(ReplayableFile {
                 path,
                 total_bytes: metadata.len(),
+                streaming_cache: false,
             }),
             role: if metadata.len() == 0 {
                 ObjectRpcBodyRole::None
@@ -1050,6 +1052,17 @@ impl ObjectRpcBodySource {
             },
             lifetime_guards: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Opts an explicitly streaming file body into best-effort consumed-page
+    /// cache advice. Identity, replay, length and lifetime behavior match file().
+    /// This does not guarantee reclamation or change the file's durability.
+    pub fn file_with_streaming_cache(path: impl Into<PathBuf>) -> Result<Self, NetworkError> {
+        let mut body = Self::file(path)?;
+        if let ObjectRpcBodySourceKind::File(source) = &mut body.kind {
+            source.streaming_cache = true;
+        }
+        Ok(body)
     }
 
     pub fn reader(reader: Box<dyn Read + Send>, total_bytes: Option<u64>) -> Self {
@@ -1279,7 +1292,13 @@ impl ObjectRpcBodySource {
                     operation: format!("open object RPC body file {}", source.path.display()),
                     detail: error.to_string(),
                 })?;
-                Ok(Box::new(file))
+                if source.streaming_cache {
+                    Ok(Box::new(
+                        sinomo_storage::streaming_file::StreamingFileReader::new(file),
+                    ))
+                } else {
+                    Ok(Box::new(file))
+                }
             }
             ObjectRpcBodySourceKind::Reader(source) => source
                 .lock()
@@ -4033,6 +4052,104 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(allocator.metrics().payload_copy_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn file_streaming_cache_preserves_bytes_reopen_length_and_producer_paths() {
+        let root = sinomo_testdir::TestDir::new("rpc-file-streaming-cache");
+        let path = root.join("input");
+        let expected = (0..(BODY_CHUNK_MAX * 33 + 97))
+            .map(|offset| (offset % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&path, &expected).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        for streaming in [false, true] {
+            let make_source = || {
+                if streaming {
+                    ObjectRpcBodySource::file_with_streaming_cache(path.clone())
+                } else {
+                    ObjectRpcBodySource::file(path.clone())
+                }
+                .unwrap()
+            };
+            let source = make_source();
+            let ObjectRpcBodySourceKind::File(file) = &source.kind else {
+                panic!("file identity retained")
+            };
+            assert_eq!(file.path, path);
+            assert_eq!(file.streaming_cache, streaming);
+            assert_eq!(source.total_bytes(), Some(expected.len() as u64));
+            assert_eq!(source.role(), ObjectRpcBodyRole::Attachment);
+            // Reopening the same replayable source must retain ordinary file semantics.
+            for _ in 0..2 {
+                let mut producer = source.producer(BODY_CHUNK_MAX).unwrap();
+                let mut offset = 0;
+                while let Some(chunk) = producer.next().await.unwrap() {
+                    assert_eq!(chunk.as_ref(), &expected[offset..offset + chunk.len()]);
+                    offset += chunk.len();
+                }
+                producer.finish().await.unwrap();
+                assert_eq!(offset, expected.len());
+            }
+            let pool =
+                crate::owned_chunk::ChunkPool::new(8 * SECURE_WIRE_MAX, SECURE_WIRE_MAX, 0, 0);
+            let allocator = ChunkAllocator::new(pool, 2 * SECURE_WIRE_MAX, SECURE_WIRE_MAX);
+            let mut producer = source.producer(BODY_CHUNK_MAX).unwrap();
+            let mut offset = 0;
+            while let Some(chunk) = producer.next_owned(&allocator).await.unwrap() {
+                assert_eq!(chunk.as_slice(), &expected[offset..offset + chunk.len()]);
+                offset += chunk.len();
+            }
+            producer.finish().await.unwrap();
+            assert_eq!(offset, expected.len());
+            assert_eq!(allocator.metrics().payload_copy_bytes, 0);
+            assert_eq!(
+                make_source().collect_to_vec(expected.len()).await.unwrap(),
+                expected
+            );
+        }
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn file_streaming_cache_preserves_empty_bounds_and_lazy_open_errors() {
+        let root = sinomo_testdir::TestDir::new("rpc-file-streaming-cache-errors");
+        let path = root.join("input");
+        for streaming in [false, true] {
+            let make_source = || {
+                if streaming {
+                    ObjectRpcBodySource::file_with_streaming_cache(path.clone())
+                } else {
+                    ObjectRpcBodySource::file(path.clone())
+                }
+            };
+            std::fs::write(&path, []).unwrap();
+            let empty = make_source().unwrap();
+            assert!(empty.is_empty());
+            assert_eq!(empty.total_bytes(), Some(0));
+            assert_eq!(empty.role(), ObjectRpcBodyRole::None);
+            assert!(empty.collect_to_vec(0).await.unwrap().is_empty());
+            std::fs::write(&path, b"bytes").unwrap();
+            assert!(matches!(
+                make_source().unwrap().collect_to_vec(4).await,
+                Err(NetworkError::FrameTooLarge { .. })
+            ));
+            let source = make_source().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(source.total_bytes(), Some(5));
+            let error = match source.producer(BODY_CHUNK_MAX) {
+                Ok(_) => panic!("removed source must fail at its ordinary lazy open"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, NetworkError::Io { operation, .. }
+                if operation == format!("open object RPC body file {}", path.display())));
+            assert!(make_source().is_err());
+        }
+        assert!(ObjectRpcBodySource::file(root.to_path_buf()).is_err());
+        assert!(ObjectRpcBodySource::file_with_streaming_cache(root.to_path_buf()).is_err());
     }
 
     #[tokio::test]

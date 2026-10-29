@@ -543,9 +543,24 @@ impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
         arm_request_id: &dfs::MountedSifsMutationArmRequestId,
         observation: &dfs::MountedSifsMutationErrorObservation,
     ) -> std::result::Result<(), ()> {
-        lease
+        let persisted = lease
             .record_unknown_after_error(arm_request_id, observation.clone())
-            .map_err(|_| ())
+            .map_err(|_| ());
+        // The existing durability attempt precedes diagnostics. Keep its result
+        // even when stderr is unavailable, and expose no command or nonce data.
+        use std::io::Write as _;
+        let marker = lease.marker();
+        let _ = writeln!(
+            io::stderr().lock(),
+            "sinomo-dfs-fuse: mounted-mutation-unknown phase=unknown-persist-attempted marker_id={} mount_session_id={} operation={:?} arm_request_id={} error_code={:?} persistence_succeeded={}",
+            marker.marker_id,
+            marker.origin.mount_session_id,
+            marker.origin.operation,
+            arm_request_id,
+            observation.error_code,
+            persisted.is_ok(),
+        );
+        persisted
     }
 
     fn persist_proven_no_write(

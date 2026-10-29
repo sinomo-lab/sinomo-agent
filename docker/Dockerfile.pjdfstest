@@ -64,6 +64,10 @@ RUN apt-get update \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
 
+# The dedicated runner explicitly mounts with --allow-other so pjdfstest can
+# exercise access from its test UIDs. Keep that consent inside this opt-in image.
+RUN printf '\nuser_allow_other\n' >> /etc/fuse.conf
+
 # Upstream's test helpers walk up from tests/ until they find the pjdfstest
 # executable, so keep the executable and complete test tree together.
 COPY --from=pjdfstest-builder /src/pjdfstest/pjdfstest /opt/pjdfstest/pjdfstest

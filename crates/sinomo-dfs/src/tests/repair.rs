@@ -5647,6 +5647,256 @@ pub(super) fn native_committed_repair_backlog_with_nodes(
 }
 
 #[test]
+fn native_original_repair_survives_late_retention_and_head_change() {
+    let (runtime, owner, replica, mut core, first, intent_id, background) =
+        native_committed_repair_backlog("native-original-late-retention", true);
+    let intent = core.coordinator().intent(&intent_id).unwrap().clone();
+    let pending = core.writes.pending_writes.get(&intent_id).unwrap().clone();
+    let queue = core.owned_repair_queue_store().unwrap().unwrap();
+    // W is committed, but a background producer may or may not have reached
+    // enrollment before the negative claim gate. If needed, run that same
+    // producer now; both cases retain its actual immutable command.
+    if queue
+        .original_repair_for_slot(&intent_id, &replica)
+        .unwrap()
+        .is_none()
+    {
+        let object = core.current_read_object_metadata(&first.object_id).unwrap();
+        let request_id = core.next_request_id();
+        let prepared = core
+            .prepare_current_background_repair_replica_sends(
+                &[(replica.clone(), request_id)],
+                &intent,
+                &pending,
+                object,
+            )
+            .unwrap();
+        assert!(prepared.is_current_background_repair());
+        drop(prepared);
+    }
+    let birth = queue
+        .original_repair_for_slot(&intent_id, &replica)
+        .unwrap()
+        .unwrap();
+    let DfsNetworkMessage::RepairReplica(original) = &birth.original.message else {
+        panic!("actual current repair producer");
+    };
+    let request_id = original.request_id.clone();
+    assert!(original.expected_base_version.is_none());
+    assert!(birth.observed.is_empty());
+    drop(core);
+
+    // Real public mutations change retention and the head after enrollment.
+    let mut client = runtime.client(&owner).unwrap();
+    client
+        .retain_content_revision(DfsContentReferenceRequest {
+            namespace: "vendor.late-retention".into(),
+            path: first.path.clone(),
+            identity: DfsRevisionReference {
+                file_system_id: first.file_system_id.clone(),
+                object_id: first.object_id.clone(),
+                version: first.version.clone(),
+            },
+            operation: DfsContentReferenceOperation::CaptureCurrent {
+                reference_id: "original-repair-pin".into(),
+                metadata: None,
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        })
+        .unwrap();
+    let head = client
+        .posix_write_file(
+            &first.path,
+            b"later canonical head",
+            DfsWriteOptions {
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                policy: intent.policy.clone(),
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+        )
+        .unwrap();
+    assert_ne!(head.version, first.version);
+    drop(client);
+    for node in [&owner, &replica] {
+        let mut read = runtime.client(node).unwrap();
+        assert_eq!(
+            read.posix_stat_distributed(&first.path).unwrap().version,
+            head.version
+        );
+        assert_eq!(
+            read.posix_read_file_distributed(&first.path).unwrap(),
+            b"later canonical head"
+        );
+    }
+    let mut core = runtime.metadata_primary_service(&first.path).unwrap();
+    assert!(
+        core.retained_content_transfer_required(&intent_id, &first.object_id, &first.version)
+            .unwrap()
+    );
+    core.retry_pending_repairs_bounded_with_attempts(0, &queue.view().unwrap().records)
+        .unwrap();
+    let current = core.current_read_object_metadata(&first.object_id).unwrap();
+    assert_eq!(current.version, head.version);
+    let wrong_request = core.next_request_id();
+    assert!(
+        core.prepare_current_background_repair_replica_sends(
+            &[(replica.clone(), wrong_request)],
+            &intent,
+            &pending,
+            current.clone(),
+        )
+        .is_err(),
+        "an alternate identity cannot replace the enrolled original"
+    );
+    let mut wrong_pending = pending.clone();
+    wrong_pending.content_hash = content_hash(b"different immutable bytes");
+    assert!(
+        core.prepare_current_background_repair_replica_sends(
+            &[(replica.clone(), request_id.clone())],
+            &intent,
+            &wrong_pending,
+            current.clone(),
+        )
+        .is_err(),
+        "an alternate payload cannot reuse the enrolled identity"
+    );
+    let prepared = core
+        .prepare_current_background_repair_replica_sends(
+            &[(replica.clone(), request_id.clone())],
+            &intent,
+            &pending,
+            current,
+        )
+        .expect("late retention must not replace or block the exact enrolled original");
+    assert!(prepared.is_current_background_repair());
+    let after = queue
+        .original_repair_for_slot(&intent_id, &replica)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.original, birth.original);
+    assert_eq!(after.attachment, birth.attachment);
+    assert_eq!(after.root, birth.root);
+    assert!(
+        after.observed.is_empty(),
+        "preparation cannot invent an outcome"
+    );
+    assert_eq!(
+        core.current_read_object_metadata(&first.object_id)
+            .unwrap()
+            .version,
+        head.version
+    );
+    // Observe the authenticated native command and its real receiver result.
+    // Lose only the completed reply: unknown custody must remain unknown.
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&received);
+    let expected_request = request_id.clone();
+    let receiver_hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&replica),
+        Arc::new(move |point, command, _| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+            ) && let Some(command) = command
+                && matches!(&command.routed_message.message, DfsNetworkMessage::RepairReplica(body) if body.request_id == expected_request)
+            {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(command.routed_message.clone());
+            }
+            Ok(())
+        }),
+    );
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    runtime.clear_faults();
+    runtime.install_fault(crate::test_runtime::FaultRule {
+        source: Some(owner.clone()),
+        target: Some(replica.clone()),
+        route: Some(DFS_DATA_REPAIR_REPLICA_ROUTE.into()),
+        call_id: None,
+        origin: Some(crate::test_runtime::RpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: crate::test_runtime::FaultAction::CaptureTransferReplyAndLoseAfterDispatch {
+            intent_id: Some(intent_id.clone()),
+            captured: Arc::clone(&replies),
+        },
+    });
+    drop(background);
+    let outcomes = crate::test_runtime::executor()
+        .block_on(core.dispatch_prepared_repair_replica_sends(prepared, false))
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].delivery_state,
+        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+    );
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].source_node_id, birth.original.source_node_id);
+    assert_eq!(received[0].target_node_id, birth.original.target_node_id);
+    // Ingress has materialized the attachment into the decoded command.
+    // Check those exact bytes separately before comparing the immutable head.
+    let mut decoded = received[0].message.clone();
+    let DfsNetworkMessage::RepairReplica(body) = &mut decoded else {
+        unreachable!()
+    };
+    assert_eq!(body.bytes.len() as u64, birth.attachment.total_size_bytes);
+    assert_eq!(content_hash(&body.bytes), original.content_hash);
+    body.bytes.clear();
+    assert!(
+        decoded == birth.original.message,
+        "actual native command head must equal its enrolled original"
+    );
+    drop(received);
+    let replies = replies.lock().unwrap();
+    assert_eq!(replies.len(), 1);
+    let DfsNetworkMessage::RepairReplicaResponse(reply) = &replies[0].message else {
+        panic!("actual native repair reply");
+    };
+    assert_eq!(reply.request_id, request_id);
+    assert_eq!(reply.intent_id, intent_id);
+    assert_eq!(reply.version, first.version);
+    assert!(
+        matches!(&reply.result, DfsBlobTransferResult::Committed { content_hash } if Some(content_hash) == first.content_hash.as_ref()),
+        "actual receiver: {reply:?}"
+    );
+    drop(replies);
+    let unresolved = queue
+        .original_repair_for_slot(&intent_id, &replica)
+        .unwrap()
+        .unwrap();
+    assert!(unresolved.observed.is_empty());
+    assert!(unresolved.closed_at_sequence.is_none());
+    assert_eq!(unresolved.original, birth.original);
+    drop(receiver_hook);
+    drop(core);
+    runtime.clear_faults();
+    for node in [&owner, &replica] {
+        let mut read = runtime.client(node).unwrap();
+        let current = read.posix_stat_distributed(&first.path).unwrap();
+        assert_eq!(current.version, head.version);
+        assert_eq!(current.content_hash, head.content_hash);
+        assert_eq!(
+            read.posix_read_file_distributed(&first.path).unwrap(),
+            b"later canonical head"
+        );
+        if node == &replica {
+            let (manifest, bytes) = read
+                .content()
+                .read_object_version(first.object_id.as_str(), first.version.as_str())
+                .unwrap();
+            assert_eq!(Some(manifest.content_hash), first.content_hash);
+            assert_eq!(bytes.len() as u64, first.size_bytes.unwrap());
+        }
+    }
+    runtime.assert_fault_budgets().unwrap();
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn repair_retry_schedule_preserves_network_error_diagnostics() {
     let (runtime, owner, replica, mut service, stat, intent_id, background_interception) =
         native_committed_repair_backlog("native-retry-network-diagnostics", true);

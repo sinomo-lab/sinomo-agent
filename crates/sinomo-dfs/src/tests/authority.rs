@@ -805,6 +805,161 @@ fn native_explicit_retry_resumes_ready_intent_after_overlapping_prepare() {
 }
 
 #[test]
+fn native_authority_fallback_keeps_the_original_operation_deadline() {
+    native_authority_held_reply_deadline_case(
+        "native-authority-remaining-deadline",
+        std::time::Duration::from_secs(5),
+        true,
+        false,
+    );
+}
+
+#[test]
+fn native_authority_fallback_does_not_extend_an_earlier_caller_deadline() {
+    native_authority_held_reply_deadline_case(
+        "native-authority-earlier-deadline",
+        std::time::Duration::from_millis(500),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn native_authority_cancellation_stops_before_routed_fallback() {
+    native_authority_held_reply_deadline_case(
+        "native-authority-cancelled-probe",
+        std::time::Duration::from_secs(5),
+        false,
+        true,
+    );
+}
+
+fn native_authority_held_reply_deadline_case(
+    name: &str,
+    budget: std::time::Duration,
+    expect_pending: bool,
+    cancel_probe: bool,
+) {
+    use crate::test_support::{
+        DfsTestFaultAction, DfsTestFaultRule, DfsTestRpcOrigin, DfsTestRpcPhase,
+    };
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+    let (mut runtime, mut requester, shard) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    let path = "/services/authority-remaining-deadline";
+    let original = requester
+        .posix_write_file(
+            path,
+            b"unchanged content",
+            DfsWriteOptions::replicated_eventual(vec![shard.primary_node_id.clone()]),
+        )
+        .unwrap();
+    drop(requester);
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    let mut object = owner
+        .metadata_backend()
+        .unwrap()
+        .get_object(&original.object_id)
+        .unwrap()
+        .unwrap();
+    object.accessed_at_unix_nanos += 1;
+    let replica = shard.replica_node_ids.last().unwrap().clone();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    struct Release(Arc<tokio::sync::Semaphore>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.add_permits(64);
+        }
+    }
+    let release = Release(Arc::clone(&gate));
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    for route in [
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE,
+    ] {
+        runtime.install_fault(DfsTestFaultRule {
+            source: Some(shard.primary_node_id.clone()),
+            target: Some(replica.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: Some(DfsTestRpcOrigin::RegisteredHost),
+            remaining_hits: 32,
+            action: DfsTestFaultAction::PauseAfterDispatch(Arc::clone(&gate)),
+        });
+    }
+    // Hold only a real, authenticated receiver's completed reply. Publication
+    // retains its original five-second deadline and still needs every member.
+    let started = Instant::now();
+    let deadline = started + budget;
+    let cancellation = DfsCancellationFlag::new();
+    owner.add_cancellation(cancellation.clone());
+    owner.transport.set_operation_deadline(Some(deadline));
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = owner.add_object_metadata(object).map_err(|e| e.to_string());
+        done_tx.send(result).unwrap();
+    });
+    let observed_deadline = Instant::now() + Duration::from_secs(1);
+    while !runtime.rpc_observations().iter().any(|o| {
+        o.target == replica
+            && o.source == shard.primary_node_id
+            && o.route == DFS_METADATA_JOURNAL_BATCH_ROUTE
+            && o.phase == DfsTestRpcPhase::AfterDispatch
+    }) {
+        assert!(
+            Instant::now() < observed_deadline,
+            "actual receiver did not reach held reply"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The two short probe budgets are not the enclosing operation deadline.
+    // A held real reply must remain pending while that original budget remains.
+    if cancel_probe {
+        cancellation.cancel();
+    }
+    let premature = done_rx.recv_timeout(Duration::from_millis(2500));
+    drop(release);
+    let result = match &premature {
+        Ok(result) => result.clone(),
+        Err(mpsc::RecvTimeoutError::Timeout) => done_rx
+            .recv_timeout(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(1),
+            )
+            .unwrap(),
+        Err(error) => panic!("publication worker disappeared: {error}"),
+    };
+    worker.join().unwrap();
+    runtime.clear_faults();
+    if expect_pending {
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "publication ended before its original deadline while the actual ACK was retained: {premature:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "release before the original deadline must complete: {result:?}"
+        );
+    } else {
+        assert!(
+            matches!(premature, Ok(Err(_))),
+            "original caller expiry must terminate: {premature:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "caller budget was reset or extended"
+        );
+        if cancel_probe {
+            assert!(
+                result.unwrap_err().contains("cancel"),
+                "cancellation must stay explicit"
+            );
+        }
+    }
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_new_write_recovers_current_epoch_receipt_preparation() {
     let path = "/services/current-epoch-receipt-recovery";
     let (mut runtime, mut requester, shard) = crate::test_support::current_native_metadata_service(
