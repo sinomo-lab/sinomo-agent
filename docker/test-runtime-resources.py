@@ -183,6 +183,34 @@ class RuntimeResources(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 resources.check_node(row)
 
+    def test_memory_failure_keeps_optional_breakdown_without_weakening_gate(self):
+        row = {"Id": "container123", "Config": {"Labels": {"com.docker.compose.service": "node1"}},
+               "HostConfig": {"Memory": resources.NODE_LIMIT, "MemorySwap": resources.NODE_LIMIT},
+               "State": {"Running": True, "OOMKilled": False, "Pid": 123}, "RestartCount": 0}
+        values = {"cgroup": "0::/docker-container123.scope\n", "memory.max": str(resources.NODE_LIMIT),
+                  "memory.swap.max": "0", "memory.current": "1024", "memory.peak": "2048",
+                  "memory.events": "max 0\noom 0\noom_kill 0",
+                  "memory.stat": "anon 100\nfile 900\nfile_dirty 800\nfile_writeback 0"}
+        reads = []
+        def read(path, *args, **kwargs):
+            reads.append(path.name)
+            if path.name == "memory.stat" and path.name not in values:
+                raise FileNotFoundError(path)
+            return values[path.name]
+        with patch.object(Path, "read_text", read):
+            self.assertTrue(resources.check_node(row)["running"])
+            self.assertNotIn("memory.stat", reads)
+            values["memory.events"] = "max 1\noom 0\noom_kill 0"
+            with self.assertRaisesRegex(RuntimeError, "memory.max boundary") as failed:
+                resources.check_node(row)
+            self.assertIn("anon 100", str(failed.exception))
+            self.assertIn("file_dirty 800", str(failed.exception))
+            del values["memory.stat"]
+            with self.assertRaisesRegex(RuntimeError, "memory.max boundary") as unavailable:
+                resources.check_node(row)
+            self.assertIn("memory.stat_unavailable", str(unavailable.exception))
+            self.assertIn("FileNotFoundError", str(unavailable.exception))
+
     def test_retired_pid_is_unavailable_not_zero_counters(self):
         row = {"Id": "container123", "Config": {"Labels": {"com.docker.compose.service": "node1"}},
                "HostConfig": {"Memory": resources.NODE_LIMIT, "MemorySwap": resources.NODE_LIMIT},

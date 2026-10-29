@@ -194,6 +194,12 @@ def check_node(row, activation=None, now=None):
     if int(values["memory.max"]) != NODE_LIMIT or int(values["memory.swap.max"]) != 0:
         raise RuntimeError(f"{node}: effective cgroup limits incorrect: {values}")
     if any(events.get(key, 0) for key in ["max", "oom", "oom_kill", "oom_group_kill"]) or int(values["memory.peak"]) > NODE_LIMIT:
+        # Attribute a failed owned scope without adding work to healthy samples.
+        # Supplemental diagnostics must never replace or weaken this failure.
+        try:
+            values["memory.stat"] = (root / "memory.stat").read_text().strip()
+        except Exception as error:
+            values["memory.stat_unavailable"] = type(error).__name__
         raise RuntimeError(f"{node}: memory.max boundary or OOM condition requires debugging: {values}")
     if activation is not None:
         # Resource reads are part of the existing join interval. A sample that
