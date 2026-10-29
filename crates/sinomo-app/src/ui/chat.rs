@@ -2570,6 +2570,7 @@ impl ChatState {
         let agent_catalog_transport_error: Option<String> = None;
         let event_wake = chat_event_wake(waker.as_ref());
         let handle = ChatHandle::spawn_restored(
+            backend.app_runtime.clone(),
             daemon_address.clone(),
             event_wake,
             restored
@@ -2767,6 +2768,7 @@ impl ChatState {
 
         let event_wake = chat_event_wake(self.ui_waker.as_ref());
         let handle = ChatHandle::spawn_restored(
+            backend.app_runtime.clone(),
             daemon_address.clone(),
             event_wake,
             self.handle.connection_snapshot(),
@@ -3059,6 +3061,7 @@ impl ChatState {
     pub(crate) fn reconnect_after_update_failure(&mut self) {
         let event_wake = chat_event_wake(self.ui_waker.as_ref());
         self.handle = ChatHandle::spawn_restored(
+            self.handle.runtime(),
             self.daemon_address.clone(),
             event_wake,
             self.handle.connection_snapshot(),

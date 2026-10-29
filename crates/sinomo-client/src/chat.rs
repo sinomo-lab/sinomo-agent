@@ -145,6 +145,21 @@ impl ChatDaemonClient {
         )
     }
 
+    /// Non-blocking counterpart with the same request and response semantics.
+    pub async fn attach_async(
+        &self,
+        execution_id: Option<String>,
+    ) -> Result<wire::ChatSessionOpenResponse, DaemonApiError> {
+        self.call_async(
+            wire::CHAT_SESSION_OPEN_ROUTE,
+            &wire::ChatSessionOpenRequest {
+                client_id: self.client_id.clone(),
+                execution_id,
+            },
+        )
+        .await
+    }
+
     pub fn command(
         &self,
         command: wire::ChatSessionCommand,
@@ -167,6 +182,23 @@ impl ChatDaemonClient {
         )
     }
 
+    /// Non-blocking counterpart with the same request and response semantics.
+    pub async fn command_with_id_async(
+        &self,
+        command: wire::ChatSessionCommand,
+        request_id: Option<String>,
+    ) -> Result<wire::ChatSessionCommandResponse, DaemonApiError> {
+        self.call_async(
+            wire::CHAT_SESSION_COMMAND_ROUTE,
+            &wire::ChatSessionCommandRequest {
+                client_id: self.client_id.clone(),
+                request_id,
+                command,
+            },
+        )
+        .await
+    }
+
     pub fn events(
         &self,
         after_sequence: u64,
@@ -184,6 +216,25 @@ impl ChatDaemonClient {
         )
     }
 
+    /// Non-blocking counterpart with the same request and response semantics.
+    pub async fn events_async(
+        &self,
+        after_sequence: u64,
+        max_events: usize,
+        wait: Duration,
+    ) -> Result<wire::ChatSessionEventsResponse, DaemonApiError> {
+        self.call_async(
+            wire::CHAT_SESSION_EVENTS_ROUTE,
+            &wire::ChatSessionEventsRequest {
+                client_id: self.client_id.clone(),
+                after_sequence,
+                max_events,
+                wait_ms: wait.as_millis().min(u64::MAX as u128) as u64,
+            },
+        )
+        .await
+    }
+
     pub fn close(&self) -> Result<wire::ChatSessionCloseResponse, DaemonApiError> {
         self.call(
             wire::CHAT_SESSION_CLOSE_ROUTE,
@@ -191,6 +242,17 @@ impl ChatDaemonClient {
                 client_id: self.client_id.clone(),
             },
         )
+    }
+
+    /// Non-blocking counterpart with the same request and response semantics.
+    pub async fn close_async(&self) -> Result<wire::ChatSessionCloseResponse, DaemonApiError> {
+        self.call_async(
+            wire::CHAT_SESSION_CLOSE_ROUTE,
+            &wire::ChatSessionCloseRequest {
+                client_id: self.client_id.clone(),
+            },
+        )
+        .await
     }
 
     fn call<Req, Resp>(&self, route: &str, request: &Req) -> Result<Resp, DaemonApiError>
@@ -201,6 +263,23 @@ impl ChatDaemonClient {
         let request = ObjectRpcRequest::encode_body(route, wire::CHAT_RPC_CATEGORY, request)?;
         self.daemon
             .call_request(&request)?
+            .decode_body()
+            .map_err(Into::into)
+    }
+
+    async fn call_async<Req, Resp>(
+        &self,
+        route: &str,
+        request: &Req,
+    ) -> Result<Resp, DaemonApiError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let request = ObjectRpcRequest::encode_body(route, wire::CHAT_RPC_CATEGORY, request)?;
+        self.daemon
+            .call_request_async(&request)
+            .await?
             .decode_body()
             .map_err(Into::into)
     }

@@ -51,6 +51,7 @@ const DELETED_CHAT_PURGE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 #[derive(Clone)]
 struct ChatEventLog {
     state: Arc<(Mutex<ChatEventLogState>, Condvar)>,
+    async_changed: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -71,6 +72,7 @@ impl ChatEventLog {
                 }),
                 Condvar::new(),
             )),
+            async_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -88,10 +90,11 @@ impl ChatEventLog {
             state.events.pop_front();
         }
         changed.notify_all();
+        self.async_changed.notify_waiters();
     }
 
+    #[cfg(test)]
     fn poll(&self, request: &wire::ChatSessionEventsRequest) -> wire::ChatSessionEventsResponse {
-        let limit = request.max_events.clamp(1, wire::CHAT_EVENT_PAGE_MAX);
         let wait = Duration::from_millis(request.wait_ms.min(wire::CHAT_EVENT_WAIT_MAX_MS));
         let (lock, changed) = &*self.state;
         let mut state = lock
@@ -109,6 +112,48 @@ impl ChatEventLog {
                 Err(error) => error.into_inner().0,
             };
         }
+        Self::response(&state, request)
+    }
+
+    async fn poll_async(
+        &self,
+        request: &wire::ChatSessionEventsRequest,
+    ) -> wire::ChatSessionEventsResponse {
+        let wait = Duration::from_millis(request.wait_ms.min(wire::CHAT_EVENT_WAIT_MAX_MS));
+        // Register before checking the log so publication between the check
+        // and await cannot strand a reader until its deadline.
+        let changed = self.async_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        {
+            let state = self
+                .state
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if wait.is_zero()
+                || state
+                    .events
+                    .iter()
+                    .any(|event| event.sequence > request.after_sequence)
+            {
+                return Self::response(&state, request);
+            }
+        }
+        let _ = tokio::time::timeout(wait, changed).await;
+        let state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::response(&state, request)
+    }
+
+    fn response(
+        state: &ChatEventLogState,
+        request: &wire::ChatSessionEventsRequest,
+    ) -> wire::ChatSessionEventsResponse {
+        let limit = request.max_events.clamp(1, wire::CHAT_EVENT_PAGE_MAX);
         let events = state
             .events
             .iter()
@@ -1583,19 +1628,31 @@ impl HostedChatService {
         Ok(fanout.poll_peer(&request))
     }
 
-    fn events(
-        &self,
-        request: wire::ChatSessionEventsRequest,
-    ) -> Result<wire::ChatSessionEventsResponse, String> {
-        let execution_id = self.execution_id(&request.client_id)?;
+    fn event_log(&self, client_id: &str) -> Result<ChatEventLog, String> {
+        let execution_id = self.execution_id(client_id)?;
         let events = self
             .views
             .lock()
             .map_err(|_| "chat view registry lock poisoned".to_string())?
             .get(&execution_id)
             .map(|view| view.events.clone())
-            .ok_or_else(|| format!("unknown chat client `{}`", request.client_id))?;
-        Ok(events.poll(&request))
+            .ok_or_else(|| format!("unknown chat client `{client_id}`"))?;
+        Ok(events)
+    }
+
+    #[cfg(test)]
+    fn events(
+        &self,
+        request: wire::ChatSessionEventsRequest,
+    ) -> Result<wire::ChatSessionEventsResponse, String> {
+        Ok(self.event_log(&request.client_id)?.poll(&request))
+    }
+
+    async fn events_async(
+        &self,
+        request: wire::ChatSessionEventsRequest,
+    ) -> Result<wire::ChatSessionEventsResponse, String> {
+        Ok(self.event_log(&request.client_id)?.poll_async(&request).await)
     }
 
     fn close(
@@ -2145,9 +2202,9 @@ impl Service for HostedChatService {
                 wire::CHAT_SESSION_EVENTS_ROUTE => {
                     let payload: wire::ChatSessionEventsRequest =
                         ctx.decode_request_body(&request).await?;
-                    let response = tokio::task::spawn_blocking(move || service.events(payload))
+                    let response = service
+                        .events_async(payload)
                         .await
-                        .map_err(|error| ServiceError::Service(error.to_string()))?
                         .map_err(ServiceError::Service)?;
                     ctx.respond_value(wire::CHAT_SESSION_EVENTS_ROUTE, response)?;
                 }
@@ -5525,3 +5582,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod async_events_tests;

@@ -132,6 +132,7 @@ mod tests {
         let backend = crate::backend::Backend::local_fallback();
         let mut before = ChatState::new(&backend);
         before.handle = ChatHandle::spawn_restored(
+            backend.app_runtime.clone(),
             None,
             None,
             ChatConnectionSnapshot {
