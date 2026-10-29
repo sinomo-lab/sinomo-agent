@@ -61,6 +61,60 @@ async fn wait_target(store: &LocalNodePermissionStore) -> DesktopTargetInfo {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires private dbus-run-session on a fixture without the optional PipeWire client"]
+async fn optional_gui_client_absence_preserves_portal_input() {
+    assert_eq!(std::env::var("SINOMO_TEST_PRIVATE_PORTAL_BUS").as_deref(), Ok("1"));
+    assert!(pipewire::check_available().is_err(), "this control requires an absent client library");
+    let fixture = Arc::new(fixture::Fixture::default());
+    fixture.devices.store(3, Ordering::Release);
+    fixture.node.store(42, Ordering::Release);
+    fixture.serial.store(1234, Ordering::Release);
+    let connection = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.freedesktop.portal.Desktop")
+        .unwrap()
+        .serve_at("/org/freedesktop/portal/desktop", fixture::Remote(fixture.clone()))
+        .unwrap()
+        .serve_at("/org/freedesktop/portal/desktop", fixture::Screen(fixture.clone()))
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let root = std::env::temp_dir().join(format!("sinomo-optional-gui-{}", sinomo_core::Id::generate()));
+    let store = LocalNodePermissionStore::new(&root);
+    assert!(matches!(targets(&store, false), Err(DesktopError::PermissionDenied(_))));
+    assert_eq!(fixture.starts.load(Ordering::Acquire), 0);
+    store.mutate(|p| Ok(p.set_remote_management_enabled(true))).unwrap();
+    let caps = capabilities();
+    assert!(!caps.capture);
+    assert!(caps.keyboard_mouse);
+    assert!(caps.limitations.iter().any(|detail| detail.contains("PipeWire capture client unavailable")));
+    let target = wait_target(&store).await;
+    store.mutate(|p| p.expose_resource_operation(&target.resource_id, "input")).unwrap();
+    let mut input = Input::new(&target.target, &store).unwrap();
+    store.mutate(|p| p.expose_resource_operation(&target.resource_id, "capture")).unwrap();
+    let config = DesktopCaptureConfig {
+        target: target.target.clone(),
+        frames_per_second: 10,
+        include_cursor: false,
+        lease_ms: 10000,
+    };
+    let capture_store = store.clone();
+    let unavailable = tokio::task::spawn_blocking(move || DesktopCapture::start(config, capture_store))
+        .await
+        .unwrap()
+        .err()
+        .expect("missing client must reject capture");
+    assert!(matches!(unavailable, DesktopError::Unsupported(_)));
+    input.send(&DesktopInput::Move { x: 320, y: 240 }).unwrap();
+    assert!(validate_target(&target.target).is_ok());
+    drop(input);
+    shutdown();
+    drop(connection);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a private dbus-run-session; never run against the user's desktop portal"]
 async fn wayland_portal_consent_input_revocation_and_shutdown() {
     assert_eq!(
@@ -471,5 +525,9 @@ async fn wayland_pipewire_frames_and_revocation() {
     shutdown();
     assert!(fixture.closes.load(Ordering::Acquire) > 0);
     assert!(validate_target(&info.target).is_err());
+    // The capture worker and portal owner have drained. Exercise the same
+    // optional-library release used by native module shutdown after that drain.
+    unsafe { pipewire::release_optional_runtime() };
+    assert!(!std::fs::read_to_string("/proc/self/maps").unwrap().contains("libpipewire-0.3.so"));
     std::fs::remove_dir_all(root).unwrap();
 }

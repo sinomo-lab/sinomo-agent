@@ -4335,15 +4335,19 @@ impl AgentChat {
                     ),
                 })?;
         }
-        let roaming_session = if participant_id.is_some() {
-            self.session_checkpoint_store
-                .load_latest(&channel, &participant)
-                .map_err(|detail| CliError::Parse {
-                    detail: format!("load roaming agent session checkpoint failed: {detail}"),
-                })?
-        } else {
-            None
-        };
+        // A group channel's outer runtime and its participants have distinct
+        // sessions. Participant checkpoints belong to load_participant_session;
+        // only an aligned chat participant can restore this outer session.
+        let roaming_session =
+            if participant_id.is_some() && participant.agent_session_id == session.session_id {
+                self.session_checkpoint_store
+                    .load_latest(&channel, &participant)
+                    .map_err(|detail| CliError::Parse {
+                        detail: format!("load roaming agent session checkpoint failed: {detail}"),
+                    })?
+            } else {
+                None
+            };
         let persisted_session = select_resumable_agent_session(local_session, roaming_session)
             .map_err(|detail| CliError::Parse {
                 detail: format!("select canonical agent session failed: {detail}"),
@@ -12060,12 +12064,53 @@ mod tests {
             .save_session(&outer_session)
             .expect("save outer channel session");
 
+        // A completed participant turn publishes its own roaming checkpoint.
+        // The channel's outer runtime is a different session and must not try
+        // to reconcile that checkpoint with its local outer-session record.
+        let participant_session =
+            AgentSession::new(participant_session_id.clone(), AgentRole::Main)
+                .with_agent_definition_key("main-agent");
+        let checkpoints = SifsAgentSessionCheckpointStore::open(&data_dir).expect("checkpoints");
+        checkpoints
+            .publish(
+                &channel,
+                channel.participant(&participant_id).expect("participant"),
+                &participant_session,
+            )
+            .expect("publish participant checkpoint");
+
         let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume group outer session");
 
         assert_ne!(participant_session_id, channel_id);
         assert_eq!(chat.channel.participants, durable_participants);
+        assert_eq!(
+            chat.runtime
+                .handler()
+                .agent_session_snapshot()
+                .expect("outer runtime snapshot")
+                .expect("outer runtime")
+                .session_id,
+            channel_id
+        );
+        assert_eq!(
+            checkpoints
+                .load_latest(
+                    &channel,
+                    channel.participant(&participant_id).expect("participant"),
+                )
+                .expect("retained participant checkpoint"),
+            Some(participant_session.clone()),
+            "resuming the outer runtime must not replace its participant's checkpoint"
+        );
+        assert_eq!(
+            chat.load_participant_session(
+                channel.participant(&participant_id).expect("participant"),
+            )
+            .expect("restore participant through its own session owner"),
+            Some(participant_session)
+        );
         assert!(
             chat.take_resume_sync_warnings().is_empty(),
             "an outer channel session must not be published as a participant checkpoint"

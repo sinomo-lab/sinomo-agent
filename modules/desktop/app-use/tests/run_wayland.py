@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Exercise public portal D-Bus contracts and real PipeWire pixels in isolation.
 
-Requires PipeWire tools/plugins, a C toolchain with PipeWire development headers,
-and dbus-run-session. Does not start a compositor or approve a real desktop grant.
+Requires a selected PipeWire runtime/tools/plugins, a C build toolchain and
+dbus-run-session. ABI headers are bundled. Does not start a compositor or approve
+a real desktop grant.
 """
 import argparse
-import fcntl
 import json
 import os
 import signal
@@ -22,9 +22,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("target/app-use-wayland"))
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    with open("/tmp/sinomo-maintenance-build.lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        subprocess.run(["cargo", "build", "-p", "sinomo-app-use-module", "--example", "wayland_video_fixture"], check=True)
+    subprocess.run(["cargo", "build", "--locked", "-p", "sinomo-app-use-module", "--example", "wayland_video_fixture"], check=True)
     producer_binary = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "debug/examples/wayland_video_fixture"
     config = Path(__file__).with_name("wayland-pipewire.conf").resolve()
     with tempfile.TemporaryDirectory(prefix="sinomo-wayland-") as runtime:
@@ -79,9 +77,7 @@ def main():
                 test_env.update(SINOMO_TEST_PRIVATE_PORTAL_BUS="1", SINOMO_TEST_PIPEWIRE_SOCKET=str(Path(runtime, "pipewire-0")),
                                 SINOMO_TEST_PIPEWIRE_NODE=str(source["id"]), SINOMO_TEST_PIPEWIRE_SERIAL=str(source["info"]["props"]["object.serial"]),
                                 PIPEWIRE_REMOTE="must-not-be-used-by-the-provider")
-                with open("/tmp/sinomo-maintenance-build.lock", "a") as lock:
-                    fcntl.flock(lock, fcntl.LOCK_EX)
-                    result = subprocess.run(["dbus-run-session", "--", "cargo", "test", "-p", "sinomo-app-use-module", "wayland_", "--", "--ignored", "--test-threads=1", "--nocapture"], env=test_env)
+                result = subprocess.run(["dbus-run-session", "--", "cargo", "test", "--locked", "-p", "sinomo-app-use-module", "wayland_", "--", "--ignored", "--test-threads=1", "--nocapture"], env=test_env)
                 return result.returncode
             finally:
                 stop.set()
