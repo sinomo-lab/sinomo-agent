@@ -1,4 +1,5 @@
 //! Entry point for the Sinomo graphical client.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::process::ExitCode;
 
@@ -11,7 +12,13 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|| {
                     app.with_file_name(format!("sinomo{}", std::env::consts::EXE_SUFFIX))
                 });
-            std::process::Command::new(helper)
+            let mut command = std::process::Command::new(helper);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000); // CREATE_NO_WINDOW for the CLI supervisor.
+            }
+            command
                 .args(["app", "supervise", "--"])
                 .arg(app)
                 .args(std::env::args_os().skip(1))

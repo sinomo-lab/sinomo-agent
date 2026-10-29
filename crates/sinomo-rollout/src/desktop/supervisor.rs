@@ -117,11 +117,57 @@ fn is_managed_app_launch(data_dir: &SinomoDataDir, releases: &DesktopReleases, a
     if fs::canonicalize(installed).is_ok_and(|installed| installed == app) {
         return true;
     }
+    if app.file_name() == Some(std::ffi::OsStr::new(&name))
+        && app.parent().is_some_and(|directory| {
+            sinomo_core::local::installed_data_dir(directory)
+                .ok()
+                .flatten()
+                .and_then(|root| fs::canonicalize(root).ok())
+                .zip(fs::canonicalize(data_dir.root()).ok())
+                .is_some_and(|(bound, selected)| bound == selected)
+        })
+    {
+        return true;
+    }
     // Immutable installed images can also be launched directly. Compare canonical paths so
     // relative data directories and platform path aliases have the same launch policy.
     app.file_name() == Some(std::ffi::OsStr::new(&name))
         && fs::canonicalize(releases.root.join("releases"))
             .is_ok_and(|root| app.parent().and_then(Path::parent) == Some(root.as_path()))
+}
+
+#[cfg(test)]
+mod installation_tests {
+    use super::*;
+
+    #[test]
+    fn custom_install_binding_only_manages_its_selected_data_root() {
+        let fixture = sinomo_testdir::TestDir::new("custom-install-launch");
+        let install = fixture.join("application");
+        let data = fixture.join("data");
+        let other = fixture.join("other-data");
+        for directory in [&install, &data, &other] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let app = install.join(crate::executable_name("sinomo-app"));
+        fs::write(&app, b"fixture").unwrap();
+        let app = fs::canonicalize(app).unwrap();
+        let selected = SinomoDataDir::new(&data);
+        let releases = DesktopReleases::new(&data);
+        assert!(!is_managed_app_launch(&selected, &releases, &app));
+        fs::write(
+            install.join(sinomo_core::local::INSTALLED_DATA_DIR_FILE),
+            data.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(is_managed_app_launch(&selected, &releases, &app));
+        let other = SinomoDataDir::new(other);
+        assert!(!is_managed_app_launch(
+            &other,
+            &DesktopReleases::new(other.root()),
+            &app
+        ));
+    }
 }
 
 fn run_app_loop(

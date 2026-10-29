@@ -20,7 +20,16 @@ selected a different directory, not that state was deleted.
 
 ## Process Lifecycle
 
-`sinomo install` is a deliberate redeployment transaction. It first holds new
+`sinomo install` performs initial setup, registers per-user startup and starts
+main and shadow daemons by default. It does not invoke the graphical installer
+or replace an evolved release. `--no-start` stages registration without launching
+new processes. The CLI and graphical uninstaller both stop the deployment and
+remove its recorded startup integration, retaining data unless deletion is
+explicitly requested.
+
+For legacy deployments outside the shared installer,
+`sinomo install --runtime-service` explicitly selects a redeployment transaction.
+It first holds new
 agent turns and waits up to five minutes for running turns to finish, failing
 rather than interrupting them. It may then stop both daemons, replace installed
 binaries, advance managed source from the invoking checkout, build and install
@@ -30,7 +39,7 @@ start. Verify the data directory, checkout and commit, desired binary, and
 expected outage first.
 
 For ordinary process recovery with an already installed known-good binary, use
-`sinomo daemon start` rather than redeploying with `install`.
+`sinomo daemon start` rather than redeploying with `install --runtime-service`.
 
 For direct control:
 

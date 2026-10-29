@@ -26,7 +26,8 @@ chat.
 
 The `sinomo-app` launcher comes from a desktop release: `sinomo install` run
 from that release, or with `--desktop --app-bundle`, places it in
-`$SINOMO_DATA_DIR/bin`. A source-checkout or runtime-only install is headless.
+the chosen application directory. An existing active release in the selected
+data directory is preserved. A source-checkout or CLI-only install is headless.
 See [desktop app rollout](rollout-operations.md#desktop-app-rollout).
 
 ## Settings

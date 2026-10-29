@@ -5506,7 +5506,7 @@ const DAEMON_AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = cluster::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
-const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
+const INSTALL_DEFAULT_HOST: &str = sinomo_runtime::installer::initial_setup::services::DEFAULT_HOST;
 
 fn daemon_fetch_cluster_kv_local_snapshot_from_endpoint(
     endpoint: &ClusterEndpointRecord,

@@ -17,7 +17,8 @@ Command syntax can change with the installed binary. Use
 | Update a mixed-platform cluster from source | Cluster build and rollout |
 | Update only the current machine from managed source | Local apply |
 | Update compatible nodes from an existing artifact | Prebuilt artifact rollout |
-| Refresh installation and boot integration | Install |
+| Initial deployment and daemon startup | CLI or graphical installer |
+| Redeploy a legacy installation outside the shared installer | Install with `--runtime-service` |
 | Build or update the desktop client independently | Desktop app rollout |
 
 Before rollout, commit or otherwise preserve the intended source, run the
@@ -32,8 +33,9 @@ desktop app automatically. A runtime-only release remains headless. The explicit
 forms are:
 
 ```sh
-sinomo install --desktop --app-bundle /path/to/desktop-release
-sinomo install --headless
+sinomo install --desktop --app-bundle /path/to/desktop-release --add-to-path
+sinomo install --headless --add-to-path
+# Launch through PATH after starting a new login session:
 sinomo-app
 # Equivalent supervised launch through the CLI:
 sinomo rollout app launch
@@ -241,11 +243,12 @@ Import an external checkout and apply it in one step:
 sinomo rollout apply-external --repo /path/to/sinomo
 ```
 
-Use `sinomo install` instead when the goal is to refresh the installed binary,
+For legacy deployments outside the shared installer, use
+`sinomo install --runtime-service` when the goal is to refresh the installed binary,
 boot entries, daemon bind settings, and managed source together:
 
 ```sh
-cargo run -p sinomo -- install
+cargo run -p sinomo -- install --runtime-service
 ```
 
 ## Prebuilt Artifact Rollout
@@ -435,13 +438,14 @@ the existing deployment without replacing it:
 sinomo daemon start
 ```
 
-Use `install` only when the deployment itself must be replaced. Verify the
+For legacy deployments outside the shared installer, use `install --runtime-service`
+only when the deployment itself must be replaced. Verify the
 selected data directory, invoking checkout and commit, expected binary/module
 set, and outage first; installation may stop both daemons, advance managed
 source, rebuild native modules, rewrite boot entries, and restart processes:
 
 ```sh
-cargo run -p sinomo -- install
+cargo run -p sinomo -- install --runtime-service
 ```
 
 When the main daemon is unavailable but the shadow daemon is reachable, use the

@@ -2,11 +2,13 @@ image: rust:1.96.0-bookworm
 
 workflow:
   rules:
+    - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == "main"'
     - when: never
 
 stages:
   - build
+  - validate
 
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cache/cargo"
@@ -38,6 +40,7 @@ build:documentation:
     - python3 scripts/docs/check_links.py
     - python3 scripts/docs/check_links.py AGENTS.md .agents/skills skills
     - python3 scripts/docs/check_content.py
+    - python3 -m unittest discover -s scripts/ci -p 'test_desktop_installer.py'
 
 build:dfs-kv-boundary:
   stage: build
@@ -85,6 +88,7 @@ build:desktop-linux-x86_64:
   variables:
     SINOMO_RELEASE_PROFILE: desktop
     SINOMO_RELEASE_TARGETS: x86_64-unknown-linux-gnu
+    APPIMAGE_EXTRACT_AND_RUN: "1"
   before_script:
     - >-
       apt-get update
@@ -92,11 +96,62 @@ build:desktop-linux-x86_64:
       ca-certificates file git zip build-essential pkg-config cmake clang python3
       libssl-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
       libx11-dev libxrandr-dev libxi-dev libxext-dev libxcursor-dev libxinerama-dev
-      libvulkan-dev libv4l-dev
+      libvulkan-dev libv4l-dev libfuse2 patchelf squashfs-tools desktop-file-utils
+      librsvg2-bin
+    - cargo install cargo-packager --version 0.11.8 --locked --root target/packager-tool --target-dir target/packager-tool-build
   script:
     - ./scripts/ci/build-release-artifacts.sh
+    - cargo test --locked -p sinomo-installer -p sinomo-setup -p sinomo-local
+    - python3 scripts/ci/build-desktop-installer.py --target x86_64-unknown-linux-gnu --packager target/packager-tool/bin/cargo-packager
   artifacts:
     name: "sinomo-desktop-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
     paths:
       - dist/
+      - target/ci/installer-stage/x86_64-unknown-linux-gnu/headless-cli.tar.gz
+    expire_in: 3 days
+
+# A shell runner tagged windows must provide MSVC/Windows SDK, Rustup, Python >=3.11,
+# CMake, LLVM and Git. No signing credentials or upstream binary updater are required.
+build:desktop-windows-x86_64:
+  stage: build
+  tags: [windows]
+  timeout: 3h
+  variables:
+    RUSTUP_TOOLCHAIN: "1.96.0"
+  before_script:
+    - '$ErrorActionPreference = "Stop"'
+    - rustup toolchain install 1.96.0 --profile minimal
+    - 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+    - rustup target add x86_64-pc-windows-msvc
+    - 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+    - cargo install cargo-packager --version 0.11.8 --locked --root target/packager-tool --target-dir target/packager-tool-build
+    - 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+  script:
+    - cargo test --locked -p sinomo-installer -p sinomo-setup -p sinomo-local
+    - 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+    - python scripts/ci/build-desktop-installer.py --target x86_64-pc-windows-msvc --packager target/packager-tool/bin/cargo-packager.exe
+    - 'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+  artifacts:
+    name: "sinomo-desktop-windows-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/installers/
+    expire_in: 3 days
+
+validate:headless-container-install:
+  stage: validate
+  image: python:3.12-slim-bookworm
+  needs:
+    - job: build:cross-platform-cli
+      artifacts: true
+    - job: build:desktop-linux-x86_64
+      artifacts: true
+  cache: []
+  script:
+    - python3 scripts/ci/test-headless-install.py --archive $(find dist -maxdepth 1 -name 'sinomo-*-linux-x86_64.tar.gz' | head -n 1) --output target/headless-install
+    - python3 scripts/ci/test-headless-install.py --archive target/ci/installer-stage/x86_64-unknown-linux-gnu/headless-cli.tar.gz --output target/headless-desktop-cli
+  artifacts:
+    when: always
+    paths:
+      - target/headless-install/
+      - target/headless-desktop-cli/
     expire_in: 3 days
