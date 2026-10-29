@@ -637,25 +637,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .retained_content_transfer_required(intent_id, object_id, version)?;
         let mut requests = Vec::with_capacity(targets.len());
         for (target_node_id, request_id) in targets {
-            if matches!(
+            let original_store = if matches!(
                 kind,
                 ReplicaTransferKind::Repair | ReplicaTransferKind::BackgroundRepair
-            ) && (!matches!(kind, ReplicaTransferKind::BackgroundRepair) || retained_transfer)
-                && let Some(store) = self.owned_repair_queue_store()?
-                && store
-                    .original_repair_for_slot(intent_id, target_node_id)?
-                    .is_some()
-            {
+            ) {
+                self.owned_repair_queue_store()?
+            } else {
+                None
+            };
+            let existing = original_store
+                .as_ref()
+                .map(|store| store.original_repair_for_slot(intent_id, target_node_id))
+                .transpose()?
+                .flatten();
+            if matches!(kind, ReplicaTransferKind::Repair) && existing.is_some() {
                 return Err(DfsError::Distributed {
                     message: "alternate Repair dispatch cannot bypass an unresolved original"
                         .into(),
                 });
             }
-            // Only current native background Repair enters this custody slice.
-            // Stage, retained repair and non-native transports keep their owners.
+            // Retention can change after enrollment. An existing original still
+            // owns its exact command, base, authority and payload; never switch
+            // it to a newly constructed retained transfer. New retained repairs,
+            // Stage and non-native transports keep their existing owners.
             if matches!(kind, ReplicaTransferKind::BackgroundRepair)
-                && !retained_transfer
-                && let Some(store) = self.owned_repair_queue_store()?
+                && (!retained_transfer || existing.is_some())
+                && let Some(store) = original_store
             {
                 let pending_error = || DfsError::Distributed {
                     message: format!(
@@ -663,7 +670,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     ),
                 };
                 let incarnation = store.custody_incarnation()?;
-                let existing = store.original_repair_for_slot(intent_id, target_node_id)?;
                 let (routed_message, reader, descriptor) = if let Some(birth) = existing {
                     let DfsNetworkMessage::RepairReplica(original) = &birth.original.message else {
                         return Err(pending_error());
