@@ -6104,9 +6104,9 @@ fn pattern_payload(seed: &str, bytes: usize) -> Vec<u8> {
     let seed = payload_pattern(seed);
     let mut payload = Vec::with_capacity(bytes);
     while payload.len() < bytes {
-        payload.extend_from_slice(seed.as_bytes());
+        let remaining = bytes - payload.len();
+        payload.extend_from_slice(&seed.as_bytes()[..remaining.min(seed.len())]);
     }
-    payload.truncate(bytes);
     payload
 }
 
@@ -6680,6 +6680,68 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    #[ignore = "manual 256 MiB payload allocation control under an owned memory limit"]
+    fn pattern_payload_large_partial_period_stays_within_requested_capacity() {
+        let path = "/services/cluster-tests/20261029-200450-2807193/large-b.bin";
+        let seed = format!("{path}|sinomo-dfs-large");
+        let pattern = concat!(
+            "/services/cluster-tests/20261029-200450-2807193/large-b.bin",
+            "|sinomo-dfs-large|sinomo-dfs-payload|"
+        )
+        .as_bytes();
+        let bytes = 268_435_456;
+        assert_eq!(pattern.len(), 96);
+        assert_eq!(bytes % pattern.len(), 64);
+        let pid = std::process::id();
+        eprintln!("pattern-payload phase=before-allocation pid={pid} requested_bytes={bytes}");
+        let payload = pattern_payload(&seed, bytes);
+        eprintln!(
+            "pattern-payload phase=allocated pid={pid} len={} capacity={}",
+            payload.len(),
+            payload.capacity()
+        );
+        assert_eq!(payload.len(), bytes);
+        assert!(
+            payload
+                .chunks(pattern.len())
+                .all(|chunk| chunk == &pattern[..chunk.len()])
+        );
+        eprintln!("pattern-payload phase=content-verified pid={pid}");
+        assert!(
+            payload.capacity() <= bytes,
+            "payload capacity {} exceeds requested {bytes} bytes",
+            payload.capacity()
+        );
+        eprintln!("pattern-payload phase=capacity-verified pid={pid}");
+    }
+
+    #[test]
+    fn pattern_payload_partial_period_keeps_exact_bytes_without_capacity_growth() {
+        let seed = "partial-period";
+        let pattern = payload_pattern(seed);
+        let period = pattern.len();
+        for bytes in [
+            0,
+            1,
+            period - 1,
+            period,
+            period + 1,
+            2 * period - 1,
+            2 * period + 1,
+        ] {
+            let payload = pattern_payload(seed, bytes);
+            assert_eq!(payload.len(), bytes);
+            assert!(payload.capacity() <= bytes);
+            assert!(
+                payload
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| { *byte == pattern.as_bytes()[index % period] })
+            );
+        }
+    }
 
     #[test]
     fn large_expect_pattern_matches_the_original_payload_at_every_period_boundary() {
