@@ -171,6 +171,8 @@ def check_node(row, activation=None, now=None):
     if not state["Running"]:
         return {"node": node, "running": False, "state": state}
     pid = state["Pid"]
+    if activation is not None and (pid <= 0 or state.get("Restarting", False)):
+        return {"node": node, "running": False, "retired_pid": pid}
     try:
         cgroup = next(line.split("::", 1)[1] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines() if line.startswith("0::"))
     except FileNotFoundError:
@@ -193,6 +195,10 @@ def check_node(row, activation=None, now=None):
         raise RuntimeError(f"{node}: effective cgroup limits incorrect: {values}")
     if any(events.get(key, 0) for key in ["max", "oom", "oom_kill", "oom_group_kill"]) or int(values["memory.peak"]) > NODE_LIMIT:
         raise RuntimeError(f"{node}: memory.max boundary or OOM condition requires debugging: {values}")
+    if activation is not None:
+        # Resource reads are part of the existing join interval. A sample that
+        # finishes after its deadline cannot promote using its earlier timestamp.
+        activation.observe(row, time.monotonic(), resources_observed=True)
     return {"node": node, "container_id": row["Id"], "pid": pid, "cgroup": cgroup,
             "running": True, "limits_and_counters": values}
 
@@ -283,7 +289,8 @@ class ActivationLifecycle:
     def __init__(self, project, candidate_hash, rows, started_ns):
         self.project, self.candidate_hash, self.started_ns = project, candidate_hash, started_ns
         self.initial = {row["Id"]: row for row in rows}
-        self.latest = dict(self.initial)
+        self.latest = {cid: {"inspect": row, "resources_observed": False}
+                       for cid, row in self.initial.items()}
         self.intents, self.claims, self.dies, self.starts, self.pending = [], {}, {}, {}, {}
         self.replacements = {}
         self.consumed = set()
@@ -350,13 +357,14 @@ class ActivationLifecycle:
         self.pending.setdefault(cid, now)
         self.reconcile(cid)
 
-    def observe(self, row, now):
+    def observe(self, row, now, *, resources_observed=False):
         self.expire(now)
         cid, count, state = row["Id"], row["RestartCount"], row["State"]
-        old, last = self.initial.get(cid), self.latest.get(cid)
+        old, previous = self.initial.get(cid), self.latest.get(cid)
         if (old is None or row["Config"]["Labels"].get("com.docker.compose.project") != self.project or
                 row["Config"]["Labels"].get("com.docker.compose.service") != old["Config"]["Labels"]["com.docker.compose.service"]):
             raise RuntimeError("activation container identity changed")
+        last = previous["inspect"]
         if count not in (0, 1) or count < last["RestartCount"]:
             raise RuntimeError("extra or reset activation restart count")
         generation = (state["Pid"], state["StartedAt"])
@@ -369,27 +377,30 @@ class ActivationLifecycle:
                 raise RuntimeError("undeclared container restart")
             if state.get("ExitCode", 0) != 0:
                 raise RuntimeError("nonzero activation exit in inspect")
-            self.pending.setdefault(cid, now)
-        self.latest[cid] = row
+            if cid not in self.replacements:
+                self.pending.setdefault(cid, now)
+        self.latest[cid] = {"inspect": row, "resources_observed": resources_observed}
         self.reconcile(cid)
 
     def reconcile(self, cid):
-        row, old = self.latest[cid], self.initial[cid]
+        observation, old = self.latest[cid], self.initial[cid]
+        row = observation["inspect"]
+        state = row["State"]
         if cid in self.dies and cid in self.starts:
             if self.starts[cid]["timeNano"] < self.dies[cid]["timeNano"]:
                 raise RuntimeError("activation start precedes its exit")
-            if (row["RestartCount"] == 1 and row["State"]["Running"] and
-                    (row["State"]["Pid"], row["State"]["StartedAt"]) !=
-                    (old["State"]["Pid"], old["State"]["StartedAt"])):
+            if (observation["resources_observed"] and row["RestartCount"] == 1 and
+                    state["Running"] and not state.get("Restarting", False) and state["Pid"] > 0 and
+                    state["StartedAt"] and state["StartedAt"] != old["State"]["StartedAt"]):
                 self.pending.pop(cid, None)
-                self.replacements[cid] = (row["State"]["Pid"], row["State"]["StartedAt"])
+                self.replacements[cid] = (state["Pid"], state["StartedAt"])
 
     def expire(self, now):
         if any(now - began >= LIFECYCLE_JOIN_SECONDS for began in self.pending.values()):
             raise RuntimeError("activation lifecycle evidence missing at fixed join deadline")
 
     def classification(self, cid):
-        return {"observed_restart_count": self.latest[cid]["RestartCount"],
+        return {"observed_restart_count": self.latest[cid]["inspect"]["RestartCount"],
                 "classified_rollout_exits": int(cid in self.dies),
                 "lifecycle_pending": cid in self.pending,
                 "lifecycle_pending_since_monotonic": self.pending.get(cid)}
@@ -398,8 +409,10 @@ class ActivationLifecycle:
         self.expire(now)
         if self.pending or set(self.claims) != set(self.dies) or set(self.dies) != set(self.starts):
             raise RuntimeError("activation observation ended with unresolved lifecycle evidence")
-        if any(not row["State"]["Running"] or row["RestartCount"] != int(cid in self.dies)
-               for cid, row in self.latest.items()):
+        if any(not observation["resources_observed"] or
+               not observation["inspect"]["State"]["Running"] or
+               observation["inspect"]["RestartCount"] != int(cid in self.dies)
+               for cid, observation in self.latest.items()):
             raise RuntimeError("activation observation ended without all live reconciled nodes")
 
 

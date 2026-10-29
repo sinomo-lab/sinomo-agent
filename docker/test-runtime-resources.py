@@ -221,6 +221,10 @@ class ActivationResources(unittest.TestCase):
 
     def lifecycle(self, claimed=True):
         result = resources.ActivationLifecycle("owned", "a" * 64, copy.deepcopy(self.rows), 100)
+        # Policy-only fixtures explicitly supply successful baseline resource
+        # observations; check_node controls exercise the physical validation.
+        for row in self.rows:
+            result.observe(copy.deepcopy(row), 0, resources_observed=True)
         if claimed:
             result.refresh([copy.deepcopy(self.intent)])
         return result
@@ -233,7 +237,7 @@ class ActivationResources(unittest.TestCase):
     def complete(self, life):
         life.event(self.event("die"), 0)
         life.event(self.event("start"), 0.1)
-        life.observe(copy.deepcopy(self.new), 0.2)
+        life.observe(copy.deepcopy(self.new), 0.2, resources_observed=True)
 
     def test_each_event_inspect_delivery_order_reconciles_without_rewriting_counts(self):
         import itertools
@@ -243,7 +247,7 @@ class ActivationResources(unittest.TestCase):
                 raw = copy.deepcopy(self.new)
                 for i, action in enumerate(order):
                     if action == "inspect":
-                        life.observe(raw, i * 0.1)
+                        life.observe(raw, i * 0.1, resources_observed=True)
                         self.assertEqual(raw["RestartCount"], 1)
                         if i < 2:
                             self.assertTrue(life.classification(self.cid)["lifecycle_pending"])
@@ -254,10 +258,157 @@ class ActivationResources(unittest.TestCase):
                     "observed_restart_count": 1, "classified_rollout_exits": 1, "lifecycle_pending": False,
                     "lifecycle_pending_since_monotonic": None})
 
+    def test_r43_restarting_pid_zero_is_not_the_replacement_generation(self):
+        # Retained R43 inspect/event order. The genuine replacement arrived
+        # 1.096313517 seconds after this transitional inspect, within the
+        # unchanged two-second join bound. No Docker operation is replayed.
+        old = copy.deepcopy(self.rows[1])
+        old["Id"] = "0ec9cfd87e5ab42954ad70f94bd53d83a471a13db90150f17ab5f6bea29e330b"
+        old["State"].update(Pid=2387005, Restarting=False,
+                            StartedAt="2026-10-29T16:28:01.700227965Z")
+        project = "sinomo-activation-20261029t162753z-52bea00d"
+        rows = copy.deepcopy(self.rows)
+        rows[1] = old
+        for row in rows:
+            row["Config"]["Labels"]["com.docker.compose.project"] = project
+        claim = dict(self.intent, project=project, container_id=old["Id"],
+                     old_pid=2387005, old_started_at=old["State"]["StartedAt"],
+                     time_ns=1793291343441398186)
+        life = resources.ActivationLifecycle(project, "a" * 64, rows, 1793291332000000000)
+        life.refresh([claim])
+        transitional = copy.deepcopy(old)
+        transitional["RestartCount"] = 1
+        transitional["State"].update(Running=True, Restarting=True, Pid=0)
+        before = copy.deepcopy(transitional)
+        with patch.object(Path, "read_text", side_effect=FileNotFoundError("/proc/0/cgroup")):
+            checked = resources.check_node(transitional, life, 0)
+        self.assertFalse(checked["running"])
+        self.assertEqual(checked["retired_pid"], 0)
+        self.assertEqual(transitional, before)
+        for action, event_ns, observed in [
+                ("die", 1793291360594464889, 0.1),
+                ("start", 1793291361042429822, 0.5)]:
+            event = self.event(action)
+            event["timeNano"] = event_ns
+            event["Actor"]["ID"] = old["Id"]
+            event["Actor"]["Attributes"]["com.docker.compose.project"] = project
+            life.event(event, observed)
+        self.assertNotIn(old["Id"], life.replacements,
+                         "PID0/oldStartedAt must not become the recorded replacement")
+        self.assertEqual(life.pending[old["Id"]], 0)
+        replacement = copy.deepcopy(transitional)
+        replacement["State"].update(Restarting=False, Pid=2405051,
+                                    StartedAt="2026-10-29T16:29:20.750336725Z")
+        values = {"cgroup": f"0::/docker-{old['Id']}.scope\n", "memory.max": str(resources.NODE_LIMIT),
+                  "memory.swap.max": "0", "memory.current": "1024", "memory.peak": "2048",
+                  "memory.events": "max 0\noom 0\noom_kill 0"}
+        with patch.object(Path, "read_text", lambda path: values[path.name]), \
+                patch.object(resources.time, "monotonic", return_value=1.096313517):
+            checked = resources.check_node(replacement, life, 1.096313517)
+        self.assertTrue(checked["running"])
+        self.assertEqual(life.replacements[old["Id"]],
+                         (2405051, "2026-10-29T16:29:20.750336725Z"))
+        self.assertNotIn(old["Id"], life.pending)
+        self.assertEqual(replacement["RestartCount"], 1)
+
+    def test_transitional_generations_cannot_resolve_or_refresh_the_join_deadline(self):
+        for state in [{"Pid": 0}, {"Pid": -1}, {"Restarting": True}, {"Running": False},
+                      {"StartedAt": "initial-2"}, {"StartedAt": ""}]:
+            with self.subTest(state=state):
+                life = self.lifecycle()
+                transitional = copy.deepcopy(self.new)
+                transitional["State"].update(state)
+                life.observe(transitional, 0, resources_observed=True)
+                life.event(self.event("die"), 0.1)
+                life.event(self.event("start"), 0.2)
+                self.assertNotIn(self.cid, life.replacements)
+                self.assertEqual(life.pending[self.cid], 0)
+                life.observe(copy.deepcopy(transitional), 1.9, resources_observed=True)
+                self.assertEqual(life.pending[self.cid], 0)
+                with self.assertRaisesRegex(RuntimeError, "unresolved lifecycle"):
+                    life.finish(1.9)
+                with self.assertRaisesRegex(RuntimeError, "fixed join deadline"):
+                    life.observe(copy.deepcopy(self.new), 2, resources_observed=True)
+                self.assertNotIn(self.cid, life.replacements)
+
+    def test_retired_resource_sample_cannot_reuse_an_earlier_resource_proof(self):
+        life = self.lifecycle()
+        values = {"cgroup": f"0::/docker-{self.cid}.scope\n", "memory.max": str(resources.NODE_LIMIT),
+                  "memory.swap.max": "0", "memory.current": "1024", "memory.peak": "2048",
+                  "memory.events": "max 0\noom 0\noom_kill 0"}
+        with patch.object(Path, "read_text", lambda path: values[path.name]), \
+                patch.object(resources.time, "monotonic", return_value=0):
+            self.assertTrue(resources.check_node(copy.deepcopy(self.new), life, 0)["running"])
+        with patch.object(Path, "read_text", side_effect=FileNotFoundError("retired process")):
+            unavailable = resources.check_node(copy.deepcopy(self.new), life, 0.1)
+        self.assertFalse(unavailable["running"])
+        self.assertNotIn("limits_and_counters", unavailable)
+        life.event(self.event("die"), 0.2)
+        life.event(self.event("start"), 0.3)
+        self.assertNotIn(self.cid, life.replacements)
+        self.assertEqual(life.pending[self.cid], 0)
+        with patch.object(Path, "read_text", lambda path: values[path.name]), \
+                patch.object(resources.time, "monotonic", return_value=1.9):
+            self.assertTrue(resources.check_node(copy.deepcopy(self.new), life, 1.9)["running"])
+        self.assertNotIn(self.cid, life.pending)
+        self.assertEqual(life.replacements[self.cid], (202, "replacement-2"))
+
+    def test_resource_confirmation_at_join_deadline_fails_without_promotion(self):
+        for finished in [2.0, 2.1]:
+            with self.subTest(finished=finished):
+                life = self.lifecycle()
+                life.observe(copy.deepcopy(self.new), 0)
+                life.event(self.event("die"), 0.1)
+                life.event(self.event("start"), 0.2)
+                clock = [1.9]
+                values = {"cgroup": f"0::/docker-{self.cid}.scope\n", "memory.max": str(resources.NODE_LIMIT),
+                          "memory.swap.max": "0", "memory.current": "1024", "memory.peak": "2048",
+                          "memory.events": "max 0\noom 0\noom_kill 0"}
+                def read(path):
+                    if path.name == "memory.events":
+                        clock[0] = finished  # The resource read completes after its original timestamp.
+                    return values[path.name]
+                with patch.object(Path, "read_text", read), \
+                        patch.object(resources.time, "monotonic", side_effect=lambda: clock[0]):
+                    with self.assertRaisesRegex(RuntimeError, "fixed join deadline"):
+                        resources.check_node(copy.deepcopy(self.new), life, 1.9)
+                self.assertNotIn(self.cid, life.replacements)
+                self.assertEqual(life.pending[self.cid], 0)
+
+    def test_confirmed_generation_has_no_new_lifecycle_grace_for_missing_resources(self):
+        life = self.lifecycle()
+        self.complete(life)
+        with patch.object(Path, "read_text", side_effect=FileNotFoundError("retired process")):
+            unavailable = resources.check_node(copy.deepcopy(self.new), life, 0.3)
+        self.assertFalse(unavailable["running"])
+        self.assertNotIn(self.cid, life.pending)
+        self.assertEqual(life.replacements[self.cid], (202, "replacement-2"))
+        with self.assertRaisesRegex(RuntimeError, "live reconciled"):
+            life.finish(0.4)
+
+    def test_unavailable_transition_does_not_hide_extra_reset_identity_or_oom_failures(self):
+        for problem in ["extra", "reset", "identity", "oom", "nonzero", "limit"]:
+            with self.subTest(problem=problem):
+                life = self.lifecycle()
+                transitional = copy.deepcopy(self.new)
+                transitional["State"].update(Pid=0, Restarting=True, StartedAt="initial-2")
+                life.observe(transitional, 0)
+                bad = copy.deepcopy(transitional)
+                if problem == "extra": bad["RestartCount"] = 2
+                elif problem == "reset": bad["RestartCount"] = 0
+                elif problem == "identity": bad["Id"] = "f" * 64
+                elif problem == "oom": bad["State"]["OOMKilled"] = True
+                elif problem == "nonzero": bad["State"]["ExitCode"] = 137
+                else: bad["HostConfig"]["Memory"] = resources.NODE_LIMIT * 2
+                with patch.object(Path, "read_text", side_effect=AssertionError("must reject before resource read")):
+                    with self.assertRaises(RuntimeError):
+                        resources.check_node(bad, life, 0.1)
+                self.assertNotIn(self.cid, life.replacements)
+
     def test_missing_events_have_one_fixed_deadline_and_late_evidence_cannot_pass(self):
         life = self.lifecycle()
-        life.observe(copy.deepcopy(self.new), 0)
-        life.observe(copy.deepcopy(self.new), 1.9)
+        life.observe(copy.deepcopy(self.new), 0, resources_observed=True)
+        life.observe(copy.deepcopy(self.new), 1.9, resources_observed=True)
         self.assertEqual(life.pending[self.cid], 0)
         with self.assertRaisesRegex(RuntimeError, "fixed join deadline"):
             life.event(self.event("die"), resources.LIFECYCLE_JOIN_SECONDS)
@@ -266,24 +417,24 @@ class ActivationResources(unittest.TestCase):
             life = self.lifecycle()
             life.event(self.event(first), 0)
             with self.assertRaisesRegex(RuntimeError, "fixed join deadline"):
-                life.observe(copy.deepcopy(self.new), resources.LIFECYCLE_JOIN_SECONDS)
+                life.observe(copy.deepcopy(self.new), resources.LIFECYCLE_JOIN_SECONDS, resources_observed=True)
 
     def test_missing_claim_reset_extra_count_and_extra_generation_fail(self):
         with self.assertRaisesRegex(RuntimeError, "undeclared"):
-            self.lifecycle(False).observe(copy.deepcopy(self.new), 0)
+            self.lifecycle(False).observe(copy.deepcopy(self.new), 0, resources_observed=True)
         for count in (0, 2):
             life = self.lifecycle()
-            life.observe(copy.deepcopy(self.new), 0)
+            life.observe(copy.deepcopy(self.new), 0, resources_observed=True)
             row = copy.deepcopy(self.new)
             row["RestartCount"] = count
             with self.assertRaisesRegex(RuntimeError, "extra or reset"):
-                life.observe(row, 0.1)
+                life.observe(row, 0.1, resources_observed=True)
         life = self.lifecycle()
         self.complete(life)
         extra = copy.deepcopy(self.new)
         extra["State"]["Pid"] += 1
         with self.assertRaisesRegex(RuntimeError, "extra activation process"):
-            life.observe(extra, 0.3)
+            life.observe(extra, 0.3, resources_observed=True)
 
     def test_provenance_and_append_only_intents_are_required(self):
         edits = [{"container_id": self.cid[:12]}, {"project": "foreign"}, {"nodes": ["node3"]},
@@ -344,11 +495,11 @@ class ActivationResources(unittest.TestCase):
                       old_started_at="initial-3", rollout_id="plan2",
                       claim_path="/data/rollout/staged/uploads/plan2-target3/activation-started.sobj")
         life.refresh([copy.deepcopy(self.intent), second])
-        life.observe(copy.deepcopy(self.new), 0)
+        life.observe(copy.deepcopy(self.new), 0, resources_observed=True)
         new3 = copy.deepcopy(row3)
         new3["RestartCount"] = 1
         new3["State"].update(Pid=203, StartedAt="replacement-3")
-        life.observe(new3, 0.1)
+        life.observe(new3, 0.1, resources_observed=True)
         for action in ("die", "start"):
             event = self.event(action)
             event["Actor"]["ID"] = row3["Id"]
@@ -365,13 +516,14 @@ class ActivationResources(unittest.TestCase):
             else:
                 row["Config"]["Labels"]["com.docker.compose." + kind] = "foreign"
             with self.assertRaisesRegex(RuntimeError, "identity changed"):
-                self.lifecycle().observe(row, 0)
+                self.lifecycle().observe(row, 0, resources_observed=True)
 
     def test_memory_oom_and_cgroup_failures_still_apply_while_join_is_pending(self):
         values = {"cgroup": f"0::/docker-{self.cid}.scope\n", "memory.max": str(resources.NODE_LIMIT),
                   "memory.swap.max": "0", "memory.current": "1024", "memory.peak": "2048",
                   "memory.events": "max 0\noom 0\noom_kill 0"}
-        with patch.object(Path, "read_text", lambda p: values[p.name]):
+        with patch.object(Path, "read_text", lambda p: values[p.name]), \
+                patch.object(resources.time, "monotonic", return_value=0):
             life = self.lifecycle()
             self.assertTrue(resources.check_node(copy.deepcopy(self.new), life, 0)["running"])
             self.assertTrue(life.pending)
@@ -483,7 +635,7 @@ class ActivationResources(unittest.TestCase):
                 return pending.empty()
         def checked(row, activation=None, now=None):
             if activation:
-                activation.observe(row, now)
+                activation.observe(row, now, resources_observed=True)
             return {"node": row["Config"]["Labels"]["com.docker.compose.service"], "running": True}
         with patch.object(resources, "inspect_nodes", side_effect=inspect), \
                 patch.object(resources, "check_node", side_effect=checked), \
