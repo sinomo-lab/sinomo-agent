@@ -596,7 +596,7 @@ fn install_android_lifecycle_monitor(
             unsafe {
                 NativeMethod::from_raw_parts(
                     jni_str!("sinomoWindowInsetsChanged"),
-                    jni_str!("(IIII)V"),
+                    jni_str!("(IIIIF)V"),
                     android_window_insets_changed as *mut _,
                 )
             },
@@ -638,8 +638,9 @@ extern "system" fn android_window_insets_changed(
     top: jni::sys::jint,
     right: jni::sys::jint,
     bottom: jni::sys::jint,
+    density: jni::sys::jfloat,
 ) {
-    crate::android_safe_area_changed_physical([left, top, right, bottom]);
+    crate::android_safe_area_changed_physical([left, top, right, bottom], density);
 }
 
 #[cfg(all(target_os = "android", feature = "mobile"))]

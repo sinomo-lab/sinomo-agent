@@ -117,14 +117,19 @@ impl TabStrip {
             .scroll_bars(false);
         let mut pinned = sui::Flex::horizontal().gap(2.0);
         for tab in Tab::ALL {
-            pinned = pinned.with_child(
-                sui::Tooltip::new(
-                    tab.title(),
-                    super::pinned_tab::PinnedTab::new(shared.clone(), tab, compact),
-                )
-                .placement(sui::TooltipPlacement::Below)
-                .theme(shared.theme()),
-            );
+            let control = super::pinned_tab::PinnedTab::new(shared.clone(), tab, compact);
+            #[cfg(target_os = "android")]
+            {
+                pinned = pinned.with_child(control);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                pinned = pinned.with_child(
+                    sui::Tooltip::new(tab.title(), control)
+                        .placement(sui::TooltipPlacement::Below)
+                        .theme(shared.theme()),
+                );
+            }
         }
         let content = sui::Flex::horizontal()
             .align_items(sui::Alignment::Center)

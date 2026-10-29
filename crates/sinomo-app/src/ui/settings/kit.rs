@@ -26,10 +26,15 @@ pub(super) fn page_header(shared: &Shared, section: SettingsSection) -> impl Wid
     let theme = shared.theme();
     let mut title_style = settings_text_style(shared, theme.text.xl);
     title_style.weight = sui::FontWeight::SEMIBOLD;
+    let title_color = shared.clone();
     let header = Stack::vertical()
         .gap(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(Label::new(section.title()).text_style(title_style))
+        .with_child(
+            Label::new(section.title())
+                .text_style(title_style)
+                .color_when(move || palette(&title_color).text),
+        )
         .with_child(muted_label_with_token(
             shared,
             section.description(),
@@ -175,10 +180,15 @@ impl SettingRow {
             style.color = palette(shared).text;
             style
         };
+        let label_color = shared.clone();
         let mut text = Stack::vertical()
             .gap(2.0)
             .alignment(Alignment::Stretch)
-            .with_child(Label::new(self.label.clone()).text_style(label_style));
+            .with_child(
+                Label::new(self.label.clone())
+                    .text_style(label_style)
+                    .color_when(move || palette(&label_color).text),
+            );
         if let Some(help) = self.help.filter(|help| !help.trim().is_empty()) {
             text = text.with_child(muted_label_with_token(shared, help, theme.text.sm));
         }

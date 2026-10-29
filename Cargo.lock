@@ -194,6 +194,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,6 +900,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2 0.6.4",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
 ]
 
 [[package]]
@@ -9682,6 +9697,7 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark 0.13.4",
  "rfd",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "sinomo-agent",
@@ -10726,9 +10742,7 @@ version = "0.1.0"
 
 [[package]]
 name = "sinomo-ui"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7638886c790e9820c96c2e00f48361ff4db8a089c3cf6c52a8ae96d0d82968e9"
+version = "0.5.0"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
@@ -10743,18 +10757,14 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-animation"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5165c9ae971029e3d2f69244fbb89794404090a03d61ab80c5211f8d91129f35"
+version = "0.5.0"
 dependencies = [
  "sinomo-ui-core",
 ]
 
 [[package]]
 name = "sinomo-ui-avif"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "104fe6b7d2be414a01c72c528098ae78787e04639c72fec1c279887d81765ece"
+version = "0.5.0"
 dependencies = [
  "avif-serialize",
  "rav1e",
@@ -10762,9 +10772,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-core"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f28c26e18c8cb1e5875ca5f6a6545fa5592190edd88181ec7f46323038d73a33"
+version = "0.5.0"
 
 [[package]]
 name = "sinomo-ui-extension-host"
@@ -10779,9 +10787,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-layout"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fedf5670de929d186eaf8d2c3ba49f29b1350fd532c98bb1afc5271d71148cd"
+version = "0.5.0"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-scene",
@@ -10790,9 +10796,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-lucide"
-version = "1.47.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ba48ab492ceb9070721a908785952597f96300449fabcd5d65abfd86f23b2dc"
+version = "1.47.2"
 dependencies = [
  "roxmltree 0.21.1",
  "sinomo-ui-core",
@@ -10803,9 +10807,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-platform"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1bc6aa1eda39433f70f72ce30b071317b9070b308494bb4ccba65c83dc09e07"
+version = "0.5.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -10832,15 +10834,11 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-reactive"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5a22423946821c7501e411dff052155c26cbdd18cbd229125a96af34f9981dd"
+version = "0.5.0"
 
 [[package]]
 name = "sinomo-ui-render-wgpu"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "694d3eb5167390630a18f0b3169546c032a960c6cc3f2ae2d8630139b0e4dd5d"
+version = "0.5.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -10864,9 +10862,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-runtime"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c60a00f971fea59bccdf875c9b8ff1ae7a472038ff820e30f0b7c2385750e682"
+version = "0.5.0"
 dependencies = [
  "lru",
  "sinomo-ui-animation",
@@ -10880,9 +10876,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-scene"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c3d334b2d42de1540a00594d5fcb9ccf9369d53545558163ce5f184564cd4c5"
+version = "0.5.0"
 dependencies = [
  "resvg",
  "sinomo-ui-core",
@@ -10891,9 +10885,7 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-testing"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "235ea4df9b43d7bd4673f06c471180b8ada9e99c1ca637a06672b75791d4791f"
+version = "0.5.0"
 dependencies = [
  "exr",
  "png",
@@ -10910,22 +10902,19 @@ dependencies = [
 
 [[package]]
 name = "sinomo-ui-text"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a751adffc66fd2682001282653c9818440f954fff9c53fd50c551accfb5e3d0"
+version = "0.5.0"
 dependencies = [
  "cosmic-text",
  "lru",
  "rustybuzz",
  "sinomo-ui-core",
  "ttf-parser",
+ "wuff",
 ]
 
 [[package]]
 name = "sinomo-ui-widgets"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d2141aa9c6601ef35d174e6fcb5b6d25b78b71b32400b0e45db5d7d981e985e"
+version = "0.5.0"
 dependencies = [
  "palette",
  "pulldown-cmark 0.13.4",
@@ -10938,6 +10927,7 @@ dependencies = [
  "sinomo-ui-scene",
  "sinomo-ui-text",
  "unicode-segmentation",
+ "web-time",
 ]
 
 [[package]]
@@ -14307,6 +14297,17 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wuff"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "200a7b806377b65f1ff9a985874332f15357c87e5dd7855f35f06dade95b8b3d"
+dependencies = [
+ "brotli-decompressor",
+ "bytes",
+ "flate2",
 ]
 
 [[package]]

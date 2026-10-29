@@ -88,6 +88,25 @@ pub fn resolve_theme_with_preferences(
     mode: AppThemeMode,
     text_scale: AppTextScale,
 ) -> DefaultTheme {
+    // Theme readers run throughout layout and paint. Derived color roles do
+    // gamut searches, so resolve each finite preference pair only once.
+    static THEMES: [[std::sync::OnceLock<DefaultTheme>; 3]; 4] =
+        [const { [const { std::sync::OnceLock::new() }; 3] }; 4];
+    let mode_index = match mode {
+        AppThemeMode::Light => 0,
+        AppThemeMode::Dark => 1,
+        AppThemeMode::Void => 2,
+        AppThemeMode::System => 3,
+    };
+    let scale_index = match text_scale {
+        AppTextScale::Standard => 0,
+        AppTextScale::Large => 1,
+        AppTextScale::ExtraLarge => 2,
+    };
+    *THEMES[mode_index][scale_index].get_or_init(|| build_theme(mode, text_scale))
+}
+
+fn build_theme(mode: AppThemeMode, text_scale: AppTextScale) -> DefaultTheme {
     let mut theme = match mode {
         AppThemeMode::Light => DefaultTheme::light(),
         AppThemeMode::Void => DefaultTheme::void(),

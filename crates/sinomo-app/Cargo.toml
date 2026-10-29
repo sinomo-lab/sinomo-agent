@@ -44,7 +44,7 @@ image = { workspace = true, features = ["jpeg", "png", "webp"] }
 pulldown-cmark.workspace = true
 percent-encoding.workspace = true
 
-# Published SUI release shared with Android and locked for reproducible builds.
+# Sibling SUI checkout shared by desktop and Android.
 sui = { workspace = true, optional = true, features = ["wgpu"] }
 sui-lucide = { workspace = true, optional = true }
 
@@ -64,6 +64,7 @@ sinomo-runtime = { path = "../sinomo-runtime", default-features = false, feature
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
+rustls-platform-verifier.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
 sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }

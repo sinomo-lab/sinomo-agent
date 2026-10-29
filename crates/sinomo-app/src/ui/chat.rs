@@ -1729,6 +1729,8 @@ pub struct ChatState {
     pub info: RuntimeInfo,
     pub tool_runtime: ChatToolRuntimeSelection,
     workspace_path_input: String,
+    #[cfg(target_os = "android")]
+    workspace_folder_input: String,
     workspace_error: Option<String>,
     workspace_picker_generation: u64,
     workspace_picker: NativePickerLane,
@@ -2632,6 +2634,8 @@ impl ChatState {
             info: RuntimeInfo::default(),
             tool_runtime: ChatToolRuntimeSelection::default(),
             workspace_path_input: String::new(),
+            #[cfg(target_os = "android")]
+            workspace_folder_input: String::new(),
             workspace_error: None,
             workspace_picker_generation: 0,
             workspace_picker: NativePickerLane::new(),
@@ -4160,6 +4164,8 @@ impl ChatState {
         self.tool_runtime.workspace_session_id = None;
         self.tool_runtime.workspace_root = None;
         self.workspace_path_input.clear();
+        #[cfg(target_os = "android")]
+        self.workspace_folder_input.clear();
         self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
         self.attachment_manual_path_open = false;
@@ -6876,6 +6882,18 @@ impl ChatState {
                 self.workspace_error = Some(error);
             }
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn add_workspace_folder_path(&mut self) {
+        let path = PathBuf::from(self.workspace_folder_input.trim());
+        if !path.is_absolute() {
+            self.workspace_error = Some("Enter an absolute device folder path.".into());
+            return;
+        }
+        // The daemon validates the directory and owns the conversation grant;
+        // entering a path does not grant Android storage permissions.
+        self.update_workspaces(ChatWorkspaceChange::AddFolder { path });
     }
 
     fn clear_workspace(&mut self) {
@@ -18138,6 +18156,21 @@ fn composer_workspace_popup(
         "Commands start in the default workspace. All attached folders remain available.".into()
     };
     content = content.with_child(muted_label(shared, hint));
+    #[cfg(target_os = "android")]
+    {
+        let change = shared.clone();
+        content = content.with_child(
+            TextInput::new("chat-workspace-folder-path")
+                .value(shared.chat().workspace_folder_input.clone())
+                .placeholder("Device folder path")
+                .leading_icon(IconGlyph::Folder)
+                .theme_when(composer_control_reader(reader))
+                .enabled(enabled)
+                .on_change(move |value| {
+                    change.chat_mut().workspace_folder_input = value;
+                }),
+        );
+    }
     for (index, workspace) in workspaces.iter().enumerate() {
         let name = workspace_display_name(&workspace.path);
         let title = if index == 0 {
@@ -18222,7 +18255,11 @@ fn composer_workspace_popup(
             .min_height(30.0)
             .theme_when(composer_control_reader(reader))
             .enabled(enabled)
+            .focus_on_press(!cfg!(target_os = "android"))
             .on_press_with_ctx(move |ctx| {
+                #[cfg(target_os = "android")]
+                add.chat_mut().add_workspace_folder_path();
+                #[cfg(not(target_os = "android"))]
                 add.chat_mut().request_workspace_picker();
                 request_chat_window_relayout(ctx);
             }),
@@ -18884,7 +18921,12 @@ fn composer_bar(
         )
     };
     row = row.with_child(
-        Tooltip::new(action_tooltip, action)
+        // Keep the IME open through touch release. Blurring the editor on
+        // touch-down moves this bottom-anchored button out from under the tap.
+        Tooltip::new(
+            action_tooltip,
+            action.focus_on_press(!cfg!(target_os = "android")),
+        )
             .placement(TooltipPlacement::Above)
             .alignment(TooltipAlignment::End)
             .theme(reader()),
@@ -19530,7 +19572,11 @@ impl ComposerPanel {
 
     fn popup_height(&self) -> f32 {
         if self.shared.chat().composer_popup() == Some(ComposerPopup::Workspace) {
-            300.0
+            if cfg!(target_os = "android") {
+                200.0
+            } else {
+                300.0
+            }
         } else {
             COMPOSER_POPUP_H
         }

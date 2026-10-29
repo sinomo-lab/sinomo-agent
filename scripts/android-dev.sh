@@ -98,8 +98,11 @@ build_apk() {
   require_command cargo
   ensure_debug_keystore
   cargo apk build -p sinomo-app-android --target-dir "${CARGO_TARGET_DIR}"
+  python3 scripts/android-runtime-jars.py --output "${CARGO_TARGET_DIR}/android-java"
   python3 modules/desktop/app-use/android/package.py "${apk_path}" \
-    --keystore "${debug_keystore}" --password-env CARGO_APK_DEV_KEYSTORE_PASSWORD
+    --keystore "${debug_keystore}" --password-env CARGO_APK_DEV_KEYSTORE_PASSWORD \
+    --java-archive "${CARGO_TARGET_DIR}/android-java/rustls-platform-verifier.jar" \
+    --java-archive "${CARGO_TARGET_DIR}/android-java/kotlin-stdlib.jar"
 }
 
 install_apk() {
