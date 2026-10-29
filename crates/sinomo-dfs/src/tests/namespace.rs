@@ -399,6 +399,226 @@ fn native_warm_remote_client_recreates_unlinked_dangling_symlink() {
 }
 
 #[test]
+fn native_mounted_symlink_recreate_with_held_replica_materialization() {
+    let SifsPosixCluster {
+        _runtime: runtime,
+        primary_node,
+        writer_node,
+        mut writer,
+        primary,
+        observer,
+        ..
+    } = sifs_posix_cluster("native-held-symlink-recreate", "/");
+    drop(primary);
+    drop(observer);
+    let control_plane = writer.control_plane.take();
+    drop(writer);
+    let (sync_transport, async_transport) = runtime.peer_transports(&writer_node).unwrap();
+    let mut writer = crate::open_mounted_sifs_service_with_peer_transports(
+        runtime.data_dir(&writer_node).clone(),
+        sync_transport,
+        async_transport,
+        control_plane,
+    )
+    .expect("actual mounted opener over registered native Main")
+    .service;
+    let shard = runtime.root_shard().unwrap();
+    let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+    assert_ne!(primary_node, writer_node);
+    assert_eq!(shard.primary_node_id, primary_node);
+    assert!(shard.replica_node_ids.contains(&writer_node));
+    assert!(writer.transport.delegates_local_namespace_authority());
+    let link = "/native-held-symlink-recreate/link";
+    writer.posix_mkdir("/native-held-symlink-recreate").unwrap();
+    let options =
+        DfsWriteOptions::replicated_eventual(vec![primary_node.clone(), writer_node.clone()]);
+    writer
+        .posix_symlink("absent-target", link, options.clone())
+        .expect("initial native dangling symlink");
+    let original = writer.posix_lstat_distributed(link).unwrap();
+    let initial_sequence = {
+        let owner = runtime.metadata_primary_service(link).unwrap();
+        let backend = owner.metadata_backend().unwrap();
+        let current = backend.get_object(&original.object_id).unwrap().unwrap();
+        assert_eq!(current.version, original.version);
+        let snapshot = backend.export_table_snapshot().unwrap();
+        assert!(snapshot.prefix_proof.is_well_formed());
+        assert_eq!(
+            snapshot.materialized_through_sequence,
+            snapshot.prefix_proof.journal_sequence
+        );
+        snapshot.materialized_through_sequence
+    };
+    crate::runtime_host::materialization_test::wait_for_existing_materialization(
+        runtime.data_dir(&writer_node),
+        &sifs_file_system_id(),
+        &shard_id,
+        &runtime.runtime_handle(),
+        initial_sequence,
+        Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        |_| {},
+    )
+    .expect("initial real symlink is materialized before the hold");
+    assert_eq!(
+        writer.lookup_sifs_path(link).unwrap().unwrap().version,
+        original.version
+    );
+    let pause = Arc::new(
+        runtime
+            .pause_replica_materialization(&writer_node, &shard_id)
+            .unwrap(),
+    );
+    let unlink_capture = runtime
+        .capture_namespace_requests(&primary_node, 32)
+        .unwrap();
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let previous_deadline = writer.set_transport_operation_deadline(Some(deadline));
+    let removed = writer.posix_unlink(link).expect("ordinary primary unlink");
+    let captured = runtime
+        .wait_paused_materialization(&pause, deadline.saturating_duration_since(Instant::now()))
+        .expect("the actual replica materializer reached its pause");
+    let pending = crate::runtime_host::materialization_test::wait_for_existing_materialization(
+        runtime.data_dir(&writer_node),
+        &sifs_file_system_id(),
+        &shard_id,
+        &runtime.runtime_handle(),
+        initial_sequence,
+        deadline,
+        |_| {},
+    )
+    .expect("observe the existing replica after its actual ingress checkout returns");
+    eprintln!("HELD_MOUNTED_SYMLINK_BOUNDARY captured={captured:?} pending={pending:?}");
+    assert!(captured.unavailable.is_none(), "{captured:?}");
+    assert!(pending.unavailable.is_none(), "{pending:?}");
+    assert!(
+        pending.durable_sequence.unwrap() > pending.materialized_sequence.unwrap(),
+        "the real unlink must leave accepted journal work pending: {pending:?}"
+    );
+    let request = unlink_capture
+        .records()
+        .into_iter()
+        .find_map(|message| match message.message {
+            DfsNetworkMessage::NamespaceRequest(command)
+                if matches!(&command.operation,
+                    DfsNamespaceOperation::ConditionalUnlink { path, .. } if path == link) =>
+            {
+                Some(command)
+            }
+            _ => None,
+        })
+        .expect("actual unlink request identity");
+    drop(unlink_capture);
+    // Release only when the real recreate crosses the decision under test and
+    // reaches Main. The hold must not prevent its later publication completion.
+    let dispatched = Arc::new(Mutex::new(None));
+    let observed = Arc::clone(&dispatched);
+    let release_on_dispatch = Arc::clone(&pause);
+    let expected_source = writer_node.clone();
+    let expected_target = primary_node.clone();
+    let dispatch_hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&primary_node),
+        Arc::new(move |point, command, _| {
+            if !matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeExecute { .. }
+            ) {
+                return Ok(());
+            }
+            if let Some(command) = command
+                && command.routed_message.source_node_id == expected_source
+                && command.routed_message.target_node_id == expected_target
+                && let DfsNetworkMessage::DistributedWriteRequest(write)
+                | DfsNetworkMessage::ExclusiveCreateRequest(write) =
+                    &command.routed_message.message
+                && write.object_metadata.as_ref().is_some_and(|object| {
+                    object.path == link && object.kind == DfsObjectKind::Symlink
+                })
+            {
+                *observed.lock().unwrap() = Some((
+                    write.request_id.clone(),
+                    write.request.object_id.clone(),
+                    write.request.target_version.clone(),
+                ));
+                release_on_dispatch.release();
+            }
+            Ok(())
+        }),
+    );
+    let recreated = writer.posix_symlink("absent-target", link, options);
+    let actual_dispatch = dispatched.lock().unwrap().clone();
+    let local_after = writer.lookup_sifs_path(link).unwrap();
+    pause.release();
+    drop(dispatch_hook);
+    let published_sequence = {
+        let mut owner = runtime.metadata_primary_service(link).unwrap();
+        let backend = owner.metadata_backend_mut().unwrap();
+        let tombstone = backend
+            .get_object_on_shard(&shard_id, &original.object_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.kind, DfsObjectKind::Tombstone);
+        assert_eq!(tombstone.kind, DfsObjectKind::Tombstone);
+        assert_eq!(tombstone.version, removed.version);
+        let admission = backend
+            .namespace_request_admission_snapshot(
+                &shard_id,
+                &request.requesting_node_id,
+                &request.request_id,
+            )
+            .unwrap();
+        let digest = namespace_command_digest(&request).unwrap();
+        if let Some(receipt) = admission.receipt {
+            assert_eq!(receipt.command_digest, digest);
+            assert_eq!(receipt.result, DfsNamespaceResult::Applied);
+        } else {
+            let recorded = admission.request.expect("exact original unlink outcome");
+            assert_eq!(recorded.command_digest, digest);
+            assert_eq!(recorded.status, DfsNamespaceRequestStatus::Completed);
+            assert_eq!(recorded.result, Some(DfsNamespaceResult::Applied));
+        }
+        backend
+            .export_table_snapshot()
+            .unwrap()
+            .materialized_through_sequence
+    };
+    let materialized = crate::runtime_host::materialization_test::wait_for_existing_materialization(
+        runtime.data_dir(&writer_node),
+        &sifs_file_system_id(),
+        &shard_id,
+        &runtime.runtime_handle(),
+        published_sequence,
+        deadline,
+        |_| {},
+    );
+    eprintln!(
+        "HELD_MOUNTED_SYMLINK writer={writer_node} primary={primary_node} unlink_request={} initial_sequence={initial_sequence} captured={captured:?} pending={pending:?} recreate={recreated:?} dispatch={actual_dispatch:?} local_after={local_after:?} publication_sequence={published_sequence} materialized={materialized:?} omitted={}",
+        request.request_id,
+        runtime.observation_dropped_count()
+    );
+    materialized.expect("publication materializes within the original caller deadline");
+    let recreated =
+        recreated.expect("warm mounted recreate must use the actual final-entry authority");
+    assert!(
+        actual_dispatch.is_some(),
+        "real recreate must reach native Main"
+    );
+    let current = writer.posix_lstat_distributed(link).unwrap();
+    assert_eq!(current.kind, DfsObjectKind::Symlink);
+    assert_eq!(current.object_id, recreated.object_id);
+    assert_ne!(current.object_id, original.object_id);
+    assert_eq!(
+        writer.posix_readlink_distributed(link).unwrap(),
+        "absent-target"
+    );
+    assert!(Instant::now() < deadline, "original caller deadline");
+    writer.set_transport_operation_deadline(previous_deadline);
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    drop(pause);
+    drop(writer);
+    runtime.close().expect("actual native owners drain");
+}
+
+#[test]
 fn sifs_posix_create_attrs_are_installed_atomically_and_only_on_create() {
     let root = temp_root("sifs-posix-create-attrs");
     let node_id = NodeId::from_legacy_named("node_sifs_create_attrs").expect("node");
