@@ -1,5 +1,56 @@
 # Getting Started
 
+## Graphical Installer
+
+For a prebuilt desktop installation, use the Windows setup executable or Linux
+installer AppImage from the CI `dist/installers/` artifacts. Windows registers
+Sinomo in Installed Apps. On Linux, make the AppImage executable in your file
+manager and open it; the installer uses native desktop dialogs and requires a
+working desktop portal. No terminal setup is needed after opening the installer.
+
+Select an empty setup folder and a separate persistent data folder. The setup
+folder holds removal metadata; executable components live only in `<data>/bin`. Windows
+offers a directory entry and Browse button; Linux uses folder choosers, which can
+create new folders. PATH integration and app desktop/menu shortcuts are optional.
+The CLI and app use the selected data folder; an explicit `SINOMO_DATA_DIR`
+environment variable takes precedence. Linux PATH integration writes a removable
+block to `~/.profile` and applies to future login sessions that read that file.
+Desktop environments may ask you to trust a newly created desktop shortcut.
+
+Both setup frontends register and start the main and shadow daemons by default.
+Windows uses current-user sign-in startup, without a machine-wide service or
+administrator requirement. Linux registers enabled systemd user units. If no
+user service manager is running, setup reports that condition and starts the
+daemons directly for the current session. No GUI is needed for `sinomo install`.
+
+Setup is for initial installation, not upstream updates. It refuses a nonempty
+application destination. When reusing a data directory with an active desktop
+release, setup preserves that release, its binaries, modules and managed source.
+The complete distribution includes every default platform-compatible native module,
+including evolution, and an offline source checkout. Fresh deployments receive
+those defaults; retained deployments preserve their evolved module selection.
+The evolution agent merges and verifies upstream changes; rollout replaces each
+selected node's source with the approved snapshot. No binary auto-updater is installed.
+
+For an older installation with executable copies in the setup folder, first
+update its daemon through the approved rollout workflow. Then uninstall while
+keeping data and reinstall from the complete distribution using that data folder.
+This rebuilds OS integration around the canonical binaries without replacing the
+evolved deployment. Setup does not perform an implicit runtime upgrade.
+
+To uninstall, use Installed Apps on Windows or **Uninstall Sinomo** in the Linux
+applications menu. Linux also provides `<data>/bin/sinomo-setup`. Data is kept by
+default, including evolved binaries, native modules and source history. Permanent data deletion requires
+explicit confirmation and is available only for the selected data folder bound
+to this installation. Setup does not take deletion ownership from another
+installation. Either the CLI or graphical uninstaller can remove either setup
+type. Both remove startup/PATH/shortcut integration and stop the deployment. A persistent
+removal fence prevents background recovery from reviving it. Shutdown has a bounded
+grace period; stuck work or rollout cannot veto removal, which can terminate owned
+processes. Explicit reinstall validates and re-enables retained deployment data.
+
+## Source Installation
+
 This guide builds Sinomo from the repository, installs it for the current user,
 creates a one-node cluster, configures a model provider, and runs a first
 interaction.
@@ -41,26 +92,54 @@ will disappear unexpectedly, or another machine's live data directory.
 From the repository root:
 
 ```sh
-cargo build -p sinomo
-cargo run -p sinomo -- install
+# Linux x86-64 example; use x86_64-pc-windows-msvc and .exe on Windows.
+cargo build --locked -p sinomo --target x86_64-unknown-linux-gnu
+cargo run --locked -p sinomo-installer --bin sinomo-package -- . target/x86_64-unknown-linux-gnu/debug target/x86_64-unknown-linux-gnu/debug x86_64-unknown-linux-gnu dev
+target/x86_64-unknown-linux-gnu/debug/sinomo install --add-to-path
 ```
 
-`install` is a deployment transaction. It creates or updates the user-local
-installation, adds daemon startup integration, exposes the client in the user
-binary directory, builds and installs the current native modules, and starts
-the main and shadow daemons. On an existing installation it may first stop both
-daemons, replace binaries, advance managed source from the current checkout,
-rewrite boot entries, and then restart. Verify the data directory, current
-repository and commit, and expected outage before running it. `--no-start`
-suppresses the final start; it does not make the preceding deployment steps a
-dry run. Installing from a source build is headless; running `install` from a
-desktop release also installs the graphical app (see
-[desktop app rollout](rollout-operations.md#desktop-app-rollout)).
+`sinomo install` uses the same initial-setup engine as the graphical installer.
+Use a complete `sinomo-cli` archive from the installer artifacts, or prepare the
+offline payload from a clean committed source checkout as above. Keep
+`initial-payload.tar` beside the downloaded CLI. Setup requires an empty metadata
+destination, binds executable components to `<data>/bin`, registers removal
+integration, and preserves an evolved deployment. It registers per-user daemon startup and verifies main and
+shadow are running before reporting success. It seeds missing managed source and default native modules from the verified
+offline payload, without compiling or downloading during installation. `--no-start` registers
+the deployment without starting new daemon processes.
+
+Use `--install-dir PATH` and `--data-dir PATH` to choose locations. The defaults
+are `%LOCALAPPDATA%/Programs/Sinomo` on Windows and `~/.local/opt/sinomo` on Linux,
+with the data directory selected by `SINOMO_DATA_DIR` or `~/.sinomo`.
+`--add-to-path`, `--desktop-shortcut` and `--menu-shortcut` opt into shell
+integration. The menu option covers Start Menu on Windows and the applications
+menu on Linux. App shortcuts require a verified desktop bundle.
+
+A source-built CLI without a sibling desktop manifest installs only the CLI.
+Use `--app-bundle DIRECTORY` to install a verified desktop release; `--headless`
+explicitly installs only the CLI. See [desktop app rollout](rollout-operations.md#desktop-app-rollout)
+for desktop bundle preparation.
+
+`sinomo uninstall` removes an initial installation and retains data by default.
+Use `--install-dir PATH` to select another installation, or add `--delete-data`
+to explicitly request permanent removal of its associated data. The same path
+and ownership checks apply to both graphical and command-line removal.
 
 If `sinomo` is not immediately on `PATH`, start a new shell or continue with
 `cargo run -p sinomo -- <command>` from the repository.
 
-Verify both processes:
+Daemon host/port options work with normal installation. The default service bind
+host is `0.0.0.0`, with preferred ports `21353` and `21354`; supplying a port makes
+it strict, while default ports permit an OS-assigned fallback.
+
+`--runtime-service` is a legacy operator redeployment workflow for installations
+outside the shared installer. It can import source, build modules and replace
+daemon images. It is not needed to register services, and is rejected for data
+directories owned by the shared installer; use the normal rollout workflow for
+those deployments. `uninstall --runtime-service` remains available to remove
+legacy startup entries, with `--no-stop` to leave legacy daemons running.
+
+Verify both processes after installation:
 
 ```sh
 sinomo daemon status
@@ -70,6 +149,20 @@ sinomo daemon shadow status
 For a foreground development process instead of boot integration, use
 `sinomo daemon run`. Do not run a foreground and installed main daemon against
 the same data directory at the same time.
+
+### Minimal Containers
+
+The complete CLI distribution and its install/uninstall path do not require a
+display, desktop portal, graphical installer or GPU. Required native runtime
+libraries are bundled; installed perception modules do not grant device consent. A container with
+no systemd user manager receives enabled unit files and directly started daemon
+processes, with that fallback reported explicitly. As with all background
+processes, they cannot outlive the container's PID 1.
+
+For an image build, use `sinomo install --headless --no-start`. At container
+runtime, run the daemon in the foreground as the container entry point, for
+example `sinomo daemon run`, using the same persistent data directory. A normal
+install inside an already running container starts both daemon processes.
 
 ## 4. Create the One-Node Cluster
 

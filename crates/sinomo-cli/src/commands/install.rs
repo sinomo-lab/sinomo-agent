@@ -5,6 +5,13 @@ use sinomo_runtime::cli_registry::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallOptions {
+    pub(crate) install_dir: Option<PathBuf>,
+    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) add_to_path: bool,
+    pub(crate) desktop_shortcut: bool,
+    pub(crate) menu_shortcut: bool,
+    pub(crate) runtime_service: bool,
+    pub(crate) preserve_service_configuration: bool,
     pub(crate) desktop: sinomo_runtime::installer::DesktopInstallProfile,
     pub(crate) app_bundle: Option<PathBuf>,
     pub(crate) host: String,
@@ -18,6 +25,13 @@ pub(crate) struct InstallOptions {
 impl Default for InstallOptions {
     fn default() -> Self {
         Self {
+            install_dir: None,
+            data_dir: None,
+            add_to_path: false,
+            desktop_shortcut: false,
+            menu_shortcut: false,
+            runtime_service: false,
+            preserve_service_configuration: true,
             desktop: sinomo_runtime::installer::DesktopInstallProfile::Auto,
             app_bundle: None,
             host: INSTALL_DEFAULT_HOST.to_string(),
@@ -33,11 +47,19 @@ impl Default for InstallOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UninstallOptions {
     pub(crate) stop: bool,
+    pub(crate) install_dir: Option<PathBuf>,
+    pub(crate) delete_data: bool,
+    pub(crate) runtime_service: bool,
 }
 
 impl Default for UninstallOptions {
     fn default() -> Self {
-        Self { stop: true }
+        Self {
+            stop: true,
+            install_dir: None,
+            delete_data: false,
+            runtime_service: false,
+        }
     }
 }
 
@@ -62,7 +84,34 @@ pub(crate) fn uninstall_cli_command_handler() -> DeclarativeCommandHandler<Unins
 }
 
 fn install_cli_spec() -> CliCommandSpec {
-    CliCommandSpec::new("install", "install or update the local Sinomo runtime").with_options([
+    CliCommandSpec::new(
+        "install",
+        "initial installation of the CLI and optional bundled app",
+    )
+    .with_options([
+        CliOptionSpec::value(
+            "--install-dir",
+            "setup and uninstall files directory",
+            CliValueSpec::new("path", "path"),
+        ),
+        CliOptionSpec::value(
+            "--data-dir",
+            "program and persistent data directory",
+            CliValueSpec::new("path", "path"),
+        ),
+        CliOptionSpec::flag(
+            "--add-to-path",
+            "add the data directory bin folder to user PATH",
+        ),
+        CliOptionSpec::flag("--desktop-shortcut", "create an app desktop shortcut"),
+        CliOptionSpec::flag(
+            "--menu-shortcut",
+            "create an app Start Menu/applications-menu shortcut",
+        ),
+        CliOptionSpec::flag(
+            "--runtime-service",
+            "also redeploy managed source and native modules (operator workflow)",
+        ),
         CliOptionSpec::flag(
             "--desktop",
             "install the bundled desktop app as well as the runtime",
@@ -101,13 +150,54 @@ fn install_cli_spec() -> CliCommandSpec {
 }
 
 fn uninstall_cli_spec() -> CliCommandSpec {
-    CliCommandSpec::new("uninstall", "remove local daemon boot entries").with_options([
+    CliCommandSpec::new(
+        "uninstall",
+        "remove an initial installation; retain data by default",
+    )
+    .with_options([
+        CliOptionSpec::value(
+            "--install-dir",
+            "installation to remove",
+            CliValueSpec::new("path", "path"),
+        ),
+        CliOptionSpec::flag(
+            "--delete-data",
+            "permanently remove this installation's data directory",
+        ),
+        CliOptionSpec::flag(
+            "--runtime-service",
+            "remove the separate daemon startup integration",
+        ),
         CliOptionSpec::flag("--no-stop", "leave running daemons untouched"),
     ])
 }
 
 fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, CliParseError> {
     let mut options = InstallOptions::default();
+    options.install_dir = matches.value("--install-dir").map(PathBuf::from);
+    options.data_dir = matches.value("--data-dir").map(PathBuf::from);
+    options.add_to_path = matches.contains("--add-to-path");
+    options.desktop_shortcut = matches.contains("--desktop-shortcut");
+    options.menu_shortcut = matches.contains("--menu-shortcut");
+    options.runtime_service = matches.contains("--runtime-service");
+    options.preserve_service_configuration = ![
+        "--host",
+        "--port",
+        "--shadow-port",
+        "--no-port-fallback",
+        "--no-shadow-port-fallback",
+    ]
+    .iter()
+    .any(|flag| matches.contains(flag));
+    if options.runtime_service
+        && (options.install_dir.is_some()
+            || options.data_dir.is_some()
+            || options.add_to_path
+            || options.desktop_shortcut
+            || options.menu_shortcut)
+    {
+        return Err(CliParseError::Parse { detail: "initial-setup directory/integration options cannot be combined with --runtime-service; use SINOMO_DATA_DIR for service deployment".into() });
+    }
     if matches.contains("--desktop") && matches.contains("--headless") {
         return Err(CliParseError::Parse {
             detail: "choose --desktop or --headless".into(),
@@ -149,8 +239,19 @@ fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, 
 }
 
 fn parse_uninstall_matches(matches: &CliCommandMatches) -> Result<UninstallOptions, CliParseError> {
+    if matches.contains("--runtime-service")
+        && (matches.contains("--install-dir") || matches.contains("--delete-data"))
+    {
+        return Err(CliParseError::Parse { detail: "--runtime-service removes boot entries only; directory removal uses initial-setup uninstall".into() });
+    }
+    if matches.contains("--no-stop") && !matches.contains("--runtime-service") {
+        return Err(CliParseError::Parse { detail: "--no-stop requires --runtime-service; initial-setup uninstall requires a stopped runtime".into() });
+    }
     Ok(UninstallOptions {
         stop: !matches.contains("--no-stop"),
+        install_dir: matches.value("--install-dir").map(PathBuf::from),
+        delete_data: matches.contains("--delete-data"),
+        runtime_service: matches.contains("--runtime-service"),
     })
 }
 
@@ -257,11 +358,83 @@ fn register_cli_application_storage_paths(
 }
 
 pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {
+    if !options.runtime_service {
+        use sinomo_runtime::installer::initial_setup;
+        let executable = std::env::current_exe().map_err(|e| CliError::Parse {
+            detail: e.to_string(),
+        })?;
+        let source = sinomo_runtime::installer::prepare_desktop_install(
+            options.desktop,
+            options.app_bundle.as_deref(),
+        )
+        .map_err(|detail| CliError::Parse { detail })?;
+        let root = options
+            .install_dir
+            .map(Ok)
+            .unwrap_or_else(initial_setup::default_install_dir)
+            .map_err(|e| CliError::Parse {
+                detail: e.to_string(),
+            })?;
+        let data = match options.data_dir {
+            Some(data) => data,
+            None => SinomoDataDir::from_env_or_home()?.root(),
+        };
+        let root = absolute_setup_path(root)?;
+        let data = absolute_setup_path(data)?;
+        initial_setup::install(
+            &executable,
+            source.as_deref(),
+            &root,
+            &data,
+            &initial_setup::IntegrationOptions {
+                add_to_path: options.add_to_path,
+                desktop_shortcut: options.desktop_shortcut,
+                menu_shortcut: options.menu_shortcut,
+            },
+            &initial_setup::services::Options {
+                start: options.start,
+                host: options.host,
+                main_port: options.port,
+                shadow_port: options.shadow_port,
+                main_port_fallback: options.port_fallback,
+                shadow_port_fallback: options.shadow_port_fallback,
+                preserve_existing: options.preserve_service_configuration,
+            },
+        )
+        .map_err(|e| CliError::Parse {
+            detail: e.to_string(),
+        })?;
+        println!("installed at: {}", root.display());
+        println!("data directory: {}", data.display());
+        println!(
+            "Per-user daemon services registered; startup {}. Source and evolved releases preserved.",
+            if options.start {
+                "verified"
+            } else {
+                "skipped (--no-start)"
+            }
+        );
+        return Ok(());
+    }
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    if data_dir.root().join("config/installer-owner").exists() {
+        return Err(CliError::Parse { detail: "This data directory belongs to the shared installer. Services are already part of normal install; use rollout for source/module changes instead of --runtime-service.".into() });
+    }
     data_dir.ensure_root_layout()?;
     let boot_dir = default_boot_dir(&data_dir)?;
     let layout = InstallLayout::new(&data_dir, boot_dir);
     install_with_layout(options, &layout)
+}
+
+fn absolute_setup_path(path: PathBuf) -> Result<PathBuf, CliError> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|root| root.join(path))
+        .map_err(|e| CliError::Parse {
+            detail: e.to_string(),
+        })
 }
 
 pub(crate) fn install_with_layout(
@@ -359,6 +532,51 @@ fn installed_managed_source_head(layout: &InstallLayout) -> Option<String> {
 }
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<(), CliError> {
+    let shared_owner = SinomoDataDir::from_env_or_home()?
+        .root()
+        .join("config/installer-owner");
+    if shared_owner.is_file() && !options.stop {
+        return Err(CliError::Parse { detail: "--no-stop only applies to legacy startup removal; shared deployment uninstall stops its runtime".into() });
+    }
+    if !options.runtime_service || shared_owner.is_file() {
+        use sinomo_runtime::installer::initial_setup;
+        let root = match options.install_dir {
+            Some(root) => root,
+            None if std::env::var_os("SINOMO_INSTALL_DIR").is_some() => PathBuf::from(
+                std::env::var_os("SINOMO_INSTALL_DIR").expect("checked installation binding"),
+            ),
+            None => {
+                let executable = std::env::current_exe().map_err(|e| CliError::Parse {
+                    detail: e.to_string(),
+                })?;
+                let directory = executable.parent().ok_or_else(|| CliError::Parse {
+                    detail: "executable has no parent".into(),
+                })?;
+                if let Ok(owner) = std::fs::read_to_string(
+                    SinomoDataDir::from_env_or_home()?
+                        .root()
+                        .join("config/installer-owner"),
+                ) {
+                    PathBuf::from(owner)
+                } else if directory.join(initial_setup::RECEIPT).is_file() {
+                    directory.to_path_buf()
+                } else {
+                    initial_setup::default_install_dir().map_err(|e| CliError::Parse {
+                        detail: e.to_string(),
+                    })?
+                }
+            }
+        };
+        let root = absolute_setup_path(root)?;
+        initial_setup::uninstall(&root, options.delete_data).map_err(|e| CliError::Parse {
+            detail: e.to_string(),
+        })?;
+        println!("uninstalled: {}", root.display());
+        if !options.delete_data {
+            println!("data directory retained");
+        }
+        return Ok(());
+    }
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     let boot_dir = default_boot_dir(&data_dir)?;

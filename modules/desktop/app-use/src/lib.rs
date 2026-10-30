@@ -17,8 +17,43 @@ static LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 #[derive(Default)]
 struct State {
-    inputs: BTreeMap<String, (String, DesktopTarget, Instant, device::DesktopInputSession)>,
-    captures: BTreeMap<String, (String, Instant, Arc<device::DesktopCapture>)>,
+    inputs: BTreeMap<String, InputEntry>,
+    captures: BTreeMap<String, CaptureEntry>,
+    applications: BTreeMap<String, ApplicationEntry>,
+}
+struct InputEntry {
+    owner: String,
+    target: DesktopTarget,
+    expires: Instant,
+    application: Option<String>,
+    input: device::DesktopInputSession,
+}
+struct CaptureEntry {
+    owner: String,
+    expires: Instant,
+    application: Option<String>,
+    capture: Arc<device::DesktopCapture>,
+}
+struct ApplicationEntry {
+    owner: String,
+    tracker: Arc<device::ApplicationTracker>,
+}
+impl Drop for ApplicationEntry {
+    fn drop(&mut self) {
+        self.tracker.close();
+    }
+}
+fn application(
+    state: &State,
+    id: &str,
+    owner: &str,
+) -> DesktopResult<Arc<device::ApplicationTracker>> {
+    let entry = state
+        .applications
+        .get(id)
+        .ok_or_else(|| DesktopError::Closed("unknown application session".into()))?;
+    same_owner(&entry.owner, owner)?;
+    Ok(entry.tracker.clone())
 }
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
@@ -92,11 +127,173 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
     let owner = request.permission_store;
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    state.inputs.retain(|_, (_, _, expires, _)| *expires > now);
-    state.captures.retain(|_, (_, expires, _)| *expires > now);
+    state.inputs.retain(|_, entry| entry.expires > now);
+    state.captures.retain(|_, entry| entry.expires > now);
+    state
+        .applications
+        .retain(|_, entry| !entry.tracker.remaining().is_zero());
     use DesktopProviderCommand as C;
     use DesktopProviderResponse as R;
     match request.command {
+        C::SurfaceCapabilities => Ok(R::SurfaceCapabilities {
+            capabilities: device::surface_capabilities(),
+        }),
+        C::Applications => Ok(R::Applications {
+            applications: device::applications(&permissions)?,
+        }),
+        C::OpenApplication {
+            application: app,
+            lease_ms,
+        } => {
+            let duration = lease(lease_ms)?;
+            if state.applications.len() >= 8 {
+                return Err(DesktopError::Invalid(
+                    "application session capacity reached".into(),
+                ));
+            }
+            let tracker = device::ApplicationTracker::new(app, permissions, duration)?;
+            let snapshot = tracker.snapshot()?;
+            let application_id = sinomo_core::Id::generate().to_string();
+            state
+                .applications
+                .insert(application_id.clone(), ApplicationEntry { owner, tracker });
+            Ok(R::ApplicationOpened {
+                application_id,
+                snapshot,
+            })
+        }
+        C::ApplicationSurfaces { application_id } => {
+            let tracker = application(&state, &application_id, &owner)?;
+            drop(state);
+            Ok(R::ApplicationSurfaces {
+                snapshot: tracker.snapshot()?,
+            })
+        }
+        C::CloseApplication { application_id } => {
+            if let Some(entry) = state.applications.get(&application_id) {
+                same_owner(&entry.owner, &owner)?;
+            }
+            state.applications.remove(&application_id);
+            state
+                .inputs
+                .retain(|_, entry| entry.application.as_ref() != Some(&application_id));
+            state
+                .captures
+                .retain(|_, entry| entry.application.as_ref() != Some(&application_id));
+            Ok(R::Closed)
+        }
+        C::ResolveApplicationWindow { binding, operation } => {
+            if !["observe", "input", "capture"].contains(&operation.as_str()) {
+                return Err(DesktopError::Invalid("unsupported window operation".into()));
+            }
+            let tracker = application(&state, &binding.application_id, &owner)?;
+            Ok(R::ApplicationWindow {
+                window: tracker.resolve(&binding.surface_id, &operation)?,
+            })
+        }
+        C::OpenApplicationInput { binding, lease_ms } => {
+            let tracker = application(&state, &binding.application_id, &owner)?;
+            let target = tracker.resolve(&binding.surface_id, "input")?.window.target;
+            let duration = lease(lease_ms)?.min(tracker.remaining());
+            if state.inputs.len() >= 8 || state.inputs.values().any(|entry| entry.target == target)
+            {
+                return Err(DesktopError::Invalid(
+                    "window already leased or input capacity reached".into(),
+                ));
+            }
+            let input = device::DesktopInputSession::open_authorized(
+                target.clone(),
+                tracker.authority(binding.surface_id)?,
+                duration,
+                Arc::new(AtomicBool::new(false)),
+            )?;
+            let id = sinomo_core::Id::generate().to_string();
+            state.inputs.insert(
+                id.clone(),
+                InputEntry {
+                    owner,
+                    target,
+                    expires: Instant::now() + duration,
+                    application: Some(binding.application_id),
+                    input,
+                },
+            );
+            Ok(R::Opened { id })
+        }
+        C::OpenApplicationCapture {
+            binding,
+            mut config,
+        } => {
+            let tracker = application(&state, &binding.application_id, &owner)?;
+            let target = tracker
+                .resolve(&binding.surface_id, "capture")?
+                .window
+                .target;
+            if config.target != target {
+                return Err(DesktopError::Invalid(
+                    "capture target does not match surface reference".into(),
+                ));
+            }
+            config.lease_ms = config.lease_ms.min(tracker.remaining().as_millis() as u64);
+            if config.lease_ms == 0 || state.captures.len() >= 8 {
+                return Err(DesktopError::Closed(
+                    "capture expired or capacity reached".into(),
+                ));
+            }
+            let expires = Instant::now() + Duration::from_millis(config.lease_ms);
+            let capture = device::DesktopCapture::start_authorized(
+                config,
+                tracker.authority(binding.surface_id)?,
+            )?;
+            let id = sinomo_core::Id::generate().to_string();
+            state.captures.insert(
+                id.clone(),
+                CaptureEntry {
+                    owner,
+                    expires,
+                    application: Some(binding.application_id),
+                    capture: Arc::new(capture),
+                },
+            );
+            Ok(R::Opened { id })
+        }
+        C::TrayItems => {
+            drop(state);
+            Ok(R::SemanticItems {
+                snapshot: device::tray_items(&permissions)?,
+            })
+        }
+        C::InvokeTray {
+            item_id,
+            operation,
+            allow_desktop_interaction,
+        } => {
+            drop(state);
+            device::invoke_tray(&permissions, item_id, operation, allow_desktop_interaction)?;
+            Ok(R::SemanticInvoked)
+        }
+        C::MenuItems { binding } => {
+            let tracker = application(&state, &binding.application_id, &owner)?;
+            drop(state);
+            Ok(R::SemanticItems {
+                snapshot: device::menu_items(tracker, binding.surface_id)?,
+            })
+        }
+        C::InvokeMenuItem {
+            binding,
+            item_id,
+            allow_desktop_interaction,
+        } => {
+            let tracker = application(&state, &binding.application_id, &owner)?;
+            drop(state);
+            device::invoke_menu_item(
+                tracker,
+                binding.surface_id,
+                item_id,
+                allow_desktop_interaction,
+            )?;
+            Ok(R::SemanticInvoked)
+        }
         C::Capabilities => Ok(R::Capabilities {
             capabilities: device::capabilities(),
         }),
@@ -117,8 +314,8 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             mode.validate_target(&target)?;
             let duration = lease(lease_ms)?;
             if state.inputs.len() >= 8
-                || state.inputs.values().any(|(_, existing, _, _)| {
-                    existing == &target || (!existing.is_window() && !target.is_window())
+                || state.inputs.values().any(|entry| {
+                    entry.target == target || (!entry.target.is_window() && !target.is_window())
                 })
             {
                 return Err(DesktopError::Invalid(
@@ -134,23 +331,29 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             let id = sinomo_core::Id::generate().to_string();
             state.inputs.insert(
                 id.clone(),
-                (owner, target, Instant::now() + duration, input),
+                InputEntry {
+                    owner,
+                    target,
+                    expires: Instant::now() + duration,
+                    application: None,
+                    input,
+                },
             );
             Ok(R::Opened { id })
         }
         C::Input { id, events } => {
-            let (bound, _, _, input) = state
+            let entry = state
                 .inputs
                 .get_mut(&id)
                 .ok_or_else(|| DesktopError::Closed("unknown OS input handle".into()))?;
-            same_owner(bound, &owner)?;
+            same_owner(&entry.owner, &owner)?;
             Ok(R::Applied {
-                events: input.send(&events)?,
+                events: entry.input.send(&events)?,
             })
         }
         C::CloseInput { id } => {
-            if let Some((bound, ..)) = state.inputs.get(&id) {
-                same_owner(bound, &owner)?;
+            if let Some(entry) = state.inputs.get(&id) {
+                same_owner(&entry.owner, &owner)?;
             }
             state.inputs.remove(&id);
             Ok(R::Closed)
@@ -171,7 +374,12 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             let id = sinomo_core::Id::generate().to_string();
             state.captures.insert(
                 id.clone(),
-                (owner, Instant::now() + duration, Arc::new(capture)),
+                CaptureEntry {
+                    owner,
+                    expires: Instant::now() + duration,
+                    application: None,
+                    capture: Arc::new(capture),
+                },
             );
             Ok(R::Opened { id })
         }
@@ -180,12 +388,12 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             after_sequence,
             timeout_ms,
         } => {
-            let (bound, _, capture) = state
+            let entry = state
                 .captures
                 .get(&id)
                 .ok_or_else(|| DesktopError::Closed("unknown OS capture handle".into()))?;
-            same_owner(bound, &owner)?;
-            let capture = capture.clone();
+            same_owner(&entry.owner, &owner)?;
+            let capture = entry.capture.clone();
             drop(state);
             let frame = capture
                 .next(after_sequence, Duration::from_millis(timeout_ms.min(100)))?
@@ -221,8 +429,8 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             Ok(R::Frame { available })
         }
         C::CloseCapture { id } => {
-            if let Some((bound, ..)) = state.captures.get(&id) {
-                same_owner(bound, &owner)?;
+            if let Some(entry) = state.captures.get(&id) {
+                same_owner(&entry.owner, &owner)?;
             }
             state.captures.remove(&id);
             Ok(R::Closed)
@@ -303,6 +511,11 @@ pub extern "C" fn sinomo_module_invoke(
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
     if !LIFECYCLE.begin_shutdown() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
+    // UIA calls can involve an unresponsive provider. A worker that does not
+    // stop within its bound keeps the library quarantined rather than unloaded.
+    if !device::shutdown_surfaces() {
         return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
     }
     // Drop all OS handles and join workers before releasing callback code.

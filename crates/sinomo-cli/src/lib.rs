@@ -1068,6 +1068,48 @@ pub fn default_cli_runtime_config() -> CliRuntimeConfig {
     }
 }
 
+/// Build command composition after local startup admission, before loading any
+/// installed native CLI extensions. Maintenance never maps removable libraries.
+pub fn default_cli_runtime_config_for_args(args: &[String]) -> Result<CliRuntimeConfig, String> {
+    let starts_runtime = matches!(args, [daemon, action, ..]
+        if daemon == "daemon" && matches!(action.as_str(), "run" | "start" | "__complete-shadow-rollout"))
+        || matches!(args, [daemon, shadow, action, ..]
+            if daemon == "daemon" && shadow == "shadow" && matches!(action.as_str(), "run" | "start"));
+    if starts_runtime
+        && !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        let enabled = SinomoDataDir::from_env_or_home()
+            .map_err(|error| error.to_string())
+            .and_then(|data| sinomo_runtime::local::ensure_deployment_enabled(&data.root()));
+        enabled?;
+    }
+    Ok(
+        if matches!(
+            args.first().map(String::as_str),
+            Some("install" | "uninstall")
+        ) {
+            maintenance_cli_runtime_config()
+        } else {
+            default_cli_runtime_config()
+        },
+    )
+}
+
+/// Maintenance must be able to remove native libraries without loading them
+/// into the uninstalling process (Windows keeps loaded DLLs locked).
+pub fn maintenance_cli_runtime_config() -> CliRuntimeConfig {
+    CliRuntimeConfig {
+        command_registry: CliCommandRegistry::new()
+            .register(install_cli_command_handler())
+            .register(uninstall_cli_command_handler()),
+        config_registry_hooks: Vec::new(),
+        storage_layout_hooks: Vec::new(),
+        test_registry_hooks: Vec::new(),
+    }
+}
+
 pub fn install_cli_runtime_config(config: CliRuntimeConfig) -> Result<(), &'static str> {
     CLI_RUNTIME_CONFIG
         .set(config)
@@ -5534,7 +5576,7 @@ const DAEMON_AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = cluster::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
-const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
+const INSTALL_DEFAULT_HOST: &str = sinomo_runtime::installer::initial_setup::services::DEFAULT_HOST;
 
 fn daemon_fetch_cluster_kv_local_snapshot_from_endpoint(
     endpoint: &ClusterEndpointRecord,

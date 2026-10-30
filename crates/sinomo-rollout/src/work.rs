@@ -59,6 +59,7 @@ fn acquire_work(
     cancelled: impl Fn() -> bool,
 ) -> Result<RuntimeWorkLease, String> {
     loop {
+        sinomo_core::local::ensure_deployment_enabled(data_dir)?;
         if cancelled() {
             return Err("execution host stopped before command admission".into());
         }
@@ -68,7 +69,7 @@ fn acquire_work(
         if let Some(admission) = &admission {
             match FileExt::try_lock_shared(&admission.file) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if lock_contended(&error) => {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
@@ -78,7 +79,7 @@ fn acquire_work(
         let file = work_file(data_dir, "runtime-work.lock")?;
         match FileExt::try_lock_shared(&file.file) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if lock_contended(&error) => {
                 drop(admission);
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -100,6 +101,11 @@ fn acquire_work(
     }
 }
 
+fn lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 pub fn drain_runtime_work(
     data_dir: &Path,
     timeout: Duration,
@@ -111,9 +117,7 @@ pub fn drain_runtime_work(
     loop {
         match FileExt::try_lock_exclusive(&admission.file) {
             Ok(()) => break,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
+            Err(error) if lock_contended(&error) && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5))
             }
             Err(error) => {
@@ -132,9 +136,7 @@ pub fn drain_runtime_work(
                     _admission: admission,
                 });
             }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
+            Err(error) if lock_contended(&error) && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(50))
             }
             Err(error) => {

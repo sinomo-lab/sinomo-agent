@@ -587,6 +587,9 @@ pub fn start_daemon_command_process(
     ready_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<DaemonStatus, DaemonError> {
+    let data = crate::daemon_data_dir_path(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(&data)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     if matches!(
         probe_daemon_status(paths, probe_timeout),
         DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. }
@@ -601,7 +604,18 @@ pub fn start_daemon_command_process(
         path: "current executable".to_string(),
         detail: source.to_string(),
     })?;
-    let exe = daemon_start_executable_for_command(&exe, command_prefix);
+    let installed = sinomo_core::local::SinomoDataDir::new(&data).binary(
+        if command_prefix.starts_with(&["daemon", "shadow"]) {
+            "sinomo-shadow"
+        } else {
+            "sinomo"
+        },
+    );
+    let exe = if installed.is_file() {
+        installed
+    } else {
+        daemon_start_executable_for_command(&exe, command_prefix)
+    };
     let mut command = Command::new(exe);
     command.args(command_prefix);
     for (key, value) in extra_env {

@@ -85,6 +85,7 @@ pub fn daemon_status_projection(
 }
 
 pub fn recover_startup_state(data_dir_root: &std::path::Path) -> Result<(), String> {
+    sinomo_core::local::ensure_deployment_enabled(data_dir_root)?;
     let data_dir = sinomo_core::local::SinomoDataDir::new(data_dir_root);
     runtime::recover_native_loader_intents_before_registry_load(&DaemonPaths::new(&data_dir))
         .map(|_| ())
@@ -224,6 +225,9 @@ async fn run_shadow_finalization_until_stopped(
 }
 
 pub fn maintenance_inhibited(data_dir_root: &std::path::Path) -> bool {
+    if sinomo_core::local::ensure_deployment_enabled(data_dir_root).is_err() {
+        return true;
+    }
     let paths = sinomo_rollout::SelfRolloutPaths::new(data_dir_root);
     sinomo_rollout::rollout_shadow_finalize_path(&paths).exists()
         || sinomo_rollout::rollout_main_activation_path(&paths).exists()

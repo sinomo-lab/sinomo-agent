@@ -20,6 +20,62 @@ accessibility, screen sharing and exact-display grants locally. Query raw
 targets directly when capabilities report no background input. Never request
 or infer a silent mode change from a failed input batch.
 
+For a Windows app with multiple windows, check `capabilities.surfaces` and use
+an application session. `applications` returns process-instance identities and
+resource IDs. `open_application` takes that exact `application` and a bounded
+`lease_ms`. Its `session_id` remains valid while the process runs, even if its
+main window closes. Local `observe` consent for the application resource is
+required; discovery never grants it.
+
+Call `surfaces` with the application `session_id` to see current top-level
+windows and child controls, their opaque `surface_id`, owner/parent, visibility,
+enabled state and `blocks_owner`. A disabled window is not an input target;
+select its enabled dialog explicitly. Destroyed/recreated windows get new
+references. Process-wide `input`/`capture` grants cover windows in that exact
+process instance. Cross-process owned windows require their own lifetime-scoped
+surface grants. Legacy window grants remain usable only through the legacy
+window API and are never promoted into application consent.
+
+Use `open_window` with `application_session_id`, `surface_id`, `input`, `capture`
+and `lease_ms`. Every `input` on that session must repeat its `surface_id`.
+Capture records carry the matching identity. Never substitute a different
+window's coordinates, even when dimensions happen to match.
+
+`open_overview` creates a media view for an application session (up to four
+windows). Attach its stream through the normal capture route. `select_window`
+with `overview_session_id` and a `surface_id` switches that view to the selected
+window's full-resolution video; `surface_id:null` returns to thumbnails.
+Selection changes observation only, never an input session's target. Use a full
+window view before coordinate input. Overview tiles retain source dimensions
+and capture timestamps; omitted surfaces are listed explicitly. An
+`identity.kind:unavailable` frame is a derived status, not live window pixels.
+Use `surfaces` to choose a new window instead of acting on a stale frame.
+
+`tray_items` discovers exposed, visible Windows shell controls without opening
+overflow. These controls have no verified application ownership. Use their exact
+`item_id` for `invoke_tray`, choosing `operation:invoke` or `context_menu`.
+UIA context-menu support may be unknown (`context_menu:null`) and can fail
+explicitly. Never assume an accepted semantic call completed the app task.
+
+Tray/menu invocation can open or activate app/shell UI. It requires
+`allow_desktop_interaction:true` plus local consent: tray resources need `invoke`
+and `desktop-interaction`; app menu actions need `input` and
+`desktop-interaction` for the app or exact surface. App/window consent does not
+authorize the tray. Hidden/overflow icons are unavailable until the relevant
+shell UI is explicitly opened. Do not open it or switch to raw input silently.
+No pointer injection, Explorer memory scraping or guessed callback messages are
+used for semantic actions.
+
+After an app exposes a menu window, `menu_items` takes
+`application_session_id` and its `surface_id`. `invoke_menu_item` takes those
+same fields, the returned `item_id`, and explicit desktop-interaction opt-in.
+Menu references expire when their owning window/session is gone. Closing an
+application session with the existing `close` action closes its input/view
+leases and releases native observers. Close any separately opened legacy/raw
+sessions as well. The application-session and semantic APIs report unsupported
+on platforms where they are unavailable; existing per-window/raw tools remain
+usable according to their capabilities.
+
 Prefer **background** control. `{"action":"targets"}` defaults to
 `"mode":"background"` and lists windows. Preserve the complete target identity
 (handle, process ID, thread ID, process creation time). Open with

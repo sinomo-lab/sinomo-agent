@@ -2,12 +2,15 @@
 //! never falls back to linked desktop code when the native provider is absent.
 use sinomo_runtime::device::{
     NativeVideoSample,
-    desktop::{protocol::*, *},
+    desktop::{protocol::*, surfaces::*, *},
 };
 use sinomo_runtime::module::*;
 use sinomo_runtime::node::LocalNodePermissionStore;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 pub struct DesktopProviderClient {
@@ -72,7 +75,9 @@ impl DesktopProviderClient {
         // Cleanup remains possible after provider removal or consent revocation.
         if !matches!(
             command,
-            DesktopProviderCommand::CloseInput { .. } | DesktopProviderCommand::CloseCapture { .. }
+            DesktopProviderCommand::CloseInput { .. }
+                | DesktopProviderCommand::CloseCapture { .. }
+                | DesktopProviderCommand::CloseApplication { .. }
         ) {
             self.check_current()?;
         }
@@ -153,10 +158,15 @@ impl DesktopProviderClient {
         self: &Arc<Self>,
         config: DesktopCaptureConfig,
     ) -> DesktopResult<NativeDesktopCapture> {
+        let identity = DesktopCaptureIdentity::Target {
+            target: config.target.clone(),
+            application: None,
+        };
         match self.invoke(DesktopProviderCommand::OpenCapture { config })? {
             DesktopProviderResponse::Opened { id } => Ok(NativeDesktopCapture {
                 provider: self.clone(),
                 id,
+                identity,
             }),
             _ => Err(error("invalid capture open response")),
         }
@@ -165,6 +175,189 @@ impl DesktopProviderClient {
         self.component.unload()
     }
 }
+pub struct NativeApplication {
+    pub id: String,
+    pub application: DesktopApplication,
+    provider: Arc<DesktopProviderClient>,
+    closed: AtomicBool,
+}
+impl DesktopProviderClient {
+    pub fn surface_capabilities(&self) -> DesktopResult<DesktopSurfaceCapabilities> {
+        match self.invoke(DesktopProviderCommand::SurfaceCapabilities)? {
+            DesktopProviderResponse::SurfaceCapabilities { capabilities } => Ok(capabilities),
+            _ => Err(error("invalid surface capabilities")),
+        }
+    }
+    pub fn applications(&self) -> DesktopResult<Vec<DesktopApplicationInfo>> {
+        match self.invoke(DesktopProviderCommand::Applications)? {
+            DesktopProviderResponse::Applications { applications } => Ok(applications),
+            _ => Err(error("invalid applications response")),
+        }
+    }
+    pub fn open_application(
+        self: &Arc<Self>,
+        application: DesktopApplication,
+        lease_ms: u64,
+    ) -> DesktopResult<(Arc<NativeApplication>, DesktopApplicationSnapshot)> {
+        if !self.surface_capabilities()?.application_sessions {
+            return Err(DesktopError::Unsupported(
+                "application sessions unavailable on this provider".into(),
+            ));
+        }
+        match self.invoke(DesktopProviderCommand::OpenApplication {
+            application: application.clone(),
+            lease_ms,
+        })? {
+            DesktopProviderResponse::ApplicationOpened {
+                application_id,
+                snapshot,
+            } => Ok((
+                Arc::new(NativeApplication {
+                    id: application_id,
+                    application,
+                    provider: self.clone(),
+                    closed: AtomicBool::new(false),
+                }),
+                snapshot,
+            )),
+            _ => Err(error("invalid application open response")),
+        }
+    }
+    pub fn tray_items(&self) -> DesktopResult<DesktopSemanticSnapshot> {
+        match self.invoke(DesktopProviderCommand::TrayItems)? {
+            DesktopProviderResponse::SemanticItems { snapshot } => Ok(snapshot),
+            _ => Err(error("invalid tray response")),
+        }
+    }
+    pub fn invoke_tray(
+        &self,
+        item_id: String,
+        operation: DesktopSemanticAction,
+        allow_desktop_interaction: bool,
+    ) -> DesktopResult<()> {
+        match self.invoke(DesktopProviderCommand::InvokeTray {
+            item_id,
+            operation,
+            allow_desktop_interaction,
+        })? {
+            DesktopProviderResponse::SemanticInvoked => Ok(()),
+            _ => Err(error("invalid tray invocation response")),
+        }
+    }
+}
+impl NativeApplication {
+    fn binding(&self, surface_id: &str) -> DesktopResult<ApplicationWindowBinding> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(DesktopError::Closed("application session closed".into()));
+        }
+        Ok(ApplicationWindowBinding {
+            application_id: self.id.clone(),
+            surface_id: surface_id.into(),
+        })
+    }
+    pub fn snapshot(&self) -> DesktopResult<DesktopApplicationSnapshot> {
+        self.binding("")?;
+        match self
+            .provider
+            .invoke(DesktopProviderCommand::ApplicationSurfaces {
+                application_id: self.id.clone(),
+            })? {
+            DesktopProviderResponse::ApplicationSurfaces { snapshot } => Ok(snapshot),
+            _ => Err(error("invalid application snapshot")),
+        }
+    }
+    pub fn resolve(
+        &self,
+        surface_id: &str,
+        operation: &str,
+    ) -> DesktopResult<DesktopWindowSurface> {
+        match self
+            .provider
+            .invoke(DesktopProviderCommand::ResolveApplicationWindow {
+                binding: self.binding(surface_id)?,
+                operation: operation.into(),
+            })? {
+            DesktopProviderResponse::ApplicationWindow { window } => Ok(window),
+            _ => Err(error("invalid window resolution")),
+        }
+    }
+    pub fn open_input(&self, surface_id: &str, lease_ms: u64) -> DesktopResult<NativeDesktopInput> {
+        match self
+            .provider
+            .invoke(DesktopProviderCommand::OpenApplicationInput {
+                binding: self.binding(surface_id)?,
+                lease_ms,
+            })? {
+            DesktopProviderResponse::Opened { id } => Ok(NativeDesktopInput {
+                provider: self.provider.clone(),
+                id: Some(id),
+            }),
+            _ => Err(error("invalid application input response")),
+        }
+    }
+    pub fn capture(
+        &self,
+        surface_id: &str,
+        config: DesktopCaptureConfig,
+    ) -> DesktopResult<NativeDesktopCapture> {
+        let binding = self.binding(surface_id)?;
+        let identity = DesktopCaptureIdentity::Target {
+            target: config.target.clone(),
+            application: Some(binding.clone()),
+        };
+        match self
+            .provider
+            .invoke(DesktopProviderCommand::OpenApplicationCapture { binding, config })?
+        {
+            DesktopProviderResponse::Opened { id } => Ok(NativeDesktopCapture {
+                provider: self.provider.clone(),
+                id,
+                identity,
+            }),
+            _ => Err(error("invalid application capture response")),
+        }
+    }
+    pub fn menu_items(&self, surface_id: &str) -> DesktopResult<DesktopSemanticSnapshot> {
+        match self.provider.invoke(DesktopProviderCommand::MenuItems {
+            binding: self.binding(surface_id)?,
+        })? {
+            DesktopProviderResponse::SemanticItems { snapshot } => Ok(snapshot),
+            _ => Err(error("invalid menu response")),
+        }
+    }
+    pub fn invoke_menu_item(
+        &self,
+        surface_id: &str,
+        item_id: String,
+        allow_desktop_interaction: bool,
+    ) -> DesktopResult<()> {
+        match self
+            .provider
+            .invoke(DesktopProviderCommand::InvokeMenuItem {
+                binding: self.binding(surface_id)?,
+                item_id,
+                allow_desktop_interaction,
+            })? {
+            DesktopProviderResponse::SemanticInvoked => Ok(()),
+            _ => Err(error("invalid menu invocation response")),
+        }
+    }
+    pub fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            let _ = self
+                .provider
+                .invoke(DesktopProviderCommand::CloseApplication {
+                    application_id: self.id.clone(),
+                });
+        }
+    }
+}
+impl Drop for NativeApplication {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 struct InvocationCallbacks {
     permission: String,
     capture: Option<(String, u64)>,
@@ -233,8 +426,12 @@ impl Drop for NativeDesktopInput {
 pub struct NativeDesktopCapture {
     provider: Arc<DesktopProviderClient>,
     id: String,
+    identity: DesktopCaptureIdentity,
 }
 impl DesktopFrameSource for NativeDesktopCapture {
+    fn identity(&self) -> Option<DesktopCaptureIdentity> {
+        Some(self.identity.clone())
+    }
     fn next(
         &self,
         after_sequence: u64,

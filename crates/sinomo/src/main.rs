@@ -11,7 +11,11 @@ fn main() {
         });
     configure_long_lived_daemon_allocator(&args);
     install_build_info();
-    let runtime_config = sinomo_cli::default_cli_runtime_config();
+    let runtime_config =
+        sinomo_cli::default_cli_runtime_config_for_args(&args).unwrap_or_else(|error| {
+            eprintln!("sinomo: {error}");
+            std::process::exit(1);
+        });
     sinomo_cli::install_cli_runtime_config(runtime_config)
         .expect("default CLI module bindings should be installed once");
     if let Err(error) = sinomo_cli::run(args) {

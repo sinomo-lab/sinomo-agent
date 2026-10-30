@@ -15,6 +15,7 @@ use std::time::Duration;
 #[derive(Clone, Copy, Debug)]
 enum Case {
     AppForm,
+    AppMultiWindow,
     AppDragResize,
     ComputerForm,
     GamepadCapability,
@@ -24,6 +25,7 @@ impl Case {
     fn id(self) -> &'static str {
         match self {
             Self::AppForm => "agent.desktop.app-form",
+            Self::AppMultiWindow => "agent.desktop.app-multiwindow",
             Self::AppDragResize => "agent.desktop.app-drag-resize",
             Self::ComputerForm => "agent.desktop.computer-form",
             Self::GamepadCapability => "agent.desktop.gamepad-capability",
@@ -45,6 +47,7 @@ pub fn register(builder: SinomoTestRegistryBuilder) -> SinomoTestRegistryBuilder
         ]
     };
     builder.register(SinomoTestCase::new(Case::AppForm.id(),"Live agent fills a background form and uses message-based controls",["agent-desktop","live","video"],requirements(),|ctx|run(ctx,Case::AppForm)))
+    .register(SinomoTestCase::new(Case::AppMultiWindow.id(),"Live agent discovers and controls a newly spawned application window through explicit surface identities",["agent-desktop","live","video"],requirements(),|ctx|run(ctx,Case::AppMultiWindow)))
     .register(SinomoTestCase::new(Case::AppDragResize.id(),"Live agent drags, scrolls, and continues after a background window resize",["agent-desktop","live","video"],requirements(),|ctx|run(ctx,Case::AppDragResize)))
     .register(SinomoTestCase::new(Case::ComputerForm.id(),"Live agent operates an owned foreground app through raw desktop input",["agent-desktop","live","video"],requirements(),|ctx|run(ctx,Case::ComputerForm)))
     .register(SinomoTestCase::new(Case::GamepadCapability.id(),"Live agent probes native gamepad injection and reports unsupported capability honestly",["agent-desktop","live","video"],requirements(),|ctx|run(ctx,Case::GamepadCapability)))
@@ -152,6 +155,10 @@ fn run_live(
         .map_err(|e| e.to_string())?
         .to_string();
     let interactive = ctx.parameter("interactive-fixture") == Some("true");
+    let interrupt_background = ctx.parameter("background-interruption") == Some("true");
+    if interrupt_background && !matches!(case, Case::AppMultiWindow) {
+        return Err("background-interruption requires the multi-window case with input before and after the interruption".into());
+    }
     fixture::require_test_desktop(&desktop, interactive)?;
     let ffmpeg = PathBuf::from(
         ctx.required_parameter("ffmpeg")
@@ -184,10 +191,11 @@ fn run_live(
         &root.join("desktop-ready"),
         &desktop,
         interactive,
+        interrupt_background,
     )?;
     let initial_pointer = window.pointer()?;
     let initial_foreground = window.foreground();
-    if initial_foreground != window.foreground_handle
+    if (case.raw() && initial_foreground != window.foreground_handle)
         || (!case.raw() && initial_foreground == window.handle)
     {
         return Err("fixture did not establish the required foreground ownership".into());
@@ -244,6 +252,32 @@ fn run_live(
             .map_err(|e| e.to_string())?;
     }
     permissions.save(&grants).map_err(|e| e.to_string())?;
+    let application_identity = match &target_info.target {
+        DesktopTarget::Window {
+            process_id,
+            process_started,
+            ..
+        } => Some(
+            sinomo_runtime::device::desktop::surfaces::DesktopApplication {
+                process_id: *process_id,
+                process_started: *process_started,
+            },
+        ),
+        _ => None,
+    };
+    let multi = matches!(case, Case::AppMultiWindow);
+    if multi {
+        for operation in ["observe", "input", "capture"] {
+            grants
+                .expose_resource_operation(
+                    application_identity.as_ref().unwrap().resource_id(),
+                    operation,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        permissions.save(&grants).map_err(|e| e.to_string())?;
+    }
+    let allowed_application = application_identity.clone();
     let allowed = target_info.target.clone();
     let allowed_bounds = target_info.bounds;
     let fixture_handle = window.handle;
@@ -261,6 +295,8 @@ fn run_live(
             let command: DesktopControlRequest =
                 request.decode_body().map_err(|e| e.to_string())?;
             match command {
+                DesktopControlRequest::Applications | DesktopControlRequest::TrayItems | DesktopControlRequest::InvokeTray { .. } | DesktopControlRequest::InvokeMenuItem { .. } => return Err("global application/tray discovery and semantic shell actions are outside this window-only case".into()),
+                DesktopControlRequest::OpenApplication { application, .. } if !multi || Some(&application) != allowed_application.as_ref() => return Err("application is outside the owned fixture".into()),
                 DesktopControlRequest::Targets{..}=>return Err("fixture discovery is scoped to the assigned target; use the supplied target identity and current video dimensions".into()),
                 DesktopControlRequest::Open{target,..}|DesktopControlRequest::Children{target} if target!=allowed=>return Err("target is outside the owned test resource".into()),
                 DesktopControlRequest::Input{events,..}=>{
@@ -294,23 +330,55 @@ fn run_live(
         .build()
         .map_err(|e| e.to_string())?;
     let mut environment = ComponentTestEnvironment::start(&data, catalog, guard)?;
-    let open = environment.runtime.block_on(environment.transport.invoke(
-        kind.control_route(),
-        kind.name(),
-        &DesktopControlRequest::Open {
-            target: target_info.target.clone(),
-            mode,
-            input: false,
-            capture: true,
-            lease_ms: 300_000,
-        },
-    ))?;
-    let DesktopControlResponse::Opened {
-        session_id: capture_id,
-        ..
-    } = open.response.decode_body().map_err(|e| e.to_string())?
-    else {
-        return Err("capture lease failed".into());
+    let (application_id, capture_id) = if multi {
+        let opened = environment.runtime.block_on(environment.transport.invoke(
+            kind.control_route(),
+            kind.name(),
+            &DesktopControlRequest::OpenApplication {
+                application: application_identity.clone().unwrap(),
+                lease_ms: 300_000,
+            },
+        ))?;
+        let DesktopControlResponse::ApplicationOpened { session_id, .. } =
+            opened.response.decode_body().map_err(|e| e.to_string())?
+        else {
+            return Err("application lease failed".into());
+        };
+        let overview = environment.runtime.block_on(environment.transport.invoke(
+            kind.control_route(),
+            kind.name(),
+            &DesktopControlRequest::OpenOverview {
+                application_session_id: session_id.clone(),
+                max_windows: 4,
+            },
+        ))?;
+        let DesktopControlResponse::Opened {
+            session_id: view, ..
+        } = overview.response.decode_body().map_err(|e| e.to_string())?
+        else {
+            return Err("overview lease failed".into());
+        };
+        (Some(session_id), view)
+    } else {
+        let open = environment.runtime.block_on(environment.transport.invoke(
+            kind.control_route(),
+            kind.name(),
+            &DesktopControlRequest::Open {
+                target: target_info.target.clone(),
+                mode,
+                input: false,
+                capture: true,
+                lease_ms: 300_000,
+            },
+        ))?;
+        let DesktopControlResponse::Opened {
+            session_id: capture_id,
+            ..
+        } = open.response.decode_body().map_err(|e| e.to_string())?
+        else {
+            return Err("capture lease failed".into());
+        };
+        (None, capture_id)
     };
     let max_dimension: u32 = ctx
         .parameter("capture-max-dimension")
@@ -358,7 +426,7 @@ fn run_live(
             kind.control_route(),
             kind.name(),
             &DesktopControlRequest::Close {
-                session_id: capture_id,
+                session_id: capture_id.clone(),
             },
         ));
         environment.close()?;
@@ -424,6 +492,7 @@ fn run_live(
     );
     let mut task=match case{
         Case::AppForm|Case::ComputerForm=>format!("Fill the visible input with {code}, submit it using Enter or the Submit button, make Counter exactly 3, and turn the OFF button ON. Use the provided desktop control tool. Verify the final screen, release all held inputs and close your input session."),
+        Case::AppMultiWindow=>format!("Use the provided application session {} and video view {}. Call surfaces, identify the main owned fixture window, and select_window on that video view to see it at full resolution. Open its input with open_window, using capture:false. Click OPEN WINDOW. Refresh surfaces, identify the newly created secondary workspace, select_window on the same video view, and open_window for its input. In the SECONDARY workspace, type and submit {code}, set Counter exactly 3 and turn OFF to ON. Every input request must include the matching surface_id. Use move_in_frame and source dimensions from that window's current image. Close all input sessions you open, but leave the provided application and video view sessions open for the harness. Do not interact with the foreground guard or any uncontrolled interruption window. Other windows may appear or become foreground; continue using only the main and secondary owned fixture surfaces. Verify the final visible state.", application_id.as_deref().unwrap(), capture_id),
         Case::AppDragResize=>format!("Click EXPAND to resize the window, then use the updated visual frame to drag the yellow token into the green DROP HERE area. Scroll upward three wheel ticks so Scroll ticks reads 3. Type {code} into the input and submit. Verify the final screen and close your input session."),
         Case::GamepadCapability=>"Open an input session and attempt one neutral native gamepad state (all buttons, axes and triggers zero). If the OS rejects the restricted capability, report that honestly and do not substitute keyboard input. Close your session. This is a capability probe, not a game-play claim.".into(),
         Case::GamepadState=>"Use native gamepad injection to hold A (Windows GamepadButtons mask 4), left_x=0.65, left_y=-0.4, right_trigger=0.75, all other axes/triggers zero. Wait for the next visual observation and verify Gamepad pattern reads true. Then send a separate completely neutral gamepad state, verify Returned neutral reads true, and close your input session. Never send the held and neutral states in the same batch. If Windows reports the native capability unsupported, report that honestly without substituting keyboard input.".into(),
@@ -435,8 +504,13 @@ fn run_live(
         task.push_str(" Do not copy example coordinates from the skill. Capture is already streaming to you: open input=true, capture=false with lease_ms=180000, then use only input and close. Keep speech brief and perform the task with native function calls.");
     }
     task.push_str(&format!(" Use mode={} in the open request for this case. This is an explicit test of that input mode.", if raw { "raw" } else { "background" }));
+    let session_instruction = if multi {
+        "Use the application and video view sessions specified in the task. Use open_window for input and select_window for the video view. Do not open another application session or use legacy open. Selecting video does not retarget an input session. Include surface_id in every input call."
+    } else {
+        "Use the exact target below when opening an input=true, capture=false, lease_ms=180000 session."
+    };
     let system = format!(
-        "You are an actual Sinomo agent performing a bounded acceptance task in an owned Windows test window with isolated runtime state. Use only the offered module control tool; do not delegate or invent other tools. A fresh video frame is supplied before each model request. Coordinate metadata accompanies it. The test window belongs to this task. Use the exact target below when opening an input=true, capture=false, lease_ms=180000 session. All observation recording is already running independently. Do not open a second capture. Query capabilities if useful. Global target discovery is intentionally denied; use the assigned target. The window origin stays fixed if it resizes, and current video metadata supplies the updated dimensions. Use one tool invocation at a time, but batch related input events. Always pair button/key down and up. For background app input send move before clicks, use VK_RETURN 13 for Enter; computer use uses scan-code 28 for Enter. Only claim completion after observing the resulting state.\nTARGET INFO:\n{}\nMODULE SKILL:\n{}",
+        "You are an actual Sinomo agent performing a bounded acceptance task in an owned Windows test window with isolated runtime state. Use only the offered module control tool; do not delegate or invent other tools. A fresh video frame is supplied before each model request. Coordinate metadata accompanies it. The test window belongs to this task. {session_instruction} All observation recording is already running independently. Do not open a second capture. Query capabilities if useful. Global target discovery is intentionally denied; use the assigned target. The window origin stays fixed if it resizes, and current video metadata supplies the updated dimensions. Use one tool invocation at a time, but batch related input events. Always pair button/key down and up. For background app input send move before clicks, use VK_RETURN 13 for Enter; computer use uses scan-code 28 for Enter. Only claim completion after observing the resulting state.\nTARGET INFO:\n{}\nMODULE SKILL:\n{}",
         serde_json::to_string(&target_info).unwrap(),
         skill
     );
@@ -512,7 +586,7 @@ fn run_live(
         kind.control_route(),
         kind.name(),
         &DesktopControlRequest::Close {
-            session_id: capture_id,
+            session_id: capture_id.clone(),
         },
     ));
     environment.close()?;
@@ -561,7 +635,7 @@ fn run_live(
     let opened_inputs: Vec<_> = calls
         .iter()
         .filter(|r| {
-            r["input"]["action"] == "open"
+            (r["input"]["action"] == "open" || r["input"]["action"] == "open_window")
                 && r["input"]["input"] == true
                 && r["response"]["status"] == "opened"
         })
@@ -576,6 +650,13 @@ fn run_live(
             })
         });
     let task_passed = match case {
+        Case::AppMultiWindow => {
+            actual.secondary_window != 0
+                && actual.submitted_window == actual.secondary_window
+                && actual.submitted == code
+                && actual.counter == 3
+                && actual.enabled
+        }
         Case::AppForm | Case::ComputerForm => {
             actual.submitted == code && actual.counter == 3 && actual.enabled
         }
@@ -595,9 +676,11 @@ fn run_live(
     let focus_preserved = if case.raw() {
         foreground == window.handle
     } else {
-        foreground == initial_foreground && pointer == initial_pointer
+        actual.background_input_isolated(window.handle, foreground, initial_pointer, pointer)
     };
-    let diagnostics = serde_json::json!({"actual_app_state":actual,"goal_reached":task_passed,"task_delivered_to_model":task_delivered,"agent_closed_input_session":agent_closed,"input_isolation_verified":focus_preserved,"background_focus_and_pointer_preserved":if raw{None}else{Some(focus_preserved)},"raw_fixture_retained_foreground":if raw{Some(focus_preserved)}else{None},"initial_foreground":initial_foreground,"final_foreground":foreground,"initial_pointer":initial_pointer,"final_pointer":pointer,"agent_tool_calls":calls.len(),"input_applied":applied,"gamepad_unsupported":unsupported,"real_cluster_used":false});
+    let interruption_verified = !interrupt_background
+        || (actual.interruption_became_foreground && actual.input_events_after_interruption > 0);
+    let diagnostics = serde_json::json!({"background_interruption_requested":interrupt_background,"background_interruption_verified":interruption_verified,"controlled_windows_stayed_background":if raw { None } else { Some(actual.target_activation_events == 0 && actual.target_focus_events == 0 && actual.foreground_input_events == 0) },"external_foreground_change_allowed":!raw,"actual_app_state":actual,"goal_reached":task_passed,"task_delivered_to_model":task_delivered,"agent_closed_input_session":agent_closed,"input_isolation_verified":focus_preserved,"background_input_noninterference_verified":if raw{None}else{Some(focus_preserved)},"raw_fixture_retained_foreground":if raw{Some(focus_preserved)}else{None},"initial_foreground":initial_foreground,"final_foreground":foreground,"initial_pointer":initial_pointer,"final_pointer":pointer,"agent_tool_calls":calls.len(),"input_applied":applied,"gamepad_unsupported":unsupported,"real_cluster_used":false,"application_session":application_id,"video_view_session":capture_id});
     write_json(&directory.join("assertions.json"), &diagnostics)?;
     if auth_failed.load(Ordering::Acquire) {
         return Err(
@@ -618,6 +701,7 @@ fn run_live(
         || !task_delivered
         || !agent_closed
         || !focus_preserved
+        || !interruption_verified
         || !applied
         || calls.is_empty()
     {

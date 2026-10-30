@@ -48,6 +48,7 @@ pub fn connect_or_start_local_daemon_with_binary(
     binary: Option<&std::path::Path>,
     progress: &impl Fn(&str),
 ) -> Result<LocalDaemonConnection, String> {
+    sinomo_runtime::local::ensure_deployment_enabled(&data_dir.root())?;
     let paths = DaemonPaths::new(data_dir);
     progress("Looking for a daemon…");
     match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
