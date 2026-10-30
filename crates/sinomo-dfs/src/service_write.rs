@@ -475,28 +475,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &desired_replica_nodes,
             &policy,
         )? {
-            // The planner already handles required nodes, pins and eligible
-            // candidates. Appending the historical object owner a second time
-            // widens N and undoes a completed placement change on the next write.
             Some(plan) => plan,
-            None => (
-                self.normalize_desired_replica_nodes(object, desired_replica_nodes, &policy),
-                policy,
-            ),
-        };
-        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
-            let desired_replicas = desired_replica_nodes.len();
-            // A confirmed write waits for every desired replica. If normalization
-            // adds the owner, widen both counts so it cannot silently become an
-            // eventual write.
-            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
-                desired_replicas
-            } else {
-                policy.min_commit_replicas.min(desired_replicas)
-            };
-            policy.with_counts(min_commit_replicas, desired_replicas)?
-        } else {
-            policy
+            // A cold caller preserves its validated selection and W/N until
+            // the primary replans. A historical owner is not an extra replica.
+            None => (desired_replica_nodes, policy),
         };
         validate_replication_plan(&desired_replica_nodes, &policy)?;
         Ok((desired_replica_nodes, policy))
@@ -3410,6 +3392,242 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod initial_receipt_tests {
     use super::*;
+
+    #[test]
+    fn no_snapshot_replica_plan_keeps_counts_and_selected_members() {
+        let root = sinomo_testdir::TestDir::new("no-snapshot-plan-counts");
+        let owner = NodeId::from_legacy_named("historical-plan-owner").unwrap();
+        let targets = ["selected-a", "selected-b", "selected-c"]
+            .map(|name| NodeId::from_legacy_named(name).unwrap());
+        let service = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
+            LocalContentStore::open_for_inspection(root.join("content")),
+        );
+        assert!(service.placement_snapshot_cache().snapshot().is_none());
+        // Pure plan DATA: no metadata is published and no authority is fabricated.
+        let mut object = crate::namespace::distributed_sifs_bootstrap_objects(owner.clone())
+            .into_iter()
+            .find(|object| object.path == "/services")
+            .unwrap();
+        for (w, n, object_policy) in [
+            (1, 2, DfsObjectPolicy::ReplicatedEventual),
+            (2, 3, DfsObjectPolicy::ReplicatedEventual),
+            (2, 2, DfsObjectPolicy::ReplicatedConfirmed),
+        ] {
+            object.policy = object_policy;
+            let selected = targets[..n].to_vec();
+            let zones: std::collections::BTreeMap<NodeId, String> = targets
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (node.clone(), format!("zone-{}", index % 2)))
+                .collect();
+            for historical_owner in [targets[0].clone(), owner.clone()] {
+                object.owner_node_id = historical_owner;
+                for forbidden in [Vec::new(), vec![owner.clone()]] {
+                    let policy = DfsReplicationPolicy::new(w, n)
+                        .unwrap()
+                        .with_placement_constraints(
+                            vec![targets[0].clone()],
+                            forbidden,
+                            2,
+                            zones.clone(),
+                        )
+                        .unwrap();
+                    let (actual_nodes, actual_policy) = service
+                        .normalize_distributed_write_replication_plan(
+                            &object,
+                            &object.version,
+                            selected.clone(),
+                            policy.clone(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        actual_policy, policy,
+                        "historical owner must not change W/N or constraints"
+                    );
+                    assert_eq!(
+                        actual_nodes, selected,
+                        "historical owner is not another selected candidate"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_snapshot_replica_plan_rejects_invalid_constraints_and_candidates() {
+        let root = sinomo_testdir::TestDir::new("no-snapshot-plan-invalid");
+        let owner = NodeId::from_legacy_named("unselected-owner").unwrap();
+        let [a, b, c] =
+            ["plan-a", "plan-b", "plan-c"].map(|name| NodeId::from_legacy_named(name).unwrap());
+        let service = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(owner.clone()),
+            LocalContentStore::open_for_inspection(root.join("content")),
+        );
+        let mut object = crate::namespace::distributed_sifs_bootstrap_objects(owner)
+            .into_iter()
+            .find(|object| object.path == "/services")
+            .unwrap();
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        let plain = DfsReplicationPolicy::new(1, 2).unwrap();
+        for selected in [
+            vec![a.clone()],
+            vec![a.clone(), a.clone()],
+            vec![a.clone(), b.clone(), c.clone()],
+        ] {
+            assert!(
+                service
+                    .normalize_distributed_write_replication_plan(
+                        &object,
+                        &object.version,
+                        selected,
+                        plain.clone(),
+                    )
+                    .is_err()
+            );
+        }
+        for policy in [
+            plain
+                .clone()
+                .with_placement_constraints(vec![c.clone()], Vec::new(), 0, Default::default())
+                .unwrap(),
+            plain
+                .clone()
+                .with_placement_constraints(Vec::new(), vec![b.clone()], 0, Default::default())
+                .unwrap(),
+            plain
+                .clone()
+                .with_placement_constraints(
+                    Vec::new(),
+                    Vec::new(),
+                    2,
+                    [
+                        (a.clone(), "same".into()),
+                        (b.clone(), "same".into()),
+                        (c, "other".into()),
+                    ]
+                    .into(),
+                )
+                .unwrap(),
+        ] {
+            assert!(
+                service
+                    .normalize_distributed_write_replication_plan(
+                        &object,
+                        &object.version,
+                        vec![a.clone(), b.clone()],
+                        policy,
+                    )
+                    .is_err()
+            );
+        }
+        object.policy = DfsObjectPolicy::ReplicatedConfirmed;
+        assert!(
+            service
+                .normalize_distributed_write_replication_plan(
+                    &object,
+                    &object.version,
+                    vec![a, b],
+                    plain,
+                )
+                .is_err(),
+            "confirmed writes must not accept W<N"
+        );
+    }
+
+    #[test]
+    fn native_no_snapshot_routed_producer_preserves_managed_counts() {
+        let name = "native-no-snapshot-routed-counts";
+        let path = "/services/native-no-snapshot-routed-counts.bin";
+        let (runtime, initial, shard) =
+            crate::test_support::current_native_metadata_service(name, 3, path).unwrap();
+        drop(initial);
+        assert_eq!(shard.replica_node_ids.len(), 2);
+        let primary = shard.primary_node_id.clone();
+        let requester = shard.replica_node_ids[0].clone();
+        let other = shard.replica_node_ids[1].clone();
+        let mut caller = runtime
+            .client(&requester)
+            .unwrap()
+            .with_placement_snapshot_cache(Default::default());
+        // Model the ordinary cold CLI handle, not a new author: it has no local
+        // publication provider or placement snapshot. Native Main still owns
+        // authenticated dispatch, current configuration and durable publication.
+        caller.publication_provider = Default::default();
+        assert!(caller.transport.delegates_local_namespace_authority());
+        assert!(caller.placement_snapshot_cache().snapshot().is_none());
+        assert!(caller.publication_provider.current().is_none());
+        let (resolved, _, policy) = caller
+            .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 3)
+            .unwrap();
+        assert!(
+            resolved.source_path.is_none(),
+            "no managed override supplies the count"
+        );
+        assert_eq!(
+            (policy.min_commit_replicas, policy.desired_replicas),
+            (1, 2)
+        );
+        // Both hints are real admitted members. Ingress replaces the requester
+        // slot with the remote primary; normalization must not add it back.
+        let bytes = b"actual cold requester write without count inflation";
+        let stat = caller
+            .posix_write_file_with_known_parent_deferred_local_replay(
+                path,
+                bytes,
+                crate::DfsWriteOptions {
+                    policy,
+                    replica_candidates: vec![requester.clone(), other],
+                    wait_for_commit: false,
+                    foreground_replica_repair: false,
+                },
+            )
+            .expect("the original routed write must complete without a test retry");
+        drop(caller);
+        let authority = runtime.metadata_primary_service(path).unwrap();
+        let version = authority
+            .metadata_backend()
+            .unwrap()
+            .get_version(&stat.object_id, &stat.version)
+            .unwrap()
+            .unwrap();
+        assert!(version.visible);
+        assert_eq!(
+            version.content_hash.as_deref(),
+            Some(crate::content_hash(bytes).as_str())
+        );
+        let durability = version.content_durability.unwrap();
+        let completed = runtime.rpc_observations().iter().any(|call| {
+            call.source == requester
+                && call.target == primary
+                && call.route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                && call.origin == crate::test_runtime::RpcOrigin::RegisteredHost
+                && call.phase == crate::test_runtime::RpcPhase::Completed
+                && call.outcome_error.is_none()
+        });
+        eprintln!(
+            "native-no-snapshot-counts {}",
+            serde_json::json!({
+                "object": stat.object_id, "version": stat.version, "requester": requester,
+                "primary": primary, "durability": durability,
+                "native_registered_write_completed": completed,
+            })
+        );
+        drop(authority);
+        runtime.close().unwrap();
+        assert!(
+            completed,
+            "the actual authenticated Main producer must have completed"
+        );
+        assert_eq!(
+            (
+                durability.policy.min_commit_replicas,
+                durability.policy.desired_replicas
+            ),
+            (1, 2)
+        );
+        assert_eq!(durability.desired_replica_node_ids.len(), 2);
+    }
 
     #[test]
     fn authoritative_replica_plan_does_not_append_historical_owner() {
