@@ -394,7 +394,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             backend_object.as_ref(),
         )?;
         object = self.object_metadata_with_receipt_locations(object)?;
+        #[cfg(test)]
+        let placement_prune_input = self
+            .placement_read_prune_capture_selected(&object)
+            .then(|| object.current_locations.clone());
         self.apply_transient_remote_read_location_prunes(&mut object);
+        #[cfg(test)]
+        if let Some(before) = placement_prune_input {
+            self.capture_placement_read_prune(backend_object.as_ref(), &before, &object);
+        }
         if !self.transient_metadata_object_ids.contains(object_id) {
             self.namespace_execution.observe_path(
                 &object.file_system_id,
@@ -470,6 +478,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             version.clone(),
             content_hash.clone(),
         ));
+    }
+
+    pub(crate) fn clear_transient_remote_read_location_prune(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &Option<String>,
+        source_node_id: &NodeId,
+    ) {
+        let key = (object_id.clone(), version.clone(), content_hash.clone());
+        let Some(pruned) = self
+            .reads
+            .transient_remote_read_pruned_locations
+            .get_mut(&key)
+        else {
+            return;
+        };
+        pruned.remove(source_node_id);
+        if pruned.is_empty() {
+            self.reads
+                .transient_remote_read_pruned_locations
+                .remove(&key);
+        }
     }
 
     pub(crate) fn resolve_authoritative_object_metadata(
