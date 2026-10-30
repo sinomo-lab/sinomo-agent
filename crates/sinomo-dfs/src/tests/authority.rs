@@ -3,6 +3,567 @@
 use super::*;
 
 #[test]
+fn native_cold_primary_repairs_real_commit_gap_after_advisory_cursor_loss() {
+    use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcOrigin};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    fn protected_metadata_files(
+        root: &std::path::Path,
+        excluded: &std::path::Path,
+    ) -> BTreeMap<std::path::PathBuf, (u64, String, bool)> {
+        let mut todo = vec![root.to_path_buf()];
+        let mut files = BTreeMap::new();
+        while let Some(directory) = todo.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path == excluded {
+                    continue;
+                }
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                if metadata.is_dir() {
+                    todo.push(path);
+                } else {
+                    assert!(metadata.is_file());
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        (
+                            metadata.len(),
+                            blake3::hash(&bytes).to_hex().to_string(),
+                            metadata.permissions().readonly(),
+                        ),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    let (mut runtime, nodes) =
+        DfsTestRuntime::start_cluster("native-cold-authority-gap", 6).unwrap();
+    let assignment = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let source = assignment.primary_node_id.clone();
+    let lagging = assignment.replica_node_ids[1].clone();
+    let shard_id = DfsMetadataShardId::new("services");
+    let prefix = "/services/native-cold-authority-gap";
+    let seed_path = format!("{prefix}/seed.bin");
+    let create_path = format!("{prefix}/activation.txt");
+    let read_prefix = |runtime: &DfsTestRuntime, node: &NodeId| {
+        let reader = runtime.client(node).unwrap();
+        reader
+            .metadata_backend()
+            .unwrap()
+            .metadata_prefix_proof(&shard_id)
+            .unwrap()
+            .unwrap()
+    };
+    let mut writer = runtime.client(&source).unwrap();
+    writer.posix_mkdir_all(prefix).unwrap();
+    drop(writer);
+    let applied = runtime
+        .apply_placement_policy(
+            &source,
+            &seed_path,
+            DfsPlacementScope::SelfOnly,
+            DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 1).unwrap(),
+        )
+        .unwrap();
+    super::writes::finish_native_placement_fixture_apply(&runtime, &applied);
+    let mut writer = runtime.client(&source).unwrap();
+    let (_, _, seed_policy) = writer
+        .managed_replication_policy_for_path(&seed_path, DfsObjectPolicy::ReplicatedEventual, 1)
+        .unwrap();
+    assert_eq!(
+        (
+            seed_policy.min_commit_replicas,
+            seed_policy.desired_replicas
+        ),
+        (1, 1)
+    );
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let setup_deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
+    writer.set_transport_operation_deadline(Some(setup_deadline));
+    let mut last = None;
+    let mut mutations = 0;
+    // This corpus crosses the production suffix bound using normal committed
+    // writes. Its count and setup window are fixed, not a search for a race.
+    for index in 0..=DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT {
+        assert!(
+            Instant::now() < setup_deadline,
+            "bounded real journal setup expired"
+        );
+        last = Some(
+            writer
+                .posix_write_file(
+                    &seed_path,
+                    format!("actual committed prefix {index}").as_bytes(),
+                    DfsWriteOptions {
+                        policy: seed_policy.clone(),
+                        replica_candidates: vec![source.clone()],
+                        wait_for_commit: true,
+                        foreground_replica_repair: false,
+                    },
+                )
+                .unwrap(),
+        );
+        mutations += 1;
+        if mutations % 4 == 0 {
+            runtime.checkpoint_rpc_observation_window().unwrap();
+        }
+        if read_prefix(&runtime, &source).journal_sequence
+            > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
+        {
+            break;
+        }
+    }
+    let last = last.unwrap();
+    assert!(
+        read_prefix(&runtime, &source).journal_sequence
+            > DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64
+    );
+    assert!(Instant::now() < setup_deadline);
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let predecessor_operation = sinomo_core::Id::generate().to_string();
+    let intent_id =
+        crate::intent::stable_write_intent_id(&source, &last.object_id, &predecessor_operation);
+    let commit_operation = format!("write:{intent_id}");
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    runtime.install_fault(FaultRule {
+        source: Some(source.clone()),
+        target: Some(lagging.clone()),
+        route: Some(DFS_METADATA_JOURNAL_BATCH_ROUTE.into()),
+        call_id: None,
+        origin: Some(RpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: FaultAction::PauseExactWriteCommitPublication {
+            operation_id: commit_operation.clone(),
+            gate: Arc::clone(&gate),
+            captured: Arc::clone(&captured),
+        },
+    });
+    let publication_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    writer.set_transport_operation_deadline(Some(publication_deadline));
+    let predecessor = writer
+        .posix_write_file_with_operation_id(
+            &seed_path,
+            b"actual predecessor committed before advisory cursor loss",
+            DfsWriteOptions {
+                policy: seed_policy,
+                replica_candidates: vec![source.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: false,
+            },
+            &predecessor_operation,
+        )
+        .unwrap();
+    drop(writer);
+    let captured_commit = loop {
+        if let Some(command) = captured.lock().unwrap().first().cloned() {
+            break command;
+        }
+        assert!(
+            Instant::now() < publication_deadline,
+            "actual exact commit publication was not observed"
+        );
+        std::thread::yield_now();
+    };
+    let commit = captured_commit.batch.decoded().unwrap().entries.into_iter().find(|entry| {
+        matches!(&entry.mutation, DfsMetadataMutation::CommitPreparedOperationV7 { operation_id, .. }
+            if operation_id == &commit_operation)
+    }).expect("the held command contains the actual predecessor commit");
+    let missing_sequence = commit.sequence;
+    let lagging_before = read_prefix(&runtime, &lagging);
+    assert_eq!(
+        lagging_before.journal_sequence + 1,
+        missing_sequence,
+        "the real authority ACK retained Prepare, while only its Commit is withheld"
+    );
+    assert!(read_prefix(&runtime, &source).journal_sequence >= missing_sequence);
+    // Isolate the proven state, without claiming to reproduce Docker handoff:
+    // an actual missing Commit plus loss of the sender's advisory cursor.
+    runtime.clear_faults();
+    for route in [
+        DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    ] {
+        runtime.install_fault(FaultRule {
+            source: Some(source.clone()),
+            target: Some(lagging.clone()),
+            route: Some(route.into()),
+            call_id: None,
+            origin: None,
+            remaining_hits: 32,
+            action: FaultAction::BudgetExhausted,
+        });
+    }
+    gate.close();
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let mut config_reader = runtime.client(&lagging).unwrap();
+    let mut control = config_reader
+        .control_plane
+        .take()
+        .expect("the still-live peer owns its ordinary configuration client");
+    drop(config_reader);
+    runtime.stop_node(&source).unwrap();
+    let metadata_root = crate::default_dfs_metadata_shards_root(runtime.data_dir(&source));
+    let shard_root = metadata_root.join(&shard_id.0);
+    let cursor_path =
+        crate::metadata_cursor::metadata_replication_cursor_path(&shard_root, &lagging, &shard_id);
+    let backup_path = runtime
+        .data_dir(&source)
+        .root()
+        .join("boundary-diagnostic-lost-outgoing-cursor.sobj");
+    let cursor_bytes = std::fs::read(&cursor_path)
+        .expect("the stopped producer has its actual scheduling sidecar");
+    let previous_cursor =
+        crate::metadata_cursor::metadata_replication_cursor(&shard_root, &lagging, &shard_id)
+            .unwrap();
+    let protected_before = protected_metadata_files(&metadata_root, &cursor_path);
+    let config_before = DfsControlPlaneStore::new(control.as_mut())
+        .get_file_system_config(&assignment.file_system_id)
+        .unwrap();
+    let shards_before = runtime.metadata_shards().unwrap();
+    assert!(!backup_path.exists());
+    // This is the only physical fault: move the atomic, non-durable outgoing
+    // scheduling hint aside. No journal, replay cursor, ACK floor, table,
+    // semantic generation, readiness record or configuration is changed.
+    std::fs::rename(&cursor_path, &backup_path).unwrap();
+    assert_eq!(std::fs::read(&backup_path).unwrap(), cursor_bytes);
+    let protected_after = protected_metadata_files(&metadata_root, &cursor_path);
+    let config_after = DfsControlPlaneStore::new(control.as_mut())
+        .get_file_system_config(&assignment.file_system_id)
+        .unwrap();
+    let shards_after = runtime.metadata_shards().unwrap();
+    assert_eq!(protected_after, protected_before);
+    assert_eq!(config_after, config_before);
+    assert_eq!(shards_after, shards_before);
+    assert_eq!(
+        crate::metadata_cursor::metadata_replication_cursor(&shard_root, &lagging, &shard_id,)
+            .unwrap(),
+        0
+    );
+    let fault_proof = serde_json::json!({
+        "qualification": "decomposed native real-Commit-gap plus cold-owner advisory-cursor-loss; not a handoff reproduction",
+        "cursor_path": cursor_path, "backup_path": backup_path,
+        "cursor_bytes": cursor_bytes.len(), "cursor_blake3": blake3::hash(&cursor_bytes).to_hex().to_string(),
+        "previous_cursor": previous_cursor,
+        "protected_metadata_before": protected_before, "protected_metadata_after": protected_after,
+        "configuration_before": config_before, "configuration_after": config_after,
+        "shards_before": shards_before, "shards_after": shards_after,
+    });
+    std::fs::write(
+        runtime
+            .data_dir(&source)
+            .root()
+            .join("boundary-diagnostic-cursor-loss-proof.json"),
+        serde_json::to_vec_pretty(&fault_proof).unwrap(),
+    )
+    .unwrap();
+    drop(control);
+    runtime.reopen_node(source.clone()).unwrap();
+    let activated_client = runtime
+        .client(&source)
+        .expect("cold owner must complete its real current startup inputs");
+    drop(activated_client);
+    let active = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    assert_eq!(active, assignment);
+    assert_eq!(
+        std::iter::once(active.primary_node_id.clone())
+            .chain(active.replica_node_ids.clone())
+            .collect::<BTreeSet<_>>(),
+        nodes.iter().cloned().collect()
+    );
+    let cold_owner = runtime.metadata_primary_service(prefix).unwrap();
+    assert_eq!(cold_owner.node_id(), &source);
+    let admission = cold_owner
+        .acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: active.file_system_id.clone(),
+            shard_id: shard_id.clone(),
+            owner_epoch: active.epoch,
+            operation_id: format!("native-cold-gap-observation:{}", active.epoch),
+        })
+        .unwrap()
+        .expect("the actual cold owner grants current native admission");
+    let effective_cursor = cold_owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_replication_cursor(&lagging, &shard_id)
+        .unwrap();
+    let private_cursor = cold_owner
+        .replication
+        .metadata_replication_cursors
+        .get(&(lagging.clone(), shard_id.clone()))
+        .copied()
+        .unwrap_or(0);
+    let hold = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
+        runtime.data_dir(&source),
+        Arc::new(|point, command, _context| {
+            if matches!(
+                point,
+                crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeResidentPreflight
+            ) && command.is_none()
+            {
+                return Err(DfsError::Cancelled {
+                    operation: "foreground authority owns real gap recovery control",
+                });
+            }
+            Ok(())
+        }),
+    );
+    let cold_prefix = cold_owner
+        .metadata_backend()
+        .unwrap()
+        .metadata_prefix_proof(&shard_id)
+        .unwrap()
+        .unwrap();
+    let lagging_after_reopen = read_prefix(&runtime, &lagging);
+    // Preserve all actual setup RPCs before any critical assertion can fail.
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    eprintln!(
+        "NATIVE_COLD_OWNER_COMMIT_GAP {}",
+        serde_json::json!({
+            "setup_mutations": mutations, "assignment": active, "fault": fault_proof,
+            "predecessor": {"object_id": predecessor.object_id, "version": predecessor.version,
+                "content_hash": predecessor.content_hash, "path": predecessor.path},
+            "commit": commit, "held_command": captured_commit, "cold_prefix": cold_prefix,
+            "lagging_before": lagging_before, "lagging_after_reopen": lagging_after_reopen,
+            "effective_outgoing_cursor": effective_cursor, "private_outgoing_cursor": private_cursor,
+        })
+    );
+    assert_eq!(
+        effective_cursor, 0,
+        "cold reopen must genuinely lose the advisory hint"
+    );
+    assert_eq!(
+        private_cursor, 0,
+        "no resident sender hint is manually reset"
+    );
+    assert!(cold_prefix.journal_sequence >= missing_sequence);
+    assert_eq!(
+        lagging_after_reopen, lagging_before,
+        "a real reopen that healed this peer is setup divergence, not the gap control"
+    );
+    runtime.clear_faults();
+    drop(admission);
+    drop(cold_owner);
+
+    let diagnostics = crate::native_boundary_diagnostics::capture_all_operations(
+        runtime.data_dir(&source).root(),
+    );
+    let receiver_diagnostics = crate::native_boundary_diagnostics::capture_all_operations(
+        runtime.data_dir(&lagging).root(),
+    );
+    let operation = sinomo_core::Id::generate().to_string();
+    let mut requester = runtime.client(&lagging).unwrap();
+    let create_started = Instant::now();
+    let deadline = create_started + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let previous_deadline = requester.set_transport_operation_deadline(Some(deadline));
+    let result = requester.posix_write_file_with_operation_id(
+        &create_path,
+        b"fresh create uses the existing bounded prefix repair",
+        DfsWriteOptions {
+            policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+            replica_candidates: nodes.clone(),
+            wait_for_commit: true,
+            foreground_replica_repair: false,
+        },
+        &operation,
+    );
+    let create_returned = Instant::now();
+    requester.set_transport_operation_deadline(previous_deadline);
+    assert_eq!(requester.transport.operation_deadline(), previous_deadline);
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    let proof_owner = runtime.metadata_primary_service(&create_path).unwrap();
+    let backend = proof_owner.metadata_backend().unwrap();
+    let preparations = backend
+        .list_prepared_operations()
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            record
+                .payload
+                .prepared_intent
+                .iter()
+                .chain(record.payload.terminal_intent.iter())
+                .chain(record.payload.metadata_effects.iter().filter_map(|effect| {
+                    if let DfsPreparedMetadataEffect::PutIntent { intent } = effect {
+                        Some(intent)
+                    } else {
+                        None
+                    }
+                }))
+                .any(|intent| intent.operation_id.as_deref() == Some(operation.as_str()))
+        })
+        .collect::<Vec<_>>();
+    diagnostics.dump(
+        "cold-owner-gap-create",
+        serde_json::json!({
+            "operation": operation, "result": format!("{result:?}"), "preparations": preparations,
+            "create_elapsed_ms": create_returned.duration_since(create_started).as_millis(),
+            "create_budget_ms": sinomo_core::network::DEFAULT_NETWORK_TIMEOUT.as_millis(),
+            "create_returned_within_original_deadline": create_returned < deadline,
+            "prior_transport_deadline_restored": previous_deadline.is_some(),
+            "required_shard": active, "missing_commit": commit,
+            "lagging_before": lagging_before, "lagging_after": read_prefix(&runtime, &lagging),
+            "observation_omissions": runtime.observation_dropped_count(),
+        }),
+    );
+    receiver_diagnostics.dump(
+        "cold-owner-gap-receiver",
+        serde_json::json!({
+            "operation": operation, "missing_sequence": missing_sequence,
+        }),
+    );
+    drop(proof_owner);
+    // No logical create retry: on failure retain its complete original prepare
+    // and peer rejection before this success oracle is evaluated.
+    let stat = result.expect(
+        "fresh authority must repair the actual predecessor gap within its original deadline",
+    );
+    assert!(
+        create_returned < deadline,
+        "the one create must return inside its original five-second deadline"
+    );
+    let proof_dump = runtime
+        .data_dir(&source)
+        .root()
+        .join("boundary-diagnostic-cold-owner-gap-create.json");
+    let proof: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proof_dump).unwrap()).unwrap();
+    assert_eq!(proof["dropped"].as_u64(), Some(0));
+    let write_intent = crate::intent::stable_write_intent_id(&lagging, &stat.object_id, &operation);
+    let sealed_operation = format!("write:{write_intent}");
+    let expected = nodes.iter().cloned().collect::<BTreeSet<_>>();
+    let committed_digest = &proof["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            event["kind"] == "kernel-commit-durable"
+                && event["facts"]["digest"]["operation_id"] == sealed_operation
+        })
+        .expect("the critical create has its actual durable original commit")["facts"]["digest"];
+    assert!(
+        proof["events"].as_array().unwrap().iter().any(|event| {
+            if event["kind"] != "authorization-participants"
+                || !event["facts"]["operation"]
+                    .to_string()
+                    .contains(&sealed_operation)
+            {
+                return false;
+            }
+            let required: BTreeSet<NodeId> =
+                serde_json::from_value(event["facts"]["required"].clone()).unwrap();
+            let acknowledged: BTreeSet<NodeId> =
+                serde_json::from_value(event["facts"]["acknowledged"].clone()).unwrap();
+            required == expected
+                && acknowledged == expected
+                && [
+                    "operation_id",
+                    "file_system_id",
+                    "shard_id",
+                    "owner_epoch",
+                    "prepare_sequence",
+                    "payload_digest",
+                ]
+                .into_iter()
+                .all(|field| event["facts"]["operation"][field] == committed_digest[field])
+        }),
+        "the exact original write must have a fresh actual all-six authority proof"
+    );
+    // The critical create and its exact fresh proof are complete. This hold
+    // must not suppress ordinary N-W repair or readiness for a separate API.
+    drop(hold);
+    let sync_started = Instant::now();
+    let sync_result = requester.posix_sync_file(&create_path, DfsPosixSyncKind::File);
+    let sync_elapsed = sync_started.elapsed();
+    runtime.checkpoint_rpc_observation_window().unwrap();
+    diagnostics.dump("cold-owner-gap-filesync", serde_json::json!({
+        "operation": operation, "object_id": stat.object_id, "version": stat.version,
+        "create_elapsed_ms": create_returned.duration_since(create_started).as_millis(),
+        "create_budget_ms": sinomo_core::network::DEFAULT_NETWORK_TIMEOUT.as_millis(),
+        "sync_elapsed_ms": sync_elapsed.as_millis(),
+        "sync_main_budget_ms": crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT.as_millis(),
+        "sync_outer_budget": "existing public FileSync50s bound, capped only by the restored prior caller deadline",
+        "certificate": sync_result.as_ref().ok(),
+        "error": sync_result.as_ref().err().map(ToString::to_string),
+        "observation_omissions": runtime.observation_dropped_count(),
+    }));
+    let certificate = sync_result.expect(
+        "separate FileSync must establish its full named N plan under its normal API budget",
+    );
+    assert_eq!(certificate.target.object_id, stat.object_id);
+    assert_eq!(certificate.target.version, stat.version);
+    assert_eq!(certificate.content_evidence.required_receipts, 2);
+    let inspect = runtime.metadata_primary_service(&create_path).unwrap();
+    let backend = inspect.metadata_backend().unwrap();
+    let current = backend.get_object(&stat.object_id).unwrap().unwrap();
+    let durability =
+        crate::content_durability::current_content_durability_from_backend(backend, &current)
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        (
+            durability.policy.min_commit_replicas,
+            durability.policy.desired_replicas
+        ),
+        (1, 2)
+    );
+    assert_eq!(
+        certificate
+            .content_evidence
+            .receipt_node_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        durability
+            .desired_replica_node_ids
+            .iter()
+            .cloned()
+            .collect()
+    );
+    let receipts = backend
+        .receipts_for_version(&stat.object_id, &stat.version)
+        .unwrap();
+    assert!(
+        durability
+            .desired_replica_node_ids
+            .iter()
+            .all(|node| receipts
+                .iter()
+                .any(|receipt| &receipt.replica_node_id == node
+                    && receipt.content_hash == stat.content_hash))
+    );
+    diagnostics.dump(
+        "cold-owner-gap-success",
+        serde_json::json!({
+            "operation": operation, "object": current, "durability": durability,
+            "receipts": receipts, "certificate": certificate,
+        }),
+    );
+    drop(inspect);
+    drop(requester);
+    runtime.clear_faults();
+    drop(receiver_diagnostics);
+    drop(diagnostics);
+    assert_eq!(runtime.observation_dropped_count(), 0);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn native_explicit_primary_handoff_preserves_an_unfinished_metadata_prepare() {
     let (mut runtime, requester, retiring) = crate::test_support::current_native_metadata_service(
         "native-handoff-unfinished-prepare",

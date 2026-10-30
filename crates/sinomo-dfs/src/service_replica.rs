@@ -327,14 +327,102 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .transport
             .set_operation_deadline(Some(effective_operation_deadline));
         let previous_deadline = replaced_previous_deadline.or(observed_previous_deadline);
-        let result = self.try_all_metadata_shard_members_accept_fresh_authority(
-            shard,
-            operation,
-            prepared_batch,
-            targets,
-            effective_operation_deadline,
-            timeout,
-        );
+        let result = (|| {
+            let mut rejected_node_ids = BTreeSet::new();
+            let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
+                shard,
+                operation,
+                prepared_batch,
+                targets.clone(),
+                effective_operation_deadline,
+                timeout,
+                &mut rejected_node_ids,
+            )?;
+            self.check_cancelled("metadata authority result")?;
+            if Instant::now() >= effective_operation_deadline {
+                return Ok(BTreeSet::from([self.node_id.clone()]));
+            }
+            if acknowledged.len() == targets.len() + 1 || rejected_node_ids.is_empty() {
+                return Ok(acknowledged);
+            }
+
+            // An authority rejection grants no repair permission. Use the
+            // existing ordinary durability owner to send its actual journal
+            // prefix. Only that path's own typed rejection/source-history
+            // checks can select its existing snapshot repair.
+            let prefix = self
+                .metadata_backend
+                .as_deref()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "metadata authority catch-up has no durable backend".into(),
+                })?
+                .metadata_prefix_proof(&prepared_batch.shard_id)?
+                .filter(|prefix| {
+                    prefix.is_well_formed()
+                        && prefix.journal_sequence >= prepared_batch.next_after_sequence
+                })
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "metadata authority catch-up has no current prepared prefix".into(),
+                })?;
+            let target = DfsMetadataQuorumSyncTarget {
+                file_system_id: shard.file_system_id.clone(),
+                shard_id: prepared_batch.shard_id.clone(),
+                primary_node_id: self.node_id.clone(),
+                authority_epoch: Some(shard.epoch),
+                replica_node_ids: targets.iter().cloned().collect(),
+                expected_shard: Some(shard.clone()),
+                journal_sequence: prefix.journal_sequence,
+                barrier_id: sinomo_core::Id::generate().to_string(),
+                state_fingerprint: prefix.digest,
+                checkpoint_snapshot: None,
+            };
+            let Some(remaining) =
+                effective_operation_deadline.checked_duration_since(Instant::now())
+            else {
+                return Ok(BTreeSet::from([self.node_id.clone()]));
+            };
+            self.check_cancelled("metadata authority catch-up")?;
+            // This invocation already validates the retained assignment, native
+            // owner/freeze and response identities, and restores/cleans up only
+            // its own pending requests. Its certificate is not write authority.
+            let _ = self.sync_metadata_shard_to_quorum(&target, remaining)?;
+            self.check_cancelled("metadata authority after catch-up")?;
+            if Instant::now() >= effective_operation_deadline {
+                return Ok(BTreeSet::from([self.node_id.clone()]));
+            }
+            let context = self
+                .retained_metadata_replica_context(&shard.file_system_id, &prepared_batch.shard_id)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "metadata authority catch-up lost its retained shard context".into(),
+                })?;
+            if context.shard != *shard || context.pending_membership_handoff.is_some() {
+                return Err(DfsError::StaleOwnerEpoch {
+                    file_system_id: shard.file_system_id.clone(),
+                    local_node_id: self.node_id.clone(),
+                    primary_node_id: context.shard.primary_node_id,
+                    epoch: context.shard.epoch,
+                });
+            }
+
+            // Discard every old ACK. The same immutable preparation is checked
+            // again against the current exact prefix with new nonces on ALL
+            // assigned replicas. No further catch-up round is started here.
+            let mut rejected_again = BTreeSet::new();
+            let acknowledged = self.try_all_metadata_shard_members_accept_fresh_authority(
+                shard,
+                operation,
+                prepared_batch,
+                targets,
+                effective_operation_deadline,
+                timeout,
+                &mut rejected_again,
+            )?;
+            self.check_cancelled("metadata authority refreshed result")?;
+            if Instant::now() >= effective_operation_deadline {
+                return Ok(BTreeSet::from([self.node_id.clone()]));
+            }
+            Ok(acknowledged)
+        })();
         self.transport.set_operation_deadline(previous_deadline);
         match result {
             // Delivery uncertainty concerns this optional hidden-prepare
@@ -362,6 +450,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         targets: BTreeSet<NodeId>,
         operation_deadline: Instant,
         timeout: Duration,
+        rejected_node_ids: &mut BTreeSet<NodeId>,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
         #[cfg(any(test, feature = "test-support"))]
         let diagnostic_root = self.native_publication_owner_for_observation().map(|(root, _)| root)
@@ -547,6 +636,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             else {
                                 continue;
                             };
+                            if response.request_id == group.command.request_id
+                                && response.shard_id == group.command.batch.shard_id
+                                && response.next_after_sequence
+                                    == group.command.batch.next_after_sequence
+                                && !response.verified_prefix_only
+                                && response.verified_authority_probe_id.is_none()
+                                && matches!(&response.result,
+                                    DfsMetadataJournalBatchResult::Rejected { code, .. }
+                                        if *code != DfsMetadataRejectionCode::PrimaryMismatch)
+                            {
+                                rejected_node_ids.insert(target_node_id.clone());
+                            }
                             if response.request_id != group.command.request_id
                                 || response.shard_id != group.command.batch.shard_id
                                 || response.next_after_sequence
@@ -603,7 +704,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let unresolved_target_node_ids = group
                     .target_node_ids
                     .into_iter()
-                    .filter(|target_node_id| !acknowledged_node_ids.contains(target_node_id))
+                    .filter(|target_node_id| {
+                        !acknowledged_node_ids.contains(target_node_id)
+                            && !rejected_node_ids.contains(target_node_id)
+                    })
                     .collect::<Vec<_>>();
                 let target_count = unresolved_target_node_ids.len();
                 let mut shared_command = Some(group.command);
@@ -692,7 +796,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 loop {
                     self.check_cancelled("metadata authority acknowledgement")?;
-                    self.process_incoming()?;
+                    for event in self.process_incoming()? {
+                        if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                            request_id,
+                            source_node_id,
+                            shard_id,
+                            ..
+                        } = event
+                            && shard_id == prepared_batch.shard_id
+                            && request_targets.iter().any(|(pending_id, target)| {
+                                pending_id == &request_id && target == &source_node_id
+                            })
+                        {
+                            rejected_node_ids.insert(source_node_id);
+                        }
+                    }
                     let mut unresolved = false;
                     for (request_id, target_node_id) in &request_targets {
                         match self
