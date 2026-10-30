@@ -25,6 +25,38 @@ pub use sinomo_api::module::UiExtensionCatalogEntry;
 
 pub use sinomo_api::module::UiExtensionCatalogResponse;
 
+/// Resident module metadata for host clients. Reading this catalog never loads
+/// native libraries or reopens their persisted loader state.
+pub const MODULE_CATALOG_ROUTE: &str = "/module/catalog";
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModuleCatalogRequest {}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ModuleCatalogResponse {
+    pub registry_generation: u64,
+    pub registrations: Vec<crate::ModuleRegistration>,
+}
+
+pub fn module_catalog_response(snapshot: &ModuleRegistrySnapshot) -> ModuleCatalogResponse {
+    ModuleCatalogResponse {
+        registry_generation: snapshot.version(),
+        registrations: snapshot.registry().registrations().cloned().collect(),
+    }
+}
+
+pub fn module_catalog_route() -> ServiceRoute {
+    ServiceRoute::describe(
+        MODULE_CATALOG_ROUTE,
+        "module.catalog",
+        "read resident module registrations",
+        "sinomo_module::ModuleCatalogRequest",
+        "sinomo_module::ModuleCatalogResponse",
+    )
+    .with_auth_scope("local-command")
+    .observable("module.catalog", "read")
+}
+
 #[derive(Clone)]
 pub struct HostedUiExtensionCatalogService {
     generations: ModuleRuntimeGenerationStore,
@@ -46,17 +78,34 @@ impl Service for HostedUiExtensionCatalogService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[MODULE_UI_CATALOG_ROUTE, MODULE_OBSERVATIONS_ROUTE]
+        &[
+            MODULE_UI_CATALOG_ROUTE,
+            MODULE_OBSERVATIONS_ROUTE,
+            MODULE_CATALOG_ROUTE,
+        ]
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        vec![ui_extension_catalog_route(), module_observations_route()]
+        vec![
+            ui_extension_catalog_route(),
+            module_observations_route(),
+            module_catalog_route(),
+        ]
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let generations = self.generations.clone();
         let data_dir_root = self.data_dir_root.clone();
         Box::pin(async move {
+            if request.route == MODULE_CATALOG_ROUTE {
+                let _: ModuleCatalogRequest = ctx.decode_request_body(&request).await?;
+                let generation = generations.active_snapshot();
+                ctx.respond_value(
+                    MODULE_CATALOG_ROUTE,
+                    module_catalog_response(generation.module_registry.as_ref()),
+                )?;
+                return Ok(ServiceDisposition::Continue);
+            }
             if request.route == MODULE_OBSERVATIONS_ROUTE {
                 let _: ModuleObservationsRequest = ctx.decode_request_body(&request).await?;
                 let generation = generations.active_snapshot();
@@ -467,6 +516,33 @@ mod tests {
         FILE_PREVIEW_EXTENSION_POINT_ID, FILE_PREVIEW_EXTENSION_POINT_VERSION, UiComponentArtifact,
         UiContentSelector, UiCustomWidgetContribution, UiExtensionContribution,
     };
+
+    #[test]
+    fn resident_catalog_tracks_registration_withdrawal_without_artifacts() {
+        let registration = ModuleRegistration::native_rust(
+            ModuleId::from_legacy_named("module.catalog-fixture").unwrap(),
+            "1.0.0",
+            "fixture",
+            "fixture",
+            "fixture",
+            sinomo_core::TrustRing::R1TrustedRuntime,
+            "fixture",
+        );
+        let registry = ModuleRegistry::builder()
+            .register(registration.clone())
+            .unwrap()
+            .try_build()
+            .unwrap();
+        let snapshots = crate::ModuleRegistrySnapshotStore::new(registry).unwrap();
+        let first = module_catalog_response(&snapshots.active_snapshot().unwrap());
+        assert_eq!(first.registrations, vec![registration]);
+        let withdrawn = snapshots
+            .replace_registry(ModuleRegistry::default())
+            .unwrap();
+        let next = module_catalog_response(&withdrawn);
+        assert!(next.registry_generation > first.registry_generation);
+        assert!(next.registrations.is_empty());
+    }
 
     #[test]
     fn observations_publish_registered_names_and_keep_legacy_wire_compatible() {

@@ -4266,6 +4266,52 @@ mod tests {
         assert!(response.declarative.is_ok());
     }
 
+    #[tokio::test]
+    async fn module_catalog_reads_resident_metadata_without_loader_files() {
+        let root = sinomo_testdir::TestDir::new("daemon-resident-module-catalog");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().unwrap();
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let host =
+            DaemonServiceRegistryHost::from_registry_for_paths(ServiceRegistry::default(), &paths)
+                .unwrap();
+        // A catalog request must not rediscover or verify installed libraries.
+        let loaders = sinomo_module::native_dylib_module_loader_state_dir(&data_dir.root());
+        std::fs::create_dir_all(&loaders).unwrap();
+        std::fs::write(loaders.join("corrupt.sobj"), b"invalid native loader state").unwrap();
+        let descriptor = host
+            .object_rpc_route_descriptor(sinomo_module::MODULE_CATALOG_ROUTE)
+            .unwrap();
+        assert_eq!(descriptor.auth_scope.as_deref(), Some("local-command"));
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_module::MODULE_CATALOG_ROUTE,
+            "module.catalog",
+            &sinomo_module::ModuleCatalogRequest::default(),
+        )
+        .unwrap();
+        let response: sinomo_module::ModuleCatalogResponse =
+            call_value_service_host_async(&host, request)
+                .await
+                .unwrap()
+                .decode_body()
+                .unwrap();
+        let resident = host.module_runtime.generations.active_snapshot();
+        assert_eq!(
+            response.registry_generation,
+            resident.module_registry.version()
+        );
+        assert_eq!(
+            response.registrations,
+            resident
+                .module_registry
+                .registry()
+                .registrations()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+
     async fn call_value_service_host_async(
         host: &DaemonServiceRegistryHost,
         request: sinomo_core::network::ObjectRpcRequest,
