@@ -27,6 +27,86 @@ enum ReplicaTransferKind {
     BackgroundRepair,
 }
 
+fn repair_retry_blocks_first_original(
+    pending: &crate::transfer::PendingNetworkedWrite,
+    target: &NodeId,
+) -> bool {
+    pending.repair_retries.get(target).is_some_and(|retry| {
+        retry.unresolved_custody_without_request
+            || retry.retrying_unresolved_transfer
+            || (retry.inflight
+                && (pending.repair_inflight_request_ids.contains_key(target)
+                    || retry.completed_transfer_request_id.is_some()
+                    || retry.transfer_delivery_state
+                        != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)))
+    })
+}
+
+#[cfg(test)]
+mod first_original_retry_tests {
+    use super::*;
+    use crate::transfer::{PendingNetworkedWrite, RepairRetryState};
+    use sinomo_core::network::NetworkDeliveryState;
+
+    #[test]
+    fn fetch_only_retry_does_not_hide_named_or_uncertain_repair_custody() {
+        let target = NodeId::from_legacy_named("fetch-only-target").unwrap();
+        let other = NodeId::from_legacy_named("other-fetch-target").unwrap();
+        let mut pending = PendingNetworkedWrite::new(
+            DfsObjectId::from_legacy_named("fetch-only-object").unwrap(),
+            DfsVersion::generate(),
+            "content-hash".into(),
+            1,
+        );
+        let fetch_only = RepairRetryState {
+            inflight: true,
+            transfer_delivery_state: Some(NetworkDeliveryState::DefinitelyNotSent),
+            ..Default::default()
+        };
+        pending
+            .repair_retries
+            .insert(target.clone(), fetch_only.clone());
+        pending
+            .fetch_inflight_request_ids
+            .insert(other.clone(), "actual-read".into());
+        assert!(!repair_retry_blocks_first_original(&pending, &target));
+
+        pending
+            .repair_inflight_request_ids
+            .insert(target.clone(), "named-repair".into());
+        assert!(repair_retry_blocks_first_original(&pending, &target));
+        pending.repair_inflight_request_ids.clear();
+
+        for delivery in [None, Some(NetworkDeliveryState::PossiblyApplied)] {
+            let retry = pending.repair_retries.get_mut(&target).unwrap();
+            retry.transfer_delivery_state = delivery;
+            assert!(repair_retry_blocks_first_original(&pending, &target));
+        }
+        for rejected in [
+            RepairRetryState {
+                completed_transfer_request_id: Some("terminal-repair".into()),
+                ..fetch_only.clone()
+            },
+            RepairRetryState {
+                unresolved_custody_without_request: true,
+                ..fetch_only.clone()
+            },
+            RepairRetryState {
+                retrying_unresolved_transfer: true,
+                ..fetch_only.clone()
+            },
+        ] {
+            pending.repair_retries.insert(target.clone(), rejected);
+            assert!(repair_retry_blocks_first_original(&pending, &target));
+        }
+        pending.repair_retries.insert(target.clone(), fetch_only);
+        pending
+            .repair_inflight_request_ids
+            .insert(other, "other-repair".into());
+        assert!(!repair_retry_blocks_first_original(&pending, &target));
+    }
+}
+
 struct ReplicaTransfer<'a> {
     intent_id: &'a str,
     file_system_id: &'a DfsFileSystemId,
@@ -650,18 +730,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|store| store.original_repair_for_slot(intent_id, target_node_id))
                 .transpose()?
                 .flatten();
-            if matches!(kind, ReplicaTransferKind::Repair) && existing.is_some() {
-                return Err(DfsError::Distributed {
-                    message: "alternate Repair dispatch cannot bypass an unresolved original"
-                        .into(),
-                });
-            }
             // Retention can change after enrollment. An existing original still
             // owns its exact command, base, authority and payload; never switch
             // it to a newly constructed retained transfer. New retained repairs,
             // Stage and non-native transports keep their existing owners.
-            if matches!(kind, ReplicaTransferKind::BackgroundRepair)
-                && (!retained_transfer || existing.is_some())
+            // A synchronous caller may continue only an actually enrolled
+            // original. A new ordinary Repair retains its existing path below.
+            if (existing.is_some()
+                || (matches!(kind, ReplicaTransferKind::BackgroundRepair) && !retained_transfer))
                 && let Some(store) = original_store
             {
                 let pending_error = || DfsError::Distributed {
@@ -697,11 +773,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .writes
                             .pending_writes
                             .get(intent_id)
-                            .and_then(|pending| pending.repair_retries.get(target_node_id))
-                            .is_some_and(|retry| {
-                                retry.unresolved_custody_without_request
-                                    || retry.retrying_unresolved_transfer
-                                    || retry.inflight
+                            .is_some_and(|pending| {
+                                // A read-only Fetch shares this scheduling flag.
+                                // Only nameless, explicitly NotSent repair DATA
+                                // may proceed to its first Original; the durable
+                                // queue independently rechecks enrollment below.
+                                repair_retry_blocks_first_original(pending, target_node_id)
                             })
                     {
                         return Err(pending_error());
@@ -1021,10 +1098,69 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 kind: ReplicaTransferKind::Repair,
             },
         )?;
+        let original_store = self.owned_repair_queue_store()?;
+        // Preserve the exact generated carrier frames before transport consumes
+        // the requests. These are headers, not copied attachment bodies.
+        let original_carriers = requests
+            .iter()
+            .map(|request| -> Result<_, DfsError> {
+                if let Some(store) = &original_store
+                    && matches!(
+                        &request.call.message.message,
+                        DfsNetworkMessage::RepairReplica(_)
+                    )
+                    && store.original_repair(&request.call.message)?.is_some()
+                {
+                    store.validate_original_repair_dispatch(&request.call.message)?;
+                    Ok(Some(request.call.message.clone()))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let identities = self.begin_replica_sends(&requests)?;
         let outcomes = self
             .transport
             .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP);
+        if let Some(store) = &original_store {
+            match &outcomes {
+                Ok(returned)
+                    if returned.len() == expected_targets.len()
+                        && returned
+                            .iter()
+                            .zip(&expected_targets)
+                            .all(|(outcome, target)| &outcome.target_node_id == target) =>
+                {
+                    for (carrier, outcome) in original_carriers.iter().zip(returned) {
+                        if let Some(carrier) = carrier {
+                            // Same delivery classification as the ordinary
+                            // fan-out reducer; transport success is not a receipt.
+                            let delivery = match &outcome.result {
+                                Ok(()) => Some(
+                                    sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                                ),
+                                Err(NetworkError::UnknownNode { .. }) => None,
+                                Err(error) => error.delivery_state(),
+                            };
+                            store.record_original_repair_delivery(carrier, delivery)?;
+                        }
+                    }
+                }
+                Err(error) => {
+                    // An aggregate error cannot prove individual non-delivery.
+                    // Match the existing fan-out error path's conservative join.
+                    let delivery = error.delivery_state().filter(|state| {
+                        *state == sinomo_core::network::NetworkDeliveryState::PossiblyApplied
+                    });
+                    for carrier in original_carriers.iter().flatten() {
+                        store.record_original_repair_delivery(carrier, delivery)?;
+                    }
+                }
+                // The existing reducer rejects count/order mismatches below.
+                // Leave the actual Original attempts unknown when correlation fails.
+                Ok(_) => {}
+            }
+        }
         let outcomes = self.observe_replica_fanout_result(&identities, outcomes)?;
         self.finish_replica_sends(&identities, &expected_targets, outcomes)
     }
