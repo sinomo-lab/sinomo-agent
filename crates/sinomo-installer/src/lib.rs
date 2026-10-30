@@ -1002,11 +1002,10 @@ fn probe_installed_daemon_start_status(
     timeout: Duration,
 ) -> Option<DaemonStatus> {
     match probe_daemon_status(paths, timeout) {
-        sinomo_daemon::DaemonProbeStatus::Running(status)
-        | sinomo_daemon::DaemonProbeStatus::Locked {
-            status: Some(status),
-        } => return Some(status),
-        sinomo_daemon::DaemonProbeStatus::Locked { status: None }
+        sinomo_daemon::DaemonProbeStatus::Running(status) => return Some(status),
+        // A live lock and saved status establish ownership, not readiness.
+        // Keep waiting until the matching process actually answers its RPC.
+        sinomo_daemon::DaemonProbeStatus::Locked { .. }
         | sinomo_daemon::DaemonProbeStatus::NotRunning => {}
     }
 
@@ -1321,6 +1320,46 @@ fn vbs_string_literal(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn installed_start_requires_rpc_readiness_not_only_a_held_status_lock() {
+        use fs2::FileExt;
+        let root = sinomo_testdir::TestDir::new("installed-not-yet-rpc-ready");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = DaemonRunOptions {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            port_fallback: false,
+        };
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.lock)
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        sinomo_api::write_daemon_status(
+            &paths,
+            &DaemonStatus::new(&options, &paths, None),
+        )
+        .unwrap();
+        let args = vec![
+            "daemon".into(),
+            "run".into(),
+            "--host".into(),
+            options.host,
+            "--port".into(),
+            options.port.to_string(),
+        ];
+        // The real socket accepts connections but deliberately serves no RPC.
+        // A published status and live lock cannot claim endpoint readiness.
+        assert!(
+            probe_installed_daemon_start_status(&paths, &args, Duration::from_millis(30)).is_none()
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_install_children_are_hidden_and_still_capture_output() {
@@ -1439,9 +1478,9 @@ mod tests {
 
         let main = read_boot_script(&layout.main_boot_entry).expect("read main boot entry");
         let shadow = read_boot_script(&layout.shadow_boot_entry).expect("read shadow boot entry");
-        assert!(main.contains("[Service]\nEnvironment=SINOMO_DATA_DIR="));
+        assert!(main.contains("[Service]\nEnvironment=\"SINOMO_DATA_DIR="));
         assert!(!main.contains("KillMode="));
-        assert!(shadow.contains("[Service]\nKillMode=process\nEnvironment=SINOMO_DATA_DIR="));
+        assert!(shadow.contains("[Service]\nKillMode=process\nEnvironment=\"SINOMO_DATA_DIR="));
         assert_eq!(shadow.matches("KillMode=process").count(), 1);
     }
 
