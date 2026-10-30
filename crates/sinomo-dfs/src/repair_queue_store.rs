@@ -151,6 +151,17 @@ impl DfsRepairQueueKey {
     }
 }
 
+// Fetch can advance scheduling counters before the first Repair is created.
+// Only these explicit facts show that an in-flight row names no sent Repair;
+// an existing Original still has its separate immutable-slot checks.
+fn is_nameless_not_sent_repair(record: &DfsRepairAttemptRecord) -> bool {
+    record.transfer_kind == Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair)
+        && record.transfer_delivery_state
+            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+        && record.transfer_request_id.is_none()
+        && record.completed_transfer_request_id.is_none()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsRepairQueueOperation {
@@ -961,7 +972,7 @@ impl RepairCustodyIndex {
                 }
             }
             if effective.is_some_and(|record| {
-                record.in_flight
+                (record.in_flight && !is_nameless_not_sent_repair(record))
                     || (record.completed_transfer_request_id.is_none()
                         && record.transfer_delivery_state
                             != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent))
@@ -2566,7 +2577,7 @@ impl LocalDfsRepairQueueStore {
         };
         Ok(state.records.get(&key).is_some_and(|record| {
             record.completed_transfer_request_id.is_none()
-                && (record.in_flight
+                && ((record.in_flight && !is_nameless_not_sent_repair(record))
                     || record.transfer_delivery_state
                         != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent))
         }))
@@ -4250,6 +4261,60 @@ pub(crate) mod tests {
     use std::fs::OpenOptions;
     use std::io::Write as _;
 
+    // Read only a stopped, fresh native fixture's complete active history.
+    // This grants no queue/metadata authority and performs no recovery writes.
+    pub(crate) fn native_queue_history(
+        snapshot_path: &Path,
+    ) -> Vec<(u64, Vec<DfsRepairQueueOperation>)> {
+        use std::io::Seek as _;
+        assert!(
+            matches!(fs::symlink_metadata(snapshot_path), Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound),
+            "fresh native history control must not omit a compacted snapshot"
+        );
+        let path = repair_queue_active_log_path(snapshot_path);
+        let metadata = fs::symlink_metadata(&path).expect("actual native active queue log");
+        assert!(metadata.file_type().is_file());
+        let file_bytes = metadata.len();
+        assert!(
+            file_bytes <= DEFAULT_DFS_REPAIR_QUEUE_COMPACTION_LOG_BYTES,
+            "native history control is bounded to the existing fresh-log size"
+        );
+        let mut file = File::open(&path).unwrap();
+        let mut history = Vec::new();
+        loop {
+            let start = file.stream_position().unwrap();
+            let Some(record) = durable_file::read_length_prefixed_record(
+                &mut file,
+                &path,
+                durable_file::DurableRecordReadOptions::new(
+                    durable_file::DurableLengthEndian::Little,
+                )
+                .max_record_bytes(DFS_REPAIR_QUEUE_LOG_MAX_RECORD_BYTES),
+            )
+            .expect("complete native queue frame") else {
+                assert_eq!(start, file_bytes, "incomplete native queue tail");
+                break;
+            };
+            assert_eq!(record.record_start, start);
+            assert!(
+                record.record_end <= file_bytes,
+                "native queue changed during read"
+            );
+            let batch: DfsRepairQueueLogBatch =
+                sinomo_object_serde::from_bytes(&record.bytes).expect("owning queue frame codec");
+            assert_eq!(
+                batch.sequence,
+                history.len() as u64 + 1,
+                "native queue sequence gap"
+            );
+            history.push((batch.sequence, batch.operations));
+        }
+        assert_eq!(file.metadata().unwrap().len(), file_bytes);
+        assert_eq!(fs::metadata(&path).unwrap().len(), file_bytes);
+        history
+    }
+
     mod imported_executor_association_tests {
         use super::*;
 
@@ -5806,6 +5871,200 @@ pub(crate) mod tests {
             "the actual pre-enrollment page/cursor token must checkpoint its named claim");
         assert_eq!(store.view().unwrap().records, vec![claimed]);
         store.validate_original_repair_dispatch(&message).unwrap();
+    }
+
+    // Queue DATA control for a Fetch that advanced scheduling counters before
+    // any Repair birth. The native Fetch producer is qualified separately.
+    fn fetch_only_not_sent_row(message: &crate::DfsRoutedMessage) -> DfsRepairAttemptRecord {
+        let crate::DfsNetworkMessage::RepairReplica(command) = &message.message else {
+            unreachable!()
+        };
+        let mut row = record("fetch-only", "custody-receiver", 1);
+        row.intent_id = command.intent_id.clone();
+        row.object_id = command.object_id.clone();
+        row.version = command.version.clone();
+        row.content_hash = command.content_hash.clone();
+        row.missing_replica_node_id = message.target_node_id.clone();
+        row.attempts = 1;
+        row.in_flight = true;
+        row.last_attempt_unix_nanos = 42;
+        row.next_retry_unix_nanos = 57;
+        row.transfer_request_id = None;
+        row.completed_transfer_request_id = None;
+        row.transfer_delivery_state =
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent);
+        row.transfer_kind = Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair);
+        row
+    }
+
+    #[test]
+    fn fetch_only_not_sent_row_is_not_uncovered_legacy_repair() {
+        let root = sinomo_testdir::TestDir::new("dfs-fetch-only-legacy-predicate");
+        let (store, content, message, _, payload) = original_fixture(&root);
+        let row = fetch_only_not_sent_row(&message);
+        store.append_enqueues([row.clone()]).unwrap();
+        assert!(
+            store
+                .original_repair_for_slot(&row.intent_id, &message.target_node_id)
+                .unwrap()
+                .is_none()
+        );
+        let before = diagnostic_fixture_state(&store);
+        let uncovered = store
+            .legacy_repair_is_uncovered(&row.intent_id, &message.target_node_id)
+            .unwrap();
+        assert_eq!(diagnostic_fixture_state(&store), before);
+        content.inspect_repair_payload_root(payload.root()).unwrap();
+        assert!(
+            !uncovered,
+            "typed NotSent without a Repair request, completion or Original is Fetch-only scheduling DATA"
+        );
+    }
+
+    #[test]
+    fn fetch_only_not_sent_row_allows_first_original_enrollment_without_rewriting_data() {
+        let root = sinomo_testdir::TestDir::new("dfs-fetch-only-first-enrollment");
+        let (store, content, message, descriptor, payload) = original_fixture(&root);
+        let row = fetch_only_not_sent_row(&message);
+        store.append_enqueues([row.clone()]).unwrap();
+        assert!(
+            store
+                .original_repair_for_slot(&row.intent_id, &message.target_node_id)
+                .unwrap()
+                .is_none()
+        );
+        let head = store.view().unwrap().head_sequence;
+        let birth = store
+            .enroll_original_repair(&message, &descriptor, &payload)
+            .expect(
+                "verified first Repair birth may follow nameless typed-NotSent Fetch scheduling",
+            );
+        assert_eq!(birth.original, message);
+        assert_eq!(birth.attachment, descriptor);
+        assert_eq!(&birth.root, payload.root());
+        assert!(birth.attempts.is_empty() && birth.observed.is_empty());
+        assert!(birth.closed_at_sequence.is_none());
+        assert_eq!(
+            store.view().unwrap().records,
+            vec![row.clone()],
+            "enrollment must not rewrite Fetch counters, clocks or delivery facts"
+        );
+        assert!(store.view().unwrap().head_sequence > head);
+        let reopened = reopen(&root.join("repair.sobj"));
+        assert_eq!(reopened.original_repair(&message).unwrap(), Some(birth));
+        assert_eq!(reopened.view().unwrap().records, vec![row]);
+        content.inspect_repair_payload_root(payload.root()).unwrap();
+    }
+
+    #[test]
+    fn fetch_only_exception_rejects_uncertain_or_named_rows() {
+        use sinomo_core::network::NetworkDeliveryState;
+        for variant in [
+            "unknown",
+            "possibly-applied",
+            "unknown-kind",
+            "stage-kind",
+            "named-request",
+            "other-request",
+            "completed-request",
+            "other-completion",
+        ] {
+            let root = sinomo_testdir::TestDir::new(&format!("dfs-fetch-only-negative-{variant}"));
+            let (store, content, message, descriptor, payload) = original_fixture(&root);
+            let crate::DfsNetworkMessage::RepairReplica(command) = &message.message else {
+                unreachable!()
+            };
+            let mut row = fetch_only_not_sent_row(&message);
+            match variant {
+                "unknown" => row.transfer_delivery_state = None,
+                "possibly-applied" => {
+                    row.transfer_delivery_state = Some(NetworkDeliveryState::PossiblyApplied)
+                }
+                "unknown-kind" => row.transfer_kind = None,
+                "stage-kind" => {
+                    row.transfer_kind =
+                        Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Stage)
+                }
+                "named-request" => row.transfer_request_id = Some(command.request_id.clone()),
+                "other-request" => row.transfer_request_id = Some("other-original-request".into()),
+                "completed-request" => {
+                    row.completed_transfer_request_id = Some(command.request_id.clone())
+                }
+                "other-completion" => {
+                    row.completed_transfer_request_id = Some("other-completed-request".into())
+                }
+                _ => unreachable!(),
+            }
+            store.append_enqueues([row.clone()]).unwrap();
+            let before = diagnostic_fixture_state(&store);
+            // A completed ID is already distinguished by the existing legacy
+            // query. It still cannot acquire this first birth while in flight.
+            assert_eq!(
+                store
+                    .legacy_repair_is_uncovered(&row.intent_id, &message.target_node_id)
+                    .unwrap(),
+                row.completed_transfer_request_id.is_none(),
+                "{variant}"
+            );
+            assert!(
+                store
+                    .enroll_original_repair(&message, &descriptor, &payload)
+                    .is_err(),
+                "{variant} cannot be treated as the nameless Fetch-only exception"
+            );
+            assert_eq!(diagnostic_fixture_state(&store), before, "{variant}");
+            assert_eq!(store.view().unwrap().records, vec![row]);
+            assert!(store.original_repair(&message).unwrap().is_none());
+            content.inspect_repair_payload_root(payload.root()).unwrap();
+        }
+    }
+
+    #[test]
+    fn fetch_only_exception_cannot_replace_an_existing_original() {
+        let root = sinomo_testdir::TestDir::new("dfs-fetch-only-existing-original");
+        let (store, content, message, descriptor, payload) = original_fixture(&root);
+        store
+            .enroll_original_repair(&message, &descriptor, &payload)
+            .unwrap();
+        store.record_original_repair_attempt(&message).unwrap();
+        let birth = store.original_repair(&message).unwrap().unwrap();
+        assert_eq!(birth.attempts.len(), 1);
+        assert!(birth.attempts[0].delivery_state.is_none());
+        let before = diagnostic_fixture_state(&store);
+        for variant in ["request", "base", "hash", "producer"] {
+            let mut changed = message.clone();
+            let crate::DfsNetworkMessage::RepairReplica(command) = &mut changed.message else {
+                unreachable!()
+            };
+            match variant {
+                "request" => command.request_id = "replacement-request".into(),
+                "base" => {
+                    command.expected_base_version =
+                        Some(DfsVersion::from_legacy_named("changed-base").unwrap())
+                }
+                "hash" => {
+                    command.content_hash =
+                        format!("blake3:{}", blake3::hash(b"different-body").to_hex())
+                }
+                "producer" => {
+                    changed.source_node_id =
+                        NodeId::from_legacy_named("different-producer").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                store
+                    .enroll_original_repair(&changed, &descriptor, &payload)
+                    .is_err(),
+                "{variant}"
+            );
+            assert_eq!(
+                store.original_repair(&message).unwrap(),
+                Some(birth.clone())
+            );
+            assert_eq!(diagnostic_fixture_state(&store), before, "{variant}");
+        }
+        content.inspect_repair_payload_root(&birth.root).unwrap();
     }
 
     #[test]

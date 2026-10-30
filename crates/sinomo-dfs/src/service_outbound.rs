@@ -27,6 +27,86 @@ enum ReplicaTransferKind {
     BackgroundRepair,
 }
 
+fn repair_retry_blocks_first_original(
+    pending: &crate::transfer::PendingNetworkedWrite,
+    target: &NodeId,
+) -> bool {
+    pending.repair_retries.get(target).is_some_and(|retry| {
+        retry.unresolved_custody_without_request
+            || retry.retrying_unresolved_transfer
+            || (retry.inflight
+                && (pending.repair_inflight_request_ids.contains_key(target)
+                    || retry.completed_transfer_request_id.is_some()
+                    || retry.transfer_delivery_state
+                        != Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)))
+    })
+}
+
+#[cfg(test)]
+mod first_original_retry_tests {
+    use super::*;
+    use crate::transfer::{PendingNetworkedWrite, RepairRetryState};
+    use sinomo_core::network::NetworkDeliveryState;
+
+    #[test]
+    fn fetch_only_retry_does_not_hide_named_or_uncertain_repair_custody() {
+        let target = NodeId::from_legacy_named("fetch-only-target").unwrap();
+        let other = NodeId::from_legacy_named("other-fetch-target").unwrap();
+        let mut pending = PendingNetworkedWrite::new(
+            DfsObjectId::from_legacy_named("fetch-only-object").unwrap(),
+            DfsVersion::generate(),
+            "content-hash".into(),
+            1,
+        );
+        let fetch_only = RepairRetryState {
+            inflight: true,
+            transfer_delivery_state: Some(NetworkDeliveryState::DefinitelyNotSent),
+            ..Default::default()
+        };
+        pending
+            .repair_retries
+            .insert(target.clone(), fetch_only.clone());
+        pending
+            .fetch_inflight_request_ids
+            .insert(other.clone(), "actual-read".into());
+        assert!(!repair_retry_blocks_first_original(&pending, &target));
+
+        pending
+            .repair_inflight_request_ids
+            .insert(target.clone(), "named-repair".into());
+        assert!(repair_retry_blocks_first_original(&pending, &target));
+        pending.repair_inflight_request_ids.clear();
+
+        for delivery in [None, Some(NetworkDeliveryState::PossiblyApplied)] {
+            let retry = pending.repair_retries.get_mut(&target).unwrap();
+            retry.transfer_delivery_state = delivery;
+            assert!(repair_retry_blocks_first_original(&pending, &target));
+        }
+        for rejected in [
+            RepairRetryState {
+                completed_transfer_request_id: Some("terminal-repair".into()),
+                ..fetch_only.clone()
+            },
+            RepairRetryState {
+                unresolved_custody_without_request: true,
+                ..fetch_only.clone()
+            },
+            RepairRetryState {
+                retrying_unresolved_transfer: true,
+                ..fetch_only.clone()
+            },
+        ] {
+            pending.repair_retries.insert(target.clone(), rejected);
+            assert!(repair_retry_blocks_first_original(&pending, &target));
+        }
+        pending.repair_retries.insert(target.clone(), fetch_only);
+        pending
+            .repair_inflight_request_ids
+            .insert(other, "other-repair".into());
+        assert!(!repair_retry_blocks_first_original(&pending, &target));
+    }
+}
+
 struct ReplicaTransfer<'a> {
     intent_id: &'a str,
     file_system_id: &'a DfsFileSystemId,
@@ -697,11 +777,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .writes
                             .pending_writes
                             .get(intent_id)
-                            .and_then(|pending| pending.repair_retries.get(target_node_id))
-                            .is_some_and(|retry| {
-                                retry.unresolved_custody_without_request
-                                    || retry.retrying_unresolved_transfer
-                                    || retry.inflight
+                            .is_some_and(|pending| {
+                                // A read-only Fetch shares this scheduling flag.
+                                // Only nameless, explicitly NotSent repair DATA
+                                // may proceed to its first Original; the durable
+                                // queue independently rechecks enrollment below.
+                                repair_retry_blocks_first_original(pending, target_node_id)
                             })
                     {
                         return Err(pending_error());
