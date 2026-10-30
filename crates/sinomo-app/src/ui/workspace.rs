@@ -14,6 +14,7 @@ pub(super) struct TabStrip {
     child: WidgetPod,
     scroll: ScrollState,
     selected_bounds: Rc<Cell<Option<Rect>>>,
+    tab_width_limit: Rc<Cell<f32>>,
     last_selection: Option<(
         WorkspaceSelection,
         Vec<crate::state::WorkspaceTabId>,
@@ -36,6 +37,8 @@ impl TabStrip {
         let select = shared.clone();
         let close = shared.clone();
         let theme = shared.clone();
+        let tab_width_limit = Rc::new(Cell::new(220.0));
+        let theme_width_limit = tab_width_limit.clone();
         let tabs = BrowserTabBar::new("shell-tabs")
             .max_tab_width(220.0)
             .tabs_when(move || labels.signals().workspace_titles.get())
@@ -52,6 +55,8 @@ impl TabStrip {
                 let mut theme = theme.theme();
                 theme.metrics.tab_height = 32.0;
                 theme.metrics.tab_gap = 3.0;
+                theme.metrics.tab_min_width =
+                    theme.metrics.tab_min_width.min(theme_width_limit.get());
                 theme
             })
             .on_change_with_ctx(move |ctx, index, _| {
@@ -108,8 +113,9 @@ impl TabStrip {
         let scroll_state = ScrollState::new();
         let selected_bounds = Rc::new(Cell::new(None));
         let tabs = MeasuredTabs {
-            tabs,
+            tabs: Some(tabs),
             selected_bounds: selected_bounds.clone(),
+            width_limit: tab_width_limit.clone(),
         };
         let scroll = ScrollView::horizontal(Padding::all(4.0, tabs))
             .state(scroll_state.clone())
@@ -182,6 +188,7 @@ impl TabStrip {
             child,
             scroll: scroll_state,
             selected_bounds,
+            tab_width_limit,
             last_selection: None,
         }
     }
@@ -193,6 +200,13 @@ impl Widget for TabStrip {
         ctx.observe(&self.shared.signals().workspace_titles);
         let selected = ctx.observe(&self.shared.signals().workspace_selection);
         let size = self.child.measure(ctx, constraints);
+        // The horizontal scroller measures its content without a width bound.
+        // Cap each tab to the actual viewport so revealing Close cannot scroll
+        // the beginning of the selected document's name off the screen.
+        let limit = (self.scroll.viewport_size().width - 8.0).clamp(0.0, 220.0);
+        if self.tab_width_limit.replace(limit) != limit {
+            self.child.measure(ctx, constraints);
+        }
         let key = (selected, ids, size, self.selected_bounds.get());
         if self.last_selection.as_ref() != Some(&key) {
             self.last_selection = Some(key);
@@ -233,33 +247,41 @@ impl Widget for TabStrip {
 }
 
 struct MeasuredTabs {
-    tabs: BrowserTabBar,
+    tabs: Option<BrowserTabBar>,
     selected_bounds: Rc<Cell<Option<Rect>>>,
+    width_limit: Rc<Cell<f32>>,
 }
 
 impl Widget for MeasuredTabs {
     fn event(&mut self, ctx: &mut EventCtx, event: &sui::Event) {
-        self.tabs.event(ctx, event);
+        self.tabs.as_mut().unwrap().event(ctx, event);
     }
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let size = self.tabs.measure(ctx, constraints);
-        self.selected_bounds.set(self.tabs.selected_tab_bounds());
+        // SUI 0.6 exposes this setting through its consuming builder; taking
+        // and returning the same widget preserves its interaction state.
+        self.tabs = self
+            .tabs
+            .take()
+            .map(|tabs| tabs.max_tab_width(self.width_limit.get()));
+        let tabs = self.tabs.as_mut().unwrap();
+        let size = tabs.measure(ctx, constraints);
+        self.selected_bounds.set(tabs.selected_tab_bounds());
         size
     }
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.tabs.arrange(ctx, bounds);
+        self.tabs.as_mut().unwrap().arrange(ctx, bounds);
     }
     fn paint(&self, ctx: &mut PaintCtx) {
-        self.tabs.paint(ctx);
+        self.tabs.as_ref().unwrap().paint(ctx);
     }
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.tabs.semantics(ctx);
+        self.tabs.as_ref().unwrap().semantics(ctx);
     }
     fn accepts_focus(&self) -> bool {
-        self.tabs.accepts_focus()
+        self.tabs.as_ref().unwrap().accepts_focus()
     }
     fn focus_changed(&mut self, ctx: &mut EventCtx, focused: bool) {
-        self.tabs.focus_changed(ctx, focused);
+        self.tabs.as_mut().unwrap().focus_changed(ctx, focused);
     }
 }
 
@@ -360,6 +382,62 @@ mod tests {
     use super::*;
     use crate::{backend::Backend, state::AppState};
     use sui::{Event, SemanticsRole, WindowEvent};
+
+    #[test]
+    fn mobile_p2_document_tab_fits_viewport_with_extra_large_text() -> sui::Result<()> {
+        let root = sinomo_testdir::TestDir::new("app-mobile-p2-tabs");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(root.to_path_buf()),
+        );
+        let shared = Shared::new(AppState::ready(backend));
+        shared.set_text_scale(crate::theme::AppTextScale::ExtraLarge);
+        let name = "mobile-smoke-with-a-long-document-name.txt";
+        shared
+            .open_document_tab(
+                super::files::FilesSourceKind::Sifs,
+                format!("/{name}"),
+                name.into(),
+            )
+            .unwrap();
+        let app = sui_testing::TestApp::from_runtime(crate::build_runtime(shared.clone())?)?;
+        let window = app.main_window()?;
+        for width in [380.0, 320.0, 520.0, 380.0] {
+            window
+                .root()
+                .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 780.0))))?;
+            window.run_until_idle()?;
+            let snapshot = window.snapshot()?;
+            let viewport = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| node.name.as_deref() == Some("Primary navigation tabs"))
+                .unwrap()
+                .bounds;
+            let tab = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(name)
+                })
+                .unwrap()
+                .bounds;
+            let close = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| node.name.as_deref() == Some(&format!("Close {name} tab")))
+                .unwrap()
+                .bounds;
+            assert!(
+                tab.x() >= viewport.x() - 0.5 && tab.max_x() <= viewport.max_x() + 0.5,
+                "both edges of the selected tab must fit at {width}: tab={tab:?}, viewport={viewport:?}"
+            );
+            assert!(close.x() >= viewport.x() && close.max_x() <= viewport.max_x());
+        }
+        Ok(())
+    }
 
     #[test]
     fn workspace_tabs_menu_opens_independent_tabs_and_closes_them() -> sui::Result<()> {

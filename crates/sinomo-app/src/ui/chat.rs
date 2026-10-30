@@ -2091,13 +2091,11 @@ struct ChatModelSelectorStructure {
 struct ChatAttachmentStructure {
     theme: (AppThemeMode, AppTextScale),
     attachments: Vec<(String, u64)>,
-    path_empty: bool,
     manual_path_open: bool,
     operation_pending: bool,
     picker_pending: bool,
     pending_validations: usize,
     drop_hovered: bool,
-    picker_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2163,13 +2161,11 @@ impl ChatStructureSnapshot {
         ChatAttachmentStructure {
             theme: self.theme,
             attachments: self.attachments.clone(),
-            path_empty: self.attachment_path_empty,
             manual_path_open: self.attachment_manual_path_open,
             operation_pending: self.attachment_operation_pending,
             picker_pending: self.attachment_picker_pending,
             pending_validations: self.pending_attachment_validations,
             drop_hovered: self.attachment_drop_hovered,
-            picker_error: self.attachment_picker_error.clone(),
         }
     }
 
@@ -11400,7 +11396,25 @@ fn session_edit_details(
 }
 
 fn session_meta_label(session: &SessionRef) -> String {
-    let updated = session_updated_label(session.updated_unix);
+    let updated = if is_untitled_chat(session) {
+        time::OffsetDateTime::from_unix_timestamp(session.updated_unix)
+            .ok()
+            .filter(|_| session.updated_unix > 0)
+            .map(|at| {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                    at.year(),
+                    at.month() as u8,
+                    at.day(),
+                    at.hour(),
+                    at.minute(),
+                    at.second()
+                )
+            })
+            .unwrap_or_else(|| session_updated_label(session.updated_unix))
+    } else {
+        session_updated_label(session.updated_unix)
+    };
     match session.kind {
         ConversationKind::Chat => updated,
         ConversationKind::Channel => {
@@ -11413,6 +11427,22 @@ fn session_meta_label(session: &SessionRef) -> String {
                 format!("{} · {updated}", plural_agents(session.participant_count))
             }
         }
+    }
+}
+
+fn is_untitled_chat(session: &SessionRef) -> bool {
+    session.kind == ConversationKind::Chat && session.title.trim().eq_ignore_ascii_case("new chat")
+}
+
+fn session_row_title(session: &SessionRef) -> String {
+    if is_untitled_chat(session) && !session.participant_names.is_empty() {
+        format!(
+            "{} · {}",
+            session.title,
+            session.participant_names.join(", ")
+        )
+    } else {
+        session.title.clone()
     }
 }
 
@@ -11443,7 +11473,9 @@ fn session_matches_filter(session: &SessionRef, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
-    session.title.to_ascii_lowercase().contains(filter)
+    session_row_title(session)
+        .to_ascii_lowercase()
+        .contains(filter)
         || session_meta_label(session)
             .to_ascii_lowercase()
             .contains(filter)
@@ -12243,7 +12275,7 @@ fn session_row_content(
     let labels = Flex::vertical()
         .align_items(Alignment::Start)
         .with_child(
-            Label::new(session.title.clone())
+            Label::new(session_row_title(&session))
                 .single_line(true)
                 .text_style(title_style),
         )
@@ -15408,9 +15440,29 @@ impl TranscriptView {
         style
     }
 
-    fn code_block_height(code: &ChatCodeBlock) -> f32 {
+    fn tool_header_height(theme: &DefaultTheme, subtitle: bool) -> f32 {
+        if subtitle {
+            (16.0
+                + theme.text.sm.line_height
+                + theme.metrics.action_card_text_gap.min(3.0)
+                + theme.text.xs.line_height)
+                .max(50.0)
+        } else {
+            (16.0 + theme.text.sm.line_height).max(42.0)
+        }
+    }
+
+    fn narrative_header_height(theme: &DefaultTheme) -> f32 {
+        15.0 + theme.text.xs.line_height
+    }
+
+    fn detail_header_height(theme: &DefaultTheme) -> f32 {
+        6.0 + theme.text.xs.line_height.max(16.0)
+    }
+
+    fn code_block_height(code: &ChatCodeBlock, theme: &DefaultTheme) -> f32 {
         let line_count = code.text.lines().count().max(1) as f32;
-        30.0 + line_count * 17.0 + 12.0
+        42.0 + line_count * theme.text.sm.line_height
     }
 
     /// Trace rows to draw before each message, indexed like `chat.messages`.
@@ -15479,7 +15531,7 @@ impl TranscriptView {
                 includes_reasoning,
                 latest,
                 bubble_w,
-                bubble_h: 64.0,
+                bubble_h: Self::tool_header_height(theme, true).max(64.0),
             }];
         }
 
@@ -15487,7 +15539,7 @@ impl TranscriptView {
             call_count: event_count,
             includes_reasoning,
             bubble_w,
-            bubble_h: 42.0,
+            bubble_h: Self::tool_header_height(theme, false),
         }];
         for entry in &trace.entries {
             items.push(match entry {
@@ -15535,7 +15587,9 @@ impl TranscriptView {
             label,
             text,
             bubble_w,
-            bubble_h: 34.0 + lines.len().max(1) as f32 * style.line_height + 14.0,
+            bubble_h: Self::narrative_header_height(theme)
+                + lines.len().max(1) as f32 * style.line_height
+                + 14.0,
         }
     }
 
@@ -15567,7 +15621,7 @@ impl TranscriptView {
             input_block,
             output_block,
             bubble_w,
-            bubble_h: 50.0
+            bubble_h: Self::tool_header_height(theme, true)
                 + detail_h
                 + if chat.tool_detail_expanded(&tool_detail_key(
                     trace_key,
@@ -15695,7 +15749,7 @@ impl TranscriptView {
             ..code.clone()
         });
         let content_h = if let Some(code) = &visible_code {
-            Self::code_block_height(code)
+            Self::code_block_height(code, theme)
         } else {
             let style = Self::transcript_muted_text_style(pal, theme, pal.text);
             let measure_style = style.clone();
@@ -15715,7 +15769,7 @@ impl TranscriptView {
             } else {
                 None
             },
-            height: 22.0 + content_h + button_h + 8.0,
+            height: Self::detail_header_height(theme) + content_h + button_h + 8.0,
         }
     }
 
@@ -15973,7 +16027,7 @@ impl TranscriptView {
                         bubble.x() + 12.0,
                         bubble.y() + 9.0,
                         bubble.width() - 24.0,
-                        18.0,
+                        theme.text.xs.line_height,
                     ),
                     label,
                     "",
@@ -15984,9 +16038,9 @@ impl TranscriptView {
                     theme,
                     Rect::new(
                         bubble.x() + 12.0,
-                        bubble.y() + 31.0,
+                        bubble.y() + Self::narrative_header_height(theme),
                         bubble.width() - 24.0,
-                        bubble.height() - 39.0,
+                        bubble.height() - Self::narrative_header_height(theme) - 8.0,
                     ),
                     text,
                     TextBlockPaint::new()
@@ -16017,7 +16071,7 @@ impl TranscriptView {
                         .leading_tone_dot(activity_tone_semantic(tool_status_tone(&call.status)))
                         .leading_width(18.0),
                 );
-                let mut ty = y + 50.0;
+                let mut ty = y + Self::tool_header_height(theme, true);
                 let dark = widgets::theme_is_dark(&self.shared);
                 if let Some(input) = input_block {
                     Self::paint_tool_detail(
@@ -16070,14 +16124,24 @@ impl TranscriptView {
         paint_section_label_detail(
             ctx,
             theme,
-            Rect::new(rect.x(), rect.y() + 2.0, rect.width(), 16.0),
+            Rect::new(
+                rect.x(),
+                rect.y() + 2.0,
+                rect.width(),
+                theme.text.xs.line_height.max(16.0),
+            ),
             section_label,
             &detail.title,
             sui::SectionLabelPaint::new().color(pal.text_faint),
         );
-        let y = rect.y() + 22.0;
+        let y = rect.y() + Self::detail_header_height(theme);
         if let Some(code) = &detail.code {
-            let code_rect = Rect::new(rect.x(), y, rect.width(), Self::code_block_height(code));
+            let code_rect = Rect::new(
+                rect.x(),
+                y,
+                rect.width(),
+                Self::code_block_height(code, theme),
+            );
             Self::paint_code_block(ctx, pal, theme, code_rect, code, dark);
         } else if let Some(text) = detail.text.as_deref() {
             let bottom_reserve = if detail.collapsible { 34.0 } else { 8.0 };
@@ -16631,7 +16695,7 @@ impl TranscriptControls {
                         ..
                     } => {
                         let bx = area.x() + PAD;
-                        let mut ty = y + 50.0;
+                        let mut ty = y + TranscriptView::tool_header_height(&theme, true);
                         for detail in [input_block.as_ref(), output_block.as_ref()]
                             .into_iter()
                             .flatten()
@@ -17685,7 +17749,7 @@ fn attachment_drawer_chip(
     .tone(SemanticTone::Neutral)
 }
 
-fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn attachment_controls(shared: &Shared, reader: &ThemeReader, scroll: &ScrollState) -> WidgetPod {
     let mut chips = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(6.0)
@@ -17816,6 +17880,7 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .icon(IconGlyph::Add)
                 .min_height(ATTACHMENT_ENTRY_H)
                 .min_width(96.0)
+                .focus_on_press(!cfg!(target_os = "android"))
                 .theme_when(clone_reader(reader))
                 .appearance(sui::ButtonAppearance::Tonal)
                 .tone(SemanticTone::Neutral)
@@ -17838,29 +17903,54 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         );
     }
 
-    if let Some(error) = shared.chat().attachment_picker_error.clone() {
-        let s = shared.clone();
-        body = Stack::vertical()
-            .gap(8.0)
-            .alignment(Alignment::Stretch)
-            .with_child(
-                Flex::horizontal()
-                    .wrap(FlexWrap::Wrap)
-                    .gap(8.0)
-                    .align_items(Alignment::Center)
-                    .with_child(
+    let feedback_source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("attachment failure feedback", |key| {
+                key.0
+                    .as_deref()
+                    .and_then(|snapshot| snapshot.attachment_picker_error.clone())
+            });
+    let feedback_shared = shared.clone();
+    let feedback_reader = Rc::clone(reader);
+    let feedback_scroll = scroll.clone();
+    let feedback = RebuildOnChange::key_from(feedback_source, move |error| {
+        let Some(error) = error else {
+            return WidgetPod::new(SizedBox::new());
+        };
+        // Show a new validation failure even when the manual form was scrolled
+        // down. Feedback updates must not replace the focused path editor.
+        feedback_scroll.set_offset(sui::Vector::ZERO);
+        let colors = feedback_shared.clone();
+        WidgetPod::new(WidgetPadding::new(
+            Insets {
+                left: 0.0,
+                top: 0.0,
+                right: 0.0,
+                bottom: 8.0,
+            },
+            Flex::vertical()
+                .gap(8.0)
+                .align_items(Alignment::Stretch)
+                .with_child(
+                    Stack::horizontal().with_child(
                         StatusBadge::new("Couldn’t attach")
                             .icon(IconGlyph::Alert)
                             .tone(SemanticTone::Danger)
-                            .theme_when(clone_reader(reader)),
-                    )
-                    .with_item(
-                        small_label(shared, error).color_when(move || palette(&s).danger_text),
-                        FlexItem::flex(1.0).min_width(140.0),
+                            .theme_when(clone_reader(&feedback_reader)),
                     ),
-            )
-            .with_child(body);
-    }
+                )
+                .with_child(
+                    small_label(&feedback_shared, error)
+                        .color_when(move || palette(&colors).danger_text),
+                ),
+        ))
+    });
+    body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(feedback)
+        .with_child(body);
 
     if !shared.chat().attachments.is_empty() {
         body = body.with_child(chips);
@@ -18095,6 +18185,7 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 }
 
 fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let scroll = ScrollState::new();
     let controls = {
         let source = shared.signals().chat_structure.select_named(
             "chat attachment popup structure",
@@ -18106,7 +18197,10 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::key_from(source, move |_sig| attachment_controls(&s, &r))
+        let controls_scroll = scroll.clone();
+        RebuildOnChange::key_from(source, move |_sig| {
+            attachment_controls(&s, &r, &controls_scroll)
+        })
     };
     let body = Stack::vertical()
         .gap(8.0)
@@ -18118,9 +18212,12 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             "Close attachments",
         ))
         .with_child(
-            SizedBox::new()
-                .height(COMPOSER_POPUP_H - 34.0)
-                .child(ScrollView::vertical(controls).viewport_width_hint(true)),
+            SizedBox::new().height(COMPOSER_POPUP_H - 34.0).child(
+                    ScrollView::vertical(controls)
+                        .name("Attachment options")
+                    .state(scroll)
+                    .viewport_width_hint(true),
+            ),
         );
     WidgetPod::new(
         Surface::new(
@@ -19859,6 +19956,7 @@ pub fn view(shared: Shared) -> impl Widget {
 #[cfg(test)]
 mod tests {
     include!("chat/mobile_regression_tests.rs");
+    include!("chat/mobile_p2_tests.rs");
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
