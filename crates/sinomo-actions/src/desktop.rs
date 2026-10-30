@@ -2,6 +2,7 @@
 //! modes. Native OS effects are provided by the independently loaded OS module.
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{CapabilityName, ModuleCapabilities, TrustRing};
+use sinomo_runtime::device::desktop::surfaces::*;
 use sinomo_runtime::device::desktop::*;
 use sinomo_runtime::module::*;
 use sinomo_runtime::network::{ObjectRpcRequest, ObjectRpcResponse};
@@ -12,6 +13,7 @@ use sinomo_runtime::service::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+mod applications;
 pub mod provider;
 use provider::{DesktopProviderClient, NativeDesktopInput};
 use std::sync::{
@@ -73,6 +75,52 @@ impl DesktopModule {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopControlRequest {
     Capabilities,
+    Applications,
+    OpenApplication {
+        application: DesktopApplication,
+        #[serde(default = "default_lease_ms")]
+        lease_ms: u64,
+    },
+    Surfaces {
+        session_id: String,
+    },
+    OpenWindow {
+        application_session_id: String,
+        surface_id: String,
+        #[serde(default)]
+        input: bool,
+        #[serde(default)]
+        capture: bool,
+        #[serde(default = "default_lease_ms")]
+        lease_ms: u64,
+    },
+    OpenOverview {
+        application_session_id: String,
+        #[serde(default = "default_overview_windows")]
+        max_windows: usize,
+    },
+    SelectWindow {
+        overview_session_id: String,
+        surface_id: Option<String>,
+    },
+    TrayItems,
+    InvokeTray {
+        item_id: String,
+        operation: DesktopSemanticAction,
+        #[serde(default)]
+        allow_desktop_interaction: bool,
+    },
+    MenuItems {
+        application_session_id: String,
+        surface_id: String,
+    },
+    InvokeMenuItem {
+        application_session_id: String,
+        surface_id: String,
+        item_id: String,
+        #[serde(default)]
+        allow_desktop_interaction: bool,
+    },
     Targets {
         #[serde(default)]
         mode: DesktopControlMode,
@@ -93,11 +141,16 @@ pub enum DesktopControlRequest {
     },
     Input {
         session_id: String,
+        #[serde(default)]
+        surface_id: Option<String>,
         events: Vec<DesktopInput>,
     },
     Close {
         session_id: String,
     },
+}
+fn default_overview_windows() -> usize {
+    4
 }
 fn default_lease_ms() -> u64 {
     60_000
@@ -115,6 +168,29 @@ pub struct DesktopStreamDescriptor {
 pub enum DesktopControlResponse {
     Capabilities {
         capabilities: DesktopCapabilities,
+        #[serde(default)]
+        surfaces: DesktopSurfaceCapabilities,
+    },
+    Applications {
+        applications: Vec<DesktopApplicationInfo>,
+    },
+    ApplicationOpened {
+        session_id: String,
+        resource_id: String,
+        lease_ms: u64,
+        snapshot: DesktopApplicationSnapshot,
+    },
+    Surfaces {
+        snapshot: DesktopApplicationSnapshot,
+    },
+    SemanticItems {
+        snapshot: DesktopSemanticSnapshot,
+    },
+    SemanticInvoked {
+        delivery: String,
+    },
+    ViewSelected {
+        surface_id: Option<String>,
     },
     Targets {
         targets: Vec<DesktopTargetInfo>,
@@ -124,6 +200,8 @@ pub enum DesktopControlResponse {
         resource_id: String,
         lease_ms: u64,
         stream: Option<DesktopStreamDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        surface_id: Option<String>,
     },
     InputApplied {
         events: usize,
@@ -161,6 +239,7 @@ struct Session {
     capture_active: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     expires: Instant,
+    application: Option<ApplicationWindowBinding>,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -178,6 +257,9 @@ struct Runtime {
     workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     closed: AtomicBool,
     changed: tokio::sync::Notify,
+    applications: Mutex<BTreeMap<String, Arc<applications::ApplicationSession>>>,
+    overviews: Mutex<BTreeMap<String, applications::OverviewSession>>,
+    application_changed: tokio::sync::Notify,
 }
 impl Runtime {
     fn provider(&self) -> DesktopResult<Arc<DesktopProviderClient>> {
@@ -224,6 +306,13 @@ impl Runtime {
         match request {
             DesktopControlRequest::Capabilities => Ok(DesktopControlResponse::Capabilities {
                 capabilities: self.provider()?.capabilities()?,
+                surfaces: self
+                    .provider()?
+                    .surface_capabilities()
+                    .unwrap_or_else(|error| DesktopSurfaceCapabilities {
+                        limitations: vec![error.to_string()],
+                        ..Default::default()
+                    }),
             }),
             DesktopControlRequest::Targets { mode } => Ok(DesktopControlResponse::Targets {
                 targets: self.provider()?.targets(mode)?,
@@ -295,10 +384,12 @@ impl Runtime {
                         capture_active: Arc::new(AtomicBool::new(false)),
                         cancelled,
                         expires: Instant::now() + Duration::from_millis(lease_ms),
+                        application: None,
                     },
                 );
                 self.changed.notify_one();
                 Ok(DesktopControlResponse::Opened {
+                    surface_id: None,
                     resource_id,
                     lease_ms,
                     stream: capture.then(|| DesktopStreamDescriptor {
@@ -310,10 +401,22 @@ impl Runtime {
                     session_id,
                 })
             }
-            DesktopControlRequest::Input { session_id, events } => {
+            DesktopControlRequest::Input {
+                session_id,
+                surface_id,
+                events,
+            } => {
                 let (input, mode) = {
                     let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
                     let session = owned_session(&sessions, &session_id, &owner)?;
+                    if session
+                        .application
+                        .as_ref()
+                        .map(|binding| &binding.surface_id)
+                        != surface_id.as_ref()
+                    {
+                        return Err(DesktopError::Invalid("input surface_id must match the selected window and its capture identity".into()));
+                    }
                     validate_inputs(&session.target, &events)?;
                     (
                         session.input.clone().ok_or_else(|| {
@@ -339,6 +442,9 @@ impl Runtime {
                 })
             }
             DesktopControlRequest::Close { session_id } => {
+                if self.close_application_or_overview(&session_id, &owner)? {
+                    return Ok(DesktopControlResponse::Closed);
+                }
                 {
                     let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(session) = sessions.get(&session_id)
@@ -355,6 +461,7 @@ impl Runtime {
                 self.changed.notify_one();
                 Ok(DesktopControlResponse::Closed)
             }
+            request => self.application_control(kind, owner, request),
         }
     }
 }
@@ -433,12 +540,47 @@ impl Service for DesktopService {
                     DesktopControlRequest::Open { .. } => "open",
                     DesktopControlRequest::Input { .. } => "input",
                     DesktopControlRequest::Close { .. } => "close",
+                    DesktopControlRequest::Applications => "applications",
+                    DesktopControlRequest::OpenApplication { .. } => "open_application",
+                    DesktopControlRequest::Surfaces { .. } => "surfaces",
+                    DesktopControlRequest::OpenWindow { .. } => "open_window",
+                    DesktopControlRequest::OpenOverview { .. } => "open_overview",
+                    DesktopControlRequest::SelectWindow { .. } => "select_window",
+                    DesktopControlRequest::TrayItems => "tray_items",
+                    DesktopControlRequest::InvokeTray { .. } => "invoke_tray",
+                    DesktopControlRequest::MenuItems { .. } => "menu_items",
+                    DesktopControlRequest::InvokeMenuItem { .. } => "invoke_menu_item",
                 };
                 let subject = match &command {
                     DesktopControlRequest::Open { target, .. }
                     | DesktopControlRequest::Children { target } => Some(target.resource_id()),
                     DesktopControlRequest::Input { session_id, .. }
-                    | DesktopControlRequest::Close { session_id } => Some(session_id.clone()),
+                    | DesktopControlRequest::Close { session_id }
+                    | DesktopControlRequest::Surfaces { session_id } => Some(session_id.clone()),
+                    DesktopControlRequest::OpenApplication { application, .. } => {
+                        Some(application.resource_id())
+                    }
+                    DesktopControlRequest::OpenWindow {
+                        application_session_id,
+                        ..
+                    }
+                    | DesktopControlRequest::OpenOverview {
+                        application_session_id,
+                        ..
+                    }
+                    | DesktopControlRequest::MenuItems {
+                        application_session_id,
+                        ..
+                    }
+                    | DesktopControlRequest::InvokeMenuItem {
+                        application_session_id,
+                        ..
+                    } => Some(application_session_id.clone()),
+                    DesktopControlRequest::InvokeTray { item_id, .. } => Some(item_id.clone()),
+                    DesktopControlRequest::SelectWindow {
+                        overview_session_id,
+                        ..
+                    } => Some(overview_session_id.clone()),
                     _ => None,
                 };
                 let state = self.state.clone();
@@ -463,39 +605,13 @@ impl Service for DesktopService {
             } else {
                 let capture_request: DesktopStreamRequest =
                     ctx.decode_request_body_bounded(&request, 16 * 1024).await?;
-                let (target, cancelled, active, duration) = {
-                    let sessions = self
-                        .state
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let session = owned_session(&sessions, &capture_request.session_id, &owner)
-                        .map_err(service_error)?;
-                    if !session.capture {
-                        return Err(service_error("session was not opened for capture"));
-                    }
-                    if session.capture_active.swap(true, Ordering::AcqRel) {
-                        return Err(service_error("session already has a video consumer"));
-                    }
-                    (
-                        session.target.clone(),
-                        session.cancelled.clone(),
-                        session.capture_active.clone(),
-                        session.expires.saturating_duration_since(Instant::now()),
-                    )
-                };
-                let active_guard = CaptureActive(active);
-                let config = DesktopCaptureConfig {
-                    target,
-                    frames_per_second: capture_request.frames_per_second,
-                    include_cursor: capture_request.include_cursor,
-                    lease_ms: duration.as_millis().min(MAX_LEASE_MS as u128) as u64,
-                };
-                if self.state.closed.load(Ordering::Acquire) {
-                    return Err(service_error("module is unloading"));
-                }
-                let native = self.state.provider().map_err(service_error)?;
-                let capture = tokio::task::spawn_blocking(move || native.capture(config))
+                let state = self.state.clone();
+                let capture_options = capture_request.clone();
+                let actor = owner.clone();
+                let (capture, cancelled, active_guard, duration) =
+                    tokio::task::spawn_blocking(move || {
+                        state.capture_source(&capture_options, &actor)
+                    })
                     .await
                     .map_err(service_error)?
                     .map_err(service_error)?;
@@ -662,7 +778,7 @@ fn control_request_schema(_kind: DesktopModule) -> serde_json::Value {
             &["action", "target"],
         ),
         object(
-            json!({"action":{"type":"string","enum":["input"]},"session_id":{"type":"string","description":"Exact ID from the opened input session"},"events":{"type":"array","minItems":1,"maxItems":256,"items":{"oneOf":events}}}),
+            json!({"action":{"type":"string","enum":["input"]},"session_id":{"type":"string","description":"Exact ID from the opened input session"},"surface_id":{"type":"string","description":"Required for an application window: copy the surface_id from its open_window response and matching frame identity. Omit for legacy window/monitor sessions."},"events":{"type":"array","minItems":1,"maxItems":256,"items":{"oneOf":events}}}),
             &["action", "session_id", "events"],
         ),
         object(
@@ -676,6 +792,23 @@ fn control_request_schema(_kind: DesktopModule) -> serde_json::Value {
             &["action", "target"],
         ));
     }
+    let text = json!({"type":"string"});
+    let lease = json!({"type":"integer","minimum":1000,"maximum":300000});
+    let app = object(
+        json!({"process_id":integer,"process_started":integer}),
+        &["process_id", "process_started"],
+    );
+    actions.extend([
+        object(json!({"action":{"type":"string","enum":["applications","tray_items"]}}), &["action"]),
+        object(json!({"action":{"type":"string","enum":["open_application"]},"application":app,"lease_ms":lease}), &["action","application"]),
+        object(json!({"action":{"type":"string","enum":["surfaces"]},"session_id":text}), &["action","session_id"]),
+        object(json!({"action":{"type":"string","enum":["open_window"]},"application_session_id":text,"surface_id":text,"input":{"type":"boolean"},"capture":{"type":"boolean"},"lease_ms":lease}), &["action","application_session_id","surface_id"]),
+        object(json!({"action":{"type":"string","enum":["open_overview"]},"application_session_id":text,"max_windows":{"type":"integer","minimum":1,"maximum":4,"default":4}}), &["action","application_session_id"]),
+        object(json!({"action":{"type":"string","enum":["select_window"]},"overview_session_id":text,"surface_id":{"type":["string","null"],"description":"Select a full-resolution window view; null returns to the overview. This never retargets an input session."}}), &["action","overview_session_id","surface_id"]),
+        object(json!({"action":{"type":"string","enum":["invoke_tray"]},"item_id":text,"operation":{"type":"string","enum":["invoke","context_menu"]},"allow_desktop_interaction":{"type":"boolean","default":false,"description":"Explicit opt-in to app/shell UI activation. Separate native resource grants are still required."}}), &["action","item_id","operation"]),
+        object(json!({"action":{"type":"string","enum":["menu_items"]},"application_session_id":text,"surface_id":text}), &["action","application_session_id","surface_id"]),
+        object(json!({"action":{"type":"string","enum":["invoke_menu_item"]},"application_session_id":text,"surface_id":text,"item_id":text,"allow_desktop_interaction":{"type":"boolean","default":false}}), &["action","application_session_id","surface_id","item_id"]),
+    ]);
     json!({"oneOf":actions,"description":"Unified App Use control request. Background window messages are preferred; raw desktop input requires an explicit raw session. For background video grounding prefer move_in_frame: normalized fractions of the entire image plus source dimensions. Legacy move uses physical client pixels in background mode and virtual-desktop pixels in raw mode, except Wayland portal targets use portal-advertised stream-local bounds: scale video pixels to those target bounds. On Wayland, raw target discovery starts a local chooser; repeat discovery after user approval. Button names are strings, never numeric IDs. Capture is a separate media stream, not a control action."})
 }
 
@@ -735,6 +868,16 @@ pub fn module_registration(kind: DesktopModule) -> ModuleRegistration {
                     ),
             )
             .publish_event(publication(kind));
+    for kind in [
+        "app.window.added",
+        "app.window.changed",
+        "app.window.removed",
+        "app.session.closed",
+    ] {
+        registration.component = registration
+            .component
+            .publish_event(applications::publication(kind));
+    }
     registration
 }
 
@@ -755,10 +898,22 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
                 .register(DesktopService {
                     kind,
                     state: state.clone(),
-                    events,
+                    events: events.clone(),
                 })
                 .build(),
         );
+        let mut app_shutdown = scope.shutdown_receiver();
+        let app_state = state.clone();
+        scope.own_task("application-window-observation", runtime.spawn(async move {
+            loop {
+                let active = !app_state.applications.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+                let wait = async { if active { tokio::time::sleep(Duration::from_millis(250)).await; } else { std::future::pending::<()>().await; } };
+                tokio::select! { _ = app_shutdown.changed() => break, _ = app_state.application_changed.notified() => {}, _ = wait => {} }
+                let state = app_state.clone();
+                let updates = tokio::task::spawn_blocking(move || state.application_updates()).await.unwrap_or_default();
+                for (kind, payload) in updates { let _ = applications::publish(&events, &kind, payload).await; }
+            }
+        }));
         let mut shutdown = scope.shutdown_receiver();
         let reaper = state.clone();
         scope.own_task("desktop-session-expiry", runtime.spawn(async move {
@@ -800,6 +955,22 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
                         &mut *cleanup.sessions.lock().unwrap_or_else(|e| e.into_inner()),
                     );
                     drop(sessions);
+                    cleanup
+                        .overviews
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                    let apps = std::mem::take(
+                        &mut *cleanup
+                            .applications
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
+                    for app in apps.values() {
+                        app.cancelled.store(true, Ordering::Release);
+                        app.native.close();
+                    }
+                    drop(apps);
                 })
                 .await
                 .map_err(|e| e.to_string())?;
@@ -835,6 +1006,55 @@ pub fn component_factory(kind: DesktopModule) -> Result<StaticComponentFactory, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn application_input_rejects_a_different_surface_before_any_effect() {
+        let root = sinomo_testdir::TestDir::new("app-input-surface-binding");
+        let permissions = LocalNodePermissionStore::new(&root);
+        let mut grants = sinomo_runtime::node::LocalNodePermissions::new();
+        grants.set_remote_management_enabled(true);
+        permissions.save(&grants).unwrap();
+        let runtime = Runtime::default();
+        runtime.sessions.lock().unwrap().insert(
+            "window-session".into(),
+            Session {
+                owner: "owner".into(),
+                mode: DesktopControlMode::Background,
+                target: DesktopTarget::Window {
+                    handle: 1,
+                    process_id: 1,
+                    thread_id: 1,
+                    process_started: 1,
+                },
+                input: None,
+                capture: false,
+                capture_active: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                expires: Instant::now() + Duration::from_secs(60),
+                application: Some(ApplicationWindowBinding {
+                    application_id: "app".into(),
+                    surface_id: "window-a".into(),
+                }),
+            },
+        );
+        for surface_id in [None, Some("window-b".into())] {
+            assert!(matches!(
+                runtime.control(
+                    DesktopModule::AppUse,
+                    permissions.clone(),
+                    "owner".into(),
+                    DesktopControlRequest::Input {
+                        session_id: "window-session".into(),
+                        surface_id,
+                        events: vec![DesktopInput::Text {
+                            text: "never sent".into()
+                        }]
+                    }
+                ),
+                Err(DesktopError::Invalid(_))
+            ));
+        }
+        assert!(runtime.provider.lock().unwrap().is_none());
+    }
     #[test]
     fn missing_os_provider_has_no_linked_fallback() {
         let root = sinomo_testdir::TestDir::new("app-use-missing-provider");

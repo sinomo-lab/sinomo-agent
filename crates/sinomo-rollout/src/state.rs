@@ -238,6 +238,7 @@ impl RolloutActivationGuard {
 
 impl Drop for RolloutActivationGuard {
     fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.with_extension("owner.json"));
         let _ = FileExt::unlock(&self.file);
     }
 }
@@ -248,6 +249,14 @@ pub fn acquire_rollout_activation_guard(
     let guard = acquire_rollout_activation_file_guard(paths)?;
     ensure_rollout_activation_admission(paths)?;
     Ok(guard)
+}
+
+/// Setup/removal owns lifecycle admission even when a crashed activation left a
+/// pending record. Removal fences normal admission before trying this lock.
+pub fn acquire_installation_guard(
+    paths: &SelfRolloutPaths,
+) -> Result<RolloutActivationGuard, RolloutError> {
+    acquire_rollout_activation_file_guard(paths)
 }
 
 fn acquire_rollout_activation_file_guard(
@@ -290,10 +299,26 @@ fn acquire_rollout_activation_file_guard(
             });
         }
     }
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    if let Some(process) = system.process(pid) {
+        let owner = serde_json::json!({"pid": std::process::id(), "start_time": process.start_time(), "exe": std::env::current_exe().ok()});
+        fs::write(
+            path.with_extension("owner.json"),
+            serde_json::to_vec(&owner).expect("owner JSON"),
+        )
+        .map_err(|error| RolloutError::Io {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    }
     Ok(RolloutActivationGuard { file, path })
 }
 
 fn ensure_rollout_activation_admission(paths: &SelfRolloutPaths) -> Result<(), RolloutError> {
+    sinomo_core::local::ensure_deployment_enabled(paths.bin.parent().expect("data directory"))
+        .map_err(|detail| RolloutError::InvalidTransition { detail })?;
     for (label, pending_path) in [
         ("main", rollout_main_activation_path(paths)),
         ("shadow", rollout_shadow_finalize_path(paths)),

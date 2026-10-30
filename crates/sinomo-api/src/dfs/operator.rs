@@ -266,6 +266,10 @@ pub struct DfsOperatorObjectView {
     pub versions: Vec<DfsObjectVersionRecord>,
     pub receipts: Vec<DfsReplicaReceiptRecord>,
     pub intents: Vec<DfsWriteIntentRecord>,
+    /// Current content placement projected from its canonical owner or recorded
+    /// durability. Missing means unavailable, not an empty or completed goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_desired_replica_node_ids: Option<Vec<NodeId>>,
     pub repairs: Vec<DfsOperatorRepairView>,
     pub agent_state: DfsAgentObjectState,
 }

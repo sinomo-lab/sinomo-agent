@@ -4423,17 +4423,7 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let last_state = match backend.object_by_path(&path) {
             Ok(Some(view)) => {
                 let object = &view.object;
-                let mut current_locations = object.current_locations.clone();
-                if let Some(content_hash) = object.content_hash.as_deref() {
-                    for receipt in &view.receipts {
-                        if receipt.receipt.committed_version == object.version
-                            && receipt.content_hash.as_deref() == Some(content_hash)
-                            && !current_locations.contains(&receipt.replica_node_id)
-                        {
-                            current_locations.push(receipt.replica_node_id.clone());
-                        }
-                    }
-                }
+                let current_locations = current_version_replica_nodes(&view);
                 let size_bytes = view
                     .versions
                     .iter()
@@ -4530,17 +4520,32 @@ fn run_expect_replicated(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 }
 
+fn current_version_replica_nodes(object: &dfs::DfsOperatorObjectView) -> Vec<NodeId> {
+    let mut nodes = object.object.current_locations.clone();
+    if let Some(content_hash) = object.object.content_hash.as_deref() {
+        for receipt in &object.receipts {
+            if receipt.receipt.file_system_id == object.object.file_system_id
+                && receipt.receipt.object_id == object.object.object_id
+                && receipt.receipt.committed_version == object.object.version
+                && receipt.content_hash.as_deref() == Some(content_hash)
+                && !nodes.contains(&receipt.replica_node_id)
+            {
+                nodes.push(receipt.replica_node_id.clone());
+            }
+        }
+    }
+    nodes
+}
+
 fn current_version_desired_replica_nodes(
     object: &dfs::DfsOperatorObjectView,
 ) -> Result<Vec<NodeId>, String> {
     object
-        .intents
-        .iter()
-        .find(|intent| intent.target_version == object.object.version)
-        .map(|intent| intent.desired_replica_node_ids.clone())
+        .current_desired_replica_node_ids
+        .clone()
         .ok_or_else(|| {
             format!(
-                "DFS inspection did not return the write intent for object {} version {}",
+                "DFS inspection has no unambiguous current placement for object {} version {}",
                 object.object.object_id, object.object.version
             )
         })
@@ -6104,9 +6109,9 @@ fn pattern_payload(seed: &str, bytes: usize) -> Vec<u8> {
     let seed = payload_pattern(seed);
     let mut payload = Vec::with_capacity(bytes);
     while payload.len() < bytes {
-        payload.extend_from_slice(seed.as_bytes());
+        let remaining = bytes - payload.len();
+        payload.extend_from_slice(&seed.as_bytes()[..remaining.min(seed.len())]);
     }
-    payload.truncate(bytes);
     payload
 }
 
@@ -6682,6 +6687,68 @@ mod tests {
     use sinomo_runtime::node::ClusterId;
 
     #[test]
+    #[ignore = "manual 256 MiB payload allocation control under an owned memory limit"]
+    fn pattern_payload_large_partial_period_stays_within_requested_capacity() {
+        let path = "/services/cluster-tests/20261029-200450-2807193/large-b.bin";
+        let seed = format!("{path}|sinomo-dfs-large");
+        let pattern = concat!(
+            "/services/cluster-tests/20261029-200450-2807193/large-b.bin",
+            "|sinomo-dfs-large|sinomo-dfs-payload|"
+        )
+        .as_bytes();
+        let bytes = 268_435_456;
+        assert_eq!(pattern.len(), 96);
+        assert_eq!(bytes % pattern.len(), 64);
+        let pid = std::process::id();
+        eprintln!("pattern-payload phase=before-allocation pid={pid} requested_bytes={bytes}");
+        let payload = pattern_payload(&seed, bytes);
+        eprintln!(
+            "pattern-payload phase=allocated pid={pid} len={} capacity={}",
+            payload.len(),
+            payload.capacity()
+        );
+        assert_eq!(payload.len(), bytes);
+        assert!(
+            payload
+                .chunks(pattern.len())
+                .all(|chunk| chunk == &pattern[..chunk.len()])
+        );
+        eprintln!("pattern-payload phase=content-verified pid={pid}");
+        assert!(
+            payload.capacity() <= bytes,
+            "payload capacity {} exceeds requested {bytes} bytes",
+            payload.capacity()
+        );
+        eprintln!("pattern-payload phase=capacity-verified pid={pid}");
+    }
+
+    #[test]
+    fn pattern_payload_partial_period_keeps_exact_bytes_without_capacity_growth() {
+        let seed = "partial-period";
+        let pattern = payload_pattern(seed);
+        let period = pattern.len();
+        for bytes in [
+            0,
+            1,
+            period - 1,
+            period,
+            period + 1,
+            2 * period - 1,
+            2 * period + 1,
+        ] {
+            let payload = pattern_payload(seed, bytes);
+            assert_eq!(payload.len(), bytes);
+            assert!(payload.capacity() <= bytes);
+            assert!(
+                payload
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| { *byte == pattern.as_bytes()[index % period] })
+            );
+        }
+    }
+
+    #[test]
     fn large_expect_pattern_matches_the_original_payload_at_every_period_boundary() {
         for path in ["/large.bin", "/services/δ/文件.bin", ""] {
             let literal = format!("{path}|sinomo-dfs-large|sinomo-dfs-payload|");
@@ -7062,6 +7129,112 @@ mod tests {
             vec![desired[1].clone()]
         );
         assert_eq!(desired.len(), current.len());
+    }
+
+    fn current_goal_view_for_test() -> (dfs::DfsOperatorObjectView, Vec<NodeId>) {
+        let nodes = ["goal-owner", "goal-missing", "goal-other-holder"]
+            .into_iter()
+            .map(|name| NodeId::from_legacy_named(name).unwrap())
+            .collect::<Vec<_>>();
+        let fs = dfs::DfsFileSystemId::from_legacy_named("goal-filesystem").unwrap();
+        let object = dfs::DfsObjectId::generate();
+        let version = dfs::DfsVersion::generate();
+        let value = serde_json::json!({
+            "object": {
+                "object_id": object, "file_system_id": fs, "path": "/services/current-goal",
+                "kind": "file", "owner_node_id": nodes[0],
+                "current_locations": [nodes[0], nodes[2]],
+                "content_hash": "blake3:current-goal", "content_size_bytes": 7,
+                "mode": 420, "uid": 0, "gid": 0,
+                "accessed_at_unix_nanos": 0, "modified_at_unix_nanos": 0,
+                "created_at_unix_nanos": 0, "changed_at_unix_nanos": 0,
+                "version": version, "policy": "replicated-eventual"
+            },
+            "versions": [], "receipts": [], "repairs": [], "agent_state": "current",
+            "intents": [{
+                "publication": {"kind": "current"}, "intent_id": "original-retry-history",
+                "file_system_id": fs, "object_id": object, "target_version": version,
+                "coordinator_node_id": nodes[0], "owner_epoch": 1,
+                "desired_replica_node_ids": [nodes[0], nodes[2]],
+                "policy": {"min_commit_replicas": 1, "desired_replicas": 2},
+                "status": "committed", "content_hash": "blake3:current-goal",
+                "touch_parent_on_create": false, "created_at": "1970-01-01T00:00:00Z"
+            }]
+        });
+        (serde_json::from_value(value).unwrap(), nodes)
+    }
+
+    #[test]
+    fn current_goal_uses_projection_without_changing_retry_history() {
+        let (mut view, nodes) = current_goal_view_for_test();
+        let history = view.intents.clone();
+        view.current_desired_replica_node_ids = Some(vec![nodes[0].clone(), nodes[1].clone()]);
+        let desired = current_version_desired_replica_nodes(&view).unwrap();
+        let current = current_version_replica_nodes(&view);
+        assert_eq!(desired.len(), current.len());
+        assert_eq!(
+            missing_desired_replica_nodes(&desired, &current),
+            vec![nodes[1].clone()]
+        );
+        assert_eq!(view.intents, history);
+    }
+
+    #[test]
+    fn current_goal_old_payload_is_unavailable_even_with_current_version_history() {
+        let (view, _) = current_goal_view_for_test();
+        let encoded = serde_json::to_value(&view).unwrap();
+        assert!(encoded.get("current_desired_replica_node_ids").is_none());
+        let decoded: dfs::DfsOperatorObjectView = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.current_desired_replica_node_ids, None);
+        assert!(!decoded.intents.is_empty());
+        assert!(current_version_desired_replica_nodes(&decoded).is_err());
+    }
+
+    #[test]
+    fn current_goal_foreign_receipts_cannot_fill_an_actual_missing_member() {
+        let (mut view, nodes) = current_goal_view_for_test();
+        view.current_desired_replica_node_ids = Some(vec![nodes[0].clone(), nodes[1].clone()]);
+        let receipt: dfs::DfsReplicaReceiptRecord = serde_json::from_value(serde_json::json!({
+            "receipt": {
+                "file_system_id": view.object.file_system_id,
+                "object_id": view.object.object_id,
+                "committed_version": view.object.version,
+                "owner_node_id": nodes[0],
+                "event_id": sinomo_runtime::core::events::EventId::generate()
+            },
+            "replica_node_id": nodes[1], "content_hash": view.object.content_hash,
+            "received_at": "1970-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let mut foreign = receipt.clone();
+        foreign.receipt.file_system_id =
+            dfs::DfsFileSystemId::from_legacy_named("foreign-goal-fs").unwrap();
+        view.receipts.push(foreign);
+        let mut foreign = receipt.clone();
+        foreign.receipt.object_id = dfs::DfsObjectId::generate();
+        view.receipts.push(foreign);
+        let mut foreign = receipt.clone();
+        foreign.receipt.committed_version = dfs::DfsVersion::generate();
+        view.receipts.push(foreign);
+        let mut foreign = receipt.clone();
+        foreign.content_hash = Some("blake3:foreign-goal".into());
+        view.receipts.push(foreign);
+        let desired = current_version_desired_replica_nodes(&view).unwrap();
+        let current = current_version_replica_nodes(&view);
+        assert_eq!(
+            current.len(),
+            desired.len(),
+            "enough other holders cannot fill the missing member"
+        );
+        assert_eq!(
+            missing_desired_replica_nodes(&desired, &current),
+            vec![nodes[1].clone()]
+        );
+        view.receipts.push(receipt);
+        assert!(
+            missing_desired_replica_nodes(&desired, &current_version_replica_nodes(&view))
+                .is_empty()
+        );
     }
 
     #[test]

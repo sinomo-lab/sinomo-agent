@@ -752,7 +752,13 @@ async fn native_remote_noop_pages_resume_at_exact_backend_cursor_without_mutatio
         .unwrap();
     let calls = case.namespace_calls();
     case.service
-        .advance_placement_reconciliation_page_async(&config, &mut selected, 3, None)
+        .advance_placement_reconciliation_page_async(
+            &config,
+            &mut selected,
+            3,
+            None,
+            Instant::now(),
+        )
         .await
         .unwrap();
     assert_eq!(selected.scanned_object_count, 3);
@@ -767,7 +773,13 @@ async fn native_remote_noop_pages_resume_at_exact_backend_cursor_without_mutatio
         "one genuine primary LookupPaths supplies this page"
     );
     case.service
-        .advance_placement_reconciliation_page_async(&config, &mut selected, 3, None)
+        .advance_placement_reconciliation_page_async(
+            &config,
+            &mut selected,
+            3,
+            None,
+            Instant::now(),
+        )
         .await
         .unwrap();
     assert_eq!(selected.scanned_object_count, 4);
@@ -1833,6 +1845,35 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
                 .is_some(),
             "the exact original request remains a receipt, never executable old repair work"
         );
+        let view = crate::DfsOperatorInspector::new(case.service.metadata_backend().unwrap())
+            .object(&object.object_id)
+            .unwrap()
+            .unwrap();
+        let historical_desired = view
+            .intents
+            .iter()
+            .find(|intent| intent.target_version == view.object.version)
+            .map(|intent| intent.desired_replica_node_ids.clone())
+            .expect("current-version inspection must expose its desired replicas");
+        assert_eq!(
+            historical_desired, actual_durability.desired_replica_node_ids,
+            "inspection keeps the original retry history; ordering is not current ownership"
+        );
+        assert_eq!(
+            view.current_desired_replica_node_ids,
+            Some(vec![case.primary.clone()]),
+            "current-placement observation must exclude the superseded retry receipt"
+        );
+        assert!(
+            crate::content_durability::current_placement_durability_for_intent_from_backend(
+                case.service.metadata_backend().unwrap(),
+                &view.object,
+                &original_intent,
+            )
+            .unwrap()
+            .is_none(),
+            "an exact terminal receipt cannot be revived as current placement DATA"
+        );
     }
     case.service
         .gc_metadata_history(crate::DfsMetadataHistoryGcOptions::delete_eligible(
@@ -1850,6 +1891,36 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
     assert_eq!(
         retained.content_durability.as_ref(),
         Some(&actual_durability)
+    );
+    let current_goal = format!(
+        "placement:{}:{}:{}",
+        job.job_id, object.object_id, object.version
+    );
+    assert!(
+        case.service
+            .metadata_backend()
+            .unwrap()
+            .get_intent_receipt(&object.object_id, &current_goal)
+            .unwrap()
+            .is_none(),
+        "completed current placement remains a full repair contract after GC"
+    );
+    let view = crate::DfsOperatorInspector::new(case.service.metadata_backend().unwrap())
+        .object(&object.object_id)
+        .unwrap()
+        .unwrap();
+    let exact = crate::content_durability::current_placement_durability_for_intent_from_backend(
+        case.service.metadata_backend().unwrap(),
+        &view.object,
+        &current_goal,
+    )
+    .unwrap()
+    .expect("the existing authoritative job can read its exact full current owner");
+    assert_eq!(exact.desired_replica_node_ids, vec![case.primary.clone()]);
+    assert_eq!(exact.source_version, actual_durability.source_version);
+    assert_eq!(
+        view.current_desired_replica_node_ids,
+        Some(vec![case.primary.clone()])
     );
     if retain {
         assert!(
@@ -1892,6 +1963,15 @@ fn native_placement_retirement(retain: bool, replay_after_handoff: bool) {
         case.runtime.stop_node(&primary).unwrap();
         case.runtime.reopen_node(primary.clone()).unwrap();
         case.service = case.runtime.metadata_primary_service(&path).unwrap();
+        let view = crate::DfsOperatorInspector::new(case.service.metadata_backend().unwrap())
+            .object(&object.object_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            view.current_desired_replica_node_ids,
+            Some(vec![primary.clone()]),
+            "reopen retains the current placement projection independently of old history"
+        );
         assert!(
             !case
                 .service
@@ -2161,6 +2241,12 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
         })
     };
     let durable_before = read_job();
+    assert_eq!(
+        durable_before.state,
+        DfsPlacementReconciliationState::Pending
+    );
+    assert!(durable_before.cursor.is_none());
+    let mut durable_started = None;
     let before = case
         .service
         .metadata_backend()
@@ -2195,13 +2281,31 @@ async fn native_remote_page_cancellation_preserves_durable_cursor_and_replays_on
                 if case.runtime.rpc_observations().iter().any(|call| call.call_id > first_call && call.target == case.primary && call.route == crate::DFS_DATA_NAMESPACE_ROUTE && call.phase == RpcPhase::BeforeDispatch) { break; }
             }
         }).await.unwrap();
+        let before_cancellation = read_job();
+        if let Some(started) = durable_started.as_ref() {
+            assert_eq!(
+                &before_cancellation, started,
+                "repeated cancellation cannot advance the started job or checkpoint a page"
+            );
+        } else {
+            let mut expected = durable_before.clone();
+            expected.state = DfsPlacementReconciliationState::Scanning;
+            expected.revision += 1;
+            assert!(before_cancellation.updated_at_unix_nanos >= expected.updated_at_unix_nanos);
+            expected.updated_at_unix_nanos = before_cancellation.updated_at_unix_nanos;
+            assert_eq!(
+                before_cancellation, expected,
+                "starting a page changes only its state, revision and update time; cancellation preserves every input, cursor and counter"
+            );
+            durable_started = Some(before_cancellation.clone());
+        }
         drop(page);
         case.runtime.clear_faults();
         gate.add_permits(1);
         assert_eq!(
             read_job(),
-            durable_before,
-            "cancelled native lookup cannot checkpoint a page"
+            before_cancellation,
+            "cancelled native lookup preserves its actual pre-dispatch checkpoint"
         );
         assert_eq!(
             case.service

@@ -19,6 +19,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+pub(crate) trait TargetAuthority: Send + Sync {
+    fn check(&self, target: &DesktopTarget, operation: &str) -> DesktopResult<()>;
+}
+#[derive(Clone)]
+pub(crate) struct DeviceAuthority {
+    pub store: LocalNodePermissionStore,
+    pub application: Option<Arc<dyn TargetAuthority>>,
+}
+impl DeviceAuthority {
+    pub fn exact(store: LocalNodePermissionStore) -> Self {
+        Self {
+            store,
+            application: None,
+        }
+    }
+    pub fn check(&self, target: &DesktopTarget, operation: &str) -> DesktopResult<()> {
+        match &self.application {
+            Some(authority) => authority.check(target, operation),
+            None => authorize(&self.store, target, operation),
+        }
+    }
+}
+#[cfg(windows)]
+pub(crate) use platform::surfaces::*;
+#[cfg(not(windows))]
+#[path = "surfaces_unsupported.rs"]
+mod surfaces_unsupported;
+#[cfg(not(windows))]
+pub(crate) use surfaces_unsupported::*;
 pub fn capabilities() -> DesktopCapabilities {
     platform::capabilities()
 }
@@ -49,7 +78,7 @@ pub fn enumerate_child_windows(
 /// Cleanup is allowed after revocation so keys cannot remain stuck.
 struct InputState {
     target: DesktopTarget,
-    permissions: LocalNodePermissionStore,
+    permissions: DeviceAuthority,
     input: platform::Input,
     keys: BTreeSet<(u16, bool)>,
     buttons: BTreeSet<MouseButton>,
@@ -59,14 +88,14 @@ struct InputState {
 impl InputState {
     fn open(
         target: DesktopTarget,
-        permissions: LocalNodePermissionStore,
+        permissions: DeviceAuthority,
         cancelled: Arc<AtomicBool>,
         deadline: Instant,
     ) -> DesktopResult<Self> {
-        authorize(&permissions, &target, "input")?;
+        permissions.check(&target, "input")?;
         platform::validate_target(&target)?;
         #[cfg(target_os = "linux")]
-        let input = platform::Input::new(&target, &permissions)?;
+        let input = platform::Input::new(&target, &permissions.store)?;
         #[cfg(not(target_os = "linux"))]
         let input = platform::Input::new(&target)?;
         Ok(Self {
@@ -93,7 +122,7 @@ impl InputState {
                     Ok(())
                 };
             if let Err(error) = active
-                .and_then(|_| authorize(&self.permissions, &self.target, "input"))
+                .and_then(|_| self.permissions.check(&self.target, "input"))
                 .and_then(|_| platform::validate_target(&self.target))
                 .and_then(|_| self.input.send(event))
             {
@@ -195,7 +224,20 @@ impl DesktopInputSession {
         duration: Duration,
         cancelled: Arc<AtomicBool>,
     ) -> DesktopResult<Self> {
-        authorize(&permissions, &target, "input")?;
+        Self::open_authorized(
+            target,
+            DeviceAuthority::exact(permissions),
+            duration,
+            cancelled,
+        )
+    }
+    pub fn open_authorized(
+        target: DesktopTarget,
+        permissions: DeviceAuthority,
+        duration: Duration,
+        cancelled: Arc<AtomicBool>,
+    ) -> DesktopResult<Self> {
+        permissions.check(&target, "input")?;
         let deadline = Instant::now() + duration.min(Duration::from_secs(300));
         let (commands, receiver) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(1);
@@ -231,7 +273,7 @@ impl DesktopInputSession {
                     if last_input.elapsed() >= Duration::from_secs(30)
                         || Instant::now() >= state.deadline
                         || state.cancelled.load(Ordering::Acquire)
-                        || authorize(&state.permissions, &state.target, "input").is_err()
+                        || state.permissions.check(&state.target, "input").is_err()
                     {
                         break;
                     }
@@ -298,7 +340,7 @@ impl CaptureMailbox {
 /// select their own cadence. No encoding, polling screenshots, or unbounded queue.
 pub struct DesktopCapture {
     target: DesktopTarget,
-    permissions: LocalNodePermissionStore,
+    permissions: DeviceAuthority,
     mailbox: Arc<CaptureMailbox>,
     stop: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<()>>,
@@ -308,10 +350,16 @@ impl DesktopCapture {
         config: DesktopCaptureConfig,
         permissions: LocalNodePermissionStore,
     ) -> DesktopResult<Self> {
+        Self::start_authorized(config, DeviceAuthority::exact(permissions))
+    }
+    pub fn start_authorized(
+        config: DesktopCaptureConfig,
+        permissions: DeviceAuthority,
+    ) -> DesktopResult<Self> {
         if !(1..=120).contains(&config.frames_per_second) {
             return Err(DesktopError::Invalid("capture fps must be 1..120".into()));
         }
-        authorize(&permissions, &config.target, "capture")?;
+        permissions.check(&config.target, "capture")?;
         platform::validate_target(&config.target)?;
         let mailbox = Arc::new(CaptureMailbox::default());
         let output = mailbox.clone();
@@ -322,7 +370,11 @@ impl DesktopCapture {
         let worker = std::thread::Builder::new()
             .name("desktop-capture".into())
             .spawn(move || {
+                #[cfg(windows)]
                 let result = platform::capture(config, authority, &output, stopping, ready_tx);
+                #[cfg(not(windows))]
+                let result =
+                    platform::capture(config, authority.store, &output, stopping, ready_tx);
                 output.close(result.err());
             })
             .map_err(|e| DesktopError::Platform(e.to_string()))?;
@@ -350,7 +402,7 @@ impl DesktopCapture {
         after_sequence: u64,
         timeout: Duration,
     ) -> DesktopResult<Option<NativeVideoSample>> {
-        authorize(&self.permissions, &self.target, "capture")?;
+        self.permissions.check(&self.target, "capture")?;
         #[cfg(target_os = "linux")]
         platform::validate_capture_target(&self.target)?;
         let state = self.mailbox.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -365,7 +417,7 @@ impl DesktopCapture {
             })
             .unwrap_or_else(|e| e.into_inner());
         // Do not return a cached frame across permission revocation.
-        authorize(&self.permissions, &self.target, "capture")?;
+        self.permissions.check(&self.target, "capture")?;
         #[cfg(target_os = "linux")]
         platform::validate_capture_target(&self.target)?;
         if let Some(error) = &state.error {

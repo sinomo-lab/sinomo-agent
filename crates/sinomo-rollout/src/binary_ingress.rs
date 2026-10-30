@@ -656,10 +656,11 @@ pub fn verify_rollout_uploaded_artifact(
 }
 
 pub(crate) fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, RolloutError> {
-    let mut file = fs::File::open(path).map_err(|source| RolloutError::Io {
+    let file = fs::File::open(path).map_err(|source| RolloutError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let mut file = sinomo_core::storage::streaming_file::StreamingFileReader::new(file);
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {

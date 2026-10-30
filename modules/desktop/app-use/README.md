@@ -51,6 +51,34 @@ specific built DLL; test installation is confined to temporary data directories.
 See the [desktop agent harness](../../../docs/developer/testing.md#live-desktop-agent-verification-windows)
 for recorded real-agent tests of both modes through the same tools.
 
+## Windows application and shell surfaces
+
+Application sessions are rooted in a verified PID/process-creation identity.
+Out-of-context WinEvent hooks invalidate observed window references and mark
+window inventories dirty. The hooks run on owned message-loop threads and are
+removed before those threads or the DLL are released. Child controls retain
+parent relationships; cross-process owner links are discovery evidence and do
+not inherit process-wide authority.
+
+Application and per-surface grants are checked at every input/capture boundary.
+Legacy exact-window grants retain their original API scope. Native handles stay
+bound to one surface reference; closing an application closes its native handles
+and observers. Application discovery, window capture and semantic operations
+share the existing host/provider protocol without adding a second toolset.
+
+Visible tray and app-menu discovery uses a bounded UIA worker with automatic
+focus disabled. Tray controls are not attributed to an app by label. Semantic
+invocation requires both explicit desktop-interaction opt-in and local grants.
+Overflow is never opened implicitly. Unknown/unsupported context-menu behavior
+is reported, and no raw input is synthesized as a fallback. Timed-out requests
+are not replayed; failed worker shutdown retains the DLL mapping through the
+normal native-module quarantine mechanism.
+
+The shared host media path builds bounded application overviews and selected
+window views. Per-frame identities and tile metadata keep observation selection
+separate from input targeting. Provider-specific UIA objects and WinEvent hooks
+never escape the native module.
+
 ## Linux X11
 
 The Linux provider builds with bundled PipeWire/SPA ABI headers and ordinary C

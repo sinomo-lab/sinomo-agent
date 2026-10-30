@@ -628,7 +628,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
                 service
                     .coordinator
-                    .record_durable_receipt(intent_id, local_node_id)?;
+                    .record_durable_receipt(intent_id, local_node_id.clone())?;
+                // This invocation verified the local content and published its
+                // receipt. Retire only that replica's exact negative read view;
+                // a deduplicated historical receipt cannot clear a later failure.
+                service.clear_transient_remote_read_location_prune(
+                    object_id,
+                    version,
+                    &Some(content_hash.to_owned()),
+                    &local_node_id,
+                );
             }
             // A previous completion can have persisted this receipt and then
             // failed to authorize its exact prepared publication. Deduplicate

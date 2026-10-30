@@ -1249,6 +1249,26 @@ fn native_pending_ordinary_repair(
     // delegates it to Main and cannot be inspected as that producer.
     let mut service = runtime.metadata_primary_service("/native-repair").unwrap();
     assert_eq!(service.node_id(), &nodes[0]);
+    let shard = runtime.shared_control_plane().unwrap().with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .select_metadata_shard_for_path_strict_default_sifs_split(
+                &crate::sifs_file_system_id(),
+                "/native-repair",
+            )
+            .unwrap()
+            .expect("the seed has an actual native shard assignment")
+    });
+    // Retain this same Core producer while the existing native provider owns
+    // its real ExactShard admission for the original seed write.
+    let execution = service
+        .acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id,
+            shard_id: crate::DfsMetadataShardId::new(shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: format!("native-ordinary-repair-seed:{name}"),
+        })
+        .unwrap()
+        .expect("the actual Core provider acquired native seed admission");
     let stat = service
         .posix_write_file(
             "/native-repair",
@@ -1261,6 +1281,7 @@ fn native_pending_ordinary_repair(
             },
         )
         .unwrap();
+    drop(execution);
     assert_eq!(service.coordinator.repair_jobs().len(), 2);
     assert_eq!(service.durable_repair_queue_records().len(), 2);
     (runtime, nodes, service, stat)

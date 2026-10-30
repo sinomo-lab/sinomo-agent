@@ -10,6 +10,7 @@ pub mod durable_file;
 pub mod io_trace;
 pub mod migration;
 pub mod scratch;
+pub mod streaming_file;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

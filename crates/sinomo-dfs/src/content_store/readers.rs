@@ -1,5 +1,6 @@
 use super::inline_bindings::{ContentReadSnapshot, InlineReaderLease, InlineStoreLease};
 use super::{ContentExtent, ValidatedContentManifest};
+use sinomo_core::storage::streaming_file::StreamingFileReader;
 use std::fs;
 use std::io::{self, Read};
 use std::sync::Arc;
@@ -10,21 +11,44 @@ use std::sync::Arc;
 /// stream large DFS payloads without buffering the full blob in memory.
 #[derive(Debug)]
 pub struct BlobReader {
-    file: Option<fs::File>,
+    file: Option<BlobFile>,
     size_bytes: u64,
     remaining_bytes: u64,
     store_lease: Option<InlineStoreLease>,
     inline_generation: Option<InlineReaderLease>,
 }
 
+#[derive(Debug)]
+enum BlobFile {
+    Plain(fs::File),
+    Streaming(StreamingFileReader),
+}
+
+impl Read for BlobFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(file) => file.read(buffer),
+            Self::Streaming(file) => file.read(buffer),
+        }
+    }
+}
+
 impl BlobReader {
     pub(super) fn new(file: fs::File, size_bytes: u64) -> Self {
-        Self::with_remaining(file, size_bytes, size_bytes)
+        // Only the complete loose-blob path opts into consumed-page advice.
+        // Inline/shared segment and bounded-range readers stay plain below.
+        Self {
+            file: Some(BlobFile::Streaming(StreamingFileReader::new(file))),
+            size_bytes,
+            remaining_bytes: size_bytes,
+            store_lease: None,
+            inline_generation: None,
+        }
     }
 
     pub(super) fn with_remaining(file: fs::File, size_bytes: u64, remaining_bytes: u64) -> Self {
         Self {
-            file: Some(file),
+            file: Some(BlobFile::Plain(file)),
             size_bytes,
             remaining_bytes,
             store_lease: None,
@@ -383,5 +407,68 @@ impl Read for ManifestExtentRangeReader {
             }
         }
         Ok(total_read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom};
+
+    #[test]
+    fn full_loose_reader_preserves_bytes_bounds_and_empty_reads() {
+        let root = sinomo_testdir::TestDir::new("full-loose-reader-bounds");
+        let path = root.join("blob");
+        fs::write(&path, b"abcdef").unwrap();
+        let mut reader = BlobReader::new(fs::File::open(&path).unwrap(), 4);
+        assert!(matches!(&reader.file, Some(BlobFile::Streaming(_))));
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut bytes = Vec::new();
+        assert_eq!(reader.read_to_end(&mut bytes).unwrap(), 4);
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(fs::read(path).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn positioned_inline_and_range_readers_remain_plain_and_bounded() {
+        let root = sinomo_testdir::TestDir::new("plain-range-reader-bounds");
+        let path = root.join("segment");
+        fs::write(&path, b"prefixPAYLOADsuffix").unwrap();
+        let mut inline_file = fs::File::open(&path).unwrap();
+        inline_file.seek(SeekFrom::Start(6)).unwrap();
+        let mut inline = BlobReader::with_remaining(inline_file, 7, 7);
+        assert!(matches!(&inline.file, Some(BlobFile::Plain(_))));
+        let mut bytes = Vec::new();
+        inline.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"PAYLOAD");
+
+        let mut range_file = fs::File::open(&path).unwrap();
+        range_file.seek(SeekFrom::Start(8)).unwrap();
+        let mut range = BlobRangeReader::new(range_file, 2, 7, 3);
+        assert!(matches!(&range.reader.file, Some(BlobFile::Plain(_))));
+        bytes.clear();
+        range.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"YLO");
+        assert_eq!(range.offset(), 2);
+        assert_eq!(range.remaining_bytes(), 0);
+        assert_eq!(fs::read(path).unwrap(), b"prefixPAYLOADsuffix");
+    }
+
+    #[test]
+    fn both_reader_backings_reject_premature_eof() {
+        let root = sinomo_testdir::TestDir::new("blob-reader-premature-eof");
+        let path = root.join("blob");
+        fs::write(&path, b"short").unwrap();
+        for mut reader in [
+            BlobReader::new(fs::File::open(&path).unwrap(), 6),
+            BlobReader::with_remaining(fs::File::open(&path).unwrap(), 6, 6),
+        ] {
+            let mut bytes = Vec::new();
+            let error = reader.read_to_end(&mut bytes).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(bytes, b"short");
+            assert_eq!(reader.remaining_bytes, 1);
+        }
     }
 }

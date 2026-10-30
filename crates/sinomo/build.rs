@@ -9,6 +9,11 @@ const WINDOWS_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
     configure_windows_main_stack();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        // RPATH also covers dependencies of independently rolled-out native
+        // modules. RUNPATH only covers the executable's direct dependencies.
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags,-rpath,$ORIGIN/lib");
+    }
     println!("cargo:rerun-if-env-changed={ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV}");
     let commit = std::env::var(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV)
         .ok()
@@ -41,7 +46,7 @@ fn windows_main_stack_link_arg(target_os: &str, target_env: &str) -> Option<Stri
 }
 
 fn git_commit() -> Option<String> {
-    let hash = run(&["rev-parse", "--short=12", "HEAD"])?;
+    let hash = run(&["rev-parse", "HEAD"])?;
     let hash = hash.trim();
     if hash.is_empty() {
         return None;

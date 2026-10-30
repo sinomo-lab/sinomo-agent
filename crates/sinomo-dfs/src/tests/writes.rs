@@ -874,6 +874,9 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     let path = "/services/local-primary-large.bin";
     let mut placement = DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 2).unwrap();
     placement.required_node_ids = vec![local.clone(), peer.clone()];
+    // The original write must carry the constraints of this installed rule.
+    let mut policy = DfsReplicationPolicy::new(1, 2).unwrap();
+    policy.required_node_ids = placement.required_node_ids.clone();
     runtime
         .apply_placement_policy(&local, path, DfsPlacementScope::Subtree, placement)
         .unwrap();
@@ -895,18 +898,20 @@ fn posix_local_primary_detached_manifest_write_persists_visible_metadata_without
     let bytes = vec![0x63; 2 * 1024 * 1024 + 8192];
     let expected_hash = content_hash(&bytes);
     let before = runtime.rpc_observations().len();
+    let execution = super::repair::native_fixture_write_admission(&runtime, &writer, path);
     let stat = writer
         .posix_write_file_with_known_parent_deferred_local_replay(
             path,
             &bytes,
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(1, 2).unwrap(),
+                policy,
                 replica_candidates: vec![local.clone(), peer.clone()],
                 wait_for_commit: false,
                 foreground_replica_repair: false,
             },
         )
         .unwrap();
+    drop(execution);
     assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
     assert_eq!(writer.posix_read_file(path).unwrap(), bytes);
     let actual = writer

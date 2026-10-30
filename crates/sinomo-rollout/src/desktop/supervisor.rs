@@ -117,11 +117,57 @@ fn is_managed_app_launch(data_dir: &SinomoDataDir, releases: &DesktopReleases, a
     if fs::canonicalize(installed).is_ok_and(|installed| installed == app) {
         return true;
     }
+    if app.file_name() == Some(std::ffi::OsStr::new(&name))
+        && app.parent().is_some_and(|directory| {
+            sinomo_core::local::installed_data_dir(directory)
+                .ok()
+                .flatten()
+                .and_then(|root| fs::canonicalize(root).ok())
+                .zip(fs::canonicalize(data_dir.root()).ok())
+                .is_some_and(|(bound, selected)| bound == selected)
+        })
+    {
+        return true;
+    }
     // Immutable installed images can also be launched directly. Compare canonical paths so
     // relative data directories and platform path aliases have the same launch policy.
     app.file_name() == Some(std::ffi::OsStr::new(&name))
         && fs::canonicalize(releases.root.join("releases"))
             .is_ok_and(|root| app.parent().and_then(Path::parent) == Some(root.as_path()))
+}
+
+#[cfg(test)]
+mod installation_tests {
+    use super::*;
+
+    #[test]
+    fn custom_install_binding_only_manages_its_selected_data_root() {
+        let fixture = sinomo_testdir::TestDir::new("custom-install-launch");
+        let install = fixture.join("application");
+        let data = fixture.join("data");
+        let other = fixture.join("other-data");
+        for directory in [&install, &data, &other] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let app = install.join(crate::executable_name("sinomo-app"));
+        fs::write(&app, b"fixture").unwrap();
+        let app = fs::canonicalize(app).unwrap();
+        let selected = SinomoDataDir::new(&data);
+        let releases = DesktopReleases::new(&data);
+        assert!(!is_managed_app_launch(&selected, &releases, &app));
+        fs::write(
+            install.join(sinomo_core::local::INSTALLED_DATA_DIR_FILE),
+            data.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(is_managed_app_launch(&selected, &releases, &app));
+        let other = SinomoDataDir::new(other);
+        assert!(!is_managed_app_launch(
+            &other,
+            &DesktopReleases::new(other.root()),
+            &app
+        ));
+    }
 }
 
 fn run_app_loop(
@@ -193,7 +239,7 @@ fn run_app_loop(
                     return Err("candidate manifest identity changed".into());
                 }
                 verify_bundle(&directory, &manifest)?;
-                Ok(directory.join(crate::executable_name("sinomo-app")))
+                releases.publish_canonical(&directory)
             })();
             match candidate {
                 Ok(candidate) => {
@@ -223,9 +269,8 @@ fn active_app(releases: &DesktopReleases) -> Result<Option<PathBuf>> {
     Ok(active_launch(releases)?.map(|(app, _)| app))
 }
 
-// A pre-consolidation installed release can still restore its GUI, but its retired helper
-// is never executed. The caller's current CLI hosts the daemon until a new bundle is activated.
-// New imports and candidate activation continue to require the CLI in the verified manifest.
+// Historical files remain part of bundle verification, but daemon images in a
+// desktop artifact are never executed. Only the canonical CLI can host a daemon.
 fn active_launch(releases: &DesktopReleases) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     let Some(id) = releases.status()?.active_release else {
         return Ok(None);
@@ -235,30 +280,16 @@ fn active_launch(releases: &DesktopReleases) -> Result<Option<(PathBuf, Option<P
     if release_id(&manifest)? != id {
         return Err("active manifest identity changed".into());
     }
-    let cli_name = crate::executable_name("sinomo");
-    let bundled_cli = manifest.files.iter().any(|file| file.path == cli_name);
-    if bundled_cli {
-        verify_bundle(&directory, &manifest)?;
-    } else {
-        if manifest.target_os != std::env::consts::OS
-            || manifest.target_arch != std::env::consts::ARCH
-        {
-            return Err("desktop bundle is for a different platform".into());
-        }
-        validate_manifest_shape_for_binaries(
-            &manifest,
-            &[
-                "sinomo-app",
-                "sinomo-app-daemon",
-                "sinomo-ui-extension-host",
-            ],
-        )?;
-        verify_manifest_files(&directory, &manifest)?;
-    }
-    Ok(Some((
-        directory.join(crate::executable_name("sinomo-app")),
-        bundled_cli.then(|| directory.join(cli_name)),
-    )))
+    verify_bundle(&directory, &manifest)?;
+    let app = releases.publish_canonical(&directory)?;
+    let cli = releases
+        .root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("no data directory")?
+        .join("bin")
+        .join(crate::executable_name("sinomo"));
+    Ok(Some((app, cli.is_file().then_some(cli))))
 }
 
 #[cfg(all(test, unix))]

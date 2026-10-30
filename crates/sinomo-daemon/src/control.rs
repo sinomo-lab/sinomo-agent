@@ -912,6 +912,8 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     // uses this hook to recover interrupted native-loader transactions without
     // making the daemon depend on Rollout implementation code.
     let data_dir_root = daemon_data_dir_path(&paths)?;
+    sinomo_core::local::ensure_deployment_enabled(&data_dir_root)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     component_catalog
         .run_startup_contributors(&data_dir_root)
         .map_err(|detail| DaemonError::Parse { detail })?;

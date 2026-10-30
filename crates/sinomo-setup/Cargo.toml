@@ -1,0 +1,15 @@
+[package]
+name = "sinomo-setup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Graphical initial installation and removal of Sinomo desktop bundles"
+
+[package.metadata.sinomo]
+ring = "application"
+
+[dependencies]
+sinomo-runtime = { path = "../sinomo-runtime" }
+rfd.workspace = true
+tar.workspace = true

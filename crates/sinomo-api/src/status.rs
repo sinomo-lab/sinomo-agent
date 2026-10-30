@@ -273,7 +273,8 @@ pub fn daemon_package_version() -> String {
     daemon_build_info().version
 }
 
-/// Short git commit the daemon process was built from, installed by the application binary.
+/// Git revision the daemon process was built from, installed by the application binary.
+/// Current ordinary builds embed the full commit; older builds may report an abbreviation.
 /// Returns None when the process had no git context (commit recorded as "unknown").
 pub fn daemon_git_commit() -> Option<String> {
     daemon_build_info().commit

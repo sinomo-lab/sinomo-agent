@@ -13,6 +13,10 @@ use std::{
 };
 pub(crate) const CLOUD_FILES_DFS_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
+#[path = "endpoint_transport/main_query_tests.rs"]
+mod main_query_tests;
+
 #[derive(Clone)]
 pub(crate) struct DfsCloudFilesEndpointTransport {
     local_node_id: NodeId,
@@ -199,6 +203,40 @@ impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
 }
 
 impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
+    fn send_local_metadata_query_to_main(
+        &mut self,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        if message.source_node_id != self.local_node_id
+            || message.target_node_id != self.local_node_id
+            || !matches!(&message.message,
+                dfs::DfsNetworkMessage::NamespaceRequest(command)
+                if command.requesting_node_id == self.local_node_id
+                    && !command.include_metadata_journal_batches
+                    && command.metadata_journal_after_sequences.is_empty()
+                    && matches!(command.operation, dfs::DfsNamespaceOperation::MetadataQuery { .. }))
+        {
+            return Err(NetworkError::Io {
+                operation: "local metadata query to Main".into(),
+                detail: "only an exact local read-only metadata query may use Main dispatch".into(),
+            });
+        }
+        if self.daemon_peer.is_none() {
+            return Err(NetworkError::Io {
+                operation: "local metadata query to Main".into(),
+                detail: "registered Main query has no authenticated sender".into(),
+            });
+        }
+        // Reuse the daemon peer's Main affinity, deadline and response custody.
+        // Without that peer, ordinary self-dispatch would enqueue locally;
+        // mounted metadata queries may never substitute that private authority.
+        self.send_routed_call_to_target(
+            &self.local_node_id.clone(),
+            DfsRoutedCall::value(message),
+            true,
+        )
+    }
+
     fn take_namespace_response(
         &mut self,
         request_id: &str,

@@ -247,19 +247,35 @@ finalization has a bounded encoder deadline.
 
 | Case | Independent acceptance condition |
 |---|---|
-| `agent.desktop.app-form` | Submit a fresh code, set counter to 3 and toggle ON while another window retains focus and the pointer stays unchanged |
+| `agent.desktop.app-multiwindow` | Open a second window, select its full-resolution application view, submit the code and operate its controls using matching surface IDs |
+| `agent.desktop.app-form` | Submit a fresh code, set counter to 3 and toggle ON while controlled windows remain in the background and the pointer stays unchanged |
 | `agent.desktop.app-drag-resize` | Resize, drag into a target, scroll exactly three ticks and submit the code in an occluded background window |
 | `agent.desktop.computer-form` | Complete the form through raw input while the owned full-screen fixture retains foreground |
 | `agent.desktop.gamepad-capability` | Attempt native neutral gamepad injection and close the input lease; unsupported hosts are explicitly skipped |
 | `agent.desktop.gamepad-state` | Observe A, stick and trigger values through XInput or Windows.Gaming.Input, then observe neutral before closing the lease; unsupported hosts are explicitly skipped |
 
 `-UseInteractiveDesktop` explicitly allows the owned windows on the current
-desktop. Setup may click an owned, hit-tested window to establish foreground,
-restoring the pointer before measurements begin. Raw tests occupy the primary
-display and move the pointer. Avoid user input during the run. Foreground and desktop checks stop raw input and frame
-forwarding when ownership changes; a hidden watchdog stops only the exact owned
-child on timeout or launcher failure and restores the previous desktop, pointer
-and foreground. These guards are test isolation, not a security sandbox.
+desktop. Background fixtures appear without activation and allow unrelated
+windows to become foreground. They record activation/focus messages in the
+controlled windows, foreground state when input arrives, and a bounded diagnostic
+sample of global foreground changes. A brief target activation still fails even
+if another window becomes foreground again. Pointer equality remains a separate
+assertion, so avoid moving the pointer during verification.
+
+`-BackgroundInterruption -Case agent.desktop.app-multiwindow` deliberately
+activates an uncontrolled guard before measurement, then creates and activates
+another uncontrolled window after the first input. Acceptance requires further
+input and task completion in the controlled background windows. This mode uses
+no injected keyboard/mouse input to cause the interruption and fails setup if
+Windows denies the initial guard activation.
+
+Raw tests occupy the primary display and move the pointer. Their setup may click
+an owned, hit-tested window to establish foreground, restoring the pointer before
+measurement. Foreground and desktop checks stop raw input and frame forwarding
+when ownership changes. A hidden watchdog stops only the exact owned child on
+timeout or launcher failure. Desktop/input restoration applies to raw or separate
+desktop runs; shared-desktop background runs leave newer foreground and pointer
+state alone. These guards are test isolation, not a security sandbox.
 Without that flag, the launcher uses a separate Win32 desktop. On the verified
 Windows host, WGC returned a zero-sized capture item there even after painting
 and activating the window; interactive fixture mode was required. The harness
@@ -275,6 +291,26 @@ hashes. MP4 recording uses FFmpeg only as an artifact sink after Sinomo's shared
 encoder and media transport; repeated latest frames preserve recording time
 and are declared in its metadata. Failed runs are retained, and reusing an
 existing run directory is rejected.
+
+## Native application and tray verification
+
+Build `sinomo-app-use-module` and run the owned Windows surface fixture with the
+keyboard/pointer idle. The tray case may explicitly open the shell overflow and
+its own menu; it never invokes another application's icon. It requires `ffmpeg`
+on PATH. A non-English shell can set `SINOMO_TRAY_OVERFLOW_NAME` to the exposed
+UIA name of its overflow toggle.
+
+```powershell
+$env:SINOMO_APP_SURFACES_ARTIFACTS = Join-Path $PWD ('benchmark-results/app-surfaces-' + [Guid]::NewGuid().ToString('N'))
+cargo test -p sinomo-actions --test app_use_surfaces_windows -- --ignored --test-threads=1
+```
+
+The fixture checks process-scoped grants, new windows, disabled owners/dialogs,
+stale references, main-window closure, visible tray invocation and menu actions.
+Tray recordings and call receipts are written under the configured artifact
+root. Run the `agent.desktop.app-multiwindow` case through the desktop agent
+launcher for a real model/runtime/tool test with an application overview and
+explicit video selection. Keep failed runs and source/provider hash receipts.
 
 ## Live Realtime Visual Probe
 

@@ -6527,6 +6527,7 @@ fn cluster_repair_members_parser_accepts_peer_and_promotion() {
 fn install_parser_accepts_custom_daemon_ports() {
     assert_eq!(
         parse_install_schema_for_test(&[
+            "--runtime-service".to_string(),
             "--host".to_string(),
             "127.0.0.1".to_string(),
             "--port".to_string(),
@@ -6545,12 +6546,54 @@ fn install_parser_accepts_custom_daemon_ports() {
             port_fallback: false,
             shadow_port_fallback: false,
             start: false,
+            runtime_service: true,
+            preserve_service_configuration: false,
+            ..InstallOptions::default()
         }
     );
     assert_eq!(
-        parse_uninstall_schema_for_test(&["--no-stop".to_string()]).expect("uninstall options"),
-        UninstallOptions { stop: false }
+        parse_uninstall_schema_for_test(&["--runtime-service".to_string(), "--no-stop".to_string()]).expect("uninstall options"),
+        UninstallOptions { stop: false, runtime_service: true, ..UninstallOptions::default() }
     );
+}
+
+#[test]
+fn install_parser_separates_initial_setup_from_service_deployment() {
+    let parsed = parse_install_schema_for_test(&[
+        "--install-dir".into(),
+        "application folder".into(),
+        "--data-dir".into(),
+        "data folder".into(),
+        "--add-to-path".into(),
+        "--desktop-shortcut".into(),
+        "--menu-shortcut".into(),
+    ])
+    .expect("initial setup options");
+    assert_eq!(
+        parsed.install_dir,
+        Some(PathBuf::from("application folder"))
+    );
+    assert_eq!(parsed.data_dir, Some(PathBuf::from("data folder")));
+    assert!(parsed.add_to_path && parsed.desktop_shortcut && parsed.menu_shortcut);
+    assert!(!parsed.runtime_service);
+    assert!(parsed.start);
+    let defaults = sinomo_runtime::installer::initial_setup::services::Options::default();
+    assert_eq!(parsed.host, defaults.host);
+    assert_eq!((parsed.port, parsed.shadow_port), (defaults.main_port, defaults.shadow_port));
+    let service = parse_install_schema_for_test(&["--port".into(), "21400".into(), "--no-start".into()]).unwrap();
+    assert!(!service.start && !service.port_fallback);
+    assert!(
+        parse_install_schema_for_test(&["--runtime-service".into(), "--add-to-path".into()])
+            .is_err()
+    );
+    let removal = parse_uninstall_schema_for_test(&[
+        "--install-dir".into(),
+        "application folder".into(),
+        "--delete-data".into(),
+    ])
+    .unwrap();
+    assert!(removal.delete_data && !removal.runtime_service);
+    assert!(!UninstallOptions::default().delete_data);
 }
 
 #[test]
@@ -7193,6 +7236,8 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
             port_fallback: false,
             shadow_port_fallback: false,
             start: false,
+            runtime_service: true,
+            ..InstallOptions::default()
         },
         &layout,
     )
@@ -7228,10 +7273,10 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
         storage_report
             .covered
             .iter()
-            .any(|path| path.relative_path == "bin/sinomo")
+            .any(|path| path.relative_path == format!("bin/sinomo{}", std::env::consts::EXE_SUFFIX))
     );
 
-    uninstall_with_layout(UninstallOptions { stop: false }, &layout).expect("uninstall");
+    uninstall_with_layout(UninstallOptions { stop: false, runtime_service: true, ..UninstallOptions::default() }, &layout).expect("uninstall");
     assert!(!layout.main_boot_entry.exists());
     assert!(!layout.shadow_boot_entry.exists());
     assert!(layout.data_dir.exists());
@@ -7377,6 +7422,8 @@ fn install_reports_unregistered_storage_without_blocking_startup() {
             port_fallback: false,
             shadow_port_fallback: false,
             start: false,
+            runtime_service: true,
+            ..InstallOptions::default()
         },
         &layout,
     )
@@ -7388,7 +7435,7 @@ fn install_reports_unregistered_storage_without_blocking_startup() {
             && finding.detail.contains("unexpected-local-file")
     }));
 
-    uninstall_with_layout(UninstallOptions { stop: false }, &layout).expect("uninstall");
+    uninstall_with_layout(UninstallOptions { stop: false, runtime_service: true, ..UninstallOptions::default() }, &layout).expect("uninstall");
 }
 
 #[test]

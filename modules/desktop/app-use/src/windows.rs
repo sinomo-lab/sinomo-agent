@@ -1,3 +1,5 @@
+#[path = "windows/surfaces.rs"]
+pub(crate) mod surfaces;
 use super::*;
 use sinomo_device::{NativeVideoPlane, NativeVideoSampleFormat};
 use std::ffi::c_void;
@@ -710,7 +712,7 @@ fn send_input(events: &[INPUT]) -> DesktopResult<()> {
 
 pub fn capture(
     config: DesktopCaptureConfig,
-    permissions: LocalNodePermissionStore,
+    permissions: DeviceAuthority,
     output: &CaptureMailbox,
     stop: mpsc::Receiver<()>,
     ready: mpsc::SyncSender<DesktopResult<()>>,
@@ -737,7 +739,7 @@ pub fn capture(
             Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        authorize(&permissions, &config.target, "capture")?;
+        permissions.check(&config.target, "capture")?;
         validate_target(&config.target)?;
         if pending_frame && Instant::now() >= next_frame {
             pending_frame = false;

@@ -6,7 +6,6 @@ use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -971,12 +970,71 @@ fn resolve_evolution_repo(
     }
     let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
     ensure_rollout_layout(&rollout_paths)?;
-    let current_repo = env::current_dir().map_err(|source| CliError::Io {
-        path: ".".to_string(),
-        detail: source.to_string(),
-    })?;
-    ensure_rollout_source_repo(&rollout_paths, Some(&current_repo))?;
+    if !rollout_paths.source_repo.join(".git").exists() {
+        return Err(CliError::Parse { detail: "managed source is not installed; install the complete distribution or select --repo explicitly".into() });
+    }
+    ensure_rollout_source_repo(&rollout_paths, Some(&rollout_paths.source_repo))?;
     Ok(rollout_paths.source_repo)
+}
+
+#[cfg(test)]
+mod installation_source_tests {
+    use super::*;
+
+    #[test]
+    fn default_evolution_repo_does_not_import_the_callers_checkout() {
+        let fixture = sinomo_testdir::TestDir::new("evolution-managed-installation");
+        let data = SinomoDataDir::new(fixture.join("data"));
+        assert!(resolve_evolution_repo(&data, None).is_err());
+        let repo = SelfRolloutPaths::new(&data.root()).source_repo;
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "fixture"],
+            vec!["config", "user.email", "fixture@invalid"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(repo.join("evolved"), b"preserve this divergent source").unwrap();
+        for args in [
+            vec!["add", "evolved"],
+            vec!["commit", "-q", "-m", "Evolved fixture"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let head = || {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout
+        };
+        let before = head();
+        assert_eq!(resolve_evolution_repo(&data, None).unwrap(), repo);
+        assert_eq!(head(), before);
+        assert_eq!(
+            std::fs::read(repo.join("evolved")).unwrap(),
+            b"preserve this divergent source"
+        );
+    }
 }
 
 fn resolve_requested_evolution_model(

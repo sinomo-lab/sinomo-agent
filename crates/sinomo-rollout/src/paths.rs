@@ -19,7 +19,7 @@ pub struct SelfRolloutPaths {
 impl SelfRolloutPaths {
     pub fn new(data_dir_root: &Path) -> Self {
         let root = data_dir_root.join("rollout");
-        let bin = data_dir_root.join("bin");
+        let bin = sinomo_core::local::SinomoDataDir::new(data_dir_root).bin_dir();
         let build_paths = sinomo_build::BuildPaths::new(data_dir_root);
         Self {
             source_repo: build_paths.managed_source,

@@ -8,6 +8,7 @@ param(
     [string]$RunDirectory,
     [ValidateRange(128,4096)][int]$CaptureMaxDimension = 1440,
     [switch]$CoordinateGrid,
+    [switch]$BackgroundInterruption,
     [int]$TimeoutSeconds = 900,
     [switch]$FixtureOnly,
     [switch]$UseInteractiveDesktop,
@@ -93,9 +94,11 @@ if ($Watchdog) {
             Stop-OwnedChild $owner
             $restore = [DesktopHarness]::OpenDesktopW($owner.original_desktop,0,$false,0x101)
             if ($restore -ne [IntPtr]::Zero) {
-                [DesktopHarness]::SwitchDesktop($restore) | Out-Null
-                [DesktopHarness]::SetCursorPos($owner.pointer_x,$owner.pointer_y) | Out-Null
-                if ([DesktopHarness]::IsWindow([IntPtr]$owner.foreground)) { [DesktopHarness]::SetForegroundWindow([IntPtr]$owner.foreground) | Out-Null }
+                if ($owner.switch_desktop) { [DesktopHarness]::SwitchDesktop($restore) | Out-Null }
+                if ($owner.restore_input) {
+                    [DesktopHarness]::SetCursorPos($owner.pointer_x,$owner.pointer_y) | Out-Null
+                    if ([DesktopHarness]::IsWindow([IntPtr]$owner.foreground)) { [DesktopHarness]::SetForegroundWindow([IntPtr]$owner.foreground) | Out-Null }
+                }
                 [DesktopHarness]::CloseDesktop($restore) | Out-Null
             }
             [IO.File]::WriteAllText((Join-Path $RunDirectory 'watchdog-recovery.txt'),'The launcher ended or exceeded its deadline. Its exact child was stopped and the original desktop restored.')
@@ -106,6 +109,10 @@ if ($Watchdog) {
     exit 0
 }
 
+if ($BackgroundInterruption -and $Case -ne 'agent.desktop.app-multiwindow') { throw 'BackgroundInterruption requires agent.desktop.app-multiwindow.' }
+# Shared-desktop background tests must not undo another application's newer
+# foreground/pointer state. Raw tests and switched desktops still own restoration.
+$restoreInput = !$UseInteractiveDesktop -or !$Case -or !$Case.StartsWith('agent.desktop.app-')
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (!$Binary) { $Binary = Join-Path $repo 'target/debug/sinomo.exe' }
 $Binary = (Resolve-Path -LiteralPath $Binary).Path
@@ -147,6 +154,7 @@ try {
         '--param',('ffmpeg='+$ffmpeg),'--param',('ffprobe='+$ffprobe))
     if ($FixtureOnly) { $arguments += @('--param','fixture-only=true') }
     if ($CoordinateGrid) { $arguments += @('--param','coordinate-grid=true') }
+    if ($BackgroundInterruption) { $arguments += @('--param','background-interruption=true') }
     if ($UseInteractiveDesktop) { $arguments += @('--param','interactive-fixture=true') }
     $sourceFiles = @(& git -C $repo diff --name-only) + @(& git -C $repo ls-files --others --exclude-standard)
     $deletedSources = @(& git -C $repo diff --name-only --diff-filter=D)
@@ -161,7 +169,7 @@ try {
     $child = Get-Process -Id $childId
     $parent = Get-Process -Id $PID
     $owner = @{parent_pid=$PID;parent_start_ticks=$parent.StartTime.ToUniversalTime().Ticks;child_pid=$childId;child_start_ticks=$child.StartTime.ToUniversalTime().Ticks;
-        binary=$Binary;original_desktop=[DesktopHarness]::Name($original);foreground=$foreground.ToInt64();pointer_x=$pointer.X;pointer_y=$pointer.Y;
+        binary=$Binary;switch_desktop=(!$UseInteractiveDesktop);restore_input=$restoreInput;original_desktop=[DesktopHarness]::Name($original);foreground=$foreground.ToInt64();pointer_x=$pointer.X;pointer_y=$pointer.Y;
         deadline_utc=[DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds).ToString('o')}
     $owner | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $RunDirectory 'owner.json')
     $watchdogArgs = @('-NoProfile','-File',$PSCommandPath,'-Watchdog','-RunDirectory',$RunDirectory) | ForEach-Object { [DesktopHarness]::Quote($_) }
@@ -171,7 +179,7 @@ try {
     $started = [Diagnostics.Stopwatch]::StartNew()
     $switched = $false
     while ([DesktopHarness]::WaitForSingleObject($childHandle,250) -eq 258) {
-        if (!$switched -and (Test-Path -LiteralPath (Join-Path $RunDirectory 'desktop-ready'))) {
+        if (!$UseInteractiveDesktop -and !$switched -and (Test-Path -LiteralPath (Join-Path $RunDirectory 'desktop-ready'))) {
             if (![DesktopHarness]::SwitchDesktop($testDesktop)) { throw 'Cannot activate isolated desktop.' }
             $switched=$true
         }
@@ -185,9 +193,11 @@ try {
         if ([DesktopHarness]::WaitForSingleObject($childHandle,0) -eq 258) { Stop-OwnedChild $owner }
         [DesktopHarness]::CloseHandle($childHandle) | Out-Null
     }
-    [DesktopHarness]::SwitchDesktop($original) | Out-Null
-    [DesktopHarness]::SetCursorPos($pointer.X,$pointer.Y) | Out-Null
-    if ([DesktopHarness]::IsWindow($foreground)) { [DesktopHarness]::SetForegroundWindow($foreground) | Out-Null }
+    if (!$UseInteractiveDesktop) { [DesktopHarness]::SwitchDesktop($original) | Out-Null }
+    if ($restoreInput) {
+        [DesktopHarness]::SetCursorPos($pointer.X,$pointer.Y) | Out-Null
+        if ([DesktopHarness]::IsWindow($foreground)) { [DesktopHarness]::SetForegroundWindow($foreground) | Out-Null }
+    }
     [DesktopHarness]::CloseDesktop($original) | Out-Null
     if ($testDesktop -ne [IntPtr]::Zero) { [DesktopHarness]::CloseDesktop($testDesktop) | Out-Null }
     [IO.File]::WriteAllText((Join-Path $RunDirectory 'watchdog.stop'),'restored')

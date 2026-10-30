@@ -10212,11 +10212,19 @@ dependencies = [
 name = "sinomo-installer"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "fs2",
+ "serde",
+ "serde_json",
  "sinomo-api",
+ "sinomo-build",
  "sinomo-core",
  "sinomo-daemon",
+ "sinomo-module",
  "sinomo-rollout",
  "sinomo-testdir",
+ "sysinfo",
+ "tar",
 ]
 
 [[package]]
@@ -10530,6 +10538,7 @@ dependencies = [
  "sinomo-module-api",
  "sinomo-registry",
  "sinomo-testdir",
+ "sysinfo",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -10695,6 +10704,15 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sinomo-setup"
+version = "0.1.0"
+dependencies = [
+ "rfd",
+ "sinomo-runtime",
+ "tar",
 ]
 
 [[package]]

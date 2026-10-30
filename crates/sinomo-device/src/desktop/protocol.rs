@@ -1,5 +1,6 @@
 //! Versioned OS boundary using the native module SOBJ ABI. Continuous capture
 //! returns raw BGRA samples for the common media encoder, never encoded images.
+use super::surfaces::*;
 use super::*;
 use crate::{NativeVideoPlane, NativeVideoSampleFormat};
 use std::sync::Arc;
@@ -23,6 +24,44 @@ pub struct DesktopProviderRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DesktopProviderCommand {
+    SurfaceCapabilities,
+    Applications,
+    OpenApplication {
+        application: DesktopApplication,
+        lease_ms: u64,
+    },
+    ApplicationSurfaces {
+        application_id: String,
+    },
+    CloseApplication {
+        application_id: String,
+    },
+    ResolveApplicationWindow {
+        binding: ApplicationWindowBinding,
+        operation: String,
+    },
+    OpenApplicationInput {
+        binding: ApplicationWindowBinding,
+        lease_ms: u64,
+    },
+    OpenApplicationCapture {
+        binding: ApplicationWindowBinding,
+        config: DesktopCaptureConfig,
+    },
+    TrayItems,
+    InvokeTray {
+        item_id: String,
+        operation: DesktopSemanticAction,
+        allow_desktop_interaction: bool,
+    },
+    MenuItems {
+        binding: ApplicationWindowBinding,
+    },
+    InvokeMenuItem {
+        binding: ApplicationWindowBinding,
+        item_id: String,
+        allow_desktop_interaction: bool,
+    },
     Capabilities,
     Targets {
         mode: DesktopControlMode,
@@ -57,6 +96,26 @@ pub enum DesktopProviderCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DesktopProviderResponse {
+    SurfaceCapabilities {
+        capabilities: DesktopSurfaceCapabilities,
+    },
+    Applications {
+        applications: Vec<DesktopApplicationInfo>,
+    },
+    ApplicationOpened {
+        application_id: String,
+        snapshot: DesktopApplicationSnapshot,
+    },
+    ApplicationSurfaces {
+        snapshot: DesktopApplicationSnapshot,
+    },
+    ApplicationWindow {
+        window: DesktopWindowSurface,
+    },
+    SemanticItems {
+        snapshot: DesktopSemanticSnapshot,
+    },
+    SemanticInvoked,
     Capabilities {
         capabilities: DesktopCapabilities,
     },

@@ -629,15 +629,23 @@ impl PoolKey {
 // sections runtime-neutral; the per-relationship connect mutex below remains
 // asynchronous because it intentionally spans carrier establishment.
 static ROUTED_STREAM_POOL: OnceLock<Mutex<BTreeMap<PoolKey, Arc<PooledCarrier>>>> = OnceLock::new();
+#[derive(Default)]
+struct RoutedStreamConnectAdmission {
+    owner: tokio::sync::Mutex<()>,
+    // A wake carries no carrier or authority. Callers revalidate the existing
+    // pool after an independently established carrier is published.
+    published: tokio::sync::Notify,
+}
 static ROUTED_STREAM_CONNECT_LOCKS: OnceLock<
-    Mutex<BTreeMap<PoolKey, Arc<tokio::sync::Mutex<()>>>>,
+    Mutex<BTreeMap<PoolKey, Arc<RoutedStreamConnectAdmission>>>,
 > = OnceLock::new();
 
 fn routed_stream_pool() -> &'static Mutex<BTreeMap<PoolKey, Arc<PooledCarrier>>> {
     ROUTED_STREAM_POOL.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn routed_stream_connect_locks() -> &'static Mutex<BTreeMap<PoolKey, Arc<tokio::sync::Mutex<()>>>> {
+fn routed_stream_connect_locks()
+-> &'static Mutex<BTreeMap<PoolKey, Arc<RoutedStreamConnectAdmission>>> {
     ROUTED_STREAM_CONNECT_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -649,7 +657,7 @@ fn lock_routed_stream_pool() -> std::sync::MutexGuard<'static, BTreeMap<PoolKey,
 }
 
 fn lock_routed_stream_connect_locks()
--> std::sync::MutexGuard<'static, BTreeMap<PoolKey, Arc<tokio::sync::Mutex<()>>>> {
+-> std::sync::MutexGuard<'static, BTreeMap<PoolKey, Arc<RoutedStreamConnectAdmission>>> {
     routed_stream_connect_locks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -696,6 +704,53 @@ fn reusable_pooled_client(
     pool.insert(key.clone(), Arc::clone(&client));
     pool.retain(|candidate, _| !candidate.same_relationship(key) || candidate == key);
     Some(client)
+}
+
+fn current_pooled_client<G>(
+    key: &PoolKey,
+    current_generation: &G,
+) -> Result<Option<Arc<PooledCarrier>>, NetworkError>
+where
+    G: Fn() -> u64,
+{
+    let validate = || {
+        if registered_routed_stream_incoming_token(&key.local_node_id) != key.local_dispatcher {
+            return Err(NetworkError::Directory {
+                detail: "local reverse dispatcher changed during carrier establishment".into(),
+            });
+        }
+        let observed = current_generation();
+        if observed != key.route_compatibility_generation {
+            return Err(stale_route_compatibility_error(
+                key.route_compatibility_generation,
+                observed,
+            ));
+        }
+        Ok(())
+    };
+    validate()?;
+    let client = {
+        let mut pool = lock_routed_stream_pool();
+        if let Some(newer) = newer_route_compatibility_generation(&pool, key) {
+            return Err(stale_route_compatibility_error(
+                key.route_compatibility_generation,
+                newer,
+            ));
+        }
+        reusable_pooled_client(&mut pool, key)
+    };
+    validate()?;
+    Ok(client)
+}
+
+fn notify_pooled_carrier_publication(key: &PoolKey) {
+    // Directory generations can share an already authenticated relationship.
+    // Retain/wake only existing active admissions; there is no second registry.
+    for (waiting_key, admission) in lock_routed_stream_connect_locks().iter() {
+        if waiting_key.same_relationship(key) {
+            admission.published.notify_waiters();
+        }
+    }
 }
 
 fn newer_route_compatibility_generation<T>(
@@ -877,6 +932,15 @@ where
     if let Some(endpoint) = terminal_endpoint_id.as_ref() {
         observation.record("terminal_endpoint", tracing::field::display(endpoint));
     }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline_error = || {
+        NetworkError::timeout(
+            "open pooled routed carrier",
+            crate::NetworkTimeoutPhase::Connect,
+            timeout,
+            crate::NetworkDeliveryState::DefinitelyNotSent,
+        )
+    };
     let mut phase = "pool-lookup";
     let open = async {
         let mut key = PoolKey::new(
@@ -890,23 +954,7 @@ where
             protection,
         );
         key.terminal_endpoint_id = terminal_endpoint_id.clone();
-        let observed_generation = current_route_compatibility_generation();
-        if observed_generation != key.route_compatibility_generation {
-            return Err(stale_route_compatibility_error(
-                key.route_compatibility_generation,
-                observed_generation,
-            ));
-        }
-        let existing = {
-            let mut pool = lock_routed_stream_pool();
-            if let Some(newer_generation) = newer_route_compatibility_generation(&pool, &key) {
-                return Err(stale_route_compatibility_error(
-                    key.route_compatibility_generation,
-                    newer_generation,
-                ));
-            }
-            reusable_pooled_client(&mut pool, &key)
-        };
+        let existing = current_pooled_client(&key, &current_route_compatibility_generation)?;
         if let Some(client) = existing {
             let observed_generation = current_route_compatibility_generation();
             if observed_generation != key.route_compatibility_generation {
@@ -914,6 +962,9 @@ where
                     key.route_compatibility_generation,
                     observed_generation,
                 ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(deadline_error());
             }
             match client.open() {
                 Ok(stream) => return Ok(stream),
@@ -938,7 +989,7 @@ where
                     newer_generation,
                 ));
             }
-            locks.retain(|lock_key, _| {
+            locks.retain(|lock_key, admission| {
                 if !lock_key.same_base_relationship(&key) {
                     return true;
                 }
@@ -948,120 +999,162 @@ where
                 {
                     std::cmp::Ordering::Less => false,
                     std::cmp::Ordering::Greater => true,
-                    std::cmp::Ordering::Equal => lock_key == &key,
+                    std::cmp::Ordering::Equal => {
+                        lock_key == &key || Arc::strong_count(admission) > 1
+                    }
                 }
             });
             Arc::clone(
                 locks
                     .entry(key.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                    .or_insert_with(|| Arc::new(RoutedStreamConnectAdmission::default())),
             )
         };
-        phase = "connect-owner-wait";
-        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
-        let connect_guard = connect_lock.lock().await;
-        phase = "connect-owner-acquired";
-        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
-        let observed_generation = current_route_compatibility_generation();
-        if observed_generation != key.route_compatibility_generation {
-            return Err(stale_route_compatibility_error(
-                key.route_compatibility_generation,
-                observed_generation,
-            ));
-        }
-        let existing = {
-            let mut pool = lock_routed_stream_pool();
-            if let Some(newer_generation) = newer_route_compatibility_generation(&pool, &key) {
-                return Err(stale_route_compatibility_error(
-                    key.route_compatibility_generation,
-                    newer_generation,
-                ));
-            }
-            reusable_pooled_client(&mut pool, &key)
-        };
-        let client = match existing {
-            Some(client) => client,
-            None => {
-                phase = "carrier-establish";
+        let client = {
+            let ready = async {
+                loop {
+                    let published = connect_lock.published.notified();
+                    tokio::pin!(published);
+                    // Register before checking the pool so publication cannot fall
+                    // between an empty lookup and parking this existing caller.
+                    published.as_mut().enable();
+                    let current =
+                        current_pooled_client(&key, &current_route_compatibility_generation)?;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(deadline_error());
+                    }
+                    if let Some(client) = current {
+                        return Ok::<_, NetworkError>(client);
+                    }
+                    published.await;
+                }
+            };
+            let connect = async {
+                phase = "connect-owner-wait";
                 tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
-                let carrier = establish.await?;
-                phase = "carrier-validate";
-                if registered_routed_stream_incoming_token(&key.local_node_id)
-                    != key.local_dispatcher
-                {
-                    return Err(NetworkError::Directory {
+                let connect_guard = connect_lock.owner.lock().await;
+                phase = "connect-owner-acquired";
+                tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
+                let observed_generation = current_route_compatibility_generation();
+                if observed_generation != key.route_compatibility_generation {
+                    return Err(stale_route_compatibility_error(
+                        key.route_compatibility_generation,
+                        observed_generation,
+                    ));
+                }
+                let existing =
+                    current_pooled_client(&key, &current_route_compatibility_generation)?;
+                let client = match existing {
+                    Some(client) => client,
+                    None => {
+                        phase = "carrier-establish";
+                        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
+                        let established = establish.await;
+                        // Publication can race the final poll of a dial, including a
+                        // failing dial. Prefer the independently usable current owner.
+                        if let Some(client) =
+                            current_pooled_client(&key, &current_route_compatibility_generation)?
+                        {
+                            client
+                        } else {
+                            let carrier = established?;
+                            phase = "carrier-validate";
+                            if registered_routed_stream_incoming_token(&key.local_node_id)
+                                != key.local_dispatcher
+                            {
+                                return Err(NetworkError::Directory {
                         detail: "local reverse dispatcher changed during carrier establishment"
                             .into(),
                     });
-                }
-                if carrier.local_node_id != key.local_node_id
-                    || carrier.peer_node_id != key.peer_node_id
-                    || carrier.protection != key.protection
-                    || key.terminal_endpoint_id.as_ref().is_some_and(|endpoint| {
-                        carrier.route_trace.endpoint_ids.last() != Some(endpoint)
-                    })
-                {
-                    return Err(NetworkError::AuthDenied);
-                }
-                let observed_generation = current_route_compatibility_generation();
-                if observed_generation != key.route_compatibility_generation {
-                    return Err(stale_route_compatibility_error(
-                        key.route_compatibility_generation,
-                        observed_generation,
-                    ));
-                }
-                let incoming_node_id = key.local_node_id.clone();
-                let incoming_token = key.local_dispatcher.clone();
-                let incoming: IncomingLogicalStreamResolver = Arc::new(move || {
-                    registered_routed_stream_incoming_sender(
-                        &incoming_node_id,
-                        incoming_token.as_ref(),
-                    )
-                });
-                let client = Arc::new(PooledCarrier::new_with_incoming(
-                    carrier,
-                    1,
-                    IncomingLogicalStreamSink::Resolve(incoming),
-                )?);
-                {
-                    let mut pool = lock_routed_stream_pool();
-                    pool.retain(|candidate, pooled| {
-                        !pooled.is_closed()
-                            && (!candidate.same_base_relationship(&key)
-                                || (candidate.local_dispatcher == key.local_dispatcher
-                                    && candidate.route_compatibility_generation
-                                        >= key.route_compatibility_generation))
-                    });
-                    if let Some(newer_generation) =
-                        newer_route_compatibility_generation(&pool, &key)
-                    {
-                        return Err(stale_route_compatibility_error(
-                            key.route_compatibility_generation,
-                            newer_generation,
-                        ));
+                            }
+                            if carrier.local_node_id != key.local_node_id
+                                || carrier.peer_node_id != key.peer_node_id
+                                || carrier.protection != key.protection
+                                || key.terminal_endpoint_id.as_ref().is_some_and(|endpoint| {
+                                    carrier.route_trace.endpoint_ids.last() != Some(endpoint)
+                                })
+                            {
+                                return Err(NetworkError::AuthDenied);
+                            }
+                            let observed_generation = current_route_compatibility_generation();
+                            if observed_generation != key.route_compatibility_generation {
+                                return Err(stale_route_compatibility_error(
+                                    key.route_compatibility_generation,
+                                    observed_generation,
+                                ));
+                            }
+                            let incoming_node_id = key.local_node_id.clone();
+                            let incoming_token = key.local_dispatcher.clone();
+                            let incoming: IncomingLogicalStreamResolver = Arc::new(move || {
+                                registered_routed_stream_incoming_sender(
+                                    &incoming_node_id,
+                                    incoming_token.as_ref(),
+                                )
+                            });
+                            let client = Arc::new(PooledCarrier::new_with_incoming(
+                                carrier,
+                                1,
+                                IncomingLogicalStreamSink::Resolve(incoming),
+                            )?);
+                            let client = {
+                                let mut pool = lock_routed_stream_pool();
+                                pool.retain(|candidate, pooled| {
+                                    !pooled.is_closed()
+                                        && (!candidate.same_base_relationship(&key)
+                                            || (candidate.local_dispatcher == key.local_dispatcher
+                                                && candidate.route_compatibility_generation
+                                                    >= key.route_compatibility_generation))
+                                });
+                                if let Some(newer_generation) =
+                                    newer_route_compatibility_generation(&pool, &key)
+                                {
+                                    return Err(stale_route_compatibility_error(
+                                        key.route_compatibility_generation,
+                                        newer_generation,
+                                    ));
+                                }
+                                // A publication on another runtime may have won since the
+                                // last lookup. An unused late dial must not replace it.
+                                if let Some(published) = reusable_pooled_client(&mut pool, &key) {
+                                    published
+                                } else {
+                                    pool.insert(key.clone(), Arc::clone(&client));
+                                    client
+                                }
+                            };
+                            let observed_generation = current_route_compatibility_generation();
+                            if observed_generation != key.route_compatibility_generation {
+                                let mut pool = lock_routed_stream_pool();
+                                if pool
+                                    .get(&key)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &client))
+                                {
+                                    pool.remove(&key);
+                                }
+                                return Err(stale_route_compatibility_error(
+                                    key.route_compatibility_generation,
+                                    observed_generation,
+                                ));
+                            }
+                            notify_pooled_carrier_publication(&key);
+                            client
+                        }
                     }
-                    pool.insert(key.clone(), Arc::clone(&client));
-                }
-                let observed_generation = current_route_compatibility_generation();
-                if observed_generation != key.route_compatibility_generation {
-                    let mut pool = lock_routed_stream_pool();
-                    if pool
-                        .get(&key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &client))
-                    {
-                        pool.remove(&key);
-                    }
-                    return Err(stale_route_compatibility_error(
-                        key.route_compatibility_generation,
-                        observed_generation,
-                    ));
-                }
-                client
+                };
+                drop(connect_guard);
+                phase = "connect-owner-released";
+                tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
+                Ok::<_, NetworkError>(client)
+            };
+            tokio::select! {
+                biased;
+                client = ready => client?,
+                client = connect => client?,
             }
-        };
-        drop(connect_guard);
-        phase = "connect-owner-released";
-        tracing::trace!(target: "sinomo.perf", parent: &observation, phase, "routed carrier open boundary");
+        }; // Drops only this caller's unused dial/lock future before logical open.
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
         match client.open() {
             Ok(stream) => Ok(stream),
             Err(error) => {
@@ -1077,8 +1170,8 @@ where
         }
     };
 
-    match tokio::time::timeout(
-        timeout,
+    match tokio::time::timeout_at(
+        deadline,
         tracing::Instrument::instrument(open, observation.clone()),
     )
     .await
@@ -1361,7 +1454,7 @@ where
                 newer_generation,
             ));
         }
-        locks.retain(|lock_key, _| {
+        locks.retain(|lock_key, admission| {
             if !lock_key.same_base_relationship(key) {
                 return true;
             }
@@ -1371,12 +1464,12 @@ where
             {
                 std::cmp::Ordering::Less => false,
                 std::cmp::Ordering::Greater => true,
-                std::cmp::Ordering::Equal => lock_key == key,
+                std::cmp::Ordering::Equal => lock_key == key || Arc::strong_count(admission) > 1,
             }
         });
         locks
             .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+            .or_insert_with(|| Arc::new(RoutedStreamConnectAdmission::default()));
     }
     // This carrier is already authenticated and established. Waiting behind an
     // outbound dial can prevent both service dispatch and publication of the
@@ -1438,6 +1531,9 @@ where
             key.route_compatibility_generation,
             observed_generation,
         ));
+    }
+    if published {
+        notify_pooled_carrier_publication(key);
     }
     Ok(published)
 }
@@ -2002,6 +2098,535 @@ mod tests {
         stalled.abort();
         let _ = stalled.await;
         assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+    }
+
+    #[tokio::test]
+    async fn preexisting_opens_adopt_accepted_reverse_carrier_before_dial_deadline() {
+        preexisting_opens_adopt_accepted_reverse_carrier_at_generation(1).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_publication_notifies_active_compatible_directory_generations() {
+        preexisting_opens_adopt_accepted_reverse_carrier_at_generation(2).await;
+    }
+
+    async fn preexisting_opens_adopt_accepted_reverse_carrier_at_generation(
+        published_directory_generation: u64,
+    ) {
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let (peer_carrier, mut local_carrier) =
+            carrier_pair_for_nodes(Id::generate(), Id::generate());
+        let local = local_carrier.local_node_id.clone();
+        let peer = local_carrier.peer_node_id.clone();
+        local_carrier.reverse_process_affinity =
+            Some(crate::DestinationProcessAffinity::MainDaemon);
+        let _incoming = register_routed_stream_incoming_with_process_affinity(
+            local.clone(),
+            crate::DestinationProcessAffinity::MainDaemon,
+        )
+        .expect("local main dispatcher");
+        let establish_started = Arc::new(AtomicUsize::new(0));
+        let establish_dropped = Arc::new(AtomicUsize::new(0));
+        struct EstablishGuard(Arc<AtomicUsize>);
+        impl Drop for EstablishGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let started = Arc::clone(&establish_started);
+        let dropped = Arc::clone(&establish_dropped);
+        let mut owner = Box::pin(open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(5),
+            async move {
+                let _guard = EstablishGuard(dropped);
+                started.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<PeerStream, NetworkError>>().await
+            },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(establish_started.load(Ordering::SeqCst), 1);
+        let mut waiter = Box::pin(open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(5),
+            async { panic!("the already parked waiter must never establish a duplicate carrier") },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let key = PoolKey::new(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local.clone(),
+            peer.clone(),
+            crate::RoutedSessionProtection::Plaintext,
+        );
+        let admission = lock_routed_stream_connect_locks()
+            .get(&key)
+            .cloned()
+            .unwrap();
+        assert!(
+            admission.owner.try_lock().is_err(),
+            "the original dial still owns admission"
+        );
+
+        let _accepted = accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+            vec![scope.clone()],
+            generation,
+            published_directory_generation,
+            RouteConstraints::default(),
+            local_carrier,
+            move || generation,
+        )
+        .await
+        .expect("publish authenticated reverse carrier while both callers are parked");
+        let (peer_sender, mut peer_incoming) = mpsc::channel(3);
+        let _peer_client = PooledCarrier::new_with_incoming(
+            peer_carrier,
+            1,
+            IncomingLogicalStreamSink::Fixed(peer_sender),
+        )
+        .expect("initiating peer carrier");
+        let mut fresh = open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            published_directory_generation,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local,
+            peer,
+            Duration::from_millis(100),
+            async { panic!("published capacity must already be usable by a fresh caller") },
+        )
+        .await
+        .expect("fresh caller reuses accepted carrier");
+        fresh.write_all(b"f").await.unwrap();
+        let mut received = tokio::time::timeout(Duration::from_millis(100), peer_incoming.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        received.read_exact(&mut byte).await.unwrap();
+        assert_eq!(
+            &byte, b"f",
+            "the published carrier transfers bytes before owner release"
+        );
+        assert_eq!(establish_dropped.load(Ordering::SeqCst), 0);
+
+        let completed = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(owner.as_mut(), waiter.as_mut())
+        })
+        .await;
+        println!(
+            "accepted_reverse_before_existing_opens={{usable:true, original_connect_seconds:5, original_establishments:{}, original_establishment_dropped:{}, preexisting_completed:{}}}",
+            establish_started.load(Ordering::SeqCst),
+            establish_dropped.load(Ordering::SeqCst),
+            completed.is_ok()
+        );
+        let (owner_stream, waiter_stream) = match completed {
+            Ok(streams) => streams,
+            Err(_) => {
+                drop(owner);
+                drop(waiter);
+                retire_pooled_routed_streams(&scope).await;
+                panic!(
+                    "usable accepted carrier left both preexisting opens parked behind an unrelated pending dial"
+                );
+            }
+        };
+        for (stream, expected) in [(owner_stream, b'o'), (waiter_stream, b'w')] {
+            let mut stream = stream.expect("preexisting open adopts the authenticated carrier");
+            stream.write_all(&[expected]).await.unwrap();
+            let mut received =
+                tokio::time::timeout(Duration::from_millis(100), peer_incoming.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            received.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, [expected]);
+        }
+        assert_eq!(establish_started.load(Ordering::SeqCst), 1);
+        assert_eq!(establish_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_wakes_preserve_original_deadlines_and_dial_ownership() {
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let local = Id::generate();
+        let peer = Id::generate();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let mut owner = Box::pin(open_test_pooled_routed_stream(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(5),
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<PeerStream, NetworkError>>().await
+            },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let mut waiter = Box::pin(open_test_pooled_routed_stream(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(1),
+            async { panic!("waiter must not acquire the live owner's dial") },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let key = PoolKey::new(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::Any,
+            local,
+            peer,
+            crate::RoutedSessionProtection::Plaintext,
+        );
+        let admission = lock_routed_stream_connect_locks()
+            .get(&key)
+            .cloned()
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        admission.published.notify_waiters();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(
+            matches!(waiter.await, Err(NetworkError::Timeout { timeout, delivery_state: crate::NetworkDeliveryState::DefinitelyNotSent, .. }) if timeout == Duration::from_secs(1))
+        );
+        assert!(
+            admission.owner.try_lock().is_err(),
+            "timed-out waiter cannot release another caller's guard"
+        );
+        tokio::time::advance(Duration::from_millis(3500)).await;
+        admission.published.notify_waiters();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(
+            matches!(owner.await, Err(NetworkError::Timeout { timeout, delivery_state: crate::NetworkDeliveryState::DefinitelyNotSent, .. }) if timeout == Duration::from_secs(5))
+        );
+        assert!(admission.owner.try_lock().is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 0);
+    }
+
+    #[tokio::test]
+    async fn publication_wake_revalidates_role_scope_dispatcher_and_generation() {
+        for invalid in ["role", "scope", "dispatcher", "generation"] {
+            let scope = Id::generate().to_string();
+            let generation = crate::network_module_routing_generation();
+            let current = Arc::new(std::sync::atomic::AtomicU64::new(generation));
+            let (peer_carrier, mut local_carrier) =
+                carrier_pair_for_nodes(Id::generate(), Id::generate());
+            let local = local_carrier.local_node_id.clone();
+            let peer = local_carrier.peer_node_id.clone();
+            local_carrier.reverse_process_affinity =
+                Some(crate::DestinationProcessAffinity::MainDaemon);
+            let mut incoming = Some(
+                register_routed_stream_incoming_with_process_affinity(
+                    local.clone(),
+                    crate::DestinationProcessAffinity::MainDaemon,
+                )
+                .unwrap(),
+            );
+            let fence = Arc::clone(&current);
+            let mut owner = Box::pin(open_pooled_routed_stream_with_route_compatibility_source(
+                scope.clone(),
+                generation,
+                1,
+                RouteConstraints::default(),
+                crate::DestinationProcessAffinity::MainDaemon,
+                local.clone(),
+                peer.clone(),
+                crate::RoutedSessionProtection::Plaintext,
+                Duration::from_secs(5),
+                std::future::pending::<Result<PeerStream, NetworkError>>(),
+                move || fence.load(Ordering::SeqCst),
+                None,
+            ));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            let key = PoolKey::new(
+                scope.clone(),
+                generation,
+                1,
+                RouteConstraints::default(),
+                crate::DestinationProcessAffinity::MainDaemon,
+                local.clone(),
+                peer,
+                crate::RoutedSessionProtection::Plaintext,
+            );
+            let admission = lock_routed_stream_connect_locks()
+                .get(&key)
+                .cloned()
+                .unwrap();
+            let mut accepted_scope = scope.clone();
+            let mut accepted_generation = generation;
+            match invalid {
+                "role" => {
+                    local_carrier.reverse_process_affinity =
+                        Some(crate::DestinationProcessAffinity::Any)
+                }
+                "scope" => accepted_scope = Id::generate().to_string(),
+                "dispatcher" => {
+                    drop(incoming.take());
+                    incoming = Some(
+                        register_routed_stream_incoming_with_process_affinity(
+                            local,
+                            crate::DestinationProcessAffinity::MainDaemon,
+                        )
+                        .unwrap(),
+                    );
+                }
+                "generation" => {
+                    accepted_generation += 1;
+                    current.store(accepted_generation, Ordering::SeqCst);
+                }
+                _ => unreachable!(),
+            }
+            let _accepted = accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+                vec![accepted_scope.clone()],
+                accepted_generation,
+                1,
+                RouteConstraints::default(),
+                local_carrier,
+                || current.load(Ordering::SeqCst),
+            )
+            .await
+            .unwrap();
+            // A wake is advisory, even if it arrives spuriously or from a
+            // publication whose key no longer belongs to this caller.
+            admission.published.notify_waiters();
+            let outcome = std::future::poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx))).await;
+            if matches!(invalid, "dispatcher" | "generation") {
+                assert!(
+                    matches!(outcome, Poll::Ready(Err(NetworkError::Directory { .. }))),
+                    "{invalid}"
+                );
+            } else {
+                assert!(
+                    outcome.is_pending(),
+                    "{invalid} cannot satisfy MainDaemon/current scope"
+                );
+            }
+            drop(owner);
+            drop(peer_carrier);
+            drop(incoming);
+            retire_pooled_routed_streams(&scope).await;
+            retire_pooled_routed_streams(&accepted_scope).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_publication_cannot_revive_an_expired_connect_deadline() {
+        let scope = Id::generate().to_string();
+        let generation = crate::network_module_routing_generation();
+        let (peer_carrier, mut accepted_carrier) =
+            carrier_pair_for_nodes(Id::generate(), Id::generate());
+        let local = accepted_carrier.local_node_id.clone();
+        let peer = accepted_carrier.peer_node_id.clone();
+        accepted_carrier.reverse_process_affinity =
+            Some(crate::DestinationProcessAffinity::MainDaemon);
+        let _incoming = register_routed_stream_incoming_with_process_affinity(
+            local.clone(),
+            crate::DestinationProcessAffinity::MainDaemon,
+        )
+        .unwrap();
+        let mut expired = Box::pin(open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local.clone(),
+            peer.clone(),
+            Duration::from_secs(5),
+            std::future::pending::<Result<PeerStream, NetworkError>>(),
+        ));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(expired.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let _accepted = accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+            vec![scope.clone()],
+            generation,
+            1,
+            RouteConstraints::default(),
+            accepted_carrier,
+            move || generation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(expired.await, Err(NetworkError::Timeout {
+            timeout, delivery_state: crate::NetworkDeliveryState::DefinitelyNotSent, ..
+        }) if timeout == Duration::from_secs(5)),
+            "a ready publication cannot extend the original caller deadline"
+        );
+        let (sender, mut incoming) = mpsc::channel(1);
+        let _peer_client = PooledCarrier::new_with_incoming(
+            peer_carrier,
+            1,
+            IncomingLogicalStreamSink::Fixed(sender),
+        )
+        .unwrap();
+        let mut fresh = open_test_pooled_routed_stream_with_affinity(
+            scope.clone(),
+            generation,
+            1,
+            RouteConstraints::default(),
+            crate::DestinationProcessAffinity::MainDaemon,
+            local,
+            peer,
+            Duration::from_secs(5),
+            async { panic!("the expired caller must not remove the independent publication") },
+        )
+        .await
+        .unwrap();
+        fresh.write_all(b"l").await.unwrap();
+        let mut received = incoming.recv().await.unwrap().unwrap();
+        let mut byte = [0];
+        received.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"l");
+        assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+    }
+
+    #[tokio::test]
+    async fn unused_dial_completion_cannot_replace_a_published_reverse_carrier() {
+        for failed_dial in [false, true] {
+            let scope = Id::generate().to_string();
+            let generation = crate::network_module_routing_generation();
+            let (peer_carrier, mut accepted_carrier) =
+                carrier_pair_for_nodes(Id::generate(), Id::generate());
+            let local = accepted_carrier.local_node_id.clone();
+            let peer = accepted_carrier.peer_node_id.clone();
+            accepted_carrier.reverse_process_affinity =
+                Some(crate::DestinationProcessAffinity::MainDaemon);
+            let binding = accepted_carrier.channel_binding;
+            let (unused_peer, unused_carrier) = carrier_pair_for_nodes(peer.clone(), local.clone());
+            let _incoming = register_routed_stream_incoming_with_process_affinity(
+                local.clone(),
+                crate::DestinationProcessAffinity::MainDaemon,
+            )
+            .unwrap();
+            let (peer_sender, mut peer_incoming) = mpsc::channel(1);
+            let _peer_client = PooledCarrier::new_with_incoming(
+                peer_carrier,
+                1,
+                IncomingLogicalStreamSink::Fixed(peer_sender),
+            )
+            .unwrap();
+            let established_scope = scope.clone();
+            let (accepted_tx, accepted_rx) = oneshot::channel();
+            let mut stream = open_test_pooled_routed_stream_with_affinity(
+                scope.clone(),
+                generation,
+                1,
+                RouteConstraints::default(),
+                crate::DestinationProcessAffinity::MainDaemon,
+                local,
+                peer,
+                Duration::from_secs(5),
+                async move {
+                    let accepted =
+                        accept_pooled_routed_stream_carrier_for_scopes_with_peer_capability(
+                            vec![established_scope],
+                            generation,
+                            1,
+                            RouteConstraints::default(),
+                            accepted_carrier,
+                            move || generation,
+                        )
+                        .await
+                        .unwrap();
+                    accepted_tx.send(accepted).ok().unwrap();
+                    if failed_dial {
+                        Err(NetworkError::Io {
+                            operation: "unused dial".into(),
+                            detail: "late failure".into(),
+                        })
+                    } else {
+                        Ok(unused_carrier)
+                    }
+                },
+            )
+            .await
+            .expect("independent publication wins the final dial poll");
+            let _accepted = accepted_rx.await.unwrap();
+            assert_eq!(stream.channel_binding, binding);
+            stream.write_all(b"a").await.unwrap();
+            let mut received =
+                tokio::time::timeout(Duration::from_millis(100), peer_incoming.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            let mut byte = [0];
+            received.read_exact(&mut byte).await.unwrap();
+            assert_eq!(&byte, b"a");
+            drop(unused_peer);
+            assert_eq!(retire_pooled_routed_streams(&scope).await, 1);
+        }
     }
 
     #[test]

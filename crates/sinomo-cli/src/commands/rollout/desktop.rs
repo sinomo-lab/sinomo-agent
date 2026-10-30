@@ -51,8 +51,38 @@ pub(super) fn run(options: DesktopOptions) -> Result<(), CliError> {
             } else {
                 ""
             };
-            let files = sinomo_runtime::rollout::desktop::DESKTOP_BINARY_STEMS
-                .map(|name| format!("{name}{suffix}"));
+            let mut files: Vec<_> = sinomo_runtime::rollout::desktop::DESKTOP_BINARY_STEMS
+                .map(|name| format!("{name}{suffix}"))
+                .into_iter()
+                .collect();
+            if directory.join("lib").is_dir() {
+                for entry in
+                    fs::read_dir(directory.join("lib")).map_err(|error| CliError::Parse {
+                        detail: error.to_string(),
+                    })?
+                {
+                    let entry = entry.map_err(|error| CliError::Parse {
+                        detail: error.to_string(),
+                    })?;
+                    if !entry
+                        .file_type()
+                        .map_err(|error| CliError::Parse {
+                            detail: error.to_string(),
+                        })?
+                        .is_file()
+                    {
+                        return Err(CliError::Parse {
+                            detail: "bundle lib directory must contain regular files".into(),
+                        });
+                    }
+                    files.push(format!(
+                        "lib/{}",
+                        entry.file_name().to_str().ok_or_else(|| CliError::Parse {
+                            detail: "invalid dependency name".into()
+                        })?
+                    ));
+                }
+            }
             sinomo_runtime::rollout::desktop::write_bundle_manifest_for_target(
                 directory,
                 options.revision.expect("validated revision"),

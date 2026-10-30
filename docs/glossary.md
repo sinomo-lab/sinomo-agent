@@ -108,7 +108,9 @@ one normal cluster node.
 
 **Installed deployment**
 The binaries, managed source, native modules, boot entries, and daemon lifecycle
-maintained by `sinomo install` for an installation.
+maintained by the shared installer and rollout for an installation. Initial
+installation registers and starts the main and shadow daemons by default;
+legacy operator deployments can use `sinomo install --runtime-service`.
 
 ## M
 

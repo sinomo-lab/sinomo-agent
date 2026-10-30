@@ -242,10 +242,11 @@ fn rollout_upload_artifact_spec(
             detail: source.to_string(),
         })?
         .len();
-    let mut file = std::fs::File::open(path).map_err(|source| RolloutError::Io {
+    let file = std::fs::File::open(path).map_err(|source| RolloutError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let mut file = sinomo_core::storage::streaming_file::StreamingFileReader::new(file);
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
