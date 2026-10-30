@@ -777,13 +777,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
             }
+            // Surface only the exact correlated rejection to the existing
+            // caller. It may run ordinary catch-up under its original budget;
+            // this event does not authorize snapshot repair or count as proof.
+            let rejected = match &response.result {
+                DfsMetadataJournalBatchResult::Rejected { reason, code }
+                    if *code != DfsMetadataRejectionCode::PrimaryMismatch =>
+                {
+                    Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected {
+                        request_id: response.request_id.clone(),
+                        source_node_id,
+                        shard_id: response.shard_id.clone(),
+                        reason: reason.clone(),
+                    })
+                }
+                _ => None,
+            };
             self.replication
                 .pending_metadata_authority_probes
                 .remove(&response.request_id);
             self.replication
                 .metadata_authority_probe_results
                 .insert(response.request_id, accepted);
-            return Ok(None);
+            return Ok(rejected);
         }
         let pending = self
             .replication

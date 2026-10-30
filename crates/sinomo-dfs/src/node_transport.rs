@@ -6136,6 +6136,268 @@ mod tests {
         assert!(transport.finish_message().is_empty());
     }
 
+    // Routing/codec controls only: this existing recording peer supplies no
+    // content, replica receipt, or durability certificate. The native combined
+    // FileSync control owns end-to-end content and authority qualification.
+    fn served_file_sync_fetch_fixture() -> (
+        DfsNodeTransport,
+        Arc<RecordingAsyncMessagePeerTransport>,
+        DfsRoutedMessage,
+        DfsRoutedMessage,
+    ) {
+        let local = node_id("node_served_file_sync_authority");
+        let caller = node_id("node_served_file_sync_caller");
+        let object = DfsObjectId::from_legacy_named("served_file_sync_object").unwrap();
+        let version = DfsVersion::from_legacy_named("served_file_sync_version").unwrap();
+        let hash = crate::content_hash(b"transport routing bytes only");
+        let mut served = test_namespace_message(&caller, &local, 1);
+        let DfsNetworkMessage::NamespaceRequest(command) = &mut served.message else {
+            unreachable!()
+        };
+        command.operation = DfsNamespaceOperation::FileSync {
+            path: "/services/served-file-sync.bin".into(),
+            target: crate::DfsPosixFileSyncTarget {
+                kind: crate::DfsPosixSyncKind::File,
+                file_system_id: sifs_file_system_id(),
+                object_id: object.clone(),
+                path: "/services/served-file-sync.bin".into(),
+                version: version.clone(),
+                content_hash: hash.clone(),
+            },
+        };
+        let peer = Arc::new(RecordingAsyncMessagePeerTransport::default());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            [caller.clone()],
+            sync_peer,
+            async_peer,
+            Duration::from_secs(1),
+        );
+        transport.begin_message(&served).unwrap();
+        let fetch = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: caller.clone(),
+            frame_id: 2,
+            message_id: 2,
+            message: DfsNetworkMessage::FetchBlob(crate::DfsFetchBlobCommand {
+                request_id: "served-file-sync-fetch".into(),
+                intent_id: "served-file-sync-intent".into(),
+                object_id: object,
+                version,
+                content_hash: hash,
+                authority_shard: None,
+            }),
+        };
+        let response = DfsRoutedMessage {
+            source_node_id: local,
+            target_node_id: caller,
+            frame_id: 3,
+            message_id: 3,
+            message: DfsNetworkMessage::NamespaceResponse(crate::DfsNamespaceResponse {
+                request_id: "namespace_request_1".into(),
+                committed_work: Default::default(),
+                result: crate::DfsNamespaceResult::Rejected {
+                    reason: "routing-only control, no durability evidence".into(),
+                    posix_error: None,
+                    current_primary_node_id: None,
+                },
+                synced_path_object: None,
+                synced_path_objects: Vec::new(),
+                metadata_journal_batches: Vec::new(),
+                metadata_journal_has_more: false,
+                posix_coordination_result: None,
+            }),
+        };
+        (transport, peer, fetch, response)
+    }
+
+    #[test]
+    fn file_sync_caller_fetch_sync_single_reaches_peer_before_reply() {
+        let (mut transport, peer, fetch, response) = served_file_sync_fetch_fixture();
+        let caller = fetch.target_node_id.clone();
+        transport
+            .send_routed_call(&caller, DfsRoutedCall::value(fetch.clone()))
+            .unwrap();
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "FileSync must dispatch its required caller Fetch before finish_message"
+        );
+        transport
+            .send_routed_call(&caller, DfsRoutedCall::value(response.clone()))
+            .unwrap();
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "NamespaceResponse remains reply-owned"
+        );
+        assert_eq!(transport.finish_message(), vec![response]);
+        transport
+            .begin_message(&test_distributed_write_message(
+                &caller,
+                &fetch.source_node_id,
+                10,
+            ))
+            .unwrap();
+        transport
+            .send_routed_call(&caller, DfsRoutedCall::value(fetch.clone()))
+            .unwrap();
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "ordinary write retains Fetch piggyback"
+        );
+        assert_eq!(transport.finish_message(), vec![fetch]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_sync_caller_fetch_async_single_reaches_peer_before_reply() {
+        let (mut transport, peer, fetch, response) = served_file_sync_fetch_fixture();
+        let caller = fetch.target_node_id.clone();
+        transport
+            .send_routed_call_async(&caller, DfsRoutedCall::value(fetch.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "FileSync must dispatch its required caller Fetch before finish_message"
+        );
+        transport
+            .send_routed_call_async(&caller, DfsRoutedCall::value(response.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "NamespaceResponse remains reply-owned"
+        );
+        assert_eq!(transport.finish_message(), vec![response]);
+        transport
+            .begin_message(&test_distributed_write_message(
+                &caller,
+                &fetch.source_node_id,
+                10,
+            ))
+            .unwrap();
+        transport
+            .send_routed_call_async(&caller, DfsRoutedCall::value(fetch.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "ordinary write retains Fetch piggyback"
+        );
+        assert_eq!(transport.finish_message(), vec![fetch]);
+    }
+
+    #[test]
+    fn file_sync_caller_fetch_sync_fanout_reaches_peer_before_reply() {
+        let (mut transport, peer, fetch, response) = served_file_sync_fetch_fixture();
+        let caller = fetch.target_node_id.clone();
+        let outcomes = transport
+            .send_routed_calls_bounded(
+                vec![
+                    DfsRoutedSend::new(caller.clone(), DfsRoutedCall::value(fetch.clone())),
+                    DfsRoutedSend::new(caller.clone(), DfsRoutedCall::value(response.clone())),
+                ],
+                2,
+            )
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.target_node_id == caller && outcome.result.is_ok())
+        );
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "only the required Fetch crosses the peer before finish_message"
+        );
+        assert_eq!(transport.finish_message(), vec![response]);
+        transport
+            .begin_message(&test_distributed_write_message(
+                &caller,
+                &fetch.source_node_id,
+                10,
+            ))
+            .unwrap();
+        let outcomes = transport
+            .send_routed_calls_bounded(
+                vec![DfsRoutedSend::new(
+                    caller.clone(),
+                    DfsRoutedCall::value(fetch.clone()),
+                )],
+                2,
+            )
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_ok());
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "ordinary write retains Fetch piggyback"
+        );
+        assert_eq!(transport.finish_message(), vec![fetch]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_sync_caller_fetch_async_fanout_reaches_peer_before_reply() {
+        let (mut transport, peer, fetch, response) = served_file_sync_fetch_fixture();
+        let caller = fetch.target_node_id.clone();
+        let outcomes = transport
+            .send_routed_calls_bounded_async(
+                vec![
+                    DfsRoutedSend::new(caller.clone(), DfsRoutedCall::value(fetch.clone())),
+                    DfsRoutedSend::new(caller.clone(), DfsRoutedCall::value(response.clone())),
+                ],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.target_node_id == caller && outcome.result.is_ok())
+        );
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "only the required Fetch crosses the peer before finish_message"
+        );
+        assert_eq!(transport.finish_message(), vec![response]);
+        transport
+            .begin_message(&test_distributed_write_message(
+                &caller,
+                &fetch.source_node_id,
+                10,
+            ))
+            .unwrap();
+        let outcomes = transport
+            .send_routed_calls_bounded_async(
+                vec![DfsRoutedSend::new(
+                    caller.clone(),
+                    DfsRoutedCall::value(fetch.clone()),
+                )],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_ok());
+        assert_eq!(
+            peer.calls.load(Ordering::SeqCst),
+            1,
+            "ordinary write retains Fetch piggyback"
+        );
+        assert_eq!(transport.finish_message(), vec![fetch]);
+    }
+
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
     }
@@ -8458,6 +8720,8 @@ mod tests {
 #[derive(Debug, Default)]
 struct DfsServedMessageState {
     return_node_id: Option<NodeId>,
+    // FileSync may need the caller's content before it can construct its reply.
+    caller_fetch_before_reply: bool,
     inbound_messages: VecDeque<DfsRoutedMessage>,
     outbound_messages: Vec<DfsRoutedMessage>,
     outbound_attachment: Option<DfsOutboundAttachment>,
@@ -8658,7 +8922,10 @@ impl DfsNodeTransport {
             .return_node_id
             .as_ref()
             .is_some_and(|return_node_id| target_node_id == return_node_id)
-            && dfs_network_message_can_return_to_served_caller(&message.message)
+            && dfs_network_message_can_return_to_served_caller(
+                &message.message,
+                self.served().caller_fetch_before_reply,
+            )
         {
             if attachment.is_some() && self.served().outbound_attachment.is_some() {
                 return Err(NetworkError::Serialization {
@@ -8725,7 +8992,10 @@ impl DfsNodeTransport {
                 .return_node_id
                 .as_ref()
                 .is_some_and(|return_node_id| target_node_id == return_node_id)
-                && dfs_network_message_can_return_to_served_caller(&message.message)
+                && dfs_network_message_can_return_to_served_caller(
+                    &message.message,
+                    self.served().caller_fetch_before_reply,
+                )
             {
                 if attachment.is_some() && self.served().outbound_attachment.is_some() {
                     return Err(NetworkError::Serialization {
@@ -8786,7 +9056,10 @@ impl DfsNodeTransport {
                 .return_node_id
                 .as_ref()
                 .is_some_and(|return_node_id| &request.target_node_id == return_node_id)
-                && dfs_network_message_can_return_to_served_caller(&request.call.message.message);
+                && dfs_network_message_can_return_to_served_caller(
+                    &request.call.message.message,
+                    self.served().caller_fetch_before_reply,
+                );
             if returns_to_caller {
                 let target_node_id = request.target_node_id;
                 let result = self.send_routed_call(&target_node_id, request.call);
@@ -8864,6 +9137,7 @@ impl DfsNodeTransport {
                         .is_some_and(|return_node_id| &request.target_node_id == return_node_id)
                         && dfs_network_message_can_return_to_served_caller(
                             &request.call.message.message,
+                            self.served().caller_fetch_before_reply,
                         ));
                 if handled_by_served_lane {
                     let target_node_id = request.target_node_id;
@@ -9097,6 +9371,11 @@ impl DfsNodeTransport {
             });
         }
         self.served_mut().return_node_id = Some(message.source_node_id.clone());
+        self.served_mut().caller_fetch_before_reply = matches!(
+            &message.message,
+            DfsNetworkMessage::NamespaceRequest(command)
+                if matches!(&command.operation, crate::DfsNamespaceOperation::FileSync { .. })
+        );
         Ok(())
     }
 
@@ -9113,6 +9392,7 @@ impl DfsNodeTransport {
             return (Vec::new(), None);
         }
         self.served_mut().return_node_id = None;
+        self.served_mut().caller_fetch_before_reply = false;
         self.served_mut().inbound_messages.clear();
         self.incoming_messages.clear();
         (
@@ -9174,9 +9454,12 @@ fn stable_reconciliation_test_responses() -> [DfsNetworkMessage; 2] {
     ]
 }
 
-fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) -> bool {
+fn dfs_network_message_can_return_to_served_caller(
+    message: &DfsNetworkMessage,
+    caller_fetch_before_reply: bool,
+) -> bool {
     dfs_network_message_is_served_call_response(message)
-        || matches!(message, DfsNetworkMessage::FetchBlob(_))
+        || (!caller_fetch_before_reply && matches!(message, DfsNetworkMessage::FetchBlob(_)))
 }
 
 impl NetworkedDfsService<DfsNodeTransport> {
