@@ -23,7 +23,16 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, String>;
-pub const DESKTOP_BINARY_STEMS: [&str; 3] = ["sinomo-app", "sinomo", "sinomo-ui-extension-host"];
+pub const DESKTOP_BINARY_STEMS: [&str; 2] = ["sinomo-app", "sinomo-ui-extension-host"];
+
+/// Legacy bundles may carry host images. They remain hash-verified artifacts,
+/// but GUI publication must never select daemon/setup code or installation binding.
+pub fn is_desktop_payload_file(path: &str) -> bool {
+    !["sinomo", "sinomo-shadow", "sinomo-app-daemon", "sinomo-setup"].iter()
+        .any(|name| path.eq_ignore_ascii_case(&crate::executable_name(name)))
+        && !path.eq_ignore_ascii_case(sinomo_core::local::INSTALLED_DATA_DIR_FILE)
+        && !path.eq_ignore_ascii_case("sinomo-install.json")
+}
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -71,6 +80,12 @@ impl DesktopReleases {
     }
 
     fn ensure_root(&self) -> Result<()> {
+        sinomo_core::local::ensure_deployment_enabled(
+            self.root
+                .parent()
+                .and_then(Path::parent)
+                .ok_or("no data directory")?,
+        )?;
         fs::create_dir_all(self.root.parent().ok_or("desktop root has no parent")?).map_err(err)?;
         ensure_private_directory(&self.root).map_err(err)
     }
@@ -130,10 +145,84 @@ impl DesktopReleases {
         Ok(self.root.join("releases").join(id))
     }
 
+    /// Publish only the GUI component into its canonical execution directory.
+    /// Immutable releases are rollback inputs, never daemon launch locations.
+    fn publish_canonical(&self, source: &Path) -> Result<PathBuf> {
+        let data = self
+            .root
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("no data directory")?;
+        let _admission =
+            crate::acquire_rollout_activation_guard(&crate::SelfRolloutPaths::new(data))
+                .map_err(err)?;
+        let manifest = read_manifest(source)?;
+        verify_bundle(source, &manifest)?;
+        let bin = data.join("bin");
+        let scratch =
+            sinomo_core::storage::scratch::ScratchDirectory::create(&self.root, "publish")
+                .map_err(err)?;
+        let mut changed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        let result: Result<()> = (|| {
+            for file in &manifest.files {
+                if !is_desktop_payload_file(&file.path) {
+                    continue;
+                }
+                let destination = bin.join(&file.path);
+                if destination.is_file() && {
+                    let mut hash = blake3::Hasher::new();
+                    hash.update_reader(File::open(&destination).map_err(err)?)
+                        .map_err(err)?;
+                    hash.finalize().to_hex().as_str() == file.content_hash
+                } {
+                    continue;
+                }
+                let backup = if destination.exists() {
+                    let backup = scratch.path().join(changed.len().to_string());
+                    fs::copy(&destination, &backup).map_err(err)?;
+                    Some(backup)
+                } else {
+                    None
+                };
+                changed.push((destination.clone(), backup));
+                crate::install_binary_atomically(&source.join(&file.path), &destination)
+                    .map_err(err)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut failures = Vec::new();
+            for (destination, backup) in changed.iter().rev() {
+                let restored = match backup {
+                    Some(backup) => {
+                        crate::install_binary_atomically(backup, destination).map_err(err)
+                    }
+                    None => remove_file_if_exists_and_sync_parent(destination)
+                        .map(|_| ())
+                        .map_err(err),
+                };
+                if let Err(error) = restored {
+                    failures.push(error);
+                }
+            }
+            return Err(format!(
+                "GUI publication failed: {error}; rollback errors: {failures:?}"
+            ));
+        }
+        Ok(bin.join(crate::executable_name("sinomo-app")))
+    }
+
     /// Copy to an unpublished directory, verify stored bytes, then publish once. A rejected
     /// bundle never changes desired or active state. This is a local operator-authorized import.
     pub fn stage(&self, source: &Path) -> Result<AppUpdateStatus> {
         let manifest = read_manifest(source)?;
+        if manifest
+            .files
+            .iter()
+            .any(|f| f.path == crate::executable_name("sinomo-app-daemon"))
+        {
+            return Err("cannot stage a retired sinomo-app-daemon helper".into());
+        }
         validate_manifest(&manifest)?;
         let id = release_id(&manifest)?;
         let _stage_lock = self.lock("stage.lock")?;

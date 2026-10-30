@@ -91,17 +91,17 @@ fn install_cli_spec() -> CliCommandSpec {
     .with_options([
         CliOptionSpec::value(
             "--install-dir",
-            "new application directory",
+            "setup and uninstall files directory",
             CliValueSpec::new("path", "path"),
         ),
         CliOptionSpec::value(
             "--data-dir",
-            "persistent data directory",
+            "program and persistent data directory",
             CliValueSpec::new("path", "path"),
         ),
         CliOptionSpec::flag(
             "--add-to-path",
-            "add the installation directory to user PATH",
+            "add the data directory bin folder to user PATH",
         ),
         CliOptionSpec::flag("--desktop-shortcut", "create an app desktop shortcut"),
         CliOptionSpec::flag(
@@ -532,7 +532,13 @@ fn installed_managed_source_head(layout: &InstallLayout) -> Option<String> {
 }
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<(), CliError> {
-    if !options.runtime_service {
+    let shared_owner = SinomoDataDir::from_env_or_home()?
+        .root()
+        .join("config/installer-owner");
+    if shared_owner.is_file() && !options.stop {
+        return Err(CliError::Parse { detail: "--no-stop only applies to legacy startup removal; shared deployment uninstall stops its runtime".into() });
+    }
+    if !options.runtime_service || shared_owner.is_file() {
         use sinomo_runtime::installer::initial_setup;
         let root = match options.install_dir {
             Some(root) => root,
@@ -546,7 +552,13 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<(), CliError> {
                 let directory = executable.parent().ok_or_else(|| CliError::Parse {
                     detail: "executable has no parent".into(),
                 })?;
-                if directory.join(initial_setup::RECEIPT).is_file() {
+                if let Ok(owner) = std::fs::read_to_string(
+                    SinomoDataDir::from_env_or_home()?
+                        .root()
+                        .join("config/installer-owner"),
+                ) {
+                    PathBuf::from(owner)
+                } else if directory.join(initial_setup::RECEIPT).is_file() {
                     directory.to_path_buf()
                 } else {
                     initial_setup::default_install_dir().map_err(|e| CliError::Parse {

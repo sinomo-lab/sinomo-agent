@@ -54,7 +54,8 @@ def configuration(stage, output, target, version):
     if windows:
         config["resources"] = [{"src": str(manifest), "target": "desktop-release.json"},
                                {"src": str(ROOT / "crates/sinomo-installer/src/initial_setup/windows-integration.ps1"),
-                                "target": "windows-integration.ps1"}]
+                                "target": "windows-integration.ps1"},
+                               {"src": str(stage / "initial-payload.tar"), "target": "initial-payload.tar"}]
         config["nsis"] = {"installMode": "currentUser", "template": str(ROOT / "packaging/windows/installer.nsi")}
     else:
         # linuxdeploy patches ELF RPATHs. Preserve the verified originals in an opaque archive,
@@ -85,24 +86,46 @@ def main():
     test_root = args.test_root.resolve() if args.test_root else stage
     if not args.skip_build:
         run("cargo", "build", "--locked", "--profile", args.profile, "--target", args.target,
-            "-p", "sinomo-app", "-p", "sinomo-ui-extension-host", "-p", "sinomo-setup")
+            "-p", "sinomo-app", "-p", "sinomo-ui-extension-host")
+        # Setup owns installation authority; keep its host features out of the GUI build.
+        run("cargo", "build", "--locked", "--profile", args.profile, "--target", args.target, "-p", "sinomo-setup")
         # Feature unification with the app must not add native media/GUI prerequisites to CLI.
         run("cargo", "build", "--locked", "--profile", args.profile, "--target", args.target, "-p", "sinomo")
     suffix = ".exe" if windows else ""
     for name in ("sinomo", "sinomo-app", "sinomo-ui-extension-host", "sinomo-setup"):
         shutil.copy2(binaries / (name + suffix), stage / (name + suffix))
     revision = os.environ.get("CI_COMMIT_SHA") or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    run("cargo", "run", "--locked", "-p", "sinomo-installer", "--bin", "sinomo-package", "--",
+        ROOT, binaries, stage, args.target, args.profile)
+    if not windows:
+        for name in ("sinomo-app", "sinomo-ui-extension-host", "sinomo-setup"):
+            run("patchelf", "--force-rpath", "--set-rpath", "$ORIGIN/lib", stage / name)
     run(stage / ("sinomo" + suffix), "rollout", "app", "package", "--directory", stage,
-        "--revision", revision, "--target-os", "windows" if windows else "linux", "--target-arch", "x86_64")
+        "--revision", revision, "--target-os", "windows" if windows else "linux", "--target-arch", "x86_64",
+        env=dict(os.environ, SINOMO_DATA_DIR=str(stage / "manifest-data")))
     if not windows:
         with tarfile.open(stage / "sinomo-payload.tar", "w") as archive:
-            for name in ("sinomo", "sinomo-app", "sinomo-ui-extension-host", "desktop-release.json"):
+            for name in ("sinomo", "sinomo-app", "sinomo-ui-extension-host", "desktop-release.json", "initial-payload.tar", "sinomo-setup"):
                 archive.add(stage / name, arcname=name, recursive=False)
+            for library in sorted((stage / "lib").glob("*")):
+                archive.add(library, arcname="lib/" + library.name, recursive=False)
         # The minimal-container gate also checks the exact CLI installed by this desktop package.
         with tarfile.open(stage / "headless-cli.tar.gz", "w:gz") as archive:
             archive.add(stage / "sinomo", arcname="sinomo", recursive=False)
+            archive.add(stage / "initial-payload.tar", arcname="initial-payload.tar", recursive=False)
+            for library in sorted((stage / "lib").glob("*")):
+                archive.add(library, arcname="lib/" + library.name, recursive=False)
     write_icon(stage / "icon.png")
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+    output.mkdir(parents=True, exist_ok=True)
+    cli_archive = output / f"sinomo-cli-{version}-{args.target}.{'zip' if windows else 'tar.gz'}"
+    if windows:
+        import zipfile
+        with zipfile.ZipFile(cli_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name in ("sinomo.exe", "initial-payload.tar"):
+                archive.write(stage / name, arcname=name)
+    else:
+        shutil.copy2(stage / "headless-cli.tar.gz", cli_archive)
     config = stage / "packager.json"
     config.write_text(json.dumps(configuration(stage, output, args.target, version), indent=2), encoding="utf-8")
     tool_version = subprocess.check_output([args.packager, "--version"], text=True).strip()
@@ -126,7 +149,7 @@ def main():
             "-File", ROOT / "scripts/ci/test-cli-install-windows.ps1", "-Cli", stage / "sinomo.exe",
             "-SandboxRoot", test_root / "cli-smoke-test")
     sums = []
-    for artifact in artifacts:
+    for artifact in [*artifacts, cli_archive]:
         with artifact.open("rb") as source:
             sums.append(f"{hashlib.file_digest(source, 'sha256').hexdigest()}  {artifact.name}\n")
     (output / "SHA256SUMS").write_text("".join(sums), encoding="utf-8")

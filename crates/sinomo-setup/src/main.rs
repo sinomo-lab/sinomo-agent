@@ -42,6 +42,24 @@ fn run() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "linux")]
+        Some("install") => {
+            let root = value(&args, "--install-dir")?;
+            let data = value(&args, "--data-dir")?;
+            let exe = env::current_exe()?;
+            let (_guard, source) = unpack_payload(exe.parent().ok_or("no package directory")?)?;
+            install(
+                &source.join(binary("sinomo")),
+                Some(&source),
+                &root,
+                &data,
+                &IntegrationOptions::default(),
+                &services::Options {
+                    start: !args.iter().any(|a| a == "--no-start"),
+                    ..services::Options::default()
+                },
+            )
+        }
+        #[cfg(target_os = "linux")]
         Some("--launch-cli" | "--launch-app") => {
             let root = installed_root()?;
             let receipt = read_receipt(&root)?;
@@ -150,12 +168,12 @@ fn info(message: &str) {
 }
 
 fn installed_root() -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    if let Some(appimage) = env::var_os("APPIMAGE") {
-        return Ok(PathBuf::from(appimage)
-            .parent()
-            .ok_or("no AppImage directory")?
-            .to_path_buf());
+    if let Some(root) = env::var_os("SINOMO_INSTALL_DIR") {
+        return Ok(root.into());
+    }
+    let data = sinomo_runtime::local::SinomoDataDir::from_env_or_home()?;
+    if let Ok(root) = fs::read_to_string(data.root().join("config/installer-owner")) {
+        return Ok(root.into());
     }
     Ok(env::current_exe()?
         .parent()
@@ -174,7 +192,7 @@ fn select_folder(title: &str, default: &Path) -> Option<PathBuf> {
 fn install_gui() -> Result<()> {
     let home = home()?;
     info(
-        "Select or create an EMPTY folder for the Sinomo CLI and app, then select or create a separate data folder. Cancel either chooser to exit.",
+        "Select or create an EMPTY folder for setup and uninstall metadata, then select or create a separate data folder. Cancel either chooser to exit.",
     );
     let Some(root) = select_folder("Sinomo installation folder (must be empty)", &home) else {
         return Ok(());
@@ -187,7 +205,7 @@ fn install_gui() -> Result<()> {
         return Err("Choose an empty installation folder. Existing installations must be managed through Sinomo rollout, not replaced by setup.".into());
     }
     let path = optional_integration(
-        "Add the CLI installation directory to PATH for future login sessions?",
+        "Add the data directory's bin folder to PATH for future login sessions?",
     );
     let menu = optional_integration("Add Sinomo to the applications menu?");
     let desktop = optional_integration("Add a Sinomo desktop shortcut?");
@@ -207,49 +225,20 @@ fn install_gui() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let source = package;
     desktop::verify_bundle(source, &desktop::read_manifest(source)?)?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let image = env::var_os("APPIMAGE").ok_or(
-            "Run the packaged Sinomo installer AppImage to install its bundled runtime libraries.",
-        )?;
-        fs::copy(image, root.join("Sinomo.AppImage"))?;
-        fs::set_permissions(
-            root.join("Sinomo.AppImage"),
-            fs::Permissions::from_mode(0o755),
-        )?;
-        for (name, argument) in [
-            ("sinomo-app", "--launch-app"),
-            ("sinomo-setup", "--uninstall"),
-        ] {
-            fs::write(
-                root.join(name),
-                format!(
-                    "#!/bin/sh\nexec {} {} \"$@\"\n",
-                    shell_quote(root.join("Sinomo.AppImage").to_str().unwrap()),
-                    argument
-                ),
-            )?;
-            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o755))?;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        for name in payload_files() {
-            fs::copy(source.join(&name), root.join(&name))?;
-        }
-        fs::copy(&exe, root.join(binary("sinomo-setup")))?;
-    }
-    #[cfg(target_os = "linux")]
-    fs::copy(source.join("sinomo"), root.join("sinomo"))?;
-    configure_from(&root, &data, source)?;
-    #[cfg(target_os = "linux")]
-    linux_integration(&root, path, menu, desktop)?;
-    #[cfg(not(target_os = "linux"))]
-    let _ = (path, menu, desktop);
-    complete_services(&root, &services::Options::default())?;
+    install(
+        &source.join(binary("sinomo")),
+        Some(source),
+        &root,
+        &data,
+        &IntegrationOptions {
+            add_to_path: path,
+            desktop_shortcut: desktop,
+            menu_shortcut: menu,
+        },
+        &services::Options::default(),
+    )?;
     info(
-        "Sinomo is installed and its per-user daemon services are running. Open sinomo-app from the installation folder or your chosen shortcuts. PATH changes apply to future login sessions. Use Uninstall Sinomo in the applications menu to remove it.",
+        "Sinomo is installed and its per-user daemon services are running. Open sinomo-app from the data directory's bin folder or your chosen shortcuts. PATH changes apply to future login sessions. Use Uninstall Sinomo in the applications menu to remove it.",
     );
     Ok(())
 }
@@ -268,12 +257,18 @@ fn unpack_payload(
     fs::create_dir(&root)?;
     let guard = sinomo_runtime::storage::scratch::ScratchPath::new(root.clone());
     let mut archive = tar::Archive::new(fs::File::open(package.join("sinomo-payload.tar"))?);
-    let allowed = payload_files();
+    let mut allowed = payload_files();
+    allowed.extend(["initial-payload.tar".into(), binary("sinomo-setup")]);
     let mut seen = std::collections::BTreeSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let name = entry.path()?.to_string_lossy().into_owned();
-        if !allowed.contains(&name) || !entry.header().entry_type().is_file() || !seen.insert(name)
+        let library = name.strip_prefix("lib/").is_some_and(|leaf| {
+            !leaf.is_empty() && !leaf.contains(['/', '\\']) && leaf != "." && leaf != ".."
+        });
+        if (!allowed.contains(&name) && !library)
+            || !entry.header().entry_type().is_file()
+            || !seen.insert(name)
         {
             return Err("invalid installer payload entry".into());
         }
@@ -281,7 +276,7 @@ fn unpack_payload(
             return Err("payload escaped extraction directory".into());
         }
     }
-    if seen.len() != allowed.len() {
+    if !allowed.iter().all(|name| seen.contains(name)) {
         return Err("incomplete installer payload".into());
     }
     Ok((guard, root))

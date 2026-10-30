@@ -26,9 +26,10 @@ relevant tests, and confirm the current cluster is healthy.
 
 ## Desktop App Rollout
 
-A desktop release contains `sinomo`, `sinomo-app`, `sinomo-ui-extension-host`,
-and `desktop-release.json`. The CLI binary also hosts the desktop supervisor
-and app-owned daemon. Running `sinomo install` from that release installs the
+A desktop release contains `sinomo-app`, `sinomo-ui-extension-host`, optional
+runtime libraries, and `desktop-release.json`. It can be delivered independently
+of the daemon and native modules. The initial installer also ships the CLI and
+offline default-module/source payload; the CLI hosts local desktop supervision. Running `sinomo install` from that release installs the
 desktop app automatically. A runtime-only release remains headless. The explicit
 forms are:
 
@@ -42,8 +43,11 @@ sinomo rollout app launch
 ```
 
 Previously installed desktop bundles can still restore their verified GUI;
-the current CLI supplies their daemon host. New bundles must include `sinomo`
-in the manifest, and retired daemon helpers are never launched by the current CLI.
+the current CLI supplies their daemon host. The launcher always selects the canonical installed CLI rather than a daemon
+copy in an old desktop bundle. Retired daemon helpers are never launched.
+Approved desktop files are published to `<data>/bin` after the previous UI exits;
+readiness failure restores the previous release through the same location.
+A remote GUI's connection and pairing configuration is a separate client feature.
 
 Build the local desktop platform through the existing cluster build service:
 

@@ -5,13 +5,19 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     if std::env::var_os(sinomo_client::api::app::update::APP_SUPERVISED_ENV).is_none() {
-        let result = (|| -> Result<std::process::ExitStatus, String> {
+        let result = (|| -> Result<Option<std::process::Child>, String> {
             let app = std::env::current_exe().map_err(|e| e.to_string())?;
             let helper = std::env::var_os(sinomo_client::api::SINOMO_APP_DAEMON_BINARY_ENV)
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| {
                     app.with_file_name(format!("sinomo{}", std::env::consts::EXE_SUFFIX))
                 });
+            if let Ok(data) = sinomo_runtime::local::SinomoDataDir::from_env_or_home() {
+                sinomo_runtime::local::ensure_deployment_enabled(&data.root())?;
+            }
+            if !helper.is_file() {
+                return Ok(None);
+            }
             let mut command = std::process::Command::new(helper);
             #[cfg(windows)]
             {
@@ -22,16 +28,18 @@ fn main() -> ExitCode {
                 .args(["app", "supervise", "--"])
                 .arg(app)
                 .args(std::env::args_os().skip(1))
-                .status()
+                .spawn()
+                .map(Some)
                 .map_err(|e| e.to_string())
         })();
-        return match result {
-            Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8),
+        match result {
+            Ok(Some(_)) => return ExitCode::SUCCESS,
+            Ok(None) => {}
             Err(error) => {
                 eprintln!("sinomo-app launcher: {error}");
-                ExitCode::FAILURE
+                return ExitCode::FAILURE;
             }
-        };
+        }
     }
     match sinomo_app::run() {
         Ok(()) => ExitCode::SUCCESS,

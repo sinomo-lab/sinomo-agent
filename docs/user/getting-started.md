@@ -8,7 +8,8 @@ Sinomo in Installed Apps. On Linux, make the AppImage executable in your file
 manager and open it; the installer uses native desktop dialogs and requires a
 working desktop portal. No terminal setup is needed after opening the installer.
 
-Select an empty application folder and a separate persistent data folder. Windows
+Select an empty setup folder and a separate persistent data folder. The setup
+folder holds removal metadata; executable components live only in `<data>/bin`. Windows
 offers a directory entry and Browse button; Linux uses folder choosers, which can
 create new folders. PATH integration and app desktop/menu shortcuts are optional.
 The CLI and app use the selected data folder; an explicit `SINOMO_DATA_DIR`
@@ -24,17 +25,29 @@ daemons directly for the current session. No GUI is needed for `sinomo install`.
 
 Setup is for initial installation, not upstream updates. It refuses a nonempty
 application destination. When reusing a data directory with an active desktop
-release, setup preserves that release. Evolution and upstream source merges stay
-under the cluster's normal rollout system; no binary auto-updater is installed.
+release, setup preserves that release, its binaries, modules and managed source.
+The complete distribution includes every default platform-compatible native module,
+including evolution, and an offline source checkout. Fresh deployments receive
+those defaults; retained deployments preserve their evolved module selection.
+The evolution agent merges and verifies upstream changes; rollout replaces each
+selected node's source with the approved snapshot. No binary auto-updater is installed.
 
-To uninstall, quit the app and use Installed Apps on Windows or **Uninstall
-Sinomo** in the Linux applications menu. Linux also provides `sinomo-setup` in
-the application folder. Data is kept by default. Permanent data deletion requires
+For an older installation with executable copies in the setup folder, first
+update its daemon through the approved rollout workflow. Then uninstall while
+keeping data and reinstall from the complete distribution using that data folder.
+This rebuilds OS integration around the canonical binaries without replacing the
+evolved deployment. Setup does not perform an implicit runtime upgrade.
+
+To uninstall, use Installed Apps on Windows or **Uninstall Sinomo** in the Linux
+applications menu. Linux also provides `<data>/bin/sinomo-setup`. Data is kept by
+default, including evolved binaries, native modules and source history. Permanent data deletion requires
 explicit confirmation and is available only for the selected data folder bound
 to this installation. Setup does not take deletion ownership from another
 installation. Either the CLI or graphical uninstaller can remove either setup
-type. Both stop shadow recovery before main, remove daemon startup integration,
-and remove owned app files while preserving other files added to the app folder.
+type. Both remove startup/PATH/shortcut integration and stop the deployment. A persistent
+removal fence prevents background recovery from reviving it. Shutdown has a bounded
+grace period; stuck work or rollout cannot veto removal, which can terminate owned
+processes. Explicit reinstall validates and re-enables retained deployment data.
 
 ## Source Installation
 
@@ -79,16 +92,20 @@ will disappear unexpectedly, or another machine's live data directory.
 From the repository root:
 
 ```sh
-cargo build -p sinomo
-cargo run -p sinomo -- install --add-to-path
+# Linux x86-64 example; use x86_64-pc-windows-msvc and .exe on Windows.
+cargo build --locked -p sinomo --target x86_64-unknown-linux-gnu
+cargo run --locked -p sinomo-installer --bin sinomo-package -- . target/x86_64-unknown-linux-gnu/debug target/x86_64-unknown-linux-gnu/debug x86_64-unknown-linux-gnu dev
+target/x86_64-unknown-linux-gnu/debug/sinomo install --add-to-path
 ```
 
 `sinomo install` uses the same initial-setup engine as the graphical installer.
-It requires an empty application destination, binds the CLI and app to the
-selected data directory, registers removal integration, and preserves an active
-evolved release. It registers per-user daemon startup and verifies main and
-shadow are running before reporting success. It does not import source, build
-native modules, or offer a replacement upstream binary. `--no-start` registers
+Use a complete `sinomo-cli` archive from the installer artifacts, or prepare the
+offline payload from a clean committed source checkout as above. Keep
+`initial-payload.tar` beside the downloaded CLI. Setup requires an empty metadata
+destination, binds executable components to `<data>/bin`, registers removal
+integration, and preserves an evolved deployment. It registers per-user daemon startup and verifies main and
+shadow are running before reporting success. It seeds missing managed source and default native modules from the verified
+offline payload, without compiling or downloading during installation. `--no-start` registers
 the deployment without starting new daemon processes.
 
 Use `--install-dir PATH` and `--data-dir PATH` to choose locations. The defaults
@@ -135,8 +152,9 @@ the same data directory at the same time.
 
 ### Minimal Containers
 
-The standalone CLI and its install/uninstall path do not require a display,
-desktop portal, graphical installer, GPU or desktop libraries. A container with
+The complete CLI distribution and its install/uninstall path do not require a
+display, desktop portal, graphical installer or GPU. Required native runtime
+libraries are bundled; installed perception modules do not grant device consent. A container with
 no systemd user manager receives enabled unit files and directly started daemon
 processes, with that fallback reported explicitly. As with all background
 processes, they cannot outlive the container's PID 1.

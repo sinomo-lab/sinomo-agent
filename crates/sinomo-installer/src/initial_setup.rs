@@ -1,6 +1,6 @@
 //! Shared initial-installation, integration and removal contract for CLI and graphical setup.
+mod removal;
 pub mod services;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::local;
 use sinomo_rollout::desktop;
@@ -25,6 +25,15 @@ pub struct Receipt {
     pub integrations: Vec<PathBuf>,
     #[serde(default)]
     pub services: Option<services::Registration>,
+    #[serde(default)]
+    pub setup_owner: Option<ProcessIdentity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    pub exe: PathBuf,
 }
 
 /// Optional shell integration shared by CLI and graphical initial setup.
@@ -69,33 +78,67 @@ pub fn install(
     fs::create_dir_all(root)?;
     fs::create_dir_all(data)?;
     validate_locations(root, data)?;
+    validate_new_owner(root, data)?;
     if fs::read_dir(root)?.next().is_some() {
         return Err("Choose an empty installation directory. Use rollout to evolve an existing installation.".into());
     }
-    let mut files = if let Some(source) = desktop_source {
-        let files = payload_files();
-        for name in &files {
-            fs::copy(source.join(name), root.join(name))?;
+    let retain_components = retained_runtime(data);
+    let bin = data.join("bin");
+    fs::create_dir_all(&bin)?;
+    let _admission =
+        sinomo_rollout::acquire_installation_guard(&sinomo_rollout::SelfRolloutPaths::new(data))?;
+    local::inhibit_deployment(data)?;
+    if !bin.join(binary("sinomo")).exists() {
+        fs::copy(executable, bin.join(binary("sinomo")))?;
+    }
+    if let Some(source) = desktop_source {
+        let manifest = desktop::read_manifest(source)?;
+        for file in &manifest.files {
+            if !desktop::is_desktop_payload_file(&file.path) {
+                continue;
+            }
+            let destination = bin.join(&file.path);
+            if !destination.exists() {
+                fs::create_dir_all(destination.parent().ok_or("no component parent")?)?;
+                fs::copy(source.join(&file.path), destination)?;
+            }
         }
-        if source.join(binary("sinomo-setup")).is_file() {
+        if !bin.join("desktop-release.json").exists() {
             fs::copy(
-                source.join(binary("sinomo-setup")),
-                root.join(binary("sinomo-setup")),
+                source.join("desktop-release.json"),
+                bin.join("desktop-release.json"),
             )?;
         }
-        files
-    } else {
-        fs::copy(executable, root.join(binary("sinomo")))?;
-        vec![binary("sinomo")]
-    };
+        if source.join(binary("sinomo-setup")).is_file() {
+            let destination = if cfg!(target_os = "linux") {
+                bin.join(binary("sinomo-setup"))
+            } else {
+                root.join(binary("sinomo-setup"))
+            };
+            if !destination.exists() {
+                fs::copy(source.join(binary("sinomo-setup")), destination)?;
+            }
+        }
+    }
+    let mut files = Vec::new();
     files.extend([
         binary("sinomo-setup"),
         local::INSTALLED_DATA_DIR_FILE.into(),
         RECEIPT.into(),
         "windows-integration.ps1".into(),
+        "windows-integration.json.next".into(),
         "uninstall.ps1".into(),
+        crate::bundle::PAYLOAD.into(),
     ]);
     configure_with_files(root, data, desktop_source, files)?;
+    let package = executable
+        .parent()
+        .filter(|p| p.join(crate::bundle::PAYLOAD).is_file())
+        .or(desktop_source)
+        .or_else(|| executable.parent())
+        .ok_or("no package directory")?;
+    complete_payload(package, data, desktop_source, retain_components)?;
+    drop(_admission);
     #[cfg(windows)]
     {
         fs::write(
@@ -147,7 +190,7 @@ pub fn payload_files() -> Vec<String> {
     desktop::DESKTOP_BINARY_STEMS
         .into_iter()
         .map(binary)
-        .chain(["desktop-release.json".to_owned()])
+        .chain([binary("sinomo"), "desktop-release.json".to_owned()])
         .collect()
 }
 
@@ -177,10 +220,40 @@ pub fn validate_locations(root: &Path, data: &Path) -> Result<()> {
 }
 
 pub fn configure(root: &Path, data: &Path) -> Result<()> {
-    configure_from(root, data, root)
+    fs::create_dir_all(data)?;
+    validate_locations(root, data)?;
+    validate_new_owner(root, data)?;
+    let _admission =
+        sinomo_rollout::acquire_installation_guard(&sinomo_rollout::SelfRolloutPaths::new(data))?;
+    let retain_components = retained_runtime(data);
+    local::inhibit_deployment(data)?;
+    configure_from_guarded(root, data, root)?;
+    complete_payload(root, data, Some(root), retain_components)?;
+    remove_extracted_payload(root, root)?;
+    fs::remove_file(root.join(crate::bundle::PAYLOAD))?;
+    Ok(())
 }
 
 pub fn configure_from(root: &Path, data: &Path, source: &Path) -> Result<()> {
+    let _admission =
+        sinomo_rollout::acquire_installation_guard(&sinomo_rollout::SelfRolloutPaths::new(data))?;
+    configure_from_guarded(root, data, source)?;
+    remove_extracted_payload(root, source)
+}
+
+fn configure_from_guarded(root: &Path, data: &Path, source: &Path) -> Result<()> {
+    fs::create_dir_all(data)?;
+    validate_locations(root, data)?;
+    validate_new_owner(root, data)?;
+    let bin = data.join("bin");
+    fs::create_dir_all(&bin)?;
+    // NSIS extracts temporary payloads beside setup. Only DATA/bin is an
+    // executable installation; retained/evolved components always win.
+    for name in payload_files() {
+        if source.join(&name).is_file() && !bin.join(&name).exists() {
+            fs::copy(source.join(&name), bin.join(&name))?;
+        }
+    }
     let files = installed_files()
         .into_iter()
         .chain([
@@ -188,9 +261,23 @@ pub fn configure_from(root: &Path, data: &Path, source: &Path) -> Result<()> {
             local::INSTALLED_DATA_DIR_FILE.into(),
             RECEIPT.into(),
             "windows-integration.ps1".into(),
+            "windows-integration.json.next".into(),
+            crate::bundle::PAYLOAD.into(),
         ])
         .collect();
-    configure_with_files(root, data, Some(source), files)
+    configure_with_files(root, data, Some(source), files)?;
+    Ok(())
+}
+
+fn remove_extracted_payload(root: &Path, source: &Path) -> Result<()> {
+    if fs::canonicalize(source)? == fs::canonicalize(root)? {
+        for name in payload_files() {
+            if root.join(&name).is_file() {
+                fs::remove_file(root.join(name))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn configure_with_files(
@@ -218,10 +305,13 @@ fn configure_with_files(
     // Bind the explicitly selected directory, including reused cluster data. Never
     // take deletion ownership away from another registered installation.
     let owns_data = match fs::read_to_string(data.join(DATA_OWNER)) {
-        Ok(owner) => owner == root.to_string_lossy(),
+        Ok(owner) => owner == root.to_string_lossy() || !Path::new(&owner).join(RECEIPT).is_file(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(error) => return Err(error.into()),
     };
+    if !owns_data {
+        return Err("data belongs to another registered installation; uninstall it first".into());
+    }
     let receipt = Receipt {
         schema: 1,
         install_dir: root.clone(),
@@ -230,6 +320,11 @@ fn configure_with_files(
         files,
         integrations: Vec::new(),
         services: None,
+        setup_owner: match fs::read(data.join("rollout/activation.owner.json")) {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        },
     };
     // Persist recovery/removal information before installing managed state or integrations.
     write_receipt(&root, &receipt)?;
@@ -241,13 +336,64 @@ fn configure_with_files(
         root.join(local::INSTALLED_DATA_DIR_FILE),
         data.to_str().ok_or("invalid data path")?,
     )?;
+    fs::create_dir_all(data.join("bin"))?;
+    fs::write(
+        data.join("bin").join(local::INSTALLED_DATA_DIR_FILE),
+        data.to_str().ok_or("invalid data path")?,
+    )?;
     // Reuse an evolved data directory without even offering the installer as a candidate.
     let releases = desktop::DesktopReleases::new(&data);
     if let Some(source) = source {
-        if releases.status()?.active_release.is_none() {
+        if releases.status()?.active_release.is_none()
+            && local::ensure_deployment_enabled(&data).is_ok()
+        {
             let layout =
                 crate::InstallLayout::new(&local::SinomoDataDir::new(&data), data.join("boot"));
             crate::install_desktop_bundle(&layout, source)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_owner(root: &Path, data: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)?;
+    if root.join(RECEIPT).exists() || root.join(local::INSTALLED_DATA_DIR_FILE).exists() {
+        return Err("Sinomo is already registered here; uninstall before reinstalling".into());
+    }
+    match fs::read_to_string(data.join(DATA_OWNER)) {
+        Ok(owner) if Path::new(&owner) != root && Path::new(&owner).join(RECEIPT).is_file() => {
+            Err("data belongs to another registered installation; uninstall it first".into())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn retained_runtime(data: &Path) -> bool {
+    local::SinomoDataDir::new(data).binary("sinomo").is_file()
+        && sinomo_build::BuildPaths::new(data)
+            .managed_source
+            .join(".git")
+            .exists()
+}
+
+fn complete_payload(
+    package: &Path,
+    data: &Path,
+    desktop_source: Option<&Path>,
+    retain_components: bool,
+) -> Result<()> {
+    crate::bundle::install_missing(package, data, !retain_components)?;
+    local::enable_deployment(data)?;
+    if let Some(source) = desktop_source {
+        let releases = desktop::DesktopReleases::new(data);
+        if releases.status()?.active_release.is_none() {
+            let layout =
+                crate::InstallLayout::new(&local::SinomoDataDir::new(data), data.join("boot"));
+            if let Err(error) = crate::install_desktop_bundle(&layout, source) {
+                local::inhibit_deployment(data)?;
+                return Err(error.into());
+            }
         }
     }
     Ok(())
@@ -266,7 +412,12 @@ fn installed_files() -> Vec<String> {
 }
 
 fn write_receipt(root: &Path, receipt: &Receipt) -> Result<()> {
-    fs::write(root.join(RECEIPT), serde_json::to_vec_pretty(receipt)?)?;
+    sinomo_core::storage::durable_file::write_file_atomic(
+        &root.join(RECEIPT),
+        &serde_json::to_vec_pretty(receipt)?,
+        sinomo_core::storage::durable_file::DurableAtomicFileOptions::new("installer", "receipt")
+            .sync_all(),
+    )?;
     Ok(())
 }
 
@@ -283,61 +434,6 @@ pub fn read_receipt(root: &Path) -> Result<Receipt> {
     Ok(receipt)
 }
 
-fn ensure_stopped(
-    data: &Path,
-    services: Option<&services::Registration>,
-) -> Result<Option<fs::File>> {
-    use sinomo_daemon::{DaemonPaths, DaemonProbeStatus, probe_daemon_status};
-    let launcher = data.join("rollout/desktop/launcher.lock");
-    let lease = if data.is_dir() {
-        fs::create_dir_all(launcher.parent().ok_or("no launcher lock directory")?)?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(launcher)?;
-        file.try_lock_exclusive()
-            .map_err(|_| "Quit the Sinomo app before uninstalling.")?;
-        Some(file)
-    } else {
-        None
-    };
-    if let Some(services) = services {
-        services::stop_manager(services)?;
-    }
-    // Stop recovery first so it cannot restart main during removal.
-    for name in ["shadow-daemon", "daemon"] {
-        let paths = DaemonPaths::with_root(data.join(name));
-        match probe_daemon_status(&paths, Duration::from_secs(1)) {
-            DaemonProbeStatus::NotRunning => continue,
-            DaemonProbeStatus::Running(status) => {
-                sinomo_daemon::send_daemon_shutdown_request(
-                    &status.address,
-                    Duration::from_secs(5),
-                )?;
-            }
-            _ => {
-                return Err(
-                    "The runtime is starting or stopping; retry uninstall when it has stopped."
-                        .into(),
-                );
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !matches!(
-            probe_daemon_status(&paths, Duration::from_millis(500)),
-            DaemonProbeStatus::NotRunning
-        ) {
-            if Instant::now() >= deadline {
-                return Err("Runtime shutdown timed out; no files were removed.".into());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    Ok(lease)
-}
-
 pub fn uninstall(root: &Path, delete_data: bool) -> Result<()> {
     uninstall_inner(root, delete_data, false)
 }
@@ -349,24 +445,69 @@ pub fn uninstall_nsis(root: &Path, delete_data: bool) -> Result<()> {
 }
 
 fn uninstall_inner(root: &Path, delete_data: bool, _nsis_managed: bool) -> Result<()> {
-    let receipt = read_receipt(root)?;
-    if delete_data {
+    let mut receipt = read_receipt(root)?;
+    let data_existed = match fs::symlink_metadata(&receipt.data_dir) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !receipt.data_dir.is_absolute() || receipt.data_dir.parent().is_none() {
+        return Err("invalid recorded data directory".into());
+    }
+    if data_existed {
         validate_locations(root, &receipt.data_dir)?;
-        if !receipt.owns_data
+        if fs::canonicalize(&receipt.data_dir)? != receipt.data_dir
+            || !receipt.owns_data
             || fs::read_to_string(receipt.data_dir.join(DATA_OWNER))?
                 != receipt.install_dir.to_string_lossy()
         {
-            return Err("This data directory is bound to another installation, or its ownership changed. Data removal is refused.".into());
+            return Err(
+                "deployment ownership changed; refusing to stop or remove another installation"
+                    .into(),
+            );
         }
-        if fs::symlink_metadata(&receipt.data_dir)?
-            .file_type()
-            .is_symlink()
-            || fs::canonicalize(&receipt.data_dir)? != receipt.data_dir
-        {
-            return Err("Data directory identity changed; data removal is refused.".into());
+        if delete_data {
+            validate_locations(root, &receipt.data_dir)?;
+            if !receipt.owns_data
+                || fs::read_to_string(receipt.data_dir.join(DATA_OWNER))?
+                    != receipt.install_dir.to_string_lossy()
+            {
+                return Err("This data directory is bound to another installation, or its ownership changed. Data removal is refused.".into());
+            }
+            if fs::symlink_metadata(&receipt.data_dir)?
+                .file_type()
+                .is_symlink()
+                || fs::canonicalize(&receipt.data_dir)? != receipt.data_dir
+            {
+                return Err("Data directory identity changed; data removal is refused.".into());
+            }
         }
+        local::inhibit_deployment(&receipt.data_dir)?;
     }
-    let _launcher_lease = ensure_stopped(&receipt.data_dir, receipt.services.as_ref())?;
+    removal::stop(root, &receipt.data_dir, receipt.services.as_ref())?;
+    // Concurrent setup records prepared effects before making them.
+    receipt = read_receipt(root)?;
+    let paths = sinomo_rollout::SelfRolloutPaths::new(&receipt.data_dir);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut admission = if receipt.data_dir.try_exists()? {
+        Some(loop {
+            match sinomo_rollout::acquire_installation_guard(&paths) {
+                Ok(guard) => break guard,
+                Err(error) if Instant::now() >= deadline => return Err(error.into()),
+                Err(_) => {
+                    removal::terminate_owned(root, &receipt.data_dir)?;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        })
+    } else {
+        None
+    };
+    if admission.is_some() {
+        // A setup that was already admitted may have cleared the first fence
+        // before being stopped. Removal now owns admission and wins that race.
+        local::inhibit_deployment(&receipt.data_dir)?;
+    }
     if let Some(services) = &receipt.services {
         services::remove(services)?;
     }
@@ -374,8 +515,49 @@ fn uninstall_inner(root: &Path, delete_data: bool, _nsis_managed: bool) -> Resul
     windows_integration(root, "uninstall", &[])?;
     #[cfg(target_os = "linux")]
     linux_remove_integrations(&receipt)?;
-    if delete_data {
+    // Windows cannot unlink an open advisory lock. The durable fence remains
+    // authoritative after the lock closes, including while data is removed.
+    if (delete_data || !data_existed) && receipt.data_dir.try_exists()? {
+        drop(admission.take());
+        if fs::canonicalize(&receipt.data_dir)? != receipt.data_dir {
+            return Err("data identity changed during removal".into());
+        }
+        if let Ok(owner) = fs::read_to_string(receipt.data_dir.join(DATA_OWNER)) {
+            if owner != receipt.install_dir.to_string_lossy() {
+                return Err("data now belongs to another installation".into());
+            }
+        }
+        #[cfg(windows)]
+        {
+            let executable = fs::canonicalize(env::current_exe()?)?;
+            if executable.starts_with(&receipt.data_dir) {
+                // Rename the running maintenance image out of DATA before
+                // deletion. No native modules are loaded by maintenance CLI.
+                let retired = receipt
+                    .data_dir
+                    .parent()
+                    .ok_or("no data parent")?
+                    .join(format!(".sinomo-uninstall-{}.exe", std::process::id()));
+                if retired.exists() {
+                    return Err("retired uninstall image already exists".into());
+                }
+                fs::rename(&executable, &retired)?;
+                schedule_running_file_removal(
+                    &retired,
+                    receipt.data_dir.parent().ok_or("no data parent")?,
+                    false,
+                )?;
+            }
+        }
         fs::remove_dir_all(&receipt.data_dir)?;
+        // Catch a finite startup that raced shutdown before its image disappeared.
+        removal::terminate_owned(root, &receipt.data_dir)?;
+        if receipt.data_dir.try_exists()? {
+            if fs::canonicalize(&receipt.data_dir)? != receipt.data_dir {
+                return Err("data identity changed during removal".into());
+            }
+            fs::remove_dir_all(&receipt.data_dir)?;
+        }
     }
     // Never recursively remove an installation folder: users may have added their own files.
     for file in &receipt.files {
@@ -383,10 +565,10 @@ fn uninstall_inner(root: &Path, delete_data: bool, _nsis_managed: bool) -> Resul
         if env::current_exe()
             .ok()
             .and_then(|exe| fs::canonicalize(exe).ok())
-            == fs::canonicalize(root.join(file)).ok()
+            .is_some_and(|exe| fs::canonicalize(root.join(file)).is_ok_and(|path| path == exe))
         {
             if !_nsis_managed {
-                schedule_running_file_removal(&root.join(file), root)?;
+                schedule_running_file_removal(&root.join(file), root, true)?;
             }
             continue;
         }
@@ -405,6 +587,21 @@ fn uninstall_inner(root: &Path, delete_data: bool, _nsis_managed: bool) -> Resul
         }
         unregister_windows(root)?;
     }
+    if let Some(owner) = receipt.setup_owner {
+        let prefix = format!(".sinomo-install.json.receipt-{}-", owner.pid);
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(&prefix))
+                    .is_some_and(|sequence| sequence.parse::<u64>().is_ok())
+            {
+                fs::remove_file(entry.path())?;
+            }
+        }
+    }
     let _ = fs::remove_dir(root);
     Ok(())
 }
@@ -415,7 +612,7 @@ fn unregister_windows(root: &Path) -> Result<()> {
     let output = Command::new("powershell.exe").creation_flags(0x08000000)
         .args(["-NoProfile", "-NonInteractive", "-Command",
             "$ErrorActionPreference='Stop'; $key='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Sinomo'; if (Test-Path $key) { $stored=(Get-ItemProperty $key).InstallLocation; if ($stored -and ($stored.Replace('\\\\?\\','').TrimEnd('\\') -ieq $env:SINOMO_UNREGISTER_ROOT.Replace('\\\\?\\','').TrimEnd('\\'))) { Remove-Item -LiteralPath $key } }"])
-        .env("SINOMO_UNREGISTER_ROOT", root).output()?;
+        .env("SINOMO_UNREGISTER_ROOT", local::command_path(&fs::canonicalize(root)?)).output()?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
     }
@@ -423,13 +620,14 @@ fn unregister_windows(root: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn schedule_running_file_removal(file: &Path, root: &Path) -> Result<()> {
+fn schedule_running_file_removal(file: &Path, root: &Path, remove_empty_root: bool) -> Result<()> {
     use std::os::windows::process::CommandExt;
     Command::new("powershell.exe").creation_flags(0x08000000)
         .args(["-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; Wait-Process -Id ([int]$env:SINOMO_REMOVE_PID) -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $env:SINOMO_REMOVE_FILE -ErrorAction SilentlyContinue; if ((Get-ChildItem -LiteralPath $env:SINOMO_REMOVE_ROOT -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) { Remove-Item -LiteralPath $env:SINOMO_REMOVE_ROOT -ErrorAction SilentlyContinue }"])
+            "$ErrorActionPreference='Stop'; Wait-Process -Id ([int]$env:SINOMO_REMOVE_PID) -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $env:SINOMO_REMOVE_FILE -ErrorAction SilentlyContinue; if ($env:SINOMO_REMOVE_EMPTY_ROOT -eq '1' -and (Get-ChildItem -LiteralPath $env:SINOMO_REMOVE_ROOT -Force -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) { Remove-Item -LiteralPath $env:SINOMO_REMOVE_ROOT -ErrorAction SilentlyContinue }"])
         .env("SINOMO_REMOVE_PID", std::process::id().to_string())
         .env("SINOMO_REMOVE_FILE", file).env("SINOMO_REMOVE_ROOT", root)
+        .env("SINOMO_REMOVE_EMPTY_ROOT", if remove_empty_root { "1" } else { "0" })
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
     Ok(())
 }
@@ -450,10 +648,10 @@ pub fn windows_integration(root: &Path, action: &str, args: &[String]) -> Result
             "Bypass",
             "-File",
         ])
-        .arg(root.join("windows-integration.ps1"))
+        .arg(local::command_path(&root.join("windows-integration.ps1")))
         .args(["-Action", action])
         .arg("-InstallDir")
-        .arg(root);
+        .arg(local::command_path(root));
     for (flag, switch) in [
         ("--path", "-AddPath"),
         ("--menu", "-Menu"),
@@ -464,6 +662,7 @@ pub fn windows_integration(root: &Path, action: &str, args: &[String]) -> Result
             command.arg(switch);
         }
     }
+    command.env("SINOMO_PRODUCT_VERSION", env!("CARGO_PKG_VERSION"));
     let output = command.output()?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
@@ -501,14 +700,17 @@ pub fn linux_integration(root: &Path, path: bool, menu: bool, desktop: bool) -> 
     fs::create_dir_all(&applications)?;
     let app_entry = format!(
         "[Desktop Entry]\nType=Application\nName=Sinomo\nExec={}\nTerminal=false\nCategories=Utility;\n",
-        desktop_quote(&root.join("sinomo-app"))
+        desktop_quote(&receipt.data_dir.join("bin/sinomo-app"))
     );
-    let remove_command = if root.join("sinomo-setup").is_file() {
-        format!("{} --uninstall", desktop_quote(&root.join("sinomo-setup")))
+    let remove_command = if receipt.data_dir.join("bin/sinomo-setup").is_file() {
+        format!(
+            "{} --uninstall",
+            desktop_quote(&receipt.data_dir.join("bin/sinomo-setup"))
+        )
     } else {
         format!(
             "{} uninstall --install-dir {}",
-            desktop_quote(&root.join("sinomo")),
+            desktop_quote(&receipt.data_dir.join("bin/sinomo")),
             desktop_quote(root)
         )
     };
@@ -559,7 +761,7 @@ pub fn linux_integration(root: &Path, path: bool, menu: bool, desktop: bool) -> 
                 Err(e)
             }
         })?;
-        let block = profile_block(root);
+        let block = profile_block(&receipt.data_dir.join("bin"));
         if !content.contains(&block) {
             content.push_str(&block);
             fs::write(&profile, content)?;
@@ -586,12 +788,17 @@ fn linux_remove_integrations(receipt: &Receipt) -> Result<()> {
             let content = fs::read_to_string(file)?;
             fs::write(
                 file,
-                content.replace(&profile_block(&receipt.install_dir), ""),
+                content
+                    .replace(&profile_block(&receipt.data_dir.join("bin")), "")
+                    .replace(&profile_block(&receipt.install_dir), ""),
             )?;
         } else if file.exists() {
             let content = fs::read_to_string(file)?;
             // Keep a shortcut if the user replaced it with a different target.
-            if content.contains(&desktop_quote(&receipt.install_dir.join("sinomo-app")))
+            if content.contains(&desktop_quote(&receipt.data_dir.join("bin/sinomo-app")))
+                || content.contains(&desktop_quote(&receipt.data_dir.join("bin/sinomo")))
+                || content.contains(&desktop_quote(&receipt.data_dir.join("bin/sinomo-setup")))
+                || content.contains(&desktop_quote(&receipt.install_dir.join("sinomo-app")))
                 || content.contains(&desktop_quote(&receipt.install_dir.join("sinomo-setup")))
                 || content.contains(&desktop_quote(&receipt.install_dir.join("sinomo")))
             {
@@ -605,6 +812,127 @@ fn linux_remove_integrations(receipt: &Receipt) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "subprocess fixture, invoked by prioritized removal acceptance"]
+    fn removal_fixture_process() {
+        let data = PathBuf::from(env::var_os("SINOMO_REMOVAL_TEST_DATA").unwrap());
+        if env::var_os("SINOMO_REMOVAL_FOREIGN").is_some() {
+            fs::write(data.join("ready"), b"ready").unwrap();
+            loop {
+                std::thread::park_timeout(Duration::from_secs(60));
+            }
+        }
+        let _work = sinomo_rollout::acquire_runtime_work(&data).unwrap();
+        let paths = sinomo_rollout::SelfRolloutPaths::new(&data);
+        let _activation = sinomo_rollout::acquire_rollout_activation_guard(&paths).unwrap();
+        fs::write(
+            sinomo_rollout::rollout_main_activation_path(&paths),
+            b"blocked activation",
+        )
+        .unwrap();
+        fs::write(data.join("ready"), b"ready").unwrap();
+        loop {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn uninstall_outranks_a_live_rollout_and_retains_the_entire_data_directory() {
+        let fixture = sinomo_testdir::TestDir::new("uninstall-busy-rollout");
+        let root = fixture.join("setup");
+        let data = fixture.join("data");
+        fs::create_dir_all(&root).unwrap();
+        configure_with_files(
+            &root,
+            &data,
+            None,
+            vec![RECEIPT.into(), local::INSTALLED_DATA_DIR_FILE.into()],
+        )
+        .unwrap();
+        let executable = data.join("bin").join(binary("sinomo"));
+        fs::copy(env::current_exe().unwrap(), &executable).unwrap();
+        fs::create_dir_all(data.join("module/cache/native-dylib/evolved")).unwrap();
+        fs::write(
+            data.join("module/cache/native-dylib/evolved/module"),
+            b"evolved native bytes",
+        )
+        .unwrap();
+        let mut command = Command::new(&executable);
+        #[cfg(windows)]
+        sinomo_daemon::prepare_noninteractive_command(&mut command);
+        let mut child = command
+            .args([
+                "--exact",
+                "initial_setup::tests::removal_fixture_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SINOMO_REMOVAL_TEST_DATA", &data)
+            .env("SINOMO_DATA_DIR", &data)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !data.join("ready").exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "removal fixture exited early"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "removal fixture did not acquire admission"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let foreign = fixture.join("other-deployment");
+        fs::create_dir_all(&foreign).unwrap();
+        let mut foreign_command = Command::new(&executable);
+        #[cfg(windows)]
+        sinomo_daemon::prepare_noninteractive_command(&mut foreign_command);
+        let mut foreign_child = foreign_command
+            .args([
+                "--exact",
+                "initial_setup::tests::removal_fixture_process",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SINOMO_REMOVAL_TEST_DATA", &foreign)
+            .env("SINOMO_DATA_DIR", &foreign)
+            .env("SINOMO_REMOVAL_FOREIGN", "1")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !foreign.join("ready").exists() {
+            assert!(foreign_child.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let started = Instant::now();
+        uninstall(&root, false).unwrap();
+        child.wait().unwrap();
+        let preserved_other_deployment = foreign_child.try_wait().unwrap().is_none();
+        let _ = foreign_child.kill();
+        let _ = foreign_child.wait();
+        assert!(
+            preserved_other_deployment,
+            "uninstall killed a process selecting another data directory"
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(executable.is_file());
+        assert_eq!(
+            fs::read(data.join("module/cache/native-dylib/evolved/module")).unwrap(),
+            b"evolved native bytes"
+        );
+        assert!(data.join("rollout/pending-main-rollout.sobj").is_file());
+        assert!(local::ensure_deployment_enabled(&data).is_err());
+        assert!(sinomo_rollout::acquire_runtime_work(&data).is_err());
+        assert!(
+            sinomo_rollout::acquire_rollout_activation_guard(
+                &sinomo_rollout::SelfRolloutPaths::new(&data)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn headless_staging_binds_directories_before_service_completion() {
@@ -636,6 +964,27 @@ mod tests {
         assert!(!root.join(binary("sinomo")).exists());
         assert!(root.join("personal-file").exists());
         assert!(data.exists());
+    }
+
+    #[test]
+    fn uninstall_removes_registration_after_data_was_already_deleted() {
+        for delete_data in [false, true] {
+            let fixture = sinomo_testdir::TestDir::new("uninstall-missing-data");
+            let root = fixture.join("setup");
+            let data = fixture.join("data");
+            fs::create_dir_all(&root).unwrap();
+            configure_with_files(
+                &root,
+                &data,
+                None,
+                vec![RECEIPT.into(), local::INSTALLED_DATA_DIR_FILE.into()],
+            )
+            .unwrap();
+            fs::remove_dir_all(&data).unwrap();
+            uninstall(&root, delete_data).unwrap();
+            assert!(!root.exists());
+            assert!(!data.exists());
+        }
     }
 
     #[test]
@@ -679,7 +1028,7 @@ mod tests {
             &desktop::DESKTOP_BINARY_STEMS.map(binary),
         )
         .unwrap();
-        configure(&root, &data).unwrap();
+        configure_from(&root, &data, &root).unwrap();
         assert!(read_receipt(&root).unwrap().owns_data);
         assert!(configure(&root, &data).is_err());
         fs::write(root.join("user-file"), b"keep").unwrap();
@@ -706,7 +1055,7 @@ mod tests {
             &desktop::DESKTOP_BINARY_STEMS.map(binary),
         )
         .unwrap();
-        configure(&root, &data).unwrap();
+        configure_from(&root, &data, &root).unwrap();
         assert!(read_receipt(&root).unwrap().owns_data);
         fs::write(data.join(DATA_OWNER), "different install").unwrap();
         assert!(uninstall(&root, true).is_err());
@@ -733,13 +1082,15 @@ mod tests {
             )
             .unwrap();
         }
-        configure(&root, &data).unwrap();
+        configure_from(&root, &data, &root).unwrap();
         let before = desktop::DesktopReleases::new(&data).status().unwrap();
-        configure(&second, &data).unwrap();
+        assert!(configure_from(&second, &data, &second).is_err());
+        uninstall(&root, false).unwrap();
+        configure_from(&second, &data, &second).unwrap();
         let after = desktop::DesktopReleases::new(&data).status().unwrap();
         assert_eq!(before.active_release, after.active_release);
         assert_eq!(before.candidate_release, after.candidate_release);
-        uninstall(&root, true).unwrap();
+        uninstall(&second, true).unwrap();
         assert!(!data.exists());
     }
 }

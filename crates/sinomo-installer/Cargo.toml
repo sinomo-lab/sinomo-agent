@@ -16,10 +16,14 @@ sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-daemon = { path = "../sinomo-daemon" }
 sinomo-rollout = { path = "../sinomo-rollout" }
+sinomo-build = { path = "../sinomo-build" }
+sinomo-module = { path = "../sinomo-module" }
 serde.workspace = true
 serde_json.workspace = true
 fs2.workspace = true
 blake3.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

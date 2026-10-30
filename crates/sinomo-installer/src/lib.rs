@@ -1,4 +1,5 @@
 //! Local runtime installation, managed-source deployment, and boot-entry orchestration.
+pub mod bundle;
 pub mod initial_setup;
 
 use sinomo_api::daemon_status_matches_options;
@@ -129,11 +130,25 @@ pub fn prepare_desktop_install(
     }
     let source = match bundle {
         Some(path) => path.to_path_buf(),
-        None => std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .ok_or("installer has no parent directory")?
-            .to_path_buf(),
+        None => {
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            let directory = executable
+                .parent()
+                .ok_or("installer has no parent directory")?;
+            let active = sinomo_core::local::installed_data_dir(directory)
+                .map_err(|e| e.to_string())?
+                .map(|data| sinomo_rollout::desktop::DesktopReleases::new(&data))
+                .map(|releases| -> Result<Option<PathBuf>, String> {
+                    releases
+                        .status()?
+                        .active_release
+                        .map(|id| releases.release_dir(&id))
+                        .transpose()
+                })
+                .transpose()?
+                .flatten();
+            active.unwrap_or_else(|| directory.to_path_buf())
+        }
     };
     if !source
         .join(sinomo_api::app::update::APP_BUNDLE_MANIFEST)
@@ -155,8 +170,8 @@ pub fn install_desktop_bundle(
 ) -> Result<sinomo_api::app::update::AppUpdateStatus, String> {
     let releases = sinomo_rollout::desktop::DesktopReleases::new(&layout.data_dir);
     let status = releases.install_initial(source)?;
-    // Stable launch entries are bootstrap hosts. Running images (notably Windows executables)
-    // are never overwritten; subsequent releases execute out of immutable version directories.
+    // Initial setup seeds canonical execution entries. Rollout retains immutable
+    // artifacts for recovery and publishes selected GUI files back into this bin.
     for stem in sinomo_rollout::desktop::DESKTOP_BINARY_STEMS {
         let name = sinomo_rollout::executable_name(stem);
         let destination = layout.bin_dir.join(&name);
@@ -1080,6 +1095,41 @@ enum BootEntryChildProcessPolicy {
     PreserveDetachedChildren,
 }
 
+pub(crate) fn boot_script_bytes(content: &str) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        // Windows Script Host interprets BOM-less scripts using the system ANSI
+        // code page. UTF-16LE keeps user-selected paths independent of that page.
+        std::iter::once(0xfeffu16)
+            .chain(content.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    content.as_bytes().to_vec()
+}
+
+pub(crate) fn read_boot_script(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    #[cfg(windows)]
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        if bytes.len() % 2 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated startup script",
+            ));
+        }
+        let units: Vec<_> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16(&units)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn write_boot_entry(
     path: &Path,
     data_dir: &Path,
@@ -1109,7 +1159,7 @@ fn write_boot_entry(
         child_process_policy,
         extra_env,
     );
-    fs::write(path, content).map_err(|source| DaemonError::Io {
+    fs::write(path, boot_script_bytes(&content)).map_err(|source| DaemonError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })
@@ -1329,6 +1379,25 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_signin_scripts_preserve_unicode_independent_of_system_code_page() {
+        let root = sinomo_testdir::TestDir::new("unicode-signin-script");
+        let path = root.join("check.vbs");
+        let content = "WScript.Quit(AscW(\"é\") - 233)";
+        fs::write(&path, boot_script_bytes(content)).unwrap();
+        assert_eq!(read_boot_script(&path).unwrap(), content);
+        let status = install_child_command("cscript.exe")
+            .args(["//B", "//Nologo"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "Script Host did not read the Unicode path literal correctly: {status}"
+        );
+    }
+
     #[test]
     fn installed_default_ports_remain_automatic_in_process_and_boot_specs() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-install-auto-ports");
@@ -1351,8 +1420,8 @@ mod tests {
 
         write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354, true, true)
             .expect("write automatic-port boot entries");
-        let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
-        let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
+        let main = read_boot_script(&layout.main_boot_entry).expect("read main boot entry");
+        let shadow = read_boot_script(&layout.shadow_boot_entry).expect("read shadow boot entry");
         assert!(!main.contains("--port"), "{main}");
         assert!(!shadow.contains("--port"), "{shadow}");
         assert!(!shadow.contains(SHADOW_MAIN_PORT_ENV), "{shadow}");
@@ -1368,8 +1437,8 @@ mod tests {
         write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354, false, false)
             .expect("write boot entries");
 
-        let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
-        let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
+        let main = read_boot_script(&layout.main_boot_entry).expect("read main boot entry");
+        let shadow = read_boot_script(&layout.shadow_boot_entry).expect("read shadow boot entry");
         assert!(main.contains("[Service]\nEnvironment=SINOMO_DATA_DIR="));
         assert!(!main.contains("KillMode="));
         assert!(shadow.contains("[Service]\nKillMode=process\nEnvironment=SINOMO_DATA_DIR="));

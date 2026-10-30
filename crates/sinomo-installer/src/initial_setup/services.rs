@@ -7,8 +7,8 @@ use sinomo_daemon::{DaemonProbeStatus, probe_daemon_status};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 pub const DEFAULT_HOST: &str = "0.0.0.0";
@@ -132,7 +132,7 @@ fn registration(layout: &InstallLayout, options: &Options) -> Registration {
 }
 
 fn legacy_owned(path: &Path, data: &Path) -> Result<Option<String>> {
-    let content = match fs::read_to_string(path) {
+    let content = match crate::read_boot_script(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -248,8 +248,15 @@ fn adopt_legacy(
 }
 
 fn verify_entry(path: &Path, expected: &str) -> Result<()> {
-    match fs::read_to_string(path) {
-        Ok(content) if content == expected => Ok(()),
+    match fs::read(path) {
+        // The receipt records intent before writing. Removal must also handle
+        // its own interrupted write, while preserving a replaced user entry.
+        Ok(content)
+            if crate::boot_script_bytes(expected).starts_with(&content)
+                || expected.as_bytes().starts_with(&content) =>
+        {
+            Ok(())
+        }
         Ok(_) => Err(format!(
             "service registration changed or belongs to another deployment: {}",
             path.display()
@@ -323,8 +330,14 @@ pub(super) fn install(root: &Path, options: &Options) -> Result<()> {
     receipt.services = Some(record.clone());
     write_receipt(root, &receipt)?;
     fs::create_dir_all(&layout.boot_dir)?;
-    fs::write(&record.main_entry, &record.main_content)?;
-    fs::write(&record.shadow_entry, &record.shadow_content)?;
+    fs::write(
+        &record.main_entry,
+        crate::boot_script_bytes(&record.main_content),
+    )?;
+    fs::write(
+        &record.shadow_entry,
+        crate::boot_script_bytes(&record.shadow_content),
+    )?;
     #[cfg(unix)]
     for (link, target) in &record.enabled_links {
         fs::create_dir_all(link.parent().expect("enablement directory"))?;
@@ -345,7 +358,30 @@ pub(super) fn install(root: &Path, options: &Options) -> Result<()> {
             options.main_port_fallback,
             options.shadow_port_fallback,
         );
-        for (spec, entry) in specs.iter().zip([&record.main_entry, &record.shadow_entry]) {
+        let rollout_paths = sinomo_rollout::SelfRolloutPaths::new(&receipt.data_dir);
+        let recovering = sinomo_rollout::rollout_main_activation_path(&rollout_paths).exists()
+            || sinomo_rollout::rollout_shadow_finalize_path(&rollout_paths).exists();
+        let entries = [&record.main_entry, &record.shadow_entry];
+        for index in if recovering { [1, 0] } else { [0, 1] } {
+            let (spec, entry) = (&specs[index], entries[index]);
+            if recovering && index == 0 {
+                // Retained rollout intent belongs to shadow recovery. Starting
+                // old main first could pair it with staged native-loader state.
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while sinomo_rollout::rollout_main_activation_path(&rollout_paths).exists()
+                    || sinomo_rollout::rollout_shadow_finalize_path(&rollout_paths).exists()
+                {
+                    sinomo_core::local::ensure_deployment_enabled(&receipt.data_dir)?;
+                    if Instant::now() >= deadline {
+                        return Err(
+                            "retained rollout recovery did not settle; inspect rollout diagnostics"
+                                .into(),
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            sinomo_core::local::ensure_deployment_enabled(&receipt.data_dir)?;
             match probe_daemon_status(&spec.paths, Duration::from_secs(1)) {
                 DaemonProbeStatus::Running(status) => {
                     let port = if spec.label == "daemon" {
@@ -426,27 +462,32 @@ pub(super) fn install(root: &Path, options: &Options) -> Result<()> {
 }
 
 fn manager_available() -> bool {
-    cfg!(target_os = "linux")
-        && Command::new("systemctl")
-            .args(["--user", "show-environment"])
-            .output()
-            .is_ok_and(|output| output.status.success())
+    cfg!(target_os = "linux") && systemctl(&["show-environment"]).is_ok()
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {
-    let output = Command::new("systemctl")
+    let mut child = Command::new("systemctl")
         .arg("--user")
         .args(args)
-        .output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "systemctl --user {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        )
-        .into());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(format!("systemctl --user {}: {status}", args.join(" ")).into());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("systemctl --user {} timed out", args.join(" ")).into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
 }
 
 pub(super) fn stop_manager(record: &Registration) -> Result<()> {
@@ -467,6 +508,9 @@ pub(super) fn stop_manager(record: &Registration) -> Result<()> {
 
 pub(super) fn remove(record: &Registration) -> Result<()> {
     check(record)?;
+    if let Err(error) = stop_manager(record) {
+        eprintln!("Service manager stop failed; deployment remains fenced: {error}");
+    }
     for (link, _) in &record.enabled_links {
         match fs::remove_file(link) {
             Ok(()) => {}
@@ -482,7 +526,9 @@ pub(super) fn remove(record: &Registration) -> Result<()> {
         }
     }
     if manager_available() {
-        systemctl(&["daemon-reload"])?;
+        if let Err(error) = systemctl(&["daemon-reload"]) {
+            eprintln!("Service files removed; user manager reload failed: {error}");
+        }
     }
     Ok(())
 }
@@ -499,6 +545,7 @@ mod tests {
             files: Vec::new(),
             integrations: Vec::new(),
             services: None,
+            setup_owner: None,
         }
     }
     #[test]
@@ -515,6 +562,12 @@ mod tests {
         fs::write(&record.main_entry, "another deployment").unwrap();
         assert!(remove(&record).is_err());
         assert!(record.shadow_entry.exists());
+        let encoded = crate::boot_script_bytes(&record.main_content);
+        fs::write(&record.main_entry, &encoded[..encoded.len() / 2]).unwrap();
+        assert!(
+            check(&record).is_ok(),
+            "interrupted own startup writes remain removable"
+        );
         assert!(record.main_content.contains("SINOMO_DATA_DIR"));
         assert!(record.shadow_content.contains("SINOMO_SHADOW_MAIN_BINARY"));
         #[cfg(windows)]
@@ -539,8 +592,14 @@ mod tests {
             crate::systemd_value(path, true),
             r#""/data with spaces/%%u/$$HOME/quoted\"name""#
         );
-        let environment = format!("Environment={}", crate::systemd_value(&format!("SINOMO_DATA_DIR={path}"), false));
-        assert_eq!(linux_environment_data(&environment), Some(PathBuf::from(path)));
+        let environment = format!(
+            "Environment={}",
+            crate::systemd_value(&format!("SINOMO_DATA_DIR={path}"), false)
+        );
+        assert_eq!(
+            linux_environment_data(&environment),
+            Some(PathBuf::from(path))
+        );
     }
     #[test]
     fn resident_daemons_drop_only_appimage_library_paths() {

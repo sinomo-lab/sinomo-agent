@@ -25,6 +25,7 @@ Var UiFlag
 Var StartFlag
 
 !insertmacro MUI_PAGE_WELCOME
+!define MUI_DIRECTORYPAGE_TEXT_TOP "Choose the folder for setup and uninstall files. Sinomo program files will live inside the data folder selected on the next page."
 !insertmacro MUI_PAGE_DIRECTORY
 Page custom DataPage DataLeave
 !insertmacro MUI_PAGE_COMPONENTS
@@ -98,10 +99,10 @@ Function CheckEmptyDestination
 FunctionEnd
 
 Function DataPage
-  !insertmacro MUI_HEADER_TEXT "Data directory" "Choose where Sinomo stores cluster state, credentials and files."
+  !insertmacro MUI_HEADER_TEXT "Program and data directory" "Choose where Sinomo stores its program files, cluster state and data."
   nsDialogs::Create 1018
   Pop $Dialog
-  ${NSD_CreateLabel} 0 0 100% 30u "Choose a separate data folder. Existing data is preserved; setup does not upgrade an evolved cluster."
+  ${NSD_CreateLabel} 0 0 100% 30u "Choose a separate folder for the program and its data. Existing evolved components and data are preserved."
   Pop $0
   ${NSD_CreateDirRequest} 0 42u 78% 12u "$DataDir"
   Pop $DataInput
@@ -166,7 +167,7 @@ Section "-Configure"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "{{version}}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "Sinomo"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\sinomo-app.exe"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$DataDir\bin\sinomo-app.exe"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
   WriteRegStr HKCU "${UNINSTALL_KEY}" "QuietUninstallString" '$\"$INSTDIR\Uninstall.exe$\" /S'
   WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1

@@ -1437,7 +1437,7 @@ fn cluster_build_outputs_for_target(
     selection: &ClusterBuildOutputSelection,
 ) -> Result<Vec<BuildOutputRequest>, CliError> {
     if matches!(selection, ClusterBuildOutputSelection::Desktop) {
-        return Ok(["sinomo", "sinomo-app", "sinomo-ui-extension-host"]
+        return Ok(["sinomo-app", "sinomo-ui-extension-host"]
             .into_iter()
             .map(|name| BuildOutputRequest::binary(name, name))
             .collect());

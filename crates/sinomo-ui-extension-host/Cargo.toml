@@ -5,7 +5,7 @@ description = "Isolated Wasm component host for Sinomo custom UI widgets"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-include = ["src/**/*.rs", "Cargo.toml"]
+include = ["src/**/*.rs", "build.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "application"

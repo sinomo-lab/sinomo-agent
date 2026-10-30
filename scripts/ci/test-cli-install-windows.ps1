@@ -3,9 +3,11 @@ param(
     [Parameter(Mandatory)][string]$SandboxRoot
 )
 $ErrorActionPreference = 'Stop'
+$env:SINOMO_DATA_DIR = $null
+$env:SINOMO_INSTALL_DIR = $null
 $SandboxRoot = [IO.Path]::GetFullPath($SandboxRoot)
 $application = Join-Path $SandboxRoot 'application with spaces'
-$data = Join-Path $SandboxRoot 'data with spaces'
+$data = Join-Path $SandboxRoot ('data ' + [char]0x00e9 + ' with spaces')
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sinomo'
 if (Test-Path $key) { throw 'Use a clean CI account; an existing installation must not be changed by this test.' }
 if (Test-Path -LiteralPath $SandboxRoot) { throw 'Use a fresh CLI smoke-test directory.' }
@@ -40,17 +42,54 @@ function Test-ApplicationRemovalPending {
 $installArguments = "install --headless --install-dir `"$application`" --data-dir `"$data`" --add-to-path"
 if ((Invoke-Cli $Cli $installArguments 'install') -ne 0) { throw 'Initial CLI install failed.' }
 if (-not (Test-Path $key)) { throw 'CLI install did not register an uninstaller.' }
-$installedCli = Join-Path $application 'sinomo.exe'
-$receipt = Get-Content -LiteralPath (Join-Path $application 'sinomo-install.json') -Raw | ConvertFrom-Json
+$installedCli = Join-Path $data 'bin/sinomo.exe'
+if (Test-Path (Join-Path $application 'sinomo.exe')) { throw 'Duplicate installed CLI.' }
+$receipt = Get-Content -LiteralPath (Join-Path $application 'sinomo-install.json') -Encoding UTF8 -Raw | ConvertFrom-Json
 $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $SandboxRoot 'deployment.json') -Encoding utf8
 if (-not $receipt.services) { throw 'CLI install did not register daemon services.' }
 $serviceEntries = @($receipt.services.main_entry, $receipt.services.shadow_entry)
 foreach ($entry in $serviceEntries) { if (-not (Test-Path -LiteralPath $entry)) { throw "Missing sign-in service entry: $entry" } }
-if (Test-Path -LiteralPath (Join-Path $data 'source/sinomo')) { throw 'Initial setup unexpectedly imported source.' }
+if (-not (Test-Path -LiteralPath (Join-Path $data 'source/sinomo/.git/HEAD'))) { throw 'Managed source was not seeded.' }
 foreach ($role in @('daemon', 'daemon shadow')) {
     $log = $role.Replace(' ', '-') + '-status'
     if ((Invoke-Cli $installedCli "$role status" $log) -ne 0) { throw "$role status failed" }
     if ((Get-Content -LiteralPath (Join-Path $SandboxRoot ($log + '.out')) -Raw) -notmatch 'is running') { throw "$role is not answering RPC" }
+}
+if ((Invoke-Cli $installedCli 'uninstall --runtime-service --no-stop' 'reject-legacy-no-stop') -eq 0) { throw 'Shared uninstall silently accepted legacy --no-stop.' }
+foreach ($role in @('daemon', 'daemon shadow')) {
+    $log = $role.Replace(' ', '-') + '-after-no-stop'
+    if ((Invoke-Cli $installedCli "$role status" $log) -ne 0 -or
+        (Get-Content -LiteralPath (Join-Path $SandboxRoot ($log + '.out')) -Raw) -notmatch 'is running') { throw 'Rejected legacy command stopped the deployment.' }
+}
+# Exercise the actual sign-in scripts, including Unicode data paths; direct
+# startup alone cannot establish Windows Script Host encoding compatibility.
+foreach ($role in @('daemon shadow', 'daemon')) {
+    $log = $role.Replace(' ', '-') + '-stop-for-signin'
+    if ((Invoke-Cli $installedCli "$role stop" $log) -ne 0) { throw "$role stop failed" }
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $null = Invoke-Cli $installedCli "$role status" ($log + '-status')
+        $running = (Get-Content -LiteralPath (Join-Path $SandboxRoot ($log + '-status.out')) -Raw) -match 'is running'
+        if ($running) { Start-Sleep -Milliseconds 200 }
+    } while ($running -and (Get-Date) -lt $deadline)
+    if ($running) { throw "$role did not stop before sign-in verification" }
+}
+foreach ($entry in $serviceEntries) {
+    $process = Start-Process -FilePath wscript.exe -ArgumentList ('//B //Nologo "' + $entry + '"') -WindowStyle Hidden -PassThru
+    $null = $process.Handle
+    if (-not $process.WaitForExit(30000)) { throw 'Sign-in startup script timed out.' }
+    $process.Refresh()
+    if ($process.ExitCode -ne 0) { throw "Sign-in startup script failed: $entry ($($process.ExitCode))" }
+}
+foreach ($role in @('daemon', 'daemon shadow')) {
+    $log = $role.Replace(' ', '-') + '-signin-status'
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $null = Invoke-Cli $installedCli "$role status" $log
+        $running = (Get-Content -LiteralPath (Join-Path $SandboxRoot ($log + '.out')) -Raw) -match 'is running'
+        if (-not $running) { Start-Sleep -Milliseconds 200 }
+    } while (-not $running -and (Get-Date) -lt $deadline)
+    if (-not $running) { throw "$role did not start through its sign-in service" }
 }
 $before = Get-CliDigest $installedCli
 if ((Invoke-Cli $Cli $installArguments 'refuse-overwrite') -eq 0) { throw 'Initial install overwrote an existing installation.' }
@@ -61,10 +100,13 @@ $deadline = (Get-Date).AddSeconds(30)
 while ((Test-ApplicationRemovalPending) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
 if ((Test-Path $key) -or (Test-ApplicationRemovalPending)) { throw 'Self-uninstall left its registration or executable.' }
 foreach ($entry in $serviceEntries) { if (Test-Path -LiteralPath $entry) { throw 'Self-uninstall left a daemon sign-in entry.' } }
-if (-not (Test-Path -LiteralPath $data)) { throw 'Default uninstall removed data.' }
+if (-not (Test-Path -LiteralPath $installedCli) -or (Get-CliDigest $installedCli) -ne $before) { throw 'Keep-data uninstall changed retained binaries.' }
+if (-not (Test-Path (Join-Path $data 'config/uninstalled'))) { throw 'Removal fence is missing.' }
+if ((Invoke-Cli $installedCli 'daemon start' 'fenced-start') -eq 0) { throw 'Uninstalled daemon restarted.' }
 if ([Environment]::GetEnvironmentVariable('Path', 'User') -cne $originalPath) { throw 'User PATH was not restored exactly.' }
 if ((Invoke-Cli $Cli $installArguments 'reinstall') -ne 0) { throw 'Reinstall with retained data failed.' }
-if ((Invoke-Cli $Cli "uninstall --install-dir `"$application`" --delete-data" 'delete-data') -ne 0) { throw 'Explicit data deletion failed.' }
+$slashApplication = $application.Replace('\', '/')
+if ((Invoke-Cli $Cli "uninstall --install-dir `"$slashApplication`" --delete-data" 'delete-data') -ne 0) { throw 'Explicit data deletion failed.' }
 if ((Test-Path $key) -or (Test-Path -LiteralPath $data)) { throw 'Explicit uninstall left its registration or data.' }
 if ([Environment]::GetEnvironmentVariable('Path', 'User') -cne $originalPath) { throw 'Final uninstall changed the original PATH.' }
 # A CLI-created deployment is also removable by its registered graphical uninstaller.

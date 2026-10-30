@@ -25,6 +25,12 @@ def main():
     source.mkdir()
     cli = source / "sinomo"
     with tarfile.open(args.archive, "r:gz") as archive:
+        payload = archive.getmember("initial-payload.tar")
+        with archive.extractfile(payload) as input_file, (source / "initial-payload.tar").open("wb") as output:
+            shutil.copyfileobj(input_file, output)
+        for library in archive.getmembers():
+            if library.name.startswith("lib/"):
+                archive.extract(library, source, filter="data")
         member = archive.getmember("sinomo")
         if not member.isfile():
             raise RuntimeError("CLI artifact must be a regular executable")
@@ -66,7 +72,9 @@ def main():
     data = root / "data % $ with spaces"
     install = ["install", "--headless", "--install-dir", application, "--data-dir", data]
     run("install", cli, *install)
-    installed = application / "sinomo"
+    installed = data / "bin/sinomo"
+    if (application / "sinomo").exists():
+        raise RuntimeError("Duplicate installed CLI")
     receipt = json.loads((application / "sinomo-install.json").read_text())
     services = receipt["services"]
     entries = [Path(services[key]) for key in ("main_entry", "shadow_entry")]

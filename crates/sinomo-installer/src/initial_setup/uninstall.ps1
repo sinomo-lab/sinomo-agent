@@ -1,7 +1,7 @@
 param([switch]$KeepData, [switch]$Quiet, [switch]$DeleteData)
 $ErrorActionPreference = 'Stop'
 $install = Split-Path -Parent $PSCommandPath
-$receipt = Get-Content -LiteralPath (Join-Path $install 'sinomo-install.json') -Raw | ConvertFrom-Json
+$receipt = Get-Content -LiteralPath (Join-Path $install 'sinomo-install.json') -Encoding UTF8 -Raw | ConvertFrom-Json
 if ($KeepData -and $DeleteData) { throw 'Choose KeepData or DeleteData.' }
 $removeData = [bool]$DeleteData
 if (-not $Quiet) {
@@ -16,7 +16,7 @@ if (-not $Quiet) {
 # Execute an owned temporary copy so Windows can remove the installed CLI.
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('sinomo-uninstall-' + [guid]::NewGuid() + '.exe')
 try {
-    Copy-Item -LiteralPath (Join-Path $install 'sinomo.exe') -Destination $temporary
+    [IO.File]::Copy([IO.Path]::Combine([string]$receipt.data_dir, 'bin', 'sinomo.exe'), $temporary, $false)
     $arguments = @('uninstall', '--install-dir', $install)
     if ($removeData) { $arguments += '--delete-data' }
     & $temporary @arguments

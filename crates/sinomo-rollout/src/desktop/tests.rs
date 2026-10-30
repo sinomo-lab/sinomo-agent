@@ -122,23 +122,19 @@ fn installed_legacy_bundle_uses_bootstrap_cli_but_cannot_be_staged_again() {
     let data_dir = SinomoDataDir::new(root.join("data"));
     let releases = DesktopReleases::new(data_dir.root());
     let directory = bundle(&root, "legacy");
-    let mut manifest = read_manifest(&directory).unwrap();
-    let cli_name = crate::executable_name("sinomo");
     let legacy_name = crate::executable_name("sinomo-app-daemon");
-    let entry = manifest
-        .files
-        .iter_mut()
-        .find(|file| file.path == cli_name)
-        .unwrap();
-    fs::rename(directory.join(&cli_name), directory.join(&legacy_name)).unwrap();
-    entry.path = legacy_name.clone();
-    atomic_json(&directory.join(APP_BUNDLE_MANIFEST), &manifest).unwrap();
-    assert!(
-        releases
-            .stage(&directory)
-            .unwrap_err()
-            .contains("missing sinomo")
-    );
+    fs::write(
+        directory.join(&legacy_name),
+        b"legacy helper, never executed",
+    )
+    .unwrap();
+    let files: Vec<_> = DESKTOP_BINARY_STEMS
+        .map(crate::executable_name)
+        .into_iter()
+        .chain([legacy_name.clone()])
+        .collect();
+    let manifest = write_bundle_manifest(&directory, "legacy".into(), &files).unwrap();
+    assert!(releases.stage(&directory).unwrap_err().contains("retired"));
 
     // Reconstruct a release installed by the previous version without changing the new
     // staging policy. Its manifest identity and every historical file remain mandatory.
@@ -219,7 +215,11 @@ fn installed_launchers_and_images_still_require_a_verified_active_bundle() {
     let launcher = data_dir.root().join("bin").join(&app_name);
     fs::create_dir_all(launcher.parent().unwrap()).unwrap();
     fs::write(&launcher, b"stable launcher").unwrap();
-    let cli = directory.join(crate::executable_name("sinomo"));
+    let cli = data_dir
+        .root()
+        .join("bin")
+        .join(crate::executable_name("sinomo"));
+    fs::write(&cli, b"evolved daemon").unwrap();
     for app in [&launcher, &directory.join(&app_name)] {
         let error = supervise_app(&data_dir, app, &[], |selected| {
             assert_eq!(selected, Some(cli.as_path()));
@@ -237,21 +237,61 @@ fn installed_launchers_and_images_still_require_a_verified_active_bundle() {
 }
 
 #[test]
-fn desktop_bundle_requires_and_verifies_the_cli_host() {
-    let root = sinomo_testdir::TestDir::new("desktop-cli-bundle");
-    let directory = bundle(&root, "cli-host");
-    let manifest = read_manifest(&directory).unwrap();
-    verify_bundle(&directory, &manifest).unwrap();
-    let cli = crate::executable_name("sinomo");
-    let mut missing_cli = manifest.clone();
-    missing_cli.files.retain(|file| file.path != cli);
-    assert!(
-        validate_manifest(&missing_cli)
-            .unwrap_err()
-            .contains(&format!("missing {cli}"))
+fn app_release_is_independent_of_the_daemon_and_publishes_only_to_canonical_bin() {
+    let root = sinomo_testdir::TestDir::new("desktop-independent-release");
+    let data = root.join("data");
+    let releases = DesktopReleases::new(&data);
+    fs::create_dir_all(data.join("bin")).unwrap();
+    let cli = data.join("bin").join(crate::executable_name("sinomo"));
+    fs::write(&cli, b"evolved daemon").unwrap();
+    let old = bundle(&root, "app-only");
+    assert!(!old.join(crate::executable_name("sinomo")).exists());
+    releases.install_initial(&old).unwrap();
+    let app = releases.publish_canonical(&old).unwrap();
+    assert_eq!(
+        app,
+        data.join("bin").join(crate::executable_name("sinomo-app"))
     );
-    fs::write(directory.join(cli), b"tampered CLI").unwrap();
-    assert!(verify_bundle(&directory, &manifest).is_err());
+    assert_eq!(fs::read(&cli).unwrap(), b"evolved daemon");
+    let candidate = bundle(&root, "candidate");
+    releases.publish_canonical(&candidate).unwrap();
+    assert_eq!(
+        fs::read(&app).unwrap(),
+        fs::read(candidate.join(crate::executable_name("sinomo-app"))).unwrap()
+    );
+    releases.publish_canonical(&old).unwrap();
+    assert_eq!(
+        fs::read(&app).unwrap(),
+        fs::read(old.join(crate::executable_name("sinomo-app"))).unwrap()
+    );
+    assert_eq!(fs::read(&cli).unwrap(), b"evolved daemon");
+    sinomo_core::local::inhibit_deployment(&data).unwrap();
+    assert!(releases.stage(&candidate).is_err());
+    assert!(releases.publish_canonical(&candidate).is_err());
+}
+
+#[test]
+fn gui_publication_does_not_replace_host_images_or_data_binding_from_legacy_extras() {
+    let root = sinomo_testdir::TestDir::new("desktop-host-image-isolation");
+    let data = root.join("data");
+    let releases = DesktopReleases::new(&data);
+    fs::create_dir_all(data.join("bin")).unwrap();
+    let cli = data.join("bin").join(crate::executable_name("sinomo"));
+    let shadow = data.join("bin").join(crate::executable_name("sinomo-shadow"));
+    let binding = data.join("bin").join(sinomo_core::local::INSTALLED_DATA_DIR_FILE);
+    fs::write(&cli, b"evolved daemon").unwrap();
+    fs::write(&shadow, b"evolved shadow").unwrap();
+    fs::write(&binding, b"selected data root").unwrap();
+    let source = bundle(&root, "legacy-extras");
+    let extras = [crate::executable_name("sinomo").to_ascii_uppercase(), crate::executable_name("sinomo-shadow"), sinomo_core::local::INSTALLED_DATA_DIR_FILE.to_owned()];
+    for name in &extras { fs::write(source.join(name), b"retired bundled host state").unwrap(); }
+    let files: Vec<_> = DESKTOP_BINARY_STEMS.map(crate::executable_name).into_iter().chain(extras).collect();
+    write_bundle_manifest(&source, "legacy-extras".into(), &files).unwrap();
+    releases.install_initial(&source).unwrap();
+    releases.publish_canonical(&source).unwrap();
+    assert_eq!(fs::read(cli).unwrap(), b"evolved daemon");
+    assert_eq!(fs::read(shadow).unwrap(), b"evolved shadow");
+    assert_eq!(fs::read(binding).unwrap(), b"selected data root");
 }
 
 #[test]

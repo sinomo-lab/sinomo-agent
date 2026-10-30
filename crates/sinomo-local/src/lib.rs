@@ -11,6 +11,51 @@ static PROCESS_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Installer-owned, UTF-8 absolute data path beside the bootstrap executables.
 pub const INSTALLED_DATA_DIR_FILE: &str = "sinomo-data-dir";
 
+/// Windows canonical paths are valid filesystem identities, but tools such as
+/// Git parse the extended drive prefix as a remote URL when it is an argument.
+pub fn command_path(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str() {
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(local) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(local);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// A durable, node-local removal fence. Keeping data does not authorize recovery
+/// or a sign-in launcher to resurrect a deployment the user has uninstalled.
+pub const REMOVAL_FENCE: &str = "config/uninstalled";
+
+pub fn ensure_deployment_enabled(data: &std::path::Path) -> Result<(), String> {
+    match fs::symlink_metadata(data.join(REMOVAL_FENCE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err("this deployment is uninstalled; explicitly reinstall to enable it".into()),
+    }
+}
+
+pub fn inhibit_deployment(data: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(data.join("config"))?;
+    sinomo_storage::durable_file::write_file_atomic(
+        &data.join(REMOVAL_FENCE),
+        b"uninstalled\n",
+        sinomo_storage::durable_file::DurableAtomicFileOptions::new("deployment", "removal")
+            .sync_all(),
+    )
+    .map_err(std::io::Error::other)
+}
+
+/// Setup calls this only after validating the retained payload and taking the
+/// same activation admission used by rollout and removal.
+pub fn enable_deployment(data: &std::path::Path) -> std::io::Result<()> {
+    sinomo_storage::durable_file::remove_file_if_exists_and_sync_parent(&data.join(REMOVAL_FENCE))
+        .map(|_| ())
+        .map_err(std::io::Error::other)
+}
+
 /// Read only an explicit installation binding; development binaries have none.
 pub fn installed_data_dir(directory: &std::path::Path) -> Result<Option<PathBuf>, LocalDataError> {
     let file = directory.join(INSTALLED_DATA_DIR_FILE);
@@ -102,6 +147,15 @@ impl SinomoDataDir {
 
     pub fn root(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    pub fn bin_dir(&self) -> PathBuf {
+        self.root.join("bin")
+    }
+
+    pub fn binary(&self, stem: &str) -> PathBuf {
+        self.bin_dir()
+            .join(format!("{stem}{}", env::consts::EXE_SUFFIX))
     }
 
     pub fn configs_dir(&self) -> PathBuf {

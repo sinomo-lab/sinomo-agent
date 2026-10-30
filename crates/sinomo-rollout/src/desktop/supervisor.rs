@@ -239,7 +239,7 @@ fn run_app_loop(
                     return Err("candidate manifest identity changed".into());
                 }
                 verify_bundle(&directory, &manifest)?;
-                Ok(directory.join(crate::executable_name("sinomo-app")))
+                releases.publish_canonical(&directory)
             })();
             match candidate {
                 Ok(candidate) => {
@@ -269,9 +269,8 @@ fn active_app(releases: &DesktopReleases) -> Result<Option<PathBuf>> {
     Ok(active_launch(releases)?.map(|(app, _)| app))
 }
 
-// A pre-consolidation installed release can still restore its GUI, but its retired helper
-// is never executed. The caller's current CLI hosts the daemon until a new bundle is activated.
-// New imports and candidate activation continue to require the CLI in the verified manifest.
+// Historical files remain part of bundle verification, but daemon images in a
+// desktop artifact are never executed. Only the canonical CLI can host a daemon.
 fn active_launch(releases: &DesktopReleases) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     let Some(id) = releases.status()?.active_release else {
         return Ok(None);
@@ -281,30 +280,16 @@ fn active_launch(releases: &DesktopReleases) -> Result<Option<(PathBuf, Option<P
     if release_id(&manifest)? != id {
         return Err("active manifest identity changed".into());
     }
-    let cli_name = crate::executable_name("sinomo");
-    let bundled_cli = manifest.files.iter().any(|file| file.path == cli_name);
-    if bundled_cli {
-        verify_bundle(&directory, &manifest)?;
-    } else {
-        if manifest.target_os != std::env::consts::OS
-            || manifest.target_arch != std::env::consts::ARCH
-        {
-            return Err("desktop bundle is for a different platform".into());
-        }
-        validate_manifest_shape_for_binaries(
-            &manifest,
-            &[
-                "sinomo-app",
-                "sinomo-app-daemon",
-                "sinomo-ui-extension-host",
-            ],
-        )?;
-        verify_manifest_files(&directory, &manifest)?;
-    }
-    Ok(Some((
-        directory.join(crate::executable_name("sinomo-app")),
-        bundled_cli.then(|| directory.join(cli_name)),
-    )))
+    verify_bundle(&directory, &manifest)?;
+    let app = releases.publish_canonical(&directory)?;
+    let cli = releases
+        .root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("no data directory")?
+        .join("bin")
+        .join(crate::executable_name("sinomo"));
+    Ok(Some((app, cli.is_file().then_some(cli))))
 }
 
 #[cfg(all(test, unix))]
