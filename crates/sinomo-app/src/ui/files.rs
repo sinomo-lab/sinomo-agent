@@ -23881,6 +23881,7 @@ mod tests {
         let timestamp =
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("history timestamp");
         let mut view = DfsOperatorObjectView {
+            current_desired_replica_node_ids: None,
             object: sinomo_runtime::dfs::DfsObjectMetadata {
                 object_id: object_id.clone(),
                 file_system_id: file_system_id.clone(),

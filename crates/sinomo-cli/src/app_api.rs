@@ -10388,6 +10388,160 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires explicit fresh DATA and an externally measured 2 GiB/no-swap owner"]
+    fn actual_browser_owner_large_read_memory_control() {
+        use sinomo_runtime::dfs::{DfsWriteOptions, test_support::DfsTestRuntime};
+        use sinomo_runtime::network::{ClusterObjectRpcOptions, ObjectRpcCall};
+        use std::sync::atomic::AtomicUsize;
+
+        const BYTES: usize = 256 * 1024 * 1024;
+        const BASE: &str = "/services/cluster-tests/browser-owner-memory-01";
+        let root = std::path::PathBuf::from(
+            std::env::var_os("SINOMO_BROWSER_MEMORY_DATA_DIR")
+                .expect("explicit fresh browser memory control DATA directory"),
+        );
+        assert!(root.is_absolute());
+        assert_eq!(
+            std::fs::symlink_metadata(&root)
+                .expect_err("the control must not reuse existing DATA")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::create_dir(&root).expect("create only the explicit fresh DATA directory");
+        let data = SinomoDataDir::new(root);
+        let started = std::time::Instant::now();
+        let phase = |name: &str| {
+            eprintln!(
+                "browser-memory-control {}",
+                serde_json::json!({
+                    "phase": name,
+                    "pid": std::process::id(),
+                    "elapsed_ns": started.elapsed().as_nanos(),
+                    "unix_ns": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                    "data": data.root(),
+                    "scope": "in-process local owner; not six-node/main-shadow acceptance",
+                })
+            );
+        };
+        phase("setup-start");
+        let (native, node) =
+            DfsTestRuntime::start_single_node_in_data_dir("browser-owner-memory-control", data.clone())
+                .expect("start the actual native owner");
+        phase("setup-complete");
+        let mut writer = native.client(&node).expect("ordinary native write client");
+        writer
+            .posix_mkdir_all(BASE)
+            .expect("create the test namespace once");
+        for name in ["large-a.bin", "large-b.bin"] {
+            phase(&format!("seed-{name}-start"));
+            let path = format!("{BASE}/{name}");
+            let pattern = format!("{path}|sinomo-dfs-large|sinomo-dfs-payload|");
+            assert_eq!(pattern.len(), 96);
+            let mut payload = vec![0; BYTES];
+            for chunk in payload.chunks_mut(pattern.len()) {
+                chunk.copy_from_slice(&pattern.as_bytes()[..chunk.len()]);
+            }
+            let outcome = writer
+                .posix_write_file(
+                    &path,
+                    &payload,
+                    DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+                )
+                .expect("the original production seed write must succeed without replay");
+            assert_eq!(outcome.size_bytes, Some(BYTES as u64));
+            assert!(outcome.current_locations.contains(&node));
+            drop(payload);
+            phase(&format!("seed-{name}-payload-dropped"));
+        }
+        drop(writer);
+        native.checkpoint_rpc_observation_window().unwrap();
+        phase("seeds-complete");
+
+        // Adapt only transport to the registered host with its actual local signer
+        // and generation. Keep the native result; never materialize an encoded Vec.
+        let transport = native
+            .component_context(&node)
+            .unwrap()
+            .object_rpc_transport()
+            .unwrap();
+        let runtime = native.runtime_handle();
+        let target = node.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        let mut client = RemoteSifsBrowser::for_main_owner(
+            data.clone(),
+            "actual-native-browser-memory-owner".into(),
+            node.clone(),
+            &runtime,
+        )
+        .with_test_result_rpc(Arc::new(move |request, remaining| {
+            assert_eq!(
+                request.route,
+                sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE
+            );
+            assert_eq!(
+                count.fetch_add(1, Ordering::SeqCst),
+                0,
+                "one original read only"
+            );
+            transport
+                .call(
+                    &target,
+                    ObjectRpcCall::value(request),
+                    ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
+                    true,
+                )
+                .map_err(sinomo_runtime::api::DaemonApiError::from)
+        }));
+        let path = format!("{BASE}/large-b.bin");
+        let pattern = format!("{path}|sinomo-dfs-large|sinomo-dfs-payload|");
+        assert_eq!(pattern.len(), 96);
+        phase("read-start");
+        client = client.with_operation_deadline(Some(
+            std::time::Instant::now() + sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+        ));
+        let actual = client
+            .rpc_read_file(&path)
+            .expect("original real browser RPC must complete within its ordinary deadline")
+            .into_result()
+            .expect("original browser read must return found content");
+        phase("read-returned");
+        assert_eq!(actual.len(), BYTES);
+        assert!(
+            actual
+                .chunks(pattern.len())
+                .all(|chunk| chunk == &pattern.as_bytes()[..chunk.len()])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(actual);
+        phase("read-result-dropped");
+        drop(client);
+        drop(runtime);
+        let completed: Vec<_> = native
+            .rpc_observations()
+            .into_iter()
+            .filter(|call| {
+                call.source == node
+                    && call.target == node
+                    && call.route == sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE
+                    && call.phase == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::Completed
+            })
+            .collect();
+        assert_eq!(completed.len(), 1);
+        let signer = completed[0]
+            .signer
+            .as_ref()
+            .expect("actual receiver signer");
+        assert!(signer.is_local());
+        assert_eq!(signer.cluster_identity().unwrap().0, node.as_str());
+        drop(completed);
+        phase("drain-start");
+        native.close().expect("drain the exact native owner");
+        phase("drain-complete");
+    }
+
+    #[test]
     fn resident_bulk_read_rejects_unknown_owner_route_without_legacy_fallback() {
         let root = sinomo_testdir::TestDir::new("resident-bulk-read-unknown-route");
         let (_runtime, client) = typed_read_owner(&SinomoDataDir::new(root.path()));

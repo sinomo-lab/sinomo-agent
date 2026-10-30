@@ -2441,10 +2441,10 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
             action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
         });
     }
-    // This fixture owns the actual Core producer, rather than the browser
-    // client whose same-node write is delegated to Main.
-    let mut old = runtime.metadata_primary_service(path).unwrap();
-    let (_, _, replication) = old
+    // Main owns both the ordinary write and its post-request durable repair
+    // checkpoint; direct Core publication alone does not export this queue.
+    let mut writer = runtime.client(&owner).unwrap();
+    let (_, _, replication) = writer
         .managed_replication_policy_for_path(path, DfsObjectPolicy::ReplicatedEventual, 2)
         .unwrap();
     assert_eq!(replication.min_commit_replicas, 1);
@@ -2458,7 +2458,7 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
         [owner.clone(), replica.clone()].into_iter().collect(),
         "the native plan must retain this fixture's actual required missing target"
     );
-    let stat = old
+    let stat = writer
         .posix_write_file(
             path,
             b"actual old-primary repair bytes",
@@ -2470,17 +2470,43 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
             },
         )
         .unwrap();
+    drop(writer);
+    let mut old = runtime.metadata_primary_service(path).unwrap();
+    let captured = old
+        .owned_repair_queue_store()
+        .unwrap()
+        .unwrap()
+        .view()
+        .unwrap()
+        .records
+        .into_iter()
+        .filter(|row| {
+            row.object_id == stat.object_id
+                && row.version == stat.version
+                && row.missing_replica_node_id == replica
+                && Some(row.content_hash.as_str()) == stat.content_hash.as_deref()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(captured.len(), 1);
+    assert!(
+        old.retry_pending_repairs_bounded_with_attempts(0, &captured)
+            .unwrap()
+            .is_empty()
+    );
     let job = old
         .coordinator()
         .repair_jobs()
         .iter()
         .find(|job| {
-            job.object_id == stat.object_id
+            job.intent_id == captured[0].intent_id
+                && job.object_id == stat.object_id
                 && job.version == stat.version
                 && job.missing_replica_node_id == replica
         })
         .unwrap()
         .clone();
+    old.restore_pending_write_for_intent_if_missing(&job.intent_id, &job.object_id)
+        .unwrap();
     assert!(old.writes.pending_writes.contains_key(&job.intent_id));
     let activated = runtime
         .reassign_metadata_shard(
@@ -2496,6 +2522,30 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
         .unwrap();
     assert_eq!(activated.primary_node_id, new_primary);
     let before = runtime.rpc_observations().len();
+    // A service held across physical handoff must reject its stale provider
+    // before it can examine the queue under the new storage generation.
+    assert!(matches!(
+        old.retry_pending_repairs_bounded(1),
+        Err(DfsError::Metadata { message })
+            if message == "metadata serialization error: repair queue provider storage generation advanced"
+    ));
+    assert!(old.writes.pending_writes.contains_key(&job.intent_id));
+    drop(old);
+    // Reopen the same former primary through its current runtime, and restore
+    // only the actual pre-handoff row through the ordinary restart path.
+    let mut old = runtime.client(&owner).unwrap();
+    assert_eq!(old.node_id(), &owner);
+    assert!(
+        old.retry_pending_repairs_bounded_with_attempts(0, &captured)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(old.coordinator().repair_jobs().iter().any(|restored| {
+        restored.intent_id == job.intent_id
+            && restored.object_id == job.object_id
+            && restored.version == job.version
+            && restored.missing_replica_node_id == replica
+    }));
     assert!(old.retry_pending_repairs_bounded(1).unwrap().is_empty());
     assert!(!old.writes.pending_writes.contains_key(&job.intent_id));
     assert!(

@@ -151,12 +151,20 @@ impl<'a> DfsOperatorInspector<'a> {
             &receipts_by_version,
         )?;
         let agent_state = agent_state_for(&object, &intents, &repairs);
+        let current_desired_replica_node_ids =
+            crate::content_durability::current_content_durability_from_backend(
+                self.backend,
+                &object,
+            )
+            .ok()
+            .flatten()
+            .map(|durability| durability.desired_replica_node_ids);
         Ok(Some(DfsOperatorObjectView {
             object,
             versions,
             receipts,
             intents,
-
+            current_desired_replica_node_ids,
             repairs,
             agent_state,
         }))
@@ -1172,6 +1180,19 @@ mod tests {
         );
         let object = inspector.object(&stat.object_id).unwrap().unwrap();
         assert_eq!(object.agent_state, DfsAgentObjectState::PendingRepair);
+        assert_eq!(
+            object
+                .current_desired_replica_node_ids
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<BTreeSet<_>>(),
+            [&nodes[0], &nodes[2]].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert!(
+            !object.object.current_locations.contains(&nodes[2]),
+            "the current desired set must retain the real missing target"
+        );
         let owner = object
             .intents
             .iter()
@@ -1281,6 +1302,58 @@ mod tests {
             .object(&stat.object_id)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            view.current_desired_replica_node_ids,
+            Some(
+                after
+                    .content_durability
+                    .as_ref()
+                    .unwrap()
+                    .desired_replica_node_ids
+                    .clone()
+            ),
+            "ordinary terminal intent compaction keeps the exact recorded current goal"
+        );
+        let current = view.object.clone();
+        let mut changed = Vec::new();
+        let mut stale = current.clone();
+        stale.path.push_str("-stale");
+        changed.push(stale);
+        let mut stale = current.clone();
+        stale.policy = DfsObjectPolicy::LocalOwned;
+        changed.push(stale);
+        let mut stale = current.clone();
+        stale.owner_node_id = NodeId::generate();
+        changed.push(stale);
+        let mut stale = current.clone();
+        stale.version = DfsVersion::generate();
+        changed.push(stale);
+        let mut stale = current.clone();
+        stale.content_hash = Some("blake3:foreign-current-content".into());
+        changed.push(stale);
+        let mut stale = current.clone();
+        stale.content_size_bytes = Some(bytes.len() as u64 + 1);
+        changed.push(stale);
+        for stale in changed {
+            assert!(
+                crate::content_durability::current_content_durability_from_backend(
+                    writer.metadata_backend().unwrap(),
+                    &stale,
+                )
+                .is_err(),
+                "an observation cannot reuse durability for changed current object semantics"
+            );
+        }
+        assert_eq!(
+            writer
+                .metadata_backend()
+                .unwrap()
+                .get_object(&stat.object_id)
+                .unwrap()
+                .unwrap(),
+            current,
+            "durability observation never rewrites the current object"
+        );
         assert!(view.repairs.is_empty());
         assert_eq!(view.agent_state, DfsAgentObjectState::Current);
         assert_eq!(writer.posix_read_file(&path).unwrap(), bytes);
@@ -1481,15 +1554,23 @@ mod tests {
         file_system.subtree_policies.push(policy);
         writer.add_file_system(file_system).unwrap();
         for node in &nodes[1..] {
-            runtime.install_fault(DfsTestFaultRule {
-                source: None,
-                target: Some(node.clone()),
-                route: Some(crate::DFS_DATA_STAGE_BLOB_ROUTE.into()),
-                call_id: None,
-                origin: None,
-                remaining_hits: 32,
-                action: DfsTestFaultAction::BudgetExhausted,
-            });
+            // Main maintenance can repair after the W1 write returns, even
+            // when foreground repair is disabled. Keep all three replicas
+            // missing throughout the independent paging reads below.
+            for route in [
+                crate::DFS_DATA_STAGE_BLOB_ROUTE,
+                crate::DFS_DATA_REPAIR_REPLICA_ROUTE,
+            ] {
+                runtime.install_fault(DfsTestFaultRule {
+                    source: None,
+                    target: Some(node.clone()),
+                    route: Some(route.into()),
+                    call_id: None,
+                    origin: None,
+                    remaining_hits: 32,
+                    action: DfsTestFaultAction::BudgetExhausted,
+                });
+            }
         }
         let baseline = writer
             .metadata_backend()
@@ -1535,9 +1616,8 @@ mod tests {
             OffsetDateTime::now_utc(),
         )
         .unwrap();
-        // The custom corpus is authored by the actual Root Core. Keep the
-        // original all-shard reader count and inspect through a fresh Main
-        // browser after publication, rather than using it as a producer.
+        // The custom corpus is authored by the actual Root Core, rather than
+        // by the browser used for ordinary writes and later inspection.
         drop(writer);
         let mut writer = runtime.metadata_primary_service(path).unwrap();
         crate::test_support::publish_current_payload(&mut writer, payload).unwrap();
@@ -1565,6 +1645,10 @@ mod tests {
             nodes.iter().cloned().collect(),
             "every configured member must acknowledge the exact complete corpus"
         );
+        // This direct Core handle has no retained Main ingress execution scope.
+        // Admit the independent fresh write through the normal registered Main.
+        drop(writer);
+        let mut writer = runtime.client(&nodes[0]).unwrap();
         let stat = writer
             .posix_write_file(
                 path,

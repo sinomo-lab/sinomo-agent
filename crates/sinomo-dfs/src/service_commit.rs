@@ -435,30 +435,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub(crate) fn normalize_desired_replica_nodes(
-        &self,
-        object: &DfsObjectMetadata,
-        desired_replica_nodes: Vec<NodeId>,
-        policy: &DfsReplicationPolicy,
-    ) -> Vec<NodeId> {
-        let mut normalized = desired_replica_nodes;
-        if matches!(
-            object.policy,
-            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) && !policy.forbidden_node_ids.contains(&object.owner_node_id)
-            && !normalized.contains(&object.owner_node_id)
-        {
-            normalized.insert(0, object.owner_node_id.clone());
-        }
-        let mut deduped = Vec::new();
-        for node_id in normalized {
-            if !deduped.contains(&node_id) {
-                deduped.push(node_id);
-            }
-        }
-        deduped
-    }
-
     pub(crate) fn ensure_no_backend_pending_write_intent(
         &self,
         object_id: &DfsObjectId,

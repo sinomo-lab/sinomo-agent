@@ -88,6 +88,21 @@ pub use crate::test_runtime::{
 };
 use crate::*;
 use sinomo_core::DfsWriteRequest;
+
+/// Observe the complete existing original slot without changing its custody.
+pub fn original_repair_slot_snapshot(
+    store: &LocalDfsRepairQueueStore,
+    intent_id: &str,
+    target: &sinomo_core::node::NodeId,
+) -> Result<Option<serde_json::Value>, DfsError> {
+    store
+        .original_repair_for_slot(intent_id, target)?
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| DfsError::Serialization {
+            message: error.to_string(),
+        })
+}
 use sinomo_core::node::NodeId;
 
 /// One ordinary hosted current metadata authority, retained with its real

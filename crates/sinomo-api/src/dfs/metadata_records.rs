@@ -518,6 +518,9 @@ mod retention_metadata_tests {
             "retention": {"module.dfs.history": {"order": 3, "grant": {
                 "object": {"file_system_id": fs, "object_id": object_id, "version": version,
                     "path": "/services/report", "kind": "file", "owner_node_id": node,
+                    "current_locations": [node], "mode": 0o644, "uid": 0, "gid": 0,
+                    "accessed_at_unix_nanos": 0, "modified_at_unix_nanos": 0,
+                    "created_at_unix_nanos": 0, "changed_at_unix_nanos": 0,
                     "content_hash": "blake3:retained-content", "content_size_bytes": 7,
                     "policy": "replicated-eventual"},
                 "granted_at_unix_nanos": 42, "origin": "rule",
@@ -544,6 +547,7 @@ mod retention_metadata_tests {
             serde_json::from_slice::<DfsObjectVersionRecord>(&encoded).unwrap(),
             version
         );
+        let mut wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         version
             .module_metadata
             .get_mut("vendor.research")
@@ -556,10 +560,21 @@ mod retention_metadata_tests {
                 .contains("64 KiB")
         );
         assert!(
-            serde_json::from_value::<DfsObjectVersionRecord>(
-                serde_json::to_value(version).unwrap()
-            )
-            .is_err()
+            serde_json::to_value(&version)
+                .unwrap_err()
+                .to_string()
+                .contains("64 KiB")
+        );
+        // Construct only the invalid wire input; the production encoder must
+        // reject this payload before it can reach the independent decoder.
+        wire["module_metadata"]["vendor.research"]["payload"] = json!(
+            serde_json::to_vec(&version.module_metadata["vendor.research"].payload).unwrap()
+        );
+        assert!(
+            serde_json::from_value::<DfsObjectVersionRecord>(wire)
+                .unwrap_err()
+                .to_string()
+                .contains("64 KiB")
         );
     }
 

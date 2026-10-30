@@ -17,6 +17,7 @@ const RELEASE_BYTES: u64 = 8 * 1024 * 1024;
 /// Small files and incomplete leading/trailing ranges receive no advice. The
 /// caller owns this file cursor; do not seek through a duplicated descriptor
 /// while using the reader. On other platforms this is an ordinary file reader.
+#[derive(Debug)]
 pub struct StreamingFileReader {
     file: File,
     #[cfg(target_os = "linux")]
