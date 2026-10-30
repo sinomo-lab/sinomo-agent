@@ -1964,6 +1964,17 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
     let bytes = (0..2 * 1024 * 1024 + 4096)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
+    // Measure this same Core producer's stage and retry state while it owns
+    // the actual shard admission needed by a fresh namespace write.
+    let execution = dfs
+        .acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: config.file_system_id.clone(),
+            shard_id: DfsMetadataShardId::new(&config.shard_id),
+            owner_epoch: config.epoch,
+            operation_id: name.into(),
+        })
+        .unwrap()
+        .expect("the current native Core must acquire actual shard admission");
     let stat = dfs
         .posix_write_file(
             path,
@@ -1976,6 +1987,7 @@ fn background_quorum_stage_refills_failed_target_without_retry_tick() {
             },
         )
         .unwrap();
+    drop(execution);
     assert_eq!(
         dfs.repair_retry_tick, retry_tick,
         "crossing W refills immediately without a maintenance clock advance"

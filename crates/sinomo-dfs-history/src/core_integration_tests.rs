@@ -2578,6 +2578,18 @@ fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
         actual[0].missing_replica_node_id,
         original.missing_replica_node_id
     );
+    let original_custody = core_test::original_repair_slot_snapshot(
+        &store,
+        &original.intent_id,
+        &original.missing_replica_node_id,
+    )
+    .unwrap();
+    let original_bytes = original_custody.as_ref().map(|_| {
+        dfs.content()
+            .read_object_version(first.object_id.as_str(), first.version.as_str())
+            .unwrap()
+            .1
+    });
     // Exercise the production wall-clock expiry boundary while the transport
     // retry remains far in the future; no network work should run here.
     std::thread::sleep(Duration::from_secs(2));
@@ -2605,21 +2617,48 @@ fn file_history_expired_rule_retires_repairs_even_during_retry_backoff() {
     native_history_owner_tick(&runtime, &owner);
     assert!(native_history_repairs(&dfs).is_empty());
     let current = native_history_queue(&runtime, &owner);
+    let current_custody = core_test::original_repair_slot_snapshot(
+        &store,
+        &original.intent_id,
+        &original.missing_replica_node_id,
+    )
+    .unwrap();
+    assert_eq!(
+        current_custody, original_custody,
+        "expiry must preserve the exact original body, payload root, attempts and observations"
+    );
     eprintln!(
         "native expired repair: original={original:?} scheduled={actual:?} after={current:?}"
     );
-    if actual[0].transfer_request_id.is_none()
+    if current_custody.is_some() {
+        eprintln!("native expired repair branch=owned-original-preserved");
+        assert_eq!(
+            current, actual,
+            "expiry preserves the owned original queue row"
+        );
+        assert_eq!(
+            Some(
+                dfs.content()
+                    .read_object_version(first.object_id.as_str(), first.version.as_str())
+                    .unwrap()
+                    .1
+            ),
+            original_bytes,
+            "expiry preserves the owned original payload bytes"
+        );
+    } else if actual[0].transfer_request_id.is_none()
         && !actual[0].in_flight
         && actual[0].transfer_kind.is_some()
         && (actual[0].transfer_delivery_state
             == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
             || actual[0].completed_transfer_request_id.is_some())
     {
-        // Main's exact accepted terminal also settles the old carrier claim.
-        // PossiblyApplied remains its delivery history, not unresolved custody
-        // after that recorded completion. Neither outcome proves replica bytes.
+        eprintln!("native expired repair branch=unowned-settled-row-removed");
+        // Scheduling facts permit removal only after canonical slot inspection
+        // proves that no original still owns this target.
         assert!(current.is_empty());
     } else {
+        eprintln!("native expired repair branch=unowned-uncertain-row-preserved");
         assert_eq!(
             current, actual,
             "expiry withdraws execution while retaining every actual uncertain transfer fact"

@@ -2,6 +2,33 @@
 
 use super::*;
 
+// Direct Core fixtures still need the mounted owner's real scheduler admission.
+// Resolve its current native shard; the normal provider validates the physical
+// owner/generation and rechecks that assignment after acquiring ExactShard.
+pub(super) fn native_fixture_write_admission(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    service: &NetworkedDfsService<DfsNodeTransport>,
+    path: &str,
+) -> crate::publication_guard::DfsPublicationContextRestore {
+    let control = runtime.shared_control_plane().unwrap();
+    let shard = control.with_client(|kv| {
+        DfsControlPlaneStore::new(kv.as_mut())
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), path)
+            .unwrap()
+            .expect("the fixture path has an actual native assignment")
+    });
+    assert_eq!(&shard.primary_node_id, service.node_id());
+    service
+        .acquire_prepared_execution(&DfsPreparedOperationScope {
+            file_system_id: shard.file_system_id,
+            shard_id: DfsMetadataShardId::new(shard.shard_id),
+            owner_epoch: shard.epoch,
+            operation_id: format!("native-fixture-write-admission:{path}"),
+        })
+        .unwrap()
+        .expect("the actual Core provider acquired fresh native admission")
+}
+
 // Real configuration precedes each fixture producer. Candidate hints do not
 // create a managed W/N contract, and a browser owns no Core coordinator state.
 pub(super) fn native_owned_repair_fixture(
@@ -203,6 +230,7 @@ pub(super) fn native_routed_committed_backlog(
     let mut owner = runtime.metadata_primary_service(&unrelated_path).unwrap();
     let mut unrelated_policy = DfsReplicationPolicy::new(1, 2).unwrap();
     unrelated_policy.required_node_ids = vec![primary.clone(), replica.clone()];
+    let execution = native_fixture_write_admission(&runtime, &owner, &unrelated_path);
     let unrelated = owner
         .posix_write_file(
             &unrelated_path,
@@ -215,6 +243,7 @@ pub(super) fn native_routed_committed_backlog(
             },
         )
         .unwrap();
+    drop(execution);
     assert!(
         owner
             .coordinator()
@@ -3764,6 +3793,7 @@ fn retry_pending_repairs_suppresses_stale_content_target_after_object_advances()
     let (runtime, owner, peer, mut dfs) =
         native_missing_content_repair("native-stale-content-repair-retirement");
     let path = "/services/native-stale-content";
+    let execution = native_fixture_write_admission(&runtime, &dfs, path);
     let first = dfs
         .posix_write_file(
             path,
@@ -3776,6 +3806,7 @@ fn retry_pending_repairs_suppresses_stale_content_target_after_object_advances()
             },
         )
         .unwrap();
+    drop(execution);
     assert_eq!(dfs.coordinator().repair_jobs().len(), 1);
     let old_intent = dfs.coordinator().repair_jobs()[0].intent_id.clone();
     let replacement = dfs
@@ -3815,6 +3846,7 @@ fn retry_pending_repairs_keeps_same_content_after_metadata_only_advance() {
     let (runtime, owner, peer, mut dfs) =
         native_missing_content_repair("native-metadata-successor-repair-plan");
     let path = "/services/native-same-content";
+    let execution = native_fixture_write_admission(&runtime, &dfs, path);
     let first = dfs
         .posix_write_file(
             path,
@@ -3827,6 +3859,7 @@ fn retry_pending_repairs_keeps_same_content_after_metadata_only_advance() {
             },
         )
         .unwrap();
+    drop(execution);
     let old_intent = dfs.coordinator().repair_jobs()[0].intent_id.clone();
     let advanced = dfs.posix_set_mode(path, 0o640).unwrap();
     assert_ne!(advanced.version, first.version);
@@ -3979,6 +4012,7 @@ fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
         .unwrap();
     dfs.posix_mkdir_all("/services/native-global-hydration")
         .unwrap();
+    let execution = native_fixture_write_admission(&runtime, &dfs, path);
     let mut intents = Vec::new();
     for index in 0..3 {
         let stat = dfs
@@ -4001,6 +4035,7 @@ fn hydrate_from_metadata_backend_scans_receipts_once_globally() {
             .unwrap();
         intents.push(job.intent_id.clone());
     }
+    drop(execution);
     drop(dfs);
     let mut recovered = runtime.metadata_primary_service(path).unwrap();
     recovered
@@ -4042,6 +4077,8 @@ fn queued_repair_restore_rebuilds_once_and_preserves_inactive_history() {
     service
         .posix_mkdir_all("/services/native-bulk-restoration")
         .unwrap();
+    let execution =
+        native_fixture_write_admission(&runtime, &service, "/services/native-bulk-restoration");
     let mut first_path = String::new();
     for index in 0..32 {
         let path = format!("/services/native-bulk-restoration/{index}.bin");
@@ -4061,6 +4098,7 @@ fn queued_repair_restore_rebuilds_once_and_preserves_inactive_history() {
             )
             .unwrap();
     }
+    drop(execution);
     let records = service.durable_repair_queue_records();
     assert_eq!(records.len(), 32);
     let first_object = service.posix_stat(&first_path).unwrap().object_id;
@@ -4138,6 +4176,7 @@ fn hydrate_from_metadata_backend_restores_committed_pending_write_for_missing_re
     let background = runtime
         .deny_background_replica_before_claim(&owner)
         .unwrap();
+    let execution = native_fixture_write_admission(&runtime, &dfs, path);
     let stat = dfs
         .posix_write_file(
             "/services/native-missing-repair",
@@ -4150,6 +4189,7 @@ fn hydrate_from_metadata_backend_restores_committed_pending_write_for_missing_re
             },
         )
         .unwrap();
+    drop(execution);
     assert_eq!(dfs.coordinator().repair_jobs().len(), 1);
     let intent_id = dfs.coordinator().repair_jobs()[0].intent_id.clone();
     let native_intent = dfs
@@ -4218,6 +4258,8 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
             action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
         });
     }
+    let execution =
+        native_fixture_write_admission(&runtime, &primary, "/services/native-observer-hydration");
     let stat = primary
         .posix_write_file(
             "/services/native-observer-hydration",
@@ -4230,6 +4272,7 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
             },
         )
         .unwrap();
+    drop(execution);
     let intent_id = primary.coordinator().repair_jobs()[0].intent_id.clone();
     let object = primary
         .metadata_backend()
@@ -6341,6 +6384,11 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
     let (runtime, source, target, mut writer) =
         native_missing_content_repair("native-repair-current-replica-after-primary-move");
     let bytes = vec![0x72; 2 * 1024 * 1024 + 4096];
+    let execution = native_fixture_write_admission(
+        &runtime,
+        &writer,
+        "/services/native-repair-primary-move.bin",
+    );
     let stat = writer
         .posix_write_file(
             "/services/native-repair-primary-move.bin",
@@ -6353,6 +6401,7 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
             },
         )
         .unwrap();
+    drop(execution);
     let content_hash = stat
         .content_hash
         .clone()
@@ -6753,6 +6802,7 @@ fn assert_native_repair_receiver(name: &str, bytes: &[u8], advance_metadata: boo
     let _background = runtime
         .deny_background_replica_before_claim(&owner)
         .unwrap();
+    let execution = native_fixture_write_admission(&runtime, &source, &path);
     let stat = source
         .posix_write_file(
             &path,
@@ -6765,6 +6815,7 @@ fn assert_native_repair_receiver(name: &str, bytes: &[u8], advance_metadata: boo
             },
         )
         .unwrap();
+    drop(execution);
     let job = source
         .coordinator()
         .repair_jobs()
