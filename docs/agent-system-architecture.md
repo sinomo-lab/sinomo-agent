@@ -698,14 +698,17 @@ itself. A session moves between these states:
   is an involuntary interrupt and the next message resumes it. Tool calls
   without results were already closed when the session loaded. A turn hosted
   by the current process is never reconciled, because it may still be live.
-- **Release.** The daemon releases a chat host that no window shows after 30
-  idle minutes, and the longest-idle unviewed host when it reaches its
-  resident-host limit. A host is never released while it is processing a
-  command or while its session has work in flight: a turn, tools a paused turn
-  is finishing, or subagents. Releasing the host gives up its ownership of the
-  chat and removes its runtime's live-control route; a runtime removes only
-  its own route, never one a newer host registered. Reopening the chat
-  restores it from durable state.
+- **Release.** A quiescent chat becomes dormant after a 30-second warm-idle
+  grace period, including while views remain open. Queued and executing commands,
+  turns, tools a paused turn is finishing, subagents, and pending continuations
+  keep its runtime owned. Releasing the runtime withdraws only its own live-control
+  routes and stops ownership renewal. Views retain their event streams, replay
+  identity and command receipts; observing a dormant chat does not start execution.
+  The next executing command restores the runtime from durable state after a
+  fresh ownership confirmation. Restoring a session also reconciles already-admitted
+  unfinished work, including detached continuations; this recovery is distinct
+  from starting new work for a quiescent view. Unviewed presentation state is
+  retained for 30 idle minutes, subject to the resident-view limit.
 - **Delete.** Deleting a chat runs on the node that hosts it, where its live
   work and session records are; a chat no node hosts is deleted where the
   request arrives. It first cancels each of its sessions' live work, then
@@ -734,9 +737,13 @@ share one conversation, one turn, and one control route.
   turn.
 - **Ownership.** The hosting node holds an ownership record for the chat in
   cluster KV (`/agent/chat-hosts/<chat-id>`), written through the daemon's KV
-  API with compare-and-set and renewed every 10 seconds. A node that opens
-  the chat while a live owner renews it follows that owner instead of starting
-  a runtime. A restarted daemon takes its own chats back at once.
+  API with compare-and-set and renewed every 10 seconds while its runtime is
+  resident. Dormancy stops renewal; an expired record can identify the last host
+  for event following and placement affinity, but grants no execution authority.
+  View attachment, event reads and control inspection remain observational.
+  Starting execution requires a fresh confirmed claim, including when the stored
+  record still names this process. A restarted daemon takes its own chats back
+  through the same ownership boundary.
 - **Routing.** A node following another node's chat forwards its windows'
   commands to the owner over the cluster chat routes (`/chat/peer/command`,
   `/chat/peer/events`, `/chat/peer/delete`, open to cluster members) and

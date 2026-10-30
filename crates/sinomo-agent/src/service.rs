@@ -564,6 +564,18 @@ impl AgentRuntimeControlRegistry {
             .transpose()
     }
 
+    /// Inspect a live runtime or its persisted metadata without starting execution.
+    pub fn resume_or_persisted(
+        &self,
+        store: &FileAgentSessionStore,
+        request: AgentSessionResumeRequest,
+    ) -> Result<AgentSessionResumeResponse, ServiceError> {
+        match self.resume(request.clone()) {
+            Ok(response) => Ok(response),
+            Err(error) => resume_session_from_store(store, request, error.to_string()),
+        }
+    }
+
     pub fn session_count(&self) -> Result<usize, AgentRuntimeControlError> {
         self.sessions
             .lock()

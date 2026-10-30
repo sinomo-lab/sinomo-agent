@@ -4837,6 +4837,9 @@ impl AgentChat {
     /// Stop routing control to this chat's live runtime. Called when the
     /// chat's host goes away so the runtime is released with it.
     pub fn release_runtime_control(&self) -> Result<(), CliError> {
+        for runtime in self.participant_runtimes.values() {
+            runtime.handler().release_runtime_control()?;
+        }
         self.runtime.handler().release_runtime_control()
     }
 
