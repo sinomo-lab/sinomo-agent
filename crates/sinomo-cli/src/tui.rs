@@ -8140,6 +8140,7 @@ where
     runtime: Option<RuntimeMainAgentSlot<M>>,
     runtime_storage: AgentRuntimeStorage,
     runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry,
+    admission_cancellation: Option<sinomo_agent::AgentCancellationToken>,
     runtime_cursor: AgentRuntimeEventCursor,
     agent_definition: AgentDefinition,
     skill_catalog: sinomo_agent::SkillCatalog,
@@ -8259,6 +8260,7 @@ where
             runtime: Some(RuntimeMainAgentSlot::Pending(model)),
             runtime_storage: AgentRuntimeStorage::new(),
             runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry::new(),
+            admission_cancellation: None,
             runtime_cursor: AgentRuntimeEventCursor {
                 offset: 0,
                 last_event_id: None,
@@ -8279,6 +8281,13 @@ where
             auto_compact_token_limit: None,
             workspace_root: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }
+    }
+
+    pub(crate) fn set_admission_cancellation(
+        &mut self,
+        cancellation: Option<sinomo_agent::AgentCancellationToken>,
+    ) {
+        self.admission_cancellation = cancellation;
     }
 
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
@@ -10345,12 +10354,17 @@ where
         .caused_by(&message.event_id);
         store.append(requested.clone())?;
 
+        let admission_cancellation = self.admission_cancellation.clone();
         let runtime = self.ensure_runtime(session)?;
         // An interrupted (paused) session resumes when a new message arrives.
         if runtime.session_snapshot()?.is_paused() {
             runtime.submit_op(AgentOp::unpause())?;
         }
-        let result = runtime.submit_op(AgentOp::start_turn(input))?;
+        let op = AgentOp::start_turn(input);
+        let result = match admission_cancellation {
+            Some(cancellation) => runtime.submit_op_with_cancellation(op, cancellation)?,
+            None => runtime.submit_op(op)?,
+        };
         let queued = interaction_event(
             session,
             "interaction.main_agent.queued",

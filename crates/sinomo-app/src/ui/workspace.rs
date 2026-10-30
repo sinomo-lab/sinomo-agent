@@ -116,19 +116,56 @@ impl TabStrip {
             .name("Primary navigation tabs")
             .scroll_bars(false);
         let mut pinned = sui::Flex::horizontal().gap(2.0);
-        for tab in Tab::ALL {
-            let control = super::pinned_tab::PinnedTab::new(shared.clone(), tab, compact);
-            #[cfg(target_os = "android")]
-            {
-                pinned = pinned.with_child(control);
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                pinned = pinned.with_child(
-                    sui::Tooltip::new(tab.title(), control)
-                        .placement(sui::TooltipPlacement::Below)
-                        .theme(shared.theme()),
-                );
+        if compact {
+            let destinations = shared.clone();
+            let nav_theme = shared.clone();
+            let navigation = ContextMenu::new(
+                "Application navigation",
+                sui::Button::new("Navigate")
+                    .icon(IconGlyph::MoreHorizontal)
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .enabled_when({
+                        let shared = shared.clone();
+                        move || !shared.borrow().updates.view.busy
+                    })
+                    .theme_when(move || nav_theme.theme()),
+            )
+            .items_when(|| {
+                Tab::ALL
+                    .into_iter()
+                    .map(|tab| MenuItem::new(tab.title()))
+                    .collect()
+            })
+            .activation_button(PointerButton::Primary)
+            .anchor_to_pointer(false)
+            .theme_when({
+                let shared = shared.clone();
+                move || shared.theme()
+            })
+            .on_activate_path_with_ctx(move |ctx, path, _| {
+                if let [index] = path.as_slice()
+                    && let Some(tab) = Tab::ALL.get(*index)
+                {
+                    destinations.set_active_tab(*tab);
+                }
+                relayout(ctx);
+            });
+            pinned = pinned.with_child(navigation);
+        } else {
+            for tab in Tab::ALL {
+                let control = super::pinned_tab::PinnedTab::new(shared.clone(), tab, compact);
+                #[cfg(target_os = "android")]
+                {
+                    pinned = pinned.with_child(control);
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    pinned = pinned.with_child(
+                        sui::Tooltip::new(tab.title(), control)
+                            .placement(sui::TooltipPlacement::Below)
+                            .theme(shared.theme()),
+                    );
+                }
             }
         }
         let content = sui::Flex::horizontal()

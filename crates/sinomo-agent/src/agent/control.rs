@@ -1756,6 +1756,29 @@ where
         &self,
         op: AgentOp,
     ) -> Result<AgentSessionControlResult, AgentError> {
+        self.submit_turn_op_with_cancellation(op, None)
+    }
+
+    /// Bind a turn to the cancellation scope that admitted its input. This
+    /// also covers preparation that completes after its caller requested Stop.
+    pub fn submit_op_with_cancellation(
+        &self,
+        op: AgentOp,
+        cancellation: AgentCancellationToken,
+    ) -> Result<AgentSessionControlResult, AgentError> {
+        if !op.action.is_turn() {
+            return Err(AgentError::Runtime {
+                detail: "an admission cancellation scope requires a turn operation".into(),
+            });
+        }
+        self.submit_turn_op_with_cancellation(op, Some(cancellation))
+    }
+
+    fn submit_turn_op_with_cancellation(
+        &self,
+        op: AgentOp,
+        admission: Option<AgentCancellationToken>,
+    ) -> Result<AgentSessionControlResult, AgentError> {
         self.reap_finished_worker()?;
         let mut state = self.lock_state()?;
         let previous_control = state.control.clone();
@@ -1828,7 +1851,11 @@ where
                 .retain(|update| &update.task_id != task_id);
         }
         let task = self.agent.config.run_context.task.clone();
-        let cancellation_token = AgentCancellationToken::new().with_timeout_ms(timeout_ms);
+        let cancellation_token = admission
+            .as_ref()
+            .map(AgentCancellationToken::child_token)
+            .unwrap_or_default()
+            .with_timeout_ms(timeout_ms);
         state.control.active_turn = Some(AgentActiveTurn::new(
             op_id.clone(),
             sequence,

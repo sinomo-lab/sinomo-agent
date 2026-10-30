@@ -2126,6 +2126,7 @@ struct ClusterView {
     empty: WidgetPod,
     legend: WidgetPod,
     detail: WidgetPod,
+    show_detail: Cell<bool>,
 }
 
 impl ClusterView {
@@ -2135,6 +2136,7 @@ impl ClusterView {
             empty: WidgetPod::new(cluster_empty_host(&shared, &reader)),
             legend: WidgetPod::new(cluster_legend(&reader)),
             detail: WidgetPod::new(cluster_detail_host(&shared, &reader)),
+            show_detail: Cell::new(false),
             shared,
             keyboard_focus: RefCell::new(None),
         }
@@ -2238,7 +2240,8 @@ impl Widget for ClusterView {
                 }
                 let graph = graph_rect(ctx.bounds());
                 if !graph.contains(pointer.position)
-                    || detail_panel_rect(ctx.bounds()).contains(pointer.position)
+                    || (self.show_detail.get()
+                        && detail_panel_rect(ctx.bounds()).contains(pointer.position))
                 {
                     return;
                 }
@@ -2271,13 +2274,22 @@ impl Widget for ClusterView {
         let detail = detail_panel_rect(bounds);
         let legend = legend_rect(bounds);
         let has_vertices = !self.shared.cluster().snapshot.nodes.is_empty();
+        let show_detail =
+            has_vertices && (size.width >= 900.0 || self.shared.cluster().selected.is_some());
+        self.show_detail.set(show_detail);
 
         if has_vertices {
             self.empty.measure(ctx, Constraints::tight(Size::ZERO));
             self.legend
                 .measure(ctx, Constraints::tight(rect_size(legend)));
-            self.detail
-                .measure(ctx, Constraints::tight(rect_size(detail)));
+            self.detail.measure(
+                ctx,
+                Constraints::tight(if show_detail {
+                    rect_size(detail)
+                } else {
+                    Size::ZERO
+                }),
+            );
         } else {
             self.empty
                 .measure(ctx, Constraints::tight(rect_size(graph)));
@@ -2295,7 +2307,14 @@ impl Widget for ClusterView {
         } else {
             self.empty.arrange(ctx, Rect::ZERO);
             self.legend.arrange(ctx, legend_rect(bounds));
-            self.detail.arrange(ctx, detail_panel_rect(bounds));
+            self.detail.arrange(
+                ctx,
+                if self.show_detail.get() {
+                    detail_panel_rect(bounds)
+                } else {
+                    Rect::ZERO
+                },
+            );
         }
     }
 
@@ -2330,7 +2349,9 @@ impl Widget for ClusterView {
             );
         }
         self.legend.paint(ctx);
-        self.detail.paint(ctx);
+        if self.show_detail.get() {
+            self.detail.paint(ctx);
+        }
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -2382,20 +2403,26 @@ impl Widget for ClusterView {
             self.empty.semantics(ctx);
         } else {
             self.legend.semantics(ctx);
-            self.detail.semantics(ctx);
+            if self.show_detail.get() {
+                self.detail.semantics(ctx);
+            }
         }
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.empty);
         visitor.visit(&self.legend);
-        visitor.visit(&self.detail);
+        if self.show_detail.get() {
+            visitor.visit(&self.detail);
+        }
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.empty);
         visitor.visit(&mut self.legend);
-        visitor.visit(&mut self.detail);
+        if self.show_detail.get() {
+            visitor.visit(&mut self.detail);
+        }
     }
 
     fn accepts_focus(&self) -> bool {
@@ -2491,7 +2518,7 @@ fn build_cluster_activity(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             )
             .name("Cluster activity")
             .icon(IconGlyph::Check)
-            .detail("The live dashboard keeps at most 100 activity items in memory.")
+            .detail("This view updates while Cluster is open.")
             .transparent()
             .theme_when(clone_reader(reader)),
         );
@@ -3116,10 +3143,30 @@ fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     } else {
         !refreshing && cluster_actionable_warning(&snapshot).is_some()
     };
-    let mut primary_actions = Flex::horizontal()
+    let primary_count = 1 + usize::from(selection.is_some()) + usize::from(warning_visible);
+    let primary_height =
+        DETAIL_BUTTON_H * primary_count as f32 + 8.0 * primary_count.saturating_sub(1) as f32;
+    let mut primary_actions = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(8.0)
-        .with_item(refresh, FlexItem::fill().min_width(0.0));
+        .with_item(refresh, FlexItem::fixed(DETAIL_BUTTON_H));
+    if selection.is_some() {
+        let back = shared.clone();
+        primary_actions.push_item(
+            Button::new("Back to topology")
+                .min_height(DETAIL_BUTTON_H)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    let mut cluster = back.cluster_mut();
+                    cluster.selected = None;
+                    cluster.diagnostics_open = false;
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                }),
+            FlexItem::fixed(DETAIL_BUTTON_H),
+        );
+    }
     if warning_visible {
         let settings_shared = shared.clone();
         let description = if selection.is_some() {
@@ -3141,7 +3188,7 @@ fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                     ctx.request_arrange();
                     ctx.request_paint();
                 }),
-            FlexItem::flex(1.35).min_width(0.0),
+            FlexItem::fixed(DETAIL_BUTTON_H),
         );
     }
 
@@ -3208,9 +3255,9 @@ fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let actions = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(8.0)
-        .with_item(primary_actions, FlexItem::fixed(DETAIL_BUTTON_H))
+        .with_item(primary_actions, FlexItem::fixed(primary_height))
         .with_item(secondary_actions, FlexItem::fixed(DETAIL_BUTTON_H));
-    let content = Dock::new(details).bottom(DETAIL_BUTTON_H * 2.0 + 8.0, actions);
+    let content = Dock::new(details).bottom(primary_height + DETAIL_BUTTON_H + 8.0, actions);
     WidgetPod::new(
         Surface::panel(content)
             .name("Cluster inspector")

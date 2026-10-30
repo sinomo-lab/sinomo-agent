@@ -595,3 +595,62 @@ fn capacity_eviction_cannot_remove_a_placeholder_during_cold_activation() {
         1
     );
 }
+
+#[test]
+fn cancellation_covers_admitted_inputs_and_does_not_leak_to_future_sends() {
+    let root = sinomo_testdir::TestDir::new("chat-admission-cancel");
+    let journal = CommandJournal::open(&root, "cancel-client").unwrap();
+    let send = wire::ChatSessionCommand::Send {
+        session_id: SessionId::generate().to_string(),
+        text: "queued".into(),
+        attachments: vec![],
+    };
+    journal.admit("original-send", &send).unwrap();
+    let activity = HostActivity::new();
+    let admitted = activity.admit_command(&send, Some(&(journal.clone(), "original-send".into())));
+    assert!(activity.cancel_admitted_turns().unwrap());
+    assert!(admitted.cancellation().unwrap().is_cancelled());
+    assert!(
+        journal.recovery().unwrap().1.is_empty(),
+        "cancelled pending input must not replay"
+    );
+    drop(admitted);
+    assert!(!activity.cancel_admitted_turns().unwrap());
+    let next = activity.admit_command(&send, None);
+    assert!(
+        !next.cancellation().unwrap().is_cancelled(),
+        "a later Send owns a fresh cancellation scope"
+    );
+    drop(next);
+    drop(journal);
+    let reopened = CommandJournal::open(&root, "cancel-client").unwrap();
+    assert!(reopened.recovery().unwrap().1.is_empty());
+    assert!(
+        reopened
+            .admit("original-send", &send)
+            .unwrap_err()
+            .contains("cancelled")
+    );
+}
+
+#[test]
+fn invalid_cancel_does_not_signal_an_admitted_send() {
+    let (host, _rx) = fake_host(Duration::ZERO);
+    let command = wire::ChatSessionCommand::Send {
+        session_id: SessionId::generate().to_string(),
+        text: "owned input".into(),
+        attachments: vec![],
+    };
+    let admitted = host.activity.admit_command(&command, None);
+    assert!(
+        host.apply_control(
+            &AgentRuntimeControlRegistry::new(),
+            &wire::ChatSessionCommand::Cancel {
+                session_id: String::new(),
+                reason: "invalid".into()
+            }
+        )
+        .is_err()
+    );
+    assert!(!admitted.cancellation().unwrap().is_cancelled());
+}

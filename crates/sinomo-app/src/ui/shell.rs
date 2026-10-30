@@ -521,7 +521,14 @@ impl Shell {
         if !self.shared.is_ready() {
             return false;
         }
-        match self.shared.active_tab() {
+        let scope = self.shared.active_scope();
+        if scope.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document)
+            && let Some(id) = scope.workspace_id()
+        {
+            self.shared.close_workspace_tab(id);
+            return true;
+        }
+        let navigated = match self.shared.active_tab() {
             Tab::Cluster => self.shared.cluster_mut().navigate_back(),
             Tab::Evolution => false,
             Tab::Settings => self.shared.settings_mut().navigate_back(),
@@ -530,7 +537,21 @@ impl Shell {
                 self.shared.active_scope().files_mut().navigate_back(waker)
             }
             _ => false,
+        };
+        if navigated {
+            return true;
         }
+        // Root Back closes the native window. A dirty document on another
+        // tab must get the same close guard as the currently visible one.
+        if let Some(scope) = self.shared.workspace_scopes().into_iter().find(|scope| {
+            scope.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document)
+                && scope.files().has_unsaved_document()
+        }) && let Some(id) = scope.workspace_id()
+        {
+            self.shared.close_workspace_tab(id);
+            return true;
+        }
+        false
     }
 }
 

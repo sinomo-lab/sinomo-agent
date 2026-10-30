@@ -12516,6 +12516,7 @@ fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> WidgetP
     let save = {
         let s = shared.clone();
         sui::Button::new(if rename_pending { "Saving…" } else { "Save" })
+            .focus_on_press(!cfg!(target_os = "android"))
             .appearance(sui::ButtonAppearance::Filled)
             .tone(SemanticTone::Accent)
             .min_width(64.0)
@@ -13238,9 +13239,9 @@ enum ChatOverlayKey {
         session_id: String,
         theme: (AppThemeMode, AppTextScale),
     },
-    /// The compact drawer still follows the complete chat structure because its body is not a
-    /// separately retained rebuild boundary.
-    CompactDrawer(ChatStructureKey),
+    /// The sidebar and its keyed rows observe their own content. Retain the
+    /// drawer frame while filtering so its editor keeps focus and IME state.
+    CompactDrawer((AppThemeMode, AppTextScale)),
 }
 
 impl ChatOverlayKey {
@@ -13254,7 +13255,7 @@ impl ChatOverlayKey {
                 theme: snapshot.theme,
             }
         } else if snapshot.compact_drawer_open {
-            Self::CompactDrawer(structure.clone())
+            Self::CompactDrawer(snapshot.theme)
         } else {
             Self::Hidden
         }
@@ -15912,9 +15913,9 @@ impl TranscriptView {
                 let bx = area.x() + PAD;
                 let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
                 let title = if *includes_reasoning {
-                    format!("Reasoning and activity · {call_count} events")
+                    format!("Activity · {call_count}")
                 } else {
-                    format!("Tool activity · {call_count} calls")
+                    format!("Tools · {call_count}")
                 };
                 let subtitle = compact_line(latest, 72);
                 paint_action_tile(
@@ -15942,9 +15943,9 @@ impl TranscriptView {
                 let bx = area.x() + PAD;
                 let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
                 let title = if *includes_reasoning {
-                    format!("Reasoning and activity · {call_count} events")
+                    format!("Activity · {call_count}")
                 } else {
-                    format!("Tool activity · {call_count} calls")
+                    format!("Tools · {call_count}")
                 };
                 paint_action_tile(
                     ctx,
@@ -17839,22 +17840,26 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
     if let Some(error) = shared.chat().attachment_picker_error.clone() {
         let s = shared.clone();
-        body = body.with_child(
-            Flex::horizontal()
-                .wrap(FlexWrap::Wrap)
-                .gap(8.0)
-                .align_items(Alignment::Center)
-                .with_child(
-                    StatusBadge::new("Couldn’t attach")
-                        .icon(IconGlyph::Alert)
-                        .tone(SemanticTone::Danger)
-                        .theme_when(clone_reader(reader)),
-                )
-                .with_item(
-                    small_label(shared, error).color_when(move || palette(&s).danger_text),
-                    FlexItem::flex(1.0).min_width(140.0),
-                ),
-        );
+        body = Stack::vertical()
+            .gap(8.0)
+            .alignment(Alignment::Stretch)
+            .with_child(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Center)
+                    .with_child(
+                        StatusBadge::new("Couldn’t attach")
+                            .icon(IconGlyph::Alert)
+                            .tone(SemanticTone::Danger)
+                            .theme_when(clone_reader(reader)),
+                    )
+                    .with_item(
+                        small_label(shared, error).color_when(move || palette(&s).danger_text),
+                        FlexItem::flex(1.0).min_width(140.0),
+                    ),
+            )
+            .with_child(body);
     }
 
     if !shared.chat().attachments.is_empty() {
@@ -19307,6 +19312,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     };
     let title = {
         let s = shared.clone();
+        let colors = shared.clone();
         Label::new("Conversation")
             .text_when(move || {
                 let chat = s.chat();
@@ -19315,10 +19321,13 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                     .unwrap_or_else(|| chat.empty_conversation_title())
             })
             .semantic_name("Current conversation")
+            .single_line(true)
             .text_style(pal.text_style(&theme, 13.0, FontWeight::SEMIBOLD, pal.text))
+            .color_when(move || palette(&colors).text)
     };
     let agent = {
         let s = shared.clone();
+        let colors = shared.clone();
         Label::new("Agent")
             .text_when(move || {
                 let chat = s.chat();
@@ -19338,7 +19347,9 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 format!("Agent · {display}")
             })
             .semantic_name("Current agent")
+            .single_line(true)
             .text_style(pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted))
+            .color_when(move || palette(&colors).text_muted)
     };
     let edit = {
         let s = shared.clone();
@@ -19411,9 +19422,85 @@ fn wide_pod(
     )
 }
 
+/// Keep the editor and its actions usable when a landscape keyboard leaves
+/// only a short strip of the window. Conversation navigation returns as soon
+/// as there is room for its header again.
+struct CompactChatBody {
+    header: WidgetPod,
+    main: WidgetPod,
+    show_header: Cell<bool>,
+}
+impl Widget for CompactChatBody {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let show = constraints.max.height >= 220.0;
+        self.show_header.set(show);
+        let header_h = if show { COMPACT_HEADER_H } else { 0.0 };
+        let main = self.main.measure(
+            ctx,
+            Constraints::new(
+                Size::ZERO,
+                Size::new(
+                    constraints.max.width,
+                    (constraints.max.height - header_h).max(0.0),
+                ),
+            ),
+        );
+        self.header
+            .measure(ctx, Constraints::tight(Size::new(main.width, header_h)));
+        constraints.clamp(Size::new(main.width, main.height + header_h))
+    }
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let header_h = if self.show_header.get() {
+            COMPACT_HEADER_H
+        } else {
+            0.0
+        };
+        self.header.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), bounds.width(), header_h),
+        );
+        self.main.arrange(
+            ctx,
+            Rect::new(
+                bounds.x(),
+                bounds.y() + header_h,
+                bounds.width(),
+                (bounds.height() - header_h).max(0.0),
+            ),
+        );
+    }
+    fn paint(&self, ctx: &mut PaintCtx) {
+        if self.show_header.get() {
+            self.header.paint(ctx);
+        }
+        self.main.paint(ctx);
+    }
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if self.show_header.get() {
+            self.header.semantics(ctx);
+        }
+        self.main.semantics(ctx);
+    }
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        if self.show_header.get() {
+            visitor.visit(&self.header);
+        }
+        visitor.visit(&self.main);
+    }
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        if self.show_header.get() {
+            visitor.visit(&mut self.header);
+        }
+        visitor.visit(&mut self.main);
+    }
+}
+
 fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope) -> WidgetPod {
-    let body = Dock::new(main_column(shared, reader, selection))
-        .top(COMPACT_HEADER_H, compact_chat_header(shared, reader));
+    let body = CompactChatBody {
+        header: WidgetPod::new(compact_chat_header(shared, reader)),
+        main: WidgetPod::new(main_column(shared, reader, selection)),
+        show_header: Cell::new(true),
+    };
     let dialog_host = ChatDialogHost::new(body, shared.clone(), Rc::clone(reader));
     WidgetPod::new(
         Surface::window(dialog_host)
@@ -19517,9 +19604,15 @@ impl Widget for ChatView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let use_wide = constraints.max.width >= WIDE_THRESHOLD;
-        if use_wide && !self.use_wide.get() {
-            self.shared.chat_mut().compact_drawer_open = false;
+        let use_wide = constraints.max.width >= WIDE_THRESHOLD && constraints.max.height >= 380.0;
+        if use_wide != self.use_wide.get() {
+            let mut chat = self.shared.chat_mut();
+            // The inactive layout has its own retained editor. Refresh it
+            // from the canonical draft before it becomes visible again.
+            chat.draft_revision = chat.draft_revision.wrapping_add(1);
+            if use_wide {
+                chat.compact_drawer_open = false;
+            }
         }
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
@@ -19765,6 +19858,7 @@ pub fn view(shared: Shared) -> impl Widget {
 
 #[cfg(test)]
 mod tests {
+    include!("chat/mobile_regression_tests.rs");
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
