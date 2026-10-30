@@ -386,6 +386,28 @@ pub fn fence_remote_cluster_kv_txn_request_with_entries(
     Ok(request)
 }
 
+async fn fence_remote_transaction(
+    host: &dyn ClusterKvServiceHost,
+    signer: &ServiceSigner,
+    request: KvTxnRequest,
+) -> Result<KvTxnRequest, ServiceError> {
+    let (member_key, policy_key) = remote_cluster_kv_authorization_keys(signer)?;
+    let keys = vec![member_key, policy_key];
+    // Local observation can fall back to a checkpoint from before join or
+    // revocation. Capture both guards from one current, proof-bound Raft read.
+    // This locally originated authorization read uses the existing admission
+    // grace/authority forwarding, as cluster-control authorization does. The
+    // remote transaction itself still cannot forward from this voter.
+    let entries = host.authoritative_entries(keys.clone(), true).await?;
+    sinomo_kv::validate_cluster_kv_authoritative_entries_read(&keys, &entries)?;
+    fence_remote_cluster_kv_txn_request_with_entries(
+        entries.value[0].as_ref(),
+        entries.value[1].as_ref(),
+        signer,
+        request,
+    )
+}
+
 async fn run_blocking<T>(
     route: impl Into<String>,
     label: &'static str,
@@ -594,37 +616,7 @@ impl Service for HostedClusterKvService {
                     let request = match &ctx.signer {
                         ServiceSigner::Local | ServiceSigner::LocalNode { .. } => request,
                         ServiceSigner::Remote { .. } => {
-                            let (member_key, policy_key) =
-                                remote_cluster_kv_authorization_keys(&ctx.signer)?;
-                            let task_paths = cluster_paths.clone();
-                            let (member_entry, policy_entry) = run_blocking(
-                                route.clone(),
-                                "cluster kv remote authorization entries",
-                                move || {
-                                    let state = crate::read_cluster_state_without_kv(&task_paths)?;
-                                    let kv_paths = task_paths.kv_paths();
-                                    let member_entry = read_cluster_kv_local_entry(
-                                        &kv_paths,
-                                        &state.local_node_id,
-                                        &member_key,
-                                    )?
-                                    .value;
-                                    let policy_entry = read_cluster_kv_local_entry(
-                                        &kv_paths,
-                                        &state.local_node_id,
-                                        &policy_key,
-                                    )?
-                                    .value;
-                                    Ok((member_entry, policy_entry))
-                                },
-                            )
-                            .await?;
-                            fence_remote_cluster_kv_txn_request_with_entries(
-                                member_entry.as_ref(),
-                                policy_entry.as_ref(),
-                                &ctx.signer,
-                                request,
-                            )?
+                            fence_remote_transaction(host.as_ref(), &ctx.signer, request).await?
                         }
                     };
                     let mut result = host.commit_transaction(request, allow_forwarding).await?;
@@ -654,6 +646,7 @@ mod tests {
     struct TestHost {
         snapshot: Option<KvAuthoritativeRead<KvSnapshot>>,
         snapshot_calls: std::sync::atomic::AtomicUsize,
+        exact_reads: std::sync::Mutex<Vec<(Vec<String>, bool)>>,
     }
 
     impl ClusterKvServiceHost for TestHost {
@@ -680,10 +673,26 @@ mod tests {
 
         fn authoritative_entries<'a>(
             &'a self,
-            _keys: Vec<String>,
-            _allow_forwarding: bool,
+            keys: Vec<String>,
+            allow_forwarding: bool,
         ) -> ClusterKvServiceFuture<'a, KvAuthoritativeRead<Vec<Option<KvEntry>>>> {
-            Box::pin(async { Err(ServiceError::Service("unused".to_string())) })
+            Box::pin(async move {
+                self.exact_reads
+                    .lock()
+                    .unwrap()
+                    .push((keys.clone(), allow_forwarding));
+                let snapshot = self
+                    .snapshot
+                    .as_ref()
+                    .ok_or_else(|| ServiceError::Service("native exact read unavailable".into()))?;
+                Ok(KvAuthoritativeRead {
+                    value: keys
+                        .iter()
+                        .map(|key| snapshot.value.get(key).cloned())
+                        .collect(),
+                    authority: snapshot.authority,
+                })
+            })
         }
 
         fn authoritative_range_prefix<'a>(
@@ -782,5 +791,110 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn remote_transaction_uses_one_authoritative_cut_and_keeps_revocation_guards() {
+        let node_id = sinomo_node::NodeId::generate();
+        let mut member = crate::ClusterMemberRecord::local_voter(
+            sinomo_base::Id::generate(),
+            node_id.clone(),
+            "joined",
+            "joined-key",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.allowed_capabilities = member.capabilities.clone();
+        let policy = sinomo_node::ClusterCapabilityPolicyRecord::from(&member);
+        let mut store = sinomo_kv::InProcessKvStore::new();
+        let member_key = sinomo_node::cluster_member_key(&node_id);
+        let policy_key = sinomo_node::cluster_capability_policy_key(&node_id);
+        store
+            .put(
+                member_key.clone(),
+                sinomo_kv::encode_kv_value(&member).unwrap(),
+                None,
+            )
+            .unwrap();
+        store
+            .put(
+                policy_key.clone(),
+                sinomo_kv::encode_kv_value(&policy).unwrap(),
+                None,
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let host = TestHost {
+            snapshot: Some(KvAuthoritativeRead {
+                authority: sinomo_kv::KvAuthorityProof {
+                    term: 1,
+                    commit_index: 2,
+                    revision: snapshot.revision,
+                    basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                        voter_acks: 1,
+                        required_quorum: 1,
+                    },
+                },
+                value: snapshot,
+            }),
+            ..TestHost::default()
+        };
+        let signer = ServiceSigner::Remote {
+            node_id: node_id.to_string(),
+            public_key: member.node_public_key.clone(),
+        };
+        let original = KvTxnRequest::generated(sinomo_kv::KvTxn {
+            compares: vec![],
+            success: vec![sinomo_kv::KvOp::Put {
+                key: "/test/import".into(),
+                value: b"imported".to_vec(),
+                lease_id: None,
+            }],
+            failure: vec![],
+        });
+        let fenced = fence_remote_transaction(&host, &signer, original.clone())
+            .await
+            .unwrap();
+        assert_eq!(fenced.request_id, original.request_id);
+        assert_eq!(fenced.txn.success, original.txn.success);
+        assert_eq!(
+            *host.exact_reads.lock().unwrap(),
+            vec![(vec![member_key, policy_key.clone()], true)]
+        );
+        assert_eq!(fenced.txn.compares.len(), 4);
+        assert_eq!(
+            host.snapshot_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        // A revocation after the read must reject the imported mutation at commit.
+        store.delete(&policy_key).unwrap();
+        assert!(!store.txn(fenced.txn).unwrap().succeeded);
+        assert!(store.get("/test/import").is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_transaction_preserves_unavailable_authority_without_local_fallback() {
+        let host = TestHost::default();
+        let signer = ServiceSigner::Remote {
+            node_id: sinomo_node::NodeId::generate().to_string(),
+            public_key: "key".into(),
+        };
+        let error = fence_remote_transaction(
+            &host,
+            &signer,
+            KvTxnRequest::generated(sinomo_kv::KvTxn {
+                compares: vec![],
+                success: vec![],
+                failure: vec![],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, ServiceError::Service(ref detail) if detail == "native exact read unavailable")
+        );
+        assert_eq!(host.exact_reads.lock().unwrap().len(), 1);
     }
 }
