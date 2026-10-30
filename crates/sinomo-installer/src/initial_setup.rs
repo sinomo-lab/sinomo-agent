@@ -813,6 +813,53 @@ fn linux_remove_integrations(receipt: &Receipt) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "subprocess fixture, invoked by self-removal regression"]
+    fn installed_uninstall_worker_fixture() {
+        let root = PathBuf::from(env::var_os("SINOMO_UNINSTALL_SELF_FIXTURE").unwrap());
+        uninstall(&root, false).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installed_uninstaller_does_not_kill_its_own_worker_threads() {
+        let fixture = sinomo_testdir::TestDir::new("installed-uninstaller-own-threads");
+        let root = fixture.join("setup");
+        let data = fixture.join("data");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        configure_with_files(
+            &root,
+            &data,
+            None,
+            vec![RECEIPT.into(), local::INSTALLED_DATA_DIR_FILE.into()],
+        )
+        .unwrap();
+        let executable = data.join("bin/sinomo");
+        fs::copy(env::current_exe().unwrap(), &executable).unwrap();
+        // The real test harness runs the removal on a worker thread. Its
+        // executable name/data binding match the installed CLI, so an ownership
+        // scan must distinguish that caller's threads from owned child processes.
+        let output = Command::new(&executable)
+            .args([
+                "--exact",
+                "initial_setup::tests::installed_uninstall_worker_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SINOMO_DATA_DIR", &data)
+            .env("SINOMO_UNINSTALL_SELF_FIXTURE", &root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            executable.is_file(),
+            "keep-data uninstall preserves the runtime"
+        );
+        assert!(local::ensure_deployment_enabled(&data).is_err());
+    }
+
     #[test]
     #[ignore = "subprocess fixture, invoked by prioritized removal acceptance"]
     fn removal_fixture_process() {

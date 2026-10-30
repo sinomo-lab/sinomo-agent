@@ -11,7 +11,15 @@ pub(super) fn terminate_owned(root: &Path, data: &Path) -> Result<()> {
     let mut system = System::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        // Linux task IDs share the owning process's executable and environment.
+        // Killing one of our own worker threads would kill this uninstaller.
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::Always)
+                .without_tasks(),
+        );
         let mut owned = BTreeSet::new();
         if let Ok(bytes) = fs::read(data.join("rollout/activation.owner.json")) {
             if let Ok(owner) = serde_json::from_slice::<ProcessIdentity>(&bytes) {
@@ -53,7 +61,9 @@ pub(super) fn terminate_owned(root: &Path, data: &Path) -> Result<()> {
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&candidates),
             true,
-            ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
+            ProcessRefreshKind::nothing()
+                .with_environ(UpdateKind::Always)
+                .without_tasks(),
         );
         for (pid, process) in system.processes() {
             if process.status() == sysinfo::ProcessStatus::Zombie {
