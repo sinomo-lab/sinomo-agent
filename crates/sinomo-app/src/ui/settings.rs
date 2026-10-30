@@ -6024,7 +6024,10 @@ fn settings_text_style(shared: &Shared, token: ThemeTextToken) -> sui::TextStyle
 }
 
 fn settings_label(shared: &Shared, text: impl Into<String>, token: ThemeTextToken) -> Label {
-    Label::new(text).text_style(settings_text_style(shared, token))
+    let color = shared.clone();
+    Label::new(text)
+        .text_style(settings_text_style(shared, token))
+        .color_when(move || palette(&color).text)
 }
 
 fn muted_label_with_token(
@@ -15719,6 +15722,7 @@ fn narrow_pod(
     };
     let current_section = {
         let s = shared.clone();
+        let color = shared.clone();
         Label::new("Current settings section")
             .text_when(move || {
                 s.settings()
@@ -15728,6 +15732,7 @@ fn narrow_pod(
                     .to_string()
             })
             .text_style(settings_text_style(shared, shared.theme().text.base))
+            .color_when(move || palette(&color).text)
     };
     let backbar = TrailingSlotRow::new(
         Align::new(Alignment::Start, Alignment::Center, back_button),

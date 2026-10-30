@@ -64,6 +64,67 @@ fn set_android_safe_area_insets(insets: sui::Insets) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = insets;
 }
 
+#[cfg(all(target_os = "android", feature = "mobile"))]
+pub(crate) fn sync_android_system_bars(mode: theme::AppThemeMode) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static APPEARANCE: AtomicU8 = AtomicU8::new(0);
+    let light = mode == theme::AppThemeMode::Light;
+    let appearance = if light { 1 } else { 2 };
+    let Some(app) = ANDROID_APP.get() else { return };
+    if APPEARANCE.swap(appearance, Ordering::Relaxed) == appearance {
+        return;
+    }
+    let android_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        use jni::objects::JObject;
+        use jni::refs::Global;
+        use jni::{jni_sig, jni_str};
+        let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
+        let raw_activity = android_app.activity_as_ptr() as jni::sys::jobject;
+        let result: jni::errors::Result<()> = vm.attach_current_thread(|env| {
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+            let window = env
+                .call_method(
+                    &activity,
+                    jni_str!("getWindow"),
+                    jni_sig!("()Landroid/view/Window;"),
+                    &[],
+                )?
+                .l()?;
+            let decor = env
+                .call_method(
+                    &window,
+                    jni_str!("getDecorView"),
+                    jni_sig!("()Landroid/view/View;"),
+                    &[],
+                )?
+                .l()?;
+            let flags = env
+                .call_method(
+                    &decor,
+                    jni_str!("getSystemUiVisibility"),
+                    jni_sig!("()I"),
+                    &[],
+                )?
+                .i()?;
+            // LIGHT_STATUS_BAR (API 23) and LIGHT_NAVIGATION_BAR (API 26).
+            let mask = 0x2000 | 0x10;
+            let flags = if light { flags | mask } else { flags & !mask };
+            env.call_method(
+                &decor,
+                jni_str!("setSystemUiVisibility"),
+                jni_sig!("(I)V"),
+                &[flags.into()],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            APPEARANCE.store(0, Ordering::Relaxed);
+            tracing::warn!(%error, "Android system bar appearance update failed");
+        }
+    }));
+}
+
 /// Construct the application around a given shared state. Exposed so headless
 /// tooling (visual tests) can build and render the same widget tree the app uses.
 pub fn build_application(shared: Shared) -> sui::Result<App> {
@@ -98,10 +159,7 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
                     .controller(crate::ui::shell::BackgroundWorkController::new(
                         shared.clone(),
                     ))
-                    // Shell is a custom composite with flattened title chrome and descendant
-                    // overlays. A zero-duration retained boundary keeps that normal chrome alive
-                    // while Select/ContextMenu overlays update in their independent stack layer.
-                    .root(sui::LayoutTransition::new(Shell::new(shared)).duration(0.0)),
+                    .root(Shell::new(shared)),
             )
         })
 }
@@ -180,6 +238,8 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
     configure_android_data_dir(&android_app);
     let _ = ANDROID_APP.set(android_app.clone());
     set_android_safe_area_insets(sui::Insets::ZERO);
+    initialize_android_tls(&android_app)
+        .map_err(|error| sui::Error::new(format!("Android TLS initialization failed: {error}")))?;
     install_app_observability();
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
@@ -222,6 +282,29 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
                 ui.wake();
             })
             .expect("spawn connect thread");
+    })
+}
+
+/// Install Android's certificate verifier before any background HTTP client can
+/// start. Keep the application context, rather than retaining an activity.
+#[cfg(all(target_os = "android", feature = "mobile"))]
+fn initialize_android_tls(android_app: &sui::AndroidApp) -> jni::errors::Result<()> {
+    use jni::objects::JObject;
+    use jni::refs::Global;
+
+    let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
+    let raw_activity = android_app.activity_as_ptr() as jni::sys::jobject;
+    vm.attach_current_thread(|env| {
+        let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
+        let context = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getApplicationContext"),
+                jni::jni_sig!("()Landroid/content/Context;"),
+                &[],
+            )?
+            .l()?;
+        rustls_platform_verifier::android::init_with_env(env, context)
     })
 }
 
@@ -286,25 +369,16 @@ fn open_android_external_url_on_java_main_thread(
 }
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
-pub(crate) fn android_safe_area_changed_physical(physical: [i32; 4]) {
-    let Some(android_app) = ANDROID_APP.get() else {
-        return;
-    };
-    let config = android_app.config();
-    let scale = config.density().unwrap_or(160).max(1) as f32 / 160.0;
+pub(crate) fn android_safe_area_changed_physical(physical: [i32; 4], scale: f32) {
+    // Java inset callbacks must not lock NativeActivity configuration: its
+    // native event thread can be waiting for the Java thread to acknowledge
+    // the same resize. Android supplies density with the inset sample instead.
     let insets = safe_area_insets_from_physical(physical, scale);
     if platform_safe_area_insets() == insets {
         return;
     }
     set_android_safe_area_insets(insets);
-    tracing::info!(
-        content = ?android_app.content_rect(),
-        density = ?config.density(),
-        screen_width_dp = ?config.screen_width_dp(),
-        screen_height_dp = ?config.screen_height_dp(),
-        ?insets,
-        "Android safe area changed"
-    );
+    tracing::info!(?insets, "Android safe area changed");
     let ui = ANDROID_UI_HANDLE
         .get()
         .and_then(|ui| ui.lock().ok().and_then(|ui| ui.as_ref().cloned()));

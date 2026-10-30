@@ -77,11 +77,15 @@ public final class SinomoLifecycleCallbacks implements
             top = insets.top;
             right = insets.right;
             bottom = insets.bottom;
+            // Edge-to-edge NativeActivity surfaces do not resize for the IME.
+            // Keep focused editors and their controls above the visible keyboard.
+            bottom = Math.max(bottom, windowInsets.getInsets(WindowInsets.Type.ime()).bottom);
         } else {
             left = windowInsets.getStableInsetLeft();
             top = windowInsets.getStableInsetTop();
             right = windowInsets.getStableInsetRight();
             bottom = windowInsets.getStableInsetBottom();
+            bottom = Math.max(bottom, windowInsets.getSystemWindowInsetBottom());
             if (Build.VERSION.SDK_INT >= 28) {
                 DisplayCutout cutout = windowInsets.getDisplayCutout();
                 if (cutout != null) {
@@ -92,7 +96,8 @@ public final class SinomoLifecycleCallbacks implements
                 }
             }
         }
-        sinomoWindowInsetsChanged(left, top, right, bottom);
+        sinomoWindowInsetsChanged(left, top, right, bottom,
+                activity.getResources().getDisplayMetrics().density);
         return windowInsets;
     }
 
@@ -103,6 +108,7 @@ public final class SinomoLifecycleCallbacks implements
         // without keeping observers registered behind keyguard/system UI.
         if (hasFocus) {
             startOperatingConditionsObservation();
+            sinomoLifecycleChanged(true);
         } else {
             stopOperatingConditionsObservation();
         }
@@ -297,7 +303,7 @@ public final class SinomoLifecycleCallbacks implements
 
     private native void sinomoLifecycleChanged(boolean resumed);
 
-    private native void sinomoWindowInsetsChanged(int left, int top, int right, int bottom);
+    private native void sinomoWindowInsetsChanged(int left, int top, int right, int bottom, float density);
 
     private native void sinomoOperatingConditionsChanged();
 }

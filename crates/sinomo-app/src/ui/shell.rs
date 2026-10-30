@@ -35,7 +35,11 @@ use crate::state::{ConnectionPhase, HealthIssue, HealthStructureKey, HealthSurfa
 use crate::theme::Palette;
 use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
-pub const TOPBAR_HEIGHT: f32 = 44.0;
+pub const TOPBAR_HEIGHT: f32 = if cfg!(target_os = "android") {
+    56.0
+} else {
+    44.0
+};
 
 /// Application work coordinator owned by the window rather than by the
 /// presentation tree. Bare scheduler wakes keep legacy background lanes alive;
@@ -217,7 +221,11 @@ impl CommandController for BackgroundWorkController {
 }
 const LOGO_SIZE: f32 = 24.0;
 const EDGE_PAD: f32 = 18.0;
-const TAB_HEIGHT: f32 = 32.0;
+const TAB_HEIGHT: f32 = if cfg!(target_os = "android") {
+    44.0
+} else {
+    32.0
+};
 /// Keep outward SUI focus chrome inside the horizontally clipped tab viewport.
 const TAB_VIEWPORT_PADDING: f32 = 4.0;
 const TAB_SEG_HEIGHT: f32 = TAB_HEIGHT + (TAB_VIEWPORT_PADDING * 2.0);
@@ -226,7 +234,11 @@ const STATUS_PILL_H: f32 = 24.0;
 const STATUS_PILL_W: f32 = 150.0;
 const COMPACT_CHROME_WIDTH: f32 = 620.0;
 /// Stock compact `IconButton` footprint. Keep title-bar allocation in lockstep with the control.
-const COMPACT_STATUS_PILL_W: f32 = 28.0;
+const COMPACT_STATUS_PILL_W: f32 = if cfg!(target_os = "android") {
+    44.0
+} else {
+    28.0
+};
 const HEALTH_POPOVER_W: f32 = 420.0;
 const HEALTH_CONTENT_MIN_H: f32 = 176.0;
 const HEALTH_CONTENT_MAX_H: f32 = 548.0;
@@ -708,6 +720,15 @@ fn build_loading_view(shared: Shared) -> Surface {
 }
 
 impl Widget for Shell {
+    fn layer_options(&self) -> sui::LayerOptions {
+        // Keep chrome retained beneath descendant overlays without wrapping the
+        // shell: window events target the root, including Android focus/startup.
+        sui::LayerOptions {
+            paint_boundary: sui::PaintBoundaryMode::Explicit,
+            composition_mode: sui::LayerCompositionMode::Normal,
+        }
+    }
+
     fn command(&mut self, ctx: &mut EventCtx, command: &Command<'_>) {
         if command.is(sui::REACTIVE_CHANGED) {
             if cluster::observation_visible(&self.shared) {
@@ -723,6 +744,8 @@ impl Widget for Shell {
         ctx.observe(&self.shared.signals().active_tab);
         ctx.observe(&self.shared.signals().cluster_structure);
         let size = constraints.max;
+        #[cfg(all(target_os = "android", feature = "mobile"))]
+        crate::sync_android_system_bars(self.shared.borrow().theme_mode);
         let safe_size = crate::platform_safe_area_insets().inset(size);
         let compact = compact_chrome(safe_size.width);
         self.sync_tab_bar_density(compact);
@@ -1551,12 +1574,13 @@ fn build_health_content(
         0.0
     };
     let height = (HEALTH_CONTENT_MIN_H + issue_space + error_space).min(HEALTH_CONTENT_MAX_H);
-    SizedBox::new().width(width).height(height).child(
+    SizedBox::new().height(height).child(widgets::MaxWidth::new(
+        width,
         ScrollView::vertical(body)
             .name("Health and recovery details")
             .theme(theme)
             .viewport_width_hint(true),
-    )
+    ))
 }
 
 fn health_status_tone(key: &HealthCenterKey) -> SemanticTone {
@@ -2416,6 +2440,56 @@ mod tests {
             .expect("pinned settings semantics");
         assert!(pinned.state.selected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn application_root_delivers_window_events_to_shell() -> sui::Result<()> {
+        let shared = Shared::new(AppState::connecting());
+        shared.borrow_mut().window_placement.size = None;
+        let mut runtime = crate::build_runtime(shared.clone())?;
+        let window = runtime.window_ids()[0];
+        let size = Size::new(411.0, 780.0);
+        runtime.handle_event(window, Event::Window(WindowEvent::Resized(size)))?;
+        assert_eq!(
+            shared.borrow().window_placement.size,
+            Some([size.width, size.height]),
+            "root wrappers must not swallow shell lifecycle events"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn health_content_fits_a_mobile_viewport() -> sui::Result<()> {
+        let shared = Shared::new(AppState::connecting());
+        let key = shared.signals().health_structure.get();
+        let content = build_health_content(
+            shared,
+            &key,
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(RefCell::new(None)),
+        );
+        let mut runtime = sui::App::new()
+            .window(sui::Window::new("Health").root(content))
+            .build()?;
+        let window = runtime.window_ids()[0];
+        runtime.handle_event(
+            window,
+            Event::Window(WindowEvent::Resized(Size::new(320.0, 600.0))),
+        )?;
+        let output = runtime.render(window)?;
+        for node in output
+            .semantics
+            .iter()
+            .filter(|node| matches!(node.role, SemanticsRole::Text | SemanticsRole::Button))
+        {
+            assert!(
+                node.bounds.x() >= 0.0 && node.bounds.max_x() <= 320.0,
+                "health content exceeds the phone viewport: {:?}",
+                node.bounds
+            );
+        }
         Ok(())
     }
 

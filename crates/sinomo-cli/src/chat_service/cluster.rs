@@ -44,6 +44,10 @@ pub(super) trait ChatOwnership: Send + Sync {
     /// The chat's live owner, without claiming it. `None` when no node
     /// hosts it.
     fn current_owner(&self, chat_id: &str) -> Result<Option<ChatOwner>, String>;
+    /// Observational placement hint. It may outlive the lease and never grants execution.
+    fn route_hint(&self, chat_id: &str) -> Result<Option<ChatOwner>, String> {
+        self.current_owner(chat_id)
+    }
 }
 
 /// Reaches the chat service on another node.
@@ -181,6 +185,10 @@ pub(super) fn now_unix_ms() -> u64 {
 /// Authoritative reads and conditional commits of cluster KV records.
 pub(super) trait KvRecords: Send + Sync {
     fn read(&self, key: &str) -> Result<Option<KvEntry>, String>;
+    /// Read the resident projection without an authority barrier.
+    fn observe(&self, key: &str) -> Result<Option<KvEntry>, String> {
+        self.read(key)
+    }
     /// Whether the transaction's compares held and it committed.
     fn commit(&self, txn: KvTxn) -> Result<bool, String>;
 }
@@ -189,6 +197,10 @@ impl<T: KvRecords> KvRecords for Arc<T> {
     fn read(&self, key: &str) -> Result<Option<KvEntry>, String> {
         T::read(self, key)
     }
+    fn observe(&self, key: &str) -> Result<Option<KvEntry>, String> {
+        (**self).observe(key)
+    }
+
     fn commit(&self, txn: KvTxn) -> Result<bool, String> {
         T::commit(self, txn)
     }
@@ -215,6 +227,20 @@ impl DaemonKvRecords {
 }
 
 impl KvRecords for DaemonKvRecords {
+    fn observe(&self, key: &str) -> Result<Option<KvEntry>, String> {
+        let payload = sinomo_runtime::kv::cluster_kv_local_entry_rpc_payload(key)
+            .map_err(|e| e.to_string())?;
+        let request =
+            ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
+        let response = sinomo_runtime::api::DaemonApiClient::at_address(&self.daemon_address)
+            .with_timeout(CLUSTER_KV_TIMEOUT)
+            .call_request(&request)
+            .map_err(|e| e.to_string())?;
+        sinomo_runtime::kv::decode_cluster_kv_local_entry_rpc_body(&response.body)
+            .map(|read| read.value)
+            .map_err(|e| e.to_string())
+    }
+
     fn read(&self, key: &str) -> Result<Option<KvEntry>, String> {
         let read: KvAuthoritativeRead<Option<KvEntry>> = self.call(
             CLUSTER_KV_AUTHORITATIVE_ENTRY_ROUTE,
@@ -286,13 +312,39 @@ impl<R: KvRecords> KvChatOwnership<R> {
 }
 
 impl<R: KvRecords> ChatOwnership for KvChatOwnership<R> {
+    fn route_hint(&self, chat_id: &str) -> Result<Option<ChatOwner>, String> {
+        self.records
+            .observe(&chat_owner_key(chat_id))?
+            .map(|entry| {
+                let record: ChatOwnerRecord =
+                    serde_json::from_slice(&entry.value).map_err(|e| e.to_string())?;
+                if record.node_id == self.node_id {
+                    Ok(ChatOwner::Local)
+                } else {
+                    record
+                        .node_id
+                        .parse()
+                        .map(ChatOwner::Remote)
+                        .map_err(|e| format!("invalid chat host hint: {e}"))
+                }
+            })
+            .transpose()
+    }
+
     fn claim(&self, chat_id: &str) -> Result<ChatOwner, String> {
         for _ in 0..3 {
             let compare = match self.read(chat_id)? {
                 None => KvCompare::Missing {
                     key: chat_owner_key(chat_id),
                 },
-                Some((record, _)) if self.is_ours(&record) => return Ok(ChatOwner::Local),
+                Some((record, entry)) if self.is_ours(&record) => {
+                    // A dormant or restarted runtime needs a newly confirmed
+                    // renewal before execution, including after uncertain release.
+                    KvCompare::ModifyRevisionEquals {
+                        key: chat_owner_key(chat_id),
+                        revision: entry.modify_revision,
+                    }
+                }
                 Some((record, entry)) => {
                     let fresh = Self::is_fresh(&record);
                     // A live owner elsewhere keeps the chat. This node's own
@@ -602,5 +654,50 @@ pub(super) mod tests {
             ..ChatCluster::standalone()
         };
         assert_eq!(other.local_origin(&qualified), None);
+    }
+    #[test]
+    fn an_expired_placement_hint_never_authorizes_execution() {
+        let kv = Arc::new(MemoryKv::default());
+        let a = node("node_a").to_string();
+        let b = node("node_b").to_string();
+        kv.put_record(
+            "chat",
+            &ChatOwnerRecord {
+                node_id: a.clone(),
+                instance: "old".into(),
+                renewed_at_unix_ms: 1,
+            },
+        );
+        let on_b = ownership(&kv, &b, "new");
+        assert_eq!(
+            on_b.route_hint("chat").unwrap(),
+            Some(ChatOwner::Remote(node("node_a")))
+        );
+        assert_eq!(on_b.current_owner("chat").unwrap(), None);
+        assert_eq!(on_b.claim("chat").unwrap(), ChatOwner::Local);
+        assert!(!ownership(&kv, &a, "old").renew("chat").unwrap());
+    }
+
+    #[test]
+    fn a_current_process_claim_requires_a_new_confirmed_cas() {
+        struct RefuseCommit(Arc<MemoryKv>);
+        impl KvRecords for RefuseCommit {
+            fn read(&self, key: &str) -> Result<Option<KvEntry>, String> {
+                self.0.read(key)
+            }
+            fn commit(&self, _: KvTxn) -> Result<bool, String> {
+                Err("quorum unavailable".into())
+            }
+        }
+        let kv = Arc::new(MemoryKv::default());
+        let a = node("node_a").to_string();
+        let owner = ownership(&kv, &a, "process");
+        owner.claim("chat").unwrap();
+        let refusing = KvChatOwnership {
+            records: RefuseCommit(kv),
+            node_id: a,
+            instance: "process".into(),
+        };
+        assert_eq!(refusing.claim("chat").unwrap_err(), "quorum unavailable");
     }
 }

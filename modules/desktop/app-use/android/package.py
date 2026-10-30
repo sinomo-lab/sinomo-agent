@@ -46,7 +46,7 @@ def signers(tools, apk):
     return {line.strip() for line in result.splitlines() if "certificate SHA-256 digest:" in line}
 
 
-def package(apk, manifest, sdk, tools, keystore, password_env, alias):
+def package(apk, manifest, sdk, tools, keystore, password_env, alias, java_archives=()):
     if not apk.is_file() or not manifest.is_file() or not keystore.is_file():
         raise ValueError("APK, generated manifest and existing signing keystore are required")
     if password_env not in os.environ:
@@ -66,7 +66,8 @@ def package(apk, manifest, sdk, tools, keystore, password_env, alias):
         run("javac", "--release", "8", "-classpath", android_jar, "-d", classes, *sorted((SOURCE / "java").rglob("*.java")))
         dex = work / "dex"
         dex.mkdir()
-        run(tools / "d8", "--lib", android_jar, "--min-api", "26", "--output", dex, *sorted(classes.rglob("*.class")))
+        run(tools / "d8", "--lib", android_jar, "--min-api", "26", "--output", dex,
+            *sorted(classes.rglob("*.class")), *java_archives)
         resources = work / "resources.zip"
         run(tools / "aapt2", "compile", "--dir", SOURCE / "res", "-o", resources)
         compiled = work / "resources.apk"
@@ -112,12 +113,14 @@ def main():
     parser.add_argument("--keystore", type=Path, required=True)
     parser.add_argument("--password-env", required=True)
     parser.add_argument("--alias", help="key alias, only needed for keystores with multiple entries")
+    parser.add_argument("--java-archive", type=Path, action="append", default=[],
+                        help="additional application JAR to merge into the APK's DEX")
     args = parser.parse_args()
     if args.sdk is None:
         parser.error("--sdk or ANDROID_HOME is required")
     manifest = args.manifest or args.apk.parent / "AndroidManifest.xml"
     package(args.apk.resolve(), manifest.resolve(), args.sdk, args.sdk / "build-tools" / args.build_tools,
-            args.keystore, args.password_env, args.alias)
+            args.keystore, args.password_env, args.alias, args.java_archive)
 
 
 if __name__ == "__main__":

@@ -1623,7 +1623,10 @@ where
             if state.control.active_turn.is_some()
                 || state.turn_worker_running
                 || detached_calls_running(&state.control.session.session_id) > 0
-                || (include_ready_updates && !state.async_updates.is_empty())
+                || (include_ready_updates
+                    && (!state.async_updates.is_empty()
+                        || !state.control.session.steering_queue.is_empty()
+                        || !state.control.session.follow_up_queue.is_empty()))
             {
                 return Ok(true);
             }
