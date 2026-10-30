@@ -330,12 +330,12 @@ fn terminal_cleanup_preserves_output_and_modes_on_failure_and_panic() {
 }
 
 #[test]
-fn release_abort_policy_restores_for_fatal_workers_without_closing_unwind_workers() {
+fn panic_strategies_restore_fatal_panics_without_closing_unwind_workers() {
     let dir = sinomo_testdir::TestDir::new("tui-panic-policy");
     let source = dir.join("probe.rs");
     let implementation = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tui/panic_restore.rs");
     // Compile the actual panic dispatcher under BOTH strategies. Test-profile
-    // catch_unwind alone cannot qualify the release profile's panic=abort path.
+    // catch_unwind alone cannot qualify explicitly selected panic=abort builds.
     fs::write(
         &source,
         format!(
