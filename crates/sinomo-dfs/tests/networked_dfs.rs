@@ -373,9 +373,8 @@ fn native_file_sync_repairs_full_committed_w1_n3_owner_after_healing_receivers()
     let primary = shard.primary_node_id;
     let requester = nodes.iter().find(|node| **node != primary).unwrap();
     let path = "/services/native-compact-outcome-file-sync.bin";
-    let mut policy =
+    let policy =
         sinomo_dfs::DfsPlacementPolicy::new(DfsObjectPolicy::ReplicatedEventual, 1, 3).unwrap();
-    policy.required_node_ids = nodes.clone();
     runtime
         .apply_placement_policy(
             &primary,

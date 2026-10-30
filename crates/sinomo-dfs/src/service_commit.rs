@@ -301,12 +301,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 continue;
             }
-            let request_id = pending
-                .repair_inflight_request_ids
-                .get(&replica_node_id)
-                .cloned()
-                .unwrap_or_else(|| self.next_request_id());
-            full_repair_targets.push((replica_node_id, request_id));
+            if let Some(request_id) =
+                self.original_repair_request_for_target(intent_id, &replica_node_id, &pending)?
+            {
+                full_repair_targets.push((replica_node_id, request_id));
+            }
         }
         let outcomes = self.send_repair_replica_attachments_if_routable(
             &full_repair_targets,

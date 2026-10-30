@@ -933,7 +933,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(recovered)
     }
 
-    fn original_repair_request_for_target(
+    pub(crate) fn original_repair_request_for_target(
         &mut self,
         intent: &str,
         target: &NodeId,
@@ -3578,11 +3578,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 continue;
             }
-            let request_id = pending
-                .repair_inflight_request_ids
-                .get(&job.missing_replica_node_id)
-                .cloned()
-                .unwrap_or_else(|| self.next_request_id());
+            let Some(request_id) = self.original_repair_request_for_target(
+                &job.intent_id,
+                &job.missing_replica_node_id,
+                &pending,
+            )?
+            else {
+                continue;
+            };
             let remaining = budget.remaining_targets;
             if remaining == 0 {
                 break;
@@ -3619,16 +3622,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .cloned()
                     .expect("same-intent pending repair validated");
                 if self.pending_repair_targets_current_content(&companion, &companion_pending)? {
-                    let companion_request_id = companion_pending
-                        .repair_inflight_request_ids
-                        .get(&companion.missing_replica_node_id)
-                        .cloned()
-                        .unwrap_or_else(|| self.next_request_id());
-                    consumed_repair_targets.insert((
-                        companion.intent_id.clone(),
-                        companion.missing_replica_node_id.clone(),
-                    ));
-                    fanout_jobs.push((companion, companion_request_id));
+                    if let Some(companion_request_id) = self.original_repair_request_for_target(
+                        &companion.intent_id,
+                        &companion.missing_replica_node_id,
+                        &companion_pending,
+                    )? {
+                        consumed_repair_targets.insert((
+                            companion.intent_id.clone(),
+                            companion.missing_replica_node_id.clone(),
+                        ));
+                        fanout_jobs.push((companion, companion_request_id));
+                    }
                 }
             }
             let reserved = budget.reserve(fanout_jobs.len());
