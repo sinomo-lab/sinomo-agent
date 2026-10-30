@@ -43,6 +43,11 @@ const TUI_SESSION_SCHEMA_VERSION: u32 = 1;
 const TUI_WORKSPACE_PROJECTION_VERSION: u32 = 1;
 const TUI_MOUSE_SCROLL_LINES: isize = 4;
 
+mod diagnostics;
+mod panic_restore;
+mod terminal_io;
+use diagnostics::TuiDiagnostics;
+
 pub fn run_tui() -> Result<(), CliError> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         let daemon = tui_default_daemon_status()?;
@@ -425,13 +430,15 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         if state.exit_requested {
             break;
         }
+        let diagnostics_changed = state.diagnostics.refresh(&terminal.output);
         if refresh_tui_runtime_events(
             &mut runtime,
             &mut state,
             &session_store,
             daemon.as_ref(),
             &mut chat_projection,
-        )? {
+        )? || diagnostics_changed
+        {
             terminal.draw(&state)?;
         }
         if !event::poll(Duration::from_millis(250)).map_err(CliError::stdio)? {
@@ -467,7 +474,9 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
                 terminal.draw(&state)?;
             }
             CrosstermEvent::Paste(text) => {
-                state.insert_str(&text);
+                if !state.diagnostics.open {
+                    state.insert_str(&text);
+                }
                 terminal.draw(&state)?;
             }
             CrosstermEvent::Resize(_, _) => terminal.draw(&state)?,
@@ -725,27 +734,53 @@ fn combine_stable_chat_errors(original: CliError, projection: CliError) -> CliEr
 }
 
 struct TuiTerminalSession {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: Terminal<CrosstermBackend<fs::File>>,
+    output: terminal_io::TerminalOutput,
+    screen: Arc<TuiScreenRestore>,
+    _console: sinomo_runtime::observe::ObserveConsoleGuard,
+    _panic: panic_restore::PanicRestoreGuard,
 }
 
 impl TuiTerminalSession {
     fn enter() -> Result<Self, CliError> {
-        enable_raw_mode().map_err(CliError::stdio)?;
-        let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-            let _ = disable_raw_mode();
-            return Err(CliError::stdio(error));
-        }
-        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+        Self::enter_with_setup(|writer| Terminal::new(CrosstermBackend::new(writer)))
+    }
+
+    fn enter_with_setup(
+        create_terminal: impl FnOnce(fs::File) -> io::Result<Terminal<CrosstermBackend<fs::File>>>,
+    ) -> Result<Self, CliError> {
+        let console = sinomo_runtime::observe::suppress_observe_console();
+        // Collection is in memory. Existing filtering/file policy is unchanged.
+        let _ = sinomo_runtime::observe::init_observe_runtime(
+            sinomo_runtime::observe::ObserveRuntimeConfig::process("cli", None),
+        );
+        let (output, mut writer) = terminal_io::TerminalOutput::start().map_err(CliError::stdio)?;
+        let screen = Arc::new(TuiScreenRestore {
+            writer: writer.try_clone().map_err(CliError::stdio)?,
+            stdio: output.restorer(),
+            was_raw: crossterm::terminal::is_raw_mode_enabled().map_err(CliError::stdio)?,
+            restored: std::sync::atomic::AtomicBool::new(false),
+        });
+        let setup = (|| {
+            enable_raw_mode()?;
+            execute!(writer, EnterAlternateScreen, EnableMouseCapture)?;
+            create_terminal(writer)
+        })();
+        let terminal = match setup {
             Ok(terminal) => terminal,
             Err(error) => {
-                let _ = disable_raw_mode();
-                let mut stdout = io::stdout();
-                let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+                screen.restore();
                 return Err(CliError::stdio(error));
             }
         };
-        Ok(Self { terminal })
+        let panic = panic_restore::install(screen.clone());
+        Ok(Self {
+            terminal,
+            output,
+            screen,
+            _console: console,
+            _panic: panic,
+        })
     }
 
     fn draw(&mut self, state: &TuiState) -> Result<(), CliError> {
@@ -763,10 +798,42 @@ impl TuiTerminalSession {
 
 impl Drop for TuiTerminalSession {
     fn drop(&mut self) {
-        let _ = self.terminal.show_cursor();
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        self.screen.restore();
+    }
+}
+
+struct TuiScreenRestore {
+    writer: fs::File,
+    stdio: Arc<terminal_io::StdioRestore>,
+    was_raw: bool,
+    restored: std::sync::atomic::AtomicBool,
+}
+
+impl TuiScreenRestore {
+    fn restore(&self) {
+        if self
+            .restored
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut writer = &self.writer;
+        let _ = execute!(
+            writer,
+            crossterm::cursor::Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        if !self.was_raw {
+            let _ = disable_raw_mode();
+        }
+        self.stdio.restore();
+    }
+}
+
+impl panic_restore::PanicRestore for TuiScreenRestore {
+    fn restore_terminal(&self) {
+        self.restore();
     }
 }
 
@@ -1410,6 +1477,7 @@ struct TuiRuntimeActivity {
 
 #[derive(Clone, Debug)]
 struct TuiState {
+    diagnostics: TuiDiagnostics,
     session_id: String,
     workspaces: Vec<WorkspaceRef>,
     workspace_projection_version: u32,
@@ -1448,6 +1516,7 @@ impl TuiState {
             .and_then(|status| status.cluster.as_ref())
             .map(|cluster| format!("cluster {}", cluster.cluster_id));
         let mut state = Self {
+            diagnostics: TuiDiagnostics::default(),
             session_id: session.session_id.to_string(),
             workspaces: initial_tui_conversation_workspaces(),
             workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
@@ -1489,6 +1558,17 @@ impl TuiState {
 
     fn apply_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return TuiInputAction::None;
+        }
+
+        if key.code == KeyCode::F(5) {
+            self.diagnostics.toggle();
+            return TuiInputAction::None;
+        }
+        if self.diagnostics.open
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.diagnostics.key(key.code);
             return TuiInputAction::None;
         }
 
@@ -1606,6 +1686,14 @@ impl TuiState {
     }
 
     fn apply_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> TuiInputAction {
+        if self.diagnostics.open {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.diagnostics.key(KeyCode::PageUp),
+                MouseEventKind::ScrollDown => self.diagnostics.key(KeyCode::PageDown),
+                _ => {}
+            }
+            return TuiInputAction::None;
+        }
         let layout = tui_layout_areas(area, self);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -4263,6 +4351,18 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 fn render_tui(frame: &mut Frame<'_>, state: &TuiState) {
     let areas = tui_layout_areas(frame.area(), state);
     render_tui_menu_bar(frame, areas.menu, state);
+    if state.diagnostics.open {
+        state.diagnostics.render(frame, areas.main);
+        frame.render_widget(
+            Paragraph::new("Diagnostic output is separate from the conversation."),
+            areas.input,
+        );
+        frame.render_widget(
+            Paragraph::new("F5/Esc close   Up/Down/PgUp/PgDn scroll   Home newest"),
+            areas.status,
+        );
+        return;
+    }
     match state.view_mode {
         TuiViewMode::Sessions => render_tui_session_list(frame, areas.main, state),
         TuiViewMode::Settings => render_tui_settings(frame, areas.main, state),
@@ -4284,7 +4384,11 @@ fn render_tui_menu_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if area.is_empty() {
         return;
     }
-    let cluster_label = tui_cluster_status_label(state);
+    let cluster_label = format!(
+        "F5 Logs ({})  {}",
+        state.diagnostics.warnings(),
+        tui_cluster_status_label(state)
+    );
     // Navigation owns its space; cluster identity uses only the remainder.
     let tabs = tui_menu_tabs(&state.view_mode, area.width);
     let menu_width = tabs.iter().map(|tab| tab.label.len() as u16).sum::<u16>() + 3;
@@ -11350,3 +11454,6 @@ fn split_command_line(input: &str) -> Result<Vec<String>, CliError> {
 
     Ok(args)
 }
+
+#[cfg(all(test, unix))]
+mod terminal_output_tests;

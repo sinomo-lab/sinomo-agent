@@ -33,6 +33,26 @@ const TRACE_BUFFER_LIMIT: usize = 4096;
 const TRACE_SCOPE_DEPTH_LIMIT: usize = 32;
 const TRACE_MAX_CONFIGURED_RECORDS: usize = 32 * 1024;
 static LOG_COLLECTOR_INSTALLED: AtomicBool = AtomicBool::new(false);
+static CONSOLE_SUPPRESSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A terminal UI owns console output while this guard is alive. Structured
+/// collection, configured file sinks and log-level policy remain unchanged.
+#[must_use = "keep this guard alive while the TUI owns the terminal"]
+pub struct ObserveConsoleGuard {
+    _private: (),
+}
+
+/// Suppress only this process's formatted console sinks until all guards drop.
+pub fn suppress_observe_console() -> ObserveConsoleGuard {
+    CONSOLE_SUPPRESSION.fetch_add(1, Ordering::AcqRel);
+    ObserveConsoleGuard { _private: () }
+}
+
+impl Drop for ObserveConsoleGuard {
+    fn drop(&mut self) {
+        CONSOLE_SUPPRESSION.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 const CAPTURE_ID_MAX_BYTES: usize = 128;
 const CAPTURE_LEASE: Duration = Duration::from_secs(10 * 60);
 const OBSERVE_HISTOGRAM_BUCKET_UPPER_BOUNDS: &[f64] = &[
@@ -660,18 +680,18 @@ fn init_observe_runtime_inner(
             .with_target(true)
             .with_ansi(false)
             .with_writer(file)
-            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing)))
+            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing), false))
     });
     let stdout_layer = (!stderr).then(|| {
         fmt::layer()
             .with_target(true)
-            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing)))
+            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing), true))
     });
     let stderr_layer = stderr.then(|| {
         fmt::layer()
             .with_target(true)
             .with_writer(std::io::stderr)
-            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing)))
+            .with_filter(formatted_log_filter(Arc::clone(&live_log_writing), true))
     });
     tracing_subscriber::registry()
         .with(filter_layer)
@@ -695,14 +715,16 @@ fn init_observe_runtime_inner(
 
 fn formatted_log_filter<S: Subscriber>(
     live_log_writing: Arc<AtomicBool>,
+    console: bool,
 ) -> impl tracing_subscriber::layer::Filter<S> {
     // Dynamic interest is essential: a callsite disabled at startup must be
     // checked again after live writing changes. Admit span context without
     // formatting span lifecycle events. The global filter still applies.
     dynamic_filter_fn(move |metadata, _| {
         metadata.is_span()
-            || *metadata.level() <= tracing::Level::WARN
-            || live_log_writing.load(Ordering::Acquire)
+            || ((!console || CONSOLE_SUPPRESSION.load(Ordering::Acquire) == 0)
+                && (*metadata.level() <= tracing::Level::WARN
+                    || live_log_writing.load(Ordering::Acquire)))
     })
 }
 
@@ -3214,7 +3236,7 @@ mod tests {
                 trace_capacity: TRACE_BUFFER_LIMIT, logs: logs.clone(), traces: traces.clone(),
                 dropped_traces: Arc::new(AtomicU64::new(0)), capture: Arc::new(Mutex::new(None)),
             }).with(fmt::layer().with_ansi(false).with_writer(file)
-                .with_filter(formatted_log_filter(live.clone())));
+                .with_filter(formatted_log_filter(live.clone(), false)));
         let attempt = sinomo_dfs::DfsRepairAttemptRecord {
             intent_id: "original-unfinished-repair".into(),
             object_id: sinomo_dfs::DfsObjectId::generate(), version: sinomo_dfs::DfsVersion::generate(),
@@ -3283,7 +3305,7 @@ mod tests {
                 fmt::layer()
                     .with_ansi(false)
                     .with_writer(file)
-                    .with_filter(formatted_log_filter(Arc::clone(&live))),
+                    .with_filter(formatted_log_filter(Arc::clone(&live), false)),
             );
         // Reuse the SAME callsites across switches, proving that cached interest
         // cannot keep a routine event enabled/disabled after the mode changes.
@@ -3375,7 +3397,7 @@ mod tests {
                 fmt::layer()
                     .with_ansi(false)
                     .with_writer(Arc::new(std::fs::File::create(&path).unwrap()))
-                    .with_filter(formatted_log_filter(Arc::new(AtomicBool::new(true)))),
+                    .with_filter(formatted_log_filter(Arc::new(AtomicBool::new(true)), false)),
             );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("excluded routine event");
