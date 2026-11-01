@@ -7503,6 +7503,50 @@ fn cluster_member_removal_txns_bound_large_endpoint_prefix_cleanup() {
 }
 
 #[test]
+fn cluster_member_removal_retires_only_the_member_service_records() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_removal_services").expect("cluster");
+    let removed = NodeId::from_legacy_named("node_member_removal_services_gone").expect("node");
+    let retained = NodeId::from_legacy_named("node_member_removal_services_kept").expect("node");
+    let member =
+        ClusterMemberRecord::local_voter(cluster_id, removed.clone(), "removed", "pk-removed", now);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(cluster_member_key(&removed), &member, None)
+        .expect("member");
+    let removed_keys = ["dfs", "daemon"]
+        .map(|service| sinomo_service::cluster_service_instance_key(service, &removed));
+    let retained_key = sinomo_service::cluster_service_instance_key("dfs", &retained);
+    for (key, node) in removed_keys
+        .iter()
+        .map(|key| (key, &removed))
+        .chain([(&retained_key, &retained)])
+    {
+        let record = sinomo_service::ServiceInstanceRecord::new("dfs", node.clone());
+        store
+            .put_serde(key.clone(), &record, None)
+            .expect("service record");
+    }
+
+    for txn in
+        cluster_member_removal_txns_from_store(&store, std::slice::from_ref(&member)).expect("txns")
+    {
+        store
+            .apply_command(KvCommand::Txn(txn))
+            .expect("apply removal txn");
+    }
+
+    for key in &removed_keys {
+        assert!(store.get(key).is_none(), "{key} should be removed");
+    }
+    assert!(
+        store.get(&retained_key).is_some(),
+        "another member's service record must remain"
+    );
+}
+
+#[test]
 fn cleanup_legacy_shadow_daemon_members_removes_only_shadow_only_records() {
     struct MemoryMutationHost {
         store: InProcessKvStore,

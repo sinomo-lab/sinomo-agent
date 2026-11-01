@@ -353,40 +353,10 @@ pub async fn publish_local_service_instances(
     registry_version: u64,
     now: OffsetDateTime,
 ) -> Result<Option<ClusterKvTxnCompactCommitResult>, ServiceError> {
-    publish_local_service_instances_with_authoritative_recheck(
-        cluster,
-        registry,
-        node_id,
-        registry_version,
-        now,
-        false,
-    )
-    .await
-}
-
-pub async fn publish_local_service_instances_with_authoritative_recheck(
-    cluster: &dyn ClusterAccess,
-    registry: &ServiceRegistry,
-    node_id: &NodeId,
-    registry_version: u64,
-    now: OffsetDateTime,
-    authoritative_recheck: bool,
-) -> Result<Option<ClusterKvTxnCompactCommitResult>, ServiceError> {
     let records = service_instance_records_from_registry(registry, node_id, registry_version, now);
-    // During process replacement a retiring publisher can overwrite or delete
-    // this node's records after our local projection was sampled. Recheck the
-    // authority during that bounded overlap window, then compare semantics as
-    // usual. Rewriting every unchanged record instead creates a startup storm.
-    let existing = if authoritative_recheck {
-        cluster
-            .kv_range_prefix_authoritative_async(CLUSTER_SERVICES_KV_PREFIX.to_string())
-            .await?
-            .value
-    } else {
-        cluster
-            .kv_range_prefix_local(CLUSTER_SERVICES_KV_PREFIX)?
-            .value
-    };
+    let existing = cluster
+        .kv_range_prefix_local(CLUSTER_SERVICES_KV_PREFIX)?
+        .value;
     let mut existing_by_key: std::collections::BTreeMap<String, KvEntry> = existing
         .into_iter()
         .filter(|entry| service_instance_key_belongs_to_node(&entry.key, node_id))
@@ -421,7 +391,8 @@ pub async fn publish_local_service_instances_with_authoritative_recheck(
         .map(Some)
 }
 
-fn service_instance_key_belongs_to_node(key: &str, node_id: &NodeId) -> bool {
+/// Whether `key` is one of `node_id`'s service instance records.
+pub fn service_instance_key_belongs_to_node(key: &str, node_id: &NodeId) -> bool {
     key.strip_prefix(CLUSTER_SERVICES_KV_PREFIX)
         .and_then(|relative| relative.rsplit_once('/'))
         .is_some_and(|(service, owner)| !service.is_empty() && owner == node_id.as_str())
@@ -578,8 +549,6 @@ mod tests {
     struct RecordingClusterAccess {
         entries: Mutex<BTreeMap<String, KvEntry>>,
         commits: Mutex<Vec<KvTxnRequest>>,
-        authoritative_entries: Mutex<Option<BTreeMap<String, KvEntry>>>,
-        authoritative_reads: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordingClusterAccess {
@@ -661,44 +630,6 @@ mod tests {
                         term: 1,
                         commit_index: 1,
                         revision: read.revision,
-                        basis: KvAuthorityBasis::CurrentTermQuorum {
-                            voter_acks: 1,
-                            required_quorum: 1,
-                        },
-                    },
-                })
-            })
-        }
-
-        fn kv_range_prefix_authoritative_async<'a>(
-            &'a self,
-            prefix: String,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<KvAuthoritativeRead<Vec<KvEntry>>, ServiceError>,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move {
-                self.authoritative_reads
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let entries = self
-                    .authoritative_entries
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(|| self.entries.lock().unwrap().clone());
-                Ok(KvAuthoritativeRead {
-                    value: entries
-                        .into_values()
-                        .filter(|entry| entry.key.starts_with(&prefix))
-                        .collect(),
-                    authority: KvAuthorityProof {
-                        term: 1,
-                        commit_index: 1,
-                        revision: KvRevision(1),
                         basis: KvAuthorityBasis::CurrentTermQuorum {
                             voter_acks: 1,
                             required_quorum: 1,
@@ -969,60 +900,6 @@ mod tests {
             cluster.committed_requests().is_empty(),
             "an unchanged applied source-owned record must not produce a Raft transaction"
         );
-    }
-
-    #[tokio::test]
-    async fn startup_recheck_compares_authority_without_rewriting_unchanged_records() {
-        let local = node("node_publish_recheck");
-        let registry = published_registry(&["/dfs/read"]);
-        let cluster =
-            RecordingClusterAccess::with_instances([published_instance(&local, ["/dfs/read"])]);
-        for _ in 0..3 {
-            assert!(
-                publish_local_service_instances_with_authoritative_recheck(
-                    &cluster,
-                    &registry,
-                    &local,
-                    2,
-                    OffsetDateTime::UNIX_EPOCH,
-                    true,
-                )
-                .await
-                .unwrap()
-                .is_none()
-            );
-        }
-        assert!(cluster.committed_requests().is_empty());
-        assert_eq!(
-            cluster
-                .authoritative_reads
-                .load(std::sync::atomic::Ordering::SeqCst),
-            3
-        );
-
-        // The applied local view still says the record is current after the
-        // retiring process removed it on the authority. The next overlap check
-        // must restore it despite the equal local view.
-        *cluster.authoritative_entries.lock().unwrap() = Some(BTreeMap::new());
-        assert!(
-            publish_local_service_instances_with_authoritative_recheck(
-                &cluster,
-                &registry,
-                &local,
-                2,
-                OffsetDateTime::UNIX_EPOCH,
-                true,
-            )
-            .await
-            .unwrap()
-            .is_some()
-        );
-        let commits = cluster.committed_requests();
-        assert_eq!(commits.len(), 1);
-        let [KvOp::Put { key, .. }] = commits[0].txn.success.as_slice() else {
-            panic!("authoritative deletion must restore the source-owned record");
-        };
-        assert_eq!(key, &cluster_service_instance_key("dfs", &local));
     }
 
     #[tokio::test]
