@@ -31,6 +31,12 @@ impl NativeCliFixture {
         let name = format!("cli-native-{}", sinomo_runtime::core::Id::generate());
         let (native, node) = DfsTestRuntime::start_single_node_in_data_dir(&name, data.clone())
             .expect("initialize and mount actual native CLI fixture");
+        Self::from_native(native, node)
+    }
+
+    /// Adapt another genuine mounted native owner to the SAME CLI test boundary.
+    pub(crate) fn from_native(native: DfsTestRuntime, node: NodeId) -> Self {
+        let data = native.data_dir(&node);
         let path = std::fs::canonicalize(data.root()).unwrap();
         let mounted = sinomo_runtime::vfs::native_test_support::NativeMountedFixture::register(
             &native, &node,
@@ -50,6 +56,14 @@ impl NativeCliFixture {
             native: Some(native),
             mounted: Some(mounted),
         }
+    }
+
+    /// Borrow the actual fixture lifecycle owner for setup/inspection only.
+    /// Callers return owned futures/handles and release this mutex BEFORE RPC.
+    pub(crate) fn with_native<R>(&self, work: impl FnOnce(&mut DfsTestRuntime, &NodeId) -> R) -> R {
+        let node = owners().lock().unwrap().get(&self.path).unwrap().0.clone();
+        let mut native = self.native.as_ref().unwrap().lock().unwrap();
+        work(&mut native, &node)
     }
 }
 

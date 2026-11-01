@@ -7,9 +7,10 @@ use sinomo_core::service::{
     ServiceRegistryBuilder, ServiceRoute,
 };
 use sinomo_dfs::{
-    DfsBrowserBackend, DfsBrowserServiceHost, authorize_dfs_core_component_access,
-    dfs_browser_component_host, dfs_core_component_requirement, normalize_sifs_browser_path,
-    run_blocking_browser_task,
+    DfsBrowserBackend, DfsBrowserMutationAttempt, DfsBrowserServiceHost,
+    authorize_dfs_core_component_access, dfs_browser_component_host,
+    dfs_core_component_requirement, normalize_sifs_browser_path, run_blocking_browser_task,
+    run_configured_browser_task,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -60,21 +61,36 @@ impl FeatureBackend {
                 .map_err(dfs_browser_service_error)
         })
     }
-    fn restore_file_history(
+    fn try_restore_file_history(
         &self,
         mut request: DfsFileHistoryRestoreRequest,
-    ) -> Result<DfsFileHistoryRestoreResponse, ServiceError> {
+    ) -> Result<
+        DfsBrowserMutationAttempt<DfsFileHistoryRestoreRequest, DfsFileHistoryRestoreResponse>,
+        ServiceError,
+    > {
         request.destination_path = normalize_sifs_browser_path(&request.destination_path)?;
-        let result = self.core.with_mutation_service(|service| {
-            let options = self
-                .core
-                .write_options_for_path(service, &request.destination_path)?;
-            service
-                .history()
-                .restore_file_history(request, options)
-                .map_err(dfs_browser_service_error)
-        });
-        self.host.notify_maintenance();
+        let path = request.destination_path.clone();
+        let result = self.core.try_with_configured_mutation_service(
+            &[],
+            request,
+            |service, configuration, request| {
+                let options = self.core.write_options_for_path_with_configuration(
+                    service,
+                    &path,
+                    configuration,
+                )?;
+                service
+                    .history()
+                    .restore_file_history(request, options)
+                    .map_err(dfs_browser_service_error)
+            },
+        );
+        if !matches!(
+            &result,
+            Ok(DfsBrowserMutationAttempt::ConfigurationPending(_))
+        ) {
+            self.host.notify_maintenance();
+        }
         result
     }
     fn file_history_policy(
@@ -195,36 +211,33 @@ impl Service for HostedFeatureService {
                 DAEMON_DFS_BROWSER_FILE_HISTORY_RESTORE_ROUTE => {
                     let payload: DfsFileHistoryRestoreRequest =
                         ctx.decode_request_body(&request).await?;
-                    // Join the core owner's real configuration rebuild before
-                    // borrowing its browser/FIFO or mutation service. Preserve
-                    // the original restore identity and expectations; this is
-                    // one pre-execution wait, never a retry of a possible effect.
-                    tokio::time::timeout(
-                        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-                        backend_host.ensure_write_configuration_ready(&data_dir, &runtime),
-                    )
-                    .await
-                    .map_err(|_| {
-                        dfs_browser_service_error(
-                            "DFS write configuration readiness deadline elapsed",
-                        )
-                    })??;
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_browser_task(
+                    let attempt_host = Arc::clone(&backend_host);
+                    let result = run_configured_browser_task(
                         Arc::clone(&data_dir),
                         route.clone(),
                         "DFS history restore",
-                        move || {
+                        runtime.clone(),
+                        Arc::clone(&backend_host),
+                        payload,
+                        move |payload| {
                             let backend = FeatureBackend::for_data_dir(
-                                backend_data_dir,
+                                Arc::clone(&backend_data_dir),
                                 &backend_runtime,
-                                Arc::clone(&backend_host),
+                                Arc::clone(&attempt_host),
                             )?;
-                            Ok((
-                                backend.restore_file_history(payload)?,
-                                backend.event_origin_node_id()?,
-                            ))
+                            match backend.try_restore_file_history(payload)? {
+                                DfsBrowserMutationAttempt::Complete(response) => {
+                                    Ok(DfsBrowserMutationAttempt::Complete((
+                                        response,
+                                        backend.event_origin_node_id()?,
+                                    )))
+                                }
+                                DfsBrowserMutationAttempt::ConfigurationPending(original) => {
+                                    Ok(DfsBrowserMutationAttempt::ConfigurationPending(original))
+                                }
+                            }
                         },
                     )
                     .await?;
@@ -457,3 +470,7 @@ pub fn register_storage_paths(
     let _ = layout; // Retained revisions and pins use the core metadata authority.
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "service/configuration_tests.rs"]
+mod configuration_tests;

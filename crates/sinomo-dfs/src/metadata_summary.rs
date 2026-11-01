@@ -73,6 +73,7 @@ pub(crate) fn repair_root_for_intent(
     object: &DfsObjectMetadata,
     intent: &DfsWriteIntentRecord,
     version: Option<&DfsObjectVersionRecord>,
+    current_version: Option<&DfsObjectVersionRecord>,
     pinned: bool,
     high_water: &BTreeMap<String, u64>,
 ) -> Option<RepairRoot> {
@@ -83,20 +84,51 @@ pub(crate) fn repair_root_for_intent(
     {
         return None;
     }
-    if intent.publication.is_current()
-        && object.kind != crate::DfsObjectKind::Tombstone
-        && (intent.target_version == object.version
-            || (intent.content_hash.is_some() && intent.content_hash == object.content_hash))
-    {
-        return Some(RepairRoot::Permanent);
+    if intent.publication.is_current() {
+        let matched = crate::content_durability::current_repair_content_matches(
+            object,
+            intent,
+            version,
+            current_version,
+        );
+        let superseded = crate::content_durability::current_repair_content_is_superseded(
+            object,
+            intent,
+            version,
+            current_version,
+        );
+        // Keep the validated full legacy owner's recorded N contract when a
+        // missing lineage row cannot establish either role. Runtime execution
+        // reports unavailable until it can prove its actual current root.
+        return (matched || !superseded).then_some(RepairRoot::Permanent);
     }
-    let version = version.filter(|version| {
-        version.file_system_id == object.file_system_id
-            && version.object_id == object.object_id
-            && version.version == intent.target_version
-            && version.content_hash.is_some()
-            && version.content_hash == intent.content_hash
-    })?;
+    let Some(version) = version else {
+        return Some(RepairRoot::Permanent);
+    };
+    if !crate::content_durability::retained_repair_content_matches(object, intent, version)
+        && version.content_durability.is_some()
+    {
+        return None;
+    }
+    retained_version_repair_root(object, version, pinned, high_water)
+}
+
+/// Captured Version DATA already owns the named durability goal, even between
+/// a head change and enrollment of its actual retained maintenance intent.
+/// This projection never creates or impersonates such an intent.
+pub(crate) fn retained_version_repair_root(
+    object: &DfsObjectMetadata,
+    version: &DfsObjectVersionRecord,
+    pinned: bool,
+    high_water: &BTreeMap<String, u64>,
+) -> Option<RepairRoot> {
+    if object.tombstone_provenance.is_some()
+        || version.file_system_id != object.file_system_id
+        || version.object_id != object.object_id
+        || version.content_hash.is_none()
+    {
+        return None;
+    }
     if !version.has_retention_grant() {
         return None;
     }
@@ -186,51 +218,50 @@ where
     }
 
     let now = crate::dfs_now_unix_nanos();
-    let mut history_inputs = BTreeMap::new();
     let mut pending_repair_count = 0usize;
-    for intent in tables.intents.values() {
-        if intent.status != DfsWriteIntentStatus::Committed {
-            continue;
-        }
-        if !file_system_in_scope(&intent.file_system_id) {
-            continue;
-        }
-        let Some(object) = tables
-            .objects
-            .get(&intent.object_id)
-            .or_else(|| tables.compacted_tombstones.get(&intent.object_id))
-        else {
-            continue;
-        };
+    for object in tables.objects.values().chain(
+        tables
+            .compacted_tombstones
+            .values()
+            .filter(|object| !tables.objects.contains_key(&object.object_id)),
+    ) {
         if !file_system_in_scope(&object.file_system_id)
             || !tables.file_systems.contains_key(&object.file_system_id)
             || !object_is_countable(object)?
         {
             continue;
         }
-        let (high, pins) = history_inputs
-            .entry(object.object_id.clone())
-            .or_insert_with(|| object_history_root_inputs(tables, &object.object_id));
-        if !repair_root_for_intent(
-            object,
-            intent,
-            tables
-                .versions
-                .get(&(object.object_id.clone(), intent.target_version.clone())),
-            pins.contains(&intent.target_version),
-            high,
-        )
-        .is_some_and(|root| root.is_live(now))
-        {
-            continue;
-        }
-        let receipts = receipts_for_object_version_from_tables(
-            tables,
-            &object.object_id,
-            &intent.target_version,
+        let versions = tables
+            .versions
+            .range((
+                Included((object.object_id.clone(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((id, _), _)| id == &object.object_id)
+            .map(|(_, record)| record);
+        let (_, pins) = object_history_root_inputs(tables, &object.object_id);
+        let intents = tables
+            .intents
+            .range((
+                Included((object.object_id.clone(), String::new())),
+                Unbounded,
+            ))
+            .take_while(|((id, _), _)| id == &object.object_id)
+            .map(|(_, record)| record);
+        let receipts = tables
+            .receipts
+            .range((
+                Included((object.object_id.clone(), id_lower_bound(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((id, _, _), _)| id == &object.object_id)
+            .map(|(_, record)| record);
+        pending_repair_count = pending_repair_count.saturating_add(
+            repair_demands_for_object(object, intents, receipts, versions, &pins)
+                .values()
+                .filter(|demand| demand.root.is_live(now))
+                .count(),
         );
-        pending_repair_count =
-            pending_repair_count.saturating_add(missing_replica_count(intent, &receipts));
     }
 
     Ok(DfsMetadataSummary {
@@ -294,22 +325,174 @@ where
     })
 }
 
-fn receipts_for_object_version_from_tables(
-    tables: &DfsMetadataTables,
-    object_id: &DfsObjectId,
-    version: &DfsVersion,
-) -> Vec<DfsReplicaReceiptRecord> {
-    tables
-        .receipts
-        .range((
-            Included((object_id.clone(), version.clone(), id_lower_bound())),
-            Unbounded,
-        ))
-        .take_while(|((record_object_id, record_version, _), _)| {
-            record_object_id == object_id && record_version == version
+/// A missing replica subject is unique independently of how many actual
+/// maintenance records refer to it. The enclosing call fixes filesystem/object.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct RepairDemandKey {
+    pub(crate) version: DfsVersion,
+    pub(crate) content_hash: String,
+    pub(crate) replica_node_id: sinomo_core::node::NodeId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RepairDemand {
+    pub(crate) root: RepairRoot,
+    /// None denotes real Version demand without an eligible full owner. It is
+    /// never exposed as a fabricated durable intent identity.
+    pub(crate) owner_intent_id: Option<String>,
+    owner_root: Option<RepairRoot>,
+}
+
+fn repair_root_covers(owner: RepairRoot, demand: RepairRoot) -> bool {
+    match (owner, demand) {
+        (RepairRoot::Permanent, _) => true,
+        (RepairRoot::Until(_), RepairRoot::Permanent) => false,
+        (RepairRoot::Until(owner), RepairRoot::Until(demand)) => owner >= demand,
+    }
+}
+
+fn merge_repair_root(left: RepairRoot, right: RepairRoot) -> RepairRoot {
+    match (left, right) {
+        (RepairRoot::Permanent, _) | (_, RepairRoot::Permanent) => RepairRoot::Permanent,
+        (RepairRoot::Until(left), RepairRoot::Until(right)) => RepairRoot::Until(left.max(right)),
+    }
+}
+
+/// One metadata cut supplies every input. This only projects missing named N
+/// demand; existing W/source, current-primary, grant, and permit checks remain
+/// mandatory before any actual owner enrollment or content transfer.
+pub(crate) fn repair_demands_for_object<'a>(
+    object: &DfsObjectMetadata,
+    intents: impl IntoIterator<Item = &'a DfsWriteIntentRecord>,
+    receipts: impl IntoIterator<Item = &'a DfsReplicaReceiptRecord>,
+    versions: impl IntoIterator<Item = &'a DfsObjectVersionRecord>,
+    pinned_versions: &BTreeSet<DfsVersion>,
+) -> BTreeMap<RepairDemandKey, RepairDemand> {
+    let versions = versions
+        .into_iter()
+        .map(|version| (version.version.clone(), version))
+        .collect::<BTreeMap<_, _>>();
+    let high = retention_orders_for_versions(versions.values().copied());
+    let observed_at = crate::dfs_now_unix_nanos();
+    let receipts = receipts
+        .into_iter()
+        .filter(|receipt| {
+            receipt.receipt.file_system_id == object.file_system_id
+                && receipt.receipt.object_id == object.object_id
         })
-        .map(|(_, receipt)| receipt.clone())
-        .collect()
+        .filter_map(|receipt| {
+            Some(RepairDemandKey {
+                version: receipt.receipt.committed_version.clone(),
+                content_hash: receipt.content_hash.clone()?,
+                replica_node_id: receipt.replica_node_id.clone(),
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let current = versions.get(&object.version).copied();
+    let mut demands = BTreeMap::<RepairDemandKey, RepairDemand>::new();
+    let mut add_plan = |version: &DfsVersion,
+                        hash: &str,
+                        nodes: &[sinomo_core::node::NodeId],
+                        root: RepairRoot,
+                        owner: Option<&str>| {
+        for node in nodes {
+            let key = RepairDemandKey {
+                version: version.clone(),
+                content_hash: hash.to_owned(),
+                replica_node_id: node.clone(),
+            };
+            if receipts.contains(&key) {
+                continue;
+            }
+            let entry = demands.entry(key).or_insert_with(|| RepairDemand {
+                root,
+                owner_intent_id: None,
+                owner_root: None,
+            });
+            entry.root = merge_repair_root(entry.root, root);
+            // A historical expired owner cannot win lexically over a live
+            // Current root. Prefer the real owner with the strongest own root;
+            // ties are deterministic. The merged lifetime is checked below.
+            if let Some(owner) = owner.filter(|_| root.is_live(observed_at)) {
+                let replace = entry.owner_root.is_none_or(|old_root| {
+                    !repair_root_covers(old_root, root)
+                        || (repair_root_covers(root, old_root)
+                            && entry
+                                .owner_intent_id
+                                .as_deref()
+                                .is_none_or(|old| owner < old))
+                });
+                if replace {
+                    entry.owner_intent_id = Some(owner.to_owned());
+                    entry.owner_root = Some(root);
+                }
+            }
+        }
+    };
+    for intent in intents {
+        let target = versions.get(&intent.target_version).copied();
+        let Some(root) = repair_root_for_intent(
+            object,
+            intent,
+            target,
+            current,
+            pinned_versions.contains(&intent.target_version),
+            &high,
+        ) else {
+            continue;
+        };
+        let Some(hash) = intent.content_hash.as_deref() else {
+            continue;
+        };
+        add_plan(
+            &intent.target_version,
+            hash,
+            &intent.desired_replica_node_ids,
+            root,
+            Some(&intent.intent_id),
+        );
+    }
+    for version in versions.values() {
+        let Some(root) = retained_version_repair_root(
+            object,
+            version,
+            pinned_versions.contains(&version.version),
+            &high,
+        ) else {
+            continue;
+        };
+        let Some(plan) = version.content_durability.as_deref() else {
+            continue;
+        };
+        if crate::distributed::validate_replication_plan(
+            &plan.desired_replica_node_ids,
+            &plan.policy,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let Some(hash) = version.content_hash.as_deref() else {
+            continue;
+        };
+        add_plan(
+            &version.version,
+            hash,
+            &plan.desired_replica_node_ids,
+            root,
+            None,
+        );
+    }
+    for demand in demands.values_mut() {
+        if !demand
+            .owner_root
+            .is_some_and(|owner| repair_root_covers(owner, demand.root))
+        {
+            demand.owner_intent_id = None;
+            demand.owner_root = None;
+        }
+    }
+    demands
 }
 
 pub(crate) fn count_pending_repairs_for_object(
@@ -319,51 +502,17 @@ pub(crate) fn count_pending_repairs_for_object(
     versions: &BTreeMap<DfsVersion, DfsObjectVersionRecord>,
     pinned_versions: &BTreeSet<DfsVersion>,
 ) -> usize {
-    let high = retention_orders_for_versions(versions.values());
     let now = crate::dfs_now_unix_nanos();
-    let mut count = 0usize;
-    for intent in intents {
-        if !repair_root_for_intent(
-            object,
-            intent,
-            versions.get(&intent.target_version),
-            pinned_versions.contains(&intent.target_version),
-            &high,
-        )
-        .is_some_and(|root| root.is_live(now))
-        {
-            continue;
-        }
-        count = count.saturating_add(missing_replica_count(
-            intent,
-            receipts_by_version
-                .get(&intent.target_version)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-        ));
-    }
-    count
-}
-
-fn missing_replica_count(
-    intent: &DfsWriteIntentRecord,
-    receipts: &[DfsReplicaReceiptRecord],
-) -> usize {
-    let nodes = receipts
-        .iter()
-        .filter(|receipt| {
-            intent
-                .content_hash
-                .as_ref()
-                .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
-        })
-        .map(|receipt| &receipt.replica_node_id)
-        .collect::<BTreeSet<_>>();
-    intent
-        .desired_replica_node_ids
-        .iter()
-        .filter(|node| !nodes.contains(node))
-        .count()
+    repair_demands_for_object(
+        object,
+        intents,
+        receipts_by_version.values().flatten(),
+        versions.values(),
+        pinned_versions,
+    )
+    .values()
+    .filter(|demand| demand.root.is_live(now))
+    .count()
 }
 
 pub(crate) fn accumulate_metadata_summary_detail_counts(
@@ -559,6 +708,13 @@ mod tests {
         let captured_at = crate::dfs_now_unix_nanos();
         let deadline = captured_at + 60_000_000_000;
         let mut captured = version_record(&historical);
+        captured.content_durability = Some(crate::content_durability::from_intent(
+            &crate::intent::distributed_intent_from_record(&intent(
+                &historical,
+                "history-status-source",
+                DfsWriteIntentStatus::Committed,
+            )),
+        ));
         captured.retention.insert(
             "vendor.status".into(),
             crate::DfsRevisionRetentionState {
@@ -590,13 +746,6 @@ mod tests {
                 path_record: path_record_for_object(&current),
             },
             DfsMetadataTableOp::PutVersion { version: captured },
-            DfsMetadataTableOp::PutIntent {
-                intent: intent(
-                    &historical,
-                    "history-status",
-                    DfsWriteIntentStatus::Committed,
-                ),
-            },
             DfsMetadataTableOp::PutReceipt {
                 receipt: receipt(&historical, node("node_owner")),
             },
@@ -604,6 +753,9 @@ mod tests {
             tables.apply(op);
             assert_status_projection_matches_scan(&tables, "age-retained repair setup");
         }
+        // Projection DATA only: the captured version owns N demand before a
+        // separate native executor is enrolled. No intent is synthesized here.
+        assert!(tables.intents.is_empty());
         assert_eq!(
             tables
                 .metadata_status_summary_at(deadline - 1)
@@ -679,6 +831,55 @@ mod tests {
             0
         );
         assert_status_projection_matches_scan(&tables, "retained repair completion");
+    }
+
+    #[test]
+    fn full_legacy_named_demand_survives_missing_versions_and_durability() {
+        // Table DATA only. A valid full legacy W1/N2 contract with one exact
+        // receipt cannot disappear because optional lineage rows are absent.
+        let original = object();
+        let mut current = original.clone();
+        current.version = version("legacy-metadata-successor");
+        let mut owner = intent(
+            &original,
+            "legacy-full-owner",
+            DfsWriteIntentStatus::Committed,
+        );
+        owner.policy = crate::DfsReplicationPolicy::new(1, 2).unwrap();
+        let mut tables = DfsMetadataTables::default();
+        for operation in [
+            DfsMetadataTableOp::PutFileSystem {
+                file_system: file_system(),
+            },
+            DfsMetadataTableOp::PutObject {
+                object: current.clone(),
+            },
+            DfsMetadataTableOp::PutIntent {
+                intent: owner.clone(),
+            },
+            DfsMetadataTableOp::PutReceipt {
+                receipt: receipt(&original, node("node_owner")),
+            },
+        ] {
+            tables.apply(operation);
+        }
+        assert!(!crate::content_durability::current_repair_content_matches(
+            &current, &owner, None, None,
+        ));
+        assert!(
+            !crate::content_durability::current_repair_content_is_superseded(
+                &current, &owner, None, None,
+            )
+        );
+        assert_eq!(tables.metadata_status_summary().pending_repair_count, 1);
+        assert_status_projection_matches_scan(&tables, "missing legacy lineage rows");
+        for object in [&original, &current] {
+            let version = version_record(object);
+            assert!(version.content_durability.is_none());
+            tables.apply(DfsMetadataTableOp::PutVersion { version });
+            assert_eq!(tables.metadata_status_summary().pending_repair_count, 1);
+            assert_status_projection_matches_scan(&tables, "legacy version without durability");
+        }
     }
 
     #[test]

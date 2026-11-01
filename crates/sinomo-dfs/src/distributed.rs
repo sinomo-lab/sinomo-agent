@@ -294,7 +294,7 @@ pub enum DfsReplicaReceiptState {
 pub struct DistributedWriteIntent {
     #[serde(
         default,
-        skip_serializing_if = "crate::DfsWritePublication::is_current"
+        skip_serializing_if = "crate::DfsWritePublication::is_default_current"
     )]
     pub publication: crate::DfsWritePublication,
     pub intent_id: String,
@@ -1014,6 +1014,20 @@ impl DistributedEventualCoordinator {
             .collect()
     }
 
+    pub(crate) fn trace_repair_receipt_projection_data(&self, intent_id: &str, phase: &str) {
+        if !tracing::enabled!(target: "sinomo.dfs.perf", tracing::Level::TRACE) {
+            return;
+        }
+        tracing::trace!(target: "sinomo.dfs.perf",
+            stage = "dfs.repair.receipt_projection.coordinator", intent_id, phase,
+            actual_intent = ?self.intents.get(intent_id),
+            actual_receipts = ?self.receipts.get(intent_id),
+            actual_unsettled_location_targets = ?self.unsettled_location_targets.get(intent_id),
+            actual_inactive = self.inactive_repair_intent_ids.contains(intent_id),
+            actual_jobs = ?self.repair_jobs.iter().filter(|job| job.intent_id == intent_id).collect::<Vec<_>>(),
+            "borrowed current coordinator DATA; no projection mutation");
+    }
+
     pub fn durable_receipt_count(&self, intent_id: &str) -> usize {
         self.receipts
             .get(intent_id)
@@ -1086,7 +1100,8 @@ impl DistributedEventualCoordinator {
                 })?;
 
         Ok(matches!(intent.state, DfsWriteIntentState::Committed)
-            || self.durable_receipt_count(intent_id) >= intent.policy.min_commit_replicas)
+            || (matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
+                && self.durable_receipt_count(intent_id) >= intent.policy.min_commit_replicas))
     }
 
     pub fn record_durable_receipt(
@@ -1110,6 +1125,7 @@ impl DistributedEventualCoordinator {
         if matches!(
             intent.state,
             DfsWriteIntentState::Rejected | DfsWriteIntentState::Aborted
+                | DfsWriteIntentState::PreconditionFailed { .. }
         ) {
             return Err(DfsDistributedError::IntentClosed {
                 intent_id: intent_id.to_string(),
@@ -1341,6 +1357,27 @@ impl DistributedEventualCoordinator {
         Ok(intent)
     }
 
+    pub(crate) fn fail_intent_precondition(
+        &mut self,
+        intent_id: &str,
+        failure: crate::DfsWritePreconditionFailure,
+    ) -> Result<DistributedWriteIntent, DfsDistributedError> {
+        let mut intent = self.intents.get(intent_id).cloned().ok_or_else(|| {
+            DfsDistributedError::UnknownIntent { intent_id: intent_id.to_string() }
+        })?;
+        if intent.state != DfsWriteIntentState::AwaitingReceipts
+            || intent.publication.current_precondition().is_none()
+        {
+            return Err(DfsDistributedError::IntentClosed {
+                intent_id: intent_id.to_string(), state: intent.state,
+            });
+        }
+        intent.state = DfsWriteIntentState::PreconditionFailed { failure };
+        self.replace_indexed_intent(intent.clone());
+        self.repair_jobs.retain(|job| job.intent_id != intent_id);
+        Ok(intent)
+    }
+
     pub fn downgrade_intent_policy(
         &mut self,
         intent_id: &str,
@@ -1430,6 +1467,11 @@ impl DistributedEventualCoordinator {
             return Ok(());
         }
 
+        if matches!(intent.state, DfsWriteIntentState::PreconditionFailed { .. }) {
+            return Err(DfsDistributedError::IntentClosed {
+                intent_id: intent_id.to_string(), state: intent.state,
+            });
+        }
         intent.state = DfsWriteIntentState::Committed;
         self.replace_indexed_intent(intent.clone());
         if published && intent.publication.is_current() {

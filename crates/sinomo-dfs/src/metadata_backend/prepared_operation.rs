@@ -573,6 +573,7 @@ impl LocalSobjMetadataBackend {
         validate_prepared_operation_content(&self.tables, &record)?;
         if record.status == DfsPreparedOperationStatus::Prepared {
             let view = &record;
+            validate_conditional_write_publication(&self.tables, &record)?;
             namespace_prepare::validate_prepared_namespace_commit_state(&self.tables, &view)?;
             namespace_prepare::validate_namespace_prepare_expectations(&self.tables, &view)?;
             validate_namespace_transaction_preconditions(&self.tables, &view.transaction)?;
@@ -893,6 +894,7 @@ pub(crate) fn validate_preparation_against_tables(
     }
     let validated = (|| {
         let shape = namespace_prepare::validate_prepared_operation_shape(tables, shard_id, &view)?;
+        validate_conditional_write_publication(tables, record)?;
         namespace_prepare::validate_namespace_prepare_expectations(tables, &view)?;
         namespace_prepare::validate_namespace_prepare_does_not_overlap(
             tables,
@@ -913,6 +915,7 @@ pub(crate) fn validate_prepared_operation_commit(
 ) -> Result<()> {
     validate_prepared_operation_content(tables, record)?;
     let view = record;
+    validate_conditional_write_publication(tables, record)?;
     namespace_prepare::validate_prepared_namespace_commit_state(tables, &view)?;
     namespace_prepare::validate_namespace_prepare_expectations(tables, &view)?;
     validate_namespace_transaction_preconditions(tables, &view.transaction)?;
@@ -960,7 +963,8 @@ pub(crate) fn validate_prepared_operation_content(
                 )
             })?;
         match &terminal.publication {
-            crate::DfsWritePublication::Current => {
+            crate::DfsWritePublication::Current
+            | crate::DfsWritePublication::ConditionalCurrent { .. } => {
                 if !payload.expected_object_versions.iter().any(|expectation| {
                     expectation.object_id == prepared.object_id
                         && expectation.expected_version == prepared.base_version
@@ -973,6 +977,17 @@ pub(crate) fn validate_prepared_operation_content(
                 {
                     return Err(MetadataBackendError::Serde(
                         "current content publication does not seal its original head and visible effects".into(),
+                    ));
+                }
+                if let Some(condition) = terminal.publication.current_precondition()
+                    && !crate::write_precondition::guard_is_bound(
+                        condition,
+                        &payload.expected_object_versions,
+                        &payload.expected_path_occupants,
+                    )
+                {
+                    return Err(MetadataBackendError::Serde(
+                        "conditional content publication does not seal its original predicate".into(),
                     ));
                 }
             }
@@ -1061,6 +1076,275 @@ pub(crate) fn validate_prepared_operation_content(
         ));
     }
     Ok(())
+}
+
+/// The native tables decide the first visible effect. Compare the immutable
+/// caller predicate before the generic read-set check so a real late mismatch
+/// retains its typed cause. Already committed exact replies return before this
+/// boundary; metadata-only receipt/repair updates have no sealed content pair.
+fn validate_conditional_write_publication(
+    tables: &DfsMetadataTables,
+    record: &DfsPreparedOperationRecord,
+) -> Result<()> {
+    if let Some(prepared) = &record.prepared_intent
+        && let Some(condition) = prepared.publication.current_precondition()
+    {
+        crate::file_history::validate_intent_publication(prepared)?;
+        if !crate::write_precondition::guard_is_bound(
+            condition,
+            &record.expected_object_versions,
+            &record.expected_path_occupants,
+        ) {
+            return Err(MetadataBackendError::Serde(
+                "conditional content publication omits its original native comparisons".into(),
+            ));
+        }
+        if let Some(failure) = crate::write_precondition::mismatch(condition, |path| {
+            Ok::<_, MetadataBackendError>(object_by_path_from_tables(
+                tables,
+                &record.file_system_id,
+                path,
+            ))
+        })? {
+            return Err(MetadataBackendError::WritePreconditionFailed { failure });
+        }
+    }
+    for effect in &record.metadata_effects {
+        match effect {
+            crate::DfsPreparedMetadataEffect::PutIntent { intent } => {
+                validate_precondition_failure_effect(tables, record, intent)?;
+            }
+            crate::DfsPreparedMetadataEffect::PutIntentReceipt { receipt } => {
+                validate_precondition_failure_effect(tables, record, &receipt.to_intent_record())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_precondition_failure_effect(
+    tables: &DfsMetadataTables,
+    record: &DfsPreparedOperationRecord,
+    intent: &DfsWriteIntentRecord,
+) -> Result<()> {
+    let DfsWriteIntentStatus::PreconditionFailed { failure } = &intent.status else {
+        return Ok(());
+    };
+    crate::file_history::validate_intent_publication(intent)?;
+    let Some(previous) = tables.intent_record(&intent.object_id, &intent.intent_id) else {
+        // Historical adoption is gated by the native author's real source
+        // custody in validate_failed_intent_source_binding, like committed
+        // content. Replica/table materialization has no source capability.
+        // A first negative decision still requires its actual local original.
+        if record.operation_id != format!("precondition-failed:{}", intent.intent_id)
+            && !negative_publication_effect_shape(tables, record, intent)
+        {
+            return Ok(());
+        }
+        return Err(MetadataBackendError::Serde(
+            "negative precondition outcome has no actual original intent".into(),
+        ));
+    };
+    if matches!(
+        previous.status,
+        DfsWriteIntentStatus::PreconditionFailed { .. }
+    ) {
+        // Compaction can omit the original descriptor, but cannot alter the
+        // exact terminal cause, publication, identity, epoch or decision time.
+        let mut expected = previous;
+        if intent.object_metadata.is_none() {
+            expected.object_metadata = None;
+        }
+        if expected == *intent {
+            return Ok(());
+        }
+        return Err(MetadataBackendError::Serde(
+            "negative precondition effect changed its recorded terminal outcome".into(),
+        ));
+    }
+    let mut expected = previous.clone();
+    expected.status = intent.status.clone();
+    expected.updated_at = intent.updated_at;
+    if !matches!(
+        previous.status,
+        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+    ) || expected != *intent
+        || intent.object_metadata.is_none()
+        || intent.owner_epoch > record.owner_epoch
+        || intent.file_system_id != record.file_system_id
+    {
+        return Err(MetadataBackendError::Serde(
+            "negative precondition outcome changed its active original intent or scope".into(),
+        ));
+    }
+    let transaction = &record.transaction;
+    if !negative_publication_effect_shape(tables, record, intent)
+        || !transaction.objects.is_empty()
+        || !transaction.versions.is_empty()
+        || !transaction.advisory_lock_states.is_empty()
+        || transaction.file_version_pins.is_some()
+        || transaction.content_reference_identity.is_some()
+        || !transaction.extension_expectations.is_empty()
+        || transaction.contribution_digest.is_some()
+        || !record.content_receipts.is_empty()
+        || !record.required_replica_node_ids.is_empty()
+        || record.prepared_intent.is_some()
+        || record.terminal_intent.is_some()
+        || record.completed_request.is_some()
+        || record.completed_request_completion.is_some()
+    {
+        return Err(MetadataBackendError::Serde(
+            "negative precondition publication must contain only its original intent outcome"
+                .into(),
+        ));
+    }
+    let original_operation = format!("write:{}", intent.intent_id);
+    if tables
+        .prepared_operations_v7
+        .contains_key(&original_operation)
+        || tables
+            .prepared_operation_evictions
+            .contains_key(&original_operation)
+    {
+        return Err(MetadataBackendError::Serde(
+            "original content preparation owns reconciliation before any negative outcome".into(),
+        ));
+    }
+    let condition = intent
+        .publication
+        .current_precondition()
+        .expect("validated negative publication");
+    let observed = crate::write_precondition::mismatch(condition, |path| {
+        Ok::<_, MetadataBackendError>(object_by_path_from_tables(
+            tables,
+            &record.file_system_id,
+            path,
+        ))
+    })?;
+    if observed.as_ref() != Some(failure)
+        || !crate::write_precondition::failure_is_bound(
+            failure,
+            &record.expected_object_versions,
+            &record.expected_path_occupants,
+        )
+        || !record.expected_object_versions.iter().any(|expected| {
+            expected.object_id == intent.object_id
+                && expected.expected_version
+                    == tables
+                        .objects
+                        .get(&intent.object_id)
+                        .map(|object| object.version.clone())
+        })
+    {
+        return Err(MetadataBackendError::Serde(
+            "negative precondition outcome does not seal its actual native failure observation"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reuse the existing immutable supersession body. Recovery may add only its
+/// exact old digest resolution and advance the owning scope epoch; the sole
+/// original effect, predicate, comparisons and failure cause stay unchanged.
+fn negative_publication_effect_shape(
+    tables: &DfsMetadataTables,
+    record: &DfsPreparedOperationRecord,
+    intent: &DfsWriteIntentRecord,
+) -> bool {
+    let mut body = record.payload.as_ref().clone();
+    loop {
+        if body.operation_id == format!("precondition-failed:{}", intent.intent_id) {
+            return matches!(body.metadata_effects.as_slice(), [crate::DfsPreparedMetadataEffect::PutIntent { intent: only }] if only == intent);
+        }
+        let Some(crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
+            digest,
+            status: DfsPreparedOperationStatus::Superseded,
+        }) = body.metadata_effects.last()
+        else {
+            return false;
+        };
+        let Some(old) = tables.prepared_operations_v7.get(&digest.operation_id) else {
+            return false;
+        };
+        if old.digest != *digest
+            || !matches!(
+                old.status,
+                DfsPreparedOperationStatus::Prepared | DfsPreparedOperationStatus::Superseded
+            )
+            || body.file_system_id != old.file_system_id
+            || body.shard_id != old.shard_id
+            || body.owner_epoch <= old.owner_epoch
+            || body.operation_id != format!("recover:{}:{}", old.operation_id, body.owner_epoch)
+        {
+            return false;
+        }
+        body.metadata_effects.pop();
+        body.operation_id = old.operation_id.clone();
+        body.owner_epoch = old.owner_epoch;
+        if body != *old.payload {
+            return false;
+        }
+    }
+}
+
+/// Only the actual native author receives a source-adoption capability. A
+/// historical negative outcome must equal an already recorded local terminal
+/// or the exact terminal from that validated same-object source family. The
+/// generic materializer cannot mint a new negative decision from this path.
+fn validate_failed_intent_source_binding(
+    tables: &DfsMetadataTables,
+    record: &DfsPreparedOperationRecord,
+    intent: &DfsWriteIntentRecord,
+    source: Option<&crate::DfsCrossShardSourceFamily>,
+) -> Result<()> {
+    if !matches!(
+        intent.status,
+        DfsWriteIntentStatus::PreconditionFailed { .. }
+    ) {
+        return Ok(());
+    }
+    crate::file_history::validate_intent_publication(intent)?;
+    if tables
+        .intent_record(&intent.object_id, &intent.intent_id)
+        .is_some()
+    {
+        return validate_precondition_failure_effect(tables, record, intent);
+    }
+    let previous =
+        source_for_object(source, &intent.file_system_id, &intent.object_id).and_then(|source| {
+            source
+                .intents
+                .iter()
+                .find(|old| old.object_id == intent.object_id && old.intent_id == intent.intent_id)
+                .cloned()
+                .or_else(|| {
+                    source
+                        .intent_receipts
+                        .iter()
+                        .find(|old| {
+                            old.object_id == intent.object_id && old.intent_id == intent.intent_id
+                        })
+                        .map(|old| old.to_intent_record())
+                })
+        });
+    if let Some(mut previous) = previous
+        && matches!(
+            previous.status,
+            DfsWriteIntentStatus::PreconditionFailed { .. }
+        )
+    {
+        if intent.object_metadata.is_none() {
+            previous.object_metadata = None;
+        }
+        if previous == *intent {
+            return Ok(());
+        }
+    }
+    Err(MetadataBackendError::Serde(
+        "failed intent copy has no exact recorded terminal and native source custody".into(),
+    ))
 }
 
 pub(crate) fn apply_metadata_effect_with_rollback(
@@ -1636,14 +1920,14 @@ pub(super) fn validate_metadata_effect_content_bindings(
                 validate_content_object_binding(tables, record, object, source, &local_batch)?;
             }
             E::PutIntent { intent } => {
-                validate_committed_intent_content(tables, record, intent, source)?
+                validate_committed_intent_content(tables, record, intent, source)?;
+                validate_failed_intent_source_binding(tables, record, intent, source)?;
             }
-            E::PutIntentReceipt { receipt } => validate_committed_intent_content(
-                tables,
-                record,
-                &receipt.to_intent_record(),
-                source,
-            )?,
+            E::PutIntentReceipt { receipt } => {
+                let intent = receipt.to_intent_record();
+                validate_committed_intent_content(tables, record, &intent, source)?;
+                validate_failed_intent_source_binding(tables, record, &intent, source)?;
+            }
             _ => {}
         }
     }
@@ -1935,10 +2219,12 @@ fn validate_intent_effect(
     >,
 ) -> Result<()> {
     crate::file_history::validate_intent_publication(intent)?;
-    // Committed outcomes are checked against their original recorded source
-    // by validate_committed_intent_content at both author prepare and commit.
+    // Historical terminal outcomes are checked against their original source
+    // by the content/source binding validators at author prepare and commit.
     // Their historical epoch is not destination publication authority.
-    if intent.status != DfsWriteIntentStatus::Committed && intent.owner_epoch > record.owner_epoch {
+    if !matches!(intent.status, DfsWriteIntentStatus::Committed | DfsWriteIntentStatus::PreconditionFailed { .. })
+        && intent.owner_epoch > record.owner_epoch
+    {
         return Err(MetadataBackendError::Serde(
             "intent effect claims a future authority epoch".into(),
         ));

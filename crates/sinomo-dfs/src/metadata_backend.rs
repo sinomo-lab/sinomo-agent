@@ -1976,9 +1976,23 @@ impl LocalSobjMetadataBackend {
         if self.consistent_read_snapshot_depth == 0
             && self.try_materialize_resident_journal()?.is_none()
         {
+            tracing::trace!(target: "sinomo.dfs.perf",
+                stage = "dfs.repair.receipt_projection.native_cut", outcome = "source_fence_busy",
+                backend = %format_args!("{:p}", self), root = %self.root.display(),
+                shard_id = ?self.shard_id, actual_prefix = ?self.prefix_proof,
+                actual_materialized_sequence = self.materialized_through_sequence,
+                actual_snapshot_depth = self.consistent_read_snapshot_depth,
+                "existing resident snapshot opener did not acquire a coherent cut");
             return Ok(false);
         }
         self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_add(1);
+        tracing::trace!(target: "sinomo.dfs.perf",
+            stage = "dfs.repair.receipt_projection.native_cut", outcome = "ready",
+            backend = %format_args!("{:p}", self), root = %self.root.display(),
+            shard_id = ?self.shard_id, actual_prefix = ?self.prefix_proof,
+            actual_materialized_sequence = self.materialized_through_sequence,
+            actual_snapshot_depth = self.consistent_read_snapshot_depth,
+            "borrowed native prefix after existing resident snapshot admission");
         Ok(true)
     }
 

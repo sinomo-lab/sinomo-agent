@@ -377,3 +377,6 @@ fn prepared_genesis_cut_waits_for_inspection_fence_after_actual_preparation() {
         "actual prepared cut must remain available: {result:?}"
     );
 }
+
+#[path = "genesis_cache_lookup_tests/warm_foreground.rs"]
+mod warm_foreground;

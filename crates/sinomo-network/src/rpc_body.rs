@@ -3221,8 +3221,12 @@ impl SobjOutput for OwnedChunkSobjOutput {
         while !bytes.is_empty() {
             self.ensure_chunk()?;
             let chunk = self.current.as_mut().expect("SOBJ output chunk exists");
-            let written = chunk.writable_payload().len().min(bytes.len());
-            chunk.writable_payload()[..written].copy_from_slice(&bytes[..written]);
+            let (written, full) = {
+                let payload = chunk.writable_payload();
+                let written = payload.len().min(bytes.len());
+                payload[..written].copy_from_slice(&bytes[..written]);
+                (written, written == payload.len())
+            };
             chunk
                 .commit_payload(written)
                 .map_err(|error| self.fail(error))?;
@@ -3231,11 +3235,7 @@ impl SobjOutput for OwnedChunkSobjOutput {
                 .checked_add(written)
                 .ok_or(sinomo_object::Error::SizeOverflow)?;
             bytes = &bytes[written..];
-            if self
-                .current
-                .as_mut()
-                .is_some_and(|chunk| chunk.writable_payload().is_empty())
-            {
+            if full {
                 self.flush()?;
             }
         }

@@ -48,10 +48,23 @@ fn matching_source_records(
         // health state. Quorum publication coalesces those count-only changes;
         // use its semantic predicate while retaining the actual live count
         // for route ordering and the source's existing failure-budget policy.
+        let canonical_key_present = baseline.iter().any(|canonical| {
+            canonical.source_node_id == live.source_node_id
+                && canonical.target_node_id == live.target_node_id
+                && canonical.endpoint_id == live.endpoint_id
+        });
         if baseline.iter().any(|canonical| {
             crate::cluster_connectivity_stable_eq(canonical, &live)
                 && live.observed_at >= canonical.observed_at
-        }) {
+        }) || (!canonical_key_present
+            && live.state == ClusterConnectivityState::Healthy
+            && live.failure_reason.is_none())
+        {
+            // A live authenticated source can supply a previously unrepresented
+            // healthy edge within the same member/endpoint fence. It remains
+            // request-local candidate DATA. Existing canonical keys retain their
+            // semantic predicate, including failures and identity quarantine;
+            // the normal merge still preserves newer accepted observations.
             records.push(live);
         }
     }
@@ -62,7 +75,8 @@ fn matching_source_records(
 fn merge_observations(
     records: &mut Vec<ClusterConnectivityRecord>,
     incoming: Vec<ClusterConnectivityRecord>,
-) {
+) -> bool {
+    let mut changed = false;
     for live in incoming {
         let old = records.iter().position(|record| {
             record.source_node_id == live.source_node_id
@@ -70,11 +84,18 @@ fn merge_observations(
                 && record.endpoint_id == live.endpoint_id
         });
         match old {
-            Some(index) if records[index].observed_at < live.observed_at => records[index] = live,
-            None => records.push(live),
+            Some(index) if records[index].observed_at < live.observed_at => {
+                records[index] = live;
+                changed = true;
+            }
+            None => {
+                records.push(live);
+                changed = true;
+            }
             _ => {}
         }
     }
+    changed
 }
 
 enum SourceRead {
@@ -237,129 +258,436 @@ fn direct_source_endpoint_candidates(
     Ok(candidates)
 }
 
-pub(super) async fn refresh_connector(
+fn validate_target_context(
+    directory: &Arc<dyn crate::ClusterDirectory>,
+    route_context: (RouteDirectoryCacheIdentity, u64, u64),
+    dispatcher: &Option<sinomo_base::Id>,
+    local: &NodeId,
+) -> Result<(), NetworkError> {
+    if crate::network_module_routing_generation() != route_context.1
+        || route_context
+            .0
+            .effective_generation(directory.routing_version()?.0)
+            != route_context.2
+        || crate::routed_stream_pool::registered_routed_stream_incoming_token(local).as_ref()
+            != dispatcher.as_ref()
+    {
+        return Err(NetworkError::Directory {
+            detail: "original route context changed during carrier establishment".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_refresh_inputs(
+    directory: &Arc<dyn crate::ClusterDirectory>,
+    version: crate::DirectoryVersion,
+    baseline: &crate::DirectoryConnectivityBaseline,
+    route_context: (RouteDirectoryCacheIdentity, u64, u64),
+    dispatcher: &Option<sinomo_base::Id>,
+    local: &NodeId,
+) -> Result<(), NetworkError> {
+    validate_target_context(directory, route_context, dispatcher, local)?;
+    if directory.routing_version()? != version
+        || directory.connectivity_freshness_baseline()? != *baseline
+    {
+        return Err(NetworkError::Directory {
+            detail: "connectivity baseline changed during authenticated source read".into(),
+        });
+    }
+    Ok(())
+}
+
+fn same_preferred_transport(
+    left: &[crate::routing::CandidatePath],
+    right: &[crate::routing::CandidatePath],
+) -> bool {
+    match (left.first(), right.first()) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.nodes == right.nodes
+                && left.hops.len() == right.hops.len()
+                && left.hops.iter().zip(&right.hops).all(|(left, right)| {
+                    left.source_node_id == right.source_node_id
+                        && left.target_node_id == right.target_node_id
+                        && left.endpoint == right.endpoint
+                        && left.capabilities == right.capabilities
+                })
+        }
+        _ => false,
+    }
+}
+
+type CarrierProbe = Pin<
+    Box<
+        dyn Future<Output = Result<crate::PeerStream, crate::routing::CarrierEstablishmentFailure>>
+            + Send,
+    >,
+>;
+
+fn carrier_probe(
+    connector: Arc<crate::MultiHopRoutedConnector>,
+    target: NodeId,
+    options: ClusterObjectRpcOptions,
+    remaining: Duration,
+) -> CarrierProbe {
+    Box::pin(async move {
+        connector
+            .connect_with_source_freshness_observation(
+                target,
+                crate::ConnectOptions {
+                    constraints: stream_native_service_route_constraints(),
+                    timeout: remaining,
+                    protection: options.protection,
+                },
+                options.destination_process_affinity,
+            )
+            .await
+    })
+}
+
+/// Establish one actual carrier while the existing read-only source owner
+/// discovers eligible paths. No application request/body enters this function.
+pub(super) async fn connect_with_sources(
     paths: &ClusterPaths,
     directory: &Arc<dyn crate::ClusterDirectory>,
     state: &ClusterBootstrapState,
     target: &NodeId,
     options: ClusterObjectRpcOptions,
     deadline: tokio::time::Instant,
+    original_timeout: Duration,
     route_context: (RouteDirectoryCacheIdentity, u64, u64),
-) -> Result<Option<Arc<crate::MultiHopRoutedConnector>>, NetworkError> {
-    let baseline = directory.connectivity_freshness_baseline()?;
-    let (version, members, endpoints, ordinary_records) =
-        directory.routing_records_snapshot()?.into_parts();
-    let snapshot = DirectorySnapshot::try_from_records(version, members, endpoints)?;
-    if !snapshot.is_authorized(&state.local_node_id) || !snapshot.is_authorized(target) {
-        return Ok(None);
+    dispatcher: &Option<sinomo_base::Id>,
+    initial: Arc<crate::MultiHopRoutedConnector>,
+) -> Result<crate::PeerStream, NetworkError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(NetworkError::timeout(
+            "establish routed service RPC stream",
+            NetworkTimeoutPhase::Connect,
+            original_timeout,
+            NetworkDeliveryState::DefinitelyNotSent,
+        ));
     }
-    let mut records =
-        crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
-            paths,
-            state,
-            &snapshot,
-            ordinary_records,
+    let mut target_plan = initial.candidate_routes(
+        target,
+        stream_native_service_route_constraints(),
+        options.destination_process_affinity,
+    );
+    let mut probe = if target_plan.is_empty() {
+        None
+    } else {
+        Some(carrier_probe(
+            Arc::clone(&initial),
+            target.clone(),
+            options,
+            remaining,
+        ))
+    };
+    let mut first_error = None;
+    // This happens BEFORE any advisory baseline/snapshot/candidate capture.
+    // Even a synchronous advisory error cannot replace an actual target result.
+    if let Some(pending) = probe.as_mut() {
+        let immediate =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(result) = immediate {
+            drop(probe.take());
+            match result {
+                Ok(stream) => {
+                    validate_target_context(
+                        directory,
+                        route_context,
+                        dispatcher,
+                        &state.local_node_id,
+                    )?;
+                    if deadline <= tokio::time::Instant::now() {
+                        return Err(NetworkError::timeout(
+                            "establish routed service RPC stream",
+                            NetworkTimeoutPhase::Connect,
+                            original_timeout,
+                            NetworkDeliveryState::DefinitelyNotSent,
+                        ));
+                    }
+                    return Ok(stream);
+                }
+                Err(failure) => {
+                    if !failure.allows_source_read() {
+                        return Err(failure.into_error());
+                    }
+                    first_error = Some(failure.into_error());
+                }
+            }
+        }
+    }
+    let captured = (|| -> Result<_, NetworkError> {
+        let baseline = directory.connectivity_freshness_baseline()?;
+        let (version, members, endpoints, ordinary_records) =
+            directory.routing_records_snapshot()?.into_parts();
+        let snapshot = DirectorySnapshot::try_from_records(version, members, endpoints)?;
+        validate_refresh_inputs(
+            directory,
+            version,
+            &baseline,
+            route_context,
+            dispatcher,
+            &state.local_node_id,
         )?;
-    let candidates =
-        direct_source_endpoint_candidates(&snapshot, state, &records, &baseline.records)?;
+        if !snapshot.is_authorized(&state.local_node_id) {
+            return Err(NetworkError::UnauthorizedNode {
+                node_id: state.local_node_id.clone(),
+            });
+        }
+        if !snapshot.is_authorized(target) {
+            return Err(NetworkError::UnauthorizedNode {
+                node_id: target.clone(),
+            });
+        }
+        let records =
+            crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
+                paths,
+                state,
+                &snapshot,
+                ordinary_records,
+            )?;
+        let candidates =
+            direct_source_endpoint_candidates(&snapshot, state, &records, &baseline.records)?;
+        Ok((baseline, version, snapshot, records, candidates))
+    })();
+    let (baseline, version, snapshot, mut records, candidates) = match captured {
+        Ok(captured) => captured,
+        Err(advisory_error) => {
+            if let Some(pending) = probe {
+                return match pending.await {
+                    Ok(stream) => {
+                        validate_target_context(
+                            directory,
+                            route_context,
+                            dispatcher,
+                            &state.local_node_id,
+                        )?;
+                        if deadline <= tokio::time::Instant::now() {
+                            return Err(NetworkError::timeout(
+                                "establish routed service RPC stream",
+                                NetworkTimeoutPhase::Connect,
+                                original_timeout,
+                                NetworkDeliveryState::DefinitelyNotSent,
+                            ));
+                        }
+                        Ok(stream)
+                    }
+                    Err(failure) => Err(failure.into_error()),
+                };
+            }
+            return Err(first_error.unwrap_or(advisory_error));
+        }
+    };
     let mut direct = std::collections::VecDeque::from(candidates);
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let mut attempted_endpoints = std::collections::BTreeSet::new();
-    let mut refreshed = false;
     let mut authenticated = std::collections::BTreeSet::new();
-    let mut connector = connector_from_observed_records(
-        paths,
-        state,
-        snapshot.clone(),
-        records.clone(),
-        options.call_policy().health,
-        None,
-    )?;
+    let mut connector = Arc::clone(&initial);
+    let mut probe_after_progress = false;
+    enum Progress {
+        Source(Option<(SourceRead, Option<Vec<ClusterConnectivityRecord>>)>),
+        Target(Result<crate::PeerStream, crate::routing::CarrierEstablishmentFailure>),
+    }
     loop {
-        if connector.has_live_observed_route(target, options.destination_process_affinity) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             break;
         }
-        // Prioritize newly reachable sources over more direct hints. A pending
-        // unreachable endpoint cannot consume the entire original deadline
-        // before a second bridge's actual source can be queried.
-        for node in snapshot.nodes().values() {
-            if reads.len() == MAX_SOURCE_READS_IN_FLIGHT {
-                break;
-            }
-            if node.node_id == state.local_node_id
-                || &node.node_id == target
-                || !state.members.iter().any(|member| {
-                    member.node_id == node.node_id
-                        && member.node_public_key == node.public_key
-                        && member.state.is_authorized()
-                })
-                || !connector
-                    .has_live_observed_route(&node.node_id, crate::DestinationProcessAffinity::Any)
-            {
-                continue;
-            }
-            for endpoint in &node.endpoints {
+        if probe.is_none() && probe_after_progress && !target_plan.is_empty() {
+            probe_after_progress = false;
+            probe = Some(carrier_probe(
+                Arc::clone(&connector),
+                target.clone(),
+                options,
+                remaining,
+            ));
+        }
+        // Poll the captured/raw target BEFORE constructing or polling source
+        // work. A healthy target never waits for a source response. Keep a
+        // pending probe alive across failed/unchanged source replies.
+        let immediate = if let Some(pending) = probe.as_mut() {
+            std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx))).await
+        } else {
+            std::task::Poll::Pending
+        };
+        if immediate.is_pending() {
+            // Prioritize newly reachable sources over more direct hints. A pending
+            // unreachable endpoint cannot consume the entire original deadline
+            // before a second bridge's actual source can be queried.
+            for node in snapshot.nodes().values() {
                 if reads.len() == MAX_SOURCE_READS_IN_FLIGHT {
                     break;
                 }
-                let key = (node.node_id.clone(), endpoint.endpoint_id.clone());
-                if attempted_endpoints.contains(&key)
-                    || endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly
-                    || !records.iter().any(|record| {
-                        record.target_node_id == node.node_id
-                            && record.endpoint_id == endpoint.endpoint_id
-                            && record.transport == endpoint.transport
-                            && record.address == endpoint.address
-                            && record.state != ClusterConnectivityState::Unreachable
-                            && crate::cluster_network_record_live(record.expires_at, OffsetDateTime::now_utc())
+                if node.node_id == state.local_node_id
+                    || &node.node_id == target
+                    || !state.members.iter().any(|member| {
+                        member.node_id == node.node_id
+                            && member.node_public_key == node.public_key
+                            && member.state.is_authorized()
                     })
+                    || !connector.has_live_observed_route(
+                        &node.node_id,
+                        crate::DestinationProcessAffinity::Any,
+                    )
                 {
                     continue;
                 }
-                // A source node's processes can hold different live views.
-                // Narrow this read to one already-advertised endpoint without
-                // changing the authorized directory cut or inventing an edge.
-                let mut nodes = snapshot.nodes().values().cloned().collect::<Vec<_>>();
-                nodes.iter_mut().find(|n| n.node_id == node.node_id).unwrap()
-                    .endpoints.retain(|candidate| candidate == endpoint);
-                let selected = DirectorySnapshot::try_new(snapshot.version(), nodes)?;
-                let selected_records = records.iter().filter(|record| {
-                    record.target_node_id != node.node_id
-                        || record.endpoint_id == endpoint.endpoint_id
-                }).cloned().collect();
-                let source_connector = connector_from_observed_records(
-                    paths, state, selected, selected_records, options.call_policy().health,
-                    Some(&authenticated),
-                )?;
-                if !source_connector.has_live_observed_route(&node.node_id, crate::DestinationProcessAffinity::Any) {
-                    continue;
+                for endpoint in &node.endpoints {
+                    if reads.len() == MAX_SOURCE_READS_IN_FLIGHT {
+                        break;
+                    }
+                    let key = (node.node_id.clone(), endpoint.endpoint_id.clone());
+                    if attempted_endpoints.contains(&key)
+                        || endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly
+                        || !records.iter().any(|record| {
+                            record.target_node_id == node.node_id
+                                && record.endpoint_id == endpoint.endpoint_id
+                                && record.transport == endpoint.transport
+                                && record.address == endpoint.address
+                                && record.state != ClusterConnectivityState::Unreachable
+                                && crate::cluster_network_record_live(
+                                    record.expires_at,
+                                    OffsetDateTime::now_utc(),
+                                )
+                        })
+                    {
+                        continue;
+                    }
+                    // A source node's processes can hold different live views.
+                    // Narrow this read to one already-advertised endpoint without
+                    // changing the authorized directory cut or inventing an edge.
+                    let mut nodes = snapshot.nodes().values().cloned().collect::<Vec<_>>();
+                    nodes
+                        .iter_mut()
+                        .find(|n| n.node_id == node.node_id)
+                        .unwrap()
+                        .endpoints
+                        .retain(|candidate| candidate == endpoint);
+                    let selected = DirectorySnapshot::try_new(snapshot.version(), nodes)?;
+                    let selected_records = records
+                        .iter()
+                        .filter(|record| {
+                            record.target_node_id != node.node_id
+                                || record.endpoint_id == endpoint.endpoint_id
+                        })
+                        .cloned()
+                        .collect();
+                    let source_connector = connector_from_observed_records(
+                        paths,
+                        state,
+                        selected,
+                        selected_records,
+                        options.call_policy().health,
+                        Some(&authenticated),
+                    )?;
+                    if !source_connector.has_live_observed_route(
+                        &node.node_id,
+                        crate::DestinationProcessAffinity::Any,
+                    ) {
+                        continue;
+                    }
+                    attempted_endpoints.insert(key);
+                    reads.push(read_source(
+                        SourceRead::Routed(endpoint.clone(), source_connector),
+                        paths,
+                        state,
+                        options,
+                        deadline,
+                        route_context,
+                    ));
                 }
-                attempted_endpoints.insert(key);
+            }
+            while reads.len() < MAX_SOURCE_READS_IN_FLIGHT {
+                let Some(endpoint) = direct.pop_front() else {
+                    break;
+                };
+                // An authenticated reply describes this serving process's RAM;
+                // another endpoint for the same node can hold a live renewal that
+                // a cold process has not observed. Keep the finite endpoint queue
+                // eligible until the target route is proved. The existing in-flight
+                // bound, deadline, source checks and cancellation remain unchanged.
                 reads.push(read_source(
-                    SourceRead::Routed(endpoint.clone(), source_connector),
-                    paths, state, options, deadline, route_context,
+                    SourceRead::Direct(endpoint),
+                    paths,
+                    state,
+                    options,
+                    deadline,
+                    route_context,
                 ));
             }
         }
-        while reads.len() < MAX_SOURCE_READS_IN_FLIGHT {
-            let Some(endpoint) = direct.pop_front() else {
-                break;
-            };
-            // An authenticated reply describes this serving process's RAM;
-            // another endpoint for the same node can hold a live renewal that
-            // a cold process has not observed. Keep the finite endpoint queue
-            // eligible until the target route is proved. The existing in-flight
-            // bound, deadline, source checks and cancellation remain unchanged.
-            reads.push(read_source(
-                SourceRead::Direct(endpoint),
-                paths,
-                state,
-                options,
-                deadline,
-                route_context,
-            ));
-        }
-        let Some((origin, response)) = reads.next().await else {
+        let progress = match immediate {
+            std::task::Poll::Ready(result) => Progress::Target(result),
+            std::task::Poll::Pending => {
+                if let Some(pending) = probe.as_mut() {
+                    if reads.is_empty() {
+                        Progress::Target(pending.await)
+                    } else {
+                        tokio::select! {
+                            biased;
+                            result = pending => Progress::Target(result),
+                            source = reads.next() => Progress::Source(source),
+                        }
+                    }
+                } else {
+                    Progress::Source(reads.next().await)
+                }
+            }
+        };
+        let next = match progress {
+            Progress::Target(Ok(stream)) => {
+                drop(probe.take());
+                drop(reads);
+                validate_refresh_inputs(
+                    directory,
+                    version,
+                    &baseline,
+                    route_context,
+                    dispatcher,
+                    &state.local_node_id,
+                )?;
+                if deadline <= tokio::time::Instant::now() {
+                    return Err(NetworkError::timeout(
+                        "establish routed service RPC stream",
+                        NetworkTimeoutPhase::Connect,
+                        original_timeout,
+                        NetworkDeliveryState::DefinitelyNotSent,
+                    ));
+                }
+                return Ok(stream);
+            }
+            Progress::Target(Err(failure)) => {
+                drop(probe.take());
+                if !failure.allows_source_read() {
+                    return Err(failure.into_error());
+                }
+                first_error.get_or_insert_with(|| failure.error().clone());
+                validate_refresh_inputs(
+                    directory,
+                    version,
+                    &baseline,
+                    route_context,
+                    dispatcher,
+                    &state.local_node_id,
+                )?;
+                continue;
+            }
+            Progress::Source(source) => {
+                validate_refresh_inputs(
+                    directory,
+                    version,
+                    &baseline,
+                    route_context,
+                    dispatcher,
+                    &state.local_node_id,
+                )?;
+                source
+            }
+        };
+        let Some((origin, response)) = next else {
             break;
         };
         let Some(response) = response else {
@@ -374,7 +702,10 @@ pub(super) async fn refresh_connector(
             response,
             now,
         )?;
-        attempted_endpoints.insert((origin.source().clone(), origin.endpoint().endpoint_id.clone()));
+        attempted_endpoints.insert((
+            origin.source().clone(),
+            origin.endpoint().endpoint_id.clone(),
+        ));
         if let SourceRead::Direct(endpoint) = origin {
             // Only a successful direct RPC supplies a local adjacent edge.
             // A routed reply never fabricates local-to-source connectivity.
@@ -390,47 +721,120 @@ pub(super) async fn refresh_connector(
                 crate::CLUSTER_CONNECTIVITY_TTL_SECONDS,
             ));
         }
+        let relevant_progress = owned.iter().any(|record| {
+            let key = (
+                record.source_node_id.clone(),
+                record.target_node_id.clone(),
+                record.endpoint_id.clone(),
+            );
+            let newer = !authenticated.contains(&key)
+                || records
+                    .iter()
+                    .find(|old| {
+                        old.source_node_id == record.source_node_id
+                            && old.target_node_id == record.target_node_id
+                            && old.endpoint_id == record.endpoint_id
+                    })
+                    .is_none_or(|old| old.observed_at < record.observed_at);
+            newer
+                && target_plan.iter().flat_map(|path| &path.hops).any(|hop| {
+                    hop.source_node_id == record.source_node_id
+                        && hop.target_node_id == record.target_node_id
+                        && hop.endpoint.endpoint_id == record.endpoint_id
+                        && hop.endpoint.transport == record.transport
+                        && hop.endpoint.address == record.address
+                })
+        });
+        let mut new_authenticated = false;
         for record in &owned {
-            authenticated.insert((
+            new_authenticated |= authenticated.insert((
                 record.source_node_id.clone(),
                 record.target_node_id.clone(),
                 record.endpoint_id.clone(),
             ));
         }
-        merge_observations(&mut records, owned);
-        refreshed = true;
-        connector = connector_from_observed_records(
-            paths,
-            state,
-            snapshot.clone(),
-            records.clone(),
-            options.call_policy().health,
-            Some(&authenticated),
-        )?;
+        let changed = merge_observations(&mut records, owned);
+        if changed || new_authenticated {
+            let refreshed = connector_from_observed_records(
+                paths,
+                state,
+                snapshot.clone(),
+                records.clone(),
+                options.call_policy().health,
+                Some(&authenticated),
+            )?;
+            let next_plan = refreshed.candidate_routes(
+                target,
+                stream_native_service_route_constraints(),
+                options.destination_process_affinity,
+            );
+            if !same_preferred_transport(&next_plan, &target_plan) {
+                // Follow the EXISTING planner order only when the preferred
+                // physical route changes. New secondary paths or changed RTT/
+                // health on the same transport do not restart its handshake.
+                drop(probe.take());
+                probe_after_progress = true;
+            } else if probe.is_none() && first_error.is_some() && relevant_progress {
+                probe_after_progress = true;
+            }
+            target_plan = next_plan;
+            // Keep source reachability current without touching a healthy
+            // pending target for unrelated or repeated source observations.
+            connector = refreshed;
+        }
     }
     // Drop outstanding read futures on success, cancellation or deadline. No
     // detached helper survives this request-owned establishment phase.
+    drop(probe);
     drop(reads);
-    if !refreshed {
-        return Ok(None);
-    }
-    if crate::network_module_routing_generation() != route_context.1
-        || directory.routing_version()? != version
-        || directory.connectivity_freshness_baseline()? != baseline
-    {
-        return Err(NetworkError::Directory {
-            detail: "connectivity baseline changed during authenticated source read".into(),
-        });
-    }
-    let connector = connector_from_observed_records(
-        paths,
-        state,
-        snapshot,
-        records,
-        options.call_policy().health,
-        Some(&authenticated),
+    validate_refresh_inputs(
+        directory,
+        version,
+        &baseline,
+        route_context,
+        dispatcher,
+        &state.local_node_id,
     )?;
-    Ok(Some(connector))
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(NetworkError::timeout(
+            "establish routed service RPC stream",
+            NetworkTimeoutPhase::Connect,
+            original_timeout,
+            NetworkDeliveryState::DefinitelyNotSent,
+        ));
+    }
+    // With no refreshed route, preserve the captured connector's own typed
+    // no-path/auth/error result rather than fabricating source permission.
+    let result = initial
+        .connect_with_source_freshness_observation(
+            target.clone(),
+            crate::ConnectOptions {
+                constraints: stream_native_service_route_constraints(),
+                timeout: remaining,
+                protection: options.protection,
+            },
+            options.destination_process_affinity,
+        )
+        .await
+        .map_err(crate::routing::CarrierEstablishmentFailure::into_error);
+    match result {
+        Ok(stream) => {
+            validate_refresh_inputs(
+                directory,
+                version,
+                &baseline,
+                route_context,
+                dispatcher,
+                &state.local_node_id,
+            )?;
+            Ok(stream)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -656,12 +1060,68 @@ mod tests {
                 "case {change}"
             );
         }
-        assert!(
-            matching_source_records(&directory, &state, &source, &[], vec![live], now)
-                .unwrap()
-                .is_empty(),
-            "live claims cannot introduce uncommitted remote semantics"
-        );
+    }
+
+    #[test]
+    fn absent_canonical_healthy_observation_is_bounded_candidate_data() {
+        let (directory, state, source, mut live, now) = fixture();
+        live.observed_at = now;
+        live.expires_at = now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+        let canonical = Vec::new();
+        assert_eq!(matching_source_records(&directory, &state, &source, &canonical,
+            vec![live.clone()], now).unwrap(), vec![live]);
+        assert!(canonical.is_empty(), "candidate DATA does not publish canonical connectivity");
+    }
+
+    #[test]
+    fn absent_canonical_candidates_preserve_source_member_endpoint_clock_and_quarantine() {
+        let (directory, state, source, mut live, now) = fixture();
+        live.observed_at = now;
+        live.expires_at = now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+        for change in 0..12 {
+            let mut rejected = live.clone();
+            match change {
+                0 => rejected.source_node_id = state.local_node_id.clone(),
+                1 => rejected.cluster_id = ClusterId::from_legacy_named("wrong-live-cluster").unwrap(),
+                2 => rejected.target_node_id = NodeId::from_legacy_named("unknown-live-target").unwrap(),
+                3 => rejected.endpoint_id = crate::ClusterEndpointId::derived("unknown-live-endpoint", b"negative"),
+                4 => rejected.address = "127.0.0.1:39999".into(),
+                5 => rejected.transport = ClusterTransportKind::Loopback,
+                6 => rejected.observed_at = now + time::Duration::seconds(1),
+                7 => rejected.expires_at = now,
+                8 => rejected.state = ClusterConnectivityState::Degraded,
+                9 => rejected.state = ClusterConnectivityState::Unreachable,
+                10 => rejected.failure_reason = Some(crate::ClusterConnectivityFailureReason::IdentityMismatch),
+                _ => rejected.failure_reason = Some(crate::ClusterConnectivityFailureReason::CommandAuthDenied),
+            }
+            assert!(matching_source_records(&directory, &state, &source, &[],
+                vec![rejected], now).unwrap().is_empty(), "absent key case {change}");
+        }
+        for member_state in [sinomo_base::ClusterMemberState::Pending, sinomo_base::ClusterMemberState::Removed] {
+            let mut cut = state.clone();
+            cut.members.iter_mut().find(|m| m.node_id == live.target_node_id).unwrap().state = member_state.clone();
+            let directory = DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), cut.members.clone()).unwrap();
+            assert!(!directory.is_authorized(&live.target_node_id));
+            assert!(matching_source_records(&directory, &cut, &source, &[],
+                vec![live.clone()], now).unwrap().is_empty(), "target member state {member_state:?}");
+        }
+        let mut private_cut = state.clone();
+        private_cut.members.iter_mut().find(|m| m.node_id == live.target_node_id).unwrap()
+            .endpoints[0].privacy = sinomo_base::ClusterEndpointPrivacy::LocalOnly;
+        let private = DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), private_cut.members.clone()).unwrap();
+        assert!(matching_source_records(&private, &private_cut, &source, &[], vec![live.clone()], now).unwrap().is_empty());
+        let mut failed = live.clone();
+        failed.state = ClusterConnectivityState::Unreachable;
+        failed.failure_reason = Some(crate::ClusterConnectivityFailureReason::IdentityMismatch);
+        assert!(matching_source_records(&directory, &state, &source,
+            std::slice::from_ref(&failed), vec![live.clone()], now).unwrap().is_empty(),
+            "existing canonical quarantine remains controlling");
+        let mut older = live;
+        older.observed_at -= time::Duration::seconds(1);
+        let incoming = matching_source_records(&directory, &state, &source, &[], vec![older], now).unwrap();
+        let mut accepted = vec![failed.clone()];
+        assert!(!merge_observations(&mut accepted, incoming));
+        assert_eq!(accepted, vec![failed], "a new candidate cannot replace a newer accepted failure");
     }
 
     #[test]

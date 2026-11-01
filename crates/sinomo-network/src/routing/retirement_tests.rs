@@ -19,6 +19,88 @@ async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
     (client.unwrap(), server.unwrap().0)
 }
 
+#[test]
+fn cancelling_actual_tcp_relay_closes_peers_and_drains_blocking_workers() {
+    let (peers_tx, peers_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let observed = runtime.block_on(async move {
+            let (source, incoming) = tcp_pair().await;
+            let (destination, outgoing) = tcp_pair().await;
+            let source = source.into_std().unwrap();
+            let destination = destination.into_std().unwrap();
+            // Keep actual peer sockets open outside the runtime until after
+            // its normal Drop returns. Fixture teardown cannot supply EOF or
+            // release blocked workers before either production oracle.
+            peers_tx
+                .send(ShutdownOwnedSockets(vec![
+                    source.try_clone().unwrap(),
+                    destination.try_clone().unwrap(),
+                ]))
+                .unwrap_or_else(|_| panic!("retain actual native relay peers"));
+            let mut source = tokio::net::TcpStream::from_std(source).unwrap();
+            let mut destination = tokio::net::TcpStream::from_std(destination).unwrap();
+            let relay = tokio::spawn(forward_routed_relay_pair(
+                Box::new(incoming),
+                Box::new(outgoing),
+            ));
+            // Both real blocking directions must have forwarded opaque bytes
+            // before cancellation; aborting an unpolled future is insufficient.
+            tokio::time::timeout(Duration::from_secs(3), async {
+                source.write_all(b"s").await.unwrap();
+                let mut byte = [0];
+                destination.read_exact(&mut byte).await.unwrap();
+                assert_eq!(byte, *b"s");
+                destination.write_all(b"d").await.unwrap();
+                source.read_exact(&mut byte).await.unwrap();
+                assert_eq!(byte, *b"d");
+            })
+            .await
+            .unwrap();
+            relay.abort();
+            let cancelled = relay.await.unwrap_err().is_cancelled();
+            let mut source_byte = [0];
+            let mut destination_byte = [0];
+            let eof = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    source.read(&mut source_byte),
+                    destination.read(&mut destination_byte)
+                )
+            })
+            .await;
+            (cancelled, eof)
+        });
+        // Default Drop joins native blocking work without a timeout. Merely
+        // using shutdown_timeout here could hide two detached splice workers.
+        drop(runtime);
+        let _ = done_tx.send(observed);
+    });
+    let peers = peers_rx.recv_timeout(Duration::from_secs(6));
+    let peers_observed = peers.is_ok();
+    let finished = done_rx.recv_timeout(Duration::from_secs(6));
+    // On old source this releases the actual leaked socket owners, allowing
+    // the runtime thread to join before the failed observations are asserted.
+    drop(peers);
+    drop(peers_rx);
+    let joined = runner.join();
+    assert!(joined.is_ok(), "native relay runtime thread panicked");
+    assert!(
+        peers_observed,
+        "both actual fixture peer sockets must be retained"
+    );
+    let (cancelled, eof) = finished
+        .expect("canceled relay workers must drain while both fixture peer sockets remain open");
+    assert!(cancelled, "the actual async relay owner must be canceled");
+    let (source, destination) = eof.expect("both actual peer connections must reach EOF");
+    assert_eq!(source.unwrap(), 0);
+    assert_eq!(destination.unwrap(), 0);
+}
+
 async fn encrypted_owned_retirement(cancel_response: bool) {
     let (source, incoming) = tcp_pair().await;
     let (destination, outgoing) = tcp_pair().await;

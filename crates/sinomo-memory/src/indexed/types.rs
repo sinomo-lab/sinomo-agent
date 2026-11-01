@@ -1248,6 +1248,14 @@ pub trait MemorySourceConnector: Send + Sync {
         root: &IndexRoot,
         source: &SourceCandidate,
     ) -> Result<VerifiedSourceSnapshot, MemoryError>;
+
+    /// Check namespace identity after a complete scan without treating an
+    /// unavailable source provider as an authoritative deletion.
+    fn descriptor_identity_is_current(
+        &self,
+        root: &IndexRoot,
+        source: &SourceDescriptor,
+    ) -> Result<bool, MemoryError>;
 }
 
 pub trait MemorySourceCatalog: Send + Sync {

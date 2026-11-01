@@ -265,6 +265,7 @@ fn namespace_operation_returns_synced_response_objects(operation: &DfsNamespaceO
             | DfsNamespaceOperation::Mkdir { .. }
             | DfsNamespaceOperation::MkdirWithAttrs { .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { .. }
+            | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(_)
             | DfsNamespaceOperation::MkdirAll { .. }
     )
 }
@@ -760,6 +761,7 @@ fn namespace_transaction_proves_operation_completed(
         DfsNamespaceOperation::Mkdir { path }
         | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
         | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
+        | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(crate::DfsMkdirAtNoLinksWithAttrs { path, .. })
         | DfsNamespaceOperation::MkdirAll { path } => {
             transaction_has_object_at(transaction, path, |object| {
                 object.kind == DfsObjectKind::Directory
@@ -1781,6 +1783,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let DfsNamespaceOperation::Mkdir { path }
         | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
         | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
+        | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(crate::DfsMkdirAtNoLinksWithAttrs { path, .. })
         | DfsNamespaceOperation::BeginContentCopy { path, .. } = &command.operation
             && let Err(error) =
                 self.ensure_path_not_in_cross_shard_flight(&command.file_system_id, path)
@@ -2199,7 +2202,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
-            | DfsNamespaceOperation::MkdirAtNoLinks { path, .. } => {
+            | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
+            | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(crate::DfsMkdirAtNoLinksWithAttrs { path, .. }) => {
                 posix_path::normalized_posix_path_key(path)
                     .into_iter()
                     .collect()

@@ -1,11 +1,13 @@
 mod attachments;
 mod local;
+mod sifs;
 pub use attachments::*;
 mod overlay;
 mod router;
 mod types;
 
 pub use local::LocalSourceConnector;
+pub use sifs::SifsSourceConnector;
 pub use types::*;
 
 use router::{
@@ -64,6 +66,7 @@ struct RankedEvidenceCursor {
 pub struct IndexedFileMemoryStore {
     root: PathBuf,
     connector: LocalSourceConnector,
+    sifs_connector: Option<SifsSourceConnector>,
     write_lock: Arc<Mutex<()>>,
     trace_lock: Arc<Mutex<()>>,
 }
@@ -84,13 +87,103 @@ impl IndexedFileMemoryStore {
         Self {
             root: memory_root.into(),
             connector: LocalSourceConnector,
+            sifs_connector: None,
             write_lock: Arc::new(Mutex::new(())),
             trace_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn from_data_dir(data_dir: &sinomo_runtime::local::SinomoDataDir) -> Self {
-        Self::new(data_dir.root().join("memory"))
+        let mut store = Self::new(data_dir.root().join("memory"));
+        store.sifs_connector = Some(SifsSourceConnector::new(data_dir.clone()));
+        store
+    }
+
+    /// Bind an already-authorized filesystem source while retaining local
+    /// derived indexes. The caller must supply its logical namespace identity
+    /// and change that identity if the injected filesystem is rebound. Ordinary
+    /// daemon-backed sources obtain this binding from authenticated cluster state.
+    pub fn with_sifs_vfs(
+        mut self,
+        filesystem: sinomo_runtime::vfs::VfsHandle,
+        namespace: impl Into<String>,
+    ) -> Self {
+        self.sifs_connector = Some(SifsSourceConnector::from_vfs(filesystem, namespace));
+        self
+    }
+
+    fn source_connector(
+        &self,
+        root: &IndexRoot,
+    ) -> Result<&dyn MemorySourceConnector, MemoryError> {
+        match root.connector_id.as_str() {
+            "sinomo.memory.local/v1" => Ok(&self.connector),
+            sifs::CONNECTOR_ID => self
+                .sifs_connector
+                .as_ref()
+                .map(|connector| connector as &dyn MemorySourceConnector)
+                .ok_or_else(|| MemoryError::InvalidIndexRoot {
+                    path: root.config.path.display().to_string(),
+                    detail: "SIFS source connector is unavailable in this host".into(),
+                }),
+            connector => Err(MemoryError::InvalidIndexRoot {
+                path: root.config.path.display().to_string(),
+                detail: format!("unsupported memory source connector {connector}"),
+            }),
+        }
+    }
+
+    pub fn register_sifs_root(
+        &self,
+        mut config: LocalIndexRootConfig,
+    ) -> Result<IndexRoot, MemoryError> {
+        let connector =
+            self.sifs_connector
+                .as_ref()
+                .ok_or_else(|| MemoryError::InvalidIndexRoot {
+                    path: config.path.display().to_string(),
+                    detail: "SIFS source connector is unavailable in this host".into(),
+                })?;
+        let (path, root_id) = connector.registered_root_identity(&config.path)?;
+        config.path = PathBuf::from(path);
+        config.include_extensions = config
+            .include_extensions
+            .into_iter()
+            .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|extension| !extension.is_empty())
+            .collect();
+        config.include_extensions.sort();
+        config.include_extensions.dedup();
+        if config.include_extensions.is_empty() {
+            return Err(MemoryError::InvalidIndexRoot {
+                path: config.path.display().to_string(),
+                detail: "at least one file extension must be enabled".into(),
+            });
+        }
+        let _guard = self.write_guard()?;
+        self.ensure_continuation_key()?;
+        let path = self.root_path(&root_id);
+        let existing = self.read_optional::<IndexRoot>(&path)?;
+        if let Some(existing) = &existing {
+            self.fence_root_config_change(existing, &config)?;
+        }
+        let authorization_epoch = existing
+            .as_ref()
+            .filter(|root| root.config == config)
+            .map(|root| root.authorization_epoch.clone())
+            .unwrap_or_else(Id::generate);
+        let root = IndexRoot {
+            root_id,
+            connector_id: sifs::CONNECTOR_ID.into(),
+            config,
+            authorization_epoch,
+            retention: SourceRetentionCapability::CurrentOnly,
+            registered_at: existing
+                .map(|root| root.registered_at)
+                .unwrap_or_else(OffsetDateTime::now_utc),
+        };
+        self.write_sobj_atomic(&path, &root)?;
+        Ok(root)
     }
 
     pub fn root(&self) -> &Path {
@@ -250,18 +343,18 @@ impl IndexedFileMemoryStore {
         limit: usize,
     ) -> Result<SourcePage, MemoryError> {
         let root = self.root_by_id(root_id)?;
-        self.connector.scan_page(&root, cursor, limit)
+        self.source_connector(&root)?
+            .scan_page(&root, cursor, limit)
     }
 
     pub fn index_root(&self, root_id: &IndexRootId) -> Result<IndexMaintenanceReport, MemoryError> {
         let _guard = self.write_guard()?;
         let root = self.root_by_id(root_id)?;
+        let connector = self.source_connector(&root)?;
         let mut report = IndexMaintenanceReport::default();
         let mut cursor = None;
         loop {
-            let page = self
-                .connector
-                .scan_page(&root, cursor.as_ref(), SOURCE_SCAN_PAGE_SIZE)?;
+            let page = connector.scan_page(&root, cursor.as_ref(), SOURCE_SCAN_PAGE_SIZE)?;
             for source in page.sources {
                 report.discovered_files += 1;
                 let existing = self.read_optional::<SourceDescriptor>(
@@ -275,7 +368,7 @@ impl IndexedFileMemoryStore {
                         && existing.retention == root.retention
                 });
                 if metadata_unchanged {
-                    let snapshot = self.connector.acquire_snapshot(&root, &source)?;
+                    let snapshot = connector.acquire_snapshot(&root, &source)?;
                     if existing.as_ref().is_some_and(|existing| {
                         existing.version.content_hash == snapshot.version.content_hash
                     }) {
@@ -303,7 +396,7 @@ impl IndexedFileMemoryStore {
             let page = self.source_page(&root.root_id, after.as_ref(), SOURCE_SCAN_PAGE_SIZE)?;
             for mut source in page.items {
                 if source.freshness != SourceFreshness::Deleted
-                    && !local::descriptor_identity_is_current(&root, &source)
+                    && !connector.descriptor_identity_is_current(&root, &source)?
                 {
                     self.unroute_partition(&Id::derived(
                         "memory-index-partition",
@@ -340,7 +433,9 @@ impl IndexedFileMemoryStore {
         root: &IndexRoot,
         source: &SourceCandidate,
     ) -> Result<IndexGenerationId, MemoryError> {
-        let snapshot = self.connector.acquire_snapshot(root, source)?;
+        let snapshot = self
+            .source_connector(root)?
+            .acquire_snapshot(root, source)?;
         self.publish_verified_snapshot_locked(root, source, snapshot)
     }
 
@@ -1154,7 +1249,10 @@ impl IndexedFileMemoryStore {
         }
         let root = self.root_by_id(&generation.source.version.file_ref.root_id)?;
         let candidate = source_candidate_from_descriptor(&root, &generation.source)?;
-        let snapshot = match self.connector.acquire_snapshot(&root, &candidate) {
+        let snapshot = match self
+            .source_connector(&root)?
+            .acquire_snapshot(&root, &candidate)
+        {
             Ok(snapshot)
                 if snapshot.version.version_id == generation.source.version.version_id
                     && snapshot.version.content_hash == generation.source.version.content_hash =>

@@ -273,7 +273,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             1u64
         };
         let mut fences = Vec::new();
-        for shard in &shards {
+        // A directory's nlink counts only its immediate child directories.
+        // Reuse the listing scope decision while retaining the full catalog
+        // for ownership, query binding and the final generation comparison.
+        // File aliases can live anywhere, so their existing global scan stays.
+        let projection_shards = if target.kind == DfsObjectKind::Directory {
+            super::routing::directory_child_authority_shards(&target.path, &shards)?
+        } else {
+            shards.iter().collect()
+        };
+        for shard in projection_shards {
             let mut request = DfsStatProjectionRequest {
                 object_id: target.object_id.clone(),
                 object_path: target.path.clone(),
@@ -438,3 +447,6 @@ fn stat_from_projection(object: DfsObjectMetadata, path: &str, count: u64) -> Re
         current_locations: object.current_locations,
     })
 }
+
+#[cfg(test)]
+mod native_tests;

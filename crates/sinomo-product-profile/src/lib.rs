@@ -541,6 +541,90 @@ mod tests {
     }
 
     #[test]
+    fn observe_formation_storage_survives_host_roles_and_disabled_profile() {
+        use sinomo_runtime::storage::{StoragePathOwner, StorageRing};
+
+        let root = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-observe-formation-storage-{}",
+            sinomo_runtime::core::Id::generate()
+        )));
+        let observe_id = sinomo_runtime::observe::observe_module_id();
+        for enabled in [true, false] {
+            if !enabled {
+                sinomo_runtime::module::set_native_rust_module_enabled(
+                    &root.root(),
+                    &observe_id,
+                    false,
+                    "test",
+                    "preserve diagnostic ownership while Observe is disabled",
+                )
+                .unwrap();
+            }
+            for profile in [
+                ProductComponentProfile::main(false),
+                ProductComponentProfile::shadow(false),
+                ProductComponentProfile::embedded(false),
+            ] {
+                let catalog = base_component_catalog(&root, profile).unwrap();
+                assert_eq!(catalog.factory(observe_id.as_str()).is_some(), enabled);
+                let layout =
+                    sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&catalog).unwrap();
+                for path in [
+                    "observe/formation/current-capture",
+                    "observe/formation/current-daemon-pid",
+                    "observe/formation/captures.tsv",
+                    "observe/formation/formation-node6-42-123.profile-start.json",
+                    "observe/formation/formation-node6-42-123.profile-start.stderr.log",
+                    "observe/formation/formation-node6-42-123.startup-traces.json",
+                    "observe/formation/formation-node6-42-123.ready",
+                ] {
+                    assert!(
+                        matches!(layout.owner_for(path), Some(StoragePathOwner::Escape(owner))
+                        if owner.module == sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_OWNER
+                            && owner.ring == StorageRing::R1
+                            && owner.relative_path == "observe/formation"),
+                        "missing exact diagnostic owner for {path}"
+                    );
+                }
+                assert!(
+                    layout
+                        .owner_for("observe/formation-extra/state.bin")
+                        .is_none()
+                );
+                assert!(layout.owner_for("observe/unrelated-state.bin").is_none());
+            }
+        }
+        std::fs::remove_dir_all(root.root()).unwrap();
+    }
+
+    #[test]
+    fn observe_formation_storage_rejects_a_second_component_owner() {
+        let root = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-observe-formation-collision-{}",
+            sinomo_runtime::core::Id::generate()
+        )));
+        let catalog = base_component_catalog(&root, ProductComponentProfile::main(false)).unwrap();
+        let conflicting = catalog
+            .to_builder()
+            .register_storage_contributor("fixture.formation-storage", |layout| {
+                layout.register_escape_path(
+                    "fixture.formation-storage",
+                    sinomo_runtime::storage::StorageRing::R1,
+                    "observe/formation",
+                    "conflicting diagnostic owner",
+                )
+            })
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(matches!(
+            sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&conflicting),
+            Err(sinomo_runtime::storage::StorageContractError::DuplicatePath { relative_path })
+                if relative_path == "observe/formation"
+        ));
+    }
+
+    #[test]
     fn main_profile_owns_dfs_and_sandbox_factories_while_shadow_owns_neither() {
         let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
             "sinomo-product-dfs-profile-{}",

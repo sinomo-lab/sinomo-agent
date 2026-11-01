@@ -3,6 +3,7 @@ use serde::Serialize;
 pub(crate) use sinomo_memory::cli::MemoryCliCommand;
 #[cfg(test)]
 pub(crate) use sinomo_memory::cli::MemoryQueryOptions;
+use sinomo_memory::cli::MemoryRootFilesystem;
 #[cfg(test)]
 pub(crate) use sinomo_memory::cli::MemoryRootListOptions;
 use sinomo_memory::{
@@ -20,13 +21,14 @@ fn parse_memory_schema_for_test(args: &[String]) -> Result<MemoryCliCommand, Cli
 
 pub(crate) fn run_memory_cli_command(command: MemoryCliCommand) -> Result<(), CliError> {
     match command {
-        MemoryCliCommand::RootAdd { path } => {
+        MemoryCliCommand::RootAdd { path, filesystem } => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             let store = IndexedFileMemoryStore::from_data_dir(&data_dir);
-            let root = store.register_local_root(LocalIndexRootConfig::new(
-                path,
-                IndexRootPolicy::cluster_local(),
-            ))?;
+            let config = LocalIndexRootConfig::new(path, IndexRootPolicy::cluster_local());
+            let root = match filesystem {
+                MemoryRootFilesystem::Local => store.register_local_root(config)?,
+                MemoryRootFilesystem::Sifs => store.register_sifs_root(config)?,
+            };
             print_memory_json("memory root", &root)
         }
         MemoryCliCommand::RootList(options) => {
@@ -75,7 +77,22 @@ mod tests {
             parse_memory_schema_for_test(&["root".into(), "add".into(), "/tmp/notes".into()])
                 .expect("root add"),
             MemoryCliCommand::RootAdd {
-                path: PathBuf::from("/tmp/notes")
+                path: PathBuf::from("/tmp/notes"),
+                filesystem: MemoryRootFilesystem::Local,
+            }
+        );
+        assert_eq!(
+            parse_memory_schema_for_test(&[
+                "root".into(),
+                "add".into(),
+                "/users/notes".into(),
+                "--filesystem".into(),
+                "sifs".into(),
+            ])
+            .expect("SIFS root add"),
+            MemoryCliCommand::RootAdd {
+                path: PathBuf::from("/users/notes"),
+                filesystem: MemoryRootFilesystem::Sifs,
             }
         );
         assert_eq!(
@@ -137,6 +154,16 @@ mod tests {
 
     #[test]
     fn memory_parser_rejects_invalid_limits_and_missing_arguments() {
+        assert!(matches!(
+            parse_memory_schema_for_test(&[
+                "root".into(),
+                "add".into(),
+                "/notes".into(),
+                "--filesystem".into(),
+                "unknown".into(),
+            ]),
+            Err(CliError::Parse { .. })
+        ));
         assert!(matches!(
             parse_memory_schema_for_test(&["query".into()]),
             Err(CliError::Parse { .. })

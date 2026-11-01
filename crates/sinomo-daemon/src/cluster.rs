@@ -985,6 +985,42 @@ pub(crate) async fn handle_daemon_cluster_kv_authoritative_snapshot_request_asyn
     })?
 }
 
+pub(crate) async fn handle_daemon_cluster_kv_authoritative_complete_range_prefix_request_async_on_runtime(
+    paths: &DaemonPaths,
+    prefix: String,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let timeouts = cluster_control_plane_timeouts();
+    let task_runtime = runtime.clone();
+    let mut task = OwnedDaemonTask::new(runtime.spawn(async move {
+        let mut state = sinomo_core::cluster::read_cluster_state_without_kv_async(
+            &task_runtime,
+            &cluster_paths,
+        )
+        .await?;
+        let mut host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
+            DaemonClusterRpcMode::from_handle(&task_runtime),
+            timeouts,
+        );
+        sinomo_core::cluster::read_cluster_kv_authoritative_complete_range_prefix_async_with_host(
+            &task_runtime,
+            &cluster_paths,
+            &mut state,
+            prefix,
+            timeouts.kv_txn_quorum_options(allow_forwarding),
+            &mut host,
+        )
+        .await
+        .map_err(DaemonError::from)
+    }));
+    task.join().await.map_err(|source| DaemonError::Network {
+        address: "cluster KV authoritative complete prefix read task".into(),
+        detail: source.to_string(),
+    })?
+}
+
 pub(crate) async fn handle_daemon_cluster_kv_authoritative_range_prefix_request_async_on_runtime(
     paths: &DaemonPaths,
     prefix: String,
@@ -13802,9 +13838,12 @@ mod tests {
         .unwrap();
         let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
         maintenance.connectivity_converged = false;
+        // This control begins after the original startup window has expired;
+        // ordinary convergence completion no longer consumes fresh grace.
+        let settled_start = Instant::now() - DAEMON_CLUSTER_STARTUP_SETTLE_DURATION;
         maintenance
             .cadence
-            .ensure_connectivity_settle_deadline(Instant::now(), false);
+            .ensure_connectivity_settle_deadline(settled_start, false);
         maintenance.finish_connectivity_convergence();
         let renewed_at = Instant::now();
         if explicit_environment {
@@ -14008,7 +14047,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_connectivity_convergence_terminalizes_startup_settle_schedule() {
+    fn successful_connectivity_batch_preserves_original_startup_settle_schedule() {
         let now = Instant::now();
         let runtime = daemon_cluster_test_runtime();
         let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
@@ -14017,7 +14056,8 @@ mod tests {
         ));
         maintenance.discovery = None;
         maintenance.connectivity_converged = false;
-        maintenance.startup_settle_until = now.checked_add(DAEMON_CLUSTER_STARTUP_SETTLE_DURATION);
+        let original_deadline = now + DAEMON_CLUSTER_STARTUP_SETTLE_DURATION;
+        maintenance.startup_settle_until = Some(original_deadline);
         maintenance.last_publish = now;
         maintenance.last_probe = now;
         maintenance.last_discovery = now;
@@ -14029,18 +14069,21 @@ mod tests {
         );
 
         maintenance.finish_connectivity_convergence();
-        let completed_at = Instant::now();
-
         assert!(maintenance.connectivity_converged);
-        assert!(
-            maintenance
-                .startup_settle_until
-                .is_some_and(|deadline| deadline <= completed_at),
-            "successful convergence must retain a consumed, inactive startup marker"
+        assert_eq!(
+            maintenance.startup_settle_until,
+            Some(original_deadline),
+            "batch completion must preserve the original startup deadline"
+        );
+        assert_eq!(
+            maintenance.next_due_duration(now + Duration::from_secs(1)),
+            DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
+            "the original bounded startup cadence remains active after batch completion"
         );
         assert!(
-            maintenance.next_due_duration(completed_at) > DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
-            "a completed convergence must return to the role-aware steady-state schedule"
+            maintenance.next_due_duration(original_deadline)
+                > DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
+            "the original expiry must return to the role-aware steady-state schedule"
         );
     }
 

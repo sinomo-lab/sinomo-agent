@@ -688,19 +688,25 @@ impl ObjectRepairRoots {
                 .get_intent_receipt(&intent.object_id, &intent.intent_id)?
                 .is_some()
         {
-            // Compact terminal identities are retry evidence, never executors.
             return Ok(false);
         }
-        use crate::metadata_summary::repair_root_for_intent;
-        if repair_root_for_intent(object, intent, None, false, &BTreeMap::new()).is_some() {
-            return Ok(true);
+        let current = backend.get_version(&object.object_id, &object.version)?;
+        let version = backend.get_version(&object.object_id, &intent.target_version)?;
+        if intent.publication.is_current() || version.is_none() {
+            return Ok(crate::metadata_summary::repair_root_for_intent(
+                object,
+                intent,
+                version.as_ref(),
+                current.as_ref(),
+                false,
+                &BTreeMap::new(),
+            )
+            .is_some_and(|root| root.is_live(crate::dfs_now_unix_nanos())));
         }
-        let Some(version) = backend
-            .get_version(&object.object_id, &intent.target_version)?
-            .filter(|version| version.has_retention_grant())
-        else {
+        let version = version.expect("checked target version");
+        if !version.has_retention_grant() {
             return Ok(false);
-        };
+        }
         if self.history.is_none() {
             let mut high = BTreeMap::new();
             walk_metadata_pages(|cursor| {
@@ -727,10 +733,11 @@ impl ObjectRepairRoots {
             ));
         }
         let (high, pins) = self.history.as_ref().expect("loaded history roots");
-        Ok(repair_root_for_intent(
+        Ok(crate::metadata_summary::repair_root_for_intent(
             object,
             intent,
             Some(&version),
+            current.as_ref(),
             pins.contains(&intent.target_version),
             high,
         )
@@ -744,36 +751,53 @@ fn repairs_from_intents_and_receipts(
     intents: &[DfsWriteIntentRecord],
     receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
 ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
-    let mut repairs = Vec::new();
-    let mut roots = ObjectRepairRoots::default();
+    let versions = versions_for_object_from_backend(backend, &object.object_id)?;
+    let pins = if versions
+        .iter()
+        .any(DfsObjectVersionRecord::has_retention_grant)
+    {
+        backend
+            .version_pins_for_object(&object.object_id)?
+            .into_iter()
+            .map(|pin| pin.version)
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut owners = Vec::new();
     for intent in intents {
-        if !roots.intent_owns_repair_work(backend, object, intent)? {
+        if backend
+            .get_intent_receipt(&intent.object_id, &intent.intent_id)?
+            .is_none()
+        {
+            owners.push(intent);
+        }
+    }
+    let now = crate::dfs_now_unix_nanos();
+    let mut repairs = Vec::new();
+    for (key, demand) in crate::metadata_summary::repair_demands_for_object(
+        object,
+        owners,
+        receipts_by_version.values().flatten(),
+        versions.iter(),
+        &pins,
+    ) {
+        if !demand.root.is_live(now) {
             continue;
         }
-        let receipt_nodes: BTreeSet<NodeId> = receipts_by_version
-            .get(&intent.target_version)
-            .into_iter()
-            .flatten()
-            .filter(|receipt| {
-                intent
-                    .content_hash
-                    .as_ref()
-                    .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
-            })
-            .map(|receipt| receipt.replica_node_id.clone())
-            .collect();
-        for node_id in &intent.desired_replica_node_ids {
-            if !receipt_nodes.contains(node_id) {
-                repairs.push(DfsOperatorRepairView {
-                    intent_id: intent.intent_id.clone(),
-                    file_system_id: intent.file_system_id.clone(),
-                    object_id: intent.object_id.clone(),
-                    version: intent.target_version.clone(),
-                    content_hash: intent.content_hash.clone(),
-                    missing_replica_node_id: node_id.clone(),
-                });
-            }
-        }
+        let Some(intent_id) = demand.owner_intent_id else {
+            // This existing wire row names an actual full intent. A separate
+            // version-demand projection must expose unowned durable goals.
+            continue;
+        };
+        repairs.push(DfsOperatorRepairView {
+            intent_id,
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: key.version,
+            content_hash: Some(key.content_hash),
+            missing_replica_node_id: key.replica_node_id,
+        });
     }
     Ok(repairs)
 }

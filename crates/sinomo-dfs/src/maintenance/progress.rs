@@ -213,6 +213,80 @@ impl Turn {
         checkpoint.phase = next;
         checkpoint.repair_before_placement = false;
     }
+    /// Per-page DATA for the existing bounded-tick handoff. This does not
+    /// finish the turn or acknowledge a recovery generation. The existing
+    /// reached-limit predicate must remain true, so normal runtime consumers
+    /// cannot mistake this report for whole-pass completion.
+    fn checkpointed_page_report(&self) -> Result<DfsMaintenanceTickReport, DfsError> {
+        let checkpoint = self.checkpoint.as_ref().expect("active turn");
+        if !super::dfs_maintenance_report_reached_limit(&checkpoint.report) {
+            return Err(DfsError::Metadata {
+                message: "unfinished maintenance page has no actual bounded progress".into(),
+            });
+        }
+        let mut state = self.owner.0.lock().map_err(|_| poisoned())?;
+        if state.native_generation != self.native_generation
+            || !state.uncheckpointed_births.is_empty()
+        {
+            return Err(DfsError::Metadata {
+                message: "bounded maintenance page lost its generation or durable births".into(),
+            });
+        }
+        state.progress_epoch = state.progress_epoch.wrapping_add(1);
+        Ok(checkpoint.report.clone())
+    }
+
+    pub(super) fn write_intent_page_report(self) -> Result<DfsMaintenanceTickReport, DfsError> {
+        let checkpoint = self.checkpoint.as_ref().expect("active turn");
+        if checkpoint.phase != Phase::WriteIntents
+            || !checkpoint.report.write_intents.scan_has_more
+            || checkpoint.report.write_intents.visited_intent_shard_count == 0
+        {
+            return Err(DfsError::Metadata {
+                message: "maintenance intent continuation lacks its actual bounded page".into(),
+            });
+        }
+        self.checkpointed_page_report()
+    }
+
+    /// Only this existing, acknowledged report identifies a repair sweep whose
+    /// earlier intent inventory already reached EOF. It is never inferred from
+    /// a queue count, a timer, or an ordinary metadata-input "generation".
+    pub(super) fn continues_repair_sweep(&self) -> bool {
+        let report = &self.checkpoint.as_ref().expect("active turn").report;
+        (self
+            .checkpoint
+            .as_ref()
+            .expect("active turn")
+            .scope
+            .options
+            .write_intent_max_records
+            == 0
+            || !report.write_intents.scan_has_more)
+            && report.repair_budget_exhausted
+            && report.repair_page_checkpoint.has_more
+            && (report.repair_page_checkpoint.completed_record_count > 0
+                || report.repair_page_checkpoint.operation_count > 0)
+    }
+
+    pub(super) fn repair_sweep_report_after_publish(
+        mut self,
+    ) -> Result<DfsMaintenanceTickReport, DfsError> {
+        let checkpoint = self.checkpoint.as_ref().expect("active turn");
+        if checkpoint.phase != Phase::Publish || !self.continues_repair_sweep() {
+            return Err(DfsError::Metadata {
+                message: "maintenance repair continuation lacks its checkpointed published page"
+                    .into(),
+            });
+        }
+        let report = self.checkpointed_page_report()?;
+        // This sole rewind follows the actual page's normal Publish phase.
+        // Revisit normal handoff/namespace/placement/lifecycle work per page;
+        // only the intent sweep's genuine EOF stays latched in this same report.
+        self.checkpoint.as_mut().expect("active turn").phase = Phase::Handoff;
+        Ok(report)
+    }
+
     pub(super) fn finish(mut self) -> Result<DfsMaintenanceTickReport, DfsError> {
         if self.phase() != Phase::Complete {
             return Err(DfsError::Metadata {
@@ -448,7 +522,7 @@ mod tests {
             .into_iter()
             .find(|row| row.shard_id == "services")
             .unwrap();
-        let primary = shard.primary_node_id;
+        let primary = shard.primary_node_id.clone();
         native
             .apply_placement_policy(
                 &primary,
@@ -472,6 +546,15 @@ mod tests {
             action: FaultAction::BudgetExhausted,
         });
         let mut writer = native.metadata_primary_service(path).unwrap();
+        let execution = writer
+            .acquire_prepared_execution(&crate::DfsPreparedOperationScope {
+                file_system_id: shard.file_system_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(&shard.shard_id),
+                owner_epoch: shard.epoch,
+                operation_id: "native-birth-checkpoint-admission".into(),
+            })
+            .unwrap()
+            .expect("real current producer shard execution admission");
         writer.coordinator.ensure_message_repair_job_capture();
         let written = writer
             .posix_write_file_with_operation_id(
@@ -533,7 +616,13 @@ mod tests {
             written.version
         );
         drop(reopened);
+        drop(execution);
         drop(writer);
         native.close().unwrap();
     }
 }
+
+#[cfg(test)]
+mod native_page_tests;
+#[cfg(test)]
+mod bounded_page_owner_tests;

@@ -443,7 +443,7 @@ fn registered_routed_stream_incoming_sender(
         .map(|registration| registration.sender.clone())
 }
 
-fn registered_routed_stream_incoming_token(local_node_id: &NodeId) -> Option<Id> {
+pub(crate) fn registered_routed_stream_incoming_token(local_node_id: &NodeId) -> Option<Id> {
     routed_stream_incoming_registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner())

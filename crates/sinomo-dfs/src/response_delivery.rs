@@ -272,6 +272,11 @@ pub(crate) struct DfsRoutedResponseInboxOwner {
 }
 
 impl DfsRoutedResponseInboxOwner {
+    #[cfg(test)]
+    pub(crate) fn inbox_identity_for_test(&self) -> usize {
+        Arc::as_ptr(&self.inbox) as usize
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             inbox: Arc::new(ResponseInbox::default()),

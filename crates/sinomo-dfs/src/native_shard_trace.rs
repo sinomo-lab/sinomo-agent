@@ -358,6 +358,20 @@ impl NativeShardTraceCapture {
             .original_commit_subscription
             .include_original_current_term_commits(false);
     }
+    /// Scalar frontier from this existing capture. Boundary packets receive
+    /// their ordinal before the call, then flush after its owner returns.
+    #[cfg(test)]
+    pub(crate) fn observation_frontier(&self) -> Option<u64> {
+        let state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.closed || state.dropped != 0 || state.incomplete != 0 {
+            return None;
+        }
+        Some(state.next_ordinal)
+    }
     /// Export raw facts, never a predicted finite state. JSON u64 values in native
     /// blobs require the lossless Python parser; envelope counters are decimal.
     pub fn export_raw(&self, output: impl Write) -> Result<(), MetadataBackendError> {

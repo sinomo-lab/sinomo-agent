@@ -398,11 +398,17 @@ pub(crate) struct RepairObservedResult {
 pub(crate) struct ClosedRepairBirth {
     root: crate::content_store::RepairPayloadRoot,
     closed_at_sequence: u64,
+    // Exact stored attachment DATA, not a content-equivalence reconstruction.
+    attachment: crate::DfsRpcAttachmentDescriptor,
 }
 
 impl ClosedRepairBirth {
     pub(crate) fn root(&self) -> &crate::content_store::RepairPayloadRoot {
         &self.root
+    }
+
+    pub(crate) fn attachment(&self) -> &crate::DfsRpcAttachmentDescriptor {
+        &self.attachment
     }
 }
 
@@ -484,6 +490,7 @@ fn closed_repair_proof(
     Ok(ClosedRepairBirth {
         root: birth.root.clone(),
         closed_at_sequence: sequence,
+        attachment: birth.attachment.clone(),
     })
 }
 
@@ -1621,7 +1628,7 @@ struct DfsRepairQueueState {
 #[cfg(test)]
 #[derive(Debug)]
 struct OriginalRepairCloseDenial {
-    identity: SelectedOriginalFixtureIdentity,
+    identity: attempt_witness::RepairQueuePhysicalOwner,
     subject: crate::content_store::RepairPayloadSubject,
     original_command_digest: String,
     hits: std::sync::atomic::AtomicUsize,
@@ -2143,6 +2150,39 @@ impl DfsRepairQueueState {
     }
 }
 
+// Scoped test-only observation boundary. The action runs AFTER the actual
+// row/token capture and BEFORE any reconcile mutex/writer is acquired.
+#[cfg(test)]
+type TransferCheckpointTestHook = Box<dyn FnOnce(&LocalDfsRepairQueueStore,
+    &DfsRepairAttemptRecord) -> Result<(), DfsError>>;
+#[cfg(test)]
+thread_local! {
+    static TRANSFER_CHECKPOINT_TEST_HOOK: std::cell::RefCell<Option<(
+        Arc<Mutex<DfsRepairQueueState>>, TransferCheckpointTestHook,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn with_transfer_checkpoint_hook_for_test<R>(
+    store: &LocalDfsRepairQueueStore,
+    hook: impl FnOnce(&LocalDfsRepairQueueStore, &DfsRepairAttemptRecord)
+        -> Result<(), DfsError> + 'static,
+    operation: impl FnOnce() -> R,
+) -> R {
+    TRANSFER_CHECKPOINT_TEST_HOOK.with(|slot| {
+        assert!(slot.borrow().is_none(), "one scoped transfer checkpoint test hook");
+        *slot.borrow_mut() = Some((Arc::clone(&store.inner), Box::new(hook)));
+    });
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            TRANSFER_CHECKPOINT_TEST_HOOK.with(|slot| { slot.borrow_mut().take(); });
+        }
+    }
+    let _clear = Clear;
+    // Synchronous current-thread operation only: no hook/permit is exported.
+    operation()
+}
+
 static DFS_REPAIR_QUEUE_STORES: OnceLock<
     Mutex<BTreeMap<PathBuf, Arc<Mutex<DfsRepairQueueState>>>>,
 > = OnceLock::new();
@@ -2554,6 +2594,31 @@ impl LocalDfsRepairQueueStore {
             .cloned())
     }
 
+    /// Failure-diagnostic DATA only: inspect all retained native births for an
+    /// exact actually observed subject, including Closed births absent in slots.
+    #[cfg(test)]
+    pub(crate) fn diagnostic_original_history_for_subject(
+        &self,
+        producer: &NodeId,
+        intent_id: &str,
+        target: &NodeId,
+        request_id: &str,
+    ) -> Result<Vec<RepairOriginalBirth>, DfsError> {
+        let mut state = self.lock_state()?;
+        if state.writer_held || state.resync_on_load {
+            return Err(custody_error("history diagnostic refuses writer/resync custody"));
+        }
+        state.refresh_from_disk()?;
+        let producer = producer.to_string();
+        let target = target.to_string();
+        Ok(state.custody.births.values().filter(|birth|
+            birth.root.subject.producer == producer
+                && birth.root.subject.intent_id == intent_id
+                && birth.root.subject.target == target
+                && birth.root.subject.request_id == request_id
+        ).cloned().collect())
+    }
+
     pub(crate) fn original_repair(
         &self,
         message: &crate::DfsRoutedMessage,
@@ -2696,19 +2761,70 @@ impl LocalDfsRepairQueueStore {
                 custody_error("native Repair dispatch lacks its complete original body")
             })?
         };
-        if birth.closed_at_sequence.is_some()
-            || !birth.observed.is_empty()
-            || original_repair_digest(message, &birth.attachment)?
-                != birth.root.original_command_digest
-            || !birth.attempts.iter().any(|attempt| {
+        let closed = birth.closed_at_sequence.is_some();
+        let observed = !birth.observed.is_empty();
+        let digest_matches = if !closed && !observed {
+            Some(
+                original_repair_digest(message, &birth.attachment)?
+                    == birth.root.original_command_digest,
+            )
+        } else {
+            None
+        };
+        let attempt_matches = if digest_matches == Some(true) {
+            Some(birth.attempts.iter().any(|attempt| {
                 attempt.frame_id == message.frame_id && attempt.message_id == message.message_id
-            })
-        {
+            }))
+        } else {
+            None
+        };
+        if closed || observed || digest_matches == Some(false) || attempt_matches == Some(false) {
+            tracing::debug!(
+                target: "sinomo.dfs.repair",
+                stage = "dfs.repair.dispatch.rejected",
+                intent_id = %birth.root.subject.intent_id,
+                request_id = %birth.root.subject.request_id,
+                producer = %birth.root.subject.producer,
+                target = %birth.root.subject.target,
+                frame_id = ?message.frame_id,
+                message_id = ?message.message_id,
+                closed_at_sequence = ?birth.closed_at_sequence,
+                observed_results = birth.observed.len(),
+                immutable_digest_matches = ?digest_matches,
+                carrier_attempt_matches = ?attempt_matches,
+                "native Repair dispatch rejected"
+            );
             return Err(custody_error(
                 "native Repair dispatch differs from its open original/attempt or awaits result application",
             ));
         }
         Ok(birth)
+    }
+
+    /// Retire only a queued reader whose exact Original/known carrier already
+    /// has a native irreversible close. Absence or an open birth grants nothing.
+    pub(crate) fn matching_closed_original_repair_dispatch(
+        &self,
+        message: &crate::DfsRoutedMessage,
+    ) -> Result<Option<ClosedRepairBirth>, DfsError> {
+        let mut state = self.lock_state()?;
+        state.refresh_from_disk()?;
+        let subject = repair_subject(&state.custody.incarnation, message)?;
+        let Some(birth) = state.custody.births.get(&subject) else {
+            return Ok(None);
+        };
+        if birth.closed_at_sequence.is_none() {
+            return Ok(None);
+        }
+        // A stale or changed header cannot borrow another request's closure.
+        if original_repair_digest(message, &birth.attachment)? != birth.root.original_command_digest
+            || !birth.attempts.iter().any(|attempt| {
+                attempt.frame_id == message.frame_id && attempt.message_id == message.message_id
+            })
+        {
+            return Err(custody_error("queued carrier differs from its actual closed Original"));
+        }
+        closed_repair_proof(&state.custody, &subject).map(Some)
     }
 
     pub(crate) fn record_original_repair_delivery(
@@ -2826,7 +2942,7 @@ impl LocalDfsRepairQueueStore {
             return Err(custody_error("original close denial must precede actual Committed observation on an open exact original"));
         }
         let denial = Arc::new(OriginalRepairCloseDenial {
-            identity,
+            identity: attempt_witness::RepairQueuePhysicalOwner::Selected(identity),
             subject,
             original_command_digest: birth.root.original_command_digest.clone(),
             hits: std::sync::atomic::AtomicUsize::new(0),
@@ -2834,6 +2950,96 @@ impl LocalDfsRepairQueueStore {
         state.original_close_denial = Some(Arc::clone(&denial));
         drop(state);
         Ok(OriginalRepairCloseDenialGuard { store: self.clone(), denial })
+    }
+
+    /// Negative-only DEFAULT-native test cut. The real registered OS owner and
+    /// already-loaded native queue supply physical identity, never fixture rows.
+    #[cfg(test)]
+    pub(crate) fn deny_default_original_repair_close_for_test(
+        &self,
+        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
+        original: &crate::DfsRoutedMessage,
+    ) -> Result<OriginalRepairCloseDenialGuard, DfsError> {
+        let identity = attempt_witness::RepairQueuePhysicalOwner::for_default(owner)?;
+        identity.check()?;
+        let mut state = self.lock_state()?;
+        if !identity.matches_state(&state) {
+            return Err(custody_error(
+                "default close denial selected a different native physical queue",
+            ));
+        }
+        attempt_witness::checked_loaded_prefix(&state)?;
+        if state.original_close_denial.is_some() {
+            return Err(custody_error("original close denial is already installed"));
+        }
+        let subject = repair_subject(&state.custody.incarnation, original)?;
+        let birth =
+            state.custody.births.get(&subject).ok_or_else(|| {
+                custody_error("default close denial has no actual synced Original")
+            })?;
+        birth.validate(&state.custody.incarnation)?;
+        if birth.original != *original || birth.closed_at_sequence.is_some() {
+            return Err(custody_error(
+                "default close denial must name the same actual unclosed Original",
+            ));
+        }
+        let denial = Arc::new(OriginalRepairCloseDenial {
+            identity,
+            subject,
+            original_command_digest: birth.root.original_command_digest.clone(),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+        });
+        state.original_close_denial = Some(Arc::clone(&denial));
+        drop(state);
+        Ok(OriginalRepairCloseDenialGuard {
+            store: self.clone(),
+            denial,
+        })
+    }
+
+    /// Exercise the real post-metadata/pre-cursor crash boundary with the SAME
+    /// scoped negative close guard. It creates no completion/application fact.
+    #[cfg(test)]
+    pub(crate) fn before_original_repair_settlement_for_test(
+        &self,
+        original: &crate::DfsRoutedMessage,
+    ) -> Result<(), DfsError> {
+        let state = self.lock_state()?;
+        let Some(denial) = state.original_close_denial.as_ref() else {
+            return Ok(());
+        };
+        // Existing selected controls retain their exact cursor-before-close cut.
+        if matches!(
+            &denial.identity,
+            attempt_witness::RepairQueuePhysicalOwner::Selected(_)
+        ) {
+            return Ok(());
+        }
+        let subject = repair_subject(&state.custody.incarnation, original)?;
+        if subject != denial.subject {
+            return Ok(());
+        }
+        denial.identity.check()?;
+        let birth = state
+            .custody
+            .births
+            .get(&subject)
+            .ok_or_else(|| custody_error("pre-settlement close denial lost actual Original"))?;
+        if !denial.identity.matches_state(&state)
+            || birth.original != *original
+            || birth.root.original_command_digest != denial.original_command_digest
+            || birth.closed_at_sequence.is_some()
+        {
+            return Err(custody_error(
+                "pre-settlement denial differs from its actual native physical Original",
+            ));
+        }
+        denial
+            .hits
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err(custody_error(
+            "actual default Original settlement held by its scoped negative test guard",
+        ))
     }
 
     pub(crate) fn close_applied_original_repair(
@@ -2858,9 +3064,8 @@ impl LocalDfsRepairQueueStore {
                 && denial.subject == ticket.subject
                 && birth.closed_at_sequence.is_none()
             {
-                let identity = state.selected_fixture.as_ref().ok_or_else(|| custody_error("original close denial lost its selected physical queue"))?;
-                if identity.root != denial.identity.root || identity.marker != denial.identity.marker
-                    || identity.snapshot_path != denial.identity.snapshot_path
+                denial.identity .check()?;
+                if !denial.identity.matches_state(state)
                     || birth.root.original_command_digest != denial.original_command_digest
                 {
                     return Err(custody_error("original close denial no longer names its actual physical origin"));
@@ -3315,6 +3520,16 @@ impl LocalDfsRepairQueueStore {
         )?;
         if records.as_slice() != std::slice::from_ref(before) {
             return Ok(false);
+        }
+        #[cfg(test)]
+        {
+            let hook = TRANSFER_CHECKPOINT_TEST_HOOK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.as_ref().is_some_and(|(owner, _)| Arc::ptr_eq(owner, &self.inner)) {
+                    slot.take().map(|(_, hook)| hook)
+                } else { None }
+            });
+            if let Some(hook) = hook { hook(self, before)?; }
         }
         Ok(matches!(
             self.reconcile_maintenance_page(
@@ -6706,16 +6921,46 @@ pub(crate) mod tests {
         assert_eq!(fs::metadata(&log).unwrap().len(), framed.len() as u64);
         write_file_atomic(&log, &framed).unwrap();
         let beta = record("beta", "node-beta", 0);
-        store.append_enqueues([beta.clone()]).unwrap();
+        let before = store.lock_state().unwrap().disk_fingerprint().unwrap();
         REPAIR_QUEUE_FULL_REPLAYS.set(0);
+        let error = store.append_enqueues([beta.clone()]).unwrap_err();
+        assert!(matches!(error, DfsError::Metadata { message }
+            if message == "repair queue changed before its locked append; retry the same observation"));
+        assert_eq!(fs::read(&log).unwrap(), framed);
         assert_eq!(
-            store.view_for_maintenance().unwrap().0.records,
-            vec![alpha, beta]
+            store.lock_state().unwrap().disk_fingerprint().unwrap(),
+            before
         );
         assert_eq!(
             REPAIR_QUEUE_FULL_REPLAYS.get(),
+            0,
+            "rejected append cannot adopt or replay the external prefix"
+        );
+
+        let refreshed = store.view_for_maintenance().unwrap().0;
+        assert_eq!(refreshed.head_sequence, 1);
+        assert_eq!(refreshed.records, vec![alpha.clone()]);
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
             1,
-            "own append must hash its known prefix, not silently adopt a changed earlier frame"
+            "one explicit native observation replays the changed valid prefix"
+        );
+        assert_eq!(
+            fs::read(&log).unwrap(),
+            framed,
+            "observation leaves the actual prefix unchanged"
+        );
+
+        // Retry only the SAME scheduling DATA after the explicit native
+        // observation. No Original command, carrier or write is replayed here.
+        assert_eq!(store.append_enqueues([beta.clone()]).unwrap(), 1);
+        let appended = store.view_for_maintenance().unwrap().0;
+        assert_eq!(appended.head_sequence, 2);
+        assert_eq!(appended.records, vec![alpha, beta]);
+        assert_eq!(
+            REPAIR_QUEUE_FULL_REPLAYS.get(),
+            1,
+            "owned append extends the newly observed prefix without another replay"
         );
     }
 

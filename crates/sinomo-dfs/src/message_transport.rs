@@ -115,7 +115,6 @@ pub(crate) fn native_snapshot_routed_call(
 pub struct DfsRoutedSend {
     pub target_node_id: NodeId,
     pub call: DfsRoutedCall,
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) native_repair_custody: Option<crate::runtime_host::PreparedNativeRepairCustody>,
 }
 
@@ -124,7 +123,6 @@ impl DfsRoutedSend {
         Self {
             target_node_id,
             call,
-            #[cfg(any(test, feature = "test-support"))]
             native_repair_custody: None,
         }
     }
@@ -264,6 +262,17 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         })
     }
 
+    /// Scalar options only, never a native-return or publication capability.
+    /// A concrete native owner preserves the SAME absolute operation deadline;
+    /// consumers must not restart a remaining Duration after preparation/await.
+    /// Custom transports default to unsupported without changing their legacy
+    /// no-Original path or supplying a stronger native proof.
+    fn native_replica_send_options(
+        &self,
+    ) -> Result<Option<(crate::DfsObjectRpcSendOptions, Option<Instant>)>, NetworkError> {
+        Ok(None)
+    }
+
     /// Runtime-local response custody only. The service retains authority checks.
     fn register_routed_write_response_owner(
         &mut self,
@@ -304,7 +313,6 @@ pub trait DfsMessageTransport: DfsTransportIdentity {
         requests: Vec<DfsRoutedSend>,
         _max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
-        #[cfg(any(test, feature = "test-support"))]
         if requests.iter().any(|request| request.native_repair_custody.is_some()) {
             return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
         }
@@ -531,7 +539,6 @@ pub trait AsyncDfsMessageTransport: Send {
         _max_inflight: usize,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
         Box::pin(async move {
-            #[cfg(any(test, feature = "test-support"))]
             if requests.iter().any(|request| request.native_repair_custody.is_some()) {
                 return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
             }
@@ -682,7 +689,6 @@ impl DfsMessageTransport for sinomo_core::network::InProcessTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
-        #[cfg(any(test, feature = "test-support"))]
         if requests.iter().any(|request| request.native_repair_custody.is_some()) {
             return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
         }

@@ -211,6 +211,7 @@ mod smoke;
 mod transfer;
 mod write_configuration_inputs;
 mod write_configuration_projection;
+mod write_precondition;
 
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockCommand, DfsAdvisoryLockConflict,
@@ -226,10 +227,11 @@ pub use browser_api::*;
 pub use browser_service::{
     DFS_CORE_BROWSER_ROUTES, DFS_CORE_COMPONENT_ACCESS_OPERATION, DFS_CORE_COMPONENT_ACCESS_ROUTE,
     DFS_CORE_COMPONENT_INTERFACE, DFS_CORE_COMPONENT_INTERFACE_VERSION, DfsBrowserBackend,
-    DfsBrowserServiceHost, HostedDfsBrowserService, HostedDfsPlacementAuthorityAdminService,
+    DfsBrowserMutationAttempt, DfsBrowserServiceHost, HostedDfsBrowserService,
+    HostedDfsPlacementAuthorityAdminService,
     authorize_dfs_core_component_access, dfs_browser_component_host,
     dfs_core_component_requirement, normalize_sifs_browser_path, register_dfs_browser_services,
-    run_blocking_browser_task, run_blocking_service_task,
+    run_blocking_browser_task, run_blocking_browser_task_unqueued, run_blocking_service_task, run_configured_browser_task,
 };
 pub use default_projection::*;
 #[cfg(feature = "test-support")]
@@ -291,6 +293,7 @@ pub(crate) use runtime_publish::{
 pub use write_configuration_projection::DfsWriteConfigurationProjection;
 #[cfg(feature = "test-support")]
 pub mod browser_test_support {
+    pub use super::browser_service::acquire_browser_fifo_for_test;
     pub use super::browser_service::dfs_browser_backend_open_count as daemon_dfs_browser_backend_open_count;
     pub use super::browser_service::{
         DaemonDfsBrowserPlacementConnectivitySnapshot, DfsBrowserBackend,
@@ -760,6 +763,7 @@ pub use protocol::{
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof,
     DfsMessageCommand, DfsMessageResponse, DfsMetadataAuthorityOperation,
+    DfsMkdirAtNoLinksWithAttrs,
     DfsOriginalRepairHead, DfsOriginalRepairMaterial, DfsSelectedOriginalRepairCommand,
     DfsImportedRepairHistoryRef, DfsOriginalRepairHistoryQueryRef, DfsOriginalRepairHistoryCarrier,
     DfsOriginalRepairHistoryRequest, DfsOriginalRepairHistoryResponse, DfsOriginalRepairHistoryResult,

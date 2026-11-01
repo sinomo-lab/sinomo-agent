@@ -460,6 +460,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_groups = Vec::new();
         #[cfg(any(test, feature = "test-support"))]
+        let mut diagnostic_selections = Vec::new();
+        #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_unavailable = Vec::new();
         #[cfg(any(test, feature = "test-support"))]
         let mut diagnostic_direct = None;
@@ -547,6 +549,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // Background replication can close the gap independently.
                     continue;
                 };
+                #[cfg(any(test, feature = "test-support"))]
+                if diagnostic_root.is_some() {
+                    diagnostic_selections.push(serde_json::json!({
+                        "target_node_ids": target_node_ids,
+                        "replicated_through_sequence": replicated_through_sequence,
+                        "captured_current_cut_sequence": prepared_prefix.journal_sequence,
+                        "actual_first_selected_sequence": target_batch.entries.first().map(|entry| entry.sequence),
+                        "actual_last_selected_sequence": target_batch.entries.last().map(|entry| entry.sequence),
+                        "actual_selected_entry_count": target_batch.entries.len(),
+                    }));
+                }
                 let journal_frames = self
                     .metadata_backend
                     .as_ref()
@@ -865,6 +878,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     serde_json::json!({
                         "operation": operation, "result": format!("{result:?}"),
                         "original_direct_groups": diagnostic_groups,
+                        "actual_batch_selections": diagnostic_selections,
                         "unavailable_batches": diagnostic_unavailable,
                         "actual_direct_result": format!("{diagnostic_direct:?}"),
                         "actual_routed_sends": format!("{diagnostic_routed:?}"),
@@ -1732,3 +1746,7 @@ mod authority_cursor_tests {
         runtime.close().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "service_replica/promoted_primary_native_tests.rs"]
+mod promoted_primary_native_tests;

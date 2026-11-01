@@ -1,0 +1,17 @@
+# Product agent-HOME command checks use the actual kernel SIFS mount on two
+# nodes in different segments. Other nodes retain the ordinary dev image.
+x-consumer-fuse: &consumer-fuse
+  image: sinomo-dev-pjdfstest-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile.pjdfstest
+  cap_add: [SYS_ADMIN]
+  # Bubblewrap uses pivot_root for the product's live mount projection.
+  security_opt: [seccomp=unconfined]
+  devices: [/dev/fuse:/dev/fuse]
+
+services:
+  node1:
+    <<: *consumer-fuse
+  node5:
+    <<: *consumer-fuse

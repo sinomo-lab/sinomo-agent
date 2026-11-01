@@ -17,6 +17,22 @@ pub(crate) enum DaemonDfsPublishPlanningAttemptOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
     ContentStoreCacheAccess,
+    #[cfg(test)]
+    LocalPlacementAuthorityAcquired {
+        job_id: &'a str,
+        path: &'a str,
+        namespace_shards: Option<&'a [crate::DfsMetadataShardConfig]>,
+    },
+    #[cfg(test)]
+    BeforeLocalPlacementIntentPublication {
+        job_id: &'a str,
+        intent_id: &'a str,
+        owner_epoch: u64,
+    },
+    #[cfg(test)]
+    BeforeMetadataEffectPrepare {
+        payload: &'a crate::DfsPreparedOperationPayload,
+    },
     ExactLaneCacheAccess,
     BeforePreflightFence,
     AfterPreflightFence,
@@ -79,6 +95,10 @@ pub(crate) enum DaemonDfsPreDispatchTestPoint<'a> {
         admission_held: bool,
     },
     AfterExecute,
+    #[cfg(test)]
+    AfterMessageResponse {
+        response: &'a crate::DfsMessageResponse,
+    },
     /// Facts from a Running copy job reloaded at its durable step boundary.
     BeforeContentCopyStep {
         job_id_digest: [u8; 32],
@@ -1420,6 +1440,11 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
                 selected.as_deref(),
                 inspection.as_ref(),
             )
+        });
+        let fresh_response_runtime = tokio_runtime.clone();
+        let fresh_paths = paths.clone();
+        worker.set_fresh_repair_response_handler(move |fresh| {
+            handle_fresh_original_repair_return(&fresh_paths, &fresh_response_runtime, fresh)
         });
         let response_runtime = tokio_runtime.clone();
         worker.set_background_response_handler(move |message, original| {
@@ -3145,6 +3170,7 @@ pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
         runtime,
         traceparent,
         None,
+    None,
     )
 }
 
@@ -3164,6 +3190,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    fresh_original_repair: Option<crate::runtime_host::FreshOriginalRepairReturn>,
 ) -> Result<DaemonDfsMessageDispatchAttempt, sinomo_dfs::DfsError> {
     let trace_started = Instant::now();
     #[cfg(any(test, feature = "test-support"))]
@@ -3380,6 +3407,7 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
             .map(crate::publication_guard::DfsPublicationExecutionScope::owners),
         publication_provider,
         completed_phase,
+        fresh_original_repair,
         |repair_queue_records| {
             persist_daemon_dfs_repair_queue_records(data_dir, repair_queue_records)
         },
@@ -3573,6 +3601,16 @@ fn attempt_daemon_dfs_message_command_with_remote_phase(
     if let Some(hook) = execution_test_hook {
         hook(
             DaemonDfsPreDispatchTestPoint::AfterExecute,
+            observed_command.as_ref(),
+            metadata_authority_preflight.as_ref(),
+        )?;
+        // Borrow actual receiver-produced DATA only. This test observer cannot
+        // construct an owned native return or alter its transport provenance.
+        #[cfg(test)]
+        hook(
+            DaemonDfsPreDispatchTestPoint::AfterMessageResponse {
+                response: &response,
+            },
             observed_command.as_ref(),
             metadata_authority_preflight.as_ref(),
         )?;
@@ -4140,6 +4178,14 @@ async fn prepare_daemon_dfs_genesis_ingress(
             }
             // No root-cache mutex, shard lease or mutation admission survives
             // this existing async owner wait. Caller cancellation stops waiting.
+            if daemon_dfs_message_preempts_maintenance(&command.routed_message.message) {
+                let scheduler = daemon_dfs_mutation_scheduler(data_dir).map_err(|error| {
+                    sinomo_dfs::DfsError::Metadata {
+                        message: error.to_string(),
+                    }
+                })?;
+                scheduler.request_foreground_admission();
+            }
             handle.wait_until_checkout_available().await?;
         }
     }
@@ -4657,6 +4703,7 @@ pub(crate) async fn handle_daemon_dfs_message_with_encoded_size_async(
                     &process_runtime,
                     process_traceparent.clone(),
                     process_completed_phase.map(|completed| *completed),
+                None,
                 )
             });
             // A blocking task keeps running when its async JoinHandle is dropped.
@@ -4924,6 +4971,49 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
     background_response: bool,
     original_repair: Option<&sinomo_dfs::DfsRoutedMessage>,
 ) -> Result<sinomo_dfs::DfsMessageResponse, DaemonError> {
+    handle_daemon_dfs_message_on_runtime_with_native_return(
+        paths,
+        command,
+        runtime,
+        background_response,
+        original_repair,
+        None,
+    )
+}
+
+fn handle_fresh_original_repair_return(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    fresh: crate::runtime_host::FreshOriginalRepairReturn,
+) -> Result<(), crate::DfsError> {
+    let original = fresh.carrier().clone();
+    let returned = fresh.returned_frame().clone();
+    let command = DfsMessageCommand {
+        request_id: format!("dfs_fresh_original_repair_{}", fresh.rpc_request_id()),
+        routed_message: returned,
+    };
+    handle_daemon_dfs_message_on_runtime_with_native_return(
+        paths,
+        command,
+        runtime,
+        true,
+        Some(&original),
+        Some(fresh),
+    )
+    .map(|_| ())
+    .map_err(|error| crate::DfsError::Metadata {
+        message: error.to_string(),
+    })
+}
+
+fn handle_daemon_dfs_message_on_runtime_with_native_return(
+    paths: &DaemonPaths,
+    command: DfsMessageCommand,
+    runtime: &tokio::runtime::Handle,
+    background_response: bool,
+    original_repair: Option<&sinomo_dfs::DfsRoutedMessage>,
+    fresh_original_repair: Option<crate::runtime_host::FreshOriginalRepairReturn>,
+) -> Result<sinomo_dfs::DfsMessageResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -5007,11 +5097,12 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
     } else {
         None
     };
-    let result = process_daemon_dfs_message_command_on_runtime(
+    let result = match attempt_daemon_dfs_message_command_with_remote_phase(
         &data_dir,
         &cluster_paths,
         &peer_snapshot,
         command,
+        None,
         None,
         &execution_scope,
         original_repair.is_some(),
@@ -5021,7 +5112,21 @@ fn handle_daemon_dfs_message_on_runtime_with_priority(
         &mut mutation_admission,
         runtime,
         None,
-    )?;
+    None,
+        fresh_original_repair,
+    )?{
+        DaemonDfsMessageDispatchAttempt::Complete(result) => result,
+        DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(retry) => {
+            return Err(retry.stale.into_dfs_error().into());
+        }
+        DaemonDfsMessageDispatchAttempt::RemoteNamespacePhase(_, phase) => {
+            phase.cancel_before_dispatch()?;
+            return Err(crate::DfsError::Metadata {
+                message: "Repair callback cannot own a remote namespace phase".into(),
+            }
+            .into());
+        }
+    };
     let Some(result) = result else {
         return Err(DaemonError::ClusterOrphan);
     };

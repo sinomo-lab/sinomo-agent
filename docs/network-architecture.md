@@ -161,21 +161,27 @@ Newer external records and explicit source clears still supersede that cache.
 
 A cold routed caller can recover live evidence during carrier establishment
 through the existing authenticated `/cluster/network/connectivity` read. It
-accepts remote rows only from their authenticated source, against the exact
-canonical semantic baseline and current member/endpoint bindings, and rechecks
-the directory cut after the reads. Semantic matching uses the same predicate as
+accepts rows only from their authenticated source, within the current authorized
+member and endpoint bindings, and rechecks the directory cut after the reads.
+For an existing canonical key, semantic matching uses the same predicate as
 quorum publication: a source-owned failure count may progress or reset within
 the same confirmed health state and failure reason. Such a count remains part
 of local failure-budget processing and route-cache ordering; its existing local
-persistence and reconciliation are unchanged. It does not require a redundant
-quorum update before an authenticated live observation can be used. State,
-failure-reason, endpoint and generation changes still require their existing
-confirmation. A successful direct read also supplies an actual local edge
-observation. Third-party rows cannot renew another source's
-evidence. Reads share the existing establishment deadline, have bounded
-concurrency, and are dropped on completion or cancellation. A pooled live carrier
-needs no such refresh. The original operation is dispatched only after carrier
-establishment, retaining its identity and body.
+persistence and reconciliation are unchanged. State, failure-reason, endpoint
+and generation changes for an existing key still require their confirmation.
+
+A healthy source-owned observation with no failure reason may also supply an
+otherwise absent edge for a bounded, request-local carrier trial. This does not
+change canonical or stored connectivity, confirm a semantic generation, postpone
+a publication deadline, or grant membership or effect authority. Existing
+canonical keys, identity quarantine and newer accepted failure evidence retain
+precedence. The trial must realize the authorized path and establish the actual
+target identity before the original operation is dispatched. A successful
+direct read also supplies an actual local edge observation. Third-party rows
+cannot supply or renew another source's evidence. Reads share the existing
+establishment deadline, have bounded concurrency, and are dropped on completion
+or cancellation. A pooled live carrier needs no such refresh. The original
+operation retains its identity and body.
 
 When a source reply makes the next bridge reachable, the same request can read
 that bridge through the ordinary authenticated carrier. Each reachable source

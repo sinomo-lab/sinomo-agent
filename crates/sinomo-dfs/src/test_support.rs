@@ -103,6 +103,26 @@ pub fn original_repair_slot_snapshot(
             message: error.to_string(),
         })
 }
+/// Read-only evidence for the actual queue Original's current payload pin.
+/// False means no Original slot was found; it never means NotApplied.
+/// True is an observed local content/pin check, not dispatch or publication authority.
+pub fn inspect_original_repair_payload(
+    store: &LocalDfsRepairQueueStore,
+    content_root: &std::path::Path,
+    intent_id: &str,
+    target: &sinomo_core::node::NodeId,
+) -> Result<bool, DfsError> {
+    let Some(birth) = store.original_repair_for_slot(intent_id, target)? else {
+        return Ok(false);
+    };
+    // Validate the retained original and its actually named initial attempt;
+    // callers never supply a root, body or synthetic dispatch identity.
+    let actual = store.validate_original_repair_dispatch(&birth.original)?;
+    crate::content_store::RepairPayloadInspectionContext::for_default(content_root)
+        .inspect(&actual.root)?;
+    Ok(true)
+}
+
 use sinomo_core::node::NodeId;
 
 /// One ordinary hosted current metadata authority, retained with its real

@@ -1110,7 +1110,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     // soon as the runtime enters the loop below. Notify service-owned workers
     // through an in-process edge so startup never depends on a polling timer.
     service_host.notify_component_host_ready();
-    daemon_runtime.block_on(run_daemon_control_accept_loop(
+    let accept_result = daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
         paths.clone(),
         label.to_string(),
@@ -1119,7 +1119,10 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         daemon_runtime_handle.clone(),
         shutdown_tx,
         shutdown_rx.clone(),
-    ))?;
+    ));
+    if let Err(error) = &accept_result {
+        tracing::error!(%error, "sinomo {label} control accept loop failed; shutting down");
+    }
     let component_shutdown =
         service_host.shutdown_components(&daemon_runtime_handle, DAEMON_RUNTIME_TASK_JOIN_TIMEOUT);
     let _ = shutdown_signal.send(true);
@@ -1135,7 +1138,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     drain_daemon_runtime_after_task_shutdown(&daemon_runtime);
     crate::append_operational_event_best_effort(
         &paths,
-        if component_shutdown.is_ok() {
+        if accept_result.is_ok() && component_shutdown.is_ok() {
             crate::OperationalSeverity::Info
         } else {
             crate::OperationalSeverity::Error
@@ -1146,19 +1149,30 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         } else {
             "daemon.lifecycle.stop-incomplete"
         },
-        match &component_shutdown {
-            Ok(()) => format!("sinomo {label} stopped"),
-            Err(error) => format!("sinomo {label} component shutdown remains incomplete: {error}"),
+        match (&accept_result, &component_shutdown) {
+            (Ok(()), Ok(())) => format!("sinomo {label} stopped"),
+            (Err(error), Ok(())) => {
+                format!("sinomo {label} stopped after control accept loop failed: {error}")
+            }
+            (Ok(()), Err(error)) => {
+                format!("sinomo {label} component shutdown remains incomplete: {error}")
+            }
+            (Err(accept), Err(shutdown)) => format!(
+                "sinomo {label} control accept loop failed: {accept}; component shutdown remains incomplete: {shutdown}"
+            ),
         },
         None,
         serde_json::json!({
             "label": label,
             "address": bind_address,
             "pid": std::process::id(),
+            "accept_loop_error": accept_result.as_ref().err().map(ToString::to_string),
+            "component_shutdown_error": component_shutdown.as_ref().err().map(ToString::to_string),
         }),
     );
     daemon_runtime.shutdown_timeout(DAEMON_RUNTIME_SHUTDOWN_TIMEOUT);
-    component_shutdown
+    // Preserve the original run failure even when component shutdown also fails.
+    accept_result.and(component_shutdown)
 }
 
 fn join_daemon_runtime_task(

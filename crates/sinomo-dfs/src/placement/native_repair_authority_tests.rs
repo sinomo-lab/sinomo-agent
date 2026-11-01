@@ -287,14 +287,13 @@ fn native_stale_placement_custody(recover: bool) {
         successor
     });
     let deadline = std::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let mut recovery_ticks = Vec::new();
     for _ in 0..8 {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(!remaining.is_zero(), "existing native repair deadline");
-        runtime
-            .maintenance_tick(&nodes[0], remaining)
-            .unwrap()
-            .outcome
-            .unwrap();
+        let tick = runtime.maintenance_tick(&nodes[0], remaining).unwrap();
+        recovery_ticks.push(format!("{tick:?}"));
+        tick.outcome.unwrap();
         let started = store
             .view()
             .unwrap()
@@ -323,11 +322,28 @@ fn native_stale_placement_custody(recover: bool) {
         }
     }
     let final_queue = store.view().unwrap();
+    let current_progress = control.with_client(|kv| {
+        let mut store = DfsControlPlaneStore::new(kv.as_mut());
+        let fs = &runtime.file_system().file_system_id;
+        serde_json::json!({
+            "filesystem":store.get_file_system_config(fs).map_err(|error| error.to_string()),
+            "original_job":store.placement_reconciliation(fs, &job_id).map_err(|error| error.to_string()),
+            "successor_job":store.placement_reconciliation(fs, &successor.job_id).map_err(|error| error.to_string())
+        })
+    });
+    let rpc_count = runtime.checkpoint_rpc_observation_window().unwrap();
+    if rpc_count > 0 {
+        runtime.export_latest_rpc_observation_checkpoint(
+            &runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-stale-plan-recovery-rpc.json"),
+        ).unwrap();
+    }
     std::fs::write(
         runtime.data_dir(&nodes[0]).root().join("boundary-diagnostic-stale-plan-recovery.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "original": after.records, "reopened": reopened.records,
             "successor": successor.job_id, "final": final_queue.records,
+            "existing_tick_observations":recovery_ticks,"current_native_progress":current_progress,
+            "checkpointed_rpc_records":rpc_count,
             "qualification": "Actual Main stop/reopen and a new accepted placement plan; original content identities unchanged."
         })).unwrap(),
     ).unwrap();

@@ -586,12 +586,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } else {
             self.is_local_metadata_primary_for_object(&anchor)?
         };
-        let rooted = active
-            || self.retained_file_content_is_live(
-                &record.object_id,
-                &record.target_version,
-                hash,
-            )?;
+        let rooted = active || self.committed_repair_content_is_active(&anchor, record)?;
         if !rooted && record.status == DfsWriteIntentStatus::Committed {
             self.park_inactive_retained_repair(record)?;
             return Ok(());

@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod no_links;
+
 const DAEMON_RPC_CATEGORY: &str = "daemon";
 
 /// Generic owner-checked access used by optional filesystem feature components.
@@ -29,6 +31,7 @@ pub const DFS_CORE_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+    DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
@@ -111,6 +114,34 @@ pub fn dfs_browser_component_host(
 
 /// Daemon/process effects used by the DFS-owned browser services.
 pub trait DfsBrowserServiceHost: Send + Sync + 'static {
+    /// Borrow the existing host runtime; never substitute the caller executor.
+    fn browser_open_runtime(&self) -> Option<tokio::runtime::Handle> {
+        None
+    }
+
+    /// Read input only. Hosted cold opens join their existing configuration
+    /// owner without refreshing content observations or acquiring a writer.
+    fn browser_open_configuration_readiness(
+        &self,
+    ) -> Result<crate::DfsWriteConfigurationReadiness, ServiceError> {
+        Ok(crate::DfsWriteConfigurationReadiness::Ready(None))
+    }
+
+    fn ready_browser_open_configuration<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<
+        Output = Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, ServiceError>,
+    > + Send + 'a>> {
+        Box::pin(async move {
+            match self.browser_open_configuration_readiness()? {
+                crate::DfsWriteConfigurationReadiness::Ready(view) => Ok(view),
+                crate::DfsWriteConfigurationReadiness::Pending => Err(dfs_browser_service_error(
+                    "browser configuration is pending without a hosted readiness owner",
+                )),
+            }
+        })
+    }
+
     fn ensure_write_configuration_ready<'a>(
         &'a self,
         _data_dir: &'a SinomoDataDir,
@@ -447,10 +478,11 @@ impl Drop for BrowserMutation<'_> {
     }
 }
 
-/// Queue admitted RPCs fairly before allocating a blocking worker. The route
-/// registry bounds concurrency and the overall handler deadline. Keep the
-/// permit in the blocking closure: cancelling its caller does not stop an
-/// already executing filesystem operation.
+/// Prepare hosted cold core inputs, then queue backend work fairly before
+/// allocating a blocking worker. The route/caller owns the overall deadline.
+/// Registered cold contexts join their existing configuration owner and open
+/// the cached core backend before invoking the task at most once. Keep the
+/// FIFO permit in the blocking closure through an executing filesystem call.
 pub async fn run_blocking_browser_task<T>(
     data_dir: Arc<SinomoDataDir>,
     route: impl Into<String>,
@@ -460,15 +492,125 @@ pub async fn run_blocking_browser_task<T>(
 where
     T: Send + 'static,
 {
-    let execution = tracing::Instrument::instrument(
-        Arc::clone(&browser_backend_slot(&data_dir)?.execution).lock_owned(),
-        tracing::trace_span!(target: "sinomo.perf", "dfs.browser.admission", stage = "dfs.browser.admission"),
-    ).await;
-    run_blocking_service_task(route, label, move || {
-        let _execution = execution;
-        task()
-    })
-    .await
+    run_browser_task_with_admission(data_dir, route, label, task, true).await
+}
+
+/// Preserve callers that already have separate admission and intentionally do
+/// not queue behind namespace work. Cold input still joins the SAME core owner.
+pub async fn run_blocking_browser_task_unqueued<T>(
+    data_dir: Arc<SinomoDataDir>,
+    route: impl Into<String>,
+    label: &'static str,
+    task: impl FnOnce() -> Result<T, ServiceError> + Send + 'static,
+) -> Result<T, ServiceError>
+where T: Send + 'static,
+{
+    run_browser_task_with_admission(data_dir, route, label, task, false).await
+}
+
+async fn browser_backend_is_cold(
+    slot: Arc<DfsBrowserBackendSlot>,
+    route: String,
+) -> Result<bool, ServiceError> {
+    let observed = {
+        match slot.backend.try_lock() {
+            Ok(backend) => Some(backend.is_none()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                return Err(dfs_browser_service_error(error));
+            }
+        }
+    };
+    if let Some(cold) = observed { return Ok(cold); }
+    // UNKNOWN contention is neither cold nor warm. Borrow the existing task
+    // runtime to observe the actual cache owner after its mutex is released.
+    // The enclosing caller/route still bounds this read-only observation.
+    run_blocking_service_task(route, "DFS browser initialization state", move || {
+        slot.backend.lock().map(|backend| backend.is_none())
+            .map_err(dfs_browser_service_error)
+    }).await
+}
+
+async fn run_browser_task_with_admission<T>(
+    data_dir: Arc<SinomoDataDir>,
+    route: impl Into<String>,
+    label: &'static str,
+    task: impl FnOnce() -> Result<T, ServiceError> + Send + 'static,
+    namespace_admission: bool,
+) -> Result<T, ServiceError>
+where T: Send + 'static,
+{
+    let route = route.into();
+    let slot = browser_backend_slot(&data_dir)?;
+    let host = slot.host.lock().map_err(dfs_browser_service_error)?
+        .as_ref().and_then(std::sync::Weak::upgrade);
+    // The enclosing service route/caller owns the original overall deadline.
+    // No new timeout begins on configuration, FIFO, or blocking-worker entry.
+    loop {
+        let cold = browser_backend_is_cold(Arc::clone(&slot), route.clone()).await?;
+        if cold && let Some(host) = host.as_ref() {
+            host.ready_browser_open_configuration().await?;
+        }
+        let execution = if namespace_admission {
+            Some(tracing::Instrument::instrument(
+                Arc::clone(&slot.execution).lock_owned(),
+                tracing::trace_span!(target: "sinomo.perf", "dfs.browser.admission", stage = "dfs.browser.admission"),
+            ).await)
+        } else { None };
+        let observed = {
+            match slot.backend.try_lock() {
+                Ok(backend) => Some(backend.is_none()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    return Err(dfs_browser_service_error(error));
+                }
+            }
+        };
+        let Some(cold) = observed else {
+            // An unqueued constructor may own the cache mutex. Never hold the
+            // namespace FIFO while waiting to observe that existing owner.
+            drop(execution);
+            let cold = browser_backend_is_cold(Arc::clone(&slot), route.clone()).await?;
+            if cold && let Some(host) = host.as_ref() {
+                host.ready_browser_open_configuration().await?;
+            }
+            continue;
+        };
+        let configuration = if cold && let Some(host) = host.as_ref() {
+            match host.browser_open_configuration_readiness()? {
+                crate::DfsWriteConfigurationReadiness::Ready(view) => view,
+                crate::DfsWriteConfigurationReadiness::Pending => {
+                    // A queued request observed a later gap. Release the FIFO
+                    // before joining that SAME owner; task has not run once.
+                    drop(execution);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
+        } else { None };
+        return run_blocking_service_task(route, label, move || {
+            let _execution = execution;
+            if let (Some(host), Some(configuration)) = (host, configuration) {
+                // Reuse the actual Current cut instead of repeating the cold
+                // replica-candidate projection read after FIFO admission.
+                let runtime = host.browser_open_runtime().ok_or_else(||
+                    dfs_browser_service_error("cold browser configuration has no hosted runtime"))?;
+                DfsBrowserBackend::for_data_dir_with_configuration(
+                    Arc::clone(&data_dir), &runtime, host, Some(configuration),
+                )?;
+            }
+            task()
+        }).await;
+    }
+}
+
+/// Borrow the actual namespace FIFO for a test observation only. This does
+/// not open storage, join configuration or supply native mutation permission.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn acquire_browser_fifo_for_test(
+    data_dir: &SinomoDataDir,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, ServiceError> {
+    Ok(Arc::clone(&browser_backend_slot(data_dir)?.execution).lock_owned().await)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -500,9 +642,69 @@ const DAEMON_DFS_BROWSER_READ_LOCK_ADMISSION_TIMEOUT: Duration = Duration::from_
 const DAEMON_DFS_BROWSER_PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const DAEMON_DFS_BROWSER_STAT_CACHE_MAX_ENTRIES: usize = 256;
 
-enum DfsBrowserWriteAttempt {
-    Complete(crate::DaemonDfsBrowserWriteFileResponse),
-    ConfigurationPending(crate::DaemonDfsBrowserWriteFileRequest),
+/// A pending configuration result is returned only before the mutation closure
+/// runs. The caller retains the original payload without replaying an effect.
+#[derive(Debug)]
+pub enum DfsBrowserMutationAttempt<P, R> {
+    Complete(R),
+    ConfigurationPending(P),
+}
+
+type DfsBrowserWriteAttempt = DfsBrowserMutationAttempt<
+    crate::DaemonDfsBrowserWriteFileRequest,
+    crate::DaemonDfsBrowserWriteFileResponse,
+>;
+
+/// Rejoin configuration only after a typed preeffect refusal released the
+/// worker/FIFO. An error after the task begins its effect is returned unchanged.
+pub async fn run_configured_browser_task<P, R, F>(
+    data_dir: Arc<SinomoDataDir>,
+    route: String,
+    label: &'static str,
+    runtime: tokio::runtime::Handle,
+    host: Arc<dyn DfsBrowserServiceHost>,
+    mut payload: P,
+    task: F,
+) -> Result<R, ServiceError>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+    F: Fn(P) -> Result<DfsBrowserMutationAttempt<P, R>, ServiceError> + Send + Sync + 'static,
+{
+    let projection_deadline =
+        tokio::time::Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let task = Arc::new(task);
+    let mut replans = 0;
+    loop {
+        tokio::time::timeout_at(
+            projection_deadline,
+            host.ensure_write_configuration_ready(&data_dir, &runtime),
+        )
+        .await
+        .map_err(|_| {
+            dfs_browser_service_error("DFS write configuration readiness deadline elapsed")
+        })??;
+        let attempt_task = Arc::clone(&task);
+        let attempt =
+            run_blocking_browser_task(Arc::clone(&data_dir), route.clone(), label, move || {
+                attempt_task(payload)
+            })
+            .await?;
+        match attempt {
+            DfsBrowserMutationAttempt::Complete(response) => return Ok(response),
+            DfsBrowserMutationAttempt::ConfigurationPending(original) => {
+                if replans >= 2 {
+                    return Err(dfs_browser_service_error(
+                        "DFS write configuration remained pending after bounded preexecution replanning",
+                    ));
+                }
+                payload = original;
+                replans += 1;
+                tracing::trace!(target: "sinomo.dfs.perf", replans, maximum = 2, %route,
+                    "DFS browser write configuration preexecution replan");
+            }
+        }
+    }
 }
 
 impl DfsBrowserBackend {
@@ -529,6 +731,54 @@ impl DfsBrowserBackend {
         task(&mut service)
     }
 
+    /// Capture one coherent configuration before any content-writing effect.
+    /// A pending attempt drops the mutation owner before its caller joins the
+    /// existing async refresh outside the browser/FIFO worker.
+    pub fn try_with_configured_mutation_service<P, R>(
+        &self,
+        paths: &[&str],
+        payload: P,
+        task: impl FnOnce(
+            &mut crate::MountedSifsService,
+            Option<&crate::DfsWriteConfigurationProjection>,
+            P,
+        ) -> Result<R, ServiceError>,
+    ) -> Result<DfsBrowserMutationAttempt<P, R>, ServiceError> {
+        let _owner = self.host.operation_guard()?;
+        let mut service = self.lock_mutation_for_paths(paths)?;
+        self.refresh_peer_targets(&mut service);
+        let configuration = service
+            .control_plane
+            .as_deref()
+            .map(|control| control.write_configuration_readiness())
+            .transpose()
+            .map_err(dfs_browser_service_error)?;
+        let configuration = match configuration {
+            Some(crate::DfsWriteConfigurationReadiness::Ready(view)) => view,
+            None => None,
+            Some(crate::DfsWriteConfigurationReadiness::Pending) => {
+                return Ok(DfsBrowserMutationAttempt::ConfigurationPending(payload));
+            }
+        };
+        task(&mut service, configuration.as_deref(), payload)
+            .map(DfsBrowserMutationAttempt::Complete)
+    }
+
+    pub fn write_options_for_path_with_configuration(
+        &self,
+        service: &mut crate::MountedSifsService,
+        path: &str,
+        configuration: Option<&crate::DfsWriteConfigurationProjection>,
+    ) -> Result<crate::DfsWriteOptions, ServiceError> {
+        let candidates = match configuration {
+            Some(configuration) => configuration
+                .content_replica_candidates()
+                .map_err(dfs_browser_service_error)?,
+            None => self.content_replica_candidates()?,
+        };
+        sifs_browser_write_options_with_configuration(service, path, &candidates, configuration)
+    }
+
     pub fn write_options_for_path(
         &self,
         service: &mut crate::MountedSifsService,
@@ -553,19 +803,30 @@ impl DfsBrowserBackend {
         runtime: &tokio::runtime::Handle,
         host: Arc<dyn DfsBrowserServiceHost>,
     ) -> Result<Self, ServiceError> {
+        Self::open_with_configuration(data_dir, runtime, host, None)
+    }
+
+    fn open_with_configuration(
+        data_dir: SinomoDataDir,
+        runtime: &tokio::runtime::Handle,
+        host: Arc<dyn DfsBrowserServiceHost>,
+        configuration: Option<Arc<crate::DfsWriteConfigurationProjection>>,
+    ) -> Result<Self, ServiceError> {
         #[cfg(any(test, feature = "test-support"))]
         record_dfs_browser_backend_open(&data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let control_plane = host.control_plane_client(&cluster_paths, runtime);
         let replica_control_plane = host.control_plane_client(&cluster_paths, runtime);
         let (peer_transport, async_peer_transport) = host.peer_transports(&data_dir, runtime);
-        let opened = crate::open_mounted_sifs_service_with_peer_transports(
-            data_dir.clone(),
-            peer_transport,
-            async_peer_transport,
-            control_plane,
-        )
-        .map_err(dfs_browser_service_error)?;
+        let opened = match configuration {
+            Some(configuration) => crate::mounted_sifs::open_mounted_sifs_service_with_peer_transports_and_configuration(
+                data_dir.clone(), peer_transport, async_peer_transport, control_plane,
+                configuration,
+            ),
+            None => crate::open_mounted_sifs_service_with_peer_transports(
+                data_dir.clone(), peer_transport, async_peer_transport, control_plane,
+            ),
+        }.map_err(dfs_browser_service_error)?;
         let node_id = opened.service.node_id().clone();
         let cache = host.placement_snapshot_cache(&data_dir, &node_id);
         let mut service = opened.service.with_placement_snapshot_cache(cache);
@@ -586,6 +847,15 @@ impl DfsBrowserBackend {
         runtime: &tokio::runtime::Handle,
         host: Arc<dyn DfsBrowserServiceHost>,
     ) -> Result<Arc<Self>, ServiceError> {
+        Self::for_data_dir_with_configuration(data_dir, runtime, host, None)
+    }
+
+    fn for_data_dir_with_configuration(
+        data_dir: Arc<SinomoDataDir>,
+        runtime: &tokio::runtime::Handle,
+        host: Arc<dyn DfsBrowserServiceHost>,
+        configuration: Option<Arc<crate::DfsWriteConfigurationProjection>>,
+    ) -> Result<Arc<Self>, ServiceError> {
         let slot = browser_backend_slot(&data_dir)?;
         let mut initialized = slot.backend.lock().map_err(|source| {
             ServiceError::Service(format!(
@@ -595,7 +865,7 @@ impl DfsBrowserBackend {
         if let Some(backend) = initialized.as_ref() {
             return Ok(Arc::clone(backend));
         }
-        let backend = Arc::new(Self::open((*data_dir).clone(), runtime, host)?);
+        let backend = Arc::new(Self::open_with_configuration((*data_dir).clone(), runtime, host, configuration)?);
         *initialized = Some(Arc::clone(&backend));
         Ok(backend)
     }
@@ -1860,6 +2130,59 @@ impl Service for HostedDfsBrowserService {
             let request_traceparent = request.traceparent().map(ToString::to_string);
             let data_dir = Arc::clone(&ctx.data_dir);
             match route.as_str() {
+                DAEMON_DFS_BROWSER_NO_LINKS_ROUTE => {
+                    let payload: crate::DaemonDfsBrowserNoLinksRequest =
+                        ctx.decode_request_body(&request).await?;
+                    no_links::validate_cluster_namespace(
+                        &data_dir,
+                        payload.expected_cluster_id.as_ref(),
+                    )?;
+                    let content_write = matches!(
+                        &payload.operation,
+                        crate::DaemonDfsBrowserNoLinksOperation::CreateNew { .. }
+                            | crate::DaemonDfsBrowserNoLinksOperation::ReplaceIfVersion { .. }
+                    );
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let attempt_host = Arc::clone(&backend_host);
+                    let result = if content_write {
+                        run_configured_browser_task(
+                            data_dir,
+                            route.clone(),
+                            "DFS scoped no-link content write",
+                            runtime,
+                            backend_host,
+                            payload,
+                            move |payload| {
+                                DfsBrowserBackend::for_data_dir(
+                                    Arc::clone(&backend_data_dir),
+                                    &backend_runtime,
+                                    Arc::clone(&attempt_host),
+                                )?
+                                .try_no_links(payload)
+                            },
+                        )
+                        .await?
+                    } else {
+                        // Namespace-only mkdir and reads retain the normal
+                        // browser path without a content-placement dependency.
+                        run_blocking_browser_task(
+                            data_dir,
+                            route.clone(),
+                            "DFS scoped no-link operation",
+                            move || {
+                                DfsBrowserBackend::for_data_dir(
+                                    backend_data_dir,
+                                    &backend_runtime,
+                                    attempt_host,
+                                )?
+                                .no_links(payload)
+                            },
+                        )
+                        .await?
+                    };
+                    ctx.respond_value(DAEMON_DFS_BROWSER_NO_LINKS_ROUTE, result)?;
+                }
                 DFS_CORE_COMPONENT_ACCESS_ROUTE => {
                     let _: () = ctx.decode_request_body(&request).await?;
                     let _owner = backend_host.operation_guard()?.ok_or_else(|| {
@@ -2470,7 +2793,8 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task_unqueued(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser placement progress",
                         move || {
@@ -2487,7 +2811,8 @@ impl Service for HostedDfsBrowserService {
                 }
                 DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task_unqueued(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "DFS browser placement activity",
                         move || {
@@ -2515,6 +2840,7 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
         DAEMON_DFS_BROWSER_STATUS_ROUTE
             | DAEMON_DFS_BROWSER_STAT_ROUTE
             | DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE
+            | DAEMON_DFS_BROWSER_NO_LINKS_ROUTE
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
             | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
@@ -4254,8 +4580,236 @@ mod tests {
         drop(backend);
         native.close().expect("normal native browser shutdown");
     }
+
+    #[test]
+    fn daemon_no_link_browser_preserves_receipts_and_rejects_links_stale_cas_and_cursors() {
+        use crate::DaemonDfsBrowserNoLinksFailure as F;
+        use crate::DaemonDfsBrowserNoLinksOperation as O;
+        use crate::DaemonDfsBrowserNoLinksResponse as R;
+        let root = sinomo_testdir::TestDir::new("native-browser-no-link-consumers");
+        let data_dir = SinomoDataDir::new(root.path());
+        let (native, node) = crate::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+            "daemon_no_link_browser_preserves_receipts_and_rejects_links_stale_cas_and_cursors",
+            data_dir.clone(),
+        )
+        .unwrap();
+        let service = native.client(&node).unwrap();
+        let backend = DfsBrowserBackend {
+            node_id: service.node_id().clone(),
+            data_dir,
+            host: Arc::new(UnusedHost::default()),
+            service: Mutex::new(service),
+            replica_control_plane: Mutex::new(None),
+            peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
+            stat_cache: Mutex::new(HashMap::new()),
+        };
+        let scope = "/services/no-link-consumers/memory";
+        let request = |path: &str, operation| crate::DaemonDfsBrowserNoLinksRequest {
+            expected_cluster_id: None,
+            root: scope.into(),
+            path: path.into(),
+            operation,
+        };
+        let mut wrong_namespace = request(scope, O::CreateDirAll);
+        wrong_namespace.expected_cluster_id = Some(sinomo_core::Id::generate());
+        let error = backend.no_links(wrong_namespace).unwrap_err();
+        assert!(error.to_string().contains("cluster namespace changed"));
+        assert!(matches!(backend.no_links(request(scope, O::Stat)).unwrap(),
+            R::Failed { failure: F::NotFound { .. } }));
+        assert!(matches!(
+            backend.no_links(request(scope, O::CreateDirAll)).unwrap(),
+            R::DirectoryCreated
+        ));
+        let a = format!("{scope}/a.md");
+        let R::Metadata { metadata: first } = backend
+            .no_links(request(
+                &a,
+                O::CreateNew {
+                    bytes: b"first".to_vec(),
+                },
+            ))
+            .unwrap()
+        else {
+            panic!("exact create receipt");
+        };
+        assert!(matches!(
+            backend
+                .no_links(request(
+                    &a,
+                    O::CreateNew {
+                        bytes: b"duplicate".to_vec()
+                    }
+                ))
+                .unwrap(),
+            R::Failed {
+                failure: F::AlreadyExists { .. }
+            }
+        ));
+        let replace = |version: &crate::DaemonDfsBrowserStatResponse| O::ReplaceIfVersion {
+            expected_object_id: version.object_id.clone(),
+            expected_version: version.version.clone(),
+            bytes: b"second".to_vec(),
+        };
+        let R::Metadata { metadata: second } = backend.no_links(request(&a, replace(&first))).unwrap()
+        else {
+            panic!("exact replacement receipt");
+        };
+        assert_eq!(first.object_id, second.object_id);
+        assert_ne!(first.version, second.version);
+        assert!(matches!(
+            backend.no_links(request(&a, replace(&first))).unwrap(),
+            R::Failed {
+                failure: F::Conflict { .. }
+            }
+        ));
+        let R::Read {
+            metadata,
+            bytes,
+            truncated,
+        } = backend
+            .no_links(request(
+                &a,
+                O::ReadRange {
+                    offset: 1,
+                    max_bytes: 2,
+                },
+            ))
+            .unwrap()
+        else {
+            panic!("exact read receipt");
+        };
+        assert_eq!(bytes, b"ec");
+        assert!(truncated);
+        assert_eq!(metadata.object_id, second.object_id);
+        assert_eq!(metadata.version, second.version);
+        assert!(matches!(
+            backend
+                .no_links(request(
+                    &a,
+                    O::ReadRange {
+                        offset: 99,
+                        max_bytes: 2
+                    }
+                ))
+                .unwrap(),
+            R::Failed {
+                failure: F::InvalidPath { .. }
+            }
+        ));
+        assert!(matches!(
+            backend
+                .no_links(request(&format!("{scope}/missing.md"), O::Stat))
+                .unwrap(),
+            R::Failed {
+                failure: F::NotFound { .. }
+            }
+        ));
+        backend
+            .no_links(request(
+                &format!("{scope}/b.md"),
+                O::CreateNew { bytes: vec![] },
+            ))
+            .unwrap();
+        let R::DirectoryPage {
+            next_cursor: Some(cursor),
+            entries,
+            ..
+        } = backend
+            .no_links(request(
+                scope,
+                O::ListPage {
+                    cursor: None,
+                    max_entries: 1,
+                },
+            ))
+            .unwrap()
+        else {
+            panic!("bounded continuation");
+        };
+        assert_eq!(entries.len(), 1);
+        backend
+            .no_links(request(
+                &format!("{scope}/c.md"),
+                O::CreateNew { bytes: vec![] },
+            ))
+            .unwrap();
+        assert!(matches!(
+            backend
+                .no_links(request(
+                    scope,
+                    O::ListPage {
+                        cursor: Some(cursor),
+                        max_entries: 1
+                    }
+                ))
+                .unwrap(),
+            R::Failed {
+                failure: F::Conflict { .. }
+            }
+        ));
+        {
+            let mut service = backend.lock_service().unwrap();
+            service
+                .posix_mkdir_all("/services/outside-no-link")
+                .unwrap();
+            let options = crate::DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
+            service
+                .posix_symlink(
+                    "/services/outside-no-link",
+                    &format!("{scope}/linked"),
+                    options,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            backend
+                .no_links(request(&format!("{scope}/linked"), O::Stat))
+                .unwrap(),
+            R::Failed {
+                failure: F::InvalidPath { .. }
+            }
+        ));
+        assert!(matches!(
+            backend
+                .no_links(request(
+                    "/services/outside-no-link/escape.md",
+                    O::CreateNew {
+                        bytes: b"must not escape".to_vec()
+                    }
+                ))
+                .unwrap(),
+            R::Failed {
+                failure: F::InvalidPath { .. }
+            }
+        ));
+        assert!(daemon_dfs_browser_route_is_path_access(
+            DAEMON_DFS_BROWSER_NO_LINKS_ROUTE
+        ));
+        assert!(DFS_CORE_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_NO_LINKS_ROUTE));
+        drop(backend);
+        native.close().unwrap();
+    }
+
 }
 
 #[cfg(test)]
 #[path = "browser_service/write_options_tests.rs"]
 mod write_options_tests;
+
+#[cfg(test)]
+#[path = "browser_service/configuration_consumer_tests.rs"]
+mod configuration_consumer_tests;
+
+#[cfg(test)]
+#[path = "browser_service/remote_parent_tests.rs"]
+mod remote_parent_tests;
+
+#[cfg(test)]
+#[path = "browser_service/no_links_race_tests.rs"]
+mod no_links_race_tests;
+
+#[cfg(test)]
+mod same_primary_availability_native_tests;
+
+#[cfg(test)]
+mod cold_open_native_tests;

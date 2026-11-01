@@ -19802,6 +19802,116 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resident_four_prefix_read_avoids_full_snapshot_and_keeps_no_effect_replay() {
+        let root = temp_raft_root("native-four-prefix-no-full-memo");
+        let node = NodeId::generate();
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let prefixes = [
+            "/cluster/members/",
+            "/cluster/endpoints/",
+            "/cluster/policy/capabilities/",
+            "/cluster/network/connectivity/",
+        ];
+        for prefix in prefixes {
+            store
+                .append_command_with_response_and_publish_report(
+                    &node,
+                    KvCommand::Op(KvOp::Put {
+                        key: format!("{prefix}actual"),
+                        value: b"native-row".to_vec(),
+                        lease_id: None,
+                    }),
+                    |_| false,
+                )
+                .unwrap();
+        }
+        let put = KvCommand::Op(KvOp::Put {
+            key: "/directory/native-memo".into(),
+            value: vec![7; 4096],
+            lease_id: None,
+        });
+        let before = store
+            .append_command_with_response_and_publish_report(&node, put.clone(), |_| false)
+            .unwrap()
+            .0
+            .snapshot;
+        let request = KvCommandRequest::new(KvRequestId::generate(), put);
+        let after = store
+            .append_request_with_response(&node, request.clone())
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            before.revision, after.revision,
+            "real committed semantic no-effect keeps KV revision"
+        );
+        assert!(after.committed_requests.len() > before.committed_requests.len());
+        reset_complete_snapshot_materializations_for_test();
+        let cut = with_cluster_kv_resident_read_projection(
+            &paths.raft_wal_paths(&node),
+            &node,
+            |projection| {
+                let mut rows = Vec::new();
+                for prefix in prefixes {
+                    rows.extend(
+                        projection
+                            .read_index_prefix_limited_by_payload_bytes(
+                                prefix,
+                                CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                                usize::MAX,
+                            )
+                            .unwrap(),
+                    );
+                }
+                (
+                    rows,
+                    projection.read_index_request_outcome(&request.request_id),
+                )
+            },
+        )
+        .expect("actual canonical resident owner")
+        .unwrap();
+        assert_eq!(cut.value.0.len(), 4);
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            0,
+            "bounded borrowed prefix reads never build the complete snapshot/memo"
+        );
+        let KvRequestOutcome::Committed(actual) = cut.value.1.unwrap() else {
+            panic!("actual current native memo must remain committed");
+        };
+        assert_eq!(actual.request_id, request.request_id);
+        let full = read_cluster_kv_local_snapshot(&paths, &node).unwrap().value;
+        assert_eq!(
+            full.committed_requests, after.committed_requests,
+            "full native snapshot retains every current dedup response"
+        );
+        assert_eq!(full.expired_requests, after.expired_requests);
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            1,
+            "the explicit full snapshot still materializes its full record"
+        );
+        match store
+            .append_request_uncommitted_or_replay(&node, request)
+            .unwrap()
+        {
+            ClusterKvRaftUncommittedAppend::CommittedReplay { record, .. } => {
+                assert_eq!(record, actual)
+            }
+            other => {
+                panic!("exact original native request must replay committed outcome: {other:?}")
+            }
+        }
+    }
+
     fn temp_raft_root(prefix: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(prefix)
     }

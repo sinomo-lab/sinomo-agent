@@ -2005,6 +2005,23 @@ pub(crate) fn read_resident_raft_local_prefix_matching(
     })
 }
 
+pub(crate) fn read_resident_raft_local_materialized_generation(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+) -> Option<Result<KvLocalRead<(KvRevision, u64)>, KvError>> {
+    // Preserve the complete local snapshot reader's durable-state choice: an
+    // empty initialized resident must not replace a materialized-only view.
+    match crate::wal::raft_view_identity_for_read(paths) {
+        Ok((true, _)) => {}
+        Ok((false, _)) => return None,
+        Err(error) => return Some(Err(error)),
+    }
+    // This scalar is advisory comparison data, never authority.
+    with_idle_resident_raft_node(paths, node_id, |node| {
+        Ok(node.store.materialized_generation())
+    })
+}
+
 pub(crate) fn read_resident_raft_local_snapshot(
     paths: &KvWalPaths,
     node_id: &NodeId,

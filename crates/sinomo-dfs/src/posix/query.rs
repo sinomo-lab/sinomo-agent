@@ -537,35 +537,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let fs = sifs_file_system_id();
         let configs = self.metadata_shard_authorities(&fs)?;
-        let directory_owner =
-            crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
-                &fs, &configs, path,
-            )
-            .map_err(crate::DfsError::from)?
-            .ok_or_else(|| DfsPosixError::InvalidPath {
-                path: path.to_string(),
-            })?;
-        // A direct child inherits the directory's prefix owner, unless that
-        // child is itself an assignment boundary. Hash assignments can select
-        // any direct child, so their full current set remains relevant.
-        let shards = configs
-            .iter()
-            .filter(|shard| {
-                shard.shard_id == directory_owner.shard_id
-                    || match &shard.assignment {
-                        crate::DfsMetadataShardAssignment::PathPrefix { prefix } => {
-                            normalize_posix_path(prefix).is_ok_and(|prefix| {
-                                crate::posix_path::parent_posix_path(&prefix).as_deref()
-                                    == Some(path)
-                            })
-                        }
-                        crate::DfsMetadataShardAssignment::NameHashRange { .. } => true,
-                        crate::DfsMetadataShardAssignment::Root => matches!(
-                            &directory_owner.assignment,
-                            crate::DfsMetadataShardAssignment::NameHashRange { .. }
-                        ),
-                    }
-            })
+        let shards = super::routing::directory_child_authority_shards(path, &configs)?
+            .into_iter()
             .map(|shard| {
                 (
                     crate::DfsMetadataShardId::new(shard.shard_id.clone()),
