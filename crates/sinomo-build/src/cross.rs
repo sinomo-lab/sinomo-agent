@@ -39,6 +39,7 @@ pub(crate) struct ManagedCrossToolchain {
     root: PathBuf,
     zig: Download,
     zigbuild: Download,
+    clang: Download,
     cargo: PathBuf,
     rustc: PathBuf,
     rust_sysroot: PathBuf,
@@ -61,16 +62,23 @@ pub(crate) fn configured(
 ) -> Result<Vec<ManagedCrossToolchain>> {
     // This is SDK host compatibility, not a classification of node capacity.
     // AArch64 cloud servers and x86-64 servers have the same target choices.
-    let (host_arch, zig_hash, zigbuild_hash) = match info.host_target.as_str() {
+    let (host_arch, zig_hash, zigbuild_hash, clang_url, clang_hash) = match info
+        .host_target
+        .as_str()
+    {
         "x86_64-unknown-linux-gnu" => (
             "x86_64",
             "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c",
             "8c66578e495cb7f124b2a904357c43716fb6d95a862e68654a45409f19555143",
+            "https://files.pythonhosted.org/packages/1d/fc/716c1e62e512ef1c160e7984a73a5fc7df45166f2ff3f254e71c58076f7c/libclang-18.1.1-py2.py3-none-manylinux2010_x86_64.whl",
+            "c533091d8a3bbf7460a00cb6c1a71da93bffe148f172c7d03b1c31fbf8aa2a0b",
         ),
         "aarch64-unknown-linux-gnu" => (
             "aarch64",
             "f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b",
             "d34d0b7d69819876429a280d2cef5dc3f0d652904ed08fc8ccdaba9d1c7f9be8",
+            "https://files.pythonhosted.org/packages/3c/3d/f0ac1150280d8d20d059608cf2d5ff61b7c3b7f7bcf9c0f425ab92df769a/libclang-18.1.1-py2.py3-none-manylinux2014_aarch64.whl",
+            "54dda940a4a0491a9d1532bf071ea3ef26e6dbaf03b5000ed94dd7174e8f9592",
         ),
         _ => return Ok(Vec::new()),
     };
@@ -110,9 +118,10 @@ pub(crate) fn configured(
         .into_owned();
     let zig_directory = format!("zig-{host_arch}-linux-{ZIG_VERSION}");
     let zigbuild_directory = format!("cargo-zigbuild-{host_arch}-unknown-linux-gnu");
-    let bundle = blake3::hash(format!("{LAYOUT}\n{zig_hash}\n{zigbuild_hash}").as_bytes())
-        .to_hex()
-        .to_string();
+    let bundle =
+        blake3::hash(format!("{LAYOUT}\n{zig_hash}\n{zigbuild_hash}\n{clang_hash}").as_bytes())
+            .to_hex()
+            .to_string();
     let root = paths.toolchains.join("managed-cross").join(bundle);
     let mut result = Vec::new();
     for triple in targets {
@@ -125,12 +134,19 @@ pub(crate) fn configured(
             continue;
         }
         let target = target(&triple)?;
-        let fingerprint = fingerprint(&info.fingerprint, zig_hash, zigbuild_hash, &triple);
+        let fingerprint = fingerprint(
+            &info.fingerprint,
+            zig_hash,
+            zigbuild_hash,
+            clang_hash,
+            &triple,
+        );
         result.push(ManagedCrossToolchain {
             capability: BuildTargetCapability { target, artifact_kinds: vec![BuildArtifactKind::Binary, BuildArtifactKind::NativeDylibModule], toolchain_fingerprint: fingerprint, supports_source_identity_hash: true },
             root: root.clone(),
             zig: Download { url: format!("https://ziglang.org/download/{ZIG_VERSION}/{zig_directory}.tar.xz"), sha256: zig_hash, directory: zig_directory.clone() },
             zigbuild: Download { url: format!("https://github.com/rust-cross/cargo-zigbuild/releases/download/v{ZIGBUILD_VERSION}/{zigbuild_directory}.tar.xz"), sha256: zigbuild_hash, directory: zigbuild_directory.clone() },
+            clang: Download { url: clang_url.to_string(), sha256: clang_hash, directory: "libclang-18.1.1.data/platlib/clang/native".into() },
             cargo: physical_cargo.clone(), rustc: physical_rustc.clone(), rust_sysroot: rust_sysroot.clone(), rustup: rustup.clone(), rustup_toolchain: toolchain_name.clone(), base_fingerprint: info.fingerprint.clone(),
         });
     }
@@ -138,12 +154,12 @@ pub(crate) fn configured(
     Ok(result)
 }
 
-fn fingerprint(base: &str, zig: &str, zigbuild: &str, target: &str) -> String {
+fn fingerprint(base: &str, zig: &str, zigbuild: &str, clang: &str, target: &str) -> String {
     format!(
         "managed-cross-blake3:{}",
         blake3::hash(
             format!(
-                "{LAYOUT}\n{base}\n{zig}\n{zigbuild}\n{target}\n{GLIBC_BASELINE}\ndynamic-libc"
+                "{LAYOUT}\n{base}\n{zig}\n{zigbuild}\n{clang}\n{target}\n{GLIBC_BASELINE}\ndynamic-libc"
             )
             .as_bytes()
         )
@@ -187,6 +203,11 @@ impl ManagedCrossToolchain {
             self.root.join("zigbuild/cargo-zigbuild")
         }
     }
+    fn clang_path(&self, root: &Path) -> PathBuf {
+        root.join("clang")
+            .join(&self.clang.directory)
+            .join("libclang.so")
+    }
     fn marker(&self) -> PathBuf {
         self.root.join(format!(
             "qualified-{}.json",
@@ -213,6 +234,7 @@ impl ManagedCrossToolchain {
         self.has_std()
             && self.zig_path(&self.root).is_file()
             && self.program().is_file()
+            && self.clang_path(&self.root).is_file()
             && fs::read(self.marker())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Qualification>(&bytes).ok())
@@ -249,6 +271,14 @@ impl ManagedCrossToolchain {
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
         let mut environment = vec![
+            (
+                "LIBCLANG_PATH".into(),
+                self.clang_path(&self.root)
+                    .parent()
+                    .expect("libclang has a parent")
+                    .as_os_str()
+                    .to_owned(),
+            ),
             ("CARGO".into(), self.cargo.as_os_str().to_owned()),
             ("RUSTC".into(), self.rustc.as_os_str().to_owned()),
             (
@@ -302,8 +332,13 @@ impl ManagedCrossToolchain {
                 &format!("preparing verified cross tools for {}", self.triple()),
             )?;
             let staging = TempDir::new(parent)?;
-            for (name, download) in [("zig", &self.zig), ("zigbuild", &self.zigbuild)] {
-                let archive = parent.join(format!("{}.tar.xz", download.sha256));
+            for (name, download) in [
+                ("zig", &self.zig),
+                ("zigbuild", &self.zigbuild),
+                ("clang", &self.clang),
+            ] {
+                let extension = if name == "clang" { "whl" } else { "tar.xz" };
+                let archive = parent.join(format!("{}.{extension}", download.sha256));
                 if !archive.is_file() {
                     let temporary = staging.0.join(format!("{name}.tar.xz"));
                     run(
@@ -332,7 +367,11 @@ impl ManagedCrossToolchain {
                     fs::rename(&temporary, &archive).map_err(|e| io(&archive, e))?;
                 }
                 verify_sha256(&archive, download.sha256)?;
-                extract(&archive, &staging.0.join(name))?;
+                if name == "clang" {
+                    extract_zip(&archive, &staging.0.join(name))?;
+                } else {
+                    extract(&archive, &staging.0.join(name))?;
+                }
             }
             verify_version(&self.zig_path(&staging.0), &["version".into()], ZIG_VERSION)?;
             let plugin_nested = staging
@@ -346,10 +385,12 @@ impl ManagedCrossToolchain {
                 staging.0.join("zigbuild/cargo-zigbuild")
             };
             verify_version(&plugin, &["--version".into()], ZIGBUILD_VERSION)?;
+            verify_libclang(&self.clang_path(&staging.0))?;
             fs::rename(&staging.0, &self.root).map_err(|e| io(&self.root, e))?;
         }
         verify_version(&self.zig_path(&self.root), &["version".into()], ZIG_VERSION)?;
         verify_version(&self.program(), &["--version".into()], ZIGBUILD_VERSION)?;
+        verify_libclang(&self.clang_path(&self.root))?;
         if !self.has_std() {
             let rustup = self.rustup.as_ref().ok_or_else(|| {
                 invalid(format!(
@@ -455,6 +496,63 @@ impl ManagedCrossToolchain {
         }
         Ok(())
     }
+}
+
+fn verify_libclang(path: &Path) -> Result<()> {
+    // Only load the hash-verified host library during admitted preparation.
+    // Check a real C API call so missing runtime dependencies fail before build.
+    unsafe {
+        let library = libloading::Library::new(path)
+            .map_err(|e| invalid(format!("load managed libclang {}: {e}", path.display())))?;
+        let create: libloading::Symbol<unsafe extern "C" fn(i32, i32) -> *mut std::ffi::c_void> =
+            library
+                .get(b"clang_createIndex")
+                .map_err(|e| invalid(e.to_string()))?;
+        let dispose: libloading::Symbol<unsafe extern "C" fn(*mut std::ffi::c_void)> = library
+            .get(b"clang_disposeIndex")
+            .map_err(|e| invalid(e.to_string()))?;
+        let index = create(0, 0);
+        if index.is_null() {
+            return Err(invalid("managed libclang failed to create an index"));
+        }
+        dispose(index);
+    }
+    Ok(())
+}
+
+fn extract_zip(archive: &Path, root: &Path) -> Result<()> {
+    let file = File::open(archive).map_err(|e| io(archive, e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| invalid(e.to_string()))?;
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| invalid(e.to_string()))?;
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| invalid("SDK zip path escapes its installation"))?;
+        validate_relative(&relative, Path::new(""))?;
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(invalid("SDK zip contains a symlink"));
+        }
+        total = total.saturating_add(entry.size());
+        if total > 512 * 1024 * 1024 {
+            return Err(invalid(
+                "managed libclang archive exceeds its extraction limit",
+            ));
+        }
+        let path = root.join(&relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&path).map_err(|e| io(&path, e))?;
+        } else {
+            let parent = path.parent().expect("SDK member has parent");
+            fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
+            let mut out = File::create(&path).map_err(|e| io(&path, e))?;
+            std::io::copy(&mut entry, &mut out).map_err(|e| io(&path, e))?;
+        }
+    }
+    Ok(())
 }
 
 fn find_program(name: &str) -> Option<PathBuf> {
@@ -708,12 +806,49 @@ mod tests {
 
     #[test]
     fn target_and_sdk_versions_are_part_of_cross_cache_identity() {
-        let a = fingerprint("rust-a", "zig-a", "plugin-a", "aarch64-unknown-linux-gnu");
+        let a = fingerprint(
+            "rust-a",
+            "zig-a",
+            "plugin-a",
+            "clang-a",
+            "aarch64-unknown-linux-gnu",
+        );
         for b in [
-            fingerprint("rust-b", "zig-a", "plugin-a", "aarch64-unknown-linux-gnu"),
-            fingerprint("rust-a", "zig-b", "plugin-a", "aarch64-unknown-linux-gnu"),
-            fingerprint("rust-a", "zig-a", "plugin-b", "aarch64-unknown-linux-gnu"),
-            fingerprint("rust-a", "zig-a", "plugin-a", "aarch64-unknown-linux-musl"),
+            fingerprint(
+                "rust-b",
+                "zig-a",
+                "plugin-a",
+                "clang-a",
+                "aarch64-unknown-linux-gnu",
+            ),
+            fingerprint(
+                "rust-a",
+                "zig-b",
+                "plugin-a",
+                "clang-a",
+                "aarch64-unknown-linux-gnu",
+            ),
+            fingerprint(
+                "rust-a",
+                "zig-a",
+                "plugin-b",
+                "clang-a",
+                "aarch64-unknown-linux-gnu",
+            ),
+            fingerprint(
+                "rust-a",
+                "zig-a",
+                "plugin-a",
+                "clang-a",
+                "aarch64-unknown-linux-musl",
+            ),
+            fingerprint(
+                "rust-a",
+                "zig-a",
+                "plugin-a",
+                "clang-b",
+                "aarch64-unknown-linux-gnu",
+            ),
         ] {
             assert_ne!(a, b);
         }
@@ -759,6 +894,31 @@ mod tests {
         header[18] = 183;
         fs::write(&path, header).unwrap();
         verify_elf(&path, &target("aarch64-unknown-linux-gnu").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wheel_extraction_preserves_native_library_paths_and_rejects_escape() {
+        use zip::write::SimpleFileOptions;
+        let root = sinomo_testdir::TestDir::new("cross-sdk-wheel");
+        let path = root.join("libclang.whl");
+        let member = "libclang-18.1.1.data/platlib/clang/native/libclang.so";
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file(member, SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"library").unwrap();
+        zip.finish().unwrap();
+        extract_zip(&path, &root.join("safe")).unwrap();
+        assert_eq!(
+            fs::read(root.join("safe").join(member)).unwrap(),
+            b"library"
+        );
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file("../outside", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"escape").unwrap();
+        zip.finish().unwrap();
+        assert!(extract_zip(&path, &root.join("unsafe")).is_err());
+        assert!(!root.join("outside").exists());
     }
 
     #[test]

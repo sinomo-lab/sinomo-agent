@@ -218,8 +218,8 @@ serve other architectures; a small x86 machine receives the same resource
 checks as a small ARM machine. Placement uses measured resources and cache
 availability rather than treating AArch64 as synonymous with an SBC.
 
-The first admitted job for a managed target downloads pinned Zig and
-cargo-zigbuild archives over HTTPS, checks their SHA-256 digests, installs the
+The first admitted job for a managed target downloads pinned Zig,
+cargo-zigbuild, and host libclang archives over HTTPS, checks their SHA-256 digests, installs the
 Rust standard library for the selected compiler through rustup if needed, and
 qualifies executable and native-library linking. Preparation is visible in the
 build log and failures fail that job explicitly. Capability discovery does not
