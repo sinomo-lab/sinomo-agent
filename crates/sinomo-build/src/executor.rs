@@ -604,7 +604,22 @@ impl CargoBuildExecutor {
             args,
             env,
             env_remove: if managed.is_some() {
-                vec!["RUSTFLAGS".into(), "CARGO_ENCODED_RUSTFLAGS".into()]
+                let triple = plan
+                    .input
+                    .target
+                    .rust_target
+                    .as_deref()
+                    .expect("concrete target");
+                vec![
+                    "RUSTFLAGS".into(),
+                    "CARGO_ENCODED_RUSTFLAGS".into(),
+                    // Native resource/header overrides can shadow the SDK's
+                    // target libc, including through duplicate include_next
+                    // searches. cargo-zigbuild supplies target include paths.
+                    "BINDGEN_EXTRA_CLANG_ARGS".into(),
+                    format!("BINDGEN_EXTRA_CLANG_ARGS_{triple}").into(),
+                    format!("BINDGEN_EXTRA_CLANG_ARGS_{}", triple.replace('-', "_")).into(),
+                ]
             } else {
                 Vec::new()
             },

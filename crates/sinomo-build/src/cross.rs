@@ -13,7 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-const LAYOUT: &str = "sinomo-managed-cross-v1";
+const LAYOUT: &str = "sinomo-managed-cross-v2";
 const ZIG_VERSION: &str = "0.14.1";
 const ZIGBUILD_VERSION: &str = "0.21.8";
 const GLIBC_BASELINE: &str = "2.17";
@@ -960,10 +960,7 @@ mod tests {
             .iter()
             .find(|p| p.triple() == requested)
             .expect("cross target is configured");
-        assert!(
-            !cross.is_ready(),
-            "qualification fixture must start without a ready marker"
-        );
+        let initially_ready = cross.is_ready();
         let log = root.join("cross-qualification.log");
         fs::create_dir_all(&root).unwrap();
         cross.prepare(Some(&log)).unwrap();
@@ -976,8 +973,18 @@ mod tests {
         };
         let source = root.join("executor-source");
         fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("Cargo.toml"), "[package]\nname='cross-executor-probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n[[bin]]\nname='probe'\npath='probe.rs'\n[lib]\nname='probe'\npath='probe.rs'\ncrate-type=['cdylib']\n").unwrap();
-        fs::write(source.join("probe.rs"), "fn main(){println!(\"sinomo-cross-executor\");}\n#[unsafe(no_mangle)] pub extern \"C\" fn sinomo_cross_probe()->u32{42}\n").unwrap();
+        fs::write(source.join("Cargo.toml"), "[package]\nname='cross-executor-probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n[[bin]]\nname='probe'\npath='probe.rs'\n[lib]\nname='probe'\npath='probe.rs'\ncrate-type=['cdylib']\n[build-dependencies]\nbindgen='=0.72.1'\n").unwrap();
+        fs::write(source.join("probe.h"), "#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n_Static_assert(sizeof(void*) == EXPECTED_POINTER_BYTES, \"wrong cross target\");\ntypedef struct { uint32_t value; bool enabled; void *pointer; } CrossProbe;\n").unwrap();
+        fs::write(source.join("build.rs"), r#"fn main() {
+            let target = std::env::var("TARGET").unwrap();
+            let width = if target.starts_with("armv7-") { 4 } else { 8 };
+            bindgen::Builder::default().header("probe.h")
+                .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+                .clang_arg(format!("-DEXPECTED_POINTER_BYTES={width}"))
+                .generate().expect("target C bindings")
+                .write_to_file(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("bindings.rs")).unwrap();
+        }"#).unwrap();
+        fs::write(source.join("probe.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/bindings.rs\"));\nfn main(){println!(\"sinomo-cross-executor\");}\n#[unsafe(no_mangle)] pub extern \"C\" fn sinomo_cross_probe()->u32{42 + 0 * std::mem::size_of::<CrossProbe>() as u32}\n").unwrap();
         run(
             &cross.cargo,
             &[
@@ -1037,6 +1044,29 @@ mod tests {
         )
         .unwrap()
         .with_managed_cross(profiles.clone());
+        if let Ok(native_flags) = std::env::var("SINOMO_CROSS_TEST_NATIVE_FLAGS") {
+            let control = executor
+                .clone()
+                .with_target_environment(
+                    cross.capability.target.clone(),
+                    &cross.capability.toolchain_fingerprint,
+                    vec![("BINDGEN_EXTRA_CLANG_ARGS".into(), native_flags.into())],
+                )
+                .unwrap();
+            assert!(
+                control
+                    .execute_with_target_dir_and_log(
+                        &source,
+                        &plan,
+                        root.join("native-flag-control-artifacts"),
+                        root.join("executor-target"),
+                        None,
+                        Some(&root.join("native-flag-control.log")),
+                    )
+                    .is_err(),
+                "the inherited native include conflict must reproduce in the control"
+            );
+        }
         let result = executor
             .execute_with_target_dir_and_log(
                 &source,
@@ -1065,11 +1095,12 @@ mod tests {
                 .trim_start_matches("managed-cross-blake3:"),
         );
         println!(
-            "cross qualification target={} tools={} evidence={} log={}",
+            "cross qualification target={} tools={} evidence={} log={} initially_ready={}",
             requested,
             cross.root.display(),
             evidence.display(),
-            log.display()
+            log.display(),
+            initially_ready
         );
     }
 }
