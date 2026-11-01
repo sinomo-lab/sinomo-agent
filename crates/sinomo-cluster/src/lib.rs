@@ -73,10 +73,9 @@ pub use command_observation::{
     cluster_command_observation_key,
 };
 pub use connectivity_import::{
-    PeerConnectivityFetchScope, accepted_join_connectivity_record_groups,
-    filter_peer_connectivity_response_records, merge_connectivity_probe_records_with_live_unprobed,
-    newly_healthy_connectivity_target_node_ids, peer_connectivity_import_endpoint_for_record,
-    peer_connectivity_import_records_for_reachable_peers,
+    accepted_join_connectivity_record_groups, filter_peer_connectivity_response_records,
+    merge_connectivity_probe_records_with_live_unprobed,
+    newly_healthy_connectivity_target_node_ids,
 };
 pub use connectivity_projection::{
     ClusterConnectivityEndpointProjection, ClusterConnectivityMemberProjection,

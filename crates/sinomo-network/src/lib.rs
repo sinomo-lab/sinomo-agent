@@ -121,7 +121,6 @@ pub use connectivity_store::{
     record_local_cluster_endpoint_command_connectivity,
     write_local_cluster_connectivity_record_groups,
     write_local_cluster_connectivity_record_groups_async, write_local_cluster_connectivity_records,
-    write_local_cluster_connectivity_records_async,
 };
 pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
