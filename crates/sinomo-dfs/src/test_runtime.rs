@@ -555,6 +555,13 @@ pub enum FaultAction {
         change: StatReplyFault,
         captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
     },
+    /// Pause an actual completed initial stat projection without changing its
+    /// response bytes. Observation/fault DATA cannot supply read authority.
+    PauseStatProjectionReplyAfterDispatch {
+        object_id: crate::DfsObjectId,
+        gate: Arc<Semaphore>,
+        captured: Arc<Mutex<Vec<crate::DfsRoutedMessage>>>,
+    },
     PauseBeforeDispatch(Arc<Semaphore>),
     /// Hold a real committed-write journal publication before receiver ingress.
     /// Prepare/authority RPCs remain untouched; no successful reply is supplied.
@@ -693,6 +700,7 @@ impl Fabric {
                 | FaultAction::PauseExactWriteCommitPublication { gate, .. }
                 | FaultAction::PauseSelectedOriginalCustody { gate, .. }
                 | FaultAction::PauseAfterDispatch(gate)
+                | FaultAction::PauseStatProjectionReplyAfterDispatch { gate, .. }
                 | FaultAction::PauseNativeReadBody { gate, .. } = &rule.action
                 {
                     gate.close();
@@ -753,7 +761,8 @@ impl Fabric {
                     // The ordinary request value may be streamed. Select this
                     // negative fault from the real completed typed reply,
                     // without consuming or reconstructing the request body.
-                    FaultAction::AlterStatReplyAfterDispatch { .. } => false,
+                    FaultAction::AlterStatReplyAfterDispatch { .. }
+                    | FaultAction::PauseStatProjectionReplyAfterDispatch { .. } => false,
                     // Metadata journal values may be streamed. Select only
                     // after the ordinary authenticated receiver decodes them.
                     FaultAction::PauseWriteCommitPublication { .. }
@@ -1445,6 +1454,69 @@ impl Carrier {
                 ObjectRpcOutgoingResponse::encode_value(outgoing.response.route.clone(), response)?;
             rewritten.response.metadata = std::mem::take(&mut outgoing.response.metadata);
             outgoing = rewritten;
+        }
+        // Select only after the ordinary authenticated receiver completed and
+        // released its execution/admission. A controller can now perform a real
+        // normal publication without nesting a writer under that read owner.
+        let stat_pause_rules = if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE {
+            self.fabric.faults.lock().unwrap().iter().filter_map(|rule| {
+                let FaultAction::PauseStatProjectionReplyAfterDispatch {
+                    object_id, gate, captured,
+                } = &rule.action else { return None; };
+                (rule.source.as_ref().is_none_or(|id| id == &observation.source)
+                    && rule.target.as_ref().is_none_or(|id| id == &observation.target)
+                    && rule.route.as_ref().is_none_or(|route| route == &observation.route)
+                    && rule.origin.is_none_or(|origin| origin == observation.origin)
+                    && rule.call_id.is_none_or(|id| id == observation.call_id))
+                    .then(|| (object_id.clone(), Arc::clone(gate), Arc::clone(captured)))
+            }).collect::<Vec<_>>()
+        } else { Vec::new() };
+        if !stat_pause_rules.is_empty() {
+            let value = if outgoing.response.body.is_empty() {
+                let value = outgoing.body.collect_to_vec(64 * 1024).await?;
+                // Forward the exact collected bytes through the existing value
+                // owner; bytes/shared_bytes alone would label them Attachment.
+                let mut head = outgoing.response;
+                head.body = value.clone();
+                outgoing = ObjectRpcOutgoingResponse::value(head);
+                value
+            } else { outgoing.response.body.clone() };
+            let response: crate::DfsMessageResponse = sinomo_object_serde::from_bytes(&value)
+                .map_err(|error| NetworkError::Serialization { detail: error.to_string() })?;
+            for routed in &response.outbound_messages {
+                let crate::DfsNetworkMessage::NamespaceResponse(reply) = &routed.message else { continue; };
+                let Some(crate::DfsPosixCoordinationResult::MetadataQuery(query)) = &reply.posix_coordination_result else { continue; };
+                let (request, initial_page) = match &query.result {
+                    crate::DfsMetadataQueryResult::StatProjectionV1 { page } =>
+                        (&page.request, !page.request.fence_only && page.request.expected_prefix.is_none()),
+                    crate::DfsMetadataQueryResult::StatProjectionChangedV1 { request, .. } =>
+                        (request.as_ref(), false),
+                    _ => continue,
+                };
+                for (object_id, gate, captured) in &stat_pause_rules {
+                    if request.object_id != *object_id { continue; }
+                    {
+                        let mut observed = captured.lock().unwrap();
+                        assert!(observed.len() < 32, "bounded actual stat capture");
+                        observed.push(routed.clone());
+                    }
+                    let pause = if initial_page {
+                        let mut rules = self.fabric.faults.lock().unwrap();
+                        rules.iter_mut().find(|rule| {
+                            matches!(&rule.action, FaultAction::PauseStatProjectionReplyAfterDispatch {
+                                object_id: actual, gate: owned, captured: observed,
+                            } if actual == object_id && Arc::ptr_eq(owned, gate) && Arc::ptr_eq(observed, captured))
+                                && rule.remaining_hits > 0
+                        }).is_some_and(|rule| { rule.remaining_hits -= 1; true })
+                    } else { false };
+                    if pause {
+                        let permit = gate.acquire().await.map_err(|_| NetworkError::delivery_failed(
+                            "native stat completed-response pause", NetworkDeliveryState::PossiblyApplied,
+                            "case or node closed before original stat response release"))?;
+                        permit.forget();
+                    }
+                }
+            }
         }
         let stat_fault = if observation.route == crate::DFS_DATA_NAMESPACE_ROUTE {
             self.fabric

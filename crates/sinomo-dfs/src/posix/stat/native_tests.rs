@@ -492,3 +492,5 @@ fn directory_stat_selector_preserves_nested_prefix_and_hash_fallback_scopes() {
         ["services", "nested", "hash"]
     );
 }
+
+mod prefix_concurrency;
