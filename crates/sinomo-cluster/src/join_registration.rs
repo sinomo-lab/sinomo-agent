@@ -712,6 +712,37 @@ fn prepare_authoritative_cluster_join_registration(
         }
     }
 
+    // The joiner routes to its acceptor from the committed snapshot. Commit
+    // this node's current listener advertisements with the admission instead
+    // of relying on a later maintenance publish, which a single-node cluster
+    // never runs. Unchanged listeners add nothing.
+    let publication =
+        crate::member_publish::local_member_endpoint_publication_txn(&state, snapshot)?;
+    for compare in publication.compares {
+        let key = cluster_join_registration_compare_key(&compare).to_owned();
+        if compared_keys.insert(key) {
+            compares.push(compare);
+        }
+    }
+    for op in publication.success {
+        let Some(key) = cluster_join_registration_op_key(&op).map(str::to_owned) else {
+            return Err(NetworkError::InvalidClusterCommand {
+                detail: "acceptor endpoint publication produced a non-member KV operation"
+                    .to_string(),
+            });
+        };
+        if compared_keys.insert(key.clone()) {
+            match snapshot.get(&key) {
+                Some(entry) => compares.push(KvCompare::ValueEquals {
+                    key,
+                    value: entry.value.clone(),
+                }),
+                None => compares.push(KvCompare::Missing { key }),
+            }
+        }
+        success.push(op);
+    }
+
     Ok(AuthoritativeClusterJoinPreparation::Commit(
         PreparedAuthoritativeClusterJoin {
             state,
@@ -732,6 +763,18 @@ fn cluster_join_registration_op_key(op: &KvOp) -> Option<&str> {
         | KvOp::LeaseGrant { .. }
         | KvOp::LeaseKeepAlive { .. }
         | KvOp::LeaseRevoke { .. } => None,
+    }
+}
+
+fn cluster_join_registration_compare_key(compare: &KvCompare) -> &str {
+    match compare {
+        KvCompare::Exists { key }
+        | KvCompare::Missing { key }
+        | KvCompare::ValueEquals { key, .. }
+        | KvCompare::VersionEquals { key, .. }
+        | KvCompare::CreateRevisionEquals { key, .. }
+        | KvCompare::ModifyRevisionEquals { key, .. }
+        | KvCompare::LeaseEquals { key, .. } => key,
     }
 }
 
@@ -2976,11 +3019,12 @@ fn remember_join_channel_endpoint_in_local_state(
     state: &mut ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
 ) {
-    // Acceptance already bound this channel to an authorized member. Its
-    // published snapshot can still predate that member's listener endpoints,
-    // so the replacement daemon must retain numeric introducers as well as
-    // hostnames to reach the authority and catch up. This supplies route data;
-    // the normal transport and membership checks still authorize every call.
+    // Acceptance already bound this channel to an authorized member and
+    // committed that member's listener advertisements. The joiner may have
+    // reached it through an address it does not advertise (a hostname, NAT or
+    // published port), so keep the channel as an observed route as well. This
+    // supplies route data; the normal transport and membership checks still
+    // authorize every call.
     if endpoint.node_id == state.local_node_id
         || !matches!(
             endpoint.transport,

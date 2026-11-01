@@ -239,6 +239,45 @@ fn cluster_member_publish_txn_from_authoritative_snapshot(
     Ok(txn)
 }
 
+/// Brings this node's committed member records up to its current local
+/// advertisements. Each starts from the committed record, so only the local
+/// owner's endpoints change; the result is empty when they already match.
+pub(crate) fn local_member_endpoint_publication_txn(
+    state: &ClusterBootstrapState,
+    snapshot: &KvSnapshot,
+) -> Result<KvTxn, NetworkError> {
+    let mut members = Vec::new();
+    for local in cluster_local_process_members(state) {
+        let Some(committed) = snapshot
+            .get(&cluster_member_key(&local.node_id))
+            .and_then(|entry| entry.decode::<ClusterMemberRecord>().ok())
+        else {
+            continue;
+        };
+        if committed.cluster_id != state.cluster_id
+            || committed.node_public_key != local.node_public_key
+            || !committed.state.is_authorized()
+        {
+            continue;
+        }
+        let mut member = committed;
+        member.endpoints = local.endpoints;
+        members.push(member);
+    }
+    let txn = if members.is_empty() {
+        None
+    } else {
+        Some(cluster_member_publish_txn_from_authoritative_snapshot(
+            snapshot, &members, None,
+        )?)
+    };
+    Ok(txn.filter(|txn| !txn.success.is_empty()).unwrap_or(KvTxn {
+        compares: Vec::new(),
+        success: Vec::new(),
+        failure: Vec::new(),
+    }))
+}
+
 fn require_member_publish_commit(
     result: ClusterKvTxnCommitResult,
 ) -> Result<KvSnapshot, NetworkError> {

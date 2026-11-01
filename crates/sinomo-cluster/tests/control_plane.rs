@@ -15281,6 +15281,111 @@ fn cluster_join_registration_hydrates_compact_uri_from_authoritative_invite() {
     );
 }
 
+fn join_authority_fixture_observation(
+    fixture: &JoinAuthorityFixture,
+    main_endpoint: &ClusterEndpointRecord,
+) -> ClusterLocalDaemonMembershipObservation {
+    ClusterLocalDaemonMembershipObservation {
+        main_endpoints: vec![main_endpoint.clone()],
+        shadow_endpoints: Vec::new(),
+        main_public_key: fixture.state.members[0].node_public_key.clone(),
+        shadow_public_key: "observed-shadow-public-key".to_string(),
+        timestamp: fixture.now,
+    }
+}
+
+#[test]
+fn cluster_join_registration_commits_acceptor_listener_endpoints() {
+    // The fixture's committed issuer record has no endpoints, as in a
+    // single-node cluster that has never published its listeners.
+    let fixture = join_authority_fixture("join_acceptor_endpoints");
+    let issuer_node_id = fixture.state.local_node_id.clone();
+    let listener = daemon_lan_endpoint(&issuer_node_id, "10.42.1.10:21353".to_string(), 10);
+    let before = read_cluster_kv_current_snapshot(&fixture.paths).expect("pre-join snapshot");
+    assert!(
+        read_cluster_members_from_snapshot(&before)
+            .expect("pre-join members")
+            .iter()
+            .find(|member| member.node_id == issuer_node_id)
+            .is_some_and(|member| member.endpoints.is_empty())
+    );
+
+    let mut host = RecordingJoinRegistrationHost {
+        observation: Some(join_authority_fixture_observation(&fixture, &listener)),
+        ..Default::default()
+    };
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle join registration");
+
+    assert!(response.accepted, "{}", response.detail);
+    let snapshot = response.kv_snapshot.expect("accepted join snapshot");
+    let committed_issuer = read_cluster_members_from_snapshot(&snapshot)
+        .expect("committed members")
+        .into_iter()
+        .find(|member| member.node_id == issuer_node_id)
+        .expect("committed issuer");
+    assert!(
+        committed_issuer.endpoints.contains(&listener),
+        "the joiner's snapshot must route to its acceptor: {:?}",
+        committed_issuer.endpoints
+    );
+    assert!(
+        snapshot
+            .get(&cluster_endpoint_key(&issuer_node_id, &listener))
+            .is_some()
+    );
+}
+
+#[test]
+fn cluster_join_registration_leaves_current_acceptor_endpoints_unwritten() {
+    let fixture = join_authority_fixture("join_acceptor_endpoints_current");
+    let issuer_node_id = fixture.state.local_node_id.clone();
+    let listener = daemon_lan_endpoint(&issuer_node_id, "10.42.2.10:21353".to_string(), 10);
+    let mut published = fixture.state.clone();
+    published.members[0].endpoints = vec![listener.clone()];
+    sync_cluster_state_to_local_raft_unchecked(&fixture.paths, &published)
+        .expect("publish current listener");
+    let before = read_cluster_kv_current_snapshot(&fixture.paths).expect("pre-join snapshot");
+    let member_key = cluster_member_key(&issuer_node_id);
+    let endpoint_key = cluster_endpoint_key(&issuer_node_id, &listener);
+    let member_revision = before.get(&member_key).expect("issuer").modify_revision;
+    let endpoint_revision = before
+        .get(&endpoint_key)
+        .expect("issuer endpoint")
+        .modify_revision;
+
+    let mut host = RecordingJoinRegistrationHost {
+        observation: Some(join_authority_fixture_observation(&fixture, &listener)),
+        ..Default::default()
+    };
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle join registration");
+
+    assert!(response.accepted, "{}", response.detail);
+    let snapshot = response.kv_snapshot.expect("accepted join snapshot");
+    assert_eq!(
+        snapshot.get(&member_key).expect("issuer").modify_revision,
+        member_revision
+    );
+    assert_eq!(
+        snapshot
+            .get(&endpoint_key)
+            .expect("issuer endpoint")
+            .modify_revision,
+        endpoint_revision
+    );
+}
+
 #[test]
 fn cluster_join_registration_rejects_revoked_invite_and_removed_issuer() {
     let revoked = join_authority_fixture("join_revoked_invite");
