@@ -170,8 +170,6 @@ use sinomo_runtime::daemon::{
 use sinomo_runtime::daemon::{
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
 };
-#[cfg(test)]
-use sinomo_runtime::dfs::DfsMetadataBackend;
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
     DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId, DfsOperatorInspectionCursor,
