@@ -119,6 +119,9 @@ class HarnessTests(unittest.TestCase):
         runner.index = 0
         runner.completed = []
         runner.samples = []
+        # __new__ bypasses Acceptance's constructor; run() still owns its
+        # maintained compose-prefix/lifecycle classification.
+        runner.compose = ["docker", "compose"]
         return runner
 
     def test_convergence_requires_authoritative_handoff_evidence(self):
@@ -570,8 +573,10 @@ NODES=node1
             argv = ["measure-dfs-write-latency.py", "--project", "fixture", "--binary", str(binary),
                     "--artifacts", str(artifacts), "--origins", "node1", "--shards", "root",
                     "--skip-readiness"]
+            write_calls = []
             def command(args, **kwargs):
                 if "cluster.dfs.write-latency" in args:
+                    write_calls.append(list(args))
                     return subprocess.CompletedProcess(args, 7, json.dumps(report).encode(), b"gate failed")
                 return subprocess.CompletedProcess(args, 0, b"", b"")
             with patch("sys.argv", argv), \
@@ -581,9 +586,17 @@ NODES=node1
                  patch.object(latency_driver.acceptance.Acceptance, "verify_processes"), \
                  patch.object(latency_driver.acceptance.Acceptance, "verify_observe"), \
                  patch.object(latency_driver.acceptance.Acceptance, "probe"):
-                with self.assertRaisesRegex(RuntimeError, "exit 7"):
+                with self.assertRaisesRegex(RuntimeError, "write completion/verification is incomplete") as failed:
                     latency_driver.main()
+            self.assertIsInstance(failed.exception.__cause__, RuntimeError)
+            self.assertIn("exit 7", str(failed.exception.__cause__))
+            self.assertEqual(len(write_calls), 1, "incomplete evidence cannot replay this write or start another case")
             result = json.loads((artifacts / "write-latency.json").read_text())
+            self.assertEqual(len(result["groups"]), 1)
+            self.assertTrue(result["remaining_cases_unrun"])
+            self.assertEqual(result["unrun_cases"], result["planned_cases"][1:])
+            self.assertEqual(result["blocked_after"], "w1-n2-node1-root-write-latency")
+            self.assertIn("write completion/verification is incomplete", result["error"])
             self.assertFalse(result["passed"])
             self.assertEqual(result["parameters"]["max_p95_us"], 100_000)
             group = result["groups"][0]
@@ -593,6 +606,8 @@ NODES=node1
             self.assertEqual(group["samples"], samples)
             self.assertEqual(group["probe_diagnostics"], report["diagnostics"])
             self.assertIn("exit 7", group["error"])
+            self.assertEqual(group["target_returncode"], 7)
+            self.assertFalse(group["command_timed_out"])
             generated = json.loads((artifacts / "report.json").read_text())
             self.assertFalse(generated["passed"])
             self.assertEqual(generated["acceptance_rows"][0]["p95_ms"], 101)
@@ -643,10 +658,12 @@ NODES=node1
                            SINOMO_DOCKER_DIR=str(Path(__file__).resolve().parent), FAILED_SCENARIOS="",
                            FORMATION_ONLY="0", DFS_READY_ONLY="1", DFS_ONLY="0", NETWORK_CASES="",
                            CLUSTER_KV_ONLY="0", PJDFSTEST_ONLY="0")
-                command = ('teardown_cluster() { return 1; }\nlog() { :; }\n' + function
+                command = ('resource_watch_stop() { echo stop >>"$ARTIFACTS/cleanup-order"; return 0; }\n'
+                           'teardown_cluster() { echo teardown >>"$ARTIFACTS/cleanup-order"; return 1; }\nlog() { :; }\n' + function
                            + f'prior_status() {{ return {exit_code}; }}\nprior_status\nteardown')
                 completed = subprocess.run(["bash", "-c", command], env=env, capture_output=True)
                 self.assertEqual(completed.returncode, exit_code, completed.stderr.decode())
+                self.assertEqual((Path(directory) / "cleanup-order").read_text().splitlines(), ["stop", "teardown"])
                 report = json.loads((Path(directory) / "report.json").read_text())
                 self.assertEqual(report["passed"], exit_code == 0)
                 self.assertTrue((Path(directory) / "REPORT.md").is_file())
@@ -1133,15 +1150,31 @@ class AssignedParticipantInterruptionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, b'')
 
-    def exercise_selected_interruption(self, writer, leaf, extra_network=False):
+    def exercise_selected_interruption(self, writer, leaf, extra_network=False,
+                                       endpoint_drift='', ipv6=False, invalid_endpoint=False):
         # Side-effect-free transport stubs cover harness custody and sequencing;
         # these are explicitly not native partition or availability proofs.
         functions = ''.join(DfsBaselineLaneTests.shell_function(name) for name in
                             ['dfs_converged_epoch_signature', 'dfs_partition_participants_from_layout',
+                             'dfs_network_endpoint_restore_arguments',
+                             'dfs_network_endpoint_matches_snapshot',
                              'temporary_network_recovery'])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/'layout.json').write_text(json.dumps(self.partition_layout('native-' + writer)))
+            endpoint = {'NetworkID': 'actual-owned-network', 'IPAddress': '192.0.2.147',
+                        'GlobalIPv6Address': 'fd00:19::147' if ipv6 else '',
+                        'Aliases': ['dynamic-compose-' + leaf, leaf, 'actual-retained-alias']}
+            if invalid_endpoint:
+                endpoint['IPAddress'] = endpoint['GlobalIPv6Address'] = ''
+            networks = {'owned-retained_seg_b': endpoint}
+            if extra_network:
+                networks['unexpected-network'] = {}
+            (root/'network.json').write_text(json.dumps(networks))
+            drifted = json.loads(json.dumps(networks))
+            drifted['owned-retained_seg_b']['IPAddress'] = '192.0.2.148'
+            drifted['owned-retained_seg_b']['Aliases'] = [leaf]
+            (root/'drifted-network.json').write_text(json.dumps(drifted))
             prelude = r'''log() { :; }
 cluster_local_node_id() { printf 'identity\t%s\n' "$1" >>"$ARTIFACTS/calls.tsv"; printf 'native-%s\n' "$1"; }
 compose() {
@@ -1164,8 +1197,11 @@ run_probe() {
 docker() {
   printf 'docker\t%s\n' "$*" >>"$ARTIFACTS/calls.tsv"
   if [ "$1" = inspect ]; then
-    if [ "$TEST_EXTRA_NETWORK" = yes ]; then printf '{"owned-retained_seg_b":{},"unexpected-network":{}}\n';
-    else printf '{"owned-retained_seg_b":{}}\n'; fi
+    DOCKER_INSPECT_COUNT=$((DOCKER_INSPECT_COUNT + 1))
+    if { [ "$DOCKER_INSPECT_COUNT" = 2 ] && [ "$TEST_ENDPOINT_DRIFT" = after-heal ]; } ||
+       { [ "$DOCKER_INSPECT_COUNT" = 3 ] && [ "$TEST_ENDPOINT_DRIFT" = after-reopen ]; }; then
+      cat "$ARTIFACTS/drifted-network.json"
+    else cat "$ARTIFACTS/network.json"; fi
   fi
 }
 sleep() { :; }
@@ -1177,16 +1213,26 @@ PROJECT=owned-retained
 EXPECT_TIMEOUT=60
 NETWORK_PARTITION_SECONDS=1
 PROBE_INDEX=0
+DOCKER_INSPECT_COUNT=0
 '''
-            script = prelude + functions + '\nARTIFACTS="$1"\nTEST_PRIMARY_NATIVE="$2"\nRUN_ID="retained-current-$3"\nTEST_EXTRA_NETWORK="$4"\ntemporary_network_recovery'
+            script = prelude + functions + '\nARTIFACTS="$1"\nTEST_PRIMARY_NATIVE="$2"\nRUN_ID="retained-current-$3"\nTEST_EXTRA_NETWORK="$4"\nTEST_ENDPOINT_DRIFT="$5"\ntemporary_network_recovery'
             result = subprocess.run(['bash', '-c', script, 'test', directory, 'native-' + writer,
-                                     writer, 'yes' if extra_network else 'no'],
+                                     writer, 'yes' if extra_network else 'no', endpoint_drift],
                                     capture_output=True, text=True, timeout=5)
             calls = [line.split('\t') for line in (root/'calls.tsv').read_text().splitlines()]
-            if extra_network:
+            if extra_network or invalid_endpoint:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(any(len(row) > 1 and row[1] == 'cluster.dfs.write' for row in calls))
                 self.assertFalse(any(row[0] == 'docker' and row[1].startswith('network disconnect') for row in calls))
+                return
+            if endpoint_drift:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(any(row[0] == 'docker' and row[1].startswith('network connect') for row in calls))
+                if endpoint_drift == 'after-heal':
+                    self.assertFalse(any(row[0] == 'ready' for row in calls))
+                else:
+                    self.assertIn(['ready', 'post-network-heal'], calls)
+                    self.assertNotIn(['ready', 'post-network-recovery-reopen'], calls)
                 return
             self.assertEqual(result.returncode, 0, result.stderr)
             partition = [row for row in calls if len(row) > 1 and row[1] == 'cluster.dfs.partition-write']
@@ -1204,7 +1250,16 @@ PROBE_INDEX=0
                 self.assertIn('original-options-json={"immutable":"actual-options"}', row)
             self.assertEqual([row[0] for row in calls if len(row) > 1 and row[1] == 'cluster.dfs.write'], [writer, writer])
             self.assertIn(['docker', f'network disconnect owned-retained_seg_b actual-container-{leaf}'], calls)
-            self.assertIn(['docker', f'network connect --alias {leaf} owned-retained_seg_b actual-container-{leaf}'], calls)
+            arguments = ['--ip', endpoint['IPAddress']]
+            if ipv6:
+                arguments += ['--ip6', endpoint['GlobalIPv6Address']]
+            for alias in endpoint['Aliases']:
+                arguments += ['--alias', alias]
+            self.assertIn(['docker', 'network connect ' + ' '.join(arguments)
+                           + f' owned-retained_seg_b actual-container-{leaf}'], calls)
+            self.assertEqual(json.loads((root/'network-heal-restore-arguments.json').read_text()), arguments)
+            self.assertEqual(json.loads((root/'network-heal-restored-networks.json').read_text()), networks)
+            self.assertEqual(json.loads((root/'network-heal-reopened-networks.json').read_text()), networks)
             self.assertIn(['compose', f'restart {leaf}'], calls)
             restart_at = calls.index(['compose', f'restart {leaf}'])
             ready_at = calls.index(['ready', 'post-network-recovery-reopen'])
@@ -1230,6 +1285,18 @@ PROBE_INDEX=0
 
     def test_interruption_refuses_a_leaf_with_an_extra_network_before_any_seed(self):
         self.exercise_selected_interruption('node6', 'node5', extra_network=True)
+
+    def test_interruption_restores_actual_ipv6_and_every_alias(self):
+        self.exercise_selected_interruption('node4', 'node6', ipv6=True)
+
+    def test_interruption_refuses_missing_runtime_addresses_before_any_seed(self):
+        self.exercise_selected_interruption('node4', 'node6', invalid_endpoint=True)
+
+    def test_interruption_refuses_endpoint_drift_before_heal_doctor(self):
+        self.exercise_selected_interruption('node4', 'node6', endpoint_drift='after-heal')
+
+    def test_interruption_refuses_endpoint_drift_before_reopen_doctor(self):
+        self.exercise_selected_interruption('node4', 'node6', endpoint_drift='after-reopen')
 
     def test_cut_requires_exact_durable_witness_and_heal_reuses_original_inputs(self):
         body = DfsBaselineLaneTests.shell_function('temporary_network_recovery')

@@ -4363,6 +4363,42 @@ dfs_partition_participants_from_layout() {
   ' "$layout"
 }
 
+# Reconnect this exact observed endpoint, including dynamically assigned IPs.
+# Compose's configured IPAM may be empty; it does not replace the runtime cut.
+dfs_network_endpoint_restore_arguments() {
+  jq -ce --arg network "$2" '
+    .[$network] as $endpoint
+    | ($endpoint.IPAddress // "") as $ipv4
+    | ($endpoint.GlobalIPv6Address // "") as $ipv6
+    | if ($endpoint | type) != "object"
+        or ($endpoint.NetworkID | type) != "string" or ($endpoint.NetworkID | length) == 0
+        or ($ipv4 | type) != "string" or ($ipv6 | type) != "string"
+        or ($ipv4 == "" and $ipv6 == "")
+        or ($ipv4 | test("[\r\n\u0000]")) or ($ipv6 | test("[\r\n\u0000]"))
+        or (($endpoint.Aliases // []) | type) != "array"
+        or (all(($endpoint.Aliases // [])[];
+          type == "string" and length > 0 and (test("[\r\n\u0000]") | not)) | not)
+      then error("network snapshot has no restorable addresses or valid aliases")
+      else [
+        (if $ipv4 != "" then "--ip", $ipv4 else empty end),
+        (if $ipv6 != "" then "--ip6", $ipv6 else empty end),
+        (($endpoint.Aliases // [])[] | "--alias", .)
+      ] end
+  ' "$1"
+}
+
+dfs_network_endpoint_matches_snapshot() {
+  jq -e --arg network "$3" --slurpfile before "$1" '
+    . as $actual | $before[0] as $expected
+    | (keys == ($expected | keys))
+      and (.[$network].NetworkID == $expected[$network].NetworkID)
+      and ((.[$network].IPAddress // "") == ($expected[$network].IPAddress // ""))
+      and ((.[$network].GlobalIPv6Address // "") == ($expected[$network].GlobalIPv6Address // ""))
+      and (((.[$network].Aliases // []) | sort | unique)
+        == (($expected[$network].Aliases // []) | sort | unique))
+  ' "$2" >/dev/null
+}
+
 temporary_network_recovery() {
   local base="/services/cluster-tests/runs/$RUN_ID/network-heal"
   local path="$base/value.txt" new_path="$base/after-heal.txt"
@@ -4372,6 +4408,8 @@ temporary_network_recovery() {
   local network="${PROJECT}_seg_b"
   local unavailable unavailable_container unavailable_id baseline_report original_json assignment_json options_json
   local writer reader node node_id layout roster roster_rows selection network_observation
+  local restore_arguments restore_lines restored_networks reopened_networks
+  local -a restore_args
 
   # A retained cohort may have completed a cooperative handoff. Resolve the
   # actual Services owner once and keep this SAME writer through every phase.
@@ -4405,6 +4443,11 @@ temporary_network_recovery() {
   # Both supported leaves belong only to seg_b. A second attached network
   # would invalidate this cut; refuse before seeding or disconnecting.
   jq -e --arg network "$network" 'keys == [$network]' "$network_observation" >/dev/null || return 1
+  restore_arguments="$ARTIFACTS/network-heal-restore-arguments.json"
+  dfs_network_endpoint_restore_arguments "$network_observation" "$network" \
+    >"$restore_arguments" || return 1
+  restore_lines="$(jq -r '.[]' "$restore_arguments")" || return 1
+  mapfile -t restore_args <<<"$restore_lines"
   reader=node5
   if [ "$unavailable" = node5 ]; then reader=node6; fi
   jq -n --argjson selection "$selection" --arg container_id "$unavailable_container" \
@@ -4447,8 +4490,16 @@ temporary_network_recovery() {
 
   # Heal even after missing/failed cut evidence; retain that failure in rc.
   log "reconnecting $unavailable to $network"
-  if ! docker network connect --alias "$unavailable" "$network" "$unavailable_container" >/dev/null 2>&1; then
+  if ! docker network connect "${restore_args[@]}" "$network" "$unavailable_container" \
+    >"$ARTIFACTS/network-heal-reconnect.stdout" 2>"$ARTIFACTS/network-heal-reconnect.stderr"; then
     log "failed to reconnect $unavailable to $network"
+    return 1
+  fi
+  restored_networks="$ARTIFACTS/network-heal-restored-networks.json"
+  docker inspect --format '{{json .NetworkSettings.Networks}}' "$unavailable_container" \
+    >"$restored_networks" || return 1
+  if ! dfs_network_endpoint_matches_snapshot "$network_observation" "$restored_networks" "$network"; then
+    log "reconnected $unavailable did not restore its captured addresses and aliases"
     return 1
   fi
   wait_for_cluster_ready "post-network-heal" || rc=1
@@ -4471,6 +4522,13 @@ temporary_network_recovery() {
   compose restart "$unavailable" >/dev/null 2>&1 || { log "$unavailable recovery reopen failed"; return 1; }
   if [ "$(compose ps -q "$unavailable")" != "$unavailable_container" ]; then
     log "selected interrupted container identity changed during reopen"
+    return 1
+  fi
+  reopened_networks="$ARTIFACTS/network-heal-reopened-networks.json"
+  docker inspect --format '{{json .NetworkSettings.Networks}}' "$unavailable_container" \
+    >"$reopened_networks" || return 1
+  if ! dfs_network_endpoint_matches_snapshot "$network_observation" "$reopened_networks" "$network"; then
+    log "reopened $unavailable did not retain its restored addresses and aliases"
     return 1
   fi
   wait_for_cluster_ready "post-network-recovery-reopen" || rc=1
