@@ -41,6 +41,7 @@ impl TabStrip {
         let theme_width_limit = tab_width_limit.clone();
         let tabs = BrowserTabBar::new("shell-tabs")
             .max_tab_width(220.0)
+            .text_overflow(sui::TextOverflow::Ellipsis)
             .tabs_when(move || labels.signals().workspace_titles.get())
             .selected_when(move || match selected.signals().workspace_selection.get() {
                 WorkspaceSelection::Pinned(_) => None,

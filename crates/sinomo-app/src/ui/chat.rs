@@ -12230,6 +12230,7 @@ fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Wi
     let s = shared.clone();
 
     SegmentedControl::new("Conversation kind")
+        .text_overflow(sui::TextOverflow::Ellipsis)
         .items(items)
         .selected(selected)
         .theme_when(clone_reader(reader))
@@ -15441,15 +15442,7 @@ impl TranscriptView {
     }
 
     fn tool_header_height(theme: &DefaultTheme, subtitle: bool) -> f32 {
-        if subtitle {
-            (16.0
-                + theme.text.sm.line_height
-                + theme.metrics.action_card_text_gap.min(3.0)
-                + theme.text.xs.line_height)
-                .max(50.0)
-        } else {
-            (16.0 + theme.text.sm.line_height).max(42.0)
-        }
+        sui::ActionTileGeometry::height(theme, subtitle).max(if subtitle { 50.0 } else { 42.0 })
     }
 
     fn narrative_header_height(theme: &DefaultTheme) -> f32 {
@@ -16101,6 +16094,7 @@ impl TranscriptView {
     fn tool_card_paint(pal: &Palette) -> ActionTilePaint {
         // Mesh tool-call card: quiet surface, hairline border, r-2 corners.
         ActionTilePaint::neutral()
+            .text_overflow(sui::TextOverflow::Ellipsis)
             .background(pal.panel)
             .border(pal.border)
             .title_color(pal.text)
