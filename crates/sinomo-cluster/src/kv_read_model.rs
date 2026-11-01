@@ -190,12 +190,6 @@ fn read_cluster_directory_input_for_prefixes(
         return fallback();
     };
     let entries = current.value.map_err(kv_err)?;
-    // This existing identity-aware materialized read is also used by the old
-    // selector. Equal revision still chooses the actual native current cut.
-    let imported = crate::kv_local_store::read_cluster_kv_cached_snapshot_if_present(paths)?;
-    if let Some(imported) = imported.filter(|snapshot| snapshot.revision > current.revision) {
-        return ClusterDirectoryKvInput::from_snapshot_for_prefixes(&imported, prefixes).map(Some);
-    }
     Ok(Some(Arc::new(ClusterDirectoryKvInput {
         revision: current.revision,
         entries,
@@ -1935,7 +1929,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_read_model_prefers_newer_imported_membership_over_stale_local_raft_view() {
+    fn kv_read_model_reads_resident_raft_even_when_the_materialized_file_is_newer() {
         let root = sinomo_testdir::TestDir::new("kv-read-model-latest-observed-membership");
         let data_dir = sinomo_local::SinomoDataDir::new(root.path());
         let paths = ClusterPaths::new(&data_dir);
@@ -1986,10 +1980,12 @@ mod tests {
             local_current.get(&cluster_member_key(&joined)).is_none(),
             "the regression requires local Raft materialization to trail the imported acceptance"
         );
+        // The resident applied Raft state is canonical; this node learns the
+        // accepted member through Raft catch-up, not a file written ahead of it.
         let members = read_cluster_members_from_kv(&paths).expect("latest observed members");
         assert!(
-            members.iter().any(|member| member.node_id == joined),
-            "the directory read model must expose the newer accepted member"
+            !members.iter().any(|member| member.node_id == joined),
+            "the directory read model must not adopt a materialized file ahead of Raft"
         );
         let records = KvClusterDirectory::new(paths.clone())
             .records_snapshot()
@@ -1997,11 +1993,11 @@ mod tests {
         let (version, members, _) = records.into_parts();
         assert_eq!(
             version,
-            sinomo_network::DirectoryVersion(accepted.revision.0)
+            sinomo_network::DirectoryVersion(local_current.revision.0)
         );
         assert!(
-            members.iter().any(|member| member.node_id == joined),
-            "the transactional routing snapshot must use that same accepted revision"
+            !members.iter().any(|member| member.node_id == joined),
+            "the transactional routing snapshot must use the resident revision"
         );
     }
 }

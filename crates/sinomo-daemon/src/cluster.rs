@@ -314,7 +314,6 @@ impl ClusterNetworkMaintenancePendingWork {
 struct ClusterMemberPublishPendingWork {
     paths: ClusterPaths,
     state: ClusterBootstrapState,
-    force_kv_snapshot_sync: bool,
 }
 
 #[derive(Clone)]
@@ -1970,7 +1969,6 @@ pub(crate) fn publish_local_members_to_quorum_if_needed_on_runtime(
         state,
         sinomo_core::cluster::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
-            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -1980,7 +1978,6 @@ pub(crate) fn publish_local_members_to_quorum_if_needed_on_runtime(
 pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
-    force_kv_snapshot_sync: bool,
     runtime: tokio::runtime::Handle,
     timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
@@ -1994,7 +1991,6 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
         state,
         sinomo_core::cluster::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
-            force_kv_snapshot_sync,
         },
         &mut host,
     )
@@ -2644,7 +2640,6 @@ impl ClusterNetworkMaintenance {
                     .push(ClusterMemberPublishPendingWork {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
-                        force_kv_snapshot_sync: false,
                     });
             }
             if !cluster_is_solo && !probe_due && !self.connectivity_publish_retry_waiting(now) {
@@ -3255,7 +3250,6 @@ impl ClusterNetworkMaintenance {
         let result = publish_local_members_to_quorum_if_needed_async(
             &pending.paths,
             &pending.state,
-            pending.force_kv_snapshot_sync,
             runtime,
             cluster_control_plane_timeouts(),
         )
@@ -16217,7 +16211,6 @@ mod tests {
         .expect("maintenance tick")
         .expect("runtime publish tick should return pending member publish");
         assert_eq!(pending.member_publishes.len(), 1);
-        assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert_eq!(pending.node_status_refreshes.len(), 1);
         assert!(
             pending.connectivity_probe.is_some(),
@@ -16381,7 +16374,6 @@ mod tests {
         .expect("regular cadence should produce source-owned publish work");
 
         assert_eq!(pending.member_publishes.len(), 1);
-        assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert_eq!(pending.node_status_refreshes.len(), 1);
     }
 
@@ -16486,7 +16478,6 @@ mod tests {
         .expect("voter maintenance should still publish member and status records");
 
         assert_eq!(pending.member_publishes.len(), 1);
-        assert!(!pending.member_publishes[0].force_kv_snapshot_sync);
         assert_eq!(pending.node_status_refreshes.len(), 1);
     }
 
@@ -16762,10 +16753,9 @@ mod tests {
             .expect("member publish body without revision");
 
         assert!(response.accepted);
-        assert_eq!(
-            response.kv_snapshot.map(|snapshot| snapshot.revision),
-            Some(synced.revision),
-            "a publisher without a readable local KV snapshot converges via the full snapshot"
+        assert!(
+            response.kv_snapshot.is_none(),
+            "a publisher converges through Raft; no snapshot is handed back"
         );
     }
 

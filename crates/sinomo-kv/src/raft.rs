@@ -6927,13 +6927,6 @@ pub trait ClusterKvTxnQuorumHost {
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
 
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        _state: &ClusterBootstrapState,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     fn local_is_raft_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, Self::Error>;
 
     fn forward_cluster_kv_txn_to_voter(
@@ -6972,13 +6965,6 @@ pub trait ClusterKvTxnQuorumAsyncHost: Send {
     /// `From<KvError>` bound so host error types in other crates do not need
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
-
-    fn refresh_current_cluster_kv_store_async<'a>(
-        &'a mut self,
-        _state: &'a ClusterBootstrapState,
-    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
-        Box::pin(async { Ok(()) })
-    }
 
     fn local_is_raft_leader_async<'a>(
         &'a mut self,
@@ -7070,7 +7056,6 @@ pub fn commit_cluster_kv_txn_with_quorum_with_host<H>(
 where
     H: ClusterKvTxnQuorumHost,
 {
-    let _ = host.refresh_current_cluster_kv_store(state);
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host.forward_cluster_kv_txn_to_voter(state, &request)?
@@ -7220,7 +7205,6 @@ pub async fn commit_cluster_kv_txn_with_quorum_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let _ = host.refresh_current_cluster_kv_store_async(state).await;
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host
@@ -7403,7 +7387,6 @@ pub async fn commit_cluster_kv_txn_compact_with_quorum_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let _ = host.refresh_current_cluster_kv_store_async(state).await;
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host

@@ -3132,27 +3132,15 @@ impl cluster::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         runtime.shutdown_timeout(Duration::from_millis(250));
         result
     }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        _paths: &ClusterPaths,
-        _local_node_id: &NodeId,
-        _snapshot: KvSnapshot,
-    ) -> Result<bool, network::NetworkError> {
-        // `refresh_current_cluster_kv_store_with_host` has already persisted
-        // the imported materialized projection before invoking this hook. A
-        // CLI process does not own the resident Raft node and must never open
-        // it merely to arbitrate a read snapshot; the daemon will reconcile
-        // its own Raft-backed projection on its next committed edge.
-        Ok(false)
-    }
 }
 
 fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), CliError> {
     let Ok(state) = read_cluster_state_with_materialized_member_overlay(paths) else {
         return Ok(());
     };
-    match cluster::refresh_current_cluster_kv_store_with_host(
+    // Without a running daemon this CLI reads the materialized projection, so
+    // it persists the authoritative snapshot it fetched for those reads.
+    match cluster::refresh_current_cluster_kv_store_with_outcome(
         paths,
         &state,
         cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
@@ -3161,6 +3149,16 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             paths: paths.clone(),
         },
     ) {
+        Ok(outcome) if outcome.fetched_remote => {
+            let snapshot = outcome.store.try_snapshot()?;
+            if sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+                &paths.kv_paths(),
+                &snapshot,
+            )? {
+                cluster::invalidate_cluster_kv_observed_read_models(paths);
+            }
+            Ok(())
+        }
         Ok(_) | Err(network::NetworkError::ClusterReadOnly { .. }) => Ok(()),
         Err(network::NetworkError::Io { .. }) => Ok(()),
         Err(error) => Err(error.into()),
@@ -3529,55 +3527,6 @@ mod tests {
         assert_eq!(
             retained_record.state,
             sinomo_runtime::network::ClusterConnectivityState::Healthy
-        );
-    }
-
-    #[test]
-    fn cli_snapshot_refresh_host_never_opens_local_raft_storage() {
-        let root = sinomo_testdir::TestDir::new("sinomo-cli-snapshot-refresh-no-raft-open");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-        let state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_cli_snapshot_no_raft_open").expect("cluster id"),
-            "CLI snapshot no Raft open",
-            NodeId::from_legacy_named("node_cli_snapshot_no_raft_open").expect("node id"),
-            "local",
-            "public-key",
-            OffsetDateTime::now_utc(),
-        );
-        cluster::write_cluster_state(&paths, &state).expect("cluster state");
-        let snapshot = sinomo_runtime::kv::InProcessKvStore::new()
-            .try_snapshot()
-            .expect("KV snapshot");
-        sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &snapshot)
-            .expect("materialized snapshot");
-
-        // A durable-state marker makes a latest-observed read try the Raft
-        // path. Making node.lock a directory turns any such attempt into a
-        // deterministic error without relying on timing or another process.
-        let wal_paths = paths.kv_paths().raft_wal_paths(&state.local_node_id);
-        std::fs::create_dir_all(&wal_paths.root).expect("Raft root");
-        std::fs::write(&wal_paths.wal, b"").expect("durable-state marker");
-        std::fs::create_dir(&wal_paths.lock).expect("inaccessible node lock sentinel");
-
-        let mut host = CliClusterKvSnapshotRefreshHost {
-            paths: paths.clone(),
-        };
-        assert!(
-            !cluster::ClusterKvSnapshotRefreshHost::cache_cluster_kv_snapshot_if_newer_than_raft(
-                &mut host,
-                &paths,
-                &state.local_node_id,
-                snapshot.clone(),
-            )
-            .expect("CLI snapshot cache hook"),
-            "the generic refresh already persisted the imported projection"
-        );
-        assert_eq!(
-            sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-                .expect("materialized snapshot remains readable"),
-            snapshot
         );
     }
 
