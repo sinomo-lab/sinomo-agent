@@ -2240,15 +2240,17 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                     .filter(|intent| write_intent_status_is_active(&intent.status))
                     .count(),
             );
-            object_intents.extend(intent_page.intents);
+            for intent in intent_page.intents {
+                if self
+                    .get_intent_receipt(&intent.object_id, &intent.intent_id)?
+                    .is_none()
+                {
+                    object_intents.push(intent);
+                }
+            }
             Ok(intent_page.next_cursor)
         })?;
 
-        let committed_targets = object_intents
-            .iter()
-            .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
-            .map(|intent| intent.target_version.clone())
-            .collect::<BTreeSet<_>>();
         let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
         let mut repair_versions = BTreeMap::new();
         walk_metadata_pages(|version_cursor| {
@@ -2262,7 +2264,6 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 .saturating_add(version_page.versions.len());
             for version in version_page.versions {
                 repair_versions.insert(version.version.clone(), version.clone());
-                let collect_for_repair = committed_targets.contains(&version.version);
                 walk_metadata_pages(|receipt_cursor| {
                     let receipt_page = self.receipts_for_version_page(
                         &object.object_id,
@@ -2273,12 +2274,10 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                     summary.receipt_count = summary
                         .receipt_count
                         .saturating_add(receipt_page.receipts.len());
-                    if collect_for_repair {
-                        receipts_by_version
-                            .entry(version.version.clone())
-                            .or_default()
-                            .extend(receipt_page.receipts);
-                    }
+                    receipts_by_version
+                        .entry(version.version.clone())
+                        .or_default()
+                        .extend(receipt_page.receipts);
                     Ok(receipt_page.next_cursor)
                 })?;
             }

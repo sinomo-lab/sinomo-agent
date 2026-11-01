@@ -53,6 +53,9 @@ impl PreparedDaemonControlListener {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod control_loop_error_tests;
+
 pub fn prepare_daemon_control_listener(
     mut options: DaemonRunOptions,
 ) -> Result<PreparedDaemonControlListener, DaemonError> {

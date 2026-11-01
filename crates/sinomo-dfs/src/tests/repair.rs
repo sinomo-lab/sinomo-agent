@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod recovery_custody;
+mod source_fetch_admission;
+mod rename_pending;
+
 // Direct Core fixtures still need the mounted owner's real scheduler admission.
 // Resolve its current native shard; the normal provider validates the physical
 // owner/generation and rechecks that assignment after acquiring ExactShard.
@@ -5389,6 +5393,10 @@ fn repair_retry_schedule_does_not_double_count_completed_inflight_attempt() {
     let mut dfs = runtime.metadata_primary_service(path).unwrap();
     dfs.hydrate_from_metadata_backend_for_commit_promotion_recovery()
         .unwrap();
+    // The saved Original retains background_repair=true during this explicit
+    // synchronous retry. Hold the actual Core owner and exclude only Routine
+    // preflight; the old blanket claim fault would reject this retry itself.
+    let (execution, background) = native_private_repair_owner(&runtime, &dfs, path, background);
     runtime.clear_faults();
     runtime.install_fault(crate::test_support::DfsTestFaultRule {
         source: Some(owner.clone()),
@@ -5478,6 +5486,7 @@ fn repair_retry_schedule_does_not_double_count_completed_inflight_attempt() {
             .iter()
             .any(|receipt| receipt.replica_node_id == replica)
     );
+    drop(execution);
     drop(dfs);
     drop(background);
     runtime.close().unwrap();
@@ -7916,54 +7925,103 @@ fn sifs_cluster_routes_bounded_directory_rename_and_resume_receipts() {
         ..
     } = cluster;
     let stop_primary = Arc::new(AtomicBool::new(false));
-    let primary_stop = Arc::clone(&stop_primary);
-    let primary_thread = std::thread::spawn(move || {
-        let mut primary = primary;
-        while !primary_stop.load(Ordering::SeqCst) {
-            primary.process_incoming().expect("primary pump");
-            std::thread::sleep(Duration::from_millis(1));
+    std::thread::scope(|scope| {
+        let primary_stop = Arc::clone(&stop_primary);
+        let primary_thread = scope.spawn(move || {
+            let mut primary = primary;
+            while !primary_stop.load(Ordering::SeqCst) {
+                primary.process_incoming().map_err(|error| error.to_string())?;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok::<_, String>(primary)
+        });
+        // Drop before scope joins on a caller panic; preserve its original
+        // error while stopping the existing pump, rather than detaching it.
+        struct StopPrimary(Arc<AtomicBool>);
+        impl Drop for StopPrimary {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
         }
-        primary
-    });
+        let _stop_on_exit = StopPrimary(Arc::clone(&stop_primary));
 
-    let from = "/users/bounded-old";
-    let to = "/users/bounded-new";
-    writer
-        .posix_mkdir_all(&format!("{from}/nested"))
-        .expect("routed source tree");
-    for index in 0..4 {
+        let from = "/users/bounded-old";
+        let to = "/users/bounded-new";
         writer
-            .posix_write_file(
-                &format!("{from}/nested/{index}.txt"),
-                index.to_string().as_bytes(),
-                DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
-            )
-            .expect("routed source file");
-    }
-    let mut job = writer
-        .posix_rename_directory_bounded_routed(from, to, 1)
-        .expect("first routed bounded batch");
-    while job.status == DfsNamespaceJobStatus::Running {
-        job = writer
-            .posix_resume_namespace_job_bounded_routed(&job.job_id, from, 1)
-            .expect("next routed bounded batch");
-    }
-    assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
-    assert!(matches!(
-        writer.posix_stat(from),
-        Err(DfsPosixError::NotFound { .. })
-    ));
-    for index in 0..4 {
-        assert_eq!(
+            .posix_mkdir_all(&format!("{from}/nested"))
+            .expect("routed source tree");
+        for index in 0..4 {
             writer
-                .posix_read_file_distributed(&format!("{to}/nested/{index}.txt"))
-                .expect("renamed file"),
-            index.to_string().as_bytes()
-        );
-    }
+                .posix_write_file(
+                    &format!("{from}/nested/{index}.txt"),
+                    index.to_string().as_bytes(),
+                    DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+                )
+                .expect("routed source file");
+        }
+        let mut job = writer
+            .posix_rename_directory_bounded_routed(from, to, 1)
+            .expect("first routed bounded batch");
+        while job.status == DfsNamespaceJobStatus::Running {
+            let started = Instant::now();
+            let resumed = writer.posix_resume_namespace_job_bounded_routed(&job.job_id, from, 1);
+            let original_completed_after = started.elapsed();
+            if resumed.is_err() {
+                // Error-only readout AFTER the original call; no retry, mutation,
+                // manufactured row or change to the original receipt/error oracle.
+                let raw = _runtime.rpc_observations();
+                let observed = (|| -> Result<serde_json::Value, String> {
+                    let shards = _runtime.metadata_shards()?;
+                    let shard = crate::select_metadata_shard_config_for_path(
+                        &_runtime.file_system().file_system_id, &shards, to,
+                    ).map_err(|error| error.to_string())?
+                        .ok_or("actual rename target has no current metadata assignment")?;
+                    let current = _runtime.metadata_primary_service(to)?;
+                    let backend = current.metadata_backend()
+                        .ok_or("actual current Core has no native metadata backend")?;
+                    let snapshot = backend.export_shard_table_snapshot(
+                        &DfsMetadataShardId::new(&shard.shard_id),
+                    ).map_err(|error| error.to_string())?;
+                    serde_json::to_value(serde_json::json!({
+                        "actual_current_assignment":shard,
+                        "actual_current_core_node":current.node_id(),
+                        "actual_native_table_snapshot":snapshot,
+                    })).map_err(|error| error.to_string())
+                })();
+                let evidence = serde_json::json!({
+                    "qualification":"error-only actual native after-cut; same routed max_steps1 call and unchanged failure oracle; snapshot does not itself prove the earlier interleaving",
+                    "from":from,"to":to,"requested_job_before_call":job,
+                    "original_result_debug":format!("{resumed:?}"),
+                    "original_completion_elapsed_nanos":original_completed_after.as_nanos(),
+                    "actual_native_after_cut":observed,
+                    "actual_rpc_window_debug":format!("{raw:#?}"),
+                    "actual_rpc_omitted":_runtime.observation_dropped_count(),
+                });
+                let output = root.join("bounded-directory-rename-error.json");
+                let exported = serde_json::to_vec_pretty(&evidence)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| std::fs::write(&output, bytes).map_err(|error| error.to_string()));
+                if let Err(error) = exported {
+                    eprintln!("rename diagnostic export {} failed: {error}", output.display());
+                }
+            }
+            job = resumed.expect("next routed bounded batch");
+        }
+        assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+        assert!(matches!(
+            writer.posix_stat(from),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        for index in 0..4 {
+            assert_eq!(
+                writer
+                    .posix_read_file_distributed(&format!("{to}/nested/{index}.txt"))
+                    .expect("renamed file"),
+                index.to_string().as_bytes()
+            );
+        }
 
-    stop_primary.store(true, Ordering::SeqCst);
-    let _primary = primary_thread.join().expect("primary thread");
+        stop_primary.store(true, Ordering::SeqCst);
+        let _primary = primary_thread.join().expect("primary thread").expect("primary pump");
+    });
     drop(_runtime);
 }
 
@@ -8097,8 +8155,11 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
         stat,
         intent_id,
         exchange,
-        _background_interception,
+        background,
     ) = native_committed_stage_backlog("native-repair-transfer-custody");
+    let (execution, mut background) =
+        native_private_repair_owner(&runtime, &service, &stat.path, background);
+    let mut execution = Some(execution);
     let mut stage = exchange.response.clone();
     let DfsNetworkMessage::StageBlobResponse(reply) = &mut stage.message else {
         unreachable!()
@@ -8356,12 +8417,20 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
         queue.reconcile_observed(&observed_queue, &records).unwrap(),
         crate::repair_queue_store::DfsRepairQueueObservedReconcileOutcome::Applied(_)
     ));
+    drop(execution.take());
     drop(service);
     gate.add_permits(1);
     runtime.clear_faults();
     runtime.stop_node(&owner).unwrap();
+    // The source is fully stopped. Release this private-phase negative hold
+    // before canonical startup needs its real resident preflight/reconciliation.
+    drop(background);
     runtime.reopen_node(owner.clone()).unwrap();
     let mut service = runtime.metadata_primary_service(&stat.path).unwrap();
+    let (current_execution, current_background) =
+        native_private_repair_owner(&runtime, &service, &stat.path, ());
+    execution = Some(current_execution);
+    background = current_background;
     service
         .retry_pending_repairs_bounded_with_attempts(0, &records)
         .unwrap();
@@ -8376,6 +8445,28 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
     );
     assert!(restored.transfer_delivery_state.is_none());
     assert!(restored.completed_transfer_request_id.is_none());
+    // Read actual native history rather than inferring it from ACTIVE-slot
+    // absence. A Closed birth remains in the native history map.
+    let actual_history_before = queue.diagnostic_original_history_for_subject(
+        &owner, &intent_id, &replica, &unresolved_id);
+    let actual_legacy_guard_before = queue.legacy_repair_is_uncovered(&intent_id, &replica);
+    let actual_physical_before = queue.records_for_targets(&intent_id, std::slice::from_ref(&replica));
+    let actual_intent_before = service.coordinator().intent(&intent_id).cloned();
+    let actual_job_before = service.coordinator().repair_job_for_target(&intent_id, &replica);
+    let actual_subject_shard = match &exchange.command.routed_message.message {
+        DfsNetworkMessage::StageBlob(stage) => stage.authority_shard.as_ref()
+            .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone())),
+        _ => None,
+    };
+    let actual_metadata_before = service.metadata_backend().map(|backend| (
+        backend.get_object(&stat.object_id),
+        backend.get_version(&stat.object_id, &stat.version),
+        backend.object_write_intent_history(&stat.object_id),
+        backend.receipts_for_version(&stat.object_id, &stat.version),
+        actual_subject_shard.as_ref().map(|shard| backend.metadata_prefix_proof(shard)),
+    ));
+    let before_replacement_pending = service.writes.pending_writes.get(&intent_id).cloned();
+    let before_replacement_original = queue.original_repair_for_slot(&intent_id, &replica);
     let replacement_id = service.next_request_id();
     let DfsNetworkMessage::StageBlob(actual_stage) = &exchange.command.routed_message.message
     else {
@@ -8406,6 +8497,8 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
         remaining_hits: 1,
         action: crate::test_runtime::FaultAction::TransientRouteFailureBeforeDispatch,
     });
+    let before_opaque_pending = service.writes.pending_writes.get(&intent_id).cloned();
+    let before_opaque_original = queue.original_repair_for_slot(&intent_id, &replica);
     let before_opaque = runtime.rpc_observations().len();
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let previous_deadline = service.transport.set_operation_deadline(Some(deadline));
@@ -8421,7 +8514,7 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
         actual_stage.object_metadata.clone(),
     );
     service.transport.set_operation_deadline(previous_deadline);
-    attempted.unwrap();
+    let opaque_outcomes = attempted.unwrap();
     assert!(
         Instant::now() < deadline,
         "normal exact retry respects its original budget"
@@ -8446,6 +8539,25 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
         .into_iter()
         .find(|record| record.intent_id == intent_id)
         .unwrap();
+    if opaque_record.transfer_request_id.as_deref() != Some(unresolved_id.as_str())
+        || opaque_record.transfer_delivery_state.is_some()
+    {
+        eprintln!("CUSTODY_UNKNOWN_JOIN failure-only actual DATA: intent={intent_id} target={replica} saved_request={unresolved_id} before_replacement_pending={before_replacement_pending:?} before_replacement_original={before_replacement_original:?} before_opaque_pending={before_opaque_pending:?} before_opaque_original={before_opaque_original:?} actual_new_attempt_outcomes={opaque_outcomes:?} after_pending={:?} after_original={:?} after_queue_rows={:?} after_exported_record={opaque_record:?} actual_native_events={:?}",
+            service.writes.pending_writes.get(&intent_id),
+            queue.original_repair_for_slot(&intent_id, &replica),
+            queue.records_for_targets(&intent_id, std::slice::from_ref(&replica)),
+            &runtime.rpc_observations()[before_opaque..]);
+        eprintln!("CUSTODY_ACTUAL_HISTORY_METADATA failure-only DATA: exact_producer={owner} intent={intent_id} target={replica} request={unresolved_id} native_history_before={actual_history_before:?} legacy_guard_before={actual_legacy_guard_before:?} physical_before={actual_physical_before:?} coordinator_intent_before={actual_intent_before:?} coordinator_job_before={actual_job_before:?} metadata_before_object_version_history_receipts_prefix={actual_metadata_before:?} native_history_after={:?} legacy_guard_after={:?} metadata_after_object_version_history_receipts_prefix={:?}",
+            queue.diagnostic_original_history_for_subject(&owner, &intent_id, &replica, &unresolved_id),
+            queue.legacy_repair_is_uncovered(&intent_id, &replica),
+            service.metadata_backend().map(|backend| (
+                backend.get_object(&stat.object_id),
+                backend.get_version(&stat.object_id, &stat.version),
+                backend.object_write_intent_history(&stat.object_id),
+                backend.receipts_for_version(&stat.object_id, &stat.version),
+                actual_subject_shard.as_ref().map(|shard| backend.metadata_prefix_proof(shard)),
+            )));
+    }
     assert_eq!(
         opaque_record.transfer_request_id.as_deref(),
         Some(unresolved_id.as_str())
@@ -8498,6 +8610,16 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
         })
         .cloned()
         .expect("the actual native terminal reply retains its exact owner/tuple/claim");
+    // Keep the actual positive receiver packet before the existing negative
+    // DATA control changes only its result. Never fabricate successful DATA.
+    assert!(matches!(&original.message,
+        DfsNetworkMessage::RepairReplicaResponse(reply)
+            if matches!(&reply.result, DfsBlobTransferResult::Committed { content_hash }
+                if content_hash == &actual_stage.content_hash
+                    && Some(content_hash) == stat.content_hash.as_ref())),
+        "SETUP UNREACHED: actual captured positive must be Committed for exact native content: {original:?}");
+    let actual_positive_before_negative = original.clone();
+    let actual_positive_packet_debug = format!("{actual_positive_before_negative:?}");
     let DfsNetworkMessage::RepairReplicaResponse(reply) = &mut original.message else {
         unreachable!()
     };
@@ -8534,6 +8656,7 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
             .unwrap()
             .receipts_for_version(&stat.object_id, &stat.version)
             .unwrap();
+        drop(execution.take());
         drop(service);
         let command = DfsMessageCommand {
             request_id: sinomo_core::Id::generate().to_string(),
@@ -8578,6 +8701,10 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
             "a negative actual Main reply preserves the entire durable custody row"
         );
         service = runtime.metadata_primary_service(&stat.path).unwrap();
+        let (current_execution, current_background) =
+            native_private_repair_owner(&runtime, &service, &stat.path, background);
+        execution = Some(current_execution);
+        background = current_background;
         service
             .retry_pending_repairs_bounded_with_attempts(0, &persisted)
             .unwrap();
@@ -8639,23 +8766,187 @@ fn native_repair_transfer_custody_survives_cancel_restart_and_correlates_rejecte
             before_receipts
         );
     }
-    service
+    // Error-path safety: real native Set/fsync of the SAME actual observed
+    // row invalidates the checkpoint token without changing any custody fact.
+    // The hook runs outside queue mutex/writer locks, on this direct Core call.
+    assert!(service.coordinator().repair_job_for_target(&intent_id, &replica).is_none(),
+        "SETUP UNREACHED: this is passive late-response DATA, not a live executor");
+    assert!(queue.diagnostic_original_history_for_subject(&owner, &intent_id, &replica, &unresolved_id)
+        .unwrap().is_empty(), "SETUP UNREACHED: the legacy cursor has no native Original proof");
+    let passive_before = service.writes.pending_writes.get(&intent_id).unwrap();
+    assert_eq!(passive_before.content_hash, actual_stage.content_hash,
+        "actual pending native content must match the captured positive");
+    let request_before = passive_before.repair_inflight_request_ids.get(&replica).cloned();
+    let retry_before = passive_before.repair_retries.get(&replica).map(|value| format!("{value:?}"));
+    assert!(request_before.is_none() && retry_before.is_none(),
+        "SETUP UNREACHED: negative restoration must be the only passive correlation owner");
+    let native_before = queue.view().unwrap();
+    let observed_before = native_before.records.iter().find(|row|
+        row.intent_id == intent_id && row.missing_replica_node_id == replica)
+        .expect("actual named native custody row before negative checkpoint").clone();
+    assert_eq!(observed_before.content_hash, actual_stage.content_hash,
+        "actual observed native row must match the captured positive");
+    assert_eq!(observed_before.transfer_request_id.as_deref(), Some(unresolved_id.as_str()));
+    assert!(observed_before.completed_transfer_request_id.is_none());
+    assert_eq!(observed_before.transfer_kind, Some(DfsRepairTransferKind::Repair));
+    assert_eq!(observed_before.transfer_delivery_state, Some(NetworkDeliveryState::PossiblyApplied));
+    let checkpoint_hit = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hit = std::rc::Rc::clone(&checkpoint_hit);
+    let expected_actual = observed_before.clone();
+    let prefix_before = service.metadata_backend().unwrap()
+        .metadata_prefix_proof(&DfsMetadataShardId::new("services")).unwrap();
+    assert!(prefix_before.is_some(), "actual native owned shard prefix, not None==None");
+    let failed_terminal = crate::repair_queue_store::with_transfer_checkpoint_hook_for_test(
+        &queue,
+        move |store, actual| {
+            assert_eq!(actual, &expected_actual, "hook only owns the exact native observed row");
+            let before = store.view()?;
+            let operations = store.append_operations(vec![
+                crate::repair_queue_store::DfsRepairQueueOperation::Set { record: actual.clone() },
+            ])?;
+            let after = store.view()?;
+            assert_eq!(operations, 1);
+            assert_eq!(after.records, before.records, "no record/fate is forged by generation fault");
+            assert_eq!(after.head_sequence, before.head_sequence + 1);
+            hit.set(true);
+            Ok(())
+        },
+        || service.process_routed_messages_with_options(vec![original.clone()], true),
+    );
+    assert!(checkpoint_hit.get(), "SETUP UNREACHED: actual owned checkpoint was not entered");
+    assert!(matches!(&failed_terminal, Err(DfsError::Metadata { message })
+        if message == "repair completion queue changed before its owned checkpoint"),
+        "actual native generation CAS must fail: {failed_terminal:?}");
+    let after_failed = queue.view().unwrap();
+    assert_eq!(after_failed.records, native_before.records);
+    assert_eq!(after_failed.head_sequence, native_before.head_sequence + 1);
+    let passive_after = service.writes.pending_writes.get(&intent_id).unwrap();
+    let request_after_failure = passive_after.repair_inflight_request_ids.get(&replica).cloned();
+    let retry_after_failure = passive_after.repair_retries.get(&replica).map(|value| format!("{value:?}"));
+    let raw_positive = service.process_routed_messages_with_options(
+        vec![actual_positive_before_negative], true);
+    let after_positive = queue.view().unwrap();
+    let prefix_after = service.metadata_backend().unwrap()
+        .metadata_prefix_proof(&DfsMetadataShardId::new("services")).unwrap();
+    let cas_evidence = serde_json::to_vec_pretty(&serde_json::json!({
+            "qualification":"actual native same-row Set/fsync advances generation; exact owned terminal CAS rejects. Later positive is ACTUAL captured receiver packet, not minted ACK/Original.",
+            "actual_positive_packet_debug":actual_positive_packet_debug,
+            "actual_checkpoint_hit":checkpoint_hit.get(),"actual_terminal_error_debug":format!("{failed_terminal:?}"),
+            "native_before_head":native_before.head_sequence,"native_after_cas_head":after_failed.head_sequence,
+            "native_before_records":native_before.records,"native_after_cas_records":after_failed.records,
+            "pending_request_before":request_before,"pending_request_after_failed_checkpoint":request_after_failure,
+            "pending_retry_before_debug":retry_before,"pending_retry_after_failed_checkpoint_debug":retry_after_failure,
+            "actual_raw_positive_events_debug":format!("{raw_positive:?}"),
+            "native_after_raw_positive_head":after_positive.head_sequence,"native_after_raw_positive_records":after_positive.records,
+            "actual_prefix_before":prefix_before,"actual_prefix_after":prefix_after,
+        })).map_err(|error| error.to_string()).and_then(|bytes|
+            std::fs::write(runtime.data_dir(&owner).root().join("custody-checkpoint-cas-error-path.json"), bytes)
+                .map_err(|error| error.to_string()));
+    if let Err(error) = &cas_evidence {
+        eprintln!("actual CAS safety evidence export failed: {error}; terminal={failed_terminal:?}; positive={raw_positive:?}; before={observed_before:?}; after={after_positive:?}");
+    }
+    assert_eq!(request_after_failure, request_before,
+        "failed negative checkpoint cannot leak a positive request match");
+    assert_eq!(retry_after_failure, retry_before);
+    let raw_positive = raw_positive.unwrap();
+    assert!(raw_positive.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::RepairRejected { intent_id: actual, .. } if actual == &intent_id)),
+        "captured positive DATA cannot gain permission from failed negative checkpoint: {raw_positive:?}");
+    assert_eq!(after_positive.records, native_before.records,
+        "raw positive cannot consume/terminalize the named uncertain native row");
+    assert_eq!(after_positive.head_sequence, after_failed.head_sequence,
+        "raw positive cannot append terminal scheduling or Original fate");
+    assert_eq!(prefix_after, prefix_before);
+    // Retry only the SAME negative terminal bookkeeping after a real CAS
+    // conflict; the original positive application/transfer is never resent.
+    let physical_before_terminal = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(physical_before_terminal.len(), 1);
+    let physical_before_terminal = physical_before_terminal.into_iter().next().unwrap();
+    let terminal_events = service
         .process_routed_messages_with_options(vec![original], true)
         .unwrap();
+    let physical_terminal = queue
+        .records_for_targets(&intent_id, std::slice::from_ref(&replica))
+        .unwrap();
+    assert_eq!(physical_terminal.len(), 1, "actual terminal remains in the physical queue");
+    let physical_terminal = physical_terminal.into_iter().next().unwrap();
     let released = service
         .durable_repair_queue_records()
         .into_iter()
-        .find(|record| record.intent_id == intent_id)
-        .unwrap();
-    assert!(released.transfer_request_id.is_none());
+        .find(|record| record.intent_id == intent_id);
+    if physical_terminal.transfer_request_id.is_some()
+        || physical_terminal.completed_transfer_request_id.as_deref() != Some(unresolved_id.as_str())
+    {
+        eprintln!(
+            "CUSTODY_FINAL_TERMINAL failure-only DATA: intent={intent_id} target={replica} request={unresolved_id} actual_events={terminal_events:?} pending={:?} cached_row={:?} actual_physical_rows={:?} actual_native_history={:?} coordinator_intent={:?} derived_job={:?} exported={released:?}",
+            service.writes.pending_writes.get(&intent_id),
+            service.repair_attempt_records.get(&(intent_id.clone(), replica.clone())),
+            queue.records_for_targets(&intent_id, std::slice::from_ref(&replica)),
+            queue.diagnostic_original_history_for_subject(&owner, &intent_id, &replica, &unresolved_id),
+            service.coordinator().intent(&intent_id),
+            service.coordinator().repair_job_for_target(&intent_id, &replica),
+        );
+    }
+    let terminal_evidence = serde_json::to_vec_pretty(&serde_json::json!({
+            "actual_events_debug":format!("{terminal_events:?}"),
+            "actual_physical_before":physical_before_terminal,
+            "actual_physical_terminal":physical_terminal,"actual_exported":released,
+            "actual_pending_debug":format!("{:?}",service.writes.pending_writes.get(&intent_id)),
+            "actual_cached_debug":format!("{:?}",service.repair_attempt_records.get(&(intent_id.clone(), replica.clone()))),
+            "actual_job_debug":format!("{:?}",service.coordinator().repair_job_for_target(&intent_id,&replica)),
+        })).map_err(|error| error.to_string()).and_then(|bytes|
+            std::fs::write(runtime.data_dir(&owner).root().join("custody-final-physical-terminal.json"), bytes)
+                .map_err(|error| error.to_string()));
+    if let Err(error) = &terminal_evidence {
+        eprintln!("actual terminal evidence export failed: {error}; events={terminal_events:?}; physical={physical_terminal:?}; export={released:?}");
+    }
+    assert!(terminal_events.iter().any(|event| matches!(event,
+        NetworkedDfsServiceEvent::RepairRejected { intent_id: actual, object_id, replica_node_id, reason }
+            if actual == &intent_id && object_id == &stat.object_id && replica_node_id == &replica
+                && reason == "negative captured native terminal reply")),
+        "the actual matching negative response must be consumed: {terminal_events:?}");
+    assert_eq!(physical_terminal.intent_id, intent_id);
+    assert_eq!(physical_terminal.object_id, stat.object_id);
+    assert_eq!(physical_terminal.version, stat.version);
+    assert_eq!(Some(physical_terminal.content_hash.as_str()), stat.content_hash.as_deref());
+    assert_eq!(physical_terminal.missing_replica_node_id, replica);
+    assert_eq!(physical_terminal.transfer_kind, Some(DfsRepairTransferKind::Repair));
+    assert!(physical_terminal.transfer_request_id.is_none());
     assert_eq!(
-        released.completed_transfer_request_id.as_deref(),
+        physical_terminal.completed_transfer_request_id.as_deref(),
         Some(unresolved_id.as_str())
     );
-    assert!(!released.in_flight);
+    assert!(!physical_terminal.in_flight);
+    assert_eq!(physical_terminal.transfer_delivery_state, physical_before_terminal.transfer_delivery_state,
+        "terminal consumption must not rewrite older delivery evidence to NoEffect");
+    assert!(physical_terminal.attempts >= physical_before_terminal.attempts);
+    assert!(service.coordinator().repair_job_for_target(&intent_id, &replica).is_none(),
+        "metadata-satisfied transport completion creates no repair job");
+    assert!(service.writes.pending_writes.get(&intent_id).is_none_or(|pending|
+        !pending.repair_inflight_request_ids.contains_key(&replica)),
+        "the consumed exact request has no remaining RAM owner");
+    if let Some(cached) = service.repair_attempt_records.get(&(intent_id.clone(), replica.clone())) {
+        assert!(cached.transfer_request_id.is_none());
+        assert_eq!(cached.completed_transfer_request_id.as_deref(), Some(unresolved_id.as_str()));
+        assert!(!cached.in_flight);
+        assert_eq!(cached.transfer_delivery_state, physical_terminal.transfer_delivery_state);
+    }
+    if let Some(released) = released {
+        assert!(released.transfer_request_id.is_none());
+        assert_eq!(released.completed_transfer_request_id.as_deref(), Some(unresolved_id.as_str()));
+        assert!(!released.in_flight);
+        assert_eq!(released.transfer_kind, Some(DfsRepairTransferKind::Repair));
+        assert_eq!(released.transfer_delivery_state, physical_terminal.transfer_delivery_state);
+    }
+    terminal_evidence.expect("qualified actual terminal must retain its evidence export");
+    cas_evidence.expect("actual checkpoint CAS safety evidence must be exported after semantic checks");
     assert_eq!(runtime.observation_dropped_count(), 0);
     runtime.assert_fault_budgets().unwrap();
+    drop(execution.take());
     drop(service);
+    drop(background);
     runtime.close().unwrap();
 }
 
@@ -10008,23 +10299,6 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
             .expect("ordinary preserve owns an actual FULL retained-content intent")
             .intent_id
             .clone();
-        // Release first resolves authority across the filesystem. The public
-        // command belongs to Main's router, not this one physical Core view.
-        drop(core);
-        let mut release = runtime.client(&owner).unwrap();
-        release
-            .retain_content_revision(DfsContentReferenceRequest {
-                namespace: namespace.into(),
-                path: stat.path.clone(),
-                identity: identity.clone(),
-                operation: DfsContentReferenceOperation::Release {
-                    reference_id: reference_id.into(),
-                },
-                operation_id: sinomo_core::Id::generate().to_string(),
-            })
-            .unwrap();
-        drop(release);
-        let mut core = runtime.metadata_primary_service(&stat.path).unwrap();
         let backend = core.metadata_backend().unwrap();
         let version = backend
             .get_version(&identity.object_id, &identity.version)
@@ -10032,15 +10306,15 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
             .unwrap();
         assert!(
             version.has_retention_grant(),
-            "Release withdraws the reference, retaining immutable grant provenance"
+            "the actual capture supplies immutable grant provenance before its first Release"
         );
         assert!(
             backend
                 .version_pins_for_object(&identity.object_id)
                 .unwrap()
                 .iter()
-                .all(|pin| pin.version != identity.version),
-            "ordinary Release removes the actual pin"
+                .any(|pin| pin.version == identity.version),
+            "the actual capture starts with its real live pin"
         );
         let new_id = crate::file_history::retained_repair_intent_id(&version);
         let history = backend
@@ -10052,7 +10326,7 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 .iter()
                 .any(|record| record.intent_id == original_id
                     && record.status == DfsWriteIntentStatus::Committed),
-            "the first GC still has the actual FULL original retained-content owner"
+            "the first Release still has the actual FULL original retained-content owner"
         );
         assert!(
             !history
@@ -10065,7 +10339,8 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
             !history
                 .intents
                 .iter()
-                .any(|record| record.intent_id == new_id)
+                .any(|record| record.intent_id == new_id),
+            "retained owner exists before the intended first prepublication fault: version={version:?}, history={history:?}"
         );
         assert!(
             !history
@@ -10073,15 +10348,6 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 .iter()
                 .any(|receipt| receipt.intent_id == new_id)
         );
-        let reference = DfsContentReferenceRequest {
-            namespace: namespace.into(),
-            path: stat.path.clone(),
-            identity: identity.clone(),
-            operation: DfsContentReferenceOperation::Retain {
-                reference_id: reference_id.into(),
-            },
-            operation_id: sinomo_core::Id::generate().to_string(),
-        };
         let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
             runtime.data_dir(&owner),
         ));
@@ -10138,26 +10404,40 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 Ok(())
             }),
         );
-        // The real first owner is created by this ordinary GC compaction,
-        // before a later Retain can reactivate it. Inject the cut here.
-        let gc_options = DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
-            .with_now_unix_nanos(crate::test_support::now_unix_nanos());
-        assert!(core.gc_metadata_history(gc_options.clone()).is_err());
-        let original_gc = core.metadata_backend().unwrap().list_prepared_operations().unwrap()
-            .into_iter().filter(|record| record.operation_id.starts_with("history-gc:")
-                && record.metadata_effects.iter().any(|effect| matches!(effect,
-                    DfsPreparedMetadataEffect::PutIntentReceipt { receipt } if receipt.intent_id == original_id)))
+        // Release commits its pin removal, then its ordinary reconciliation
+        // first publishes the dormant retained repair owner. Arm that actual
+        // first producer; later GC must not be mistaken for its birth.
+        drop(core);
+        let mut release = runtime.client(&owner).unwrap();
+        let release_result = release.retain_content_revision(DfsContentReferenceRequest {
+            namespace: namespace.into(),
+            path: stat.path.clone(),
+            identity: identity.clone(),
+            operation: DfsContentReferenceOperation::Release {
+                reference_id: reference_id.into(),
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        });
+        drop(release);
+        assert!(release_result.is_err(), "the first owner publication must hit the armed fault: {release_result:?}");
+        let mut core = runtime.metadata_primary_service(&stat.path).unwrap();
+        assert!(core.metadata_backend().unwrap().version_pins_for_object(&identity.object_id)
+            .unwrap().iter().all(|pin| pin.version != identity.version),
+            "the ordinary Release committed its actual pin removal before owner enrollment");
+        let owner_prepare = core.metadata_backend().unwrap().list_prepared_operations().unwrap()
+            .into_iter().filter(|record| record.metadata_effects.iter().any(|effect| matches!(effect,
+                    DfsPreparedMetadataEffect::PutIntent { intent } if intent.intent_id == new_id)))
             .collect::<Vec<_>>();
         assert_eq!(
-            original_gc.len(),
+            owner_prepare.len(),
             1,
-            "the interrupted GC owns one exact durable preparation"
+            "the first interrupted retained owner owns one exact durable preparation"
         );
-        let original_gc = original_gc.into_iter().next().unwrap();
-        original_gc.validate().unwrap();
+        let owner_prepare = owner_prepare.into_iter().next().unwrap();
+        owner_prepare.validate().unwrap();
         assert!(
             reached.load(Ordering::SeqCst) >= 1,
-            "the actual GC commit reaches its new-owner queue checkpoint"
+            "the actual first owner commit reaches its queue checkpoint"
         );
         let stored = core
             .metadata_backend()
@@ -10176,7 +10456,7 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 .receipts
                 .iter()
                 .any(|receipt| receipt.intent_id == original_id),
-            "failed GC rolls back original FULL-to-compact publication"
+            "the failed first owner publication preserves the original FULL data owner"
         );
         assert_eq!(
             core.metadata_backend()
@@ -10185,7 +10465,7 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 .unwrap()
                 .unwrap(),
             version,
-            "failed GC preserves actual immutable grant provenance"
+            "failed first owner publication preserves actual immutable grant provenance"
         );
         assert!(
             core.metadata_backend()
@@ -10278,38 +10558,32 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 && row.status == DfsWriteIntentStatus::Committed
         });
         if !already_published {
-            // An uncertain GC must reconcile its saved body. Starting another
-            // anonymous GC would replan the clock and collide with this reservation.
+            // Recover the actual saved owner body. Replanning another anonymous
+            // metadata operation would collide with that exact reservation.
             assert!(
-                core.recover_one_prepared_operation(original_gc.clone())
+                core.recover_one_prepared_operation(owner_prepare.clone())
                     .unwrap()
             );
         }
-        let committed_gc = core
+        let committed_owner = core
             .metadata_backend()
             .unwrap()
-            .prepared_operation_record(&original_gc.operation_id)
+            .prepared_operation_record(&owner_prepare.operation_id)
             .unwrap()
             .unwrap();
         assert_eq!(
-            committed_gc.status,
+            committed_owner.status,
             crate::DfsPreparedOperationStatus::Committed
         );
-        assert_eq!(committed_gc.digest, original_gc.digest);
-        assert_eq!(committed_gc.payload, original_gc.payload);
+        assert_eq!(committed_owner.digest, owner_prepare.digest);
+        assert_eq!(committed_owner.payload, owner_prepare.payload);
         drop(core);
-        let core = runtime.metadata_primary_service(&stat.path).unwrap();
+        let mut core = runtime.metadata_primary_service(&stat.path).unwrap();
         let actual = core
             .metadata_backend()
             .unwrap()
             .object_write_intent_history(&stat.object_id)
             .unwrap();
-        assert!(
-            !actual
-                .intents
-                .iter()
-                .any(|record| record.intent_id == original_id)
-        );
         assert!(
             actual
                 .intents
@@ -10325,9 +10599,41 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
             .into_iter()
             .filter(|row| row.intent_id == new_id)
             .collect::<Vec<_>>();
-        assert_eq!(own.len(), 1);
         let initial_birth = born.lock().unwrap();
+        // Startup may retire an inactive, unattempted scheduling row. The
+        // actual first-publication hook below owns the immutable birth proof.
+        assert!(own.len() <= 1, "one current scheduling slot: {own:?}");
+        for row in &own {
+            assert_eq!(row.intent_id, new_id);
+            assert_eq!(row.object_id, identity.object_id);
+            assert_eq!(row.version, identity.version);
+            assert_eq!(Some(row.content_hash.as_str()), version.content_hash.as_deref());
+            assert_eq!(row.missing_replica_node_id, remote);
+            assert_eq!(row.attempts, 0);
+            assert_eq!(row.last_attempt_unix_nanos, 0);
+            assert!(!row.in_flight);
+            assert!(row.transfer_request_id.is_none());
+            assert!(row.completed_transfer_request_id.is_none());
+            assert!(row.last_error.is_none());
+            assert_eq!(row.transfer_kind, Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Repair));
+            assert_eq!(row.transfer_delivery_state, Some(NetworkDeliveryState::DefinitelyNotSent));
+        }
+        assert!(core.coordinator().repair_job_for_target(&new_id, &remote).is_none(),
+            "the released retained owner has no active Core repair job");
+        assert!(!core.writes.pending_writes.contains_key(&new_id),
+            "the released retained owner has no pending Core executor");
+        assert!(queue.original_repair_for_slot(&new_id, &remote).unwrap().is_none(),
+            "the clean dormant birth never admitted a native Original attempt");
+        assert!(!runtime.rpc_observations()[before_dispatch..].iter().any(|event|
+            event.source == owner && event.target == remote
+                && event.route == DFS_DATA_REPAIR_REPLICA_ROUTE
+                && event.dfs_intent_id.as_deref() == Some(new_id.as_str())),
+            "the released retained owner cannot dispatch before a genuine live Retain");
         assert_eq!(initial_birth.len(), 1);
+        assert_eq!(initial_birth[0].attempts, 0);
+        assert_eq!(initial_birth[0].last_attempt_unix_nanos, 0);
+        assert!(!initial_birth[0].in_flight);
+        assert!(initial_birth[0].last_error.is_none());
         assert_eq!(initial_birth[0].object_id, identity.object_id);
         assert_eq!(initial_birth[0].version, identity.version);
         assert_eq!(initial_birth[0].missing_replica_node_id, remote);
@@ -10343,12 +10649,71 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
         assert!(initial_birth[0].completed_transfer_request_id.is_none());
         drop(initial_birth);
         drop(birth_hook);
+        // Ordinary GC may now compact the original FULL data owner because its
+        // actual retained successor was published first, including after reopen.
+        let gc_options = DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 0)
+            .with_now_unix_nanos(crate::test_support::now_unix_nanos());
+        core.gc_metadata_history(gc_options).unwrap();
+        let compacted = core.metadata_backend().unwrap()
+            .object_write_intent_history(&stat.object_id).unwrap();
+        assert!(!compacted.intents.iter().any(|record| record.intent_id == original_id),
+            "ordinary GC compacts the original FULL only after exact successor/body/birth proof");
+        let actual_outcome_floor = core.metadata_backend().unwrap()
+            .content_reference_outcome_retention(&identity.file_system_id, &identity.object_id)
+            .unwrap();
         drop(core);
-        // GC created the inactive owner. Only this ordinary live Retain permits
+        // This is the first new user action after GC, not a retry of an old
+        // expired operation. Allocate its identity at that actual boundary.
+        let reference = DfsContentReferenceRequest {
+            namespace: namespace.into(),
+            path: stat.path.clone(),
+            identity: identity.clone(),
+            operation: DfsContentReferenceOperation::Retain {
+                reference_id: reference_id.into(),
+            },
+            operation_id: sinomo_core::Id::generate().to_string(),
+        };
+        let submitted_reference = reference.clone();
+        let evidence_root = runtime.data_dir(&owner).root();
+        std::fs::write(evidence_root.join("retained-first-after-gc-action-before.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "qualification":"new fixture's first Retain identity is born after actual GC; no retry or reconciliation of failed24t expired ID",
+                "actual_eviction_floor":actual_outcome_floor,
+                "actual_first_submitted_request":submitted_reference,
+            })).unwrap()).unwrap();
+        let new_order = crate::intent::stable_operation_order_token(&reference.operation_id).unwrap();
+        assert!(actual_outcome_floor.as_ref().and_then(|floor|
+                floor.max_evicted_operation_order_token.as_ref()).is_none_or(|floor| &new_order > floor),
+            "the actual newly generated action must be above its current floor; never adjust its ID or the watermark");
+        // Release created the inactive owner. Only this ordinary live Retain permits
         // its normal missing-N executor to dispatch; no grant is fabricated.
         let mut client = runtime.client(&owner).unwrap();
-        client.retain_content_revision(reference).unwrap();
+        let retain_result = client.retain_content_revision(reference);
         drop(client);
+        let actual_after = (|| -> Result<serde_json::Value, String> {
+            let shard = runtime.metadata_shards()?.into_iter().find(|shard|
+                shard.shard_id == "services" && shard.primary_node_id == owner)
+                .ok_or("the actual retained fixture no longer has its Services owner")?;
+            let current = runtime.metadata_primary_service(&stat.path)?;
+            let backend = current.metadata_backend().ok_or("current owner has no native backend")?;
+            let snapshot = backend.export_shard_table_snapshot(&DfsMetadataShardId::new(&shard.shard_id))
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({"actual_current_assignment":shard,
+                "actual_native_table_snapshot_after_first_action":snapshot}))
+        })();
+        let after_export = serde_json::to_vec_pretty(&serde_json::json!({
+            "actual_first_submitted_request":submitted_reference,
+            "actual_result":format!("{retain_result:?}"),
+            "actual_effects_after_cut":actual_after,
+        })).map_err(|error| error.to_string()).and_then(|bytes|
+            std::fs::write(evidence_root.join("retained-first-after-gc-action-after.json"), bytes)
+                .map_err(|error| error.to_string()));
+        if let Err(error) = &after_export {
+            eprintln!("actual Retain evidence export failed: {error}; original result: {retain_result:?}");
+        }
+        retain_result.unwrap();
+        after_export.expect("successful Retain must keep its actual evidence export");
+        assert!(actual_after.is_ok(), "actual native Retain effects must be captured: {actual_after:?}");
         let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
         loop {
             let prepared = background.records();
@@ -10429,6 +10794,8 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
     use sinomo_core::network::NetworkDeliveryState;
     let (mut runtime, owner, replica, mut core, stat, intent_id, background) =
         native_committed_repair_backlog("native-connectivity-park-return", true);
+    let (execution, background) =
+        native_private_repair_owner(&runtime, &core, &stat.path, background);
     let before = runtime.rpc_observations().len();
     core.retry_pending_repairs_bounded(1).unwrap();
     let actual = core.durable_repair_queue_records();
@@ -10455,6 +10822,7 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
         "the settled retry is produced by an actual native content attempt"
     );
     let queue = checkpoint_actual_native_custody(&runtime, &owner, &actual);
+    drop(execution);
     drop(core);
     runtime.clear_faults();
     runtime.stop_node(&replica).unwrap();
@@ -11038,6 +11406,8 @@ fn native_retained_restore_preserves_a_live_repin_wake_over_its_old_parked_cache
 fn native_terminal_queue_restore_does_not_rearm_its_stale_retained_producer() {
     let (runtime, owner, replica, mut service, stat, intent_id, background) =
         native_committed_repair_backlog("native-terminal-queue-stale-producer", true);
+    let (execution, background) =
+        native_private_repair_owner(&runtime, &service, &stat.path, background);
     let queue = LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(
         runtime.data_dir(&owner),
     ));
@@ -11129,6 +11499,7 @@ fn native_terminal_queue_restore_does_not_rearm_its_stale_retained_producer() {
         )
         .unwrap();
     let durable = queue.view().unwrap();
+    drop(execution);
     drop(service);
     drop(background);
     runtime.close().unwrap();

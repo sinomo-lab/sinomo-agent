@@ -9637,6 +9637,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "libc",
  "notify",
  "reqwest",
  "serde",
@@ -10212,6 +10213,7 @@ dependencies = [
  "metrics",
  "serde",
  "serde_bytes",
+ "serde_json",
  "sinomo-base",
  "sinomo-node",
  "sinomo-object",

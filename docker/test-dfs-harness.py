@@ -1081,6 +1081,156 @@ scenario() {
 
 
 class AssignedParticipantInterruptionTests(unittest.TestCase):
+    @staticmethod
+    def partition_layout(primary="native-node4"):
+        nodes = [f"native-node{i}" for i in range(1, 7)]
+        return {"status": "passed", "diagnostics": {"pending_handoff_keys": [], "shards": [
+            {"lane": lane, "file_system_id": "native-fs", "shard_id": lane, "epoch": 7,
+             "primary_node_id": owner, "replica_node_ids": [node for node in nodes if node != owner]}
+            for lane, owner in [("root", "native-node1"), ("services", primary), ("users", "native-node3")]]}}
+
+    def test_partition_roles_follow_actual_primary_and_prefer_nonprimary_leaf6_else_leaf5(self):
+        # Pure harness DATA control; no supplied observation grants authority.
+        functions = (DfsBaselineLaneTests.shell_function('dfs_converged_epoch_signature') +
+                     DfsBaselineLaneTests.shell_function('dfs_partition_participants_from_layout'))
+        roster = [{"container": f"node{i}", "node_id": f"native-node{i}"} for i in range(1, 7)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout_file, roster_file = root/'layout.json', root/'roster.json'
+            for primary, expected_writer, expected_leaf in [
+                    ("native-node4", "node4", "node6"),
+                    ("native-node6", "node6", "node5"),
+                    ("native-node2", "node2", "node6")]:
+                layout_file.write_text(json.dumps(self.partition_layout(primary)))
+                roster_file.write_text(json.dumps(roster))
+                result = subprocess.run(['bash', '-c', functions +
+                    '\ndfs_partition_participants_from_layout "$1" "$2"', 'test', str(layout_file), str(roster_file)],
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                roles = json.loads(result.stdout)
+                self.assertEqual(roles['writer_container'], expected_writer)
+                self.assertEqual(roles['writer_node_id'], primary)
+                self.assertEqual(roles['unavailable_container'], expected_leaf)
+                self.assertEqual(roles['unavailable_node_id'], 'native-' + expected_leaf)
+                self.assertNotEqual(roles['writer_node_id'], roles['unavailable_node_id'])
+            negatives = []
+            negatives.append((self.partition_layout(), roster[:-1]))
+            duplicate = [dict(row) for row in roster]
+            duplicate[-1]['node_id'] = duplicate[0]['node_id']
+            negatives.append((self.partition_layout(), duplicate))
+            wrong = self.partition_layout()
+            wrong['diagnostics']['shards'][1]['replica_node_ids'][-1] = 'foreign-node'
+            negatives.append((wrong, roster))
+            pending = self.partition_layout()
+            pending['diagnostics']['pending_handoff_keys'] = ['actual-pending-transition']
+            negatives.append((pending, roster))
+            for layout, actual_roster in negatives:
+                layout_file.write_text(json.dumps(layout))
+                roster_file.write_text(json.dumps(actual_roster))
+                result = subprocess.run(['bash', '-c', functions +
+                    '\ndfs_partition_participants_from_layout "$1" "$2"', 'test', str(layout_file), str(roster_file)],
+                    capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b'')
+
+    def exercise_selected_interruption(self, writer, leaf, extra_network=False):
+        # Side-effect-free transport stubs cover harness custody and sequencing;
+        # these are explicitly not native partition or availability proofs.
+        functions = ''.join(DfsBaselineLaneTests.shell_function(name) for name in
+                            ['dfs_converged_epoch_signature', 'dfs_partition_participants_from_layout',
+                             'temporary_network_recovery'])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'layout.json').write_text(json.dumps(self.partition_layout('native-' + writer)))
+            prelude = r'''log() { :; }
+cluster_local_node_id() { printf 'identity\t%s\n' "$1" >>"$ARTIFACTS/calls.tsv"; printf 'native-%s\n' "$1"; }
+compose() {
+  if [ "$1" = ps ] && [ "$2" = -q ]; then printf 'actual-container-%s\n' "$3";
+  else printf 'compose\t%s\n' "$*" >>"$ARTIFACTS/calls.tsv"; fi
+}
+run_probe() {
+  local node="$1" case_id="$2"; shift 2
+  PROBE_INDEX=$((PROBE_INDEX + 1))
+  printf '%s\t%s' "$node" "$case_id" >>"$ARTIFACTS/calls.tsv"
+  printf '\t%s' "$@" >>"$ARTIFACTS/calls.tsv"
+  printf '\n' >>"$ARTIFACTS/calls.tsv"
+  local output="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-$node-$case_id.json"
+  if [ "$case_id" = cluster.dfs.shard-layout ]; then
+    cp "$ARTIFACTS/layout.json" "$output"
+  elif [ "$case_id" = cluster.dfs.partition-write ]; then
+    printf '{"diagnostics":{"original":{"object_id":"actual-original"},"assignment":{"primary_node_id":"%s","epoch":7},"write_options":{"immutable":"actual-options"}}}\n' "$TEST_PRIMARY_NATIVE" >"$output"
+  fi
+}
+docker() {
+  printf 'docker\t%s\n' "$*" >>"$ARTIFACTS/calls.tsv"
+  if [ "$1" = inspect ]; then
+    if [ "$TEST_EXTRA_NETWORK" = yes ]; then printf '{"owned-retained_seg_b":{},"unexpected-network":{}}\n';
+    else printf '{"owned-retained_seg_b":{}}\n'; fi
+  fi
+}
+sleep() { :; }
+wait_for_cluster_ready() { printf 'ready\t%s\n' "$*" >>"$ARTIFACTS/calls.tsv"; }
+wait_for_dfs_ready() { :; }
+wait_for_dfs_converged() { :; }
+NODES='node1 node2 node3 node4 node5 node6'
+PROJECT=owned-retained
+EXPECT_TIMEOUT=60
+NETWORK_PARTITION_SECONDS=1
+PROBE_INDEX=0
+'''
+            script = prelude + functions + '\nARTIFACTS="$1"\nTEST_PRIMARY_NATIVE="$2"\nRUN_ID="retained-current-$3"\nTEST_EXTRA_NETWORK="$4"\ntemporary_network_recovery'
+            result = subprocess.run(['bash', '-c', script, 'test', directory, 'native-' + writer,
+                                     writer, 'yes' if extra_network else 'no'],
+                                    capture_output=True, text=True, timeout=5)
+            calls = [line.split('\t') for line in (root/'calls.tsv').read_text().splitlines()]
+            if extra_network:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(len(row) > 1 and row[1] == 'cluster.dfs.write' for row in calls))
+                self.assertFalse(any(row[0] == 'docker' and row[1].startswith('network disconnect') for row in calls))
+                return
+            self.assertEqual(result.returncode, 0, result.stderr)
+            partition = [row for row in calls if len(row) > 1 and row[1] == 'cluster.dfs.partition-write']
+            self.assertEqual(len(partition), 3)
+            self.assertEqual([row[0] for row in partition], [writer] * 3)
+            self.assertEqual([next(arg for arg in row if arg.startswith('phase=')) for row in partition],
+                             ['phase=baseline', 'phase=blocked', 'phase=recover'])
+            for row in partition:
+                self.assertIn('required-participants=6', row)
+                self.assertIn(f'operation-id=network-heal-retained-current-{writer}', row)
+                self.assertIn('unavailable-node-id=native-' + leaf, row)
+            for row in partition[1:]:
+                self.assertIn('original-object-json={"object_id":"actual-original"}', row)
+                self.assertIn('original-assignment-json={"primary_node_id":"native-' + writer + '","epoch":7}', row)
+                self.assertIn('original-options-json={"immutable":"actual-options"}', row)
+            self.assertEqual([row[0] for row in calls if len(row) > 1 and row[1] == 'cluster.dfs.write'], [writer, writer])
+            self.assertIn(['docker', f'network disconnect owned-retained_seg_b actual-container-{leaf}'], calls)
+            self.assertIn(['docker', f'network connect --alias {leaf} owned-retained_seg_b actual-container-{leaf}'], calls)
+            self.assertIn(['compose', f'restart {leaf}'], calls)
+            restart_at = calls.index(['compose', f'restart {leaf}'])
+            ready_at = calls.index(['ready', 'post-network-recovery-reopen'])
+            post_restart_identity = [index for index, row in enumerate(calls)
+                                     if index > restart_at and row == ['identity', leaf]]
+            self.assertEqual(len(post_restart_identity), 1)
+            self.assertLess(restart_at, ready_at)
+            self.assertLess(ready_at, post_restart_identity[0])
+            leaf_reads = [row for row in calls if row[0] == leaf and len(row) > 1 and row[1] == 'cluster.dfs.expect-file']
+            self.assertEqual(len(leaf_reads), 5)
+            receipt = json.loads((root/'network-heal-writer-selection.json').read_text())
+            self.assertEqual(receipt['writer_container'], writer)
+            self.assertEqual(receipt['unavailable_container'], leaf)
+            self.assertEqual(receipt['unavailable_node_id'], 'native-' + leaf)
+            self.assertEqual(receipt['unavailable_container_id'], 'actual-container-' + leaf)
+            self.assertEqual(receipt['interrupted_network'], 'owned-retained_seg_b')
+
+    def test_interruption_primary4_keeps_leaf6_and_original_through_heal_and_reopen(self):
+        self.exercise_selected_interruption('node4', 'node6')
+
+    def test_interruption_primary6_keeps_leaf5_and_original_through_heal_and_reopen(self):
+        self.exercise_selected_interruption('node6', 'node5')
+
+    def test_interruption_refuses_a_leaf_with_an_extra_network_before_any_seed(self):
+        self.exercise_selected_interruption('node6', 'node5', extra_network=True)
+
     def test_cut_requires_exact_durable_witness_and_heal_reuses_original_inputs(self):
         body = DfsBaselineLaneTests.shell_function('temporary_network_recovery')
         self.assertLess(body.index('--param phase=baseline'), body.index('docker network disconnect'))
@@ -1089,7 +1239,7 @@ class AssignedParticipantInterruptionTests(unittest.TestCase):
         self.assertEqual(body.count('--param "operation-id=$operation_id"'), 3)
         self.assertEqual(body.count('--param required-participants=6'), 3)
         self.assertEqual(body.count('--param "original-options-json=$options_json"'), 2)
-        self.assertIn('compose restart node6', body)
+        self.assertIn('compose restart "$unavailable"', body)
         self.assertIn('new write after network heal', body)
         self.assertNotIn('expect-error', body)
         self.assertNotIn('grep', body)
@@ -1111,6 +1261,165 @@ class AssignedParticipantInterruptionTests(unittest.TestCase):
             self.assertIn(required, source)
         self.assertNotIn('error.to_string().contains', source)
         self.assertNotIn('write_return.contains', source)
+
+
+class DiskDamageSelectionTests(unittest.TestCase):
+    @staticmethod
+    def inputs(locations=('native-node6', 'native-node4')):
+        # Explicit harness DATA only. No native row/ACK or physical copy is made.
+        roster = [{'container': f'node{i}', 'node_id': f'native-node{i}'} for i in range(1, 7)]
+        identity = {'file_system_id': 'native-fs', 'object_id': 'native-object',
+                    'version': 'native-version', 'content_hash': 'blake3:' + 'a' * 64,
+                    'size_bytes': 1048576, 'path': '/services/cluster-tests/test/disk-damage.bin'}
+        view = {'object': {**{k: v for k, v in identity.items() if k != 'size_bytes'},
+                           'kind': 'file', 'current_locations': list(locations)},
+                'versions': [{'version': identity['version'], 'size_bytes': identity['size_bytes']}],
+                'receipts': [{'receipt': {'file_system_id': identity['file_system_id'],
+                    'object_id': identity['object_id'], 'committed_version': identity['version'],
+                    'owner_node_id': 'native-node6', 'event_id': f'data-event-{node}'},
+                    'replica_node_id': node, 'content_hash': identity['content_hash'],
+                    'received_at': '1970-01-01T00:00:00Z'} for node in locations]}
+        report = {'status': 'passed', 'diagnostics': {**{k: identity[k] for k in
+                   ['object_id', 'version', 'content_hash', 'size_bytes']},
+                   'current_locations': list(locations)}}
+        return roster, view, report
+
+    def select(self, roster, view, report):
+        functions = ''.join(DfsBaselineLaneTests.shell_function(name) for name in
+                            ['dfs_damage_roster_valid', 'dfs_damage_participants_from_observation'])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, data in [('roster', roster), ('view', view), ('report', report)]:
+                (root/f'{name}.json').write_text(json.dumps(data))
+            return subprocess.run(['bash', '-c', functions +
+                '\ndfs_damage_participants_from_observation "$1/report.json" "$1/view.json" "$1/roster.json" "$2"',
+                'test', directory, '/services/cluster-tests/test/disk-damage.bin'],
+                capture_output=True, text=True, timeout=5)
+
+    def test_actual_locations6_and4_never_choose_stale3(self):
+        result = self.select(*self.inputs())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual['damage_container'], 'node4')
+        self.assertEqual(actual['damage_node_id'], 'native-node4')
+        self.assertEqual(actual['remaining_container'], 'node6')
+        self.assertEqual(actual['remaining_node_id'], 'native-node6')
+        self.assertEqual(actual['expected_identity']['node_id'], 'native-node4')
+        self.assertEqual(actual['expected_identity']['size_bytes'], 1048576)
+        self.assertIn('not local physical proof', actual['remaining_copy_qualification'])
+
+    def test_preferred3_is_selected_only_when_it_is_current(self):
+        result = self.select(*self.inputs(('native-node3', 'native-node4')))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['damage_container'], 'node3')
+
+    def test_missing_mapping_single_copy_or_changed_observation_refuses_before_fault(self):
+        roster, view, report = self.inputs()
+        bad_roster = roster[:-1]
+        changed_report = json.loads(json.dumps(report))
+        changed_report['diagnostics']['version'] = 'another-generation'
+        foreign = json.loads(json.dumps(view))
+        foreign['object']['current_locations'][0] = 'foreign-node'
+        single = self.inputs(('native-node6',))
+        for data in [(bad_roster, view, report), (roster, view, changed_report),
+                     (roster, foreign, report), single]:
+            result = self.select(*data)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, '')
+
+    def test_missing_or_mismatched_current_receipt_refuses_metadata_only_holder(self):
+        roster, view, report = self.inputs()
+        cases = []
+        missing = json.loads(json.dumps(view))
+        missing.pop('receipts')
+        cases.append(('missing-receipt-array', missing))
+        for label, receipts in [('empty-receipts', []), ('one-current-receipt', view['receipts'][:1])]:
+            changed = json.loads(json.dumps(view))
+            changed['receipts'] = receipts
+            cases.append((label, changed))
+        for field in ['file_system_id', 'object_id', 'committed_version', 'content_hash', 'replica_node_id']:
+            changed = json.loads(json.dumps(view))
+            receipt = changed['receipts'][0]
+            if field in ['file_system_id', 'object_id', 'committed_version']:
+                receipt['receipt'][field] = 'different-current-subject'
+            else:
+                receipt[field] = 'different-current-subject'
+            cases.append((field, changed))
+        for label, changed in cases:
+            result = self.select(roster, changed, report)
+            self.assertNotEqual(result.returncode, 0, label)
+            self.assertEqual(result.stdout, '', label)
+
+    def test_historical_receipts_do_not_select_a_current_damage_holder(self):
+        roster, view, report = self.inputs()
+        historical = json.loads(json.dumps(view['receipts'][0]))
+        historical['receipt']['committed_version'] = 'historical-version'
+        historical['replica_node_id'] = 'native-node3'
+        view['receipts'].append(historical)
+        result = self.select(roster, view, report)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual['damage_container'], 'node4')
+        self.assertEqual(actual['remaining_container'], 'node6')
+        # Even when the old recipient appears in current metadata/report, a
+        # receipt for another generation cannot qualify it for this fault.
+        view['object']['current_locations'].append('native-node3')
+        report['diagnostics']['current_locations'].append('native-node3')
+        result = self.select(roster, view, report)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['damage_container'], 'node4')
+
+    def test_exact_identity_change_refuses_even_if_bytes_are_equal(self):
+        roster, view, report = self.inputs()
+        functions = DfsBaselineLaneTests.shell_function('dfs_damage_identity_matches')
+        expected = {**{k: v for k, v in view['object'].items() if k not in ['kind', 'current_locations']},
+                    'size_bytes': 1048576, 'node_id': 'native-node4'}
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory)/'view.json'
+            file.write_text(json.dumps(view))
+            argv = ['bash', '-c', functions + '\ndfs_damage_identity_matches "$1" "$2"',
+                    'test', json.dumps(expected), str(file)]
+            result = subprocess.run(argv, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for field in ['object_id', 'version', 'content_hash', 'file_system_id', 'path']:
+                changed = json.loads(json.dumps(view))
+                changed['object'][field] = 'changed-identity'
+                file.write_text(json.dumps(changed))
+                result = subprocess.run(argv, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0, field)
+
+    def test_invalid_native_roster_refuses_before_seed_or_damage(self):
+        functions = ''.join(DfsBaselineLaneTests.shell_function(name) for name in
+                            ['dfs_damage_roster_valid', 'dfs_damage_participants_from_observation',
+                             'dfs_damage_identity_matches', 'disk_damage_recovery'])
+        prelude = r'''cluster_local_node_id() {
+  if [ "$1" = node6 ]; then printf 'native-node1\n'; else printf 'native-%s\n' "$1"; fi
+}
+run_probe() { printf '%s\n' "$*" >>"$ARTIFACTS/forbidden-calls"; }
+compose() { printf '%s\n' "$*" >>"$ARTIFACTS/forbidden-calls"; }
+NODES='node1 node2 node3 node4 node5 node6'
+RUN_ID=test
+DAMAGE_BYTES=1048576
+EXPECT_TIMEOUT=60
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(['bash', '-c', prelude + functions +
+                '\nARTIFACTS="$1"\ndisk_damage_recovery', 'test', directory],
+                capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((Path(directory)/'forbidden-calls').exists())
+
+    def test_existing_fault_keeps_expected_tuple_and_read_side_zero_contract(self):
+        body = DfsBaselineLaneTests.shell_function('disk_damage_recovery')
+        self.assertLess(body.index('dfs_damage_roster_valid'), body.index('cluster.dfs.write'))
+        self.assertLess(body.index('dfs_damage_identity_matches'), body.index('cluster.dfs.damage-local-loose-blob'))
+        self.assertIn('--param "expected-object-json=$expected"', body)
+        self.assertEqual(body.count('--param "max-proc-write-bytes=0"'), 2)
+        self.assertIn('.diagnostics.unlink_completed == true', body)
+        self.assertIn('fault_recipient_manifest.object_id == $expected.object_id', body)
+        self.assertIn('run_probe "$damage" cluster.dfs.expect-file', body)
+        self.assertNotIn('run_probe node3 cluster.dfs.damage-local-loose-blob', body)
+        self.assertNotIn('expect-error', body)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             || original.base_version != intent.base_version
             || original.target_version != intent.target_version
             || original.content_hash != intent.content_hash
+            || original.publication != intent.publication
         {
             return Err(DfsError::Metadata {
                 message: "write reconciliation differs from the retained immutable operation"

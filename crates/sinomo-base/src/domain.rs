@@ -275,6 +275,14 @@ pub struct DfsWriteRequest {
     pub requesting_node_id: Id,
 }
 
+/// Exact namespace generation compared by a conditional mutation.
+/// This is conditional data; the metadata owner still supplies authority.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceObjectPrecondition {
+    pub object_id: Id,
+    pub version: Id,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsWriteReceipt {
     pub file_system_id: Id,

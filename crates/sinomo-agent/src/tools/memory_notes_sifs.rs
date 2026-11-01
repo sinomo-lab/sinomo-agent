@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::vfs::{
-    VfsDirectoryCursor, VfsError, VfsHandle, VfsObjectKind, VfsWriteOptions, mounted_sifs,
+    VfsDirectoryCursor, VfsError, VfsHandle, VfsObjectKind, VfsWriteOptions, discovered_daemon_sifs,
 };
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -148,14 +148,24 @@ impl VfsMemoryNoteBackend {
         &self.root
     }
 
-    fn vfs_handles(&self) -> Result<MemoryNoteVfs, MemoryNoteBackendError> {
-        let mut cached = self
-            .vfs
-            .lock()
-            .map_err(|_| MemoryNoteBackendError::Unavailable {
-                detail: "memory-note VFS handle cache is poisoned".to_string(),
-            })?;
-        if let Some(vfs) = cached.as_ref() {
+    fn vfs_handles(
+        &self,
+        expected_cluster: Option<sinomo_runtime::core::Id>,
+    ) -> Result<MemoryNoteVfs, MemoryNoteBackendError> {
+        // A canonical operation retains its preflight namespace, while explicit
+        // injected and non-POSIX hosts keep their existing cached contract.
+        let mut cached = if expected_cluster.is_none() {
+            Some(
+                self.vfs
+                    .lock()
+                    .map_err(|_| MemoryNoteBackendError::Unavailable {
+                        detail: "memory-note VFS handle cache is poisoned".to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        if let Some(vfs) = cached.as_ref().and_then(|cached| cached.as_ref()) {
             return Ok(vfs.clone());
         }
         // Memory notes are the agent's authoritative roaming home, not a
@@ -167,13 +177,26 @@ impl VfsMemoryNoteBackend {
                 .ok_or_else(|| MemoryNoteBackendError::Unavailable {
                     detail: "injected memory-note VFS handle is unavailable".to_string(),
                 })?;
-        let filesystem = mounted_sifs(Some(data_dir.clone())).map_err(|source| {
-            MemoryNoteBackendError::Unavailable {
-                detail: format!(
-                    "cannot open agent memory-note SIFS root {}: {source}",
-                    self.root
-                ),
-            }
+        let data_dir = SinomoDataDir::new(data_dir);
+        let client = sinomo_runtime::api::DaemonApiClient::connect_for_paths(
+            &sinomo_runtime::api::DaemonPaths::new(&data_dir),
+        )
+        .map_err(|source| MemoryNoteBackendError::Unavailable {
+            detail: format!("cannot connect to the memory-note filesystem owner: {source}"),
+        })?;
+        let filesystem = match expected_cluster {
+            Some(cluster) => sinomo_runtime::vfs::discovered_daemon_sifs_in_cluster(
+                data_dir,
+                client.address(),
+                cluster,
+            ),
+            None => discovered_daemon_sifs(data_dir, client.address()),
+        }
+        .map_err(|source| MemoryNoteBackendError::Unavailable {
+            detail: format!(
+                "cannot open agent memory-note SIFS root {}: {source}",
+                self.root
+            ),
         })?;
         let scoped = filesystem.scoped(&self.root).map_err(|source| {
             MemoryNoteBackendError::Unavailable {
@@ -184,8 +207,61 @@ impl VfsMemoryNoteBackend {
             }
         })?;
         let vfs = MemoryNoteVfs { scoped };
-        *cached = Some(vfs.clone());
+        if let Some(cached) = cached.as_mut() {
+            **cached = Some(vfs.clone());
+        }
         Ok(vfs)
+    }
+
+    fn operation_vfs(
+        &self,
+        ensure_home: bool,
+        cancellation: &AgentCancellationToken,
+    ) -> Result<MemoryNoteVfs, MemoryNoteBackendError> {
+        if cancellation.is_cancelled() {
+            return Err(MemoryNoteBackendError::Cancelled);
+        }
+        let cluster = self.canonical_home_cluster(ensure_home)?;
+        if cancellation.is_cancelled() {
+            return Err(MemoryNoteBackendError::Cancelled);
+        }
+        let vfs = self.vfs_handles(cluster)?;
+        if cancellation.is_cancelled() {
+            return Err(MemoryNoteBackendError::Cancelled);
+        }
+        Ok(vfs)
+    }
+
+    fn canonical_home_cluster(
+        &self,
+        ensure_home: bool,
+    ) -> Result<Option<sinomo_runtime::core::Id>, MemoryNoteBackendError> {
+        #[cfg(unix)]
+        {
+            let Some(root) = self.sifs_data_dir.as_ref() else {
+                return Ok(None);
+            };
+            let home = self
+                .root
+                .rsplit_once('/')
+                .expect("host-derived memory root")
+                .0;
+            let data_dir = SinomoDataDir::new(root);
+            let cluster = if ensure_home {
+                super::local_workspace::agent_home::ensure_private_home_path(&data_dir, home)
+            } else {
+                super::local_workspace::agent_home::inspect_private_home_path(&data_dir, home)
+            }
+            .map_err(|detail| MemoryNoteBackendError::Unavailable {
+                detail: format!("cannot prepare private agent HOME {home}: {detail}"),
+            })?;
+            Ok(Some(cluster))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ensure_home;
+            Ok(None)
+        }
     }
 
     fn read_search_range(
@@ -237,7 +313,7 @@ impl MemoryNoteBackend for VfsMemoryNoteBackend {
         request: MemoryNoteSearchRequest,
         cancellation: &AgentCancellationToken,
     ) -> Result<MemoryNoteSearchPage, MemoryNoteBackendError> {
-        let vfs = self.vfs_handles()?;
+        let vfs = self.operation_vfs(false, cancellation)?;
         let query = request.query.to_lowercase();
         let binding = memory_search_cursor_binding(&self.root, &query);
         let mut state = match request.cursor.as_ref() {
@@ -581,7 +657,7 @@ impl MemoryNoteBackend for VfsMemoryNoteBackend {
         if cancellation.is_cancelled() {
             return Err(MemoryNoteBackendError::Cancelled);
         }
-        let vfs = self.vfs_handles()?;
+        let vfs = self.operation_vfs(false, cancellation)?;
         let read = self.read_search_range(
             &vfs,
             &request.path,
@@ -626,8 +702,11 @@ impl MemoryNoteBackend for VfsMemoryNoteBackend {
         if cancellation.is_cancelled() {
             return Err(MemoryNoteBackendError::Cancelled);
         }
-        let vfs = self.vfs_handles()?;
+        let vfs = self.operation_vfs(true, cancellation)?;
         self.prepare_note_parent(&vfs, &request.path)?;
+        if cancellation.is_cancelled() {
+            return Err(MemoryNoteBackendError::Cancelled);
+        }
         let (metadata, created) = match request.precondition {
             MemoryNoteWritePrecondition::CreateNew => {
                 let metadata = vfs
@@ -1066,6 +1145,130 @@ mod tests {
         MemoryNotePath::new(value).expect("valid memory-note path")
     }
 
+    // Own the normal initialized native component before any VFS clients,
+    // and drain it only after those clients and registrations have ended.
+    struct NativeMemoryFixture {
+        native: Option<sinomo_runtime::dfs::test_support::DfsTestRuntime>,
+        mounted: Option<sinomo_runtime::vfs::native_test_support::NativeMountedFixture>,
+        node: sinomo_runtime::node::NodeId,
+        data_dir: SinomoDataDir,
+        evidence_root: PathBuf,
+        checkpoint_sequence: std::cell::Cell<usize>,
+    }
+
+    impl NativeMemoryFixture {
+        fn start(data_dir: &SinomoDataDir) -> Self {
+            let name = format!(
+                "agent-memory-notes-{}",
+                sinomo_runtime::core::Id::generate()
+            );
+            let (native, node) =
+                sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node_in_data_dir(
+                    &name,
+                    data_dir.clone(),
+                )
+                .expect("initialized native memory-note filesystem owner");
+            let mounted = sinomo_runtime::vfs::native_test_support::NativeMountedFixture::register(
+                &native, &node,
+            );
+            Self {
+                native: Some(native),
+                mounted: Some(mounted),
+                node,
+                data_dir: data_dir.clone(),
+                evidence_root: std::env::temp_dir().join(format!("{name}-rpc-evidence")),
+                checkpoint_sequence: std::cell::Cell::new(0),
+            }
+        }
+
+        fn backend(&self, agent_key: &str) -> Result<VfsMemoryNoteBackend, MemoryNoteBackendError> {
+            let filesystem =
+                sinomo_runtime::vfs::mounted_sifs(Some(self.data_dir.root().to_path_buf()))
+                    .map_err(|source| MemoryNoteBackendError::Unavailable {
+                        detail: source.to_string(),
+                    })?;
+            VfsMemoryNoteBackend::from_vfs(filesystem, agent_key)
+        }
+
+        fn open_service(&self) -> sinomo_runtime::dfs::OpenedMountedSifsService {
+            sinomo_runtime::dfs::OpenedMountedSifsService {
+                service: self
+                    .native
+                    .as_ref()
+                    .unwrap()
+                    .client(&self.node)
+                    .expect("native owner client"),
+                replica_candidates: vec![self.node.clone()],
+            }
+        }
+
+        fn checkpoint(&self, phase: &str) {
+            let native = self.native.as_ref().unwrap();
+            let count = native
+                .checkpoint_rpc_observation_window()
+                .unwrap_or_else(|error| {
+                    panic!("semantic RPC window {phase} must retain complete coverage: {error}")
+                });
+            if count == 0 {
+                return;
+            }
+            std::fs::create_dir_all(&self.evidence_root).unwrap();
+            let sequence = self.checkpoint_sequence.get();
+            let path = self
+                .evidence_root
+                .join(format!("{sequence:03}-{phase}.json"));
+            assert_eq!(
+                native
+                    .export_latest_rpc_observation_checkpoint(&path)
+                    .unwrap(),
+                count
+            );
+            self.checkpoint_sequence.set(sequence + 1);
+        }
+    }
+
+    impl Drop for NativeMemoryFixture {
+        fn drop(&mut self) {
+            drop(self.mounted.take());
+            if let Some(native) = self.native.take() {
+                if let Err(error) = native.close() {
+                    if std::thread::panicking() {
+                        eprintln!("native memory-note fixture drain failed: {error}");
+                    } else {
+                        panic!("native memory-note fixture drain failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn memory_note_constructor_is_lazy_and_missing_daemon_never_creates_local_dfs() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-note-missing-owner-{}",
+            sinomo_runtime::core::Id::generate()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let backend = VfsMemoryNoteBackend::new(&data_dir, "main-agent").unwrap();
+        assert!(!root.exists());
+        assert!(matches!(
+            backend.read(
+                MemoryNoteReadRequest {
+                    path: path("note.md"),
+                    offset: 0,
+                    max_bytes: 1024,
+                    expected_version: None,
+                },
+                &AgentCancellationToken::new()
+            ),
+            Err(MemoryNoteBackendError::Unavailable { .. })
+        ));
+        assert!(
+            !root.exists(),
+            "unavailable daemon must not bootstrap a second local filesystem"
+        );
+    }
+
     #[test]
     fn memory_notes_use_an_injected_memory_vfs_without_dfs() {
         let backend = VfsMemoryNoteBackend::from_vfs(VfsHandle::memory(), "main-agent")
@@ -1116,9 +1319,11 @@ mod tests {
     fn sifs_memory_notes_are_agent_scoped_searchable_and_versioned() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-notes-sifs");
         let data_dir = SinomoDataDir::new(&root);
-        let main = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("main backend");
-        let background =
-            SifsMemoryNoteBackend::new(&data_dir, "background-agent").expect("background backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let main = native.backend("main-agent").expect("main backend");
+        let background = native
+            .backend("background-agent")
+            .expect("background backend");
         let cancellation = AgentCancellationToken::new();
         let note_path = path("runtime/lesson.md");
 
@@ -1247,7 +1452,8 @@ mod tests {
     fn sifs_memory_notes_reject_final_and_intermediate_links() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-notes-link-confinement");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
         let cancellation = AgentCancellationToken::new();
 
         backend
@@ -1261,9 +1467,7 @@ mod tests {
             )
             .expect("bootstrap memory root");
 
-        let mut opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.root().to_path_buf()))
-                .expect("open DFS service");
+        let mut opened = native.open_service();
         let options = sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(vec![
             opened.service.node_id().clone(),
         ]);
@@ -1344,9 +1548,7 @@ mod tests {
             .expect_err("intermediate symlink must reject creation");
         assert!(matches!(error, MemoryNoteBackendError::Invalid { .. }));
 
-        let mut opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.root().to_path_buf()))
-                .expect("reopen DFS service");
+        let mut opened = native.open_service();
         assert!(matches!(
             opened
                 .service
@@ -1359,12 +1561,10 @@ mod tests {
     fn sifs_memory_notes_reject_substituted_root_parent_and_note_links() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-notes-link-substitution");
         let data_dir = SinomoDataDir::new(&root);
-        let root_backend =
-            SifsMemoryNoteBackend::new(&data_dir, "root-swap-agent").expect("root backend");
-        let parent_backend =
-            SifsMemoryNoteBackend::new(&data_dir, "parent-swap-agent").expect("parent backend");
-        let note_backend =
-            SifsMemoryNoteBackend::new(&data_dir, "note-swap-agent").expect("note backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let root_backend = native.backend("root-swap-agent").expect("root backend");
+        let parent_backend = native.backend("parent-swap-agent").expect("parent backend");
+        let note_backend = native.backend("note-swap-agent").expect("note backend");
         let cancellation = AgentCancellationToken::new();
 
         let root_seed = root_backend
@@ -1399,9 +1599,7 @@ mod tests {
             .expect("bootstrap note-swap backend");
         assert!(root_seed.created && parent_seed.created && note_seed.created);
 
-        let mut opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.root().to_path_buf()))
-                .expect("open DFS service");
+        let mut opened = native.open_service();
         let options = sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(vec![
             opened.service.node_id().clone(),
         ]);
@@ -1514,9 +1712,7 @@ mod tests {
                 | Err(MemoryNoteBackendError::Conflict { .. })
         ));
 
-        let mut opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.root().to_path_buf()))
-                .expect("reopen DFS service");
+        let mut opened = native.open_service();
         for outside in [
             "/outside-memory/root/new.md",
             "/outside-memory/parent/new.md",
@@ -1539,7 +1735,8 @@ mod tests {
     fn sifs_memory_search_cursor_continues_without_repeating_notes() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-notes-cursor");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
         let cancellation = AgentCancellationToken::new();
         let query = "needle-private-query";
         for name in ["alpha.md", "bravo.md", "charlie.md"] {
@@ -1612,7 +1809,8 @@ mod tests {
     fn sifs_memory_search_cursor_rejects_directory_generation_changes() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-directory-generation");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
         let cancellation = AgentCancellationToken::new();
         for name in ["alpha.md", "bravo.md"] {
             backend
@@ -1668,7 +1866,8 @@ mod tests {
     fn sifs_memory_search_cursor_rejects_active_note_replacement() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-active-version");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
         let cancellation = AgentCancellationToken::new();
         let note_path = path("changing.md");
         let created = backend
@@ -1730,7 +1929,8 @@ mod tests {
     fn sifs_memory_search_reaches_matches_after_one_mebibyte() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-large-search");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
         let cancellation = AgentCancellationToken::new();
         let note_path = path("large.md");
         let mut markdown = "filler line\n".repeat(90_000);
@@ -1832,7 +2032,8 @@ mod tests {
     fn sifs_memory_search_cursor_cannot_cross_a_directory_link_swap() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-search-directory-swap");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
         let cancellation = AgentCancellationToken::new();
         for name in ["nested/alpha.md", "nested/bravo.md"] {
             backend
@@ -1860,9 +2061,7 @@ mod tests {
         assert_eq!(first.matches.len(), 1);
         let cursor = first.next_cursor.expect("directory continuation");
 
-        let mut opened =
-            sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.root().to_path_buf()))
-                .expect("open DFS service");
+        let mut opened = native.open_service();
         let options = sinomo_runtime::dfs::DfsWriteOptions::replicated_eventual(vec![
             opened.service.node_id().clone(),
         ]);
@@ -1919,12 +2118,28 @@ mod tests {
     fn sifs_memory_search_deep_cursor_is_bounded_and_resumable() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-notes-deep-cursor");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("backend");
+        native.checkpoint("memory-root-ready");
         let cancellation = AgentCancellationToken::new();
         let directory = (0..MAX_SEARCH_DEPTH)
             .map(|index| format!("segment-{index:02}-abcdefghij"))
             .collect::<Vec<_>>()
             .join("/");
+        // Prepare each real directory as a separate semantic operation so the
+        // unchanged long-path write and search retain complete capture windows.
+        let mut setup = native.open_service();
+        let mut prefix = backend.root().to_string();
+        for segment in directory.split('/') {
+            prefix.push('/');
+            prefix.push_str(segment);
+            setup
+                .service
+                .posix_mkdir(&prefix)
+                .expect("prepare one deep directory through the native owner");
+            native.checkpoint("deep-directory-ready");
+        }
+        drop(setup);
         let note_path = path(&format!("{directory}/deep.md"));
         backend
             .write(
@@ -1936,6 +2151,7 @@ mod tests {
                 &cancellation,
             )
             .expect("create deep note");
+        native.checkpoint("deep-note-written");
 
         let mut cursor = None;
         let mut lines = Vec::new();
@@ -1951,6 +2167,7 @@ mod tests {
                     &cancellation,
                 )
                 .expect("search deep page");
+            native.checkpoint("deep-search-page");
             lines.extend(page.matches.into_iter().filter_map(|entry| entry.line));
             if let Some(next_cursor) = page.next_cursor.as_ref() {
                 assert!(
@@ -1971,7 +2188,8 @@ mod tests {
     fn bounded_read_rejects_a_nonadvancing_utf8_page() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-memory-notes-utf8-prefix");
         let data_dir = SinomoDataDir::new(&root);
-        let backend = SifsMemoryNoteBackend::new(&data_dir, "main-agent").expect("memory backend");
+        let native = NativeMemoryFixture::start(&data_dir);
+        let backend = native.backend("main-agent").expect("memory backend");
         let cancellation = AgentCancellationToken::new();
         let note_path = path("unicode.md");
         backend

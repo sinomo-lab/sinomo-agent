@@ -302,7 +302,7 @@ pub struct DfsDistributedWritePatch {
 pub struct DfsDistributedWriteCommand {
     #[serde(
         default,
-        skip_serializing_if = "crate::DfsWritePublication::is_current"
+        skip_serializing_if = "crate::DfsWritePublication::is_default_current"
     )]
     pub publication: crate::DfsWritePublication,
     #[serde(deserialize_with = "required_optional")]
@@ -395,6 +395,13 @@ pub enum DfsDistributedWriteResult {
         operation_id: String,
         reason: String,
     },
+    PreconditionFailed {
+        failure: crate::DfsWritePreconditionFailure,
+    },
+    UnsupportedPrecondition {
+        path: String,
+        reason: String,
+    },
     Rejected {
         reason: String,
         /// Set when the addressed node is not the current metadata-shard
@@ -456,11 +463,7 @@ pub struct DfsLocalEventualBatchWriteProof {
 /// Exact namespace generation a conditional mutation is authorized to
 /// consume. Both fields are required: object ids fence delete/recreate races,
 /// while versions fence in-place changes to the same durable object.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsNamespaceObjectPrecondition {
-    pub object_id: DfsObjectId,
-    pub version: DfsVersion,
-}
+pub use sinomo_core::DfsNamespaceObjectPrecondition;
 
 /// Required destination state for a conditional rename.
 ///
@@ -505,6 +508,17 @@ pub struct DfsNamespaceLookupRangeRequest {
 }
 
 pub(crate) const DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES: usize = 64 * 1024;
+
+/// Attributed direct-child creation bound to one actual opened parent.
+/// The distinct closed payload prevents an old receiver from ignoring attrs.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DfsMkdirAtNoLinksWithAttrs {
+    pub path: String,
+    pub expected_parent_object_id: DfsObjectId,
+    pub expected_parent_version: DfsVersion,
+    pub attrs: DfsPosixCreateAttrs,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -788,6 +802,8 @@ pub enum DfsNamespaceOperation {
         alias: DfsObjectMetadata,
         source_path: String,
     },
+    /// Distinct closed command; legacy variant ordinals stay unchanged.
+    MkdirAtNoLinksWithAttrs(DfsMkdirAtNoLinksWithAttrs),
 }
 
 impl DfsNamespaceOperation {
@@ -826,6 +842,7 @@ impl DfsNamespaceOperation {
             // prefix and hash shards may intersect it. Routed feed code must
             // dispatch by the cursor's exact shard configuration.
             DfsNamespaceOperation::PollNamespaceChanges { .. } => None,
+            DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(command) => Some(&command.path),
             DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }
@@ -890,6 +907,7 @@ impl DfsNamespaceOperation {
             DfsNamespaceOperation::PollNamespaceChanges { request } => {
                 vec![request.root_path.as_str()]
             }
+            DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(command) => vec![&command.path],
             DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. }

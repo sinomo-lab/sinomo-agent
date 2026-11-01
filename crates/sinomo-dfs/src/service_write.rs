@@ -556,7 +556,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// the visible base and exclude pending writers; retained publications keep
     /// their immutable source version without claiming the current head.
     fn validate_distributed_write_admission(
-        &self,
+        &mut self,
         request: &DfsWriteRequest,
         expected_base_version: Option<&DfsVersion>,
         object: &DfsObjectMetadata,
@@ -564,6 +564,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: &DfsReplicationPolicy,
         publication: &DfsWritePublication,
     ) -> Result<(), DfsError> {
+        self.check_current_write_precondition(publication, &request.file_system_id,
+            &request.object_id, &object.path, expected_base_version)?;
         if publication.is_current() {
             if let Some(expected) = expected_base_version
                 && expected != &object.version
@@ -630,7 +632,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // object/version pair remains atomic, while the missing N-W copies stay
         // represented by coordinator repair jobs. First publication uses the
         // dedicated parent-inclusive namespace batch in the same helper.
-        let can_commit_in_one_batch = !foreground_replica_repair
+        let can_commit_in_one_batch = intent.publication.current_precondition().is_none()
+            && !foreground_replica_repair
             && intent.policy.min_commit_replicas <= 1
             && !receipt_node_ids.is_empty()
             && self.can_commit_ready_intent_batched(intent)?;
@@ -1527,6 +1530,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options,
             );
         }
+        let publication = options.publication.clone();
         let touch_parent_on_create = options.touch_parent_on_create;
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
         let operation_id = options.operation_id;
@@ -1634,7 +1638,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &object,
             &desired_replica_nodes,
             &policy,
-            &DfsWritePublication::Current,
+            &publication,
         )?;
 
         let manifest = match captured_manifest {
@@ -1646,7 +1650,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?,
         };
 
-        if operation_id.is_none()
+        if publication.is_default_current() && operation_id.is_none()
             && self.control_plane.is_none()
             && !touch_parent_on_create
             && object.policy == DfsObjectPolicy::ReplicatedEventual
@@ -1672,7 +1676,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         });
         let intent = self
             .coordinator
-            .create_intent_at_epoch_with_parent_touch_and_id(
+            .create_intent_for_publication(
                 request.file_system_id.clone(),
                 request.object_id.clone(),
                 expected_base_version.clone(),
@@ -1688,6 +1692,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 operation_id
                     .as_deref()
                     .and_then(stable_operation_order_token),
+                publication.clone(),
             )?;
         self.writes.pending_writes.insert(
             intent.intent_id.clone(),
@@ -2148,7 +2153,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let record_receipt_elapsed = record_receipt_started.elapsed();
         let commit_started = Instant::now();
         let receipt_node_ids = initial_receipt_node_ids;
-        if publication.is_current() && !foreground_replica_repair
+        if publication.is_default_current() && !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
             // Snapshot planning can replace the caller's initially durable
             // node with a healthier replica. In that case the manifest path
@@ -2305,6 +2310,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 options,
             );
         }
+        let publication = options.publication.clone();
         let touch_parent_on_create = options.touch_parent_on_create;
         let exclusive_create = options.creation.is_exclusive();
         let foreground_replica_repair = options.repair == DfsWriteRepair::Foreground;
@@ -2464,10 +2470,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &object,
             &desired_replica_nodes,
             &policy,
-            &DfsWritePublication::Current,
+            &publication,
         )?;
 
-        if operation_id.is_none()
+        if publication.is_default_current() && operation_id.is_none()
             && self.control_plane.is_none()
             && !touch_parent_on_create
             && object.policy == DfsObjectPolicy::ReplicatedEventual
@@ -2513,7 +2519,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         });
         let intent = self
             .coordinator
-            .create_intent_at_epoch_with_parent_touch_and_id(
+            .create_intent_for_publication(
                 request.file_system_id.clone(),
                 request.object_id.clone(),
                 expected_base_version.clone(),
@@ -2529,6 +2535,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 operation_id
                     .as_deref()
                     .and_then(stable_operation_order_token),
+                publication.clone(),
             )?;
         let create_intent_elapsed = create_intent_started.elapsed();
         self.writes.pending_writes.insert(

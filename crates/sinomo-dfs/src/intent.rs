@@ -90,6 +90,7 @@ pub(crate) fn stable_distributed_intent_matches_routed_write_command(
         && matches!(
             intent.state,
             DfsWriteIntentState::AwaitingReceipts | DfsWriteIntentState::Committed
+                | DfsWriteIntentState::PreconditionFailed { .. }
         )
 }
 
@@ -111,6 +112,7 @@ pub(crate) fn stable_write_intent_record_matches_routed_write_command(
             DfsWriteIntentStatus::Staging
                 | DfsWriteIntentStatus::ReceiptsPending
                 | DfsWriteIntentStatus::Committed
+                | DfsWriteIntentStatus::PreconditionFailed { .. }
         )
 }
 
@@ -149,6 +151,9 @@ fn write_intent_status(state: &DfsWriteIntentState) -> DfsWriteIntentStatus {
         DfsWriteIntentState::Committed => DfsWriteIntentStatus::Committed,
         DfsWriteIntentState::Rejected => DfsWriteIntentStatus::Rejected,
         DfsWriteIntentState::Aborted => DfsWriteIntentStatus::Aborted,
+        DfsWriteIntentState::PreconditionFailed { failure } => DfsWriteIntentStatus::PreconditionFailed {
+            failure: failure.clone(),
+        },
     }
 }
 
@@ -201,6 +206,9 @@ fn distributed_intent_state_from_status(status: &DfsWriteIntentStatus) -> DfsWri
         DfsWriteIntentStatus::Committed => DfsWriteIntentState::Committed,
         DfsWriteIntentStatus::Rejected => DfsWriteIntentState::Rejected,
         DfsWriteIntentStatus::Aborted => DfsWriteIntentState::Aborted,
+        DfsWriteIntentStatus::PreconditionFailed { failure } => DfsWriteIntentState::PreconditionFailed {
+            failure: failure.clone(),
+        },
     }
 }
 

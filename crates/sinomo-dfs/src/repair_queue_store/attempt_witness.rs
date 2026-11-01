@@ -11,11 +11,83 @@ use super::*;
 #[derive(Debug)]
 pub(crate) struct RepairOriginalAttemptWitness {
     owner: Arc<()>,
-    physical: SelectedOriginalFixtureIdentity,
+    physical: RepairQueuePhysicalOwner,
     carrier: crate::DfsRoutedMessage,
     material: crate::DfsOriginalRepairMaterial,
     payload_root: crate::content_store::RepairPayloadRoot,
     attempt_sequence: u64,
+}
+
+/// Existing physical witness: selected DATA and actual ordinary native owners
+/// remain distinct. Neither variant is serialized or a serving permission.
+#[derive(Clone, Debug)]
+pub(super) enum RepairQueuePhysicalOwner {
+    Selected(SelectedOriginalFixtureIdentity),
+    Default {
+        owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
+        snapshot_path: PathBuf,
+        lock_identity: (u64, u64),
+    },
+}
+impl RepairQueuePhysicalOwner {
+    pub(super) fn for_default(
+        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
+    ) -> Result<Self, DfsError> {
+        let snapshot_path = owner
+            .checked_default_repair_queue_path()
+            .map_err(|error| custody_error(&error.to_string()))?;
+        let lock_identity = owner
+            .storage_owner_file_identity()
+            .map_err(|error| custody_error(&error.to_string()))?;
+        Ok(Self::Default {
+            owner: Arc::downgrade(owner),
+            snapshot_path,
+            lock_identity,
+        })
+    }
+    pub(super) fn check(&self) -> Result<(), DfsError> {
+        match self {
+            Self::Selected(identity) => identity.check(),
+            Self::Default {
+                owner,
+                snapshot_path,
+                lock_identity,
+            } => {
+                let actual = owner
+                    .upgrade()
+                    .ok_or_else(|| custody_error("ordinary Repair witness native owner retired"))?;
+                if actual
+                    .checked_default_repair_queue_path()
+                    .map_err(|error| custody_error(&error.to_string()))?
+                    != *snapshot_path
+                    || actual
+                        .storage_owner_file_identity()
+                        .map_err(|error| custody_error(&error.to_string()))?
+                        != *lock_identity
+                {
+                    return Err(custody_error(
+                        "ordinary Repair witness changed registered/native physical owner",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+    pub(super) fn matches_state(&self, state: &DfsRepairQueueState) -> bool {
+        match self {
+            Self::Selected(expected) => state.selected_fixture.as_ref().is_some_and(|actual| {
+                actual.root == expected.root
+                    && actual.snapshot_path == expected.snapshot_path
+                    && actual.marker == expected.marker
+                    && state.snapshot_path == expected.snapshot_path
+            }),
+            Self::Default { snapshot_path, .. } => {
+                state.selected_fixture.is_none()
+                    && state.snapshot_path == *snapshot_path
+                    && !state.custody.incarnation.is_empty()
+            }
+        }
+    }
 }
 
 impl RepairOriginalAttemptWitness {
@@ -43,13 +115,8 @@ impl RepairOriginalAttemptWitness {
 /// Do not refresh, replay, truncate, synchronize or change resident state here.
 /// The producer's existing writer/replay must already have supplied a certain
 /// prefix. Directory identity and exact current files are checked again on use.
-fn checked_resident_prefix(
-    state: &DfsRepairQueueState,
-) -> Result<SelectedOriginalFixtureIdentity, DfsError> {
-    let physical = state.selected_fixture.as_ref().ok_or_else(|| {
-        custody_error("original attempt witness requires its explicit physical queue owner")
-    })?;
-    physical.check()?;
+pub(super) fn checked_loaded_prefix(
+    state: &DfsRepairQueueState) -> Result<(), DfsError> {
     if !state.loaded || state.selected_fixture_initializing {
         return Err(custody_error(
             "original attempt witness requires an already loaded resident prefix",
@@ -92,13 +159,23 @@ fn checked_resident_prefix(
             "original attempt witness queue files differ from the resident prefix",
         ));
     }
-    physical.check()?;
-    if state.custody.incarnation != physical.marker.queue_incarnation {
+    Ok(())
+}
+fn checked_resident_prefix(
+    state: &DfsRepairQueueState,
+) -> Result<RepairQueuePhysicalOwner, DfsError> {
+    let identity = state.selected_fixture.as_ref().ok_or_else(|| {
+        custody_error("original attempt witness requires its explicit physical queue owner")
+    })?;
+    identity.check()?;
+    checked_loaded_prefix(state)?;
+    identity.check()?;
+    if state.custody.incarnation != identity.marker.queue_incarnation {
         return Err(custody_error(
             "original attempt witness queue incarnation differs from its physical owner",
         ));
     }
-    Ok(physical.clone())
+    Ok(RepairQueuePhysicalOwner::Selected(identity.clone()))
 }
 
 fn checked_queue_file(path: &Path) -> Result<Option<fs::Metadata>, DfsError> {
@@ -162,24 +239,11 @@ impl LocalDfsRepairQueueStore {
         &self,
         witness: &RepairOriginalAttemptWitness,
     ) -> Result<(), DfsError> {
-        let state = self.lock_state()?;
-        if !Arc::ptr_eq(&state.owner, &witness.owner) {
-            return Err(custody_error(
-                "original attempt witness belongs to another resident queue owner",
-            ));
-        }
         witness.physical.check()?;
-        let physical = state.selected_fixture.as_ref().ok_or_else(|| {
-            custody_error("original attempt witness lost its physical queue owner")
-        })?;
-        physical.check()?;
-        if physical.root != witness.physical.root
-            || physical.snapshot_path != witness.physical.snapshot_path
-            || state.snapshot_path != physical.snapshot_path
-            || physical.marker != witness.physical.marker
-        {
+        let state = self.lock_state()?;
+        if !Arc::ptr_eq(&state.owner, &witness.owner) || !witness.physical.matches_state(&state) {
             return Err(custody_error(
-                "original attempt witness belongs to another physical queue incarnation",
+                "original attempt witness belongs to another native/resident physical owner",
             ));
         }
         Ok(())
@@ -206,6 +270,35 @@ impl LocalDfsRepairQueueStore {
         })
     }
 
+    /// Default production capture is available only with the normal producer's
+    /// current native admission and the SAME registered physical DATA owner.
+    pub(crate) fn capture_default_original_repair_attempt_witness(
+        &self,
+        owner: &Arc<crate::runtime_host::DfsDataOwnerLock>,
+        admission: &crate::publication_guard::NativeRepairProducerAdmission,
+        carrier: &crate::DfsRoutedMessage,
+        material: &crate::DfsOriginalRepairMaterial,
+    ) -> Result<RepairOriginalAttemptWitness, DfsError> {
+        admission.check_default_queue_owner(owner, material)?;
+        let physical = RepairQueuePhysicalOwner::for_default(owner)?;
+        let state = self.lock_state()?;
+        if !physical.matches_state(&state) {
+            return Err(custody_error(
+                "ordinary Repair witness selected a different native queue",
+            ));
+        }
+        checked_loaded_prefix(&state)?;
+        let (birth, attempt_sequence) = checked_attempt(&state, carrier, material)?;
+        Ok(RepairOriginalAttemptWitness {
+            owner: Arc::clone(&state.owner),
+            physical,
+            carrier: carrier.clone(),
+            material: material.clone(),
+            payload_root: birth.root.clone(),
+            attempt_sequence,
+        })
+    }
+
     /// Revalidate against the actual current native-owner queue before/after
     /// the RPC. No mutex survives this return. Unrelated progress and delivery
     /// updates do not erase this uniquely identified historical Attempt.
@@ -213,22 +306,14 @@ impl LocalDfsRepairQueueStore {
         &self,
         witness: &RepairOriginalAttemptWitness,
     ) -> Result<(), DfsError> {
-        let state = self.lock_state()?;
-        if !Arc::ptr_eq(&state.owner, &witness.owner) {
-            return Err(custody_error(
-                "original attempt witness belongs to another resident queue owner",
-            ));
-        }
         witness.physical.check()?;
-        let physical = checked_resident_prefix(&state)?;
-        if physical.root != witness.physical.root
-            || physical.snapshot_path != witness.physical.snapshot_path
-            || physical.marker != witness.physical.marker
-        {
+        let state = self.lock_state()?;
+        if !Arc::ptr_eq(&state.owner, &witness.owner) || !witness.physical.matches_state(&state) {
             return Err(custody_error(
-                "original attempt witness belongs to another physical queue incarnation",
+                "original attempt witness belongs to another native/resident physical owner",
             ));
         }
+        checked_loaded_prefix(&state)?;
         let (birth, sequence) = checked_attempt(&state, &witness.carrier, &witness.material)?;
         if sequence != witness.attempt_sequence || birth.root != witness.payload_root {
             return Err(custody_error(

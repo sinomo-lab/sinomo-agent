@@ -30,6 +30,10 @@ pub enum MetadataBackendError {
         identity: String,
         requirement: String,
     },
+    #[error("write precondition failed: {failure:?}")]
+    WritePreconditionFailed {
+        failure: crate::DfsWritePreconditionFailure,
+    },
     #[error("metadata serialization error: {0}")]
     Serde(String),
     #[error("metadata serialization error: {message}")]

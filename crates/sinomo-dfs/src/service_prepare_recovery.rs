@@ -340,6 +340,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<(), DfsError> {
-        self.apply_committed_intent(intent_id)
+        if self.coordinator.intent(intent_id).is_some_and(|intent|
+            intent.publication.current_precondition().is_some()) {
+            self.try_apply_committed_intent_if_ready(intent_id)
+        } else {
+            self.apply_committed_intent(intent_id)
+        }
     }
 }

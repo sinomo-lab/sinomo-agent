@@ -18,7 +18,7 @@ use sinomo_runtime::dfs_history::DfsHistoryExt;
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -869,7 +869,6 @@ pub struct AgentChatSifsStorage {
     data_dir: SinomoDataDir,
     address: String,
     runtime: tokio::runtime::Handle,
-    provider: Arc<OnceLock<AgentChatSifsProvider>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -896,17 +895,15 @@ impl AgentChatSifsStorage {
             data_dir,
             address: address.into(),
             runtime: runtime.clone(),
-            provider: Arc::new(OnceLock::new()),
         }
     }
 
     fn provider(&self) -> Result<AgentChatSifsProvider, String> {
-        if let Some(provider) = self.provider.get() {
-            return Ok(provider.clone());
-        }
-        let provider = self.discover_provider()?;
-        let _ = self.provider.set(provider.clone());
-        Ok(provider)
+        // The live service catalog owns provider availability. Reopening a
+        // store must not pin a withdrawn provider for the lifetime of a chat
+        // view. Discovery and status probes are reads; existing handles keep
+        // their exact operation ownership and never replay an uncertain write.
+        self.discover_provider()
     }
 
     fn discover_provider(&self) -> Result<AgentChatSifsProvider, String> {
@@ -1020,11 +1017,12 @@ impl AgentChatSifsStorage {
                 sinomo_runtime::vfs::daemon_sifs(self.address.clone())
                     .map_err(|error| error.to_string())
             }
-            AgentChatSifsProvider::ClusterNode(node_id) => {
-                sinomo_runtime::vfs::daemon_sifs_on_node(
+            AgentChatSifsProvider::ClusterNode(_) => {
+                // Catalog handles outlive an individual turn. Resolve the
+                // current advertised provider before each new operation.
+                sinomo_runtime::vfs::discovered_daemon_sifs(
                     self.data_dir.clone(),
                     self.address.clone(),
-                    node_id,
                 )
                 .map_err(|error| error.to_string())
             }
@@ -1086,6 +1084,10 @@ pub struct SifsAgentChannelStore {
 }
 
 impl SifsAgentChannelStore {
+    pub(crate) fn provider_node_id(&self) -> &str {
+        self.browser.node_id()
+    }
+
     pub fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         SifsBrowser::open(data_dir).map(Self::from_browser)
     }
@@ -1359,11 +1361,41 @@ impl SifsAgentChannelStore {
         bytes: &[u8],
         original_detail: String,
     ) -> Result<(), AgentChannelStoreError> {
-        let started = Instant::now();
+        let deadline = Instant::now() + SIFS_IMMUTABLE_WRITE_RECONCILIATION_BUDGET;
+        // A materialized exact immutable key/payload is a consumer observation,
+        // not proof that a lost operation receipt settled. Never submit another
+        // mutation while the original write's outcome is unknown.
+        let remote = match &self.browser.backend {
+            SifsBrowserBackend::Remote(remote) => Some(
+                remote.with_operation_deadline(Some(
+                    remote
+                        .operation_deadline
+                        .map_or(deadline, |existing| existing.min(deadline)),
+                )),
+            ),
+            SifsBrowserBackend::Local(_) => None,
+        };
+        let deadline = remote
+            .as_ref()
+            .and_then(|remote| remote.operation_deadline)
+            .unwrap_or(deadline);
         let mut delay = SIFS_BROWSER_READ_RETRY_INITIAL_DELAY;
         let mut last_detail = original_detail.clone();
         loop {
-            match self.browser.read_file(path) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(channel_store_io(
+                    path,
+                    format!(
+                        "immutable channel write outcome remained unknown after byte-for-byte reconciliation: {original_detail}; last observation: {last_detail}"
+                    ),
+                ));
+            }
+            let read = match &remote {
+                Some(remote) => remote.read_file(path),
+                None => self.browser.read_file(path),
+            };
+            match read {
                 Ok(existing) if existing == bytes => return Ok(()),
                 Ok(_) => {
                     return Err(channel_store_io(
@@ -1373,7 +1405,9 @@ impl SifsAgentChannelStore {
                         ),
                     ));
                 }
-                Err(detail) if sifs_error_is_not_found(&detail) => {}
+                Err(detail) if sifs_error_is_not_found(&detail) => {
+                    last_detail = detail;
+                }
                 Err(detail) if sifs_immutable_write_should_reconcile(&detail) => {
                     last_detail = detail;
                 }
@@ -1386,35 +1420,10 @@ impl SifsAgentChannelStore {
                     ));
                 }
             }
-
-            if started.elapsed() >= SIFS_IMMUTABLE_WRITE_RECONCILIATION_BUDGET {
-                return Err(channel_store_io(
-                    path,
-                    format!(
-                        "immutable channel write outcome remained unknown after byte-for-byte reconciliation: {original_detail}; last observation: {last_detail}"
-                    ),
-                ));
-            }
-
-            thread::sleep(delay);
-            delay = (delay * 2).min(SIFS_BROWSER_READ_RETRY_MAX_DELAY);
-            if let Err(error) = self.ensure_parent(path) {
-                match error {
-                    AgentChannelStoreError::Io { detail, .. }
-                        if sifs_immutable_write_should_reconcile(&detail) =>
-                    {
-                        last_detail = detail;
-                        continue;
-                    }
-                    error => return Err(error),
-                }
-            }
-            match self.browser.write_file(path, bytes) {
-                Ok(()) => return Ok(()),
-                Err(detail) if sifs_immutable_write_should_reconcile(&detail) => {
-                    last_detail = detail;
-                }
-                Err(detail) => return Err(channel_store_io(path, detail)),
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(SIFS_BROWSER_READ_RETRY_MAX_DELAY);
             }
         }
     }
@@ -10363,6 +10372,10 @@ fn parent_sifs_browser_path(path: &str) -> Option<String> {
 mod node_scoped_rpc_tests;
 
 #[cfg(test)]
+#[path = "app_api/channel_lost_reply_native_tests.rs"]
+mod channel_lost_reply_native_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use sinomo_agent::{
@@ -10371,6 +10384,85 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
+
+    fn native_fixture_local_node_id(data: &SinomoDataDir) -> NodeId {
+        sinomo_runtime::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data))
+            .expect("read the actual native fixture identity")
+            .local_node_id
+    }
+
+    /// A placement-policy unit has no requester identity, while its injected
+    /// catalog/channel/checkpoint transport has an actual separate native owner.
+    /// This is not public daemonless DFS initialization or cluster acceptance.
+    fn chat_with_native_stores_without_local_identity(
+        caller: SinomoDataDir,
+        provider: &SinomoDataDir,
+    ) -> AgentChat {
+        assert!(read_cli_cluster_state(&ClusterPaths::new(&caller)).is_err());
+        let catalog = sinomo_runtime::vfs::mounted_sifs(Some(provider.root()))
+            .expect("actual initialized provider catalog transport");
+        let channels = SifsAgentChannelStore::open(provider).expect("native provider channels");
+        let checkpoints =
+            SifsAgentSessionCheckpointStore::open(provider).expect("native provider checkpoints");
+        let chat = AgentChat::with_runtime_control_registry_and_stores(
+            caller,
+            false,
+            AgentRuntimeControlRegistry::new(),
+            catalog,
+            true,
+            Box::new(channels),
+            checkpoints,
+        )
+        .expect("build placement-policy runtime with explicit native stores");
+        assert!(
+            read_cli_cluster_state(&ClusterPaths::new(&chat.data_dir)).is_err(),
+            "constructing the unit must not initialize a caller and then claim it lacks identity"
+        );
+        chat
+    }
+
+    /// These two tests isolate session/registry transaction rollback. Inject an
+    /// existing typed backend over an explicit actual native test namespace;
+    /// canonical notes/private HOME/Main transport remain separate integration
+    /// obligations exercised by the daemon-backed consumer lifecycle.
+    fn inject_native_notes_for_session_rollback_unit(chat: &AgentChat, data: &SinomoDataDir) {
+        let vfs = sinomo_runtime::vfs::mounted_sifs(Some(data.root()))
+            .expect("actual native notes fixture transport");
+        let backend = sinomo_agent::VfsMemoryNoteBackend::from_vfs(vfs, "main-agent")
+            .expect("typed injected native notes backend");
+        let notes = sinomo_agent::memory_notes::registry(
+            sinomo_agent::MemoryNoteAgentToolConfig::from_backend(backend),
+        );
+        chat.runtime
+            .handler()
+            .tool_registry()
+            .replace_registered_tools_from(&notes);
+    }
+
+    fn assert_actual_local_sandbox(chat: &AgentChat, data: &SinomoDataDir, node: &NodeId) {
+        let session = chat
+            .runtime
+            .handler()
+            .agent_session_snapshot()
+            .expect("actual runtime session")
+            .expect("runtime attached");
+        let attachment = session
+            .sandbox_attachment
+            .expect("normal lifecycle attached a sandbox");
+        assert_eq!(attachment.server_id, node.to_string());
+        let id = sinomo_runtime::sandbox::SandboxId::new(attachment.sandbox_id)
+            .expect("native sandbox identity");
+        let status = crate::sandbox_lifecycle_client(data)
+            .status(
+                Some(node),
+                sinomo_runtime::sandbox::SandboxStatusRequest {
+                    sandbox_id: id.clone(),
+                },
+            )
+            .expect("real local in-process sandbox lifecycle owner returns status");
+        assert_eq!(status.manifest.sandbox_id, id);
+    }
+
 
     fn typed_read_owner(data_dir: &SinomoDataDir) -> (tokio::runtime::Runtime, RemoteSifsBrowser) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -12156,6 +12248,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-resume");
         let data_dir = SinomoDataDir::new(&root);
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+        let local_node_id = native_fixture_local_node_id(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
@@ -12170,13 +12263,14 @@ mod tests {
             .participant_mut(&participant_id)
             .expect("participant")
             .tool_runtime
-            .sandbox_node_id = Some("channel-node".to_string());
+            .sandbox_node_id = Some(local_node_id.to_string());
         assert_ne!(participant_session_id, channel_id);
         store.save_channel(&channel).expect("save channel");
 
-        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume explicit channel");
+        assert_actual_local_sandbox(&chat, &data_dir, &local_node_id);
 
         let participant = chat
             .participants()
@@ -12189,7 +12283,7 @@ mod tests {
         );
         assert_eq!(
             participant.tool_runtime.sandbox_node_id.as_deref(),
-            Some("channel-node")
+            Some(local_node_id.as_str())
         );
     }
 
@@ -12330,6 +12424,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tool-runtime-identity");
         let data_dir = SinomoDataDir::new(&root);
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+        let local_node_id = native_fixture_local_node_id(&data_dir);
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Work with the team.");
         let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
@@ -12356,8 +12451,9 @@ mod tests {
         chat.use_injected_authoritative_agent_catalog_for_test();
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume durable group channel");
-        chat.set_tool_runtime_node(Some("updated-node".to_string()))
+        chat.set_tool_runtime_node(Some(local_node_id.to_string()))
             .expect("update selected participant tool runtime");
+        assert_actual_local_sandbox(&chat, &data_dir, &local_node_id);
 
         assert_eq!(chat.channel.participants.len(), durable_participants.len());
         for durable in &durable_participants {
@@ -12378,7 +12474,7 @@ mod tests {
                 .tool_runtime
                 .sandbox_node_id
                 .as_deref(),
-            Some("updated-node")
+            Some(local_node_id.as_str())
         );
         assert_eq!(
             chat.channel
@@ -12402,7 +12498,7 @@ mod tests {
         assert_eq!(saved_worker.agent_session_id, worker_session_id);
         assert_eq!(
             saved_worker.tool_runtime.sandbox_node_id.as_deref(),
-            Some("updated-node")
+            Some(local_node_id.as_str())
         );
         assert!(
             !saved
@@ -12418,6 +12514,7 @@ mod tests {
         // Writable workspaces must be outside the protected Sinomo data root.
         let data_dir = SinomoDataDir::new(root.join("data"));
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+        let local_node_id = native_fixture_local_node_id(&data_dir);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
 
         for all_disabled in [false, true] {
@@ -12438,10 +12535,11 @@ mod tests {
             chat.resume_session(&channel_id.to_string(), &[])
                 .expect("resume quiet group channel");
             chat.set_tool_runtime(ChatToolRuntimeSelection {
-                sandbox_node_id: Some("outer-node".to_string()),
+                sandbox_node_id: Some(local_node_id.to_string()),
                 workspace_root: Some(workspace.clone()),
             })
             .expect("update outer runtime without a member");
+            assert_actual_local_sandbox(&chat, &data_dir, &local_node_id);
 
             assert_eq!(chat.channel.participants, durable_participants);
             let saved = store
@@ -12915,6 +13013,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(root.join("data"));
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        inject_native_notes_for_session_rollback_unit(&chat, &data_dir);
         let previous_interaction_session = chat.runtime.session().clone();
         let previous_channel = chat.channel.clone();
         let previous_tool_runtime = chat.tool_runtime.clone();
@@ -12992,6 +13091,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(root.join("data"));
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        inject_native_notes_for_session_rollback_unit(&chat, &data_dir);
         let previous_interaction_session = chat.runtime.session().clone();
         let previous_channel = chat.channel.clone();
         let previous_tool_runtime = chat.tool_runtime.clone();
@@ -13323,16 +13423,19 @@ mod tests {
     #[test]
     fn app_chat_rejects_agent_placement_without_local_node_identity() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-agent-tool-runtime");
-        let data_dir = SinomoDataDir::new(&root);
+        let data_dir = SinomoDataDir::new(root.join("uninitialized-caller"));
+        let provider_data = SinomoDataDir::new(root.join("actual-native-provider"));
+        let _provider = crate::native_test_fixture::NativeCliFixture::start(&provider_data);
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Use the worker sandbox.")
                 .with_sandbox_runtime_node_id("worker-node");
-        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
-            .expect("open agent definition store");
+        let definition_store =
+            sinomo_agent::AgentDefinitionSifsStore::open(Some(provider_data.root()))
+                .expect("open agent definition store");
         sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
             .expect("save agent definition");
 
-        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        let mut chat = chat_with_native_stores_without_local_identity(data_dir, &provider_data);
         chat.use_injected_authoritative_agent_catalog_for_test();
         let error = chat
             .set_agent("worker-agent")
@@ -13725,22 +13828,25 @@ mod tests {
     #[test]
     fn app_chat_channel_rejects_unenforceable_agent_tool_runtime_default() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-agent-tool-runtime");
-        let data_dir = SinomoDataDir::new(&root);
+        let data_dir = SinomoDataDir::new(root.join("uninitialized-caller"));
+        let provider_data = SinomoDataDir::new(root.join("actual-native-provider"));
+        let _provider = crate::native_test_fixture::NativeCliFixture::start(&provider_data);
         let definition =
             AgentDefinition::custom("worker-agent", AgentRole::Main, "Use the worker sandbox.")
                 .with_sandbox_runtime_node_id("worker-node");
-        let definition_store = sinomo_agent::AgentDefinitionSifsStore::open(Some(data_dir.root()))
-            .expect("open agent definition store");
+        let definition_store =
+            sinomo_agent::AgentDefinitionSifsStore::open(Some(provider_data.root()))
+                .expect("open agent definition store");
         sinomo_agent::AgentDefinitionStore::save_definition(&definition_store, &definition)
             .expect("save agent definition");
 
-        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let store = SifsAgentChannelStore::open(&provider_data).expect("open channel store");
         let channel_id = SessionId::generate();
         let mut channel = AgentChannel::new_channel(channel_id.clone(), "Team channel");
         channel.ensure_user(AgentChannelUser::app_local());
         store.save_channel(&channel).expect("save channel");
 
-        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        let mut chat = chat_with_native_stores_without_local_identity(data_dir, &provider_data);
         chat.use_injected_authoritative_agent_catalog_for_test();
         chat.resume_session(&channel_id.to_string(), &[])
             .expect("resume channel");
@@ -13772,7 +13878,7 @@ mod tests {
             "adding a group participant must not rebind the outer session"
         );
 
-        let saved = SifsAgentChannelStore::open(&data_dir)
+        let saved = SifsAgentChannelStore::open(&provider_data)
             .expect("reopen channel store")
             .load_channel(&channel_id)
             .expect("load channel")

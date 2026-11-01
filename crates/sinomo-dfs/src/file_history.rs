@@ -17,6 +17,34 @@ pub(crate) fn validate_intent_publication(
         .publication
         .validate()
         .map_err(MetadataBackendError::Serde)?;
+    if let Some(condition) = intent.publication.current_precondition() {
+        if let Some(object) = intent.object_metadata.as_ref() {
+            if condition.path() != object.path {
+                return Err(MetadataBackendError::Serde("conditional intent changed its target path".into()));
+            }
+        } else if crate::intent::write_intent_status_is_active(&intent.status) {
+            return Err(MetadataBackendError::Serde("active conditional intent lost its target descriptor".into()));
+        }
+        let expected = match condition {
+            crate::DfsCurrentWritePrecondition::Scoped { target: crate::DfsWriteTargetPrecondition::Match { expected }, .. }
+                | crate::DfsCurrentWritePrecondition::OpenedScope { target: crate::DfsWriteTargetPrecondition::Match { expected }, .. }
+                | crate::DfsCurrentWritePrecondition::CompareAndSwap { expected, .. } => Some(expected),
+            _ => None,
+        };
+        if expected.is_some_and(|expected| expected.object_id != intent.object_id
+                || Some(&expected.version) != intent.base_version.as_ref())
+            || (expected.is_none() && intent.base_version.is_some())
+        {
+            return Err(MetadataBackendError::Serde("conditional intent changed its create or CAS identity".into()));
+        }
+    }
+    if let DfsWriteIntentStatus::PreconditionFailed { failure } = &intent.status {
+        failure.validate().map_err(MetadataBackendError::Serde)?;
+        if !intent.publication.current_precondition().is_some_and(|condition|
+            crate::write_precondition::failure_matches_condition(condition, failure)) {
+            return Err(MetadataBackendError::Serde("negative precondition outcome has no matching original guard".into()));
+        }
+    }
     if intent.publication.is_retained_repair()
         && (intent.status != DfsWriteIntentStatus::Committed
             || intent.operation_id.is_some()

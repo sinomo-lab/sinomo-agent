@@ -12,6 +12,13 @@ mod native_repair_authority_tests;
 #[cfg(test)]
 #[path = "placement/native_start_checkpoint_tests.rs"]
 mod native_start_checkpoint_tests;
+#[cfg(test)]
+#[path = "placement/recorded_holder_native_tests.rs"]
+mod recorded_holder_native_tests;
+
+#[cfg(test)]
+#[path = "placement/planning_route_native_tests.rs"]
+mod planning_route_native_tests;
 
 use crate::control_plane::DfsPlacementAuthorityPermit;
 use crate::distributed::explain_replicas_best_effort;
@@ -1769,10 +1776,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
             .map_err(placement_reconciliation_policy_error)?
         };
+        // The accepted job already froze candidates, telemetry and planning
+        // time. An existing committed placement also captured its holder cut;
+        // later verified copies must not rerank that same immutable obligation.
+        let intent_id = format!(
+            "placement:{}:{}:{}",
+            job.job_id, object.object_id, object.version
+        );
+        let original = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_intent(&object.object_id, &intent_id))
+            .transpose()?
+            .flatten();
+        let ranking_object = match original.as_ref() {
+            Some(record) => recorded_placement_ranking_object(object, &intent_id, record)?,
+            None => object.clone(),
+        };
         reconciliation_placement_for_object_with_resolved_policy(
             config,
             job,
-            object,
+            &ranking_object,
             pinned_node_ids,
             resolved,
         )
@@ -2326,6 +2350,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn local_placement_planning_test_point(
+        &self,
+        point: crate::runtime_host::DaemonDfsPreDispatchTestPoint<'_>,
+    ) -> Result<(), DfsError> {
+        if let Some((root, _owner)) = self.native_publication_owner_for_observation()
+            && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                &sinomo_core::local::SinomoDataDir::new(root),
+            )
+        {
+            hook(point, None, None)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn reconcile_object_placement_local(
         &mut self,
         job_id: &str,
@@ -2336,12 +2375,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replication_policy: DfsReplicationPolicy,
         desired_replica_node_ids: &[NodeId],
     ) -> Result<(), DfsError> {
+        let file_system_id = crate::sifs_file_system_id();
+        // Only this semantic local ReconcilePlacement entry borrows its
+        // receiver-validated namespace planning cut. General authority reads
+        // and repair-replacement callbacks do not inherit that operation.
+        let planning_shard = self
+            .namespace_execution
+            .context()
+            .filter(|context| context.file_system_id == file_system_id)
+            .map(|context| {
+                crate::control_plane::select_metadata_shard_config_for_path_strict_default_sifs_split(
+                    &file_system_id,
+                    &context.shards,
+                    path,
+                )
+                .map_err(DfsError::from)?
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "local placement planning context has no selected shard".into(),
+                })
+            })
+            .transpose()?;
         self.with_authoritative_placement_reconciliation(
-            &crate::sifs_file_system_id(),
+            &file_system_id,
             job_id,
             Some(path),
             1,
             |service, job, accepted_config| {
+                #[cfg(test)]
+                service.local_placement_planning_test_point(
+                    crate::runtime_host::DaemonDfsPreDispatchTestPoint::LocalPlacementAuthorityAcquired {
+                        job_id: &job.job_id,
+                        path,
+                        namespace_shards: service.namespace_execution.context()
+                            .filter(|context| context.file_system_id == file_system_id)
+                            .map(|context| context.shards.as_slice()),
+                    },
+                )?;
                 service.reconcile_object_placement_under_authority(
                     job,
                     accepted_config,
@@ -2352,6 +2421,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     replication_policy,
                     desired_replica_node_ids,
                     None,
+                    planning_shard.as_ref(),
                 )
             },
         )?;
@@ -2629,6 +2699,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             replication,
                             &placement.plan.desired_replica_nodes,
                             Some(&old_intent_id),
+                            None,
                         )?;
                         let retired = service
                             .metadata_backend
@@ -2669,6 +2740,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replication_policy: DfsReplicationPolicy,
         desired_replica_node_ids: &[NodeId],
         replaced_repair_intent: Option<&str>,
+        planning_shard: Option<&DfsMetadataShardConfig>,
     ) -> Result<(), DfsError> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         validate_replication_plan(desired_replica_node_ids, &replication_policy)?;
@@ -2697,7 +2769,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        if !self.is_local_metadata_primary_for_object(&object)? {
+        let local_primary = match planning_shard {
+            Some(shard) => {
+                shard.file_system_id == object.file_system_id
+                    && shard.primary_node_id == self.node_id
+            }
+            None => self.is_local_metadata_primary_for_object(&object)?,
+        };
+        if !local_primary {
             return Err(DfsError::Distributed {
                 message: format!(
                     "placement reconciliation for {} reached a non-primary node",
@@ -2807,7 +2886,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // no location, policy or repair-ownership mutation to publish.
             return Ok(());
         }
-        let owner_epoch = self.local_metadata_owner_epoch_for_object(&object)?;
+        let owner_epoch = match planning_shard {
+            Some(shard) => shard.epoch,
+            None => self.local_metadata_owner_epoch_for_object(&object)?,
+        };
         let mut intent = DistributedWriteIntent {
             publication: Default::default(),
             intent_id: intent_id.clone(),
@@ -2857,7 +2939,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|node_id| current.contains(*node_id))
             .cloned()
             .collect::<Vec<_>>();
-        self.put_metadata_intent_and_receipts(&intent, &content_hash, &durable_receipts)?;
+        #[cfg(test)]
+        self.local_placement_planning_test_point(
+            crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeLocalPlacementIntentPublication {
+                job_id: &job.job_id,
+                intent_id: &intent_id,
+                owner_epoch,
+            },
+        )?;
+        self.put_metadata_intent_and_receipts_with_planning_shard(
+            &intent,
+            &content_hash,
+            &durable_receipts,
+            planning_shard,
+        )?;
         #[cfg(test)]
         native_policy_tests::interrupt_after_placement_birth(self, &intent)?;
         // A placement change replaces the current repair obligation as well
@@ -3797,6 +3892,51 @@ fn reconciliation_placement_for_object_with_pins(
     )
 }
 
+// Keep the original accepted holder observation without trusting its other
+// object fields as a substitute for current namespace or policy validation.
+fn recorded_placement_ranking_object(
+    object: &DfsObjectMetadata,
+    intent_id: &str,
+    record: &crate::DfsWriteIntentRecord,
+) -> Result<DfsObjectMetadata, DfsError> {
+    let captured = record
+        .object_metadata
+        .as_ref()
+        .ok_or_else(|| DfsError::Metadata {
+            message: "committed placement lost its original holder observation".into(),
+        })?;
+    if record.status != crate::DfsWriteIntentStatus::Committed
+        || !record.publication.is_default_current()
+        || record.intent_id != intent_id
+        || record.file_system_id != object.file_system_id
+        || record.object_id != object.object_id
+        || record.target_version != object.version
+        || record.base_version.as_ref() != Some(&object.version)
+        || record.content_hash != object.content_hash
+        || record.touch_parent_on_create
+        || record.create_predecessor_object_id.is_some()
+        || record.operation_id.is_some()
+        || captured.file_system_id != object.file_system_id
+        || captured.object_id != object.object_id
+        || captured.path != object.path
+        || captured.version != object.version
+        || captured.kind != object.kind
+        || captured.policy != object.policy
+        || captured.owner_node_id != object.owner_node_id
+        || captured.content_hash != object.content_hash
+        || captured.content_size_bytes != object.content_size_bytes
+    {
+        return Err(DfsError::Metadata {
+            message: "placement ranking differs from its original committed object".into(),
+        });
+    }
+    let mut ranking_object = object.clone();
+    ranking_object
+        .current_locations
+        .clone_from(&captured.current_locations);
+    Ok(ranking_object)
+}
+
 fn reconciliation_placement_for_object_with_resolved_policy(
     config: &DfsFileSystemConfig,
     job: &DfsPlacementReconciliationJob,
@@ -4320,6 +4460,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if matches!(
             intent.state,
             DfsWriteIntentState::Rejected | DfsWriteIntentState::Aborted
+                | DfsWriteIntentState::PreconditionFailed { .. }
         ) {
             return Ok(PlacementIntentAuthority::Stale);
         }

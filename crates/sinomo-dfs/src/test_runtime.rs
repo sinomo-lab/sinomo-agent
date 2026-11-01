@@ -3858,6 +3858,32 @@ impl DfsTestRuntime {
             .ok_or_else(|| "native mounted context is absent".into())
     }
 
+    /// Negative-only hold of the SAME mounted Main scheduler admission.
+    /// No queue row, authority proof, effect, readiness bit or owner is invented.
+    pub fn hold_main_mutation_admission(&self, node: &NodeId) -> Result<impl Send + use<>, String> {
+        let context = self.component_context(node)?;
+        let owner = crate::runtime_host::retain_component_data_owner(&context)
+            .map_err(|error| error.to_string())?;
+        let scheduler = crate::runtime_host::daemon_dfs_mutation_scheduler(context.data_dir())
+            .map_err(|error| error.to_string())?;
+        let mut captured = None;
+        run_unit(Box::pin(async {
+            let admission = tokio::time::timeout(
+                sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+                scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive),
+            )
+            .await
+            .map_err(|_| "actual Main admission hold reached its existing deadline".to_string())?
+            .map_err(|error| error.to_string())?;
+            captured = Some(admission);
+            Ok(())
+        }))?;
+        Ok((
+            captured.expect("actual scheduler returned its admission"),
+            owner,
+        ))
+    }
+
     /// Observe the existing native Main report only. Captured bits and queue
     /// facts come from its normal command execution; this installs no owner,
     /// pending state, receipt, work flag or response.
@@ -4174,6 +4200,18 @@ impl DfsTestRuntime {
             .take()
             .ok_or_else(|| "normal embedded client has no control plane".into())
     }
+
+    /// The existing native KV settings producer, independent of the DFS
+    /// projection a configuration-gap control deliberately withholds.
+    pub fn configuration_publisher(&self, node: &NodeId) -> Box<dyn DfsControlPlaneKvClient> {
+        Box::new(
+            crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(
+                &ClusterPaths::new(self.data_dir(node)),
+                executor().handle(),
+            ),
+        )
+    }
+
     pub fn shared_control_plane(
         &self,
     ) -> Result<SharedDfsControlPlaneKvClient<Box<dyn DfsControlPlaneKvClient>>, String> {
@@ -5029,6 +5067,41 @@ impl DfsTestRuntime {
         checkpoints.push(checkpoint);
         records.clear();
         Ok(count)
+    }
+
+    /// Export the latest sealed observation window before fixture shutdown.
+    /// Capture and coverage remain owned by the ordinary checkpoint/close path.
+    pub fn export_latest_rpc_observation_checkpoint(
+        &self,
+        output: &std::path::Path,
+    ) -> Result<usize, String> {
+        use std::io::Write;
+        let checkpoints = self
+            .fabric
+            .observation_checkpoints
+            .lock()
+            .map_err(|_| "observation checkpoints poisoned")?;
+        let checkpoint = checkpoints
+            .last()
+            .ok_or("no sealed RPC observation window exists")?;
+        checkpoint.verify()?;
+        let bytes = std::fs::read(&checkpoint.path).map_err(|error| error.to_string())?;
+        if blake3::hash(&bytes) != checkpoint.digest {
+            return Err("sealed RPC observation window changed before export".into());
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        let exported = std::fs::read(output).map_err(|error| error.to_string())?;
+        if exported != bytes || blake3::hash(&exported) != checkpoint.digest {
+            return Err("exported RPC observation window differs from its sealed source".into());
+        }
+        Ok(checkpoint.records)
     }
 
     /// Actual adapter events in the current window. Only an explicit successful
@@ -5903,6 +5976,8 @@ struct NativeConfigurationFault {
     reached: std::sync::Condvar,
     release: tokio::sync::Semaphore,
     deny_floor: bool,
+    deny_browser_content_preflight: AtomicBool,
+    denied_browser_content_preflights: AtomicUsize,
     deny_operation_floor_key: Mutex<Option<String>>,
     denied_operation_floor_reads: AtomicUsize,
 }
@@ -5912,6 +5987,12 @@ pub struct DfsTestNativeConfigurationFault {
     fault: Arc<NativeConfigurationFault>,
 }
 impl DfsTestNativeConfigurationFault {
+    pub fn denied_browser_content_preflights(&self) -> usize {
+        self.fault
+            .denied_browser_content_preflights
+            .load(Ordering::Acquire)
+    }
+
     /// Arm only a negative read return for the exact current floor key.
     /// The caller can retain this trigger at an existing normal preparation hook.
     pub fn operation_floor_denial_trigger(&self, key: String) -> impl FnOnce() + 'static + use<> {
@@ -6055,6 +6136,21 @@ pub(crate) fn native_configuration_floor_is_denied(
     configuration_fault(authority).is_some_and(|fault| fault.deny_floor)
 }
 
+pub(crate) fn browser_content_preflight_is_denied(
+    authority: &crate::DfsMetadataAuthorityRuntime,
+) -> bool {
+    let Some(fault) = configuration_fault(authority) else {
+        return false;
+    };
+    if !fault.deny_browser_content_preflight.load(Ordering::Acquire) {
+        return false;
+    }
+    fault
+        .denied_browser_content_preflights
+        .fetch_add(1, Ordering::AcqRel);
+    true
+}
+
 impl DfsTestRuntime {
     /// Own an initially unarmed negative operation-floor read fault on this
     /// actual mounted authority. It supplies no floor, result or permission.
@@ -6092,6 +6188,20 @@ impl DfsTestRuntime {
         node: &NodeId,
     ) -> Result<DfsTestNativeConfigurationFault, String> {
         self.install_configuration_fault(node, None, true)
+    }
+
+    /// Reject only the browser's content-planning preflight. Native metadata
+    /// authority and namespace admission keep their ordinary configuration.
+    pub fn deny_browser_content_preflight(
+        &self,
+        node: &NodeId,
+    ) -> Result<DfsTestNativeConfigurationFault, String> {
+        let fault = self.install_configuration_fault(node, None, false)?;
+        fault
+            .fault
+            .deny_browser_content_preflight
+            .store(true, Ordering::Release);
+        Ok(fault)
     }
     fn install_configuration_fault(
         &self,
@@ -6140,6 +6250,8 @@ impl DfsTestRuntime {
             reached: std::sync::Condvar::new(),
             release: tokio::sync::Semaphore::new(0),
             deny_floor,
+            deny_browser_content_preflight: AtomicBool::new(false),
+            denied_browser_content_preflights: AtomicUsize::new(0),
             deny_operation_floor_key: Mutex::new(None),
             denied_operation_floor_reads: AtomicUsize::new(0),
         });

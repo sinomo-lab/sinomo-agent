@@ -34,6 +34,9 @@ use std::sync::{Arc, Mutex};
 #[path = "tests/replica_progress_boundaries.rs"]
 mod replica_progress_boundaries;
 
+#[path = "tests/maintenance_cancellation.rs"]
+mod maintenance_cancellation;
+
 #[test]
 fn daemon_dfs_peer_transport_traits_share_one_adapter() {
     let root = temp_root("daemon-dfs-shared-peer-transport");

@@ -167,7 +167,13 @@ impl RetryFixture {
                         ..
                     }
                     | DaemonDfsPreDispatchTestPoint::PublishGenerationWorkerStarted { .. }
-                    | DaemonDfsPreDispatchTestPoint::AfterReport { .. } => {}
+                    | DaemonDfsPreDispatchTestPoint::AfterReport { .. }
+                    | DaemonDfsPreDispatchTestPoint::LocalPlacementAuthorityAcquired { .. }
+                    | DaemonDfsPreDispatchTestPoint::BeforeLocalPlacementIntentPublication {
+                        ..
+                    }
+                    | DaemonDfsPreDispatchTestPoint::AfterMessageResponse { .. }
+                    | DaemonDfsPreDispatchTestPoint::BeforeMetadataEffectPrepare { .. } => {}
                     DaemonDfsPreDispatchTestPoint::ContentStoreCacheAccess
                     | DaemonDfsPreDispatchTestPoint::ExactLaneCacheAccess
                     | DaemonDfsPreDispatchTestPoint::AfterPreflightFence

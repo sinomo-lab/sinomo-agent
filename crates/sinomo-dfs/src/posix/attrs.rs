@@ -7,13 +7,78 @@
 
 use super::now_unix_nanos;
 use crate::namespace::next_version;
-use crate::posix_model::{DfsPosixError, DfsStat, Result};
+use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, Result};
+use crate::posix_object::inherit_posix_create_attrs;
+use crate::posix_path::{normalize_posix_path, parent_posix_path};
 use crate::{
     DfsMessageTransport, DfsNamespaceOperation, DfsObjectKind, DfsObjectMetadata,
     NetworkedDfsService,
 };
 
+#[cfg(test)]
+mod strict_directory_native_tests;
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Inspect an existing directory without creating it or following links.
+    pub fn posix_inspect_directory_beneath_no_links_with_attrs(
+        &mut self,
+        path: &str,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<Option<DfsStat>> {
+        let path = normalize_posix_path(path)?;
+        let stat = match self.posix_open_beneath_no_links_distributed("/", &path) {
+            Ok(stat) => stat,
+            Err(DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. }) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        validate_directory_attrs(&path, &stat, attrs)?;
+        Ok(Some(stat))
+    }
+
+    /// Create an absent directory with its final attributes. Existing entries
+    /// must already match; this never changes their owner or mode.
+    pub fn posix_ensure_directory_beneath_no_links_with_attrs(
+        &mut self,
+        path: &str,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<DfsStat> {
+        let path = normalize_posix_path(path)?;
+        let attrs = DfsPosixCreateAttrs::new(attrs.mode, attrs.uid, attrs.gid);
+        if let Some(stat) =
+            self.posix_inspect_directory_beneath_no_links_with_attrs(&path, attrs)?
+        {
+            return Ok(stat);
+        }
+        let parent = parent_posix_path(&path)
+            .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
+        self.posix_mkdir_all_beneath_no_links("/", &parent)?;
+        let opened_parent = self.posix_open_beneath_no_links_distributed("/", &parent)?;
+        if inherit_posix_create_attrs(attrs, true, opened_parent.mode, opened_parent.gid) != attrs {
+            return Err(DfsPosixError::Conflict {
+                path,
+                reason:
+                    "parent inheritance is incompatible with the required directory owner and mode"
+                        .into(),
+            });
+        }
+        let child = path.rsplit_once('/').expect("canonical absolute path").1;
+        let stat = match self.posix_mkdir_at_opened_directory_no_links_with_attrs(
+            &opened_parent,
+            child,
+            attrs,
+        ) {
+            Ok(stat) => stat,
+            Err(DfsPosixError::AlreadyExists { .. }) => {
+                self.posix_open_beneath_no_links_distributed("/", &path)?
+            }
+            Err(error) => return Err(error),
+        };
+        validate_directory_attrs(&path, &stat, attrs)?;
+        Ok(stat)
+    }
+
     pub fn posix_set_mode(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
@@ -245,4 +310,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.add_object_metadata(target.clone())?;
         self.stat_object_for_path(&target, &path)
     }
+}
+
+fn validate_directory_attrs(path: &str, stat: &DfsStat, attrs: DfsPosixCreateAttrs) -> Result<()> {
+    if stat.kind != DfsObjectKind::Directory {
+        return Err(DfsPosixError::NotDirectory { path: path.into() });
+    }
+    if stat.uid != attrs.uid || stat.gid != attrs.gid || stat.mode != attrs.mode & 0o7777 {
+        return Err(DfsPosixError::Conflict {
+            path: path.into(),
+            reason: format!(
+                "SIFS directory {path} has owner {}:{} mode {:04o}, expected {}:{} mode {:04o}",
+                stat.uid,
+                stat.gid,
+                stat.mode,
+                attrs.uid,
+                attrs.gid,
+                attrs.mode & 0o7777,
+            ),
+        });
+    }
+    Ok(())
 }

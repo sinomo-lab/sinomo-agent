@@ -57,25 +57,59 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .iter()
                 .flat_map(|effect| effect.affected_object_ids())
                 .collect::<std::collections::BTreeSet<_>>();
-            let mut objects = Vec::new();
-            let mut paths = Vec::new();
-            for id in ids {
-                let row = self
-                    .metadata_backend
-                    .as_ref()
-                    .expect("GC backend")
-                    .get_object_on_shard(&shard_id, &id)?;
-                objects.push(DfsNamespaceObjectVersionExpectation {
-                    object_id: id,
-                    expected_version: row.as_ref().map(|row| row.version.clone()),
-                });
-                if let Some(row) = row {
-                    paths.push(DfsNamespacePathOccupantExpectation {
-                        path: row.path,
-                        expected_object_id: Some(row.object_id),
-                    });
-                }
-            }
+            // Capture object and namespace identity from one exact physical
+            // native cut. A retired SourceEviction row can remember a path now
+            // occupied by a distinct tombstone or a newly created live object.
+            let (objects, paths) = if ids.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let backend = self.metadata_backend.as_mut().expect("GC backend");
+                backend.begin_consistent_read_snapshot_on_shard(&shard_id)?;
+                let expectations: Result<(Vec<_>, Vec<_>), DfsError> = (|| {
+                    let mut objects = Vec::new();
+                    let mut paths = std::collections::BTreeMap::new();
+                    for id in ids {
+                        let row = backend.get_object_on_shard(&shard_id, &id)?;
+                        objects.push(DfsNamespaceObjectVersionExpectation {
+                            object_id: id,
+                            expected_version: row.as_ref().map(|row| row.version.clone()),
+                        });
+                        if let Some(row) = row {
+                            let path = crate::namespace::metadata_path(&row.path);
+                            let occupant = backend
+                                .get_object_by_path_on_shard(&shard_id, &fs, &path)?
+                                .map(|current| current.object_id);
+                            match paths.entry(path) {
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    entry.insert(occupant);
+                                }
+                                std::collections::btree_map::Entry::Occupied(entry)
+                                    if entry.get() != &occupant =>
+                                {
+                                    return Err(DfsError::Metadata {
+                                        message: "history GC namespace identity changed within its exact read cut".into(),
+                                    });
+                                }
+                                std::collections::btree_map::Entry::Occupied(_) => {}
+                            }
+                        }
+                    }
+                    Ok((
+                        objects,
+                        paths
+                            .into_iter()
+                            .map(
+                                |(path, expected_object_id)| DfsNamespacePathOccupantExpectation {
+                                    path,
+                                    expected_object_id,
+                                },
+                            )
+                            .collect(),
+                    ))
+                })();
+                backend.end_consistent_read_snapshot_on_shard(&shard_id);
+                expectations?
+            };
             let compacted = effects
                 .iter()
                 .filter_map(|effect| match effect {
@@ -940,3 +974,7 @@ mod compacted_transfer_retirement_data_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "service_maintenance/gc_path_native_tests.rs"]
+mod gc_path_native_tests;

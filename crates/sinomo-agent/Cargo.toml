@@ -29,5 +29,9 @@ sinomo-product-profile = { path = "../sinomo-product-profile" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
+sinomo-runtime = { workspace = true, features = ["dfs-test-support"] }
 sinomo-lm = { path = "../sinomo-lm", features = ["scripted-provider"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -1516,6 +1516,43 @@ pub async fn forward_cluster_kv_authoritative_range_prefix_to_state_authority_as
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
+    forward_cluster_kv_authoritative_prefix_kind_to_state_authority_async_with_host(
+        runtime, paths, state, prefix, options, false, host,
+    )
+    .await
+}
+
+pub(crate) async fn forward_cluster_kv_authoritative_complete_range_prefix_to_state_authority_async_with_host<
+    H,
+>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    prefix: &str,
+    options: ClusterKvTxnForwardOptions,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<Vec<KvEntry>>>, NetworkError>
+where
+    H: ClusterObjectRpcAsyncHost + Send,
+{
+    forward_cluster_kv_authoritative_prefix_kind_to_state_authority_async_with_host(
+        runtime, paths, state, prefix, options, true, host,
+    )
+    .await
+}
+
+async fn forward_cluster_kv_authoritative_prefix_kind_to_state_authority_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    prefix: &str,
+    options: ClusterKvTxnForwardOptions,
+    complete: bool,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<Vec<KvEntry>>>, NetworkError>
+where
+    H: ClusterObjectRpcAsyncHost + Send,
+{
     let deadline = cluster_kv_forward_deadline(options.timeout);
     let Some((targets, preferred_authority_id)) =
         cluster_kv_forward_authority_targets_before_deadline(
@@ -1538,7 +1575,11 @@ where
             break;
         }
         let mut call = ObjectRpcCall::encode_value(
-            sinomo_kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE,
+            if complete {
+                sinomo_kv::CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE
+            } else {
+                sinomo_kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+            },
             sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
             sinomo_kv::ClusterKvAuthoritativeRangePrefixRequest {
                 prefix: prefix.to_string(),
@@ -1565,7 +1606,12 @@ where
         .await
         {
             Ok(read) => {
-                return validate_forwarded_authoritative_range_read(read, state, prefix).map(Some);
+                return if complete {
+                    validate_forwarded_authoritative_complete_range_read(read, state, prefix)
+                } else {
+                    validate_forwarded_authoritative_range_read(read, state, prefix)
+                }
+                .map(Some);
             }
             Err(error) => {
                 failures.push(format!("node {target} failed: {error}"));
@@ -1604,6 +1650,39 @@ fn validate_forwarded_authoritative_range_read(
     state: &ClusterBootstrapState,
     prefix: &str,
 ) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, NetworkError> {
+    validate_forwarded_authoritative_range_read_with_limits(
+        read,
+        state,
+        prefix,
+        sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+    )
+}
+
+pub(crate) fn validate_forwarded_authoritative_complete_range_read(
+    read: KvAuthoritativeRead<Vec<KvEntry>>,
+    state: &ClusterBootstrapState,
+    prefix: &str,
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, NetworkError> {
+    let read = validate_forwarded_authoritative_range_read_with_limits(
+        read,
+        state,
+        prefix,
+        sinomo_kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES,
+        sinomo_kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+    )?;
+    sinomo_kv::validate_cluster_kv_authoritative_complete_range_prefix_read(prefix, &read)
+        .map_err(kv_err)?;
+    Ok(read)
+}
+
+fn validate_forwarded_authoritative_range_read_with_limits(
+    read: KvAuthoritativeRead<Vec<KvEntry>>,
+    state: &ClusterBootstrapState,
+    prefix: &str,
+    max_entries: usize,
+    max_payload_bytes: usize,
+) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, NetworkError> {
     sinomo_kv::validate_cluster_kv_current_term_authority_proof(&read.authority).map_err(kv_err)?;
     let voter_count = sinomo_kv::cluster_kv_raft_voter_ids(state)
         .map_err(kv_err)?
@@ -1633,12 +1712,12 @@ fn validate_forwarded_authoritative_range_read(
         state,
         "authoritative prefix proof",
     )?;
-    if read.value.len() > sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+    if read.value.len() > max_entries {
         return Err(NetworkError::ClusterReadOnly {
             detail: format!(
                 "authoritative prefix response returned {} entries, exceeding the {} entry limit",
                 read.value.len(),
-                sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES
+                max_entries
             ),
         });
     }
@@ -1649,11 +1728,11 @@ fn validate_forwarded_authoritative_range_read(
         payload_bytes = payload_bytes
             .saturating_add(entry.key.len())
             .saturating_add(entry.value.len());
-        if payload_bytes > sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES {
+        if payload_bytes > max_payload_bytes {
             return Err(NetworkError::ClusterReadOnly {
                 detail: format!(
                     "authoritative prefix response exceeded the {} byte payload limit",
-                    sinomo_kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES
+                    max_payload_bytes
                 ),
             });
         }

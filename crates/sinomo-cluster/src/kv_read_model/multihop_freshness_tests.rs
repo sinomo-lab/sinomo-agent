@@ -6,9 +6,9 @@ use crate::kv_local_store::ClusterKvPathsExt;
 use sinomo_kv::InProcessKvStore;
 use sinomo_network::{
     ClusterDirectory as _, ClusterObjectRpcAsyncHost, ClusterObjectRpcClient,
-    ClusterObjectRpcOptions, ObjectRpcCall,
+    ClusterObjectRpcOptions, ObjectRpcCall, RoutedConnector as _,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct ReadOnlyHost;
 impl ClusterObjectRpcAsyncHost for ReadOnlyHost {}
@@ -28,6 +28,55 @@ enum SourceCase {
     LiveFailureCountReset,
     SemanticChange,
     Deadline,
+    DegradedShortcut,
+    StalledLiveShortcut,
+    StalledSourceHint,
+    HealthyNoSources,
+    HealthyUnrelatedSource,
+    HealthyFailedSource,
+    HealthySlowSource,
+}
+impl SourceCase {
+    fn healthy_guard(self) -> bool {
+        matches!(self, Self::HealthyNoSources | Self::HealthyUnrelatedSource
+            | Self::HealthyFailedSource | Self::HealthySlowSource)
+    }
+    fn calibrated(self) -> bool {
+        matches!(self, Self::DegradedShortcut | Self::StalledLiveShortcut | Self::StalledSourceHint)
+    }
+    fn stalled(self) -> bool {
+        matches!(self, Self::StalledLiveShortcut | Self::StalledSourceHint)
+    }
+}
+
+// This test-only decorator preserves actual KV routing snapshots. An
+// advisory failure supplies no route, membership, ACK or effect permission.
+struct AdvisoryFailureDirectory {
+    inner: Arc<dyn sinomo_network::ClusterDirectory>,
+    started: Arc<AtomicBool>,
+    failures: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+impl sinomo_network::ClusterDirectory for AdvisoryFailureDirectory {
+    fn members(&self) -> Result<Vec<ClusterMemberRecord>, sinomo_network::NetworkError> { self.inner.members() }
+    fn endpoints(&self) -> Result<Vec<sinomo_base::ClusterEndpointRecord>, sinomo_network::NetworkError> { self.inner.endpoints() }
+    fn node_statuses(&self) -> Result<std::collections::BTreeMap<NodeId, sinomo_base::ClusterNodeStatusRecord>, sinomo_network::NetworkError> { self.inner.node_statuses() }
+    fn connectivity_records(&self) -> Result<Vec<sinomo_network::ClusterConnectivityRecord>, sinomo_network::NetworkError> { self.inner.connectivity_records() }
+    fn connectivity_freshness_baseline(&self) -> Result<sinomo_network::DirectoryConnectivityBaseline, sinomo_network::NetworkError> {
+        if self.started.load(Ordering::SeqCst) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+            self.release.store(true, Ordering::SeqCst);
+            self.notify.notify_one();
+            return Err(sinomo_network::NetworkError::Directory { detail: "owned test advisory source unavailable".into() });
+        }
+        self.inner.connectivity_freshness_baseline()
+    }
+    fn version(&self) -> Result<sinomo_network::DirectoryVersion, sinomo_network::NetworkError> { self.inner.version() }
+    fn routing_version(&self) -> Result<sinomo_network::DirectoryVersion, sinomo_network::NetworkError> { self.inner.routing_version() }
+    fn records_snapshot(&self) -> Result<sinomo_network::DirectoryRecordsSnapshot, sinomo_network::NetworkError> { self.inner.records_snapshot() }
+    fn routing_records_snapshot(&self) -> Result<sinomo_network::DirectoryRoutingRecordsSnapshot, sinomo_network::NetworkError> { self.inner.routing_records_snapshot() }
+    fn snapshot(&self) -> Result<sinomo_network::DirectorySnapshot, sinomo_network::NetworkError> { self.inner.snapshot() }
 }
 
 async fn multihop_source_scenario(case: SourceCase) {
@@ -220,6 +269,52 @@ async fn multihop_source_scenario(case: SourceCase) {
         .unwrap();
         live.push(observation);
     }
+    if case.calibrated() {
+        // Controlled routing DATA: the refusal/live-stall cases begin with a
+        // live A->D degraded shortcut. The initial-source-hint case stores only
+        // an expired B->D semantic baseline; B's real source later renews it.
+        // The independently calibrated healthy A->B->C->D route is discoverable.
+        let mut shortcut_owner = state.clone();
+        if case == SourceCase::StalledSourceHint {
+            shortcut_owner.local_node_id = nodes[1].clone();
+        }
+        let shortcut = sinomo_network::cluster_connectivity_record(
+            &shortcut_owner,
+            &endpoints[2],
+            sinomo_network::ClusterConnectivityState::Degraded,
+            None,
+            2,
+            None,
+            None,
+            now,
+            sinomo_network::CLUSTER_CONNECTIVITY_TTL_SECONDS,
+        );
+        let mut stored_shortcut = shortcut.clone();
+        if case == SourceCase::StalledSourceHint {
+            // Only B's actual authenticated source can supply the renewal;
+            // the initial current directory must not already claim A -> D.
+            stored_shortcut.observed_at -= time::Duration::hours(1);
+            stored_shortcut.expires_at -= time::Duration::hours(1);
+        }
+        kv.put_serde(
+            cluster_connectivity_key(
+                &stored_shortcut.source_node_id,
+                &stored_shortcut.target_node_id,
+                &stored_shortcut.endpoint_id,
+            ),
+            &stored_shortcut,
+            None,
+        )
+        .unwrap();
+        live.push(shortcut);
+    }
+    if case.healthy_guard() {
+        let healthy = sinomo_network::cluster_connectivity_record(&state, &endpoints[2],
+            sinomo_network::ClusterConnectivityState::Healthy, None, 0, None, None, now, 900);
+        kv.put_serde(cluster_connectivity_key(&healthy.source_node_id, &healthy.target_node_id,
+            &healthy.endpoint_id), &healthy, None).unwrap();
+        live.push(healthy);
+    }
     for endpoint in &extra_endpoints {
         kv.put_serde(
             cluster_endpoint_key(&endpoint.node_id, endpoint),
@@ -282,10 +377,17 @@ async fn multihop_source_scenario(case: SourceCase) {
             SourceCase::PartiallyLiveMain
                 | SourceCase::ColdSourceProcess
                 | SourceCase::ColdRoutedSourceProcess
+                | SourceCase::DegradedShortcut
+                | SourceCase::StalledLiveShortcut
+                | SourceCase::HealthyNoSources | SourceCase::HealthyUnrelatedSource
+                | SourceCase::HealthyFailedSource | SourceCase::HealthySlowSource
         ))
     );
     let baseline = observed.connectivity_freshness_baseline().unwrap();
-    assert_eq!(baseline.records.len(), 3 + extra_endpoints.len());
+    assert_eq!(
+        baseline.records.len(),
+        3 + extra_endpoints.len() + usize::from(case.calibrated() || case.healthy_guard())
+    );
     for record in &live {
         assert!(
             baseline
@@ -332,6 +434,22 @@ async fn multihop_source_scenario(case: SourceCase) {
     let reads = Arc::new((0..4).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
     let effects = Arc::new(AtomicUsize::new(0));
     let rejected_direct = Arc::new(AtomicUsize::new(0));
+    let shortcut_refusals = Arc::new(AtomicUsize::new(0));
+    let stalled_handshakes = Arc::new(AtomicUsize::new(0));
+    let drained_stalls = Arc::new(AtomicUsize::new(0));
+    let stalled_read_errors = Arc::new(AtomicUsize::new(0));
+    let stalled_handshake_bytes = Arc::new(AtomicUsize::new(0));
+    let original_started = Arc::new(AtomicBool::new(false));
+    let baseline_failures = Arc::new(AtomicUsize::new(0));
+    let guard_release = Arc::new(AtomicBool::new(false));
+    let guard_notify = Arc::new(tokio::sync::Notify::new());
+    let guard_held = Arc::new(AtomicUsize::new(0));
+    let first_binding = Arc::new(std::sync::Mutex::new(None::<[u8; 32]>));
+    let original_binding = Arc::new(std::sync::Mutex::new(None::<[u8; 32]>));
+    let hot_binding = Arc::new(std::sync::Mutex::new(None::<[u8; 32]>));
+    let failed_source_calls = Arc::new(AtomicUsize::new(0));
+    let slow_source_calls = Arc::new(AtomicUsize::new(0));
+    let first_bridge_read_refusals = Arc::new(AtomicUsize::new(usize::MAX));
     let mut servers = tokio::task::JoinSet::new();
     for (i, listener, cold_source_process) in listeners {
         let node = nodes[i].clone();
@@ -353,6 +471,22 @@ async fn multihop_source_scenario(case: SourceCase) {
         let reads = reads.clone();
         let effects = effects.clone();
         let rejected_direct = rejected_direct.clone();
+        let shortcut_refusals = shortcut_refusals.clone();
+        let original_started = original_started.clone();
+        let first_bridge_read_refusals = first_bridge_read_refusals.clone();
+        let stalled_handshakes = stalled_handshakes.clone();
+        let drained_stalls = drained_stalls.clone();
+        let stalled_read_errors = stalled_read_errors.clone();
+        let stalled_handshake_bytes = stalled_handshake_bytes.clone();
+        let stalled_source = nodes[if case == SourceCase::StalledSourceHint { 1 } else { 0 }].clone();
+        let guard_release = guard_release.clone();
+        let guard_notify = guard_notify.clone();
+        let guard_held = guard_held.clone();
+        let first_binding = first_binding.clone();
+        let original_binding = original_binding.clone();
+        let hot_binding = hot_binding.clone();
+        let failed_source_calls = failed_source_calls.clone();
+        let slow_source_calls = slow_source_calls.clone();
         let identity = Arc::new(
             sinomo_network::DaemonRoutedSessionIdentity::new(node.clone(), data[i].clone())
                 .unwrap(),
@@ -382,6 +516,22 @@ async fn multihop_source_scenario(case: SourceCase) {
                 let reads = reads.clone();
                 let effects = effects.clone();
                 let rejected_direct = rejected_direct.clone();
+                let shortcut_refusals = shortcut_refusals.clone();
+                let original_started = original_started.clone();
+                let first_bridge_read_refusals = first_bridge_read_refusals.clone();
+                let stalled_handshakes = stalled_handshakes.clone();
+                let drained_stalls = drained_stalls.clone();
+                let stalled_read_errors = stalled_read_errors.clone();
+                let stalled_handshake_bytes = stalled_handshake_bytes.clone();
+                let stalled_source = stalled_source.clone();
+                let guard_release = guard_release.clone();
+                let guard_notify = guard_notify.clone();
+                let guard_held = guard_held.clone();
+                let first_binding = first_binding.clone();
+                let original_binding = original_binding.clone();
+                let hot_binding = hot_binding.clone();
+                let failed_source_calls = failed_source_calls.clone();
+                let slow_source_calls = slow_source_calls.clone();
                 connections.spawn(async move {
                     let metadata =
                         sinomo_network::read_authenticated_transport_prelude(&mut stream).await?;
@@ -391,9 +541,53 @@ async fn multihop_source_scenario(case: SourceCase) {
                         &directory,
                         identity.as_ref(),
                     )?;
+                    let direct_binding = metadata.channel_binding;
+                    if case.healthy_guard() && i == 3 && source == caller
+                        && original_started.load(Ordering::SeqCst)
+                        && guard_held.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // Hold the real authenticated physical socket before
+                        // NORMAL routed acceptance. Keep its session bytes intact.
+                        // The Original later must prove the SAME prelude binding.
+                        *first_binding.lock().unwrap() = Some(direct_binding);
+                        loop {
+                            let notified = guard_notify.notified();
+                            if guard_release.load(Ordering::SeqCst) { break; }
+                            notified.await;
+                        }
+                    }
                     // Real authentication precedes adjacency rejection. C and D cannot
                     // accept the caller's direct link, only their previous bridge.
-                    if source != adjacent {
+                    if source != adjacent
+                        && !(case.healthy_guard() && i == 3 && source == caller) {
+                        if case.stalled() && i == 3 && source == stalled_source
+                            && original_started.load(Ordering::SeqCst) {
+                            // Hold the ACTUAL authenticated adjacent TCP stream
+                            // before routed acceptance. Drain real incoming bytes
+                            // without inventing any successful ACK/frame/result.
+                            // EOF/error is diagnostic only, not local cancellation proof.
+                            stalled_handshakes.fetch_add(1, Ordering::SeqCst);
+                            use tokio::io::AsyncReadExt as _;
+                            let mut discard = [0u8; 1024];
+                            loop {
+                                match stream.read(&mut discard).await {
+                                    Ok(0) => {
+                                        drained_stalls.fetch_add(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        stalled_read_errors.fetch_add(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    Ok(count) => { stalled_handshake_bytes.fetch_add(count, Ordering::SeqCst); }
+                                }
+                            }
+                            return Ok::<(), sinomo_network::NetworkError>(());
+                        }
+                        if case == SourceCase::DegradedShortcut && i == 3 && source == caller {
+                            // This count follows real native prelude verification.
+                            // No successful transport/session/application reply is fabricated.
+                            shortcut_refusals.fetch_add(1, Ordering::SeqCst);
+                        }
                         rejected_direct.fetch_add(1, Ordering::SeqCst);
                         return Ok::<(), sinomo_network::NetworkError>(());
                     }
@@ -422,7 +616,12 @@ async fn multihop_source_scenario(case: SourceCase) {
                     {
                         let mut acceptor = sinomo_network::accept_routed_stream_carrier(carrier);
                         while let Some(stream) = acceptor.accept().await? {
-                            assert_eq!(stream.peer_node_id, caller);
+                            if case.calibrated() && !original_started.load(Ordering::SeqCst) {
+                                assert!(stream.peer_node_id == caller || stream.peer_node_id == adjacent,
+                                    "calibration still requires an actual admitted caller or adjacent signer");
+                            } else {
+                                assert_eq!(stream.peer_node_id, caller);
+                            }
                             let peer = sinomo_network::RpcPeerContext::authenticated(
                                 stream.local_node_id.clone(),
                                 stream.peer_node_id.clone(),
@@ -435,6 +634,16 @@ async fn multihop_source_scenario(case: SourceCase) {
 
                             let reads = reads.clone();
                             let effects = effects.clone();
+                            let shortcut_refusals = shortcut_refusals.clone();
+                            let original_started = original_started.clone();
+                            let first_bridge_read_refusals = first_bridge_read_refusals.clone();
+                            let stalled_handshakes = stalled_handshakes.clone();
+                            let guard_release = guard_release.clone();
+                            let guard_notify = guard_notify.clone();
+                            let original_binding = original_binding.clone();
+                            let hot_binding = hot_binding.clone();
+                            let failed_source_calls = failed_source_calls.clone();
+                            let slow_source_calls = slow_source_calls.clone();
                             sinomo_network::serve_service_rpc_peer_stream(
                                 stream,
                                 &peer,
@@ -446,13 +655,62 @@ async fn multihop_source_scenario(case: SourceCase) {
 
                                     let reads = reads.clone();
                                     let effects = effects.clone();
+                                    let shortcut_refusals = shortcut_refusals.clone();
+                                    let original_started = original_started.clone();
+                                    let first_bridge_read_refusals = first_bridge_read_refusals.clone();
+                                    let stalled_handshakes = stalled_handshakes.clone();
+                                    let guard_release = guard_release.clone();
+                                    let guard_notify = guard_notify.clone();
+                                    let original_binding = original_binding.clone();
+                                    let hot_binding = hot_binding.clone();
+                                    let failed_source_calls = failed_source_calls.clone();
+                                    let slow_source_calls = slow_source_calls.clone();
                                     async move {
                                         let route = request.request.route.clone();
                                         if route
                                             == sinomo_network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE
                                         {
+                                            let guard_hot_read = request.request.metadata.get("guard-hot-read").map(String::as_str)
+                                                == Some("healthy-first-carrier");
                                             let _: () = request.decode_body().await?;
                                             reads[i].fetch_add(1, Ordering::SeqCst);
+                                            if guard_hot_read {
+                                                assert_eq!(case, SourceCase::HealthyNoSources);
+                                                assert_eq!(i, 3);
+                                                *hot_binding.lock().unwrap() = Some(direct_binding);
+                                            }
+                                            if original_started.load(Ordering::SeqCst) {
+                                                if case == SourceCase::HealthyFailedSource && i == 1 {
+                                                    failed_source_calls.fetch_add(1, Ordering::SeqCst);
+                                                }
+                                                if case == SourceCase::HealthySlowSource && i == 1 {
+                                                    slow_source_calls.fetch_add(1, Ordering::SeqCst);
+                                                }
+                                                if (case == SourceCase::HealthyUnrelatedSource && i == 2)
+                                                    || (matches!(case, SourceCase::HealthyFailedSource | SourceCase::HealthySlowSource) && i == 1) {
+                                                    // Actual C reachability over B requires accepted
+                                                    // B source progress, while preferred A-D is unchanged.
+                                                    guard_release.store(true, Ordering::SeqCst);
+                                                    guard_notify.notify_one();
+                                                }
+                                                if case == SourceCase::HealthyFailedSource && i == 1 {
+                                                    return Err(sinomo_network::NetworkError::Io {
+                                                        operation: "owned test source response failure".into(),
+                                                        detail: "actual request decoded before response failure".into(),
+                                                    });
+                                                }
+                                                if case == SourceCase::HealthySlowSource && i == 1 {
+                                                    std::future::pending::<()>().await;
+                                                }
+                                            }
+                                            if case.calibrated() && i == 2
+                                                && original_started.load(Ordering::SeqCst) {
+                                                let _ = first_bridge_read_refusals.compare_exchange(
+                                                    usize::MAX, if case.stalled() { stalled_handshakes.load(Ordering::SeqCst) }
+                                                        else { shortcut_refusals.load(Ordering::SeqCst) },
+                                                    Ordering::SeqCst, Ordering::SeqCst,
+                                                );
+                                            }
                                             if i == 2 && case == SourceCase::SemanticChange {
                                                 crate::write_cluster_kv_snapshot(
                                                     &server_paths,
@@ -483,6 +741,9 @@ async fn multihop_source_scenario(case: SourceCase) {
                                                 request.decode_body().await?;
                                             assert_eq!(body.id, "original-multihop");
                                             assert_eq!(body.bytes, vec![0x71; 65579]);
+                                            if case.healthy_guard() {
+                                                *original_binding.lock().unwrap() = Some(direct_binding);
+                                            }
                                             assert_eq!(effects.fetch_add(1, Ordering::SeqCst), 0);
                                             sinomo_network::ObjectRpcOutgoingResponse::encode_value(
                                                 route,
@@ -501,7 +762,93 @@ async fn multihop_source_scenario(case: SourceCase) {
             }
         });
     }
+    // Calibration uses actual native carrier/auth/RPC owners on this SAME
+    // fixture and an explicitly supplied complete routing DATA graph. Three
+    // direct endpoint RPCs prove each adjacent source can serve real data;
+    // one nonpooled full-chain connect proves the actual relay/accept path.
+    // Direct-endpoint pool scopes differ from the Original fenced scope, and
+    // the end-to-end connector never enters the object-RPC pool. No business
+    // call, KV/DFS effect authority, or successful native ACK is fabricated.
+    let calibration_started_at = std::time::Instant::now();
+    let calibration = if case.calibrated() {
+        async {
+            let mut facts = Vec::new();
+            for index in 1usize..=3 {
+                let one = async {
+                    let actor = index - 1;
+                    let actor_paths = ClusterPaths::new(&data[actor]);
+                    let mut actor_state = state.clone();
+                    actor_state.local_node_id = nodes[actor].clone();
+                    let mut host = ReadOnlyHost;
+                    let mut client = ClusterObjectRpcClient::routed(&mut host, &actor_paths);
+                    let response = client.call_endpoint(&actor_state, &endpoints[index-1],
+                        ObjectRpcCall::encode_value(
+                            sinomo_network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+                            sinomo_network::CLUSTER_NETWORK_RPC_CATEGORY, (),
+                        ).map_err(|e|e.to_string())?,
+                        ClusterObjectRpcOptions::default().with_overall_timeout(
+                            sinomo_network::DEFAULT_NETWORK_TIMEOUT),
+                    ).await.map_err(|e|e.to_string())?;
+                    let payload = response.decode_body::<Vec<sinomo_network::ClusterConnectivityRecord>>()
+                        .await.map_err(|e|e.to_string())?;
+                    if index == 2 && !payload.iter().any(|r|
+                        r.source_node_id == nodes[2] && r.target_node_id == nodes[3]
+                            && r.state == sinomo_network::ClusterConnectivityState::Healthy
+                            && r.expires_at > OffsetDateTime::now_utc()) {
+                        return Err("C's actual authenticated source endpoint did not serve its controlled live edge".into());
+                    }
+                    Ok::<_,String>(serde_json::json!({"actual_direct_source":nodes[actor],
+                        "actual_direct_target":nodes[index],"actual_endpoint":endpoints[index-1],
+                        "actual_served_routing_data":payload}))
+                };
+                facts.push(tokio::time::timeout(sinomo_network::DEFAULT_NETWORK_TIMEOUT, one)
+                    .await.map_err(|e|format!("calibration original5s action budget expired: {e}"))??);
+            }
+            let full_chain = async {
+                let identity = Arc::new(sinomo_network::DaemonRoutedSessionIdentity::new(
+                    nodes[0].clone(), data[0].clone()).map_err(|e|e.to_string())?);
+                let provider = Arc::new(sinomo_network::ClusterLinkProvider::new(
+                    nodes[0].clone(), identity.clone(),
+                    sinomo_network::NetworkHealthPolicy::default()).map_err(|e|e.to_string())?);
+                let tracker = Arc::new(sinomo_network::ConnectivityTracker::new(live_snapshot.clone()));
+                let connector = sinomo_network::MultiHopRoutedConnector::from_snapshot(
+                    nodes[0].clone(), directory.clone(), tracker.clone(), tracker, provider, identity,
+                ).map_err(|e|e.to_string())?;
+                let stream = connector.connect(nodes[3].clone(),
+                    sinomo_network::ConnectOptions {
+                        timeout: sinomo_network::DEFAULT_NETWORK_TIMEOUT,
+                        ..Default::default()
+                    }).await.map_err(|e|e.to_string())?;
+                let actual_path = stream.route_trace.nodes.clone();
+                if actual_path != nodes {
+                    return Err(format!("calibration did not use the real healthy bridge chain: {actual_path:?}"));
+                }
+                drop(stream);
+                Ok::<_,String>(serde_json::json!({"actual_nonpooled_native_route":actual_path}))
+            };
+            facts.push(tokio::time::timeout(sinomo_network::DEFAULT_NETWORK_TIMEOUT, full_chain)
+                .await.map_err(|e|format!("calibration original5s action budget expired: {e}"))??);
+            Ok::<_,String>(facts)
+        }.await
+    } else {
+        Ok(Vec::new())
+    };
+    let calibration_elapsed = calibration_started_at.elapsed();
+    let reads_before_original = reads
+        .iter()
+        .map(|n| n.load(Ordering::SeqCst))
+        .collect::<Vec<_>>();
+    let refusals_before_original = shortcut_refusals.load(Ordering::SeqCst);
     let mut host = ReadOnlyHost;
+    // Keep the existing immutable fenced routing fixture. A Dynamic factory
+    // setter is process-global with no scoped restore; do not pretend that
+    // the existing module registry mutex isolates every directory consumer.
+    let observed: Arc<dyn sinomo_network::ClusterDirectory> = if case == SourceCase::HealthyNoSources {
+        Arc::new(AdvisoryFailureDirectory {
+            inner: observed, started: original_started.clone(), failures: baseline_failures.clone(),
+            release: guard_release.clone(), notify: guard_notify.clone(),
+        })
+    } else { observed };
     let mut client = ClusterObjectRpcClient::routed_from_fenced_bootstrap_state_with_connectivity(
         &mut host, &paths, &state, observed,
     )
@@ -520,16 +867,94 @@ async fn multihop_source_scenario(case: SourceCase) {
         .insert("operation-id".into(), "original-multihop".into());
     let mut options =
         ClusterObjectRpcOptions::default().with_overall_timeout(std::time::Duration::from_secs(5));
-    if case == SourceCase::PartiallyLiveMain {
+    if matches!(
+        case,
+        SourceCase::PartiallyLiveMain | SourceCase::DegradedShortcut
+            | SourceCase::StalledLiveShortcut | SourceCase::StalledSourceHint
+            | SourceCase::HealthyNoSources | SourceCase::HealthyUnrelatedSource
+            | SourceCase::HealthyFailedSource | SourceCase::HealthySlowSource
+    ) {
         options = options.with_destination_process_affinity(
             sinomo_network::DestinationProcessAffinity::MainDaemon,
         );
     }
-    let result = client.call_target(&state, &nodes[3], call, options).await;
-    let response = match result {
-        Ok(response) => response.decode_body::<String>().await,
-        Err(error) => Err(error),
+    let original_started_at = std::time::Instant::now();
+    let response = if calibration.is_ok() {
+        original_started.store(true, Ordering::SeqCst);
+        Some(
+            match client.call_target(&state, &nodes[3], call, options).await {
+                Ok(response) => response.decode_body::<String>().await,
+                Err(error) => Err(error),
+            },
+        )
+    } else {
+        None
     };
+    let original_elapsed = original_started_at.elapsed();
+    let reads_before_hot = reads.iter().map(|n| n.load(Ordering::SeqCst)).collect::<Vec<_>>();
+    let baseline_before_hot = baseline_failures.load(Ordering::SeqCst);
+    let hot_response = if case == SourceCase::HealthyNoSources
+        && response.as_ref().is_some_and(|r| r.is_ok()) {
+        let mut hot_call = ObjectRpcCall::encode_value(
+            sinomo_network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+            sinomo_network::CLUSTER_NETWORK_RPC_CATEGORY, ()).unwrap();
+        // Harmless test DATA marks only this separate read-only call, never
+        // changes the Original body/ID or grants a carrier/effect permission.
+        hot_call.request.metadata.insert("guard-hot-read".into(), "healthy-first-carrier".into());
+        Some(match client.call_target(&state, &nodes[3], hot_call, options).await {
+            Ok(response) => response.decode_body::<Vec<sinomo_network::ClusterConnectivityRecord>>().await,
+            Err(error) => Err(error),
+        })
+    } else { None };
+    if case.healthy_guard() {
+        let facts = serde_json::json!({
+            "qualification":"controlled DATA plus real TCP/auth/session/relay/RPC; no Dynamic Main/Raft/DFS proof",
+            "case":format!("{case:?}"),"actual_original_response":format!("{response:#?}"),
+            "original_elapsed_us":original_elapsed.as_micros(),"original_budget_ms":5000,
+            "initial_physical_prelude_binding":*first_binding.lock().unwrap(),
+            "actual_original_physical_prelude_binding":*original_binding.lock().unwrap(),
+            "actual_hot_read_physical_prelude_binding":*hot_binding.lock().unwrap(),
+            "binding_limit":"Direct source D can create extra A-D sockets. Original must equal first held socket; otherwise the prerequisite is unqualified.",
+            "reads_before_original":reads_before_original,"reads_before_hot":reads_before_hot,
+            "reads_after_hot":reads.iter().map(|n| n.load(Ordering::SeqCst)).collect::<Vec<_>>(),
+            "baseline_fault_hits":baseline_failures.load(Ordering::SeqCst),"baseline_before_hot":baseline_before_hot,
+            "hot_response":format!("{hot_response:#?}"),"failed_source_calls":failed_source_calls.load(Ordering::SeqCst),
+            "slow_source_calls":slow_source_calls.load(Ordering::SeqCst),"single_original_effects":effects.load(Ordering::SeqCst),
+            "candidate_cap":sinomo_network::MAX_ROUTE_CANDIDATES,
+            "no_remote_eof_or_cancellation_inference":true,
+        });
+        std::fs::write(data[0].root().join("healthy-first-carrier-guard.json"),
+            serde_json::to_vec_pretty(&facts).unwrap()).unwrap();
+    }
+    if case.stalled() {
+        // Capture actual remote read outcomes only. A relay may retain its
+        // downstream handshake until the original wire deadline, so remote
+        // EOF is not a proof of local losing-probe cancellation.
+        let facts = serde_json::json!({
+            "qualification":"controlled routing DATA + real native TCP/auth/session/relay/RPC; FencedBootstrap shared scheduling only; no Dynamic Main/Raft/DFS publication or exactC18 RAM graph proof",
+            "case":format!("{case:?}"),"route_identity":"FencedBootstrap",
+            "calibration":calibration,"calibration_elapsed_us":calibration_elapsed.as_micros(),
+            "reads_before_original":reads_before_original,
+            "reads_after_original":reads.iter().map(|n|n.load(Ordering::SeqCst)).collect::<Vec<_>>(),
+            "actual_authenticated_stalled_streams":stalled_handshakes.load(Ordering::SeqCst),
+            "actual_stalled_stream_eof_count":drained_stalls.load(Ordering::SeqCst),
+            "actual_stalled_stream_read_errors":stalled_read_errors.load(Ordering::SeqCst),
+            "actual_stalled_session_input_bytes":stalled_handshake_bytes.load(Ordering::SeqCst),
+            "remote_read_outcomes_are_not_local_cancellation_proof":true,
+            "new_success_may_preempt_stall":"A newly discovered healthy route may win before a losing probe reaches remote authentication. That is valid, not proof that the old failed carrier never existed.",
+            "first_C_read_stalled_stream_count":first_bridge_read_refusals.load(Ordering::SeqCst),
+            "original_elapsed_us":original_elapsed.as_micros(),
+            "remaining_original_budget_us":sinomo_network::DEFAULT_NETWORK_TIMEOUT.saturating_sub(original_elapsed).as_micros(),
+            "actual_original_response":format!("{response:#?}"),"actual_single_service_effects":effects.load(Ordering::SeqCst),
+            "candidate_cap":sinomo_network::MAX_ROUTE_CANDIDATES,
+            "search_bound_qualification":"production routing.rs unmodified, existing4096 bound; not a measured search-state counter",
+            "original_budget_ms":sinomo_network::DEFAULT_NETWORK_TIMEOUT.as_millis(),
+            "native_semantic_baseline":baseline.records,
+            "stall_origin_limit":"In live-shortcut case a concurrent direct source read can share A-to-D transport identity; old zero source deltas disambiguate the original target dial. Do not call every new stalled connection an original target probe.",
+        });
+        std::fs::write(data[0].root().join("stalled-first-carrier-before-teardown.json"),
+            serde_json::to_vec_pretty(&facts).unwrap()).unwrap();
+    }
     // Cleanup also runs on the expected failed-before result.
     for scope in
         sinomo_network::cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&state)
@@ -586,13 +1011,119 @@ async fn multihop_source_scenario(case: SourceCase) {
         effects.load(Ordering::SeqCst),
         rejected_direct.load(Ordering::SeqCst)
     );
+    if case == SourceCase::DegradedShortcut {
+        let facts = serde_json::json!({
+            "qualification":"controlled routing DATA; genuine native TCP/prelude/session/relay/RPC. No Main/Raft/DFS publication proof; no attribution to C17a RAM",
+            "calibration":calibration,"reads_before_original":reads_before_original,
+            "reads_after_original":reads.iter().map(|n|n.load(Ordering::SeqCst)).collect::<Vec<_>>(),
+            "shortcut_refusals_before_original":refusals_before_original,
+            "shortcut_refusals_after_original":shortcut_refusals.load(Ordering::SeqCst),
+            "first_poststart_C_source_read_refusal_count":first_bridge_read_refusals.load(Ordering::SeqCst),
+            "original_elapsed_us":original_elapsed.as_micros(),
+            "calibration_elapsed_us":calibration_elapsed.as_micros(),
+            "remaining_original_budget_us":sinomo_network::DEFAULT_NETWORK_TIMEOUT.saturating_sub(original_elapsed).as_micros(),
+            "actual_original_response":format!("{response:#?}"),
+            "actual_test_service_effect_count":effects.load(Ordering::SeqCst),
+            "native_semantic_baseline":baseline.records,
+            "candidate_cap":sinomo_network::MAX_ROUTE_CANDIDATES,"original_budget_ms":sinomo_network::DEFAULT_NETWORK_TIMEOUT.as_millis(),
+        });
+        std::fs::write(
+            data[0]
+                .root()
+                .join("degraded-shortcut-source-discovery.json"),
+            serde_json::to_vec_pretty(&facts).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            calibration.is_ok(),
+            "SETUP UNREACHED: actual same-fixture healthy bridge/source calibration failed: {calibration:?}"
+        );
+        assert_eq!(
+            refusals_before_original, 0,
+            "calibration must not consume the shortcut refusal premise"
+        );
+        assert!(
+            shortcut_refusals.load(Ordering::SeqCst) > refusals_before_original,
+            "UNREACHED: the Original must genuinely attempt/refuse the degraded shortcut before source continuation"
+        );
+        assert!(
+            original_elapsed < sinomo_network::DEFAULT_NETWORK_TIMEOUT,
+            "UNREACHED: actual refusal exhausted the unchanged Original5s budget"
+        );
+        if response.as_ref().unwrap().is_err() {
+            assert!(
+                sinomo_network::DEFAULT_NETWORK_TIMEOUT.saturating_sub(original_elapsed)
+                    > calibration_elapsed,
+                "UNREACHED: refusal did not leave even the measured same-fixture calibration duration within the Original budget"
+            );
+            assert_eq!(
+                reads[2].load(Ordering::SeqCst),
+                reads_before_original[2],
+                "UNREACHED: failure occurred after C was consulted; not the skipped-source gap"
+            );
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(reads[2].load(Ordering::SeqCst) > reads_before_original[2]);
+            assert!(
+                first_bridge_read_refusals.load(Ordering::SeqCst) > 0
+                    && first_bridge_read_refusals.load(Ordering::SeqCst) != usize::MAX,
+                "source continuation must follow the real refusal, not replace existing preference policy"
+            );
+        }
+    }
+    if case.stalled() {
+        assert!(calibration.is_ok(), "SETUP UNREACHED: real same-fixture healthy-source/full-chain calibration failed: {calibration:?}");
+        assert_eq!(refusals_before_original, 0, "calibration cannot consume a shortcut refusal");
+        if response.as_ref().unwrap().is_err() {
+            assert!(stalled_handshakes.load(Ordering::SeqCst) > 0,
+                "UNREACHED: old failed call must actually attempt/hold authenticated shortcut");
+            assert!(stalled_handshake_bytes.load(Ordering::SeqCst) > 0,
+                "UNREACHED: actual routed-session input must reach the old held stream");
+            assert_eq!(reads[2].load(Ordering::SeqCst), reads_before_original[2],
+                "UNREACHED: failure already consulted C, not skipped-source scheduling");
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            // Candidate/relay wire deadlines may finish before the outer
+            // timeout owner. Both are typed pre-service exhaustion; this is
+            // a fixture oracle, not production source-refresh eligibility.
+            let terminal_pre_service = matches!(response.as_ref().unwrap(),
+                Err(sinomo_network::NetworkError::Timeout {
+                    delivery_state: sinomo_network::NetworkDeliveryState::DefinitelyNotSent, ..
+                })) || matches!(response.as_ref().unwrap(),
+                Err(sinomo_network::NetworkError::RetryExhausted {
+                    attempts, delivery_state: sinomo_network::NetworkDeliveryState::DefinitelyNotSent, ..
+                }) if *attempts > 0);
+            assert!(terminal_pre_service,
+                "UNREACHED: not actual typed pre-service exhaustion: {response:?}");
+            assert!(sinomo_network::DEFAULT_NETWORK_TIMEOUT.saturating_sub(original_elapsed)
+                    <= calibration_elapsed,
+                "UNREACHED: stalled first carrier left more budget than the measured healthy calibration");
+            if case == SourceCase::StalledLiveShortcut {
+                assert_eq!(reads[1].load(Ordering::SeqCst), reads_before_original[1],
+                    "UNREACHED: the live-hint old control unexpectedly read B");
+            } else {
+                assert!(reads[1].load(Ordering::SeqCst) > reads_before_original[1],
+                    "UNREACHED: the actual initial B source did not supply its route hint");
+            }
+        } else {
+            assert!(reads[2].load(Ordering::SeqCst) > reads_before_original[2]);
+            // Success may preempt a losing probe before remote authentication.
+            // Remote EOF/error is diagnostic only; relay handshake lifetime is
+            // separately bounded by the original wire deadline.
+        }
+    }
+    let response = response.expect("SETUP UNREACHED: calibration failed before the Original call");
     match case {
         SourceCase::Success
         | SourceCase::PartiallyLiveMain
         | SourceCase::SaturatedHints
         | SourceCase::ColdSourceProcess
         | SourceCase::ColdRoutedSourceProcess
-        | SourceCase::LiveFailureCountReset => {
+        | SourceCase::LiveFailureCountReset
+        | SourceCase::DegradedShortcut
+        | SourceCase::StalledLiveShortcut
+        | SourceCase::StalledSourceHint
+        | SourceCase::HealthyNoSources | SourceCase::HealthyUnrelatedSource
+        | SourceCase::HealthyFailedSource | SourceCase::HealthySlowSource => {
             assert_eq!(response.unwrap(), "original response");
             assert_eq!(effects.load(Ordering::SeqCst), 1);
         }
@@ -620,7 +1151,38 @@ async fn multihop_source_scenario(case: SourceCase) {
             assert_eq!(effects.load(Ordering::SeqCst), 0);
         }
     }
-    if case == SourceCase::ColdRoutedSourceProcess {
+    if case.healthy_guard() {
+        assert!(original_elapsed < sinomo_network::DEFAULT_NETWORK_TIMEOUT);
+        let held_binding = *first_binding.lock().unwrap();
+        assert!(held_binding.is_some(), "UNREACHED: initial authenticated A-D socket was not held");
+        assert_eq!(*original_binding.lock().unwrap(), held_binding,
+            "Original must use SAME physical socket held before native routed acceptance");
+        match case {
+            SourceCase::HealthyNoSources => {
+                assert!(baseline_before_hot > 0, "UNREACHED: actual advisory capture did not fail");
+                assert_eq!(reads_before_hot[1], reads_before_original[1]);
+                assert_eq!(reads_before_hot[2], reads_before_original[2]);
+                assert!(hot_response.unwrap().is_ok(), "hot read-only target RPC must succeed");
+                assert_eq!(*hot_binding.lock().unwrap(), held_binding,
+                    "marked hot RPC must reuse SAME actual native physical carrier as Original");
+                assert_eq!(baseline_failures.load(Ordering::SeqCst), baseline_before_hot,
+                    "hot carrier must leave establishment future unpolled");
+                assert_eq!(reads[1].load(Ordering::SeqCst), reads_before_hot[1]);
+                assert_eq!(reads[2].load(Ordering::SeqCst), reads_before_hot[2]);
+                assert_eq!(reads[3].load(Ordering::SeqCst), reads_before_hot[3] + 1);
+            }
+            SourceCase::HealthyUnrelatedSource => {
+                assert!(reads[1].load(Ordering::SeqCst) > reads_before_original[1]);
+                assert!(reads[2].load(Ordering::SeqCst) > reads_before_original[2],
+                    "UNREACHED: C source over actual B relay did not precede target release");
+            }
+            SourceCase::HealthyFailedSource => assert!(failed_source_calls.load(Ordering::SeqCst) > 0),
+            SourceCase::HealthySlowSource => assert!(slow_source_calls.load(Ordering::SeqCst) > 0),
+            _ => unreachable!(),
+        }
+    } else if case.calibrated() {
+        assert!(reads[2].load(Ordering::SeqCst) > reads_before_original[2]);
+    } else if case == SourceCase::ColdRoutedSourceProcess {
         assert!(
             (1..=2).contains(&reads[2].load(Ordering::SeqCst)),
             "C's genuine fresh process must reply; each routed endpoint is read at most once"
@@ -632,7 +1194,7 @@ async fn multihop_source_scenario(case: SourceCase) {
             "C's own authenticated reply is required; B cannot renew C's edge"
         );
     }
-    if case != SourceCase::SaturatedHints {
+    if case != SourceCase::SaturatedHints && !case.healthy_guard() {
         assert!(rejected_direct.load(Ordering::SeqCst) > 0);
     }
 }
@@ -673,4 +1235,37 @@ async fn cold_source_routes_with_live_failure_count_reset_on_remote_bridge() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_routed_source_process_does_not_hide_other_endpoint_live_observation() {
     multihop_source_scenario(SourceCase::ColdRoutedSourceProcess).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_degraded_shortcut_continues_to_the_available_authenticated_bridge_source() {
+    multihop_source_scenario(SourceCase::DegradedShortcut).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_live_target_carrier_does_not_hide_available_authenticated_sources() {
+    multihop_source_scenario(SourceCase::StalledLiveShortcut).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_target_after_initial_source_hint_does_not_hide_next_bridge_source() {
+    multihop_source_scenario(SourceCase::StalledSourceHint).await;
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_first_carrier_survives_advisory_capture_error_and_hot_reuse_skips_sources() {
+    multihop_source_scenario(SourceCase::HealthyNoSources).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_first_carrier_keeps_same_physical_socket_across_unrelated_source_progress() {
+    multihop_source_scenario(SourceCase::HealthyUnrelatedSource).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_first_carrier_survives_actual_source_response_failure() {
+    multihop_source_scenario(SourceCase::HealthyFailedSource).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn healthy_first_carrier_does_not_wait_for_actual_slow_source_response() {
+    multihop_source_scenario(SourceCase::HealthySlowSource).await;
 }

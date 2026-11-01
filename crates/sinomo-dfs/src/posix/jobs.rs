@@ -84,9 +84,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job_id: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
-        let _namespace_plan = self.namespace_execution.begin_planning();
         self.check_cancelled("namespace job resume")?;
-        let Some(job) = self.namespace_job(job_id)? else {
+        let Some(mut job) = self.namespace_job(job_id)? else {
             return Err(DfsPosixError::NotFound {
                 path: job_id.to_string(),
             });
@@ -97,6 +96,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.transport.delegates_local_namespace_authority()
             && let Some(primary) = self.routed_namespace_primary_for_path(&job.root_path)?
         {
+            let _namespace_plan = self.namespace_execution.begin_planning();
             return self.route_namespace_job_operation(
                 primary,
                 DfsNamespaceOperation::ResumeNamespaceJobBounded {
@@ -110,6 +110,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 },
             );
         }
+        if matches!(&job.kind, DfsNamespaceJobKind::RenameDirectory) {
+            // A preempted batch may have sealed moves without updating its job
+            // cursor. Recover those exact native bodies before observing the
+            // next children, then reload the job from the recovered generation.
+            let cancellation = self.cancellation.clone();
+            if !self.recover_durable_namespace_prepares_until_cancelled(&|| {
+                cancellation
+                    .as_ref()
+                    .is_some_and(crate::DfsCancellationFlag::is_cancelled)
+            })? {
+                return Err(crate::DfsError::Cancelled {
+                    operation: "namespace job resume",
+                }
+                .into());
+            }
+            self.check_cancelled("namespace job resume")?;
+            job = self.namespace_job(job_id)?.ok_or_else(|| DfsPosixError::NotFound {
+                path: job_id.to_string(),
+            })?;
+            if job.status != DfsNamespaceJobStatus::Running {
+                return Ok(job);
+            }
+        }
+        let _namespace_plan = self.namespace_execution.begin_planning();
         match job.kind {
             DfsNamespaceJobKind::ContentCopy => self
                 .run_content_copy_job(job, max_steps)

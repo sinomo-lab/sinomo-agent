@@ -8,7 +8,7 @@ use sinomo_core::service::{
 };
 use sinomo_dfs::{
     DfsBrowserBackend, DfsBrowserServiceHost, authorize_dfs_core_component_access,
-    dfs_browser_component_host, dfs_core_component_requirement, run_blocking_browser_task,
+    dfs_browser_component_host, dfs_core_component_requirement, run_blocking_browser_task, run_blocking_browser_task_unqueued,
     run_blocking_service_task,
 };
 use std::path::Path;
@@ -215,7 +215,8 @@ impl Service for HostedFeatureService {
                     let changed_path = payload.source.path.clone();
                     let backend_data_dir = Arc::clone(&data_dir);
                     let backend_runtime = runtime.clone();
-                    let result = run_blocking_service_task(
+                    let result = run_blocking_browser_task_unqueued(
+                        Arc::clone(&data_dir),
                         route.clone(),
                         "streamed DFS attachment",
                         move || {
@@ -293,7 +294,8 @@ impl Service for HostedFeatureService {
                             .acquire(actor.clone(), operation_id, bytes, &limits)
                             .await
                             .map_err(dfs_browser_service_error)?;
-                        run_blocking_service_task(
+                        run_blocking_browser_task_unqueued(
+                            Arc::clone(&data_dir),
                             route.clone(),
                             "DFS attachment mutation",
                             move || {

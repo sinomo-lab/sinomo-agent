@@ -494,20 +494,9 @@ impl ClusterAccess for DaemonClusterAccess {
         >,
     > {
         Box::pin(async move {
-            let payload = sinomo_core::kv::cluster_kv_authoritative_snapshot_rpc_payload()?;
-            let snapshot =
-                handle_daemon_cluster_kv_authoritative_snapshot_request_async_on_runtime(
-                    &self.paths,
-                    &payload.body,
-                    true,
-                    self.runtime()?,
-                )
-                .await
-                .map_err(daemon_error)?;
-            sinomo_core::kv::project_cluster_kv_authoritative_complete_range_prefix(
-                &snapshot, &prefix,
-            )
-            .map_err(ServiceError::from)
+            crate::cluster::handle_daemon_cluster_kv_authoritative_complete_range_prefix_request_async_on_runtime(
+                &self.paths, prefix, true, self.runtime()?,
+            ).await.map_err(daemon_error)
         })
     }
 
@@ -957,6 +946,21 @@ impl sinomo_core::cluster::ClusterKvServiceHost for DaemonClusterKvServiceHost {
             )
             .await
             .map_err(daemon_error)
+        })
+    }
+
+    fn authoritative_complete_range_prefix<'a>(
+        &'a self,
+        prefix: String,
+        allow_forwarding: bool,
+    ) -> sinomo_core::cluster::ClusterKvServiceFuture<
+        'a,
+        sinomo_core::kv::KvAuthoritativeRead<Vec<KvEntry>>,
+    > {
+        Box::pin(async move {
+            crate::cluster::handle_daemon_cluster_kv_authoritative_complete_range_prefix_request_async_on_runtime(
+                &self.paths, prefix, allow_forwarding, self.runtime()?,
+            ).await.map_err(daemon_error)
         })
     }
 

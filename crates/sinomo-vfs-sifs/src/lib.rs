@@ -22,10 +22,12 @@ use sinomo_vfs::{
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-support")]
 pub mod test_support;
+#[cfg(all(test, feature = "test-support"))]
+mod provider_discovery_tests;
 
 pub fn mounted_sifs(data_dir: Option<PathBuf>) -> Result<VfsHandle> {
     VfsHandle::new(Arc::new(MountedSifsVfsBackend::open(data_dir)?), "/")
@@ -51,6 +53,30 @@ pub fn mounted_sifs_with_cancellation(
 
 pub fn daemon_sifs(address: impl Into<String>) -> Result<VfsHandle> {
     VfsHandle::new(Arc::new(DaemonSifsVfsBackend::new(address.into())), "/")
+}
+
+/// Resolve a live capability-advertised filesystem provider for each operation.
+/// Discovery happens before effect dispatch and never replays an uncertain write.
+pub fn discovered_daemon_sifs(
+    data_dir: SinomoDataDir,
+    address: impl Into<String>,
+) -> Result<VfsHandle> {
+    let mut backend = DaemonSifsVfsBackend::new(address.into());
+    backend.discovery_data_dir = Some(data_dir);
+    VfsHandle::new(Arc::new(backend), "/")
+}
+
+/// Discover providers while retaining an exact authenticated cluster namespace.
+/// The owning no-link route checks the same binding at the operation boundary.
+pub fn discovered_daemon_sifs_in_cluster(
+    data_dir: SinomoDataDir,
+    address: impl Into<String>,
+    cluster_id: sinomo_core::Id,
+) -> Result<VfsHandle> {
+    let mut backend = DaemonSifsVfsBackend::new(address.into());
+    backend.discovery_data_dir = Some(data_dir);
+    backend.expected_cluster_id = Some(cluster_id);
+    VfsHandle::new(Arc::new(backend), "/")
 }
 
 pub fn daemon_sifs_with_timeout(
@@ -801,6 +827,17 @@ pub struct DaemonSifsVfsBackend {
     address: String,
     timeout: Duration,
     target: Option<(SinomoDataDir, NodeId)>,
+    discovery_data_dir: Option<SinomoDataDir>,
+    expected_cluster_id: Option<sinomo_core::Id>,
+}
+
+fn remaining_provider_budget(deadline: Instant) -> std::result::Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err("filesystem provider discovery exhausted the operation deadline".into())
+    } else {
+        Ok(remaining)
+    }
 }
 
 impl DaemonSifsVfsBackend {
@@ -809,6 +846,8 @@ impl DaemonSifsVfsBackend {
             address,
             timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             target: None,
+            discovery_data_dir: None,
+            expected_cluster_id: None,
         }
     }
 
@@ -817,6 +856,8 @@ impl DaemonSifsVfsBackend {
             address,
             timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
             target: Some((data_dir, node_id)),
+            discovery_data_dir: None,
+            expected_cluster_id: None,
         }
     }
 
@@ -837,6 +878,20 @@ impl DaemonSifsVfsBackend {
         request: &ObjectRpcRequest,
         timeout: Duration,
     ) -> std::result::Result<sinomo_core::network::ObjectRpcResponse, String> {
+        if let Some(data_dir) = &self.discovery_data_dir {
+            // Select using read-only catalog/status requests. Once selected,
+            // this exact operation has one transport owner and one destination.
+            // A failed send is returned unchanged, without another provider send.
+            let deadline = Instant::now() + timeout;
+            let target = self.discover_provider(data_dir, deadline)?;
+            let timeout = remaining_provider_budget(deadline)?;
+            return match target {
+                Some(target) => Self::on_node(data_dir.clone(), self.address.clone(), target)
+                    .send_rpc_with_timeout(request, timeout),
+                None => sinomo_api::send_daemon_rpc(&self.address, request, timeout)
+                    .map_err(|error| error.to_string()),
+            };
+        }
         if let Some((data_dir, target_node_id)) = &self.target {
             return sinomo_api::DaemonApiClient::at_address(self.address.clone())
                 .with_timeout(timeout)
@@ -851,6 +906,181 @@ impl DaemonSifsVfsBackend {
         }
         sinomo_api::send_daemon_rpc(&self.address, request, timeout)
             .map_err(|source| source.to_string())
+    }
+
+    fn discover_provider(
+        &self,
+        data_dir: &SinomoDataDir,
+        deadline: Instant,
+    ) -> std::result::Result<Option<NodeId>, String> {
+        let client = sinomo_api::DaemonApiClient::at_address(self.address.clone())
+            .with_timeout(remaining_provider_budget(deadline)?);
+        let status = client.status().map_err(|error| error.to_string())?;
+        let Some(cluster) = status.cluster else {
+            if self.expected_cluster_id.is_some() {
+                return Err(
+                    "retained filesystem source requires its original cluster namespace".into(),
+                );
+            }
+            return Ok(None);
+        };
+        if self
+            .expected_cluster_id
+            .as_ref()
+            .is_some_and(|expected| expected != &cluster.cluster_id)
+        {
+            return Err("filesystem source cluster namespace changed".into());
+        }
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_core::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+            &sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX.to_string(),
+        )
+        .map_err(|error| error.to_string())?;
+        let response = client
+            .with_timeout(remaining_provider_budget(deadline)?)
+            .call_request(&request)
+            .map_err(|error| error.to_string())?;
+        let entries: sinomo_core::kv::KvLocalRead<Vec<sinomo_core::kv::KvEntry>> =
+            response.decode_body().map_err(|error| error.to_string())?;
+        let instances = sinomo_core::service::service_instances_from_entries(&entries.value)
+            .map_err(|error| error.to_string())?;
+        let mut providers: Vec<_> = sinomo_core::service::service_instances_providing_capability(
+            instances,
+            sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY,
+        )
+        .into_iter()
+        .map(|instance| instance.node_id)
+        .collect();
+        providers.sort();
+        providers.dedup();
+        providers.sort_by_key(|node| node != &cluster.node_id);
+        let mut failures = Vec::new();
+        let probe = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserStatusRequest::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let provider_count = providers.len();
+        for (index, provider) in providers.into_iter().enumerate() {
+            // Preserve time for every later candidate and for the selected
+            // operation. Reuse the control-plane foreground route-health cap;
+            // this remains inside the caller's one absolute deadline.
+            let remaining = remaining_provider_budget(deadline)?;
+            let slots = u32::try_from(provider_count - index + 1).unwrap_or(u32::MAX);
+            let probe_budget = (remaining / slots).min(
+                sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+            );
+            if probe_budget.is_zero() {
+                return Err(
+                    "filesystem provider discovery exhausted the operation deadline".into(),
+                );
+            }
+            match Self::on_node(data_dir.clone(), self.address.clone(), provider.clone())
+                .send_rpc_with_timeout(&probe, probe_budget)
+                .and_then(|response| {
+                    response
+                        .decode_body::<sinomo_api::DaemonDfsBrowserStatusResponse>()
+                        .map_err(|error| error.to_string())
+                }) {
+                Ok(status) if status.node_id == provider.as_str() => return Ok(Some(provider)),
+                Ok(_) => failures.push(format!("{provider}: provider identity mismatch")),
+                Err(error) => failures.push(format!("{provider}: {error}")),
+            }
+        }
+        Err(format!(
+            "no reachable cluster service instance provides {} ({})",
+            sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY,
+            failures.join("; ")
+        ))
+    }
+
+    fn no_links(
+        &self,
+        root: &str,
+        path: &str,
+        operation: sinomo_api::DaemonDfsBrowserNoLinksOperation,
+    ) -> Result<sinomo_api::DaemonDfsBrowserNoLinksResponse> {
+        let mutation = operation.is_mutation();
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserNoLinksRequest {
+                expected_cluster_id: self.expected_cluster_id.clone(),
+                root: root.into(),
+                path: path.into(),
+                operation,
+            },
+        )
+        .map_err(|error| {
+            daemon_non_absence_detail_to_vfs(
+                self.backend_name(),
+                path,
+                sinomo_api::DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+                error.to_string(),
+            )
+        })?;
+        let result = if mutation {
+            self.send_rpc(&request)
+                .and_then(|response| response.decode_body().map_err(|error| error.to_string()))
+        } else {
+            self.read_response(&request)
+        };
+        let response: sinomo_api::DaemonDfsBrowserNoLinksResponse = result.map_err(|error| {
+            daemon_non_absence_detail_to_vfs(
+                self.backend_name(),
+                path,
+                sinomo_api::DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+                error,
+            )
+        })?;
+        if let sinomo_api::DaemonDfsBrowserNoLinksResponse::Failed { failure } = response {
+            use sinomo_api::DaemonDfsBrowserNoLinksFailure as F;
+            return Err(match failure {
+                F::NotFound { path } => VfsError::NotFound { path },
+                F::AlreadyExists { path } => VfsError::AlreadyExists { path },
+                F::NotDirectory { path } => VfsError::NotDirectory { path },
+                F::IsDirectory { path } => VfsError::IsDirectory { path },
+                F::InvalidPath { path, detail } => VfsError::InvalidPath { path, detail },
+                F::Conflict { path, detail } => VfsError::Conflict { path, detail },
+                F::Unsupported { detail, .. } => VfsError::Unsupported {
+                    backend: self.backend_name().into(), detail,
+                },
+                F::Unavailable { path, detail } => VfsError::Backend {
+                    backend: self.backend_name().into(),
+                    path,
+                    detail,
+                },
+            });
+        }
+        Ok(response)
+    }
+
+    fn no_links_metadata(
+        &self,
+        path: &str,
+        metadata: sinomo_api::DaemonDfsBrowserStatResponse,
+    ) -> Result<VfsMetadata> {
+        if metadata.path != path {
+            return Err(self.invalid_no_links_response(path));
+        }
+        Ok(VfsMetadata {
+            path: metadata.path,
+            kind: vfs_kind_from_dfs(&metadata.kind),
+            object_id: Some(metadata.object_id),
+            size_bytes: metadata.size_bytes,
+            content_hash: metadata.content_hash,
+            version: Some(metadata.version),
+        })
+    }
+
+    fn invalid_no_links_response(&self, path: &str) -> VfsError {
+        VfsError::Backend {
+            backend: self.backend_name().into(),
+            path: path.into(),
+            detail: "provider returned an invalid exact scoped-operation response".into(),
+        }
     }
 
     fn read_response<Response: DeserializeOwned>(
@@ -983,6 +1213,180 @@ impl DaemonSifsVfsBackend {
 impl VfsBackend for DaemonSifsVfsBackend {
     fn backend_name(&self) -> &'static str {
         "daemon-sifs"
+    }
+
+    fn lstat(&self, path: &str) -> Result<VfsMetadata> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserStatRequest {
+                path: path.into(),
+                max_staleness_millis: 0,
+            },
+        )
+        .map_err(|error| self.invalid_no_links_response(&error.to_string()))?;
+        let response = self.read_response(&request).map_err(|error| {
+            daemon_non_absence_detail_to_vfs(self.backend_name(), path, "namespace-lstat", error)
+        })?;
+        let stat = daemon_stat_response_to_vfs(self.backend_name(), path, response)?;
+        self.no_links_metadata(path, stat)
+    }
+
+    fn stat_beneath_no_links(&self, root: &str, path: &str) -> Result<VfsMetadata> {
+        match self.no_links(
+            root,
+            path,
+            sinomo_api::DaemonDfsBrowserNoLinksOperation::Stat,
+        )? {
+            sinomo_api::DaemonDfsBrowserNoLinksResponse::Metadata { metadata } => {
+                self.no_links_metadata(path, metadata)
+            }
+            _ => Err(self.invalid_no_links_response(path)),
+        }
+    }
+
+    fn list_page_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        after: Option<&[u8]>,
+        max_entries: usize,
+    ) -> Result<VfsBackendDirectoryPage> {
+        match self.no_links(
+            root,
+            path,
+            sinomo_api::DaemonDfsBrowserNoLinksOperation::ListPage {
+                cursor: after.map(<[u8]>::to_vec),
+                max_entries,
+            },
+        )? {
+            sinomo_api::DaemonDfsBrowserNoLinksResponse::DirectoryPage {
+                directory,
+                entries,
+                next_cursor,
+            } => Ok(VfsBackendDirectoryPage {
+                directory_metadata: Some(self.no_links_metadata(path, directory)?),
+                entries: entries
+                    .into_iter()
+                    .map(|entry| VfsDirEntry {
+                        name: entry.name,
+                        path: entry.path,
+                        kind: vfs_kind_from_dfs(&entry.kind),
+                        size_bytes: entry.size,
+                    })
+                    .collect(),
+                next_cursor,
+            }),
+            _ => Err(self.invalid_no_links_response(path)),
+        }
+    }
+
+    fn read_prefix_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        self.read_range_beneath_no_links(root, path, 0, max_bytes)
+    }
+
+    fn read_range_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<VfsOpenedFileRead> {
+        match self.no_links(
+            root,
+            path,
+            sinomo_api::DaemonDfsBrowserNoLinksOperation::ReadRange { offset, max_bytes },
+        )? {
+            sinomo_api::DaemonDfsBrowserNoLinksResponse::Read {
+                metadata,
+                bytes,
+                truncated,
+            } => {
+                if bytes.len() as u64 > max_bytes {
+                    return Err(self.invalid_no_links_response(path));
+                }
+                Ok(VfsOpenedFileRead {
+                    metadata: self.no_links_metadata(path, metadata)?,
+                    bytes,
+                    truncated,
+                })
+            }
+            _ => Err(self.invalid_no_links_response(path)),
+        }
+    }
+
+    fn create_dir_all_beneath_no_links(&self, root: &str, path: &str) -> Result<()> {
+        match self.no_links(
+            root,
+            path,
+            sinomo_api::DaemonDfsBrowserNoLinksOperation::CreateDirAll,
+        )? {
+            sinomo_api::DaemonDfsBrowserNoLinksResponse::DirectoryCreated => Ok(()),
+            _ => Err(self.invalid_no_links_response(path)),
+        }
+    }
+
+    fn create_new_versioned_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        bytes: &[u8],
+        options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        if options.durability != VfsWriteDurability::ReplicatedEventual {
+            return Err(VfsError::Unsupported {
+                backend: self.backend_name().into(),
+                detail: "daemon scoped mutations require distributed policy durability".into(),
+            });
+        }
+        match self.no_links(
+            root,
+            path,
+            sinomo_api::DaemonDfsBrowserNoLinksOperation::CreateNew {
+                bytes: bytes.to_vec(),
+            },
+        )? {
+            sinomo_api::DaemonDfsBrowserNoLinksResponse::Metadata { metadata } => {
+                self.no_links_metadata(path, metadata)
+            }
+            _ => Err(self.invalid_no_links_response(path)),
+        }
+    }
+
+    fn replace_if_version_beneath_no_links(
+        &self,
+        root: &str,
+        path: &str,
+        expected_object_id: &str,
+        expected_version: &str,
+        bytes: &[u8],
+        options: &VfsWriteOptions,
+    ) -> Result<VfsMetadata> {
+        if options.durability != VfsWriteDurability::ReplicatedEventual {
+            return Err(VfsError::Unsupported {
+                backend: self.backend_name().into(),
+                detail: "daemon scoped mutations require distributed policy durability".into(),
+            });
+        }
+        match self.no_links(
+            root,
+            path,
+            sinomo_api::DaemonDfsBrowserNoLinksOperation::ReplaceIfVersion {
+                expected_object_id: expected_object_id.into(),
+                expected_version: expected_version.into(),
+                bytes: bytes.to_vec(),
+            },
+        )? {
+            sinomo_api::DaemonDfsBrowserNoLinksResponse::Metadata { metadata } => {
+                self.no_links_metadata(path, metadata)
+            }
+            _ => Err(self.invalid_no_links_response(path)),
+        }
     }
 
     fn stat(&self, path: &str) -> Result<VfsMetadata> {
@@ -1222,6 +1626,9 @@ fn dfs_error_to_vfs(backend: &str, path: &str, source: DfsPosixError) -> VfsErro
         DfsPosixError::Conflict { path, reason } => VfsError::Conflict {
             path,
             detail: reason,
+        },
+        DfsPosixError::Dfs(sinomo_dfs::DfsError::UnsupportedWritePrecondition { reason, .. }) => VfsError::Unsupported {
+            backend: backend.to_string(), detail: reason,
         },
         other => VfsError::Backend {
             backend: backend.to_string(),

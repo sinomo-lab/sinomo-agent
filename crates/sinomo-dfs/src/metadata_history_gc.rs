@@ -1948,7 +1948,12 @@ fn protect_namespace_operation_versions(
             expected_parent_object_id,
             expected_parent_version,
             ..
-        } => {
+        }
+        | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(crate::DfsMkdirAtNoLinksWithAttrs {
+            expected_parent_object_id,
+            expected_parent_version,
+            ..
+        }) => {
             protected.insert(DfsMetadataVersionIdentity::new(
                 expected_parent_object_id.clone(),
                 expected_parent_version.clone(),

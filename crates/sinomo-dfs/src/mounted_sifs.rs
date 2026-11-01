@@ -202,6 +202,7 @@ pub fn open_mounted_sifs_service_with_cancellation(
         async_peer_transport,
         control_plane,
         cancellation,
+        None,
     )
 }
 
@@ -256,6 +257,7 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane_
         async_peer_transport,
         control_plane,
         cancellation,
+        None,
     )
 }
 
@@ -283,6 +285,27 @@ pub fn open_mounted_sifs_service_with_peer_transports(
         async_peer_transport,
         control_plane,
         None,
+        None,
+    )
+}
+
+/// Core browser read input captured from its actual Current configuration.
+/// This supplies only candidate DATA; normal mounted routing, bootstrap and
+/// all subsequent native publication/admission checks remain unchanged.
+pub(crate) fn open_mounted_sifs_service_with_peer_transports_and_configuration(
+    data_dir: SinomoDataDir,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    configuration: Arc<crate::DfsWriteConfigurationProjection>,
+) -> Result<OpenedMountedSifsService, DfsError> {
+    let (cluster_paths, cluster_state, local_node_id, peer_node_ids) =
+        mounted_sifs_cluster_context(&data_dir)?;
+    let candidates = configuration.content_replica_candidates()?;
+    open_mounted_sifs_service_from_context(
+        &data_dir, &cluster_paths, cluster_state.as_ref(), local_node_id,
+        peer_node_ids, sync_peer_transport, async_peer_transport, control_plane,
+        None, Some(candidates),
     )
 }
 
@@ -335,17 +358,19 @@ fn open_mounted_sifs_service_from_context(
     async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     cancellation: Option<crate::DfsCancellationFlag>,
+    captured_replica_candidates: Option<Vec<DfsNodeId>>,
 ) -> Result<OpenedMountedSifsService, DfsError> {
     // A mounted client does not own maintenance or recovery. Hydrate only the
     // filesystem records needed to route canonical operations; path/object
     // metadata remains authoritative in the backend and is loaded on demand.
     // Full metadata hydration here made every short-lived app/CLI catalog load
     // scan the entire local SIFS replica before its first distributed read.
-    let replica_candidates = mounted_sifs_replica_candidates_from_context(
-        cluster_state,
-        local_node_id.clone(),
-        control_plane.as_deref(),
-    )?;
+    let replica_candidates = match captured_replica_candidates {
+        Some(candidates) => candidates,
+        None => mounted_sifs_replica_candidates_from_context(
+            cluster_state, local_node_id.clone(), control_plane.as_deref(),
+        )?,
+    };
     let mut service = open_cluster_dfs_service_with_peer_transports_for_nodes_lazy(
         data_dir,
         cluster_paths,

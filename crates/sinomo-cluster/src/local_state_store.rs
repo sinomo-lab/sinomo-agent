@@ -6,7 +6,7 @@ use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
     read_cluster_kv_reader_node_id, record_current_cluster_kv_reader_node_id_cache,
 };
-use crate::kv_read_model::read_cluster_members_from_snapshot;
+use crate::kv_read_model::read_cluster_members_for_state;
 use crate::local_membership::{
     locally_learned_remote_route_endpoints, merge_cluster_join_registration,
     preserve_locally_learned_remote_route_endpoints, remove_superseded_daemon_listeners,
@@ -219,13 +219,7 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         .find(|member| member.node_id == state.local_node_id && member.state.is_authorized())
         .cloned();
     let local_remote_route_endpoints = locally_learned_remote_route_endpoints(&state);
-    let projected =
-        crate::kv_local_store::read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
-            .and_then(|snapshot| match snapshot {
-                Some(snapshot) => read_cluster_members_from_snapshot(&snapshot)
-                    .map(|members| (members, snapshot.revision)),
-                None => Ok((Vec::new(), sinomo_kv::KvRevision(0))),
-            });
+    let projected = read_cluster_members_for_state(paths);
     let (mut kv_members, observed_revision) = match projected {
         Ok(projected) => projected,
         Err(error) => {

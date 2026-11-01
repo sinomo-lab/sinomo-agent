@@ -17,8 +17,9 @@ use crate::{
     DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
     DfsFileSystemId, DfsLocalEventualBatchWriteProof, DfsMessageTransport, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
-    DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsNamespaceTransaction, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
     DfsPreparedMetadataEffect, DfsPreparedOperationPayload, DfsPreparedOperationScope,
+    DfsPreparedOperationStatus,
     DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, MetadataBackendError,
     NetworkedDfsService, dfs_perf_trace, metadata_path, normalize_current_locations,
     path_index_key,
@@ -839,6 +840,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         payload: DfsPreparedOperationPayload,
     ) -> Result<bool, DfsError> {
+        #[cfg(test)]
+        if let Some((root, _owner)) = self.native_publication_owner_for_observation()
+            && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                &sinomo_core::local::SinomoDataDir::new(root),
+            )
+        {
+            hook(crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeMetadataEffectPrepare {
+                payload: &payload,
+            }, None, None)?;
+        }
         if self.recover_matching_metadata_receipt_prepare(&payload)?
             || self.recover_matching_placement_intent_prepare(&payload)?
         {
@@ -939,6 +950,83 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(true)
+    }
+
+    /// Resume an actual hidden receipt publication after its content reply was
+    /// retained but metadata application failed. The response selects existing
+    /// preparation DATA only; it never constructs a replacement publication.
+    pub(crate) fn recover_original_repair_receipt_prepare(
+        &mut self,
+        birth: &crate::repair_queue_store::RepairOriginalBirth,
+    ) -> Result<bool, DfsError> {
+        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+            return Ok(false);
+        };
+        let Some(shard) = command.authority_shard.as_ref() else {
+            return Ok(false);
+        };
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        // Reuse the exact-shard reservation index with an empty-effect read
+        // footprint. It is never prepared or published, and reuses the actual
+        // Repair request ID rather than allocating another operation identity.
+        let footprint = DfsPreparedOperationPayload::for_metadata_effects(
+            DfsPreparedOperationScope {
+                file_system_id: command.file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new(&shard.shard_id),
+                owner_epoch: shard.epoch,
+                operation_id: command.request_id.clone(),
+            },
+            vec![DfsNamespaceObjectVersionExpectation {
+                object_id: command.object_id.clone(),
+                expected_version: Some(command.version.clone()),
+            }],
+            Vec::new(),
+            Vec::new(),
+            OffsetDateTime::UNIX_EPOCH,
+        )?;
+        let mut matching = None;
+        for record in backend.prepared_operation_reservations(&footprint)? {
+            if record.status != DfsPreparedOperationStatus::Prepared
+                || record.digest.file_system_id != command.file_system_id
+                || record.digest.shard_id.0 != shard.shard_id
+                || record.digest.owner_epoch < shard.epoch
+            {
+                continue;
+            }
+            record.validate()?;
+            let original = record.payload.as_ref();
+            let input = match original.metadata_effects.split_last() {
+                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
+                    if file_system.file_system_id == original.file_system_id => input,
+                _ => original.metadata_effects.as_slice(),
+            };
+            let Some(receipt) = metadata_receipt_projection_input(input) else {
+                continue;
+            };
+            if receipt.receipt.file_system_id != command.file_system_id
+                || receipt.receipt.object_id != command.object_id
+                || receipt.receipt.committed_version != command.version
+                || receipt.receipt.owner_node_id != birth.original.source_node_id
+                || receipt.replica_node_id != birth.original.target_node_id
+                || receipt.content_hash.as_deref() != Some(command.content_hash.as_str())
+            {
+                continue;
+            }
+            if matching.replace(record).is_some() {
+                return Err(DfsError::Metadata {
+                    message: "multiple hidden publications claim the same original repair receipt"
+                        .into(),
+                });
+            }
+        }
+        let Some(record) = matching else {
+            // An absent receipt after a committed publication can be a later
+            // withdrawal. Only a still-hidden original may be continued here.
+            return Ok(false);
+        };
+        self.recover_one_prepared_operation(record)
     }
 
     /// A same-version placement producer retains a deterministic intent ID,
@@ -1117,6 +1205,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn publish_namespace_prepared_operation(
         &mut self,
         payload: DfsPreparedOperationPayload,
+        configured_file_system: Option<&DfsFileSystem>,
     ) -> Result<crate::publication_guard::DfsPreparedPublication, NamespaceTransactionApplyError>
     {
         let _execution = self.acquire_prepared_execution(&DfsPreparedOperationScope {
@@ -1132,7 +1221,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| (object.object_id.clone(), object.path.clone()))
             .collect::<BTreeMap<_, _>>();
         let digest =
-            self.prepare_payload_for_publication(payload)
+            self.prepare_payload_for_publication_with_file_system(payload, configured_file_system)
                 .map_err(|error| match error {
                     MetadataBackendError::Conflict {
                         object_id,
@@ -2126,9 +2215,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let Some(digest) = backend.prepared_operation_digest(&operation_id)? else {
                     continue;
                 };
-                if backend.committed_prepared_operation(&digest)?.is_none() {
-                    continue;
-                }
+                let recovery_record = if backend.committed_prepared_operation(&digest)?.is_none() {
+                    Some(backend.prepared_operation_record(&operation_id)?.ok_or_else(|| {
+                        DfsError::Metadata {
+                            message: "recorded namespace prepare lost its immutable body".into(),
+                        }
+                    })?)
+                } else {
+                    None
+                };
                 let payload = backend
                     .prepared_operation_payload(&operation_id)?
                     .ok_or_else(|| DfsError::Metadata {
@@ -2176,8 +2271,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     .into());
                 }
-                let replay = self.commit_stored_prepared_operation(&digest)?;
-                debug_assert!(!replay.published);
+                if let Some(record) = recovery_record {
+                    record.validate()?;
+                    if record.digest != digest || record.payload.as_ref() != payload.as_ref() {
+                        return Err(DfsError::Metadata {
+                            message: "recorded namespace prepare changed during reconciliation".into(),
+                        }.into());
+                    }
+                    // The existing owner recovers the entire validated original
+                    // before a fresh policy lookup can replan any part of it.
+                    // Its established epoch transition/fencing path is retained.
+                    if !self.recover_one_prepared_operation(record)? {
+                        return Err(DfsError::Metadata {
+                            message: "recorded namespace prepare has no current recovery owner".into(),
+                        }.into());
+                    }
+                } else {
+                    let replay = self.commit_stored_prepared_operation(&digest)?;
+                    debug_assert!(!replay.published);
+                }
                 return Ok(());
             }
         }
@@ -2549,7 +2661,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             payload.journal_operation_id = captured_journal_operation_id;
             payload.metadata_effects.extend(metadata_effects);
-            let published = self.publish_namespace_prepared_operation(payload)?;
+            let configured_file_system = configured_file_system
+                .as_ref()
+                .filter(|_| !payload.transaction.objects.is_empty());
+            let published =
+                self.publish_namespace_prepared_operation(payload, configured_file_system)?;
             if !published.published {
                 return Ok(());
             }
@@ -2649,7 +2765,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             payload.journal_operation_id = journal_operation_id.clone();
             payload.metadata_effects.extend(metadata_effects);
-            let published = self.publish_namespace_prepared_operation(payload)?;
+            let configured_file_system = configured_file_system
+                .as_ref()
+                .filter(|_| !payload.transaction.objects.is_empty());
+            let published =
+                self.publish_namespace_prepared_operation(payload, configured_file_system)?;
             if !published.published {
                 return Ok(());
             }

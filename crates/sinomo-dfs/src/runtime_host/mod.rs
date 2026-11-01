@@ -438,6 +438,40 @@ impl DfsDataOwnerLock {
         storage_file_identity(&self.file)
     }
 
+    /// Bind the ordinary queue to the actual currently registered native OS owner.
+    /// A pathname/queue representation or a copied file cannot supply this proof.
+    pub(crate) fn checked_default_repair_queue_path(
+        self: &Arc<Self>,
+    ) -> Result<PathBuf, DfsRuntimeError> {
+        let invalid = |detail: &str| DfsRuntimeError::Parse {
+            detail: detail.into(),
+        };
+        if self.selected_original_data_layout()?.is_some() {
+            return Err(invalid(
+                "ordinary Repair witness refuses selected fixture DATA",
+            ));
+        }
+        let data = SinomoDataDir::new(self.physical_data_root.clone());
+        let paths = DfsRuntimePaths::new(&data);
+        let current = require_daemon_dfs_data_owner_lock(&paths)?;
+        if !Arc::ptr_eq(self, &current) {
+            return Err(invalid(
+                "ordinary Repair witness lost its registered native DATA owner",
+            ));
+        }
+        let named =
+            File::open(&paths.data_owner_lock).map_err(|error| invalid(&error.to_string()))?;
+        let held = self
+            .storage_owner_file_identity()
+            .map_err(|error| invalid(&error.to_string()))?;
+        if storage_file_identity(&named).map_err(|error| invalid(&error.to_string()))? != held {
+            return Err(invalid(
+                "ordinary Repair witness OS lock name differs from held native owner",
+            ));
+        }
+        Ok(crate::default_dfs_repair_attempt_snapshot_path(&data))
+    }
+
     pub fn acquire(paths: &DfsRuntimePaths) -> Result<Self, DfsRuntimeError> {
         std::fs::create_dir_all(&paths.root).map_err(|source| DfsRuntimeError::Io {
             path: paths.root.display().to_string(),
@@ -3350,9 +3384,13 @@ pub(crate) use data_plane::{
 pub(crate) use message_host::defer_native_owned_repair_completion;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use data_plane::{
-    NativeRepairCustodySelection, OwnedOriginalRepairCompletion, PreparedNativeRepairCustody,
-    call_native_original_repair_owned, prepare_native_repair_custody,
-    select_native_original_repair_custody, send_prepared_native_repair_custody,
+    NativeRepairCustodySelection, call_native_original_repair_owned,
+    select_native_original_repair_custody,
+};
+pub(crate) use data_plane::{
+    FreshOriginalRepairReturn, NativeOriginalRepairReturn, OwnedOriginalRepairCompletion,
+    PreparedNativeRepairCustody, prepare_native_repair_custody,
+    send_prepared_native_repair_custody, send_prepared_native_repair_custody_async,
 };
 #[cfg(feature = "storage-conversion")]
 pub use storage_import::DfsStorageImportContentReceiver;

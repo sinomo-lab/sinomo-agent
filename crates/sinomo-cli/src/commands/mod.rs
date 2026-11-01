@@ -13,6 +13,7 @@ mod rollout;
 mod support;
 mod test;
 mod test_cases_agent;
+mod test_cases_agent_home;
 mod test_cases_cluster;
 mod test_cases_cluster_kv;
 #[cfg(all(feature = "desktop-e2e", target_os = "windows"))]
@@ -21,6 +22,7 @@ mod test_cases_dfs;
 #[cfg(feature = "native-models")]
 mod test_cases_models;
 mod test_cases_network;
+mod test_cases_sifs_consumers;
 #[cfg(all(feature = "desktop-e2e", target_os = "windows"))]
 mod test_environment;
 

@@ -7422,6 +7422,97 @@ fn doctor_storage_contract_covers_cli_and_app_sessions() {
 }
 
 #[test]
+fn memory_storage_contract_covers_exact_private_files_across_catalog_profiles() {
+    use sinomo_runtime::storage::{StorageEncoding, StorageLayout, StoragePathOwner, StorageRing};
+
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-memory-storage-owned-files");
+    let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
+    let paths = [
+        "memory/indexed.write.lock",
+        "memory/private/continuation.key",
+    ];
+    let unknown = [
+        "memory/indexed.write.lock.backup",
+        "memory/private/other.key",
+    ];
+    let check = |layout: &StorageLayout| {
+        for path in paths {
+            let Some(StoragePathOwner::File(contract)) = layout.owner_for(path) else {
+                panic!("memory file must have an exact file contract: {path}");
+            };
+            assert_eq!(contract.module, "sinomo-memory");
+            assert_eq!(contract.ring, StorageRing::R2);
+            assert_eq!(contract.encoding, StorageEncoding::Binary);
+            assert_eq!(contract.relative_path, path);
+            assert_eq!(
+                layout
+                    .files
+                    .iter()
+                    .filter(|file| file.relative_path == path)
+                    .count(),
+                1
+            );
+        }
+        for path in unknown {
+            assert!(
+                layout.owner_for(path).is_none(),
+                "unknown sibling must remain visible: {path}"
+            );
+        }
+        let report = layout
+            .verify_relative_paths(paths.into_iter().chain(unknown))
+            .unwrap();
+        assert_eq!(report.covered.len(), paths.len());
+        assert_eq!(
+            report
+                .unregistered
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            unknown
+                .map(String::from)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    };
+    // This is the actual layout used by doctor, including its existing
+    // application-owned agent -> memory storage contribution.
+    check(&cli_data_dir_layout(root.path()).expect("real CLI storage layout"));
+    for (profile, has_dfs) in [
+        (
+            sinomo_product_profile::ProductComponentProfile::main(true),
+            true,
+        ),
+        (
+            sinomo_product_profile::ProductComponentProfile::shadow(true),
+            false,
+        ),
+    ] {
+        // base_component_catalog finalizes the complete module registry through
+        // ComponentCatalogBuilder::build / ModuleRegistryBuilder::try_build.
+        let catalog = sinomo_product_profile::base_component_catalog(&data_dir, profile)
+            .expect("finalize complete product catalog");
+        let dfs_id = sinomo_runtime::dfs::dfs_module_id();
+        assert_eq!(catalog.modules().get(&dfs_id).is_some(), has_dfs);
+        assert_eq!(catalog.factory(dfs_id.as_str()).is_some(), has_dfs);
+        let disabled = has_dfs.then(|| {
+            let disabled = catalog
+                .without_module(&dfs_id)
+                .expect("remove Main DFS without losing storage ownership");
+            assert!(disabled.modules().get(&dfs_id).is_none());
+            assert!(disabled.factory(dfs_id.as_str()).is_none());
+            disabled
+        });
+        for catalog in std::iter::once(&catalog).chain(disabled.as_ref()) {
+            let mut layout = sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(catalog)
+                .expect("compose finalized catalog storage");
+            sinomo_agent::register_storage_paths(&mut layout)
+                .expect("existing application agent and memory storage contribution");
+            check(&layout);
+        }
+    }
+}
+
+#[test]
 fn install_detects_existing_binary_update() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-install-update");
     let destination = root.join("bin").join(if cfg!(windows) {

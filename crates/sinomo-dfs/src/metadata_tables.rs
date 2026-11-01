@@ -799,63 +799,35 @@ impl DfsMetadataTables {
             };
         }
 
+        let versions = self
+            .versions
+            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
+            .take_while(|((id, _), _)| id == object_id)
+            .map(|(_, record)| record);
+        let (_, pins) = crate::metadata_summary::object_history_root_inputs(self, object_id);
+        let receipts = self
+            .receipts
+            .range((
+                Included((object_id.clone(), id_lower_bound(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((id, _, _), _)| id == object_id)
+            .map(|(_, record)| record);
         let mut pending_repair_count = 0usize;
         let mut expiring_repairs = BTreeMap::<u64, usize>::new();
-        let (high_water, pins) = if intents.iter().any(|intent| {
-            self.versions
-                .get(&(object_id.clone(), intent.target_version.clone()))
-                .is_some_and(|version| version.has_retention_grant())
-        }) {
-            crate::metadata_summary::object_history_root_inputs(self, object_id)
-        } else {
-            Default::default()
-        };
-        for intent in intents {
-            let Some(root) = crate::metadata_summary::repair_root_for_intent(
-                object,
-                intent,
-                self.versions
-                    .get(&(object_id.clone(), intent.target_version.clone())),
-                pins.contains(&intent.target_version),
-                &high_water,
-            ) else {
-                continue;
-            };
-            let receipt_nodes = self
-                .receipts
-                .range((
-                    Included((
-                        object_id.clone(),
-                        intent.target_version.clone(),
-                        id_lower_bound(),
-                    )),
-                    Unbounded,
-                ))
-                .take_while(|((record_object_id, record_version, _), _)| {
-                    record_object_id == object_id && record_version == &intent.target_version
-                })
-                .filter(|(_, receipt)| {
-                    intent
-                        .content_hash
-                        .as_ref()
-                        .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
-                })
-                .map(|(_, receipt)| receipt.replica_node_id.clone())
-                .collect::<BTreeSet<_>>();
-            let missing = intent
-                .desired_replica_node_ids
-                .iter()
-                .filter(|node_id| !receipt_nodes.contains(*node_id))
-                .count();
-            match root {
+        for demand in crate::metadata_summary::repair_demands_for_object(
+            object, intents, receipts, versions, &pins,
+        )
+        .values()
+        {
+            match demand.root {
                 crate::metadata_summary::RepairRoot::Permanent => {
-                    pending_repair_count = pending_repair_count.saturating_add(missing)
+                    pending_repair_count = pending_repair_count.saturating_add(1);
                 }
-                crate::metadata_summary::RepairRoot::Until(deadline) if missing > 0 => {
+                crate::metadata_summary::RepairRoot::Until(deadline) => {
                     let count = expiring_repairs.entry(deadline).or_default();
-                    *count = count.saturating_add(missing);
+                    *count = count.saturating_add(1);
                 }
-                crate::metadata_summary::RepairRoot::Until(_) => {}
             }
         }
 

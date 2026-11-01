@@ -345,6 +345,12 @@ pub struct DaemonDfsPeerTransport {
 }
 
 impl DaemonDfsPeerTransport {
+    /// Namespace captured by a deferred requester. This is identity data,
+    /// not proof that Main is currently available or that an effect is admitted.
+    pub fn captured_cluster_id(&self) -> Option<&sinomo_core::node::ClusterId> {
+        self.deferred_cluster_id.as_ref()
+    }
+
     /// Discovers and probes the main daemon for `data_dir` once, when a mounted
     /// service is opened. Clustered mounts fail closed when no local daemon is
     /// available instead of silently changing transport semantics.

@@ -42,6 +42,12 @@ pub enum DfsError {
     ContentStore { message: String },
     #[error("distributed DFS error: {message}")]
     Distributed { message: String },
+    #[error("DFS write precondition failed: {failure:?}")]
+    WritePreconditionFailed {
+        failure: crate::DfsWritePreconditionFailure,
+    },
+    #[error("conditional write unsupported at {path}: {reason}")]
+    UnsupportedWritePrecondition { path: String, reason: String },
     /// Raft votes and content receipts cannot substitute for an exact durable
     /// metadata-prepare recovery quorum.
     #[error(
@@ -290,6 +296,7 @@ impl From<MetadataBackendError> for DfsError {
                 code: error.rejection_code(),
                 message: error.to_string(),
             },
+            MetadataBackendError::WritePreconditionFailed { failure } => Self::WritePreconditionFailed { failure },
             MetadataBackendError::AlreadyExists { path } => Self::AlreadyExists { path },
             MetadataBackendError::DirectoryNotEmpty { path } => Self::DirectoryNotEmpty { path },
             error => Self::Metadata {

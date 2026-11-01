@@ -5194,13 +5194,7 @@ fn prepare_simple_sandbox_agent_home(
     data_dir: &SinomoDataDir,
     agent_id: &str,
 ) -> Result<String, String> {
-    let path = sinomo_agent::local_workspace::agent_home_sifs_path_for_id(agent_id);
-    // These libc accessors have no preconditions and only read the effective
-    // credentials of the current process.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    sifs_file_manager::SifsFileManagerBackend::open(data_dir)?
-        .ensure_posix_directory_with_attrs(&path, uid, gid, 0o700)?;
-    Ok(path)
+    sinomo_agent::local_workspace::prepare_agent_home_sifs(data_dir, agent_id)
 }
 
 #[cfg(not(unix))]

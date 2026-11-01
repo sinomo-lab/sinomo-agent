@@ -5027,18 +5027,14 @@ fn native_history_restore_joins_real_configuration_rebuild_before_browser_admiss
             Ok(Ok(_)) => panic!("restore replied while the real configuration was incomplete"),
         }
         // Readiness must not retain the browser FIFO needed by other work.
-        tokio::time::timeout_at(
+        let fifo = tokio::time::timeout_at(
             deadline,
-            sinomo_dfs::run_blocking_browser_task(
-                Arc::clone(&data_dir),
-                "history-configuration-admission-witness",
-                "history configuration admission witness",
-                || Ok(()),
-            ),
+            sinomo_dfs::browser_test_support::acquire_browser_fifo_for_test(&data_dir),
         )
         .await
         .unwrap()
         .unwrap();
+        drop(fifo);
         gap.release();
         let result = tokio::time::timeout_at(deadline, response).await.unwrap();
         let error = match result {

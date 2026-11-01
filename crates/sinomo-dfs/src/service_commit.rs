@@ -132,6 +132,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !intent.publication.is_current() {
             return self.commit_retained_file_intent(&intent, &pending);
         }
+        if intent.publication.current_precondition().is_some()
+            && self.metadata_backend.as_ref().ok_or_else(|| DfsError::Metadata {
+                message: "conditional publication requires its durable original owner".into(),
+            })?.prepared_operation_record(&format!("write:{}", intent.intent_id))?.is_none()
+        {
+            let original_path = intent.publication.current_precondition()
+                .expect("conditional publication checked above").path().to_string();
+            self.check_current_write_precondition(&intent.publication, &intent.file_system_id,
+                &intent.object_id, &original_path, intent.base_version.as_ref())?;
+        }
         let transient_create = self
             .transient_metadata_object_ids
             .contains(&intent.object_id);
@@ -338,6 +348,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         intent_id: &str,
     ) -> Result<(), DfsError> {
+        if self.coordinator.intent(intent_id).is_some_and(|intent|
+            intent.publication.current_precondition().is_some()) {
+            self.refresh_committed_write_projection(intent_id)?;
+        }
+        if self.recover_current_write_precondition_failure(intent_id)?.is_some() {
+            return Ok(());
+        }
         if self.coordinator.is_commit_ready(intent_id)? {
             if let (Some(intent), Some(pending)) = (
                 self.coordinator.intent(intent_id).cloned(),
@@ -351,6 +368,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.recover_prepared_write_for_retry(&intent, &hash, size)?;
             }
             if let Err(error) = self.apply_committed_intent(intent_id) {
+                if let DfsError::WritePreconditionFailed { failure } = &error {
+                    self.fail_current_write_precondition(intent_id, failure.clone())?;
+                    // The exact intent now owns a durable negative outcome.
+                    // Continue the callback's ordinary response flush; its
+                    // original caller observes the typed cause via write_outcome.
+                    return Ok(());
+                }
                 // A failed author attempt may have found a different immutable
                 // prepare with the same ID. It cannot authorize publication of
                 // that body. Recognize only an already committed outcome here;
@@ -602,6 +626,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         record: DfsWriteIntentRecord,
     ) -> Result<(), DfsError> {
         let intent_id = record.intent_id.as_str();
+        if matches!(record.status, DfsWriteIntentStatus::PreconditionFailed { .. }) {
+            self.coordinator.restore_intent(distributed_intent_from_record(&record))?;
+            self.remove_pending_write_state(intent_id);
+            return Ok(());
+        }
         if !record.publication.is_current() {
             return self.restore_retained_content_intent(&record);
         }
@@ -1270,6 +1299,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
         replica_node_ids: &[NodeId],
     ) -> Result<(), DfsError> {
+        self.put_metadata_intent_and_receipts_with_planning_shard(
+            intent,
+            content_hash,
+            replica_node_ids,
+            None,
+        )
+    }
+
+    pub(crate) fn put_metadata_intent_and_receipts_with_planning_shard(
+        &mut self,
+        intent: &DistributedWriteIntent,
+        content_hash: &str,
+        replica_node_ids: &[NodeId],
+        planning_shard: Option<&DfsMetadataShardConfig>,
+    ) -> Result<(), DfsError> {
         let object = self.current_object_for_write(&intent.object_id)?;
         let mut record = write_intent_record(intent, Some(content_hash), Some(object.clone()));
         let existing = self
@@ -1346,7 +1390,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if !effects.is_empty() {
-            self.publish_object_metadata_effects(&object, effects)?;
+            if let Some(shard) = planning_shard {
+                if shard.file_system_id != object.file_system_id
+                    || shard.primary_node_id != self.node_id
+                {
+                    return Err(DfsError::Metadata {
+                        message: "placement planning shard differs from the local object author".into(),
+                    });
+                }
+                // This is an input scope, not writer permission. The existing
+                // captured publisher acquires real execution and validates the
+                // native current assignment, epoch, freeze and prepared body.
+                self.publish_captured_object_metadata_effects(
+                    &object,
+                    DfsPreparedOperationScope {
+                        file_system_id: object.file_system_id.clone(),
+                        shard_id: DfsMetadataShardId::new(shard.shard_id.clone()),
+                        owner_epoch: shard.epoch,
+                        operation_id: format!("metadata:{}", sinomo_core::Id::generate()),
+                    },
+                    effects,
+                )?;
+            } else {
+                self.publish_object_metadata_effects(&object, effects)?;
+            }
         }
         Ok(())
     }
@@ -1551,7 +1618,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let history_span = tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
             stage = "dfs.commit.phase", phase = "history_refresh")
         .entered();
-        self.refresh_file_history_for_publication(base_object)?;
+        let configured_file_system = self.refresh_file_history_for_publication(base_object)?;
         drop(history_span);
         let mut planning_span = Some(
             tracing::trace_span!(target: "sinomo.perf", "dfs.commit.phase",
@@ -1788,6 +1855,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         || recorded.target_version != intent.target_version
                         || recorded.owner_epoch != intent.owner_epoch
                         || recorded.policy != intent.policy
+                        || recorded.publication != intent.publication
                         || recorded.content_hash.as_deref() != Some(content_hash)
                         || target.path != base_object.path
                         || target.kind != base_object.kind
@@ -1831,7 +1899,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
                         .map(Ok)
                         .unwrap_or_else(|| self.local_prepared_operation_shard())?;
-                    let (mut expected_object_versions, expected_path_occupants, _) =
+                    let (mut expected_object_versions, mut expected_path_occupants, _) =
                         crate::service_metadata::namespace_prepare_expectations(
                             self.metadata_backend
                                 .as_ref()
@@ -1858,7 +1926,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             })?;
                         target.expected_version = Some(expected.clone());
                     }
-                    self.publish_prepared_operation(
+                    if let Some(condition) = intent.publication.current_precondition() {
+                        crate::write_precondition::bind_guard(condition, &mut expected_object_versions,
+                            &mut expected_path_occupants).map_err(|message| DfsError::Metadata { message })?;
+                    }
+                    self.publish_prepared_operation_with_file_system(
                         DfsPreparedOperationPayload::for_namespace_transaction(
                             DfsPreparedOperationScope {
                                 file_system_id: intent.file_system_id.clone(),
@@ -1876,6 +1948,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             None,
                             None,
                         )?,
+                        configured_file_system.as_ref(),
                     )?
                 };
                 if !published.published {
@@ -2388,10 +2461,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get_intent_receipt(&intent.object_id, intent_id)?
                 .map(|receipt| receipt.to_intent_record()),
         };
-        let Some(record) = record.filter(|record| record.status == DfsWriteIntentStatus::Committed)
-        else {
+        let Some(record) = record.filter(|record| matches!(record.status,
+            DfsWriteIntentStatus::Committed | DfsWriteIntentStatus::PreconditionFailed { .. }))
+        else { return Ok(()); };
+        if let DfsWriteIntentStatus::PreconditionFailed { failure } = &record.status {
+            let mut recorded = crate::intent::distributed_intent_from_record(&record);
+            let epoch_advanced = recorded.owner_epoch >= intent.owner_epoch;
+            recorded.owner_epoch = intent.owner_epoch;
+            recorded.state = intent.state.clone();
+            if !epoch_advanced || recorded != intent
+                || self.writes.pending_writes.get(intent_id).is_some_and(|pending|
+                    record.content_hash.as_deref() != Some(pending.content_hash.as_str()))
+            {
+                return Err(DfsError::Metadata { message: "negative terminal differs from its original resident intent".into() });
+            }
+            self.coordinator.fail_intent_precondition(intent_id, failure.clone())?;
+            self.remove_pending_write_state(intent_id);
+            self.clear_active_replica_stage(&record.object_id, &record.target_version);
             return Ok(());
-        };
+        }
         let content_size = backend
             .get_version(&record.object_id, &record.target_version)?
             .and_then(|version| version.size_bytes);
@@ -2429,7 +2517,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         if let Some(intent) = self.coordinator.intent(intent_id)
-            && matches!(intent.state, DfsWriteIntentState::Committed)
+            && matches!(intent.state, DfsWriteIntentState::Committed
+                | DfsWriteIntentState::PreconditionFailed { .. })
         {
             return self.local_write_outcome(intent_id, intent);
         }
@@ -2473,6 +2562,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         intent: &DistributedWriteIntent,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        if let DfsWriteIntentState::PreconditionFailed { failure } = &intent.state {
+            return Err(DfsError::WritePreconditionFailed { failure: failure.clone() });
+        }
         if matches!(intent.state, DfsWriteIntentState::Committed) {
             let pending = self.writes.pending_writes.get(intent_id);
             let content_hash = pending

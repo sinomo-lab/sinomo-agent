@@ -65,10 +65,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn refresh_file_history_for_publication(
         &mut self,
         object: &DfsObjectMetadata,
-    ) -> Result<(), DfsError> {
+    ) -> Result<Option<DfsFileSystem>, DfsError> {
         let Some(file_system) = self.refresh_file_history_configuration(&object.file_system_id)?
         else {
-            return Ok(());
+            return Ok(None);
         };
         let path = crate::metadata_keys::normalize_posix_path(&object.path);
         if !file_system.retention_policies.is_empty() {
@@ -81,10 +81,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         .entered();
         self.namespace_shards_for_exact_paths(&object.file_system_id, [path.as_str()])?;
         drop(resolve_span);
-        // The actual scoped filesystem definition is sealed into the same
-        // prepared body as the content/namespace effect by the common facade.
-
-        Ok(())
+        // The fresh publication passes this accepted definition to the actual
+        // admission owner before sealing it beside the content effect.
+        Ok(Some(file_system))
     }
 
     pub(crate) fn require_file_history_shard_support(

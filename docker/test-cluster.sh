@@ -141,7 +141,7 @@
 #   SINOMO_TEST_PROBE_COMMAND_TIMEOUT       host/container cap for each test probe (default 300)
 #   SINOMO_TEST_ARTIFACT_COMMAND_TIMEOUT    cap for each failure artifact command (default 10)
 #   SINOMO_TEST_HOST_TIMEOUT_GRACE          host cleanup grace beyond the container timeout (default 5)
-#   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep node6 disconnected in network-heal leg (default 5)
+#   SINOMO_TEST_NETWORK_PARTITION_SECONDS   seconds to keep the selected nonprimary seg_b leaf disconnected in network-heal leg (default 5)
 #   SINOMO_TEST_NETWORK_ONLY=1              stop after network/KV baselines and DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_DFS_READY_ONLY=1            stop after initial DFS readiness/mutation/convergence gates
 #   SINOMO_TEST_DFS_READY_REQUIRE_QUIET=1   also enforce the standard quiet gate before ready-only returns
@@ -4195,31 +4195,172 @@ large_file_performance() {
     --param "timeout-seconds=$EXPECT_TIMEOUT"
 }
 
+# Observation DATA selects a real holder; the existing native fault probe
+# independently rechecks current membership and the exact expected identity.
+dfs_damage_roster_valid() {
+  jq -e 'type == "array" and length == 6
+    and ([.[].container] | sort) == ["node1","node2","node3","node4","node5","node6"]
+    and all(.[]; (.node_id | type) == "string" and .node_id != "")
+    and ([.[].node_id] | unique | length) == 6' "$1" >/dev/null
+}
+
+dfs_damage_participants_from_observation() {
+  local replicated="$1" object="$2" roster="$3" path="$4"
+  dfs_damage_roster_valid "$roster" || return 1
+  jq -ec --slurpfile view "$object" --slurpfile roster "$roster" --arg path "$path" '
+    $view[0].object as $o | $roster[0] as $nodes
+    | ($view[0].versions | map(select(.version == $o.version))) as $versions
+    | if .status != "passed" or ($versions | length) != 1
+        or $o.kind != "file" or ($o.path | ltrimstr("/")) != ($path | ltrimstr("/"))
+        or ($o.file_system_id | type) != "string" or $o.file_system_id == ""
+        or ($o.object_id | type) != "string" or $o.object_id == ""
+        or ($o.version | type) != "string" or $o.version == ""
+        or ($o.content_hash | type) != "string" or $o.content_hash == ""
+        or ($versions[0].size_bytes | type) != "number"
+        or $versions[0].size_bytes < 1 or ($versions[0].size_bytes | floor) != $versions[0].size_bytes
+        or .diagnostics.object_id != $o.object_id or .diagnostics.version != $o.version
+        or .diagnostics.content_hash != $o.content_hash or .diagnostics.size_bytes != $versions[0].size_bytes
+        or ($o.current_locations | type) != "array"
+        or ($o.current_locations | unique | length) < 2
+        or ($o.current_locations | unique | length) != ($o.current_locations | length)
+        or (.diagnostics.current_locations | type) != "array"
+        or ($view[0].receipts | type) != "array"
+        or any($o.current_locations[]; . as $id | ([$nodes[].node_id] | index($id)) == null) then
+        error("damage requires one exact current file/version/hash/size and two mapped current holders")
+      else . end
+    | .diagnostics.current_locations as $observed_locations
+    | ([$view[0].receipts[]
+        | select(.receipt.file_system_id == $o.file_system_id
+            and .receipt.object_id == $o.object_id
+            and .receipt.committed_version == $o.version
+            and .content_hash == $o.content_hash)
+        | .replica_node_id] | unique) as $receipt_nodes
+    | ($nodes | map(select(.node_id as $id | ($o.current_locations | index($id)) != null
+        and ($observed_locations | index($id)) != null
+        and ($receipt_nodes | index($id)) != null)) | sort_by(.container)) as $holders
+    | if ($holders | length) < 2 then error("damage has no distinct current admitted remaining holder") else . end
+    | (($holders | map(select(.container == "node3")) | .[0]) // $holders[0]) as $damage
+    | ($holders | map(select(.node_id != $damage.node_id)) | .[0]) as $remaining
+    | {damage_container:$damage.container, damage_node_id:$damage.node_id,
+       remaining_container:$remaining.container, remaining_node_id:$remaining.node_id,
+       expected_identity:{file_system_id:$o.file_system_id,object_id:$o.object_id,version:$o.version,
+         content_hash:$o.content_hash,size_bytes:$versions[0].size_bytes,node_id:$damage.node_id,path:$o.path},
+       remaining_copy_qualification:"current native location plus exact current-version receipt; subsequent ordinary read may route and is not local physical proof of the remaining holder"}
+  ' "$replicated"
+}
+
+dfs_damage_identity_matches() {
+  local expected="$1" object="$2"
+  jq -e --argjson expected "$expected" '
+    .object as $o | (.versions | map(select(.version == $o.version))) as $versions
+    | ($versions | length) == 1 and $o.kind == "file"
+      and $o.file_system_id == $expected.file_system_id and $o.object_id == $expected.object_id
+      and $o.version == $expected.version and $o.content_hash == $expected.content_hash
+      and $versions[0].size_bytes == $expected.size_bytes and $o.path == $expected.path
+  ' "$object" >/dev/null
+}
+
 disk_damage_recovery() {
   local path="/services/cluster-tests/$RUN_ID/disk-damage.bin"
   local seed="disk-damage-$RUN_ID"
+  local roster="$ARTIFACTS/disk-damage-native-roster.json" rows="$ARTIFACTS/disk-damage-native-roster.tsv"
+  local node native_id replicated object selection expected damage damage_id remaining remaining_id current fault_report
+  : >"$rows"
+  for node in $NODES; do
+    native_id="$(cluster_local_node_id "$node")" || return 1
+    printf '%s\t%s\n' "$node" "$native_id" >>"$rows"
+  done
+  jq -Rn '[inputs | split("\t") | {container:.[0],node_id:.[1]}]' <"$rows" >"$roster" || return 1
+  dfs_damage_roster_valid "$roster" || return 1
   run_probe node3 cluster.dfs.write \
-    --param "path=$path" \
-    --param "payload-seed=$seed" \
-    --param "payload-bytes=$DAMAGE_BYTES" \
-    --param "foreground-repair=true" \
-  && run_probe node3 cluster.dfs.expect-replicated \
-    --param "path=$path" \
-    --param "min-locations=2" \
-    --param "timeout-seconds=$EXPECT_TIMEOUT" \
-  && run_probe node3 cluster.dfs.damage-local-loose-blob \
-    --param "path=$path" \
-  && run_probe node3 cluster.dfs.expect-file \
-    --param "path=$path" \
-    --param "payload-seed=$seed" \
-    --param "payload-bytes=$DAMAGE_BYTES" \
-    --param "timeout-seconds=$EXPECT_TIMEOUT" \
-    --param "max-proc-write-bytes=0" \
-  && run_probe node4 cluster.dfs.remove \
-    --param "path=$path" \
-  && run_probe node3 cluster.dfs.expect-absent \
-    --param "path=$path" \
-    --param "timeout-seconds=$EXPECT_TIMEOUT"
+    --param "path=$path" --param "payload-seed=$seed" --param "payload-bytes=$DAMAGE_BYTES" \
+    --param "foreground-repair=true" || return 1
+  run_probe node3 cluster.dfs.expect-replicated \
+    --param "path=$path" --param "min-locations=2" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
+  replicated="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node3-cluster.dfs.expect-replicated.json"
+  object="$ARTIFACTS/disk-damage-object-before.json"
+  compose exec -T node1 sinomo dfs path "$path" --json >"$object" \
+    2>"$ARTIFACTS/disk-damage-object-before.stderr.log" || return 1
+  selection="$(dfs_damage_participants_from_observation "$replicated" "$object" "$roster" "$path" \
+    2>"$ARTIFACTS/disk-damage-selection.stderr.log")" || return 1
+  printf '%s\n' "$selection" >"$ARTIFACTS/disk-damage-selection.json"
+  damage="$(jq -er '.damage_container' <<<"$selection")" || return 1
+  damage_id="$(jq -er '.damage_node_id' <<<"$selection")" || return 1
+  remaining="$(jq -er '.remaining_container' <<<"$selection")" || return 1
+  remaining_id="$(jq -er '.remaining_node_id' <<<"$selection")" || return 1
+  expected="$(jq -ec '.expected_identity' <<<"$selection")" || return 1
+  # This verifies normative readable content from the remaining named holder's
+  # caller. It may route; it is deliberately not called physical local proof.
+  run_probe "$remaining" cluster.dfs.expect-file \
+    --param "path=$path" --param "payload-seed=$seed" --param "payload-bytes=$DAMAGE_BYTES" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT" --param "max-proc-write-bytes=0" || return 1
+  [ "$(cluster_local_node_id "$damage")" = "$damage_id" ] || return 1
+  [ "$(cluster_local_node_id "$remaining")" = "$remaining_id" ] || return 1
+  current="$ARTIFACTS/disk-damage-object-pre-fault.json"
+  compose exec -T node1 sinomo dfs path "$path" --json >"$current" \
+    2>"$ARTIFACTS/disk-damage-object-pre-fault.stderr.log" || return 1
+  dfs_damage_identity_matches "$expected" "$current" || return 1
+  jq -e --arg damage "$damage_id" --arg remaining "$remaining_id" \
+    '(.object.current_locations | index($damage)) != null and (.object.current_locations | index($remaining)) != null' \
+    "$current" >/dev/null || return 1
+  run_probe "$damage" cluster.dfs.damage-local-loose-blob \
+    --param "path=$path" --param "expected-object-json=$expected" || return 1
+  fault_report="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-$damage-cluster.dfs.damage-local-loose-blob.json"
+  jq -e --argjson expected "$expected" '
+    .status == "passed" and .diagnostics.expected_identity_checked == true and .diagnostics.unlink_completed == true
+      and .diagnostics.node == $expected.node_id and .diagnostics.path == $expected.path
+      and .diagnostics.file_system_id == $expected.file_system_id
+      and .diagnostics.object_id == $expected.object_id and .diagnostics.version == $expected.version
+      and .diagnostics.content_hash == $expected.content_hash and .diagnostics.size_bytes == $expected.size_bytes
+      and .diagnostics.fault_recipient_manifest.object_id == $expected.object_id
+      and .diagnostics.fault_recipient_manifest.content_hash == $expected.content_hash
+      and .diagnostics.fault_recipient_manifest.size_bytes == $expected.size_bytes
+  ' "$fault_report" >/dev/null || return 1
+  run_probe "$damage" cluster.dfs.expect-file \
+    --param "path=$path" --param "payload-seed=$seed" --param "payload-bytes=$DAMAGE_BYTES" \
+    --param "timeout-seconds=$EXPECT_TIMEOUT" --param "max-proc-write-bytes=0" || return 1
+  current="$ARTIFACTS/disk-damage-object-after-read.json"
+  compose exec -T node1 sinomo dfs path "$path" --json >"$current" \
+    2>"$ARTIFACTS/disk-damage-object-after-read.stderr.log" || return 1
+  dfs_damage_identity_matches "$expected" "$current" || return 1
+  run_probe node4 cluster.dfs.remove --param "path=$path" || return 1
+  run_probe "$damage" cluster.dfs.expect-absent \
+    --param "path=$path" --param "timeout-seconds=$EXPECT_TIMEOUT"
+}
+
+# Select the interrupted-write owner and distinct assigned seg_b leaf from
+# actual native observations. This never requests or rewrites placement.
+dfs_partition_participants_from_layout() {
+  local layout="$1" roster="$2"
+  dfs_converged_epoch_signature "$layout" >/dev/null || return 1
+  jq -ec --slurpfile roster "$roster" '
+    $roster[0] as $nodes
+    | if ($nodes | type) != "array"
+        or ($nodes | length) != 6
+        or ([$nodes[].container] | sort) != ["node1", "node2", "node3", "node4", "node5", "node6"]
+        or any($nodes[]; (.node_id | type) != "string" or .node_id == "")
+        or ([$nodes[].node_id] | unique | length) != 6 then
+        error("interrupted-write requires six uniquely observed native node identities")
+      else . end
+    | (.diagnostics.shards | map(select(.lane == "services")) | .[0]) as $services
+    | ([$services.primary_node_id] + $services.replica_node_ids) as $assigned
+    | ($nodes | map(select(.node_id == $services.primary_node_id))) as $writers
+    | if ($assigned | length) != 6
+        or ($assigned | unique | length) != 6
+        or ($assigned | sort) != ([$nodes[].node_id] | sort)
+        or ($writers | length) != 1 then
+        error("interrupted-write requires the complete observed six-node Services assignment")
+      else . end
+    | $writers[0] as $writer
+    | (if $writer.container == "node6" then "node5" else "node6" end) as $leaf
+    | ($nodes | map(select(.container == $leaf)) | .[0]) as $unavailable
+    | if $unavailable.node_id == $writer.node_id
+        or ($services.replica_node_ids | index($unavailable.node_id)) == null then
+        error("interrupted-write requires a distinct assigned nonprimary seg_b leaf")
+      else {writer_container: $writer.container, writer_node_id: $writer.node_id,
+            unavailable_container: $unavailable.container, unavailable_node_id: $unavailable.node_id}
+      end
+  ' "$layout"
 }
 
 temporary_network_recovery() {
@@ -4229,32 +4370,67 @@ temporary_network_recovery() {
   local payload="network heal $RUN_ID" new_payload="new write after network heal $RUN_ID"
   local operation_id="network-heal-$RUN_ID"
   local network="${PROJECT}_seg_b"
-  local node6_container node6_id baseline_report original_json assignment_json options_json
-  node6_container="$(compose ps -q node6)"
-  node6_id="$(cluster_local_node_id node6)" || return 1
-  if [ -z "$node6_container" ]; then
-    log "cannot find node6 container id"
+  local unavailable unavailable_container unavailable_id baseline_report original_json assignment_json options_json
+  local writer reader node node_id layout roster roster_rows selection network_observation
+
+  # A retained cohort may have completed a cooperative handoff. Resolve the
+  # actual Services owner once and keep this SAME writer through every phase.
+  # Reuse native layout/readiness validation and the ordinary local-ID reader;
+  # a missing/mismatched mapping fails before any fixture write or disconnect.
+  roster="$ARTIFACTS/network-heal-native-roster.json"
+  roster_rows="$ARTIFACTS/network-heal-native-roster.tsv"
+  : >"$roster_rows"
+  for node in $NODES; do
+    node_id="$(cluster_local_node_id "$node")" || return 1
+    printf '%s\t%s\n' "$node" "$node_id" >>"$roster_rows"
+  done
+  jq -Rn '[inputs | split("\t") | {container: .[0], node_id: .[1]}]' \
+    <"$roster_rows" >"$roster" || return 1
+  run_probe node1 cluster.dfs.shard-layout \
+    --param expected-replica-count=5 --param expected-distinct-primary-count=3 || return 1
+  layout="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node1-cluster.dfs.shard-layout.json"
+  selection="$(dfs_partition_participants_from_layout "$layout" "$roster" \
+    2>"$ARTIFACTS/network-heal-writer-selection.stderr.log")" || return 1
+  writer="$(jq -er '.writer_container' <<<"$selection")" || return 1
+  unavailable="$(jq -er '.unavailable_container' <<<"$selection")" || return 1
+  unavailable_id="$(jq -er '.unavailable_node_id' <<<"$selection")" || return 1
+  unavailable_container="$(compose ps -q "$unavailable")"
+  if [ -z "$unavailable_container" ]; then
+    log "cannot find selected $unavailable container id"
     return 1
   fi
+  network_observation="$ARTIFACTS/network-heal-unavailable-networks.json"
+  docker inspect --format '{{json .NetworkSettings.Networks}}' "$unavailable_container" \
+    >"$network_observation" || return 1
+  # Both supported leaves belong only to seg_b. A second attached network
+  # would invalidate this cut; refuse before seeding or disconnecting.
+  jq -e --arg network "$network" 'keys == [$network]' "$network_observation" >/dev/null || return 1
+  reader=node5
+  if [ "$unavailable" = node5 ]; then reader=node6; fi
+  jq -n --argjson selection "$selection" --arg container_id "$unavailable_container" \
+    --arg network "$network" --slurpfile layout "$layout" --slurpfile roster "$roster" \
+    '$selection + {unavailable_container_id: $container_id, interrupted_network: $network,
+      native_layout: $layout[0], native_roster: $roster[0]}' \
+    >"$ARTIFACTS/network-heal-writer-selection.json" || return 1
 
   # Seed under all six participants, then capture the actual immutable inputs
   # before disconnecting any member. Later phases retain this SAME node/ID/body.
-  run_probe node2 cluster.dfs.write \
+  run_probe "$writer" cluster.dfs.write \
     --param "path=$path" --param "payload=$original_payload" || return 1
-  run_probe node6 cluster.dfs.expect-file \
+  run_probe "$unavailable" cluster.dfs.expect-file \
     --param "path=$path" --param "payload=$original_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
-  run_probe node2 cluster.dfs.partition-write \
+  run_probe "$writer" cluster.dfs.partition-write \
     --param phase=baseline --param "path=$path" --param "payload=$payload" \
     --param "operation-id=$operation_id" --param required-participants=6 \
-    --param "unavailable-node-id=$node6_id" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
-  baseline_report="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-node2-cluster.dfs.partition-write.json"
+    --param "unavailable-node-id=$unavailable_id" --param "timeout-seconds=$EXPECT_TIMEOUT" || return 1
+  baseline_report="$ARTIFACTS/probe-$(printf '%03d' "$PROBE_INDEX")-$writer-cluster.dfs.partition-write.json"
   original_json="$(jq -ec '.diagnostics.original' "$baseline_report")" || return 1
   assignment_json="$(jq -ec '.diagnostics.assignment' "$baseline_report")" || return 1
   options_json="$(jq -ec '.diagnostics.write_options' "$baseline_report")" || return 1
 
-  log "disconnecting assigned node6 from $network for ${NETWORK_PARTITION_SECONDS}s"
-  if ! docker network disconnect "$network" "$node6_container" >/dev/null 2>&1; then
-    log "failed to disconnect node6 from $network"
+  log "disconnecting assigned $unavailable from $network for ${NETWORK_PARTITION_SECONDS}s"
+  if ! docker network disconnect "$network" "$unavailable_container" >/dev/null 2>&1; then
+    log "failed to disconnect $unavailable from $network"
     return 1
   fi
 
@@ -4262,43 +4438,52 @@ temporary_network_recovery() {
   sleep "$NETWORK_PARTITION_SECONDS"
   # An arbitrary write error cannot pass. This probe requires the exact native
   # Prepared body plus unchanged canonical content/nonvisible new generation.
-  run_probe node2 cluster.dfs.partition-write \
+  run_probe "$writer" cluster.dfs.partition-write \
     --param phase=blocked --param "path=$path" --param "payload=$payload" \
     --param "operation-id=$operation_id" --param required-participants=6 \
-    --param "unavailable-node-id=$node6_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    --param "unavailable-node-id=$unavailable_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
     --param "original-object-json=$original_json" --param "original-assignment-json=$assignment_json" \
     --param "original-options-json=$options_json" || rc=1
 
   # Heal even after missing/failed cut evidence; retain that failure in rc.
-  log "reconnecting node6 to $network"
-  if ! docker network connect --alias node6 "$network" "$node6_container" >/dev/null 2>&1; then
-    log "failed to reconnect node6 to $network"
+  log "reconnecting $unavailable to $network"
+  if ! docker network connect --alias "$unavailable" "$network" "$unavailable_container" >/dev/null 2>&1; then
+    log "failed to reconnect $unavailable to $network"
     return 1
   fi
   wait_for_cluster_ready "post-network-heal" || rc=1
-  run_probe node2 cluster.dfs.partition-write \
+  run_probe "$writer" cluster.dfs.partition-write \
     --param phase=recover --param "path=$path" --param "payload=$payload" \
     --param "operation-id=$operation_id" --param required-participants=6 \
-    --param "unavailable-node-id=$node6_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
+    --param "unavailable-node-id=$unavailable_id" --param "timeout-seconds=$EXPECT_TIMEOUT" \
     --param "original-object-json=$original_json" --param "original-assignment-json=$assignment_json" \
     --param "original-options-json=$options_json" || rc=1
   wait_for_dfs_ready || rc=1
   wait_for_dfs_converged || rc=1
-  run_probe node6 cluster.dfs.expect-file \
+  run_probe "$unavailable" cluster.dfs.expect-file \
     --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
-  run_probe node5 cluster.dfs.expect-file \
+  run_probe "$reader" cluster.dfs.expect-file \
     --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
-  run_probe node2 cluster.dfs.write \
+  run_probe "$writer" cluster.dfs.write \
     --param "path=$new_path" --param "payload=$new_payload" || rc=1
-  run_probe node6 cluster.dfs.expect-file \
+  run_probe "$unavailable" cluster.dfs.expect-file \
     --param "path=$new_path" --param "payload=$new_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
-  compose restart node6 >/dev/null 2>&1 || { log "node6 recovery reopen failed"; return 1; }
+  compose restart "$unavailable" >/dev/null 2>&1 || { log "$unavailable recovery reopen failed"; return 1; }
+  if [ "$(compose ps -q "$unavailable")" != "$unavailable_container" ]; then
+    log "selected interrupted container identity changed during reopen"
+    return 1
+  fi
   wait_for_cluster_ready "post-network-recovery-reopen" || rc=1
+  node_id="$(cluster_local_node_id "$unavailable")" || return 1
+  if [ "$node_id" != "$unavailable_id" ]; then
+    log "selected interrupted native identity changed during reopen"
+    return 1
+  fi
   wait_for_dfs_ready || rc=1
   wait_for_dfs_converged || rc=1
-  run_probe node6 cluster.dfs.expect-file \
+  run_probe "$unavailable" cluster.dfs.expect-file \
     --param "path=$path" --param "payload=$payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
-  run_probe node6 cluster.dfs.expect-file \
+  run_probe "$unavailable" cluster.dfs.expect-file \
     --param "path=$new_path" --param "payload=$new_payload" --param "timeout-seconds=$EXPECT_TIMEOUT" || rc=1
   return "$rc"
 }

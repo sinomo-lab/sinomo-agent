@@ -133,6 +133,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::Mkdir { .. } => "mkdir",
         DfsNamespaceOperation::MkdirWithAttrs { .. } => "mkdir-with-attrs",
         DfsNamespaceOperation::MkdirAtNoLinks { .. } => "mkdir-at-no-links",
+        DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(_) => "mkdir-at-no-links-with-attrs",
         DfsNamespaceOperation::MkdirAll { .. } => "mkdir-all",
         DfsNamespaceOperation::Rmdir { .. } => "rmdir",
         DfsNamespaceOperation::ConditionalRmdir { .. } => "conditional-rmdir",
@@ -178,6 +179,8 @@ pub(crate) fn dfs_distributed_write_result_trace_label(
 ) -> &'static str {
     match result {
         DfsDistributedWriteResult::Rejected { .. } => "rejected",
+        DfsDistributedWriteResult::PreconditionFailed { .. } => "precondition-failed",
+        DfsDistributedWriteResult::UnsupportedPrecondition { .. } => "unsupported-precondition",
         DfsDistributedWriteResult::ReconciliationRequired { .. } => "reconciliation-required",
         DfsDistributedWriteResult::Outcome { outcome } => match outcome {
             NetworkedDfsWriteOutcome::Pending { .. } => "pending",

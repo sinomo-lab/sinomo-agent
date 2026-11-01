@@ -383,6 +383,16 @@ impl ClusterKvPaths {
         node_id: &NodeId,
         snapshot: &KvSnapshot,
     ) -> bool {
+        if let Some(current) =
+            read_resident_raft_local_materialized_generation(&self.raft_wal_paths(node_id), node_id)
+        {
+            return match current {
+                Ok(current) => kv_snapshot_materialized_generation(snapshot) > current.value,
+                Err(_) => true,
+            };
+        }
+        // Cold, unavailable, denied or replaced native owners retain the
+        // established immutable/materialized/error behavior below.
         match read_cluster_kv_current_snapshot_for_node(self, node_id.clone()) {
             Ok(local_snapshot) => {
                 kv_snapshot_materialized_generation(snapshot)
@@ -856,3 +866,7 @@ mod tests {
         assert_eq!(turn.ticket, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "paths/imported_generation_tests.rs"]
+mod imported_generation_tests;

@@ -156,7 +156,6 @@ impl VerifiedOriginalRepairHistoryReturn {
 /// Correlation only. The caller must own the actual native RPC return before
 /// wrapping this DATA in an opaque transport capability. Generic senders and
 /// decoded inbox frames cannot establish that provenance.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn validate_original_repair_owned_rpc_return(
     expected: &DfsMessageCommand,
     response: DfsMessageResponse,
@@ -1586,6 +1585,12 @@ pub(crate) enum DfsBackgroundReplicaDispatch {
     /// The existing durable source freeze has retired this queued carrier.
     /// Its original named queue record is retained for handoff/recovery.
     Fenced,
+    /// The exact Original and named carrier already have a native close.
+    /// This retires only the worker reader; no durable fate or pin is changed.
+    Settled {
+        closed: crate::repair_queue_store::ClosedRepairBirth,
+        original_validation_error: DfsError,
+    },
 }
 
 /// Backend-free peer-sending capability with the shared detached outbox and
@@ -1599,6 +1604,13 @@ pub struct DfsNodeDetachedSendWorker {
     background_response_handler: Option<
         Arc<
             dyn Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
+                + Send
+                + Sync,
+        >,
+    >,
+    fresh_repair_response_handler: Option<
+        Arc<
+            dyn Fn(crate::runtime_host::FreshOriginalRepairReturn) -> Result<(), DfsError>
                 + Send
                 + Sync,
         >,
@@ -1664,6 +1676,68 @@ impl DfsNodeDetachedSendWorker {
         (records, omitted)
     }
 
+    /// Test-only negative DATA access to one actual already-owned call.
+    /// The callback cannot replace native queue/body authority or mint a send.
+    #[cfg(test)]
+    pub(crate) fn alter_checkpointed_replica_call_for_test<R>(
+        &self,
+        exact_message: &DfsRoutedMessage,
+        alter: impl FnOnce(&mut crate::DfsRoutedCall) -> R,
+    ) -> R {
+        let mut prepared = self
+            .prepared_replica_calls
+            .lock()
+            .expect("actual checkpointed replica calls");
+        assert_eq!(
+            prepared
+                .iter()
+                .filter(|request| &request.request.call.message == exact_message)
+                .count(),
+            1,
+            "negative DATA selects exactly one existing owned call"
+        );
+        let request = prepared
+            .iter_mut()
+            .find(|request| &request.request.call.message == exact_message)
+            .unwrap();
+        alter(&mut request.request.call)
+    }
+
+    /// Preserve missing descriptors in negative DATA observations instead of
+    /// invoking the ordinary producer's Some-only snapshot contract.
+    #[cfg(test)]
+    pub(crate) fn checkpointed_replica_call_data_for_test(
+        &self,
+        max_records: usize,
+    ) -> (
+        Vec<(DfsRoutedMessage, Option<crate::DfsRpcAttachmentDescriptor>)>,
+        usize,
+    ) {
+        let prepared = self
+            .prepared_replica_calls
+            .lock()
+            .expect("actual checkpointed replica calls");
+        let omitted = prepared.len().saturating_sub(max_records);
+        (
+            prepared
+                .iter()
+                .take(max_records)
+                .map(|request| {
+                    (
+                        request.request.call.message.clone(),
+                        request
+                            .request
+                            .call
+                            .attachment
+                            .as_ref()
+                            .map(|body| body.descriptor.clone()),
+                    )
+                })
+                .collect(),
+            omitted,
+        )
+    }
+
     pub fn drain(&mut self) -> Result<(), DfsError> {
         let background = self.drain_background_replica_calls();
         let ordinary = self
@@ -1708,6 +1782,16 @@ impl DfsNodeDetachedSendWorker {
     /// Deliver authenticated RPC returns through the existing admitted handler
     /// after releasing source mutation custody. The optional original is DATA
     /// from this SAME checkpointed local repair call, never peer authority.
+    pub(crate) fn set_fresh_repair_response_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(crate::runtime_host::FreshOriginalRepairReturn) -> Result<(), DfsError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.fresh_repair_response_handler = Some(Arc::new(handler));
+    }
+
     pub(crate) fn set_background_response_handler<F>(&mut self, handler: F)
     where
         F: Fn(DfsRoutedMessage, Option<&DfsRoutedMessage>) -> Result<(), DfsError>
@@ -1782,8 +1866,9 @@ impl DfsNodeDetachedSendWorker {
         if requests.is_empty() {
             return Ok(());
         }
-        // Capture the actual named physical rows BEFORE polling any carrier.
-        // Failed observation keeps the SAME readers parked; it supplies no fact.
+        // Inspect the complete selection BEFORE polling any carrier. Each
+        // failed observation retains its SAME reader without blocking a
+        // different call whose own native observation succeeded.
         let observed = requests
             .iter()
             .map(|request| {
@@ -1792,39 +1877,95 @@ impl DfsNodeDetachedSendWorker {
                     |handler| {
                         if request.producer_delivery.get().is_none() {
                             return Err(DfsError::Distributed {
-                                message: "background repair has no exact producer delivery basis"
-                                    .into(),
+                                message: "background repair has no exact producer delivery basis".into(),
                             });
                         }
-                        handler(DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
+                        if let Some(prepared) = request.request.native_repair_custody.as_ref() {
+                            prepared.before_dispatch()
+                        } else {
+                            handler(DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
                             message: request.request.call.message.clone(),
                         })
+                    }
                     },
                 )
             })
-            .collect::<Result<Vec<_>, DfsError>>();
-        let observed = match observed {
-            Ok(observed) => observed,
-            Err(error) => {
-                self.prepared_replica_calls
-                    .lock()
-                    .map_err(|_| DfsError::Network {
-                        message: "background DFS replica dispatch owner is poisoned".into(),
-                    })?
-                    .extend(requests);
-                return Err(error);
-            }
-        };
-        let (mut requests, mut observed): (Vec<_>, Vec<_>) = requests
-            .into_iter()
-            .zip(observed)
-            .filter_map(|(request, observation)| match observation {
-                DfsBackgroundReplicaDispatch::Observed(record) => Some((request, record)),
-                DfsBackgroundReplicaDispatch::Fenced => None,
-            })
-            .unzip();
+            .collect::<Vec<_>>();
         let mut first_error = None;
-        #[cfg(any(test, feature = "test-support"))]
+        let mut blocked = Vec::new();
+        let mut ready_requests = Vec::new();
+        let mut ready_observed = Vec::new();
+        for (request, observation) in requests.into_iter().zip(observed) {
+            match observation {
+                Ok(DfsBackgroundReplicaDispatch::Observed(record)) => {
+                    ready_requests.push(request);
+                    ready_observed.push(record);
+                }
+                Ok(DfsBackgroundReplicaDispatch::Fenced) => {}
+                Ok(DfsBackgroundReplicaDispatch::Settled { closed, original_validation_error }) => {
+                    // The native proof names the exact command/alias. Bind the
+                    // actual queued descriptor too before retiring its reader.
+                    // Native Original validation requires an external stored
+                    // descriptor. Compare its exact optional presence and all
+                    // native fields, including fields added in the future.
+                    let attachment_matches = request.request.call.attachment.as_ref().map(|attachment| &attachment.descriptor)
+                        == Some(closed.attachment());
+                    if attachment_matches {
+                        // No native close, pin release or carrier occurs here.
+                        drop(closed);
+                    } else {
+                        tracing::debug!(target: "sinomo.dfs.repair",
+                            stage = "dfs.repair.dispatch.owned_blocked",
+                            source = %request.request.call.message.source_node_id,
+                            target = %request.request.target_node_id,
+                            frame_id = request.request.call.message.frame_id,
+                            message_id = request.request.call.message.message_id,
+                            intent_id = %closed.root().subject.intent_id,
+                            request_id = %closed.root().subject.request_id,
+                            retirement_attachment_matches = false,
+                            error = %original_validation_error,
+                            "closed Original does not identify this worker reader descriptor");
+                        first_error.get_or_insert(original_validation_error);
+                        blocked.push(request);
+                    }
+                }
+                Err(error) => {
+                    if let DfsNetworkMessage::RepairReplica(command) = &request.request.call.message.message {
+                        tracing::debug!(target: "sinomo.dfs.repair",
+                            stage = "dfs.repair.dispatch.owned_blocked",
+                            intent_id = %command.intent_id,
+                            request_id = %command.request_id,
+                            source = %request.request.call.message.source_node_id,
+                            target = %request.request.target_node_id,
+                            frame_id = request.request.call.message.frame_id,
+                            message_id = request.request.call.message.message_id,
+                            error = %error,
+                            "native Repair remains owned while independent validated calls may continue");
+                    }
+                    first_error.get_or_insert(error);
+                    blocked.push(request);
+                }
+            }
+        }
+        if !blocked.is_empty() {
+            // Poisoned bookkeeping cannot authorize a send. Retain these
+            // existing owned readers even when surfacing that bookkeeping error.
+            match self.prepared_replica_calls.lock() {
+                Ok(mut parked) => parked.extend(blocked),
+                Err(poisoned) => {
+                    let mut parked = poisoned.into_inner();
+                    parked.extend(blocked);
+                    parked.extend(ready_requests);
+                    return Err(first_error.unwrap_or_else(|| DfsError::Network {
+                        message: "background DFS replica dispatch owner is poisoned".into(),
+                    }));
+                }
+            }
+        }
+        if ready_requests.is_empty() {
+            return first_error.map_or(Ok(()), Err);
+        }
+        let (mut requests, mut observed) = (ready_requests, ready_observed);
         {
             let mut ordinary = Vec::new();
             let mut ordinary_observed = Vec::new();
@@ -1841,11 +1982,27 @@ impl DfsNodeDetachedSendWorker {
                 // returns before any generic inbox/ordinary local application.
                 let returned = self.transport.current_send_options("send admitted native Repair custody")
                     .map_err(DfsError::from_network)
-                    .and_then(|options| crate::runtime_host::send_prepared_native_repair_custody(
-                        prepared, request.request.call, options,
-                    ));
+                    .and_then(|options| {
+                        crate::runtime_host::send_prepared_native_repair_custody(
+                            prepared,
+                            request.request.call,
+                            options,
+                            self.transport.operation_deadline,
+                        )
+                    });
                 match returned {
-                    Ok(completion) => {
+                    Ok(crate::runtime_host::NativeOriginalRepairReturn::Fresh(fresh)) => {
+                        let result = self.fresh_repair_response_handler.as_ref()
+                            .ok_or_else(|| DfsError::Metadata { message: "fresh native Repair return has no current admitted response owner".into() })
+                            .and_then(|handler| handler(fresh));
+                        if let Err(error) = result {
+                            // The actual return was already persisted as DATA.
+                            // Never park or recreate its consumed fresh wrapper.
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    #[cfg(any(test, feature = "test-support"))]
+        Ok(crate::runtime_host::NativeOriginalRepairReturn::Data(completion)) => {
                         let completion = Arc::new(completion);
                         if let Err(error) = crate::runtime_host::defer_native_owned_repair_completion(&completion) {
                             first_error.get_or_insert(error);
@@ -1853,6 +2010,12 @@ impl DfsNodeDetachedSendWorker {
                                 first_error.get_or_insert_with(|| DfsError::from_network(error));
                             }
                         }
+                    }
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    Ok(crate::runtime_host::NativeOriginalRepairReturn::Data(_)) => {
+                        first_error.get_or_insert_with(|| DfsError::Metadata {
+                            message: "serving native Repair unexpectedly returned selected DATA-only custody".into(),
+                        });
                     }
                     Err(error) => {
                         let delivery_state = match &error { DfsError::NetworkDelivery { delivery_state, .. } => Some(*delivery_state), _ => None };
@@ -2350,6 +2513,7 @@ impl DfsNodeTransport {
             deferred_target_node_ids: BTreeSet::new(),
             prepared_replica_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             background_response_handler: None,
+            fresh_repair_response_handler: None,
             background_delivery_handler: None,
         }
     }
@@ -4695,7 +4859,6 @@ impl AsyncDfsMessageTransport for DfsNodeTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> DfsMessageTransportFuture<'a, Result<Vec<DfsRoutedSendOutcome>, NetworkError>> {
-        #[cfg(any(test, feature = "test-support"))]
         if requests.iter().any(|request| request.native_repair_custody.is_some()) {
             return Box::pin(async { Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() }) });
         }
@@ -5549,6 +5712,13 @@ impl DfsNodeTransport {
 }
 
 impl DfsMessageTransport for DfsNodeTransport {
+    fn native_replica_send_options(
+        &self,
+    ) -> Result<Option<(DfsObjectRpcSendOptions, Option<Instant>)>, NetworkError> {
+        self.current_send_options("send native original Repair")
+            .map(|options| Some((options, self.operation_deadline)))
+    }
+
     fn send_local_metadata_query_to_main(
         &mut self,
         message: DfsRoutedMessage,
@@ -5710,7 +5880,6 @@ impl DfsMessageTransport for DfsNodeTransport {
         requests: Vec<DfsRoutedSend>,
         max_inflight: usize,
     ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
-        #[cfg(any(test, feature = "test-support"))]
         if requests.iter().any(|request| request.native_repair_custody.is_some()) {
             return Err(NetworkError::Serialization { detail: "native custody preparation requires its actual checkpointed worker".into() });
         }
@@ -8940,6 +9109,9 @@ impl DfsNodeTransport {
             return Ok(());
         }
         if target_node_id == &self.local_node_id {
+            if attachment.is_none() && self.deliver_local_write_response(&message)? {
+                return Ok(());
+            }
             let message = crate::materialize_dfs_routed_call_sync(DfsRoutedCall {
                 message,
                 attachment,
@@ -9010,6 +9182,9 @@ impl DfsNodeTransport {
                 return Ok(());
             }
             if target_node_id == &self.local_node_id {
+                if attachment.is_none() && self.deliver_local_write_response(&message)? {
+                    return Ok(());
+                }
                 let message =
                     crate::message_transport::materialize_dfs_routed_call(DfsRoutedCall {
                         message,
@@ -9584,8 +9759,17 @@ impl NetworkedDfsService<DfsNodeTransport> {
         command: DfsMessageCommand,
         preingested_blob: Option<ContentStoreQuarantinedBlob>,
     ) -> DfsMessageProcessReport {
+        self.process_message_command_report_with_native_return(command, preingested_blob, None)
+    }
+
+    pub(crate) fn process_message_command_report_with_native_return(
+        &mut self,
+        command: DfsMessageCommand,
+        preingested_blob: Option<ContentStoreQuarantinedBlob>,
+        fresh: Option<crate::runtime_host::FreshOriginalRepairReturn>,
+    ) -> DfsMessageProcessReport {
         self.begin_message_committed_work();
-        let outcome = self.process_message_command_inner(command, preingested_blob);
+        let outcome = self.process_message_command_inner(command, preingested_blob, fresh);
         let committed_work = self.take_message_committed_work();
         let repair_capture = self.coordinator.message_repair_capture_status();
         let pending_write_count = self.writes.pending_writes.len();
@@ -9658,6 +9842,47 @@ impl NetworkedDfsService<DfsNodeTransport> {
         &mut self,
         command: DfsMessageCommand,
         preingested_blob: Option<ContentStoreQuarantinedBlob>,
+    fresh: Option<crate::runtime_host::FreshOriginalRepairReturn>,
+    ) -> Result<DfsMessageProcessResult, DfsError> {
+        if !matches!(&command.routed_message.message, DfsNetworkMessage::StageBlob(_)) {
+            return self.process_message_with_current_callbacks(command, preingested_blob, fresh);
+        }
+        // A prior Routine turn can retain a Fetch response whose receipt needs
+        // authority from this Stage sender. It belongs to the same lane's next
+        // Routine admission, rather than to the Stage's current response drain.
+        let incoming = std::mem::take(&mut self.transport.incoming_messages);
+        let inbound = self.transport.served_message.as_mut()
+            .map(|served| std::mem::take(&mut served.inbound_messages));
+        let inbox = self.transport.response_inbox.take();
+        // This synchronous Result boundary includes every typed failure and
+        // cancellation. Only current-Stage callbacks enter the ordinary drain
+        // and finish; restore the preexisting custody before returning either.
+        let result = self.process_message_with_current_callbacks(command, preingested_blob, fresh);
+        self.transport.incoming_messages.extend(incoming);
+        if let Some(inbound) = inbound {
+            self.transport.served_mut().inbound_messages.extend(inbound);
+        }
+        debug_assert!(self.transport.response_inbox.is_none(),
+            "Stage processing does not register a new routed-write response owner");
+        self.transport.response_inbox = inbox;
+        if self.transport.pending_incoming_count()
+            .map_or(true, |pending| pending != Some(0))
+        {
+            // Preserve the existing later owner/wake even with no repair row.
+            // This requests validation; it grants no publication authority.
+            self.record_message_committed_work(crate::DfsMessageCommittedWork {
+                repair_maintenance: true,
+                ..Default::default()
+            });
+        }
+        result
+    }
+
+    fn process_message_with_current_callbacks(
+        &mut self,
+        command: DfsMessageCommand,
+        preingested_blob: Option<ContentStoreQuarantinedBlob>,
+    fresh: Option<crate::runtime_host::FreshOriginalRepairReturn>,
     ) -> Result<DfsMessageProcessResult, DfsError> {
         let request_id = command.request_id;
         let allow_write_repair_progress =
@@ -9667,7 +9892,15 @@ impl NetworkedDfsService<DfsNodeTransport> {
         self.transport
             .begin_message(&command.routed_message)
             .map_err(DfsError::from_network)?;
-        let initial = if let Some(blob) = preingested_blob {
+        let initial = if let Some(fresh) = fresh {
+            if preingested_blob .is_some() || fresh.returned_frame() != &command.routed_message{
+                Err(DfsError::Metadata {
+                    message: "fresh native Repair return used for another served command".into(),
+                })
+            } else {
+                self.handle_fresh_original_repair_return(fresh)
+                        .map(|event| vec![event])}
+        } else if let Some(blob) = preingested_blob {
             let routed = command.routed_message;
             if routed.target_node_id != self.node_id {
                 Err(DfsError::Network {
@@ -10029,6 +10262,9 @@ where
 
 #[cfg(test)]
 mod response_delivery_tests;
+
+#[cfg(test)]
+mod stage_callback_tests;
 
 #[cfg(test)]
 impl DfsNodeTransport {

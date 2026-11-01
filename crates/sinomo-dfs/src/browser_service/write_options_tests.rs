@@ -288,7 +288,7 @@ fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
     runtime.close().unwrap();
 }
 
-fn native_browser_runtime(
+pub(super) fn native_browser_runtime(
     name: &str,
     count: usize,
 ) -> (
@@ -304,7 +304,7 @@ fn native_browser_runtime(
     (runtime, nodes)
 }
 
-fn native_browser_policy(
+pub(super) fn native_browser_policy(
     control: &crate::SharedDfsControlPlaneKvClient<Box<dyn crate::DfsControlPlaneKvClient>>,
     path: &str,
     policy: crate::DfsPlacementPolicy,

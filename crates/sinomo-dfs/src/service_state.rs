@@ -8,11 +8,11 @@ pub(crate) use reads::DfsReadState;
 mod replication;
 pub(crate) use replication::{DfsReplicationState, RoutedReplicaProjection};
 
-pub(crate) use namespace::DfsNamespaceExecution;
+pub(crate) use namespace::{DfsNamespaceExecution, NamespaceReadSet};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -373,6 +373,7 @@ pub(crate) struct DfsNamespaceOperationContext {
 pub struct DfsCancellationFlag {
     local: Arc<AtomicBool>,
     inherited: Arc<[DfsCancellationFlag]>,
+    generation: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl DfsCancellationFlag {
@@ -389,6 +390,16 @@ impl DfsCancellationFlag {
         Self {
             local: Arc::new(AtomicBool::new(false)),
             inherited: inherited.into_iter().collect::<Vec<_>>().into(),
+            generation: None,
+        }
+    }
+
+    /// Observe the existing owner's generation directly, including while a
+    /// synchronous protocol wait prevents its async caller from being polled.
+    pub(crate) fn after_generation_change(source: Arc<AtomicU64>, observed: u64) -> Self {
+        Self {
+            generation: Some((source, observed)),
+            ..Self::default()
         }
     }
 
@@ -401,6 +412,9 @@ impl DfsCancellationFlag {
     pub fn is_cancelled(&self) -> bool {
         self.local.load(Ordering::Acquire)
             || self.inherited.iter().any(DfsCancellationFlag::is_cancelled)
+            || self.generation.as_ref().is_some_and(|(source, observed)| {
+                source.load(Ordering::Acquire) != *observed
+            })
     }
 }
 

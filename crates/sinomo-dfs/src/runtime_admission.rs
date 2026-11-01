@@ -150,7 +150,7 @@ pub(crate) struct DfsMutationScheduler {
     shard_gates: Mutex<BTreeMap<DfsMutationLaneKey, Arc<tokio::sync::Semaphore>>>,
     shard_gate_limit: usize,
     maintenance_interest_count: AtomicUsize,
-    foreground_generation: AtomicU64,
+    foreground_generation: Arc<AtomicU64>,
     foreground_notify: tokio::sync::Notify,
 }
 
@@ -171,7 +171,7 @@ impl DfsMutationScheduler {
             shard_gates: Mutex::new(BTreeMap::new()),
             shard_gate_limit,
             maintenance_interest_count: AtomicUsize::new(0),
-            foreground_generation: AtomicU64::new(0),
+            foreground_generation: Arc::new(AtomicU64::new(0)),
             foreground_notify: tokio::sync::Notify::new(),
         }
     }
@@ -357,6 +357,13 @@ pub(crate) struct DfsMaintenanceForegroundPreemption {
 }
 
 impl DfsMaintenanceForegroundPreemption {
+    pub(crate) fn cancellation_flag(&self) -> crate::DfsCancellationFlag {
+        crate::DfsCancellationFlag::after_generation_change(
+            Arc::clone(&self.scheduler.foreground_generation),
+            self.foreground_generation,
+        )
+    }
+
     pub fn is_requested(&self) -> bool {
         self.scheduler.foreground_generation.load(Ordering::Acquire) != self.foreground_generation
     }

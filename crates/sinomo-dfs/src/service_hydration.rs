@@ -15,52 +15,6 @@ fn hydration_never_cancelled() -> bool {
     false
 }
 
-/// Whether one hydrated committed intent can still own repair work for the
-/// authoritative visible object.
-///
-/// A later metadata-only version may retain the same immutable content, and a
-/// committed target may still need publication while the visible object is at
-/// its base. A later authoritative tombstone is also positive proof that the
-/// old content target is terminal. Missing hashes on a live object or a
-/// mismatched durable identity are ambiguous and remain fail-closed. Only this
-/// positive supersession evidence may discard reconstructed repair work.
-fn hydrated_committed_intent_repair_may_be_actionable(
-    intent: &DfsWriteIntentRecord,
-    visible_object: Option<&DfsObjectMetadata>,
-) -> bool {
-    let Some(visible_object) = visible_object else {
-        return true;
-    };
-    if visible_object.file_system_id != intent.file_system_id
-        || visible_object.object_id != intent.object_id
-    {
-        return true;
-    }
-    if visible_object.version == intent.target_version {
-        return true;
-    }
-    if intent
-        .base_version
-        .as_ref()
-        .is_some_and(|base_version| visible_object.version == *base_version)
-    {
-        return true;
-    }
-    if visible_object.kind == DfsObjectKind::Tombstone {
-        return false;
-    }
-    let (Some(visible_content_hash), Some(intent_content_hash)) = (
-        visible_object.content_hash.as_deref(),
-        intent.content_hash.as_deref(),
-    ) else {
-        return true;
-    };
-    if visible_content_hash == intent_content_hash {
-        return true;
-    }
-    false
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Intent history owns repair/outcome records, not the current CAS head.
     /// Restore that head from the durable visible view after replaying a
@@ -646,15 +600,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         durable_shard_id,
                     )?;
                     self.restore_retained_content_intent(&intent_record)?;
-                    let retained_live = intent_record
-                        .content_hash
-                        .as_deref()
-                        .map(|hash| {
-                            self.retained_file_content_is_live(
-                                &intent_record.object_id,
-                                &intent_record.target_version,
-                                hash,
-                            )
+                    let retained_live = self
+                        .metadata
+                        .object(&intent_record.object_id)
+                        .map(|object| {
+                            self.committed_repair_content_is_active(object, &intent_record)
                         })
                         .transpose()?
                         .unwrap_or(false);
@@ -801,18 +751,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
                 if matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
                     recovered_commit_promotion_records.push(intent_record.clone());
-                    if hydrated_committed_intent_repair_may_be_actionable(
-                        &intent_record,
-                        self.metadata.object(&intent_record.object_id),
-                    ) || intent_record
-                        .content_hash
-                        .as_deref()
-                        .map(|hash| {
-                            self.retained_file_content_is_live(
-                                &intent_record.object_id,
-                                &intent_record.target_version,
-                                hash,
-                            )
+                    if self
+                        .metadata
+                        .object(&intent_record.object_id)
+                        .map(|object| {
+                            self.committed_repair_content_is_active(object, &intent_record)
                         })
                         .transpose()?
                         .unwrap_or(false)

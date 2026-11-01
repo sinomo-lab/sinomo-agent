@@ -1847,6 +1847,34 @@ where
                     .to_string(),
             });
         }
+        let establishment_deadline = tokio::time::Instant::now() + connect_timeout;
+        let original_dispatcher =
+            crate::routed_stream_pool::registered_routed_stream_incoming_token(
+                &state.local_node_id,
+            );
+        let validate_continuation_context = || {
+            let current = directory_identity.effective_generation(directory.routing_version()?.0);
+            if current != directory_generation {
+                return Err(NetworkError::Directory {
+                    detail: "directory changed during carrier establishment".into(),
+                });
+            }
+            if crate::network_module_routing_generation() != module_generation {
+                return Err(NetworkError::Directory {
+                    detail: "network module registry changed during carrier establishment".into(),
+                });
+            }
+            if crate::routed_stream_pool::registered_routed_stream_incoming_token(
+                &state.local_node_id,
+            ) != original_dispatcher
+            {
+                return Err(NetworkError::Directory {
+                    detail: "local reverse dispatcher changed during carrier establishment".into(),
+                });
+            }
+            Ok(())
+        };
+        let mut cold_establishment = false;
         let stream_result = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_destination_affinity_and_route_compatibility(
             directory_identity.routed_stream_scope(&state.cluster_id),
             module_generation,
@@ -1858,31 +1886,26 @@ where
             options.protection,
             connect_timeout,
             async {
-                // The pool polls this only when a real carrier must be
-                // established. Live carriers do not trigger freshness reads.
-                let establishment_deadline = tokio::time::Instant::now() + connect_timeout;
-                let connector = if connector.has_live_observed_route(target_node_id, destination_process_affinity) {
-                    connector
-                } else {
-                    freshness::refresh_connector(
-                        paths, &directory, state, target_node_id, options, establishment_deadline,
-                        (directory_identity, module_generation, directory_generation),
-                    ).await?.unwrap_or(connector)
-                };
-                let remaining = establishment_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(NetworkError::timeout("establish routed service RPC stream", NetworkTimeoutPhase::Connect,
-                        connect_timeout, NetworkDeliveryState::DefinitelyNotSent));
+                // The pool polls this only for a cold actual carrier. A live
+                // pooled carrier never starts these read-only source futures.
+                cold_establishment = true;
+                validate_continuation_context()?;
+                let result = freshness::connect_with_sources(
+                    paths, &directory, state, target_node_id, options,
+                    establishment_deadline, connect_timeout,
+                    (directory_identity, module_generation, directory_generation),
+                    &original_dispatcher, connector,
+                ).await;
+                match result {
+                    Ok(stream) => {
+                        validate_continuation_context()?;
+                        Ok(stream)
+                    }
+                    Err(error) => Err(error),
                 }
-                connector.connect_with_destination_process_affinity(
-                    target_node_id.clone(),
-                    crate::ConnectOptions { constraints, timeout: remaining, protection: options.protection },
-                    destination_process_affinity,
-                ).await
             },
             None,
-        )
-        .await;
+        ).await;
         record_routed_rpc_timeline_stage(
             trace,
             crate::network_timeline_stage::ENDPOINT_OPEN,
@@ -1890,6 +1913,17 @@ where
             stream_result.is_ok(),
         );
         let stream = stream_result?;
+        if cold_establishment {
+            validate_continuation_context()?;
+            if establishment_deadline <= tokio::time::Instant::now() {
+                return Err(NetworkError::timeout(
+                    "establish routed service RPC stream",
+                    NetworkTimeoutPhase::Connect,
+                    connect_timeout,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                ));
+            }
+        }
         let exchange_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
