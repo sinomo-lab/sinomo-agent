@@ -43,7 +43,6 @@ pub(crate) use recovery_ballot::{
 
 const DFS_KV_PREFIX: &str = "/dfs";
 const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
-const METADATA_OPERATION_FLOOR_PUBLISH_RETRIES: usize = 4;
 const METADATA_SHARD_AUTHORITY_READ_RETRIES: usize = 4;
 const METADATA_MEMBERSHIP_HANDOFF_RETRIES: usize = 4;
 const PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION: u32 = 1;
@@ -61,23 +60,6 @@ pub struct DfsNativeTxnCommit {
     pub request: sinomo_core::kv::KvTxnRequest,
     pub result: sinomo_core::kv::ClusterKvTxnCompactCommitResult,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DfsMetadataOperationPermit {
-    pub file_system_id: DfsFileSystemId,
-    pub shard_id: String,
-    pub owner_epoch: u64,
-    pub operation_digest: String,
-    pub prepare_sequence: u64,
-    pub permit_id: String,
-    pub native_commit: Option<DfsNativeTxnCommit>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum MetadataOperationPermitAttempt {
-    Certified(DfsMetadataOperationPermit),
-    Rejected,
-    RetryAfterCompareMiss,
-}
 
 fn metadata_operation_authority_view_error_is_retryable(error: &KvError) -> bool {
     match error {
@@ -89,8 +71,8 @@ fn metadata_operation_authority_view_error_is_retryable(error: &KvError) -> bool
         // Cluster-backed clients retain the typed cluster error inside the KV
         // filesystem adapter. This exact marker is emitted when ReadIndex
         // reached quorum but the resident Raft generation changed before the
-        // projection was consumed. Retrying the same operation-bound floor is
-        // safe: its digest and prepared sequence are compared in Raft below.
+        // projection was consumed. Retrying the same exact-key authority read
+        // is safe: the read has no effect.
         KvError::Io { detail, .. } => {
             detail.contains("resident Raft view changed after ReadIndex quorum")
                 && detail.contains("retry the read")
@@ -973,9 +955,8 @@ pub fn metadata_shard_authority_barrier_key(
 /// Bounded quorum-committed floor that primary transfer must preserve.
 ///
 /// This is deliberately separate from [`metadata_shard_authority_barrier_key`]:
-/// ordinary authority checks overwrite that generic barrier, while an
-/// operation permit must remain effective until a later prepared operation
-/// advances this single per-shard floor.
+/// ordinary authority checks overwrite that generic barrier, while a committed
+/// floor stays in force for every later primary transfer of the shard.
 pub fn metadata_shard_operation_floor_key(
     file_system_id: &DfsFileSystemId,
     shard_id: &str,
@@ -4050,214 +4031,6 @@ impl<'a> DfsControlPlaneStore<'a> {
                 failure: Vec::new(),
             })?
             .succeeded)
-    }
-
-    /// Obtain an operation-bound quorum permit while the exact shard
-    /// assignment is still committed. This is the partition fallback for a
-    /// canonical DFS mutation. The fixed per-shard record also advances the
-    /// minimum prepared journal sequence a future primary must have replayed;
-    /// it is bounded consensus state, not per-file metadata or an operation
-    /// log.
-    /// sinomo:kv-consistency: Commit an operation-bound quorum permit when the configured metadata shard cannot fully acknowledge.
-    pub fn certify_metadata_shard_operation(
-        &mut self,
-        expected: &DfsMetadataShardConfig,
-        operation_digest: &str,
-        prepared_sequence: u64,
-    ) -> Result<Option<String>, KvError> {
-        self.certify_metadata_shard_operation_with_native_authority(
-            expected,
-            operation_digest,
-            prepared_sequence,
-        )
-        .map(|permit| permit.map(|permit| permit.permit_id))
-    }
-
-    /// The degraded metadata path has already retained its real DFS recovery
-    /// quorum. Mint only this operation's Raft floor/barrier against the exact
-    /// assignment, prior floor and absent handoff; compact-view retry retains
-    /// the same digest/prepare sequence and the existing retry budget.
-    /// sinomo:kv-consistency: Mint an exact operation-bound Raft permit against assignment/floor bytes and absent handoff after DFS recovery quorum.
-    pub(crate) fn certify_metadata_shard_operation_with_native_authority(
-        &mut self,
-        expected: &DfsMetadataShardConfig,
-        operation_digest: &str,
-        prepared_sequence: u64,
-    ) -> Result<Option<DfsMetadataOperationPermit>, KvError> {
-        if operation_digest.is_empty() || prepared_sequence == 0 {
-            return Ok(None);
-        }
-        let shard_key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
-        let floor_key =
-            metadata_shard_operation_floor_key(&expected.file_system_id, &expected.shard_id);
-        let handoff_key =
-            metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
-        for attempt in 0..METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
-            let retryable_error = match self.certify_metadata_shard_operation_once(
-                expected,
-                operation_digest,
-                prepared_sequence,
-                &shard_key,
-                &floor_key,
-                &handoff_key,
-            ) {
-                Ok(MetadataOperationPermitAttempt::Certified(permit_id)) => {
-                    return Ok(Some(permit_id));
-                }
-                Ok(MetadataOperationPermitAttempt::Rejected) => return Ok(None),
-                Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss) => None,
-                Err(error) if metadata_operation_authority_view_error_is_retryable(&error) => {
-                    Some(error)
-                }
-                Err(error) => return Err(error),
-            };
-            if attempt + 1 == METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
-                return match retryable_error {
-                    Some(error) => Err(error),
-                    None => Ok(None),
-                };
-            }
-            // Reads may come from a lagging materialized projection while the
-            // transaction compare executes against authoritative Raft. A
-            // ReadIndex generation race is equally observational: refresh and
-            // replay the same digest/prepare sequence instead of leaking a
-            // commit-ready DFS intent to the caller as a permanent failure.
-            if let Err(error) = self.kv.refresh_latest() {
-                if metadata_operation_authority_view_error_is_retryable(&error) {
-                    continue;
-                }
-                return Err(error);
-            }
-        }
-        unreachable!("metadata operation floor retry loop always returns")
-    }
-
-    fn certify_metadata_shard_operation_once(
-        &mut self,
-        expected: &DfsMetadataShardConfig,
-        operation_digest: &str,
-        prepared_sequence: u64,
-        shard_key: &str,
-        floor_key: &str,
-        handoff_key: &str,
-    ) -> Result<MetadataOperationPermitAttempt, KvError> {
-        let Some(shard_entry) = self.kv.get(shard_key)? else {
-            return Ok(MetadataOperationPermitAttempt::Rejected);
-        };
-        if shard_entry.decode::<DfsMetadataShardConfig>()? != *expected {
-            return Ok(MetadataOperationPermitAttempt::Rejected);
-        }
-        if self.kv.get(handoff_key)?.is_some() {
-            return Ok(MetadataOperationPermitAttempt::Rejected);
-        }
-
-        let floor_entry = self.kv.get(floor_key)?;
-        if let Some(previous_entry) = floor_entry.as_ref() {
-            let previous = previous_entry.decode::<DfsMetadataShardOperationFloor>()?;
-            if previous.authority_epoch == expected.epoch
-                && previous.prepared_sequence == prepared_sequence
-                && previous.operation_digest == operation_digest
-                && !previous.permit_id.is_empty()
-            {
-                // The floor may come from an observational projection. Reuse
-                // its permit only after an authoritative transaction verifies
-                // the assignment, exact floor bytes, and missing handoff.
-                let (response, native_commit) = self.kv.txn_with_native_authority(KvTxn {
-                    compares: vec![
-                        KvCompare::ValueEquals {
-                            key: shard_key.to_string(),
-                            value: shard_entry.value.clone(),
-                        },
-                        KvCompare::ValueEquals {
-                            key: floor_key.to_string(),
-                            value: previous_entry.value.clone(),
-                        },
-                        KvCompare::Missing {
-                            key: handoff_key.to_string(),
-                        },
-                    ],
-                    success: vec![KvOp::Put {
-                        key: metadata_shard_authority_barrier_key(
-                            &expected.file_system_id,
-                            &expected.shard_id,
-                        ),
-                        value: sinomo_core::kv::encode_kv_value(
-                            &sinomo_core::Id::generate().to_string(),
-                        )?,
-                        lease_id: None,
-                    }],
-                    failure: Vec::new(),
-                })?;
-                return if response.succeeded {
-                    Ok(MetadataOperationPermitAttempt::Certified(
-                        DfsMetadataOperationPermit {
-                            file_system_id: expected.file_system_id.clone(),
-                            shard_id: expected.shard_id.clone(),
-                            owner_epoch: expected.epoch,
-                            operation_digest: operation_digest.to_string(),
-                            prepare_sequence: prepared_sequence,
-                            permit_id: previous.permit_id,
-                            native_commit,
-                        },
-                    ))
-                } else {
-                    Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss)
-                };
-            }
-            if previous.authority_epoch > expected.epoch
-                || previous.prepared_sequence > prepared_sequence
-                || (previous.prepared_sequence == prepared_sequence
-                    && previous.operation_digest != operation_digest)
-            {
-                return Ok(MetadataOperationPermitAttempt::Rejected);
-            }
-        }
-
-        let permit_id = sinomo_core::Id::generate().to_string();
-        let floor = DfsMetadataShardOperationFloor {
-            operation_digest: operation_digest.to_string(),
-            prepared_sequence,
-            authority_epoch: expected.epoch,
-            permit_id: permit_id.clone(),
-        };
-        let floor_compare = match floor_entry.as_ref() {
-            Some(entry) => KvCompare::ValueEquals {
-                key: floor_key.to_string(),
-                value: entry.value.clone(),
-            },
-            None => KvCompare::Missing {
-                key: floor_key.to_string(),
-            },
-        };
-        let (response, native_commit) = self.kv.txn_with_native_authority(KvTxn {
-            compares: vec![
-                KvCompare::ValueEquals {
-                    key: shard_key.to_string(),
-                    value: shard_entry.value,
-                },
-                floor_compare,
-                KvCompare::Missing {
-                    key: handoff_key.to_string(),
-                },
-            ],
-            success: vec![KvOp::put_serde(floor_key.to_string(), &floor, None)?],
-            failure: Vec::new(),
-        })?;
-        if response.succeeded {
-            Ok(MetadataOperationPermitAttempt::Certified(
-                DfsMetadataOperationPermit {
-                    file_system_id: expected.file_system_id.clone(),
-                    shard_id: expected.shard_id.clone(),
-                    owner_epoch: expected.epoch,
-                    operation_digest: operation_digest.to_string(),
-                    prepare_sequence: prepared_sequence,
-                    permit_id,
-                    native_commit,
-                },
-            ))
-        } else {
-            Ok(MetadataOperationPermitAttempt::RetryAfterCompareMiss)
-        }
     }
 
     /// Refresh cluster configuration and verify that `expected` is still the
@@ -10942,72 +10715,11 @@ mod tests {
         assert_eq!(data.revision(), revision);
     }
 
-    // Only captured older observations or negative read failures are supplied
-    // here. All compares and native certificates come from the actual mounted
-    // control-plane client, never a private in-process quorum substitute.
-    #[derive(Debug)]
-    struct NativeFloorObservationKv {
-        inner: Box<dyn DfsControlPlaneKvClient>,
-        stale_entries: Option<BTreeMap<String, Option<KvEntry>>>,
-        remaining_read_failures: AtomicUsize,
-        refresh_calls: usize,
-        compare_misses: usize,
-    }
-
-    impl DfsControlPlaneKvClient for NativeFloorObservationKv {
-        fn refresh_latest(&mut self) -> Result<(), KvError> {
-            self.refresh_calls += 1;
-            self.inner.refresh_latest()?;
-            self.stale_entries = None;
-            Ok(())
-        }
-        fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-            if self
-                .remaining_read_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then(|| remaining - 1)
-                })
-                .is_ok()
-            {
-                return Err(KvError::Io {
-                    path: "test-cluster-authoritative-view".into(),
-                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
-                        .into(),
-                });
-            }
-            if let Some(entry) = self
-                .stale_entries
-                .as_ref()
-                .and_then(|entries| entries.get(key))
-            {
-                return Ok(entry.clone());
-            }
-            self.inner.get(key)
-        }
-        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-            self.inner.range_prefix(prefix)
-        }
-        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
-            self.inner.put(key, value)
-        }
-        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-            self.inner.txn(txn)
-        }
-        fn txn_with_native_authority(
-            &mut self,
-            txn: KvTxn,
-        ) -> Result<(KvTxnResponse, Option<DfsNativeTxnCommit>), KvError> {
-            let result = self.inner.txn_with_native_authority(txn)?;
-            self.compare_misses += usize::from(!result.0.succeeded);
-            Ok(result)
-        }
-    }
-
     struct NativeFloorFixture {
         runtime: crate::test_support::DfsTestRuntime,
         service: crate::NetworkedDfsService<crate::DfsNodeTransport>,
         shard: DfsMetadataShardConfig,
-        control: NativeFloorObservationKv,
+        control: Box<dyn DfsControlPlaneKvClient>,
         observed_create_command: Arc<Mutex<Option<crate::DfsMessageCommand>>>,
     }
     impl NativeFloorFixture {
@@ -11049,13 +10761,7 @@ mod tests {
                 runtime,
                 service,
                 shard,
-                control: NativeFloorObservationKv {
-                    inner,
-                    stale_entries: None,
-                    remaining_read_failures: AtomicUsize::new(0),
-                    refresh_calls: 0,
-                    compare_misses: 0,
-                },
+                control: inner,
                 observed_create_command: Arc::new(Mutex::new(None)),
             }
         }
@@ -11082,31 +10788,11 @@ mod tests {
         }
         fn floor(&mut self) -> DfsMetadataShardOperationFloor {
             let key = self.floor_key();
-            let entries = self
-                .control
-                .inner
-                .get_authoritative_consistent(&[key])
-                .unwrap();
+            let entries = self.control.get_authoritative_consistent(&[key]).unwrap();
             let [Some(entry)] = entries.as_slice() else {
                 panic!("actual authoritative floor baseline must contain its exact native permit");
             };
             entry.decode().unwrap()
-        }
-        fn capture_observations(&mut self) -> BTreeMap<String, Option<KvEntry>> {
-            let keys = vec![
-                metadata_shard_key(&self.shard.file_system_id, &self.shard.shard_id),
-                self.floor_key(),
-                metadata_shard_membership_handoff_key(
-                    &self.shard.file_system_id,
-                    &self.shard.shard_id,
-                ),
-            ];
-            let entries = self
-                .control
-                .inner
-                .get_authoritative_consistent(&keys)
-                .unwrap();
-            keys.into_iter().zip(entries).collect()
         }
         fn capture_create_on_main(
             &self,
@@ -11225,17 +10911,27 @@ mod tests {
                     .is_some(),
                 "actual producer must retain its exact terminal commit witness"
             );
-            // Normal native publication does not consume a KV degraded permit.
-            // Exercise this retained compatibility API explicitly with the
-            // actual committed prepare identity and native Raft producer.
-            self.certify(&record);
-            // A later normal prepared operation can advance the floor before
-            // this create returns. Verify its actual immutable body and commit,
-            // while retaining the captured create identity for restart checks.
-            let (floor, latest) = self.floor_record();
-            assert!(latest.digest.prepare_sequence >= record.digest.prepare_sequence);
-            assert_eq!(floor.authority_epoch, record.digest.owner_epoch);
             record
+        }
+        // Handoff must honor any operation floor already committed for the
+        // shard. Seed one bound to this exact native prepare.
+        fn seed_floor(&mut self, record: &crate::DfsPreparedOperationRecord) {
+            let key = self.floor_key();
+            let floor = DfsMetadataShardOperationFloor {
+                operation_digest: record.digest.payload_digest.clone(),
+                prepared_sequence: record.digest.prepare_sequence,
+                authority_epoch: record.digest.owner_epoch,
+                permit_id: sinomo_core::Id::generate().to_string(),
+            };
+            let response = self
+                .control
+                .txn(KvTxn {
+                    compares: vec![KvCompare::Missing { key: key.clone() }],
+                    success: vec![KvOp::put_serde(key, &floor, None).unwrap()],
+                    failure: Vec::new(),
+                })
+                .unwrap();
+            assert!(response.succeeded, "seed the shard's first operation floor");
         }
         fn floor_record(
             &mut self,
@@ -11381,19 +11077,6 @@ mod tests {
                 .expect("actual denied-create payload");
             let record = self.record_for_payload(path, &payload);
             assert_eq!(record.status, crate::DfsPreparedOperationStatus::Prepared);
-            let floor_error =
-                DfsControlPlaneStore::new(self.service.control_plane.as_mut().unwrap().as_mut())
-                    .certify_metadata_shard_operation_with_native_authority(
-                        &self.shard,
-                        &record.digest.payload_digest,
-                        record.digest.prepare_sequence,
-                    )
-                    .unwrap_err();
-            assert!(
-                floor_error.to_string().contains("retry the read"),
-                "{floor_error}"
-            );
-            assert!(fault.denied_operation_floor_reads() > 1);
             let pending = self
                 .service
                 .metadata_backend()
@@ -11423,39 +11106,6 @@ mod tests {
                     .is_none()
             );
             (record, fault)
-        }
-        fn certify(
-            &mut self,
-            record: &crate::DfsPreparedOperationRecord,
-        ) -> DfsMetadataOperationPermit {
-            assert_eq!(record.digest.shard_id.0, self.shard.shard_id);
-            assert_eq!(record.digest.owner_epoch, self.shard.epoch);
-            let permit = DfsControlPlaneStore::new(&mut self.control)
-                .certify_metadata_shard_operation_with_native_authority(
-                    &self.shard,
-                    &record.digest.payload_digest,
-                    record.digest.prepare_sequence,
-                )
-                .unwrap()
-                .expect("native exact operation permit");
-            assert!(
-                permit.native_commit.is_some(),
-                "the current producer must return actual native authority"
-            );
-            if record.status == crate::DfsPreparedOperationStatus::Prepared {
-                let retained = self
-                    .service
-                    .metadata_backend()
-                    .unwrap()
-                    .prepared_operation_record(&record.operation_id)
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    retained, *record,
-                    "a compatibility KV permit alone cannot publish or rewrite the native prepare"
-                );
-            }
-            permit
         }
         fn recover_and_close(mut self, path: &str, record: &crate::DfsPreparedOperationRecord) {
             let expected = record
@@ -11561,7 +11211,7 @@ mod tests {
         let fixture = NativeFloorFixture::new("native-member-policy-read-set");
         let shard = fixture.shard.clone();
         let observer = NativeParticipantReadSetObservation {
-            inner: fixture.control.inner,
+            inner: fixture.control,
             scalar_reads: AtomicUsize::new(0),
             consistent_reads: AtomicUsize::new(0),
             negative_response: AtomicUsize::new(0),
@@ -11672,53 +11322,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_operation_floor_refreshes_after_stale_observed_cas() {
-        let mut fixture = NativeFloorFixture::new("native-floor-stale-cas");
-        fixture.write("/native-floor-a.bin");
-        let stale = fixture.capture_observations();
-        fixture.write("/native-floor-b.bin");
-        let predecessor = fixture.floor();
-        let (requested, fault) = fixture.prepare_without_floor("/native-floor-c.bin");
-        assert!(requested.digest.prepare_sequence > predecessor.prepared_sequence);
-        fixture.control.stale_entries = Some(stale);
-        let permit = fixture.certify(&requested);
-        assert_eq!(fixture.control.compare_misses, 1);
-        assert_eq!(fixture.control.refresh_calls, 1);
-        let committed = fixture.floor();
-        assert_eq!(committed.operation_digest, requested.digest.payload_digest);
-        assert_eq!(
-            committed.prepared_sequence,
-            requested.digest.prepare_sequence
-        );
-        assert_eq!(committed.authority_epoch, fixture.shard.epoch);
-        assert_eq!(committed.permit_id, permit.permit_id);
-        drop(fault);
-        fixture.recover_and_close("/native-floor-c.bin", &requested);
-    }
-
-    #[test]
-    fn metadata_operation_floor_retries_readindex_generation_race() {
-        let mut fixture = NativeFloorFixture::new("native-floor-readindex-race");
-        fixture.write("/native-floor-a.bin");
-        let (requested, fault) = fixture.prepare_without_floor("/native-floor-b.bin");
-        fixture
-            .control
-            .remaining_read_failures
-            .store(1, Ordering::SeqCst);
-        let permit = fixture.certify(&requested);
-        assert_eq!(fixture.control.refresh_calls, 1);
-        assert_eq!(
-            fixture
-                .control
-                .remaining_read_failures
-                .load(Ordering::SeqCst),
-            0
-        );
-        let floor = fixture.floor();
-        assert_eq!(floor.operation_digest, requested.digest.payload_digest);
-        assert_eq!(floor.prepared_sequence, requested.digest.prepare_sequence);
-        assert_eq!(floor.authority_epoch, fixture.shard.epoch);
-        assert_eq!(floor.permit_id, permit.permit_id);
+    fn metadata_authority_view_retry_accepts_only_the_readindex_generation_race() {
+        assert!(metadata_operation_authority_view_error_is_retryable(
+            &KvError::Io {
+                path: "test-cluster-authoritative-view".into(),
+                detail: "resident Raft view changed after ReadIndex quorum; retry the read".into(),
+            }
+        ));
         for detail in ["permission denied", "permission denied; retry the read"] {
             assert!(!metadata_operation_authority_view_error_is_retryable(
                 &KvError::Io {
@@ -11727,81 +11337,6 @@ mod tests {
                 }
             ));
         }
-        drop(fault);
-        fixture.recover_and_close("/native-floor-b.bin", &requested);
-    }
-
-    #[test]
-    fn metadata_operation_floor_exact_replay_reuses_authoritative_permit() {
-        let mut fixture = NativeFloorFixture::new("native-floor-exact-replay");
-        fixture.write("/native-floor-a.bin");
-        let stale = fixture.capture_observations();
-        let created = fixture.write("/native-floor-b.bin");
-        let (exact, replayed) = fixture.floor_record();
-        fixture.control.stale_entries = Some(stale);
-        let permit = fixture.certify(&replayed);
-        assert_eq!(permit.permit_id, exact.permit_id);
-        assert_eq!(fixture.control.compare_misses, 1);
-        assert_eq!(fixture.control.refresh_calls, 1);
-        assert!(
-            fixture
-                .control
-                .inner
-                .get(&metadata_shard_authority_barrier_key(
-                    &fixture.shard.file_system_id,
-                    &fixture.shard.shard_id,
-                ))
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(fixture.floor(), exact);
-        fixture.recover_and_close("/native-floor-b.bin", &created);
-    }
-
-    #[test]
-    fn metadata_operation_floor_stale_exact_replay_cannot_bypass_authoritative_handoff() {
-        let mut fixture = NativeFloorFixture::new("native-floor-pending-handoff");
-        fixture.write("/native-floor-a.bin");
-        let (exact, replayed) = fixture.floor_record();
-        let stale = fixture.capture_observations();
-        fixture.deny_last_metadata_participant();
-        // The already denied real replica is also the promoted target. Its
-        // mandatory acknowledgement cannot be replaced by another member.
-        let promoted = fixture.shard.replica_node_ids.last().unwrap().clone();
-        let handoff = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
-            .request_metadata_shard_primary_handoff(&fixture.shard, &promoted)
-            .unwrap()
-            .expect("actual normal pending role handoff");
-        assert_eq!(handoff.retiring_shard, fixture.shard);
-        fixture.control.stale_entries = Some(stale);
-        assert!(
-            DfsControlPlaneStore::new(&mut fixture.control)
-                .certify_metadata_shard_operation_with_native_authority(
-                    &fixture.shard,
-                    &replayed.digest.payload_digest,
-                    replayed.digest.prepare_sequence,
-                )
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(fixture.control.compare_misses, 1);
-        assert_eq!(fixture.control.refresh_calls, 1);
-        assert_eq!(fixture.floor(), exact);
-        drop(fixture.control);
-        drop(fixture.service);
-        fixture.runtime.clear_faults();
-        let desired = handoff.desired_shard;
-        let active = fixture
-            .runtime
-            .reassign_metadata_shard(
-                &desired.file_system_id,
-                &desired.shard_id,
-                desired.primary_node_id.clone(),
-                desired.replica_node_ids.clone(),
-            )
-            .unwrap();
-        assert_eq!(active, desired);
-        fixture.runtime.close().unwrap();
     }
 
     #[test]
@@ -11831,22 +11366,10 @@ mod tests {
             .runtime
             .client(&fixture.shard.primary_node_id)
             .unwrap();
-        fixture.write("/native-floor-a.bin");
+        let created = fixture.write("/native-floor-a.bin");
+        fixture.seed_floor(&created);
         fixture.deny_last_metadata_participant();
-        let (floor, record) = fixture.floor_record();
-        let mut wrong_digest = record.digest.payload_digest.clone();
-        wrong_digest.push_str("-negative");
-        assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
-                .certify_metadata_shard_operation_with_native_authority(
-                    &fixture.shard,
-                    &wrong_digest,
-                    record.digest.prepare_sequence,
-                )
-                .unwrap()
-                .is_none(),
-            "same-sequence negative digest cannot replace the genuine floor"
-        );
+        let (floor, _) = fixture.floor_record();
         let mut desired = fixture.shard.clone();
         desired.replica_node_ids.push(added);
         desired.replica_node_ids.sort();
@@ -11855,22 +11378,11 @@ mod tests {
             .service
             .metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id)
             .unwrap();
-        let handoff = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let handoff = DfsControlPlaneStore::new(fixture.control.as_mut())
             .begin_metadata_shard_membership_handoff(&fixture.shard, &desired)
             .unwrap()
             .unwrap();
         assert_eq!(handoff.required_prepared_sequence, floor.prepared_sequence);
-        assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
-                .certify_metadata_shard_operation_with_native_authority(
-                    &fixture.shard,
-                    &record.digest.payload_digest,
-                    record.digest.prepare_sequence,
-                )
-                .unwrap()
-                .is_none(),
-            "actual pending handoff fences even an exact floor replay"
-        );
         let shard_id = crate::DfsMetadataShardId::new(fixture.shard.shard_id.clone());
         let backend = fixture.service.metadata_backend().unwrap();
         let sequence = backend
@@ -11891,11 +11403,9 @@ mod tests {
             journal_sequence: floor.prepared_sequence - 1,
             state_fingerprint: fingerprint,
         };
-        assert!(
-            matches!(DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        assert!(matches!(DfsControlPlaneStore::new(fixture.control.as_mut())
             .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &stale_fence),
-            Err(KvError::Serialization { detail }) if detail.contains("below required prepared floor"))
-        );
+            Err(KvError::Serialization { detail }) if detail.contains("below required prepared floor")));
         drop(gate);
         fixture.runtime.clear_faults();
         let active = fixture
@@ -11908,7 +11418,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active, desired);
-        let proof = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let proof = DfsControlPlaneStore::new(fixture.control.as_mut())
             .get_metadata_shard_membership_handoff_proof(&active.file_system_id, &active.shard_id)
             .unwrap()
             .unwrap();
@@ -11962,14 +11472,14 @@ mod tests {
         // This compatibility control record consumes an actual full native
         // certificate; it is not an implicit fallback for partial DFS Sync.
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .publish_metadata_shard_head_watermark(
                     &fixture.shard,
                     &watermark(&first_certificate)
                 )
                 .unwrap()
         );
-        let low = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let low = DfsControlPlaneStore::new(fixture.control.as_mut())
             .get_metadata_shard_head_watermark(
                 &fixture.shard.file_system_id,
                 &fixture.shard.shard_id,
@@ -12005,7 +11515,7 @@ mod tests {
             "a previously certified head cannot satisfy a new full-participant barrier while a member is stopped"
         );
         assert_eq!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .get_metadata_shard_head_watermark(
                     &fixture.shard.file_system_id,
                     &fixture.shard.shard_id
@@ -12018,14 +11528,14 @@ mod tests {
             .sync_metadata_shard_to_quorum(&second_target, std::time::Duration::from_secs(5))
             .unwrap();
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .publish_metadata_shard_head_watermark(
                     &fixture.shard,
                     &watermark(&second_certificate)
                 )
                 .unwrap()
         );
-        let high = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let high = DfsControlPlaneStore::new(fixture.control.as_mut())
             .get_metadata_shard_head_watermark(
                 &fixture.shard.file_system_id,
                 &fixture.shard.shard_id,
@@ -12040,12 +11550,12 @@ mod tests {
             second_certificate.acknowledged_node_ids
         );
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .publish_metadata_shard_head_watermark(&fixture.shard, &low)
                 .unwrap()
         );
         assert_eq!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .get_metadata_shard_head_watermark(
                     &fixture.shard.file_system_id,
                     &fixture.shard.shard_id
@@ -12453,91 +11963,6 @@ mod tests {
     }
     mod placement_update_retry;
     mod recovery_ballot_reservation;
-}
-
-impl DfsMetadataOperationPermit {
-    pub(crate) fn matches_native_preparation(
-        &self,
-        expected: &crate::DfsMetadataShardConfig,
-        digest: &crate::DfsPreparedOperationDigest,
-    ) -> bool {
-        let permit = self;
-        use sinomo_core::kv::{KvAuthorityBasis, KvCompare, KvOp};
-        if permit.file_system_id != digest.file_system_id
-            || permit.shard_id != digest.shard_id.0
-            || permit.owner_epoch != digest.owner_epoch
-            || permit.operation_digest != digest.payload_digest
-            || permit.prepare_sequence != digest.prepare_sequence
-            || permit.permit_id.is_empty()
-        {
-            return false;
-        }
-        let Some(native) = permit.native_commit.as_ref() else {
-            return false;
-        };
-        let Some(response) = native.result.txn_response.as_ref() else {
-            return false;
-        };
-        let proof = &native.result.authority;
-        let fresh_quorum = matches!(proof.basis, KvAuthorityBasis::CurrentTermQuorum { voter_acks, required_quorum }
-        if required_quorum > 0 && voter_acks >= required_quorum);
-        let request_digest = native.request.clone().into_command_request().digest();
-        if !fresh_quorum
-            || !response.succeeded
-            || proof.term == 0
-            || proof.commit_index == 0
-            || response.revision != proof.revision
-            || native.request.request_id != native.result.request_id
-            || request_digest.ok()
-                != Some(
-                    native
-                        .result
-                        .submitted_command_digest
-                        .unwrap_or(native.result.command_digest),
-                )
-        {
-            return false;
-        }
-        let txn = &native.request.txn;
-        let shard_key = crate::metadata_shard_key(&expected.file_system_id, &expected.shard_id);
-        let floor_key = crate::control_plane::metadata_shard_operation_floor_key(
-            &expected.file_system_id,
-            &expected.shard_id,
-        );
-        let handoff_key = crate::metadata_shard_membership_handoff_key(
-            &expected.file_system_id,
-            &expected.shard_id,
-        );
-        let barrier_key = crate::metadata_shard_authority_barrier_key(
-            &expected.file_system_id,
-            &expected.shard_id,
-        );
-        let config_matches = txn.compares.iter().any(|compare| matches!(compare, KvCompare::ValueEquals { key, value }
-        if key == &shard_key && sinomo_core::kv::decode_kv_value::<crate::DfsMetadataShardConfig>(value).ok().as_ref() == Some(expected)));
-        let handoff_missing = txn
-            .compares
-            .iter()
-            .any(|compare| matches!(compare, KvCompare::Missing { key } if key == &handoff_key));
-        let floor_matches = |value: &[u8]| {
-            sinomo_core::kv::decode_kv_value::<crate::control_plane::DfsMetadataShardOperationFloor>(
-            value,
-        )
-        .ok()
-        .is_some_and(|floor| {
-            floor.authority_epoch == permit.owner_epoch
-                && floor.prepared_sequence == permit.prepare_sequence
-                && floor.operation_digest == permit.operation_digest
-                && floor.permit_id == permit.permit_id
-        })
-        };
-        let effect_matches = match txn.success.as_slice() {
-        [KvOp::Put { key, value, lease_id: None }] if key == &floor_key => floor_matches(value),
-        [KvOp::Put { key, value, lease_id: None }] if key == &barrier_key && !value.is_empty() =>
-            txn.compares.iter().any(|compare| matches!(compare, KvCompare::ValueEquals { key, value } if key == &floor_key && floor_matches(value))),
-        _ => false,
-    };
-        config_matches && handoff_missing && effect_matches && txn.failure.is_empty()
-    }
 }
 
 /// Observation-only decoding of the SAME retained current control-row bytes.

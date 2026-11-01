@@ -85,8 +85,7 @@ pub use connectivity_projection::{
 };
 pub use connectivity_publish::{
     ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
-    ClusterNetworkRecordExpiryHost, cluster_connectivity_publish_record_matches,
-    cluster_network_publish_interval_for_node, expire_cluster_network_records_with_host,
+    cluster_connectivity_publish_record_matches, cluster_network_publish_interval_for_node,
     publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host,
     sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
@@ -424,11 +423,8 @@ pub(crate) mod prelude {
 pub use connectivity_publish::cluster_connectivity_full_sync_batch_ops_from_snapshot;
 // test-support re-exports (crate internals for sibling integration tests)
 #[cfg(any(test, feature = "test-support"))]
-pub use connectivity_publish::cluster_network_expiry_delete_ops;
-#[cfg(any(test, feature = "test-support"))]
 pub use connectivity_publish::{
     cluster_connectivity_full_sync_batch_ops, cluster_connectivity_sync_is_noop,
-    expire_cluster_network_record_ops, expire_cluster_network_records,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use control_plane_options::{

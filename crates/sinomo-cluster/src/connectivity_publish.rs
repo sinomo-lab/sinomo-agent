@@ -1,23 +1,15 @@
-use crate::keyspace::{
-    cluster_connectivity_key, cluster_connectivity_source_prefix, cluster_endpoint_prefix,
-};
+use crate::keyspace::{cluster_connectivity_key, cluster_connectivity_source_prefix};
 use crate::kv_local_store::ClusterKvPathsExt;
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
-#[cfg(any(test, feature = "test-support"))]
-use crate::kv_local_store::read_cluster_kv_current_snapshot_arc;
 use crate::kv_local_store::{
     append_cluster_raft_ops_in_batches, read_cluster_kv_current_or_empty_snapshot_arc,
     read_cluster_kv_snapshot,
 };
 use crate::local_state_store::read_cluster_state_without_kv;
 use crate::prelude::*;
-use sinomo_kv::{
-    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, ClusterKvTxnCommitResult, KvCompare, KvOp, KvSnapshot,
-    KvTxn, KvTxnRequest,
-};
+use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvOp, KvSnapshot, KvTxn, KvTxnRequest};
 use sinomo_network::ClusterMembershipRpcFuture;
-use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::write_local_cluster_connectivity_record_set;
@@ -26,7 +18,6 @@ use sinomo_network::{
     ClusterConnectivityRecord, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
     cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
-use sinomo_node::cluster_node_is_local_process;
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -38,18 +29,6 @@ use time::OffsetDateTime;
 // source record set could not be synced/read back through cluster KV.
 const _: () =
     assert!(MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS == CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES);
-const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
-
-pub trait ClusterNetworkRecordExpiryHost {
-    type Error: From<NetworkError>;
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        request: KvTxnRequest,
-    ) -> Result<ClusterKvTxnCommitResult, Self::Error>;
-}
 
 pub trait ClusterConnectivityPublishHost {
     type Error: From<NetworkError>;
@@ -660,121 +639,6 @@ pub fn cluster_connectivity_sync_is_noop(
     .is_empty())
 }
 
-pub fn expire_cluster_network_record_ops(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    now: OffsetDateTime,
-) -> Result<(Vec<KvCompare>, Vec<KvOp>), NetworkError> {
-    let mut compares = Vec::new();
-    let mut ops = Vec::new();
-    let max_records = sinomo_kv::MAX_KV_TXN_COMPARES.min(sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH);
-    let snapshot = read_cluster_kv_current_or_empty_snapshot_arc(paths)?;
-    for entry in snapshot.prefix_entries("/cluster/network/info/") {
-        let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
-            continue;
-        };
-        if cluster_node_is_local_process(state, &record.node_id) {
-            continue;
-        }
-        if cluster_network_record_expired(record.expires_at, now) {
-            compares.push(KvCompare::ValueEquals {
-                key: entry.key.clone(),
-                value: entry.value.clone(),
-            });
-            ops.push(KvOp::Delete {
-                key: entry.key.clone(),
-            });
-            if ops.len() >= max_records {
-                return Ok((compares, ops));
-            }
-        }
-    }
-    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
-        let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
-            continue;
-        };
-        if record.source_node_id == state.local_node_id {
-            continue;
-        }
-        if cluster_connectivity_record_target_endpoint_missing(snapshot.as_ref(), &record)
-            || cluster_network_record_expired(record.expires_at, now)
-        {
-            compares.push(KvCompare::ValueEquals {
-                key: entry.key.clone(),
-                value: entry.value.clone(),
-            });
-            ops.push(KvOp::Delete {
-                key: entry.key.clone(),
-            });
-            if ops.len() >= max_records {
-                return Ok((compares, ops));
-            }
-        }
-    }
-    Ok((compares, ops))
-}
-
-fn cluster_connectivity_record_target_endpoint_missing(
-    snapshot: &KvSnapshot,
-    record: &ClusterConnectivityRecord,
-) -> bool {
-    let endpoint_key = format!(
-        "{}{}",
-        cluster_endpoint_prefix(&record.target_node_id),
-        record.endpoint_id
-    );
-    snapshot.get(&endpoint_key).is_none_or(|entry| {
-        entry
-            .decode::<ClusterEndpointRecord>()
-            .map(|endpoint| {
-                endpoint.node_id != record.target_node_id
-                    || endpoint.endpoint_id != record.endpoint_id
-                    || endpoint.address != record.address
-                    || endpoint.transport != record.transport
-            })
-            .unwrap_or(true)
-    })
-}
-
-pub fn expire_cluster_network_records_with_host<H>(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    now: OffsetDateTime,
-    host: &mut H,
-) -> Result<Option<KvSnapshot>, H::Error>
-where
-    H: ClusterNetworkRecordExpiryHost,
-{
-    let (compares, success) = expire_cluster_network_record_ops(paths, state, now)?;
-    if success.is_empty() {
-        return Ok(None);
-    }
-    let mut local_state = read_cluster_state_without_kv(paths)?;
-    let result = host.commit_cluster_kv_txn_with_quorum(
-        paths,
-        &mut local_state,
-        KvTxnRequest::generated(KvTxn {
-            compares,
-            success,
-            failure: Vec::new(),
-        }),
-    )?;
-    if !result
-        .txn_response
-        .as_ref()
-        .is_some_and(|response| response.succeeded)
-    {
-        return Err(H::Error::from(NetworkError::InvalidClusterCommand {
-            detail: "cluster network records changed while expiring stale observations".to_string(),
-        }));
-    }
-    Ok(Some(result.snapshot))
-}
-
-fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTime) -> bool {
-    expires_at + time::Duration::seconds(CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS) <= now
-}
-
 /// Whether `record` is already published by `known`. Publication is semantic:
 /// an unchanged committed row is never renewed by time, so its age cannot make
 /// it unpublished.
@@ -784,73 +648,4 @@ pub fn cluster_connectivity_publish_record_matches(
     _now: OffsetDateTime,
 ) -> bool {
     cluster_connectivity_stable_eq(known, record)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn expire_cluster_network_records(
-    paths: &ClusterPaths,
-    now: OffsetDateTime,
-) -> Result<KvSnapshot, NetworkError> {
-    let mut snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
-    let mut success = cluster_network_expiry_delete_ops(
-        snapshot.as_ref(),
-        now,
-        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-    );
-    if success.is_empty() {
-        return Ok(snapshot.as_ref().clone());
-    }
-
-    let state = read_cluster_state_without_kv(paths)?;
-    loop {
-        snapshot = Arc::new(append_cluster_raft_ops_in_batches(
-            paths,
-            &state.local_node_id,
-            success,
-        )?);
-        success = cluster_network_expiry_delete_ops(
-            snapshot.as_ref(),
-            now,
-            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-        );
-        if success.is_empty() {
-            return Ok(snapshot.as_ref().clone());
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn cluster_network_expiry_delete_ops(
-    snapshot: &KvSnapshot,
-    now: OffsetDateTime,
-    max_ops: usize,
-) -> Vec<KvOp> {
-    let mut success = Vec::new();
-    for entry in snapshot.prefix_entries("/cluster/network/info/") {
-        if success.len() >= max_ops {
-            return success;
-        }
-        let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
-            continue;
-        };
-        if record.expires_at <= now {
-            success.push(KvOp::Delete {
-                key: entry.key.clone(),
-            });
-        }
-    }
-    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
-        if success.len() >= max_ops {
-            return success;
-        }
-        let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
-            continue;
-        };
-        if record.expires_at <= now {
-            success.push(KvOp::Delete {
-                key: entry.key.clone(),
-            });
-        }
-    }
-    success
 }

@@ -14,16 +14,12 @@ pub const SERVICE_CATALOG_PUBLISHER_COMPONENT_ID: &str = "sinomo.cluster.service
 const SERVICE_CATALOG_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SERVICE_CATALOG_RETRY_MAX: Duration = Duration::from_secs(30);
 const SERVICE_CATALOG_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
-const SERVICE_CATALOG_STARTUP_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-const SERVICE_CATALOG_STARTUP_RECONCILE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct ServiceCatalogPublisherTiming {
     publish_timeout: Duration,
     retry_initial: Duration,
     retry_max: Duration,
-    startup_reconcile_interval: Duration,
-    startup_reconcile_window: Duration,
 }
 
 impl ServiceCatalogPublisherTiming {
@@ -31,8 +27,6 @@ impl ServiceCatalogPublisherTiming {
         publish_timeout: SERVICE_CATALOG_PUBLISH_TIMEOUT,
         retry_initial: SERVICE_CATALOG_RETRY_INITIAL,
         retry_max: SERVICE_CATALOG_RETRY_MAX,
-        startup_reconcile_interval: SERVICE_CATALOG_STARTUP_RECONCILE_INTERVAL,
-        startup_reconcile_window: SERVICE_CATALOG_STARTUP_RECONCILE_WINDOW,
     };
 }
 
@@ -43,7 +37,6 @@ pub trait ServiceCatalogPublisherHost: Send + Sync {
     fn publish<'a>(
         &'a self,
         snapshot: Arc<ServiceRegistrySnapshot>,
-        authoritative_recheck: bool,
     ) -> ServiceCatalogPublishFuture<'a>;
 }
 
@@ -66,7 +59,9 @@ pub fn service_catalog_publisher_component_factory(
             let shutdown = scope.shutdown_receiver();
             scope.own_task(
                 "cluster service catalog publisher",
-                runtime.spawn(run_service_catalog_publisher(host, registry, shutdown)),
+                runtime.spawn(run_service_catalog_publisher(
+                    host, registry, None, shutdown,
+                )),
             );
             Ok(())
         },
@@ -101,18 +96,25 @@ pub fn cluster_service_catalog_publisher_component_factory()
                     ComponentError::component(SERVICE_CATALOG_PUBLISHER_COMPONENT_ID, error)
                 })?;
             let registry = context.service_registry_snapshot_store()?;
+            let records_changed = Arc::new(tokio::sync::Notify::new());
+            let subscription = subscribe_local_service_record_changes(
+                &cluster_paths,
+                state.local_node_id.clone(),
+                Arc::clone(&records_changed),
+            );
             let host: Arc<dyn ServiceCatalogPublisherHost> =
                 Arc::new(ComponentServiceCatalogPublisherHost {
                     cluster,
                     local_node_id: state.local_node_id,
                 });
+            let shutdown = scope.shutdown_receiver();
             scope.own_task(
                 "cluster service catalog publisher",
-                runtime.spawn(run_service_catalog_publisher(
-                    host,
-                    registry,
-                    scope.shutdown_receiver(),
-                )),
+                runtime.spawn(async move {
+                    let _subscription = subscription;
+                    run_service_catalog_publisher(host, registry, Some(records_changed), shutdown)
+                        .await;
+                }),
             );
             Ok(())
         },
@@ -122,6 +124,41 @@ pub fn cluster_service_catalog_publisher_component_factory()
 struct ComponentServiceCatalogPublisherHost {
     cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     local_node_id: sinomo_core::node::NodeId,
+}
+
+/// This node owns its service records. Wake the publisher when a committed
+/// change reaches them through any path other than its own registry: a late
+/// commit from the process it replaced, or a local view that caught up with one.
+fn subscribe_local_service_record_changes(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    local_node_id: sinomo_core::node::NodeId,
+    records_changed: Arc<tokio::sync::Notify>,
+) -> sinomo_core::kv::KvCommittedObservationSubscription {
+    sinomo_core::cluster::subscribe_cluster_kv_committed_observations(
+        cluster_paths,
+        move |observation| {
+            let touched = match &observation.value {
+                sinomo_core::kv::KvCommittedObservationValue::Delta(delta) => {
+                    events_touch_local_service_records(&delta.events, &local_node_id)
+                }
+                // An installed or discontinuous view can change any record.
+                sinomo_core::kv::KvCommittedObservationValue::Snapshot(_)
+                | sinomo_core::kv::KvCommittedObservationValue::Discontinuity(_) => true,
+            };
+            if touched {
+                records_changed.notify_one();
+            }
+        },
+    )
+}
+
+fn events_touch_local_service_records(
+    events: &[sinomo_core::kv::KvEvent],
+    local_node_id: &sinomo_core::node::NodeId,
+) -> bool {
+    events.iter().any(|event| {
+        sinomo_core::service::service_instance_key_belongs_to_node(&event.key, local_node_id)
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -158,7 +195,6 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
     fn publish<'a>(
         &'a self,
         snapshot: Arc<ServiceRegistrySnapshot>,
-        authoritative_recheck: bool,
     ) -> ServiceCatalogPublishFuture<'a> {
         Box::pin(async move {
             let records = sinomo_core::service::service_instance_records_from_registry(
@@ -168,17 +204,15 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
                 time::OffsetDateTime::now_utc(),
             );
             let summary = service_catalog_log_summary(&records);
-            let publication =
-                sinomo_core::service::publish_local_service_instances_with_authoritative_recheck(
-                    self.cluster.as_ref(),
-                    snapshot.registry(),
-                    &self.local_node_id,
-                    snapshot.version(),
-                    time::OffsetDateTime::now_utc(),
-                    authoritative_recheck,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+            let publication = sinomo_core::service::publish_local_service_instances(
+                self.cluster.as_ref(),
+                snapshot.registry(),
+                &self.local_node_id,
+                snapshot.version(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             tracing::info!(
                 node_id = %self.local_node_id,
                 registry_version = snapshot.version(),
@@ -199,26 +233,35 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
 async fn run_service_catalog_publisher(
     host: Arc<dyn ServiceCatalogPublisherHost>,
     registry: sinomo_core::service::ServiceRegistrySnapshotStore,
+    records_changed: Option<Arc<tokio::sync::Notify>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     run_service_catalog_publisher_with_timing(
         host,
         registry,
+        records_changed,
         shutdown,
         ServiceCatalogPublisherTiming::PRODUCTION,
     )
     .await;
 }
 
+async fn local_service_records_changed(records_changed: Option<&tokio::sync::Notify>) {
+    match records_changed {
+        Some(records_changed) => records_changed.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_service_catalog_publisher_with_timing(
     host: Arc<dyn ServiceCatalogPublisherHost>,
     registry: sinomo_core::service::ServiceRegistrySnapshotStore,
+    records_changed: Option<Arc<tokio::sync::Notify>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     timing: ServiceCatalogPublisherTiming,
 ) {
     let mut versions = registry.subscribe_versions();
     let mut retry = timing.retry_initial;
-    let mut startup_reconcile_deadline = None;
     if registry.active_snapshot().version() == 1 {
         tokio::select! {
             changed = versions.changed() => {
@@ -239,13 +282,27 @@ async fn run_service_catalog_publisher_with_timing(
             break;
         }
         let snapshot = registry.active_snapshot();
+        if snapshot.host_stopping() {
+            // Withdrawing local admission is not a change to this node's offer;
+            // the replacement process owns the same records.
+            tokio::select! {
+                changed = versions.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let _ = versions.borrow_and_update();
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
         let publication = match tokio::time::timeout(
             timing.publish_timeout,
-            host.publish(
-                snapshot.clone(),
-                startup_reconcile_deadline
-                    .is_none_or(|deadline| deadline > tokio::time::Instant::now()),
-            ),
+            host.publish(snapshot.clone()),
         )
         .await
         {
@@ -258,48 +315,21 @@ async fn run_service_catalog_publisher_with_timing(
         match publication {
             Ok(()) => {
                 retry = timing.retry_initial;
-                // A retiring main can publish its teardown registry after the
-                // replacement main has already published the same node-scoped
-                // records. Reconcile the surviving registry for a bounded
-                // overlap window so that late deletion is repaired without
-                // turning steady-state service discovery into a polling loop.
-                let startup_reconcile_deadline =
-                    *startup_reconcile_deadline.get_or_insert_with(|| {
-                        tokio::time::Instant::now() + timing.startup_reconcile_window
-                    });
                 tracing::debug!(
                     version = snapshot.version(),
                     "published component service catalog generation"
                 );
-                if let Some(remaining) =
-                    startup_reconcile_deadline.checked_duration_since(tokio::time::Instant::now())
-                {
-                    tokio::select! {
-                        _ = tokio::time::sleep(timing.startup_reconcile_interval.min(remaining)) => {}
-                        changed = versions.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                            let _ = versions.borrow_and_update();
+                tokio::select! {
+                    changed = versions.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                break;
-                            }
-                        }
+                        let _ = versions.borrow_and_update();
                     }
-                } else {
-                    tokio::select! {
-                        changed = versions.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                            let _ = versions.borrow_and_update();
-                        }
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                break;
-                            }
+                    () = local_service_records_changed(records_changed.as_deref()) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
                         }
                     }
                 }
@@ -335,25 +365,31 @@ async fn run_service_catalog_publisher_with_timing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
-    struct CountingHost(AtomicUsize, AtomicBool);
+    struct CountingHost(AtomicUsize);
 
     impl ServiceCatalogPublisherHost for CountingHost {
         fn publish<'a>(
             &'a self,
             _snapshot: Arc<ServiceRegistrySnapshot>,
-            authoritative_recheck: bool,
         ) -> ServiceCatalogPublishFuture<'a> {
             Box::pin(async move {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                if !authoritative_recheck {
-                    self.1.store(true, Ordering::SeqCst);
-                }
                 Ok(())
             })
         }
+    }
+
+    async fn wait_for_publications(host: &CountingHost, count: usize, context: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.0.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(context);
     }
 
     struct HangingOnceHost(AtomicUsize);
@@ -362,7 +398,6 @@ mod tests {
         fn publish<'a>(
             &'a self,
             _snapshot: Arc<ServiceRegistrySnapshot>,
-            _authoritative_recheck: bool,
         ) -> ServiceCatalogPublishFuture<'a> {
             Box::pin(async move {
                 let call = self.0.fetch_add(1, Ordering::SeqCst);
@@ -403,6 +438,7 @@ mod tests {
         let task = tokio::spawn(run_service_catalog_publisher(
             host.clone(),
             registry.clone(),
+            None,
             shutdown_rx,
         ));
         registry
@@ -437,6 +473,7 @@ mod tests {
         let task = tokio::spawn(run_service_catalog_publisher(
             host.clone(),
             registry.clone(),
+            None,
             shutdown_rx,
         ));
         registry
@@ -465,13 +502,12 @@ mod tests {
         let task = tokio::spawn(run_service_catalog_publisher_with_timing(
             host.clone(),
             registry.clone(),
+            None,
             shutdown_rx,
             ServiceCatalogPublisherTiming {
                 publish_timeout: Duration::from_millis(10),
                 retry_initial: Duration::from_millis(1),
                 retry_max: Duration::from_millis(2),
-                startup_reconcile_interval: Duration::from_secs(1),
-                startup_reconcile_window: Duration::from_secs(1),
             },
         ));
         registry
@@ -491,55 +527,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stable_registry_is_reconciled_during_process_replacement_window() {
+    async fn host_stop_withdrawal_is_not_published() {
         let host = Arc::new(CountingHost::default());
         let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let reconcile_interval = Duration::from_millis(5);
-        let reconcile_window = Duration::from_millis(20);
-        let task = tokio::spawn(run_service_catalog_publisher_with_timing(
+        let task = tokio::spawn(run_service_catalog_publisher(
             host.clone(),
             registry.clone(),
+            None,
             shutdown_rx,
-            ServiceCatalogPublisherTiming {
-                publish_timeout: Duration::from_secs(1),
-                retry_initial: Duration::from_millis(1),
-                retry_max: Duration::from_millis(2),
-                startup_reconcile_interval: reconcile_interval,
-                startup_reconcile_window: reconcile_window,
-            },
         ));
         registry
             .replace_registry(sinomo_core::service::ServiceRegistry::default())
             .expect("publish reconciled registry");
+        wait_for_publications(&host, 1, "initial publication").await;
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while host.0.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("stable startup registry was reconciled again");
-
-        // A delayed publisher can still owe the final startup publication after
-        // the test's timer wakes. Observe that real publication before checking
-        // that the unchanged registry stays parked.
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !host.1.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("publisher reached the end of the startup reconciliation window");
-        let settled_count = host.0.load(Ordering::SeqCst);
-        tokio::time::sleep(reconcile_interval.saturating_mul(3)).await;
+        registry
+            .withdraw_for_host_stop(sinomo_core::service::ServiceRegistry::default())
+            .expect("withdraw admission");
+        tokio::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(
             host.0.load(Ordering::SeqCst),
-            settled_count,
-            "the publisher must park again after the process-replacement window"
+            1,
+            "a stopping host must not publish its admission withdrawal"
         );
 
+        registry
+            .replace_registry(sinomo_core::service::ServiceRegistry::default())
+            .expect("reinstall registry");
+        wait_for_publications(&host, 2, "a later live generation publishes").await;
         shutdown_tx.send_replace(true);
         task.await.expect("publisher task");
+    }
+
+    #[tokio::test]
+    async fn committed_change_to_local_records_reconciles_without_polling() {
+        let host = Arc::new(CountingHost::default());
+        let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
+        let records_changed = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_service_catalog_publisher(
+            host.clone(),
+            registry.clone(),
+            Some(Arc::clone(&records_changed)),
+            shutdown_rx,
+        ));
+        registry
+            .replace_registry(sinomo_core::service::ServiceRegistry::default())
+            .expect("publish reconciled registry");
+        wait_for_publications(&host, 1, "initial publication").await;
+
+        records_changed.notify_one();
+        wait_for_publications(&host, 2, "a committed record change reconciles").await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            2,
+            "without registry or record changes the publisher stays parked"
+        );
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher task");
+    }
+
+    #[test]
+    fn only_local_service_record_events_wake_the_publisher() {
+        let local =
+            sinomo_core::node::NodeId::from_legacy_named("catalog_wake_local").expect("local node");
+        let remote = sinomo_core::node::NodeId::from_legacy_named("catalog_wake_remote")
+            .expect("remote node");
+        let event = |key: String| sinomo_core::kv::KvEvent {
+            revision: sinomo_core::kv::KvRevision(1),
+            key,
+            kind: sinomo_core::kv::KvEventKind::Delete,
+        };
+        let remote_record = event(sinomo_core::service::cluster_service_instance_key(
+            "dfs", &remote,
+        ));
+        let local_record = event(sinomo_core::service::cluster_service_instance_key(
+            "dfs", &local,
+        ));
+        let unrelated = event(format!("/cluster/members/{local}"));
+
+        assert!(!events_touch_local_service_records(
+            &[remote_record.clone(), unrelated.clone()],
+            &local
+        ));
+        assert!(events_touch_local_service_records(
+            &[remote_record, unrelated, local_record],
+            &local
+        ));
     }
 }

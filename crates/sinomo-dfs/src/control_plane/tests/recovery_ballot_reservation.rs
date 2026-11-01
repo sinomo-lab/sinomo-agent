@@ -62,7 +62,6 @@ fn serving_cells(fixture: &mut NativeFloorFixture) -> Vec<Option<KvEntry>> {
     ];
     let rows = fixture
         .control
-        .inner
         .get_authoritative_consistent_before(&names, deadline())
         .unwrap();
     assert_eq!(rows.len(), names.len());
@@ -273,7 +272,7 @@ fn native_distinct_peer_cas_mints_once_and_delayed_loser_is_spent() {
             matches!(&results[loser], Begin::Refused(Refusal::Spent)),
             "ordered expectedfloor rule: {results:?}"
         );
-        let view = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let view = DfsControlPlaneStore::new(fixture.control.as_mut())
             .metadata_shard_recovery_ballot_floor_before(
                 &fixture.shard.file_system_id,
                 &fixture.shard.shard_id,
@@ -285,12 +284,12 @@ fn native_distinct_peer_cas_mints_once_and_delayed_loser_is_spent() {
         assert_eq!(view.serving_shard, Some(fixture.shard.clone()));
         assert!(!view.handoff_pending);
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&requests[winner], deadline())
                 .unwrap()
         );
         refused(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&requests[loser], deadline())
                 .unwrap(),
             Refusal::Spent,
@@ -298,7 +297,7 @@ fn native_distinct_peer_cas_mints_once_and_delayed_loser_is_spent() {
         let next =
             Request::prepare(&fixture.shard, &requests[loser].ballot.candidate_node_id, 1).unwrap();
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&next, deadline())
                 .unwrap(),
             &next,
@@ -352,12 +351,12 @@ fn native_identical_peer_cas_converges_without_a_second_attempt() {
                 + b.counts.compare_misses.load(Ordering::SeqCst),
             1
         );
-        let value = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let value = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         assert!(
-            matches!(DfsControlPlaneStore::new(fixture.control.inner.as_mut()).begin_metadata_shard_recovery_ballot_reservation(&requested,deadline()).unwrap(),Begin::Existing(x) if x==requested)
+            matches!(DfsControlPlaneStore::new(fixture.control.as_mut()).begin_metadata_shard_recovery_ballot_reservation(&requested,deadline()).unwrap(),Begin::Existing(x) if x==requested)
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+            read_one(fixture.control.as_mut(), &key(&fixture.shard)),
             Some(value)
         );
         assert_eq!(serving_cells(fixture), before);
@@ -370,63 +369,63 @@ fn native_cancelled_requests_stay_spent_after_multiple_floor_advances() {
         let before = serving_cells(fixture);
         let first = request(fixture, 0, 0);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&first, deadline())
                 .unwrap(),
             &first,
         );
-        let held = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let held = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         assert!(
-            matches!(DfsControlPlaneStore::new(fixture.control.inner.as_mut()).begin_metadata_shard_recovery_ballot_reservation(&first,deadline()).unwrap(),Begin::Existing(x) if x==first)
+            matches!(DfsControlPlaneStore::new(fixture.control.as_mut()).begin_metadata_shard_recovery_ballot_reservation(&first,deadline()).unwrap(),Begin::Existing(x) if x==first)
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+            read_one(fixture.control.as_mut(), &key(&fixture.shard)),
             Some(held)
         );
-        let held = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let held = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         let blocked = request(fixture, 1, 1);
         refused(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&blocked, deadline())
                 .unwrap(),
             Refusal::PendingHeldByOther,
         );
         assert!(
-            !DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            !DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&blocked, deadline())
                 .unwrap()
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+            read_one(fixture.control.as_mut(), &key(&fixture.shard)),
             Some(held)
         );
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&first, deadline())
                 .unwrap()
         );
         let second = request(fixture, 1, 1);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&second, deadline())
                 .unwrap(),
             &second,
         );
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&second, deadline())
                 .unwrap()
         );
-        let cancelled = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let cancelled = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         for old in [&first, &second] {
             refused(
-                DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                DfsControlPlaneStore::new(fixture.control.as_mut())
                     .begin_metadata_shard_recovery_ballot_reservation(old, deadline())
                     .unwrap(),
                 Refusal::Spent,
             );
             assert!(matches!(
-                DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                DfsControlPlaneStore::new(fixture.control.as_mut())
                     .verify_metadata_shard_recovery_ballot_before(
                         old,
                         &fixture.shard.primary_node_id,
@@ -436,38 +435,38 @@ fn native_cancelled_requests_stay_spent_after_multiple_floor_advances() {
                 Verify::Refused(_)
             ));
             assert!(
-                !DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                !DfsControlPlaneStore::new(fixture.control.as_mut())
                     .cancel_metadata_shard_recovery_ballot_reservation(old, deadline())
                     .unwrap()
             );
             assert_eq!(
-                read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+                read_one(fixture.control.as_mut(), &key(&fixture.shard)),
                 Some(cancelled.clone())
             );
         }
         let ahead = request(fixture, 0, 5);
         refused(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&ahead, deadline())
                 .unwrap(),
             Refusal::FloorAhead,
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+            read_one(fixture.control.as_mut(), &key(&fixture.shard)),
             Some(cancelled)
         );
         let third = request(fixture, 0, 2);
         assert_ne!(third.reservation_id, first.reservation_id);
         assert_ne!(third.reservation_id, second.reservation_id);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&third, deadline())
                 .unwrap(),
             &third,
         );
         assert_eq!(third.ballot.attempt, 3);
         assert_eq!(third.ballot.epoch, fixture.shard.epoch + 1);
-        let view = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let view = DfsControlPlaneStore::new(fixture.control.as_mut())
             .metadata_shard_recovery_ballot_floor_before(
                 &fixture.shard.file_system_id,
                 &fixture.shard.shard_id,
@@ -486,31 +485,31 @@ fn native_stale_and_concurrent_cancellation_never_erase_new_pending() {
     with_native("native-reservation-cancel-cas", |fixture| {
         let first = request(fixture, 0, 0);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&first, deadline())
                 .unwrap(),
             &first,
         );
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&first, deadline())
                 .unwrap()
         );
         let next = request(fixture, 1, 1);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&next, deadline())
                 .unwrap(),
             &next,
         );
-        let held = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let held = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         assert!(
-            !DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            !DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&first, deadline())
                 .unwrap()
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+            read_one(fixture.control.as_mut(), &key(&fixture.shard)),
             Some(held)
         );
         let until = deadline();
@@ -549,7 +548,7 @@ fn native_stale_and_concurrent_cancellation_never_erase_new_pending() {
                 + b.counts.compare_misses.load(Ordering::SeqCst),
             1
         );
-        let view = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let view = DfsControlPlaneStore::new(fixture.control.as_mut())
             .metadata_shard_recovery_ballot_floor_before(
                 &fixture.shard.file_system_id,
                 &fixture.shard.shard_id,
@@ -567,12 +566,12 @@ fn native_pending_reservation_survives_peer_restart_without_serving_changes() {
         let before = serving_cells(fixture);
         let requested = request(fixture, 0, 0);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap(),
             &requested,
         );
-        let persisted = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let persisted = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         let restarted = fixture.shard.replica_node_ids[1].clone();
         fixture.runtime.stop_node(&restarted).unwrap();
         fixture.runtime.reopen_node(restarted.clone()).unwrap();
@@ -611,12 +610,12 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
         let requested = request(fixture, 0, 0);
         let serving = fixture.shard.clone();
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap(),
             &requested,
         );
-        let pending = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let pending = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         assert_eq!(
             fixture
                 .service
@@ -667,12 +666,12 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
                 .object_id
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&serving)),
+            read_one(fixture.control.as_mut(), &key(&serving)),
             Some(pending)
         );
         assert_eq!(
             read_one(
-                fixture.control.inner.as_mut(),
+                fixture.control.as_mut(),
                 &metadata_shard_key(&serving.file_system_id, &serving.shard_id)
             )
             .unwrap()
@@ -682,7 +681,7 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
         );
         assert!(
             read_one(
-                fixture.control.inner.as_mut(),
+                fixture.control.as_mut(),
                 &metadata_shard_membership_handoff_key(&serving.file_system_id, &serving.shard_id)
             )
             .is_none()
@@ -697,11 +696,11 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
             freeze
         );
         assert!(
-            matches!(DfsControlPlaneStore::new(fixture.control.inner.as_mut()).verify_metadata_shard_recovery_ballot_before(&requested,&serving.primary_node_id,deadline()).unwrap(),Verify::Verified(actual) if actual==requested)
+            matches!(DfsControlPlaneStore::new(fixture.control.as_mut()).verify_metadata_shard_recovery_ballot_before(&requested,&serving.primary_node_id,deadline()).unwrap(),Verify::Verified(actual) if actual==requested)
         );
         let outsider = NodeId::generate();
         assert!(matches!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .verify_metadata_shard_recovery_ballot_before(&requested, &outsider, deadline())
                 .unwrap(),
             Verify::Refused(Refusal::NotMember)
@@ -721,40 +720,40 @@ fn native_wrong_or_absent_authority_and_real_pending_handoff_refuse_verification
         };
         let wrong = Request::prepare(&changed, &changed.replica_node_ids[0], 0).unwrap();
         refused(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&wrong, deadline())
                 .unwrap(),
             Refusal::AuthorityChanged,
         );
-        assert!(read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).is_none());
+        assert!(read_one(fixture.control.as_mut(), &key(&fixture.shard)).is_none());
         let mut absent = fixture.shard.clone();
         absent.file_system_id = DfsFileSystemId::generate();
         let missing = Request::prepare(&absent, &absent.replica_node_ids[0], 0).unwrap();
         refused(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&missing, deadline())
                 .unwrap(),
             Refusal::NoAuthority,
         );
-        assert!(read_one(fixture.control.inner.as_mut(), &key(&absent)).is_none());
+        assert!(read_one(fixture.control.as_mut(), &key(&absent)).is_none());
         assert_eq!(serving_cells(fixture), before);
         let requested = request(fixture, 0, 0);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap(),
             &requested,
         );
-        let pending = read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).unwrap();
+        let pending = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         fixture.deny_last_metadata_participant();
         let promoted = fixture.shard.replica_node_ids.last().unwrap().clone();
-        let handoff = DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+        let handoff = DfsControlPlaneStore::new(fixture.control.as_mut())
             .request_metadata_shard_primary_handoff(&fixture.shard, &promoted)
             .unwrap()
             .unwrap();
         assert_eq!(handoff.retiring_shard, fixture.shard);
         assert!(matches!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .verify_metadata_shard_recovery_ballot_before(
                     &requested,
                     &fixture.shard.primary_node_id,
@@ -764,18 +763,18 @@ fn native_wrong_or_absent_authority_and_real_pending_handoff_refuse_verification
             Verify::Refused(Refusal::HandoffPending)
         ));
         refused(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap(),
             Refusal::HandoffPending,
         );
         assert_eq!(
-            read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)),
+            read_one(fixture.control.as_mut(), &key(&fixture.shard)),
             Some(pending)
         );
         assert_eq!(
             read_one(
-                fixture.control.inner.as_mut(),
+                fixture.control.as_mut(),
                 &metadata_shard_key(&fixture.shard.file_system_id, &fixture.shard.shard_id)
             )
             .unwrap()
@@ -784,7 +783,7 @@ fn native_wrong_or_absent_authority_and_real_pending_handoff_refuse_verification
             fixture.shard
         );
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap(),
             "stale pending can be explicitly cancelled without granting serving authority"
@@ -894,7 +893,7 @@ fn native_malformed_request_and_expired_deadline_perform_no_client_io() {
                 .is_err()
         );
         assert_eq!(client.counts.calls.load(Ordering::SeqCst), 0);
-        assert!(read_one(fixture.control.inner.as_mut(), &key(&fixture.shard)).is_none());
+        assert!(read_one(fixture.control.as_mut(), &key(&fixture.shard)).is_none());
         assert_eq!(serving_cells(fixture), before);
     });
 }
@@ -904,13 +903,13 @@ fn native_corrupt_stored_reservation_never_writes_or_becomes_authority() {
     with_native("native-reservation-corrupt-store", |fixture| {
         let requested = request(fixture, 0, 0);
         reserved(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .begin_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap(),
             &requested,
         );
         let name = key(&fixture.shard);
-        let original = read_one(fixture.control.inner.as_mut(), &name).unwrap();
+        let original = read_one(fixture.control.as_mut(), &name).unwrap();
         let before = serving_cells(fixture);
         let valid = serde_json::json!({"attempt_floor":1,"floor_epoch":fixture.shard.epoch,"pending":requested});
         let mut cases = Vec::new();
@@ -932,25 +931,24 @@ fn native_corrupt_stored_reservation_never_writes_or_becomes_authority() {
         for bad in cases {
             fixture
                 .control
-                .inner
                 .put(
                     name.clone(),
                     sinomo_core::kv::encode_kv_value(&bad).unwrap(),
                 )
                 .unwrap();
-            let corrupt = read_one(fixture.control.inner.as_mut(), &name).unwrap();
+            let corrupt = read_one(fixture.control.as_mut(), &name).unwrap();
             assert!(matches!(
-                DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                DfsControlPlaneStore::new(fixture.control.as_mut())
                     .begin_metadata_shard_recovery_ballot_reservation(&requested, deadline()),
                 Err(KvError::Serialization { .. })
             ));
             assert!(matches!(
-                DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                DfsControlPlaneStore::new(fixture.control.as_mut())
                     .cancel_metadata_shard_recovery_ballot_reservation(&requested, deadline()),
                 Err(KvError::Serialization { .. })
             ));
             assert!(matches!(
-                DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+                DfsControlPlaneStore::new(fixture.control.as_mut())
                     .verify_metadata_shard_recovery_ballot_before(
                         &requested,
                         &fixture.shard.primary_node_id,
@@ -958,15 +956,12 @@ fn native_corrupt_stored_reservation_never_writes_or_becomes_authority() {
                     ),
                 Err(KvError::Serialization { .. })
             ));
-            assert_eq!(
-                read_one(fixture.control.inner.as_mut(), &name),
-                Some(corrupt)
-            );
+            assert_eq!(read_one(fixture.control.as_mut(), &name), Some(corrupt));
             assert_eq!(serving_cells(fixture), before);
         }
-        fixture.control.inner.put(name, original.value).unwrap();
+        fixture.control.put(name, original.value).unwrap();
         assert!(
-            DfsControlPlaneStore::new(fixture.control.inner.as_mut())
+            DfsControlPlaneStore::new(fixture.control.as_mut())
                 .cancel_metadata_shard_recovery_ballot_reservation(&requested, deadline())
                 .unwrap()
         );

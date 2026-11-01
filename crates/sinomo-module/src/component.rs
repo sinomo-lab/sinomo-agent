@@ -764,7 +764,7 @@ impl ComponentReconciler {
 
     pub fn shutdown(&mut self) -> Result<(), ComponentError> {
         self.service_registry
-            .replace_registry(self.base_registry.clone())
+            .withdraw_for_host_stop(self.base_registry.clone())
             .map_err(|error| ComponentError::Registry {
                 detail: error.to_string(),
             })?;
@@ -799,7 +799,7 @@ impl ComponentReconciler {
         timeout: std::time::Duration,
     ) -> Result<(), ComponentError> {
         self.service_registry
-            .replace_registry(self.base_registry.clone())
+            .withdraw_for_host_stop(self.base_registry.clone())
             .map_err(|error| ComponentError::Registry {
                 detail: error.to_string(),
             })?;
@@ -1631,6 +1631,14 @@ mod tests {
                     .active_snapshot()
                     .registry()
                     .owns("/fixture/blocking-stop")
+            );
+            assert!(
+                fixture
+                    .reconciler
+                    .service_registry()
+                    .active_snapshot()
+                    .host_stopping(),
+                "host stop withdraws admission without changing the published offer"
             );
 
             fixture.release.send(()).expect("release blocking worker");
