@@ -71,15 +71,19 @@ fn unpack(archive: &Path, destination: &Path) -> Result<()> {
 
 /// Validate every artifact before touching installed state. No compiler, Git,
 /// display server or network access is needed on the installing machine.
-pub fn install_missing(package: &Path, data: &Path, seed_defaults: bool) -> Result<()> {
+pub fn prepare(package: &Path, data: &Path, executable: &Path) -> Result<Option<PreparedPayload>> {
     if data.join(RETAINED_PAYLOAD).try_exists()? {
-        return validate_retained(data);
+        validate_retained(data)?;
+        return Ok(None);
     }
     let archive = package.join(PAYLOAD);
     if !archive.is_file() {
         return Err("initial-payload.tar is missing; use the complete Sinomo distribution".into());
     }
-    let scratch = ScratchDirectory::create(&data.join("rollout/staged"), "initial-payload")?;
+    let scratch = ScratchDirectory::create(
+        &std::env::temp_dir().join("sinomo-setup"),
+        "initial-payload",
+    )?;
     let stage = scratch.path();
     unpack(&archive, &stage)?;
     let manifest_bytes = fs::read(stage.join("initial-payload.json"))?;
@@ -96,8 +100,13 @@ pub fn install_missing(package: &Path, data: &Path, seed_defaults: bool) -> Resu
         return Err("bootstrap source digest mismatch".into());
     }
     let source = sinomo_build::BuildPaths::new(data).managed_source;
+    let retained_cli = local::SinomoDataDir::new(data).binary("sinomo");
     if !source.exists()
-        && hash(&local::SinomoDataDir::new(data).binary("sinomo"))? != manifest.cli_hash
+        && hash(if retained_cli.is_file() {
+            &retained_cli
+        } else {
+            executable
+        })? != manifest.cli_hash
     {
         return Err("bootstrap CLI does not match its source/module payload".into());
     }
@@ -118,49 +127,104 @@ pub fn install_missing(package: &Path, data: &Path, seed_defaults: bool) -> Resu
             return Err("invalid runtime dependency".into());
         }
     }
-    fs::create_dir_all(data.join("bin/lib"))?;
-    for library in &manifest.libraries {
-        let destination = data.join("bin/lib").join(&library.file);
-        if !destination.exists() {
-            fs::copy(stage.join("lib").join(&library.file), destination)?;
-        }
-    }
     if !source.exists() {
         let prepared = stage.join("source");
         unpack(&stage.join("source.tar"), &prepared)?;
         if !prepared.join(".git/HEAD").is_file() || !prepared.join("Cargo.lock").is_file() {
             return Err("bootstrap source is not a self-contained managed checkout".into());
         }
-        fs::create_dir_all(source.parent().ok_or("no managed source parent")?)?;
-        fs::rename(prepared, &source)?;
     }
-    for module in manifest.modules {
-        if !seed_defaults {
-            continue;
+    Ok(Some(PreparedPayload {
+        scratch,
+        manifest,
+        manifest_bytes,
+    }))
+}
+
+pub struct PreparedPayload {
+    scratch: ScratchDirectory,
+    manifest: PayloadManifest,
+    manifest_bytes: Vec<u8>,
+}
+
+impl PreparedPayload {
+    pub fn install(self, data: &Path, seed_defaults: bool) -> Result<()> {
+        let stage = self.scratch.path();
+        let manifest = self.manifest;
+        let manifest_bytes = self.manifest_bytes;
+        let source = sinomo_build::BuildPaths::new(data).managed_source;
+        fs::create_dir_all(data.join("bin/lib"))?;
+        for library in &manifest.libraries {
+            let destination = data.join("bin/lib").join(&library.file);
+            if !destination.exists() {
+                fs::copy(stage.join("lib").join(&library.file), destination)?;
+            }
         }
-        let meta = module.metadata;
-        // Preserve evolved binaries and even disabled module selections.
-        if sinomo_module::read_native_dylib_module_loader_state(data, &meta.module_id)?.is_none() {
-            sinomo_module::install_native_dylib_module_from_file(
-                data,
-                &stage.join(module.file),
-                sinomo_module::NativeDylibModuleInstallRequest {
-                    expected_module_id: Some(meta.module_id),
-                    artifact_id: None,
-                    expected_interface_version: Some(meta.interface_version),
-                    cache_key: Some(meta.cache_key),
-                    library_name: Some(meta.library_name),
-                    source: meta.source,
-                },
-            )?;
+        if !source.exists() {
+            let prepared = stage.join("source");
+            let parent = source.parent().ok_or("no managed source parent")?;
+            fs::create_dir_all(parent)?;
+            // Preflight may use a different volume. Publish through an owned
+            // stage beside the destination, retaining atomic visibility.
+            let local = ScratchDirectory::create(parent, "bootstrap-source")?;
+            let candidate = local.path().join("source");
+            copy_source_tree(&prepared, &candidate)?;
+            fs::rename(candidate, &source)?;
+        }
+        for module in manifest.modules {
+            if !seed_defaults {
+                continue;
+            }
+            let meta = module.metadata;
+            // Preserve evolved binaries and even disabled module selections.
+            if sinomo_module::read_native_dylib_module_loader_state(data, &meta.module_id)?
+                .is_none()
+            {
+                sinomo_module::install_native_dylib_module_from_file(
+                    data,
+                    &stage.join(module.file),
+                    sinomo_module::NativeDylibModuleInstallRequest {
+                        expected_module_id: Some(meta.module_id),
+                        artifact_id: None,
+                        expected_interface_version: Some(meta.interface_version),
+                        cache_key: Some(meta.cache_key),
+                        library_name: Some(meta.library_name),
+                        source: meta.source,
+                    },
+                )?;
+            }
+        }
+        // The resolver is shared by the CLI, GUI and all evolved replacements.
+        fs::write(
+            data.join("bin").join(local::INSTALLED_DATA_DIR_FILE),
+            data.to_str().ok_or("invalid data path")?,
+        )?;
+        fs::write(data.join(RETAINED_PAYLOAD), manifest_bytes)?;
+        Ok(())
+    }
+}
+
+fn copy_source_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_source_tree(&entry.path(), &target)?;
+        } else if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else {
+            return Err("validated source changed before publication".into());
         }
     }
-    // The resolver is shared by the CLI, GUI and all evolved replacements.
-    fs::write(
-        data.join("bin").join(local::INSTALLED_DATA_DIR_FILE),
-        data.to_str().ok_or("invalid data path")?,
-    )?;
-    fs::write(data.join(RETAINED_PAYLOAD), manifest_bytes)?;
+    Ok(())
+}
+
+pub fn install_missing(package: &Path, data: &Path, seed_defaults: bool) -> Result<()> {
+    let executable = local::SinomoDataDir::new(data).binary("sinomo");
+    if let Some(payload) = prepare(package, data, &executable)? {
+        payload.install(data, seed_defaults)?;
+    }
     Ok(())
 }
 
@@ -210,6 +274,55 @@ fn single_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_nested_source_is_rejected_before_data_mutation() {
+        let root = sinomo_testdir::TestDir::new("bootstrap-preflight-source");
+        let package = root.join("package");
+        let data = root.join("data");
+        fs::create_dir_all(&package).unwrap();
+        let cli = package.join("sinomo");
+        fs::write(&cli, b"candidate").unwrap();
+        fs::write(package.join("source.tar"), b"invalid nested tar archive").unwrap();
+        fs::write(package.join("module.so"), b"module fixture").unwrap();
+        let manifest = PayloadManifest {
+            schema: 1,
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            revision: "fixture".into(),
+            source_hash: hash(&package.join("source.tar")).unwrap(),
+            cli_hash: hash(&cli).unwrap(),
+            libraries: Vec::new(),
+            modules: vec![PayloadModule {
+                file: "module.so".into(),
+                hash: hash(&package.join("module.so")).unwrap(),
+                metadata: NativeDylibArtifactMetadata::new(
+                    sinomo_module::ModuleId::from_legacy_named("module.preflight").unwrap(),
+                    "v1",
+                    "fixture",
+                    "module.so",
+                    "fixture",
+                ),
+            }],
+        };
+        fs::write(
+            package.join("initial-payload.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let mut archive = tar::Builder::new(fs::File::create(package.join(PAYLOAD)).unwrap());
+        for file in ["initial-payload.json", "source.tar", "module.so"] {
+            archive
+                .append_path_with_name(package.join(file), file)
+                .unwrap();
+        }
+        archive.finish().unwrap();
+        assert!(prepare(&package, &data, &cli).is_err());
+        assert!(
+            !data.exists(),
+            "preflight must not create DATA, bindings, ownership or deployment fences"
+        );
+    }
+
     #[test]
     fn adopting_evolved_data_does_not_reintroduce_upstream_modules() {
         let root = sinomo_testdir::TestDir::new("retain-module-selection");

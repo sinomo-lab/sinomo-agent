@@ -55,7 +55,9 @@ function Install-Fixture {
 function Uninstall-Fixture([switch]$DeleteData) {
     Write-Output "Uninstalling graphical fixture (delete data: $DeleteData)."
     $arguments = if ($DeleteData) { '/S /DELETE_DATA' } else { '/S' }
-    $process = Start-Process -FilePath (Join-Path $application 'Uninstall.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $script=Join-Path $application 'uninstall.ps1'
+    $flags=if($DeleteData){'-Quiet -DeleteData'}else{'-Quiet'}
+    $process = Start-Process -FilePath powershell.exe -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`" $flags" -WindowStyle Hidden -PassThru
     if (-not $process.WaitForExit(120000)) { throw 'Uninstaller timed out; retained state for diagnosis.' }
     # NSIS may run a temporary copy after the original process exits.
     $deadline = (Get-Date).AddSeconds(30)
@@ -67,6 +69,15 @@ function Uninstall-Fixture([switch]$DeleteData) {
     if ([Environment]::GetEnvironmentVariable('Path', 'User') -cne $originalPath) { throw 'Uninstall did not restore the exact previous user PATH.' }
 }
 
+Install-Fixture
+# Repeating the other frontend verifies the installation and preserves runtime versions.
+$cli=Join-Path $data 'bin/sinomo.exe'
+$before=(Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash
+$process=Start-Process -FilePath $cli -ArgumentList 'install' -WindowStyle Hidden -PassThru
+$null=$process.Handle
+if (-not $process.WaitForExit(120000)) {throw 'Cross-frontend verification timed out.'}
+$process.Refresh()
+if ($process.ExitCode -ne 0 -or (Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash -ne $before) {throw 'CLI verification of GUI install changed the runtime or failed.'}
 Install-Fixture
 Uninstall-Fixture
 if (-not (Test-Path -LiteralPath $data)) { throw 'Default uninstall deleted data.' }

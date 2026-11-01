@@ -2209,6 +2209,83 @@ mod cluster_build_service_tests {
         NativeDylibArtifactMetadata, build_content_hash, build_source_identity_hash,
     };
 
+    #[test]
+    #[ignore = "explicit real builder qualification; compiles and downloads the setup binary"]
+    fn build_setup_with_resident_service() {
+        let Some(repo) = std::env::var_os("SINOMO_SETUP_BUILD_SOURCE") else {
+            return;
+        };
+        let destination =
+            PathBuf::from(std::env::var_os("SINOMO_SETUP_BUILD_OUTPUT").expect("artifact output"));
+        let contact = RolloutTarget::address(
+            std::env::var("SINOMO_SETUP_BUILD_NODE").expect("builder endpoint"),
+        );
+        let source = prepare_cluster_build_source_input(&RolloutOptions {
+            repo: Some(repo.into()),
+            ..RolloutOptions::default()
+        })
+        .expect("immutable source");
+        let target = BuildTarget::new("windows", "x86_64")
+            .unwrap()
+            .with_rust_target("x86_64-pc-windows-msvc")
+            .unwrap();
+        let request = BuildCapabilitiesRequest {
+            target: Some(target.clone()),
+            build_key: None,
+            artifact_kinds: vec![BuildArtifactKind::Binary],
+        };
+        let capabilities = send_daemon_build_capabilities_for_target(&contact, request)
+            .expect("builder capabilities");
+        let capability =
+            supporting_build_capability(&capabilities, &target, &[BuildArtifactKind::Binary])
+                .expect("compatible builder");
+        let plan = build_plan_for_capability(
+            &source,
+            &capability,
+            &[],
+            &[BuildOutputRequest::binary("sinomo-setup", "sinomo-setup")],
+        )
+        .unwrap();
+        let exact = send_daemon_build_capabilities_for_target(
+            &contact,
+            BuildCapabilitiesRequest {
+                target: Some(plan.input.target.clone()),
+                build_key: Some(plan.key.clone()),
+                artifact_kinds: vec![BuildArtifactKind::Binary],
+            },
+        )
+        .unwrap();
+        let builder = ClusterBuilderPlan {
+            contact,
+            cache_hit: exact.cache_hit.unwrap_or(false),
+            capabilities: exact,
+            plan,
+            transfer_cost: 0,
+        };
+        let manifest =
+            submit_cluster_build_and_wait(&builder, &source.source_bundle).expect("setup build");
+        assert_eq!(manifest.artifacts.len(), 1);
+        let artifact = &manifest.artifacts[0];
+        assert_eq!(artifact.name, "sinomo-setup");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let response = send_daemon_build_artifact_for_target(
+            &builder.contact,
+            &BuildArtifactRequest {
+                build_key: builder.plan.key.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+            },
+            &destination,
+        )
+        .expect("signed artifact stream");
+        assert_eq!(response.artifact, *artifact);
+        fs::write(
+            destination.with_extension("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        println!("verified setup artifact {}", destination.display());
+    }
+
     fn exact_linux_target() -> BuildTarget {
         BuildTarget::new("linux", "aarch64")
             .expect("target")

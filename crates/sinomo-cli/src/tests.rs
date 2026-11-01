@@ -6574,13 +6574,47 @@ fn install_parser_separates_initial_setup_from_service_deployment() {
         Some(PathBuf::from("application folder"))
     );
     assert_eq!(parsed.data_dir, Some(PathBuf::from("data folder")));
-    assert!(parsed.add_to_path && parsed.desktop_shortcut && parsed.menu_shortcut);
+    assert_eq!(
+        (
+            parsed.add_to_path,
+            parsed.desktop_shortcut,
+            parsed.menu_shortcut
+        ),
+        (Some(true), Some(true), Some(true))
+    );
     assert!(!parsed.runtime_service);
     assert!(parsed.start);
+    let changes = parse_install_schema_for_test(&[
+        "--no-add-to-path".into(),
+        "--no-menu-shortcut".into(),
+        "--no-desktop-shortcut".into(),
+        "--no-startup".into(),
+    ])
+    .unwrap();
+    assert_eq!(
+        (
+            changes.add_to_path,
+            changes.menu_shortcut,
+            changes.desktop_shortcut,
+            changes.startup
+        ),
+        (Some(false), Some(false), Some(false), Some(false))
+    );
+    assert_eq!(InstallOptions::default().add_to_path, None);
+    assert!(parse_install_schema_for_test(&["--startup".into(), "--no-startup".into()]).is_err());
+    assert!(
+        parse_install_schema_for_test(&["--add-to-path".into(), "--no-add-to-path".into()])
+            .is_err()
+    );
     let defaults = sinomo_runtime::installer::initial_setup::services::Options::default();
     assert_eq!(parsed.host, defaults.host);
-    assert_eq!((parsed.port, parsed.shadow_port), (defaults.main_port, defaults.shadow_port));
-    let service = parse_install_schema_for_test(&["--port".into(), "21400".into(), "--no-start".into()]).unwrap();
+    assert_eq!(
+        (parsed.port, parsed.shadow_port),
+        (defaults.main_port, defaults.shadow_port)
+    );
+    let service =
+        parse_install_schema_for_test(&["--port".into(), "21400".into(), "--no-start".into()])
+            .unwrap();
     assert!(!service.start && !service.port_fallback);
     assert!(
         parse_install_schema_for_test(&["--runtime-service".into(), "--add-to-path".into()])

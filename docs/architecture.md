@@ -488,6 +488,11 @@ Desktop bundles are immutable rollout artifacts. Their manifests bind file
 digests, source revision, platform, daemon protocol, and restoration schema.
 Installation selects a desktop or headless profile; desktop packages install
 stable launcher entries beside the runtime.
+Command-line and graphical setup reconcile one installation identity and default
+configuration. Existing deployments are verified; explicit integration changes
+preserve component versions owned by rollout. Both removal entry points detach
+and stop the same deployment, retaining its entire data directory unless deletion
+is explicitly requested.
 Failed startup retains the previous bundle and the pre-update presentation
 snapshot, so an unsuccessful UI migration cannot overwrite the recovery state.
 UI snapshots restore drafts and event cursors; canonical conversations, tool

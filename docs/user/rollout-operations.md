@@ -29,7 +29,7 @@ relevant tests, and confirm the current cluster is healthy.
 A desktop release contains `sinomo-app`, `sinomo-ui-extension-host`, optional
 runtime libraries, and `desktop-release.json`. It can be delivered independently
 of the daemon and native modules. The initial installer also ships the CLI and
-offline default-module/source payload; the CLI hosts local desktop supervision. Running `sinomo install` from that release installs the
+offline default-module/source payload; the CLI hosts local desktop supervision. Running `sinomo install` from that release installs or verifies the
 desktop app automatically. A runtime-only release remains headless. The explicit
 forms are:
 

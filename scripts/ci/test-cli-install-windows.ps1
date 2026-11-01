@@ -92,8 +92,16 @@ foreach ($role in @('daemon', 'daemon shadow')) {
     if (-not $running) { throw "$role did not start through its sign-in service" }
 }
 $before = Get-CliDigest $installedCli
-if ((Invoke-Cli $Cli $installArguments 'refuse-overwrite') -eq 0) { throw 'Initial install overwrote an existing installation.' }
+if ((Invoke-Cli $Cli $installArguments 'verify-existing') -ne 0) { throw 'Existing installation verification failed.' }
 if ((Get-CliDigest $installedCli) -ne $before) { throw 'An existing CLI was modified.' }
+$mainBefore=(Get-Content -LiteralPath (Join-Path $SandboxRoot 'daemon-signin-status.out') -Raw)
+$preferences='install --no-add-to-path --no-startup'
+if ((Invoke-Cli $installedCli $preferences 'reconfigure-disable') -ne 0) { throw 'Disabling PATH/startup failed.' }
+foreach ($entry in $serviceEntries) { if (Test-Path -LiteralPath $entry) { throw 'Disabled startup entry remains.' } }
+if ([Environment]::GetEnvironmentVariable('Path','User') -cne $originalPath) { throw 'Disabling PATH did not preserve unrelated entries.' }
+if ((Invoke-Cli $installedCli 'install --add-to-path --startup' 'reconfigure-enable') -ne 0) { throw 'Re-enabling PATH/startup failed.' }
+foreach ($entry in $serviceEntries) { if (-not (Test-Path -LiteralPath $entry)) { throw 'Re-enabled startup entry missing.' } }
+
 if ((Invoke-Cli $installedCli '--help' 'help') -ne 0) { throw 'Installed CLI did not launch.' }
 if ((Invoke-Cli $installedCli 'uninstall' 'self-uninstall') -ne 0) { throw 'Installed CLI could not uninstall itself.' }
 $deadline = (Get-Date).AddSeconds(30)
@@ -123,4 +131,4 @@ if ([Environment]::GetEnvironmentVariable('Path', 'User') -cne $originalPath) { 
 if ((Invoke-Cli $Cli ($installArguments + ' --no-start') 'stage-only') -ne 0) { throw '--no-start staging failed.' }
 if (Test-Path -LiteralPath (Join-Path $data 'daemon/status.sobj')) { throw '--no-start launched a daemon.' }
 if ((Invoke-Cli $Cli "uninstall --install-dir `"$application`" --delete-data" 'remove-stage') -ne 0) { throw 'Staged deployment removal failed.' }
-Write-Output 'PASS: headless CLI install, registered/running main and shadow services, custom paths, overwrite refusal, self/cross-uninstall, data retention/deletion and --no-start.'
+Write-Output 'PASS: headless CLI install, registered/running main and shadow services, custom paths, verification/reconfiguration, self/cross-uninstall, data retention/deletion and --no-start.'

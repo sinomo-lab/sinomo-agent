@@ -56,6 +56,23 @@ def main():
             if "is running" not in run("-".join(role) + "-status", [cli, *role, "status"]):
                 raise RuntimeError("Installer did not start its daemon services")
         run("evolution", [cli, "evolve", "--help"])
+        initial_digest = digest(cli)
+        initial_receipt = (setup / "sinomo-install.json").read_bytes()
+        if mode == "gui":
+            run("verify-cli", [cli, "install"])
+        else:
+            run("verify-gui", [image, "--appimage-extract-and-run", "install", "--install-dir", setup, "--data-dir", data, "--no-dialogs"])
+        if digest(cli) != initial_digest or (setup / "sinomo-install.json").read_bytes() != initial_receipt:
+            raise RuntimeError("Cross-frontend verification changed the installation")
+        run("configure-on", [cli, "install", "--add-to-path", "--menu-shortcut", "--desktop-shortcut", "--no-startup"])
+        changed = json.loads((setup / "sinomo-install.json").read_text())
+        if changed["configuration"] != dict(add_to_path=True, menu_shortcut=True, desktop_shortcut=True, startup=False):
+            raise RuntimeError("Integration settings were not reconciled")
+        run("preserve-settings", [cli, "install"])
+        if json.loads((setup / "sinomo-install.json").read_text())["configuration"] != changed["configuration"]:
+            raise RuntimeError("Default verification reset configured preferences")
+        run("configure-off", [cli, "install", "--no-add-to-path", "--no-menu-shortcut", "--no-desktop-shortcut", "--startup"])
+
         # Content identity is independent of chosen paths and fallback listener ports.
         summaries.append({"cli": digest(cli), "app": digest(data / "bin/sinomo-app"),
             "native": sorted(digest(p) for p in (data / "module/cache/native-dylib").rglob("*.so")),

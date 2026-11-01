@@ -98,32 +98,57 @@ cargo run --locked -p sinomo-installer --bin sinomo-package -- . target/x86_64-u
 target/x86_64-unknown-linux-gnu/debug/sinomo install --add-to-path
 ```
 
-`sinomo install` uses the same initial-setup engine as the graphical installer.
-Use a complete `sinomo-cli` archive from the installer artifacts, or prepare the
-offline payload from a clean committed source checkout as above. Keep
-`initial-payload.tar` beside the downloaded CLI. Setup requires an empty metadata
-destination, binds executable components to `<data>/bin`, registers removal
-integration, and preserves an evolved deployment. It registers per-user daemon startup and verifies main and
-shadow are running before reporting success. It seeds missing managed source and default native modules from the verified
-offline payload, without compiling or downloading during installation. `--no-start` registers
-the deployment without starting new daemon processes.
+`sinomo install` and the graphical installer use the same setup, verification,
+configuration and removal engine. The ordinary CLI archive and graphical package
+carry the same default desktop profile. Use `--headless` for a CLI-only deployment.
+For a new deployment, use a complete distribution or prepare the offline payload
+from a clean committed source checkout as above. Keep `initial-payload.tar` beside
+the CLI. Payload and ownership checks finish before setup claims the installation
+or changes deployment enablement. Installation does not compile, download, or
+modify system libraries.
 
-Use `--install-dir PATH` and `--data-dir PATH` to choose locations. The defaults
-are `%LOCALAPPDATA%/Programs/Sinomo` on Windows and `~/.local/opt/sinomo` on Linux,
-with the data directory selected by `SINOMO_DATA_DIR` or `~/.sinomo`.
-`--add-to-path`, `--desktop-shortcut` and `--menu-shortcut` opt into shell
-integration. The menu option covers Start Menu on Windows and the applications
-menu on Linux. App shortcuts require a verified desktop bundle.
+Setup binds executable components to `<data>/bin`, registers per-user daemon
+startup and verifies main and shadow readiness before reporting success.
+`--no-start` suppresses immediate daemon startup while still configuring future
+startup. `--no-startup` disables boot/login startup without stopping processes
+that are already running.
+
+An existing installation is verified instead of overwritten. Running either
+frontend after the other preserves evolved binaries, modules, source, data and
+omitted integration settings. Healthy daemons are not restarted. Missing owned
+registration or integration files are repaired; conflicting ownership is reported.
+The graphical installer offers the same PATH, startup and shortcut choices as
+the CLI:
+
+```sh
+sinomo install
+sinomo install --add-to-path --startup --menu-shortcut
+sinomo install --no-add-to-path --no-startup --no-menu-shortcut --no-desktop-shortcut
+```
+
+Use `--install-dir PATH` and `--data-dir PATH` to choose locations for a new
+installation. The defaults are `%LOCALAPPDATA%/Programs/Sinomo` on Windows and
+`~/.local/opt/sinomo` on Linux, with data selected by `SINOMO_DATA_DIR` or
+`~/.sinomo`. Existing installation bindings are reused when those options are
+omitted. Optional PATH and shortcuts are disabled on a fresh installation;
+startup is enabled. Either frontend can subsequently enable or disable them.
+App shortcuts require a desktop profile. Component upgrades use rollout rather
+than setup.
 
 A source-built CLI without a sibling desktop manifest installs only the CLI.
 Use `--app-bundle DIRECTORY` to install a verified desktop release; `--headless`
 explicitly installs only the CLI. See [desktop app rollout](rollout-operations.md#desktop-app-rollout)
 for desktop bundle preparation.
 
-`sinomo uninstall` removes an initial installation and retains data by default.
-Use `--install-dir PATH` to select another installation, or add `--delete-data`
-to explicitly request permanent removal of its associated data. The same path
-and ownership checks apply to both graphical and command-line removal.
+Both uninstall frontends stop the same main/shadow deployment and remove its
+PATH, boot/login startup, shortcuts and operating-system registration. Data is
+retained by default, including binaries, managed source, modules and user state;
+a durable removal fence prevents retained launchers from restarting it.
+Use `--install-dir PATH` to select another installation. `--delete-data`, or the
+explicit graphical deletion choice, removes the complete owned data directory
+as well as installation metadata. Files unrelated to the installation are not
+removed from a custom metadata folder. Reinstallation verifies and re-enables
+retained components without replacing them.
 
 If `sinomo` is not immediately on `PATH`, start a new shell or continue with
 `cargo run -p sinomo -- <command>` from the repository.
