@@ -24,8 +24,7 @@ use sinomo_network::write_local_cluster_connectivity_record_set;
 use sinomo_network::{CLUSTER_NETWORK_PUBLISH_INTERVAL, cluster_network_publish_interval_for_role};
 use sinomo_network::{
     ClusterConnectivityRecord, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
-    cluster_connectivity_record_should_refresh, cluster_connectivity_stable_eq,
-    validate_cluster_connectivity_records_for_source,
+    cluster_connectivity_stable_eq, validate_cluster_connectivity_records_for_source,
 };
 use sinomo_node::cluster_node_is_local_process;
 use std::collections::BTreeMap;
@@ -776,13 +775,15 @@ fn cluster_network_record_expired(expires_at: OffsetDateTime, now: OffsetDateTim
     expires_at + time::Duration::seconds(CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS) <= now
 }
 
+/// Whether `record` is already published by `known`. Publication is semantic:
+/// an unchanged committed row is never renewed by time, so its age cannot make
+/// it unpublished.
 pub fn cluster_connectivity_publish_record_matches(
     known: &ClusterConnectivityRecord,
     record: &ClusterConnectivityRecord,
-    now: OffsetDateTime,
+    _now: OffsetDateTime,
 ) -> bool {
     cluster_connectivity_stable_eq(known, record)
-        && !cluster_connectivity_record_should_refresh(known.expires_at, now)
 }
 
 #[cfg(any(test, feature = "test-support"))]

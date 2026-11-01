@@ -8,10 +8,10 @@ use crate::raft_quorum::{
 };
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
+use sinomo_network::ClusterConnectivityRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::current_io_observer as io_observer;
-use sinomo_network::{ClusterConnectivityRecord, cluster_network_record_live};
 use sinomo_network::{ClusterFileMark, cluster_file_mark};
 
 use sinomo_base::ClusterBootstrapState;
@@ -534,8 +534,8 @@ fn route_connectivity_projection_changed(
     incoming: &KvSnapshot,
     now: OffsetDateTime,
 ) -> Result<bool, NetworkError> {
-    let existing_records = live_connectivity_records_by_key(existing, now)?;
-    let incoming_records = live_connectivity_records_by_key(incoming, now)?;
+    let existing_records = committed_connectivity_records_by_key(existing)?;
+    let incoming_records = committed_connectivity_records_by_key(incoming)?;
     if existing_records.len() != incoming_records.len() {
         return Ok(true);
     }
@@ -550,18 +550,16 @@ fn route_connectivity_projection_changed(
     Ok(false)
 }
 
-fn live_connectivity_records_by_key(
+// Routing reads every committed row as its source's current statement, so
+// the route projection changes with committed semantics, not with row age.
+fn committed_connectivity_records_by_key(
     snapshot: &KvSnapshot,
-    now: OffsetDateTime,
 ) -> Result<BTreeMap<String, ClusterConnectivityRecord>, NetworkError> {
     let mut records = BTreeMap::new();
     for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
         let record = entry
             .decode::<ClusterConnectivityRecord>()
             .map_err(kv_err)?;
-        if !cluster_network_record_live(record.expires_at, now) {
-            continue;
-        }
         records.insert(
             cluster_connectivity_key(
                 &record.source_node_id,

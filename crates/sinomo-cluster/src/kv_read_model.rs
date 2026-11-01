@@ -289,13 +289,33 @@ impl ClusterDirectoryProjection {
         (members, endpoints)
     }
 
-    fn live_connectivity_records(&self, now: OffsetDateTime) -> Vec<ClusterConnectivityRecord> {
+    /// Committed connectivity as current routing evidence.
+    ///
+    /// Quorum publication is semantic: a source commits a new, removed or
+    /// changed edge and never renews an unchanged one by time. A committed row
+    /// therefore remains its source's current statement until that source
+    /// commits a change or the directory revokes its source, target or
+    /// endpoint. The row's own lifetime restarts at this read, so routing,
+    /// which bounds uncommitted evidence by TTL, does not age it out.
+    fn routing_connectivity_records(
+        &self,
+        read_at: OffsetDateTime,
+    ) -> Vec<ClusterConnectivityRecord> {
         self.connectivity_records
             .iter()
-            .filter(|record| cluster_network_record_live(record.expires_at, now))
-            .cloned()
+            .map(|record| committed_connectivity_record_current_at(record, read_at))
             .collect()
     }
+}
+
+fn committed_connectivity_record_current_at(
+    record: &ClusterConnectivityRecord,
+    read_at: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    let mut current = record.clone();
+    let lifetime = record.expires_at - record.observed_at;
+    current.expires_at = record.expires_at.max(read_at + lifetime);
+    current
 }
 
 struct ClusterDirectoryProjectionCacheEntry {
@@ -526,8 +546,8 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
     let mut endpoints: Vec<_> = endpoint_map.into_values().flatten().collect();
     endpoints.extend(hints);
     let connectivity_records =
-        // Keep the decoded records, not their time-dependent live view. Route
-        // capture filters lease expiry on every call below.
+        // Keep the decoded committed records. Route capture states them as
+        // current evidence at each read below.
         read_all_cluster_connectivity_records_from_directory_entries(snapshot.as_ref())?;
 
     let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() else {
@@ -963,26 +983,6 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
         read_cluster_connectivity_graph_from_kv(&self.paths)
     }
 
-    fn connectivity_freshness_baseline(
-        &self,
-    ) -> Result<sinomo_network::DirectoryConnectivityBaseline, NetworkError> {
-        let Some(snapshot) = read_cluster_directory_input(&self.paths)? else {
-            return Ok(sinomo_network::DirectoryConnectivityBaseline {
-                version: sinomo_network::DirectoryVersion(0),
-                records: Vec::new(),
-            });
-        };
-        let projection = read_cluster_directory_projection_from_input_at_module_generation(
-            &self.paths,
-            snapshot,
-            sinomo_network::network_module_routing_generation(),
-        )?;
-        Ok(sinomo_network::DirectoryConnectivityBaseline {
-            version: projection.routing_version,
-            records: projection.connectivity_records.clone(),
-        })
-    }
-
     fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
         // Same source as the read methods above (max of the local raft view
         // and the imported snapshot cache): a version computed from a
@@ -1038,7 +1038,7 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
             projection.routing_version,
             members,
             endpoints,
-            projection.live_connectivity_records(OffsetDateTime::now_utc()),
+            projection.routing_connectivity_records(OffsetDateTime::now_utc()),
         ))
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_directory_projection_rechecks_connectivity_expiry() {
+    fn committed_connectivity_remains_current_for_routing_after_its_ttl() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_kv_read_model_expiry").expect("cluster");
@@ -1823,13 +1823,24 @@ mod tests {
             connectivity_records: vec![record.clone()],
         };
 
-        assert_eq!(projection.live_connectivity_records(now), vec![record]);
-        assert!(
-            projection
-                .live_connectivity_records(now + time::Duration::seconds(2))
-                .is_empty(),
-            "a cache hit must not extend a connectivity lease"
+        assert_eq!(
+            projection.routing_connectivity_records(now),
+            vec![record.clone()],
+            "a row inside its own lifetime is projected unchanged"
         );
+        // Publication is semantic, so an unchanged committed row is never
+        // renewed in KV. Routing keeps it until its source commits a change.
+        let later = now + time::Duration::hours(1);
+        let mut current = record;
+        current.expires_at = later + time::Duration::seconds(1);
+        assert_eq!(
+            projection.routing_connectivity_records(later),
+            vec![current.clone()]
+        );
+        assert!(sinomo_network::cluster_network_record_live(
+            current.expires_at,
+            later
+        ));
     }
 
     #[test]
@@ -1884,7 +1895,10 @@ mod tests {
             .unwrap();
         store.put_serde(&key, &record, None).unwrap();
         let first = read(store.try_snapshot().unwrap());
-        assert_eq!(first.live_connectivity_records(now), vec![record.clone()]);
+        assert_eq!(
+            first.routing_connectivity_records(now),
+            vec![record.clone()]
+        );
 
         record.observed_at = now + time::Duration::seconds(2);
         record.expires_at = now + time::Duration::seconds(60);
@@ -1896,15 +1910,14 @@ mod tests {
             "a real renewal must not invalidate established routing topology"
         );
         assert_eq!(
-            renewed.live_connectivity_records(now + time::Duration::seconds(2)),
+            renewed.routing_connectivity_records(now + time::Duration::seconds(2)),
             vec![record.clone()],
             "the cache must expose the actual newer observation rather than its expired predecessor"
         );
-        assert!(
-            renewed
-                .live_connectivity_records(now + time::Duration::seconds(61))
-                .is_empty(),
-            "the replacement observation still expires normally"
+        assert_eq!(
+            renewed.routing_connectivity_records(now + time::Duration::seconds(61))[0].observed_at,
+            record.observed_at,
+            "the committed replacement stays current without a time-only renewal"
         );
 
         record.state = ClusterConnectivityState::Unreachable;
@@ -1994,12 +2007,8 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "kv_read_model/live_freshness_tests.rs"]
-mod live_freshness_tests;
-
-#[cfg(test)]
-#[path = "kv_read_model/multihop_freshness_tests.rs"]
-mod multihop_freshness_tests;
+#[path = "kv_read_model/committed_route_tests.rs"]
+mod committed_route_tests;
 
 #[cfg(test)]
 #[path = "kv_read_model/directory_input_native_tests.rs"]

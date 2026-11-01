@@ -402,6 +402,15 @@ impl ClusterNetworkMaintenanceCadence {
         );
     }
 
+    /// A committed local source change needs quorum publication, not a new
+    /// probe generation. The publication retry owner re-reads the stored
+    /// source set, so a waiting retry keeps its backoff and still carries it.
+    pub fn request_connectivity_source_publication(&mut self, now: Instant) {
+        if self.connectivity_publish_retry_at.is_none() {
+            self.connectivity_publish_retry_at = Some(now);
+        }
+    }
+
     pub fn request_discovery_refresh(&mut self, now: Instant) {
         if self.discovery_retry_at.is_some() {
             self.discovery_retry_at = Some(now);
@@ -961,6 +970,29 @@ mod tests {
         assert_eq!(cadence.probe_retry_at, Some(now));
         assert!(cadence.connectivity_force_probe);
         assert!(!cadence.connectivity_converged);
+    }
+
+    #[test]
+    fn local_source_publication_is_due_now_without_a_probe_generation() {
+        let now = Instant::now();
+        let mut cadence = renewal_cadence(now);
+
+        cadence.request_connectivity_source_publication(now);
+
+        assert_eq!(cadence.connectivity_publish_retry_at, Some(now));
+        assert_eq!(cadence.next_due_duration(now, false), Duration::ZERO);
+        assert_eq!(cadence.connectivity_input_generation, 0);
+        assert!(!cadence.connectivity_force_probe);
+        assert!(cadence.connectivity_converged);
+
+        // A failed quorum publication keeps its backoff. Its retry re-reads
+        // the stored source set, so the newer change is still carried.
+        let retry_at = now + Duration::from_secs(4);
+        cadence.connectivity_publish_failure_streak = 3;
+        cadence.connectivity_publish_retry_at = Some(retry_at);
+        cadence.request_connectivity_source_publication(now);
+        assert_eq!(cadence.connectivity_publish_retry_at, Some(retry_at));
+        assert_eq!(cadence.connectivity_publish_failure_streak, 3);
     }
 
     #[test]

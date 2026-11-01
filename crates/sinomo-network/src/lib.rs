@@ -143,7 +143,6 @@ pub use direct_link::{
     write_authenticated_transport_prelude,
 };
 pub use directory::{
-    DirectoryConnectivityBaseline,
     ClusterDirectory, ClusterDirectoryFactory, DirectoryNode, DirectoryRecordsSnapshot,
     DirectoryRoutingRecordsSnapshot, DirectorySnapshot, DirectoryVersion, EmptyClusterDirectory,
     cluster_directory_for, cluster_directory_with_bootstrap_state, set_cluster_directory_provider,

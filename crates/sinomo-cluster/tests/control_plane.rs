@@ -26399,7 +26399,7 @@ fn connectivity_sync_does_not_persist_time_only_freshness() {
     write_cluster_kv_snapshot(&paths, &store.snapshot().unwrap()).unwrap();
     assert!(cluster_connectivity_full_sync_batch_ops(
         &paths, &source_node_id, &[incoming.clone()], sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-    ).unwrap().is_empty(), "raw expired canonical rows remain semantic baselines, never live routes");
+    ).unwrap().is_empty(), "an unchanged committed row is never rewritten by time alone");
     incoming.state = ClusterConnectivityState::Unreachable;
     incoming.consecutive_failures = 3;
     assert_eq!(cluster_connectivity_full_sync_batch_ops(
