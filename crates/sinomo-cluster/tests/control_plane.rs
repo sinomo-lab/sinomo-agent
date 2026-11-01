@@ -7088,6 +7088,56 @@ fn cluster_kv_watch_event_fanout_batches_split_on_payload_size() {
 }
 
 #[tokio::test]
+async fn committed_fanout_reports_unreached_targets_as_lagging() {
+    let root = sinomo_testdir::TestDir::new("sinomo-committed-raft-fanout-lagging");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, _local, peer) = cluster_raft_handler_test_state(
+        "cluster_committed_raft_fanout_lagging",
+        "node_committed_raft_fanout_lagging_local",
+        "node_committed_raft_fanout_lagging_peer",
+    );
+    let unreachable =
+        NodeId::from_legacy_named("node_committed_raft_fanout_lagging_unreachable").expect("node");
+    let mut member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == peer)
+        .expect("peer member")
+        .clone();
+    member.node_id = unreachable.clone();
+    member.node_public_key = "pk-committed-raft-fanout-lagging-unreachable".to_string();
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write cluster state");
+    let mut host = RecordingCommittedFanoutHost {
+        unreachable: BTreeSet::from([unreachable.clone()]),
+        ..RecordingCommittedFanoutHost::default()
+    };
+
+    let report = sinomo_cluster::fan_out_committed_cluster_raft_command_async_with_host(
+        &tokio::runtime::Handle::current(),
+        &paths,
+        &state,
+        &[],
+        ClusterRaftCommittedFanoutOptions {
+            raft_append_timeout: Duration::from_millis(21),
+            watch_event_timeout: Duration::from_millis(31),
+        },
+        &mut host,
+    )
+    .await
+    .expect("fanout wave");
+
+    assert_eq!(report.replicated_nodes, vec![peer]);
+    assert_eq!(
+        report.lagging_nodes,
+        vec![unreachable],
+        "an unreached target is known-behind for its restored route or contact"
+    );
+}
+
+#[tokio::test]
 async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_events() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-async-committed-raft-fanout");
     let data_dir = SinomoDataDir::new(&root);
@@ -9173,6 +9223,7 @@ struct RecordingCommittedFanoutHost {
     appended_event_counts: Vec<usize>,
     append_timeouts: Vec<Duration>,
     watch_batches: Vec<RecordedWatchBatch>,
+    unreachable: BTreeSet<NodeId>,
 }
 
 struct RecordedWatchBatch {
@@ -9194,8 +9245,12 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
         self.appended_nodes.push(target_node_id.clone());
         self.appended_event_counts.push(watch_events.len());
         self.append_timeouts.push(timeout);
+        let unreachable = self.unreachable.contains(target_node_id);
         let state = state.clone();
         Box::pin(async move {
+            if unreachable {
+                return Err(NetworkError::directory("no route to fanout target"));
+            }
             Ok(ClusterKvRaftAppendReplicationOutcome {
                 response: ClusterRaftAppendResponse {
                     accepted: true,

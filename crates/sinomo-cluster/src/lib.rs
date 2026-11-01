@@ -312,7 +312,9 @@ pub use publication_cache::{
     ClusterPublicationCacheLimits,
 };
 pub use raft_fanout::{
-    ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,
+    ClusterKvCommittedFanoutAsyncHost, claim_cluster_raft_peer_catch_up,
+    cluster_raft_peer_is_behind, finish_cluster_raft_peer_catch_up,
+    record_cluster_raft_peer_append_results, replicate_cluster_kv_to_node_async_with_host,
     spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
 pub use raft_quorum::{

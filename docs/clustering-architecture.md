@@ -419,8 +419,10 @@ that made it necessary:
 - A mutation or authoritative read owns the leadership and quorum work its
   contract requires. A membership or Raft-configuration operation reconciles
   its own durable lifecycle transition.
-- An observed append gap, explicit startup recovery, or restored route to a
-  known-behind peer initiates targeted log or snapshot recovery for that peer.
+- An observed append gap, explicit startup recovery, a restored route to a
+  known-behind peer, or that peer's own authenticated contact initiates targeted
+  log or snapshot recovery for that peer. A peer whose committed append failed
+  or was rejected is known-behind until an append is accepted.
 - Log, WAL, and snapshot mutations trigger compaction when the owning store's
   threshold is crossed.
 - A changed local member, endpoint, or connectivity source publishes its typed
