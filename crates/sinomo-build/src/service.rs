@@ -292,21 +292,35 @@ impl BuildQueueHost {
         let capabilities = BuildServiceCapabilities {
             node_id: self.node_id.clone(),
             protocol: BUILD_PROTOCOL.to_string(),
-            targets: self.target_capabilities.clone(),
+            targets: self
+                .executor
+                .as_ref()
+                .map(|e| e.native_and_installed_targets())
+                .unwrap_or_default(),
             resources,
         };
+        let cross_targets = self
+            .executor
+            .as_ref()
+            .map(|e| e.cross_capabilities())
+            .unwrap_or_default();
         let cache_hit = request.build_key.as_ref().map(|key| {
             self.cached_manifest(key, false)
                 .is_ok_and(|manifest| manifest.is_some())
         });
         let supports_requested_target = request.target.as_ref().map(|target| {
-            capabilities.supports(target, &request.artifact_kinds)
+            (capabilities.supports(target, &request.artifact_kinds)
+                || cross_targets.iter().any(|cross| {
+                    cross.supports(target, &request.artifact_kinds)
+                        && (cross.blocker.is_none() || cache_hit == Some(true))
+                }))
                 && (cache_hit == Some(true)
                     || BuildPlacementRequirements::for_source_bytes(0)
                         .is_satisfied_by(&capabilities.resources))
         });
         Ok(BuildCapabilitiesResponse {
             capabilities,
+            cross_targets,
             supports_requested_target,
             cache_hit,
         })
@@ -865,14 +879,19 @@ pub(crate) fn configured_build_executor(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("rustc"));
     let configured_targets = std::env::var_os("SINOMO_BUILD_TARGETS");
-    build_executor_for_targets(
+    let executor = build_executor_for_targets(
         cargo_program,
         &rustc_program,
         &paths.aarch64_gnu_cross_bin(),
         configured_targets
             .as_deref()
             .map(|value| value.to_string_lossy()),
-    )
+    )?;
+    let info = crate::inspect_cargo_toolchain(&rustc_program, cargo_program)
+        .map_err(|error| format!("inspect cross-builder compiler: {error}"))?;
+    let managed = crate::cross::configured(paths, cargo_program, &rustc_program, &info)
+        .map_err(|error| format!("configure managed cross targets: {error}"))?;
+    Ok(executor.with_managed_cross(managed))
 }
 
 const AARCH64_LINUX_GNU_TARGET: &str = "aarch64-unknown-linux-gnu";

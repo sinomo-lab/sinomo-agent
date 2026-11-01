@@ -162,6 +162,8 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+sha2 = "0.11"
+xz2 = { version = "0.1.7", features = ["static"] }
 sinomo-actions = { path = "crates/sinomo-actions" }
 sinomo-video = { path = "crates/sinomo-video", default-features = false }
 sinomo-lm = { path = "crates/sinomo-lm", default-features = false }

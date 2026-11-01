@@ -39,6 +39,8 @@ pub struct RolloutOptions {
     pub repo: Option<PathBuf>,
     pub binary: Option<PathBuf>,
     pub remote_repo: Option<PathBuf>,
+    /// Explicit ABI for one legacy target that cannot report its Rust triple.
+    pub rust_target_override: Option<String>,
     pub targets: Vec<String>,
     pub host: String,
     /// True only when the operator supplied `--host`. Rollout uses this to
@@ -60,6 +62,7 @@ impl Default for RolloutOptions {
             repo: None,
             binary: None,
             remote_repo: None,
+            rust_target_override: None,
             targets: Vec::new(),
             host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
             host_explicit: false,
@@ -141,6 +144,11 @@ fn rollout_cli_spec() -> CliCommandSpec {
             "compatibility alias for build-service scheduling",
         ),
         option("--remote-repo", "remote source repository", "path"),
+        option(
+            "--rust-target",
+            "exact Rust triple for one legacy source-rollout target",
+            "triple",
+        ),
         CliOptionSpec::flag("--skip-local", "exclude the local node"),
         CliOptionSpec::flag(
             "--skip-native-modules",
@@ -336,11 +344,22 @@ fn rollout_options_from_matches(
         })
         .transpose()?
         .unwrap_or(defaults.shadow_port);
+    let rust_target_override = matches.value("--rust-target").map(str::to_string);
+    if rust_target_override.is_some()
+        && (targets.len() != 1
+            || matches.value("--binary").is_some()
+            || matches.value("--remote-repo").is_some()
+            || matches.contains("--force-source")
+            || matches.contains("--skip-native-modules"))
+    {
+        return Err(CliParseError::Parse { detail: "--rust-target requires one explicit --target and a source build through the build service".into() });
+    }
     Ok(RolloutOptions {
         json: matches.contains("--json"),
         repo: matches.value("--repo").map(PathBuf::from),
         binary: matches.value("--binary").map(PathBuf::from),
         remote_repo: matches.value("--remote-repo").map(PathBuf::from),
+        rust_target_override,
         targets,
         host,
         host_explicit,
@@ -857,4 +876,55 @@ fn parse_desktop_matches(matches: &CliCommandMatches) -> Result<DesktopOptions, 
             .unwrap_or(std::env::consts::ARCH)
             .into(),
     })
+}
+
+#[cfg(test)]
+mod cross_target_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<RolloutCliCommand, CliParseError> {
+        parse_rollout_command(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn legacy_target_override_requires_one_source_build_destination() {
+        let command = parse(&[
+            "cluster",
+            "--target",
+            "oracle:21353",
+            "--rust-target",
+            "aarch64-unknown-linux-gnu",
+        ])
+        .unwrap();
+        let RolloutCliCommand::Cluster(options) = command else {
+            panic!("cluster command")
+        };
+        assert_eq!(
+            options.rust_target_override.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        for args in [
+            vec!["cluster", "--rust-target", "aarch64-unknown-linux-gnu"],
+            vec![
+                "cluster",
+                "--target",
+                "a:21353",
+                "--target",
+                "b:21353",
+                "--rust-target",
+                "aarch64-unknown-linux-gnu",
+            ],
+            vec![
+                "cluster",
+                "--target",
+                "a:21353",
+                "--binary",
+                "sinomo",
+                "--rust-target",
+                "aarch64-unknown-linux-gnu",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
 }

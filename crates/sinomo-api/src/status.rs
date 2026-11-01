@@ -201,6 +201,9 @@ pub struct DaemonStatus {
     pub target_os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_arch: Option<String>,
+    /// Compilation target, including ABI; absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,6 +241,7 @@ impl DaemonStatus {
             commit: daemon_git_commit(),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            rust_target: Some(env!("SINOMO_API_RUST_TARGET").to_string()),
             hostname: daemon_hostname(),
             executable: std::env::current_exe().ok(),
             rollout: None,
@@ -567,6 +571,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daemon_status_reports_its_compilation_target() {
+        let paths = DaemonPaths::with_root(std::env::temp_dir().join("sinomo-api-status-target"));
+        let status = DaemonStatus::new(&DaemonRunOptions::default(), &paths, None);
+        assert_eq!(
+            status.rust_target.as_deref(),
+            Some(env!("SINOMO_API_RUST_TARGET"))
+        );
+        let decoded: DaemonStatus =
+            serde_json::from_slice(&serde_json::to_vec(&status).unwrap()).unwrap();
+        assert_eq!(decoded.rust_target, status.rust_target);
+    }
+
+    #[test]
     fn legacy_status_without_protocol_or_launch_identity_decodes_as_unowned() {
         let paths = DaemonPaths::with_root(std::env::temp_dir().join("sinomo-api-status-legacy"));
         let status = DaemonStatus::new(&DaemonRunOptions::default(), &paths, None);
@@ -574,6 +591,7 @@ mod tests {
         let object = value.as_object_mut().expect("status object");
         object.remove("api_protocol_version");
         object.remove("app_launch_id");
+        object.remove("rust_target");
 
         let decoded: DaemonStatus = serde_json::from_value(value).expect("legacy status");
 
@@ -582,5 +600,6 @@ mod tests {
             SINOMO_DAEMON_API_PROTOCOL_VERSION
         );
         assert_eq!(decoded.app_launch_id, None);
+        assert_eq!(decoded.rust_target, None);
     }
 }

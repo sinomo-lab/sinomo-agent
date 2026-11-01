@@ -5840,6 +5840,7 @@ mod tests {
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            rust_target: None,
             hostname: None,
             executable: None,
             rollout: None,

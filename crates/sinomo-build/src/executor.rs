@@ -334,6 +334,7 @@ pub struct CargoBuildCommand {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
+    pub env_remove: Vec<OsString>,
     pub current_dir: PathBuf,
     pub target_dir: PathBuf,
 }
@@ -370,6 +371,7 @@ pub struct CargoBuildExecutor {
     cargo_program: PathBuf,
     supported_targets: Vec<BuildTargetCapability>,
     target_environments: BTreeMap<(BuildTarget, String), Vec<(OsString, OsString)>>,
+    managed_cross: Vec<crate::cross::ManagedCrossToolchain>,
 }
 
 impl CargoBuildExecutor {
@@ -411,6 +413,7 @@ impl CargoBuildExecutor {
             cargo_program: cargo_program.into(),
             supported_targets,
             target_environments: BTreeMap::new(),
+            managed_cross: Vec::new(),
         })
     }
 
@@ -442,6 +445,58 @@ impl CargoBuildExecutor {
         &self.supported_targets
     }
 
+    pub(crate) fn with_managed_cross(
+        mut self,
+        targets: Vec<crate::cross::ManagedCrossToolchain>,
+    ) -> Self {
+        for target in &targets {
+            // An explicitly installed SDK takes precedence over a managed SDK
+            // for the same exact Rust target.
+            if !self
+                .supported_targets
+                .iter()
+                .any(|cap| cap.target == target.capability.target)
+            {
+                self.supported_targets.push(target.capability.clone());
+                self.managed_cross.push(target.clone());
+            }
+        }
+        self
+    }
+
+    fn managed_for(
+        &self,
+        target: &BuildTarget,
+        fingerprint: &str,
+    ) -> Option<&crate::cross::ManagedCrossToolchain> {
+        self.managed_cross.iter().find(|cross| {
+            &cross.capability.target == target
+                && cross.capability.toolchain_fingerprint == fingerprint
+        })
+    }
+
+    pub(crate) fn native_and_installed_targets(&self) -> Vec<BuildTargetCapability> {
+        self.supported_targets
+            .iter()
+            .filter(|cap| {
+                self.managed_for(&cap.target, &cap.toolchain_fingerprint)
+                    .is_none()
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn cross_capabilities(&self) -> Vec<crate::CrossBuildTargetCapability> {
+        self.managed_cross
+            .iter()
+            .map(|cross| crate::CrossBuildTargetCapability {
+                capability: cross.capability.clone(),
+                ready: cross.is_ready(),
+                blocker: cross.blocker(),
+            })
+            .collect()
+    }
+
     pub fn plan_command(
         &self,
         source_repo: impl AsRef<Path>,
@@ -471,18 +526,28 @@ impl CargoBuildExecutor {
             });
         }
         let target_dir = target_dir.into();
+        let managed = self.managed_for(&plan.input.target, &plan.input.toolchain_fingerprint);
         let mut args = vec![
-            OsString::from("build"),
+            OsString::from(if managed.is_some() {
+                "zigbuild"
+            } else {
+                "build"
+            }),
             OsString::from("--locked"),
             OsString::from("--target-dir"),
             target_dir.as_os_str().to_os_string(),
             OsString::from("--target"),
             OsString::from(
-                plan.input
-                    .target
-                    .rust_target
-                    .as_deref()
-                    .expect("validated concrete target"),
+                managed
+                    .map(|cross| cross.target_argument())
+                    .unwrap_or_else(|| {
+                        plan.input
+                            .target
+                            .rust_target
+                            .as_deref()
+                            .expect("validated concrete target")
+                            .to_string()
+                    }),
             ),
             OsString::from("--profile"),
             OsString::from(&plan.input.profile),
@@ -523,6 +588,9 @@ impl CargoBuildExecutor {
             ))
             .cloned()
             .unwrap_or_default();
+        if let Some(cross) = managed {
+            env.extend(cross.environment()?);
+        }
         env.extend(plan.input.source_revision.iter().map(|revision| {
             (
                 OsString::from(CARGO_BUILD_COMMIT_OVERRIDE_ENV),
@@ -530,9 +598,16 @@ impl CargoBuildExecutor {
             )
         }));
         Ok(CargoBuildCommand {
-            program: self.cargo_program.clone(),
+            program: managed
+                .map(|cross| cross.program())
+                .unwrap_or_else(|| self.cargo_program.clone()),
             args,
             env,
+            env_remove: if managed.is_some() {
+                vec!["RUSTFLAGS".into(), "CARGO_ENCODED_RUSTFLAGS".into()]
+            } else {
+                Vec::new()
+            },
             current_dir: source_repo,
             target_dir,
         })
@@ -581,6 +656,8 @@ impl CargoBuildExecutor {
         cargo_jobs: Option<u16>,
         log_path: Option<&Path>,
     ) -> Result<CargoBuildResult> {
+        let source_repo = source_repo.as_ref();
+        plan.validate()?;
         let artifact_root = artifact_root.as_ref();
         fs::create_dir_all(artifact_root).map_err(|source| BuildError::Io {
             path: artifact_root.display().to_string(),
@@ -591,6 +668,13 @@ impl CargoBuildExecutor {
             path: target_dir.display().to_string(),
             detail: source.to_string(),
         })?;
+        // Reject unsupported plans and invalid workspaces before installing
+        // anything. Re-plan after preparation resolves the SDK's executable.
+        self.plan_command(source_repo, plan, &target_dir)?;
+        if let Some(cross) = self.managed_for(&plan.input.target, &plan.input.toolchain_fingerprint)
+        {
+            cross.prepare(log_path)?;
+        }
         let mut command = self.plan_command(source_repo, plan, &target_dir)?;
         if let Some(cargo_jobs) = cargo_jobs {
             command.args.push(OsString::from("--jobs"));
@@ -600,6 +684,9 @@ impl CargoBuildExecutor {
         process
             .args(&command.args)
             .current_dir(&command.current_dir);
+        for key in &command.env_remove {
+            process.env_remove(key);
+        }
         for (key, value) in &command.env {
             process.env(key, value);
         }
@@ -871,7 +958,7 @@ fn path_to_slash_string(path: &Path) -> String {
         .join("/")
 }
 
-fn command_stdout(program: &Path, args: &[OsString]) -> Result<String> {
+pub(crate) fn command_stdout(program: &Path, args: &[OsString]) -> Result<String> {
     let output = noninteractive_command(program)
         .args(args)
         .output()

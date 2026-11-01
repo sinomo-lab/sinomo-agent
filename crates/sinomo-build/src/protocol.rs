@@ -476,10 +476,30 @@ pub struct BuildCapabilitiesRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct BuildCapabilitiesResponse {
     pub capabilities: BuildServiceCapabilities,
+    /// Managed toolchains are separate from installed capabilities, so older
+    /// clients cannot mistake an unprepared cross toolchain for a native one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cross_targets: Vec<CrossBuildTargetCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_requested_target: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CrossBuildTargetCapability {
+    pub capability: crate::BuildTargetCapability,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+
+impl CrossBuildTargetCapability {
+    pub fn supports(&self, target: &crate::BuildTarget, kinds: &[BuildArtifactKind]) -> bool {
+        // OS/architecture alone cannot distinguish GNU/musl or ARM ABI/CPU
+        // baselines. New daemons report their precise compilation target.
+        target.rust_target.is_some() && self.capability.supports(target, kinds)
+    }
 }
 
 /// The source bundle is carried as the `/build/submit` request body. It is not
@@ -564,6 +584,27 @@ pub struct BuildArtifactResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_capability_response_has_no_managed_targets() {
+        let value = serde_json::json!({
+            "capabilities": {
+                "node_id": sinomo_core::node::NodeId::from_legacy_named("legacy-builder").unwrap(),
+                "protocol": BUILD_PROTOCOL,
+                "targets": [],
+                "resources": {"cpu_threads": 4, "active_jobs": 0, "max_jobs": 1, "queue_depth": 0}
+            }
+        });
+        let response: BuildCapabilitiesResponse = serde_json::from_value(value).unwrap();
+        assert!(response.cross_targets.is_empty());
+        assert!(
+            !serde_json::to_value(response)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("cross_targets")
+        );
+    }
 
     fn key_input() -> BuildKeyInput {
         BuildKeyInput {
