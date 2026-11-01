@@ -15278,6 +15278,114 @@ mod tests {
     }
 
     #[test]
+    fn command_observed_edge_publishes_on_source_change_without_a_probe() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let root = unique_cluster_test_root("sinomo-daemon-command-edge-publish");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        daemon_paths.ensure().expect("daemon paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_command_edge_publish").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_command_edge_publish_local").expect("local");
+        let remote_node =
+            NodeId::from_legacy_named("node_command_edge_publish_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "command edge publish",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&remote_node, "127.0.0.1:1".to_string(), 10);
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities =
+            sinomo_core::node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("sync state to local kv");
+        let cluster =
+            daemon_cluster_status(&state, crate::DaemonClusterProcess::Main).expect("cluster");
+        write_daemon_status(
+            &daemon_paths,
+            &crate::DaemonStatus::new(&DaemonRunOptions::default(), &daemon_paths, Some(cluster)),
+        )
+        .expect("write daemon status");
+
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        maintenance.local_node_role = sinomo_core::network::cluster_local_node_role(&state);
+        // An endpoint RPC proves a new edge between scheduled turns.
+        sinomo_core::cluster::ClusterCommandConnectivityObservation {
+            connectivity_state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(3),
+            bypass_failure_grace: false,
+            command_auth_denied: false,
+        }
+        .record_daemon_owned(&cluster_paths, &state, &endpoint)
+        .expect("record command observation");
+        let published = |paths: &ClusterPaths| {
+            sinomo_core::cluster::read_cluster_connectivity_graph_from_kv(paths)
+                .expect("kv connectivity")
+                .iter()
+                .any(|record| {
+                    record.source_node_id == local_node && record.target_node_id == remote_node
+                })
+        };
+        assert!(
+            run_cluster_network_maintenance_tick_for_test(
+                &mut maintenance,
+                &daemon_paths,
+                &DaemonRunOptions::default(),
+                &runtime,
+            )
+            .expect("idle tick")
+            .is_none(),
+            "no scheduled class is due, so the stored change waits without a wake"
+        );
+        assert!(!published(&cluster_paths));
+
+        // The local source watch delivers this request for the stored change.
+        maintenance.request_connectivity_source_publication(Instant::now());
+        let pending = run_cluster_network_maintenance_tick_for_test(
+            &mut maintenance,
+            &daemon_paths,
+            &DaemonRunOptions::default(),
+            &runtime,
+        )
+        .expect("publication tick")
+        .expect("the source change is due for publication");
+        assert!(pending.connectivity_publish.is_some());
+        assert!(
+            pending.connectivity_probe.is_none(),
+            "publishing a stored change needs no new probe generation"
+        );
+        runtime.block_on(maintenance.run_pending_work_async(pending, runtime.handle().clone()));
+        assert_eq!(maintenance.connectivity_publish_retry_at, None);
+        assert!(published(&cluster_paths), "the command-observed edge reaches cluster KV");
+    }
+
+    #[test]
     fn pending_connectivity_probe_preserves_unsuperseded_bootstrap_records() {
         let root = unique_cluster_test_root("sinomo-daemon-connectivity-bootstrap-merge");
         let data_dir = SinomoDataDir::new(&root);

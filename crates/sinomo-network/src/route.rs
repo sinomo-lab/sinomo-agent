@@ -1,7 +1,5 @@
 //! Object RPC over the stream-native node-routing executor.
 
-mod freshness;
-
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterPaths, DaemonRpcTimeouts, NetworkCallPolicy,
@@ -1281,7 +1279,7 @@ fn prepare_cluster_object_rpc_connector(
         let records = crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
             paths, state, &directory_snapshot, directory_connectivity,
         )?;
-        let connector = connector_from_observed_records(paths, state, directory_snapshot, records, health, None)?;
+        let connector = connector_from_observed_records(paths, state, directory_snapshot, records, health)?;
         if crate::network_module_routing_generation() != module_generation {
             continue;
         }
@@ -1306,22 +1304,10 @@ fn connector_from_observed_records(
     directory: crate::DirectorySnapshot,
     records: Vec<crate::ClusterConnectivityRecord>,
     health: NetworkHealthPolicy,
-    authenticated: Option<&std::collections::BTreeSet<(NodeId, NodeId, crate::ClusterEndpointId)>>,
 ) -> Result<Arc<crate::MultiHopRoutedConnector>, NetworkError> {
     let snapshot = crate::connectivity_snapshot_from_directory_records(
         &directory, records, OffsetDateTime::now_utc(),
     )?;
-    let snapshot = if let Some(authenticated) = authenticated {
-        let mut observations = snapshot.edges().to_vec();
-        for observation in &mut observations {
-            if authenticated.contains(&(observation.source_node_id.clone(), observation.target_node_id.clone(), observation.endpoint.endpoint_id.clone())) {
-                observation.provenance = if observation.source_node_id == state.local_node_id {
-                    "authenticated-direct-source-read"
-                } else { "authenticated-source-live-read" }.into();
-            }
-        }
-        crate::ConnectivitySnapshot::try_new(snapshot.generation(), snapshot.directory_generation(), snapshot.published_at(), observations)?
-    } else { snapshot };
     let connectivity = Arc::new(crate::ConnectivityTracker::new(snapshot));
     let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
         crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), cluster_paths_data_dir(Some(paths))?)?,
@@ -1847,34 +1833,6 @@ where
                     .to_string(),
             });
         }
-        let establishment_deadline = tokio::time::Instant::now() + connect_timeout;
-        let original_dispatcher =
-            crate::routed_stream_pool::registered_routed_stream_incoming_token(
-                &state.local_node_id,
-            );
-        let validate_continuation_context = || {
-            let current = directory_identity.effective_generation(directory.routing_version()?.0);
-            if current != directory_generation {
-                return Err(NetworkError::Directory {
-                    detail: "directory changed during carrier establishment".into(),
-                });
-            }
-            if crate::network_module_routing_generation() != module_generation {
-                return Err(NetworkError::Directory {
-                    detail: "network module registry changed during carrier establishment".into(),
-                });
-            }
-            if crate::routed_stream_pool::registered_routed_stream_incoming_token(
-                &state.local_node_id,
-            ) != original_dispatcher
-            {
-                return Err(NetworkError::Directory {
-                    detail: "local reverse dispatcher changed during carrier establishment".into(),
-                });
-            }
-            Ok(())
-        };
-        let mut cold_establishment = false;
         let stream_result = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_destination_affinity_and_route_compatibility(
             directory_identity.routed_stream_scope(&state.cluster_id),
             module_generation,
@@ -1885,27 +1843,17 @@ where
             target_node_id.clone(),
             options.protection,
             connect_timeout,
-            async {
-                // The pool polls this only for a cold actual carrier. A live
-                // pooled carrier never starts these read-only source futures.
-                cold_establishment = true;
-                validate_continuation_context()?;
-                let result = freshness::connect_with_sources(
-                    paths, &directory, state, target_node_id, options,
-                    establishment_deadline, connect_timeout,
-                    (directory_identity, module_generation, directory_generation),
-                    &original_dispatcher, connector,
-                ).await;
-                match result {
-                    Ok(stream) => {
-                        validate_continuation_context()?;
-                        Ok(stream)
-                    }
-                    Err(error) => Err(error),
-                }
-            },
-            None,
-        ).await;
+            connector.connect_with_destination_process_affinity(
+                target_node_id.clone(),
+                crate::ConnectOptions {
+                    constraints,
+                    timeout: connect_timeout,
+                    protection: options.protection,
+                },
+                destination_process_affinity,
+            ),
+        )
+        .await;
         record_routed_rpc_timeline_stage(
             trace,
             crate::network_timeline_stage::ENDPOINT_OPEN,
@@ -1913,17 +1861,6 @@ where
             stream_result.is_ok(),
         );
         let stream = stream_result?;
-        if cold_establishment {
-            validate_continuation_context()?;
-            if establishment_deadline <= tokio::time::Instant::now() {
-                return Err(NetworkError::timeout(
-                    "establish routed service RPC stream",
-                    NetworkTimeoutPhase::Connect,
-                    connect_timeout,
-                    NetworkDeliveryState::DefinitelyNotSent,
-                ));
-            }
-        }
         let exchange_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);

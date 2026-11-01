@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_cache_is_scoped_and_refreshes_before_expiry() {
+    fn connectivity_cache_is_scoped_and_matches_committed_semantics() {
         let cache = cache_with_small_limits();
         let paths_a = ClusterPaths::new(&SinomoDataDir::new("/tmp/publication-cache-a"));
         let paths_b = ClusterPaths::new(&SinomoDataDir::new("/tmp/publication-cache-b"));
@@ -435,14 +435,19 @@ mod tests {
         assert!(cache.connectivity_record_matches(&paths_a, &record, now));
         assert!(!cache.connectivity_record_matches(&paths_b, &record, now));
 
-        let mut near_expiry = record;
-        near_expiry.expires_at = now + time::Duration::seconds(30);
+        // Publication never renews an unchanged row, so its age cannot make
+        // it unpublished; only a semantic change can.
+        let mut aged = record;
+        aged.expires_at = now - time::Duration::seconds(30);
         cache.remember_connectivity_record_set(
             &paths_b,
-            &near_expiry.source_node_id,
-            std::slice::from_ref(&near_expiry),
+            &aged.source_node_id,
+            std::slice::from_ref(&aged),
         );
-        assert!(!cache.connectivity_record_matches(&paths_b, &near_expiry, now));
+        assert!(cache.connectivity_record_matches(&paths_b, &aged, now));
+        let mut changed = aged;
+        changed.state = sinomo_network::ClusterConnectivityState::Unreachable;
+        assert!(!cache.connectivity_record_matches(&paths_b, &changed, now));
     }
 
     #[test]
