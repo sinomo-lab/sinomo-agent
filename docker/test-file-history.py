@@ -152,11 +152,15 @@ class Acceptance:
 
     def verify_processes(self, label):
         for node in [f"node{i}" for i in range(1, 7)]:
+            # Debug executables can exceed a GiB. Hash every byte without
+            # retaining the one-shot read in the daemon's capped file cache.
             script = ('for exe in /proc/[0-9]*/exe; do '
                       'target=$(readlink "$exe") || continue; '
-                      'case "$target" in */sinomo|*/sinomo-shadow) sha256sum "$exe";; esac; done')
+                      'case "$target" in */sinomo|*/sinomo-shadow) '
+                      'digest=$(dd if="$exe" iflag=nocache bs=1M status=none | sha256sum) || exit 1; '
+                      'printf "%s  %s\\n" "${digest%% *}" "$exe";; esac; done')
             raw = self.run(f"{label}-{node}-process-hashes",
-                           [*self.compose, "exec", "-T", node, "sh", "-c", script])
+                           [*self.compose, "exec", "-T", node, "bash", "-o", "pipefail", "-c", script])
             hashes = [line.split()[0] for line in raw.decode().splitlines()]
             assert len(hashes) >= 2 and set(hashes) == {self.binary_hash}, (node, hashes)
 
