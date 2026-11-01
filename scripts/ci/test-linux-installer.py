@@ -73,6 +73,25 @@ def main():
             raise RuntimeError("Default verification reset configured preferences")
         run("configure-off", [cli, "install", "--no-add-to-path", "--no-menu-shortcut", "--no-desktop-shortcut", "--startup"])
 
+        for role in (["daemon", "shadow"], ["daemon"]):
+            run("stop-before-repair-" + "-".join(role), [cli, *role, "stop"])
+        sentinel = data / "repair-retained-data"
+        sentinel.write_bytes(b"application data survives binary repair")
+        excluded = ("bin/", "module/", "rollout/", "daemon/", "shadow-daemon/", "boot/")
+        retained = {p.relative_to(data).as_posix(): digest(p) for p in data.rglob("*")
+                    if p.is_file() and not p.relative_to(data).as_posix().startswith(excluded)}
+        cli.write_bytes(b"damaged executable")
+        (data / "bin/sinomo-shadow").write_bytes(b"damaged shadow")
+        if mode == "gui":
+            run("repair", [image, "--appimage-extract-and-run", "install", "--repair", "--no-start", "--no-dialogs", "--install-dir", setup, "--data-dir", data])
+        else:
+            run("repair", [payload / "sinomo", "install", "--repair", "--no-start", "--install-dir", setup, "--data-dir", data])
+        if digest(cli) != initial_digest or digest(data / "bin/sinomo-shadow") != initial_digest:
+            raise RuntimeError("Repair did not restore packaged daemon binaries")
+        if any(digest(data / p) != value for p, value in retained.items()):
+            raise RuntimeError("Repair changed retained application data or source")
+        run("start-after-repair", [cli, "install"])
+
         # Content identity is independent of chosen paths and fallback listener ports.
         summaries.append({"cli": digest(cli), "app": digest(data / "bin/sinomo-app"),
             "native": sorted(digest(p) for p in (data / "module/cache/native-dylib").rglob("*.so")),

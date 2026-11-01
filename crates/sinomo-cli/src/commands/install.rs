@@ -11,6 +11,7 @@ pub(crate) struct InstallOptions {
     pub(crate) desktop_shortcut: Option<bool>,
     pub(crate) menu_shortcut: Option<bool>,
     pub(crate) startup: Option<bool>,
+    pub(crate) repair: bool,
     pub(crate) runtime_service: bool,
     pub(crate) preserve_service_configuration: bool,
     pub(crate) desktop: sinomo_runtime::installer::DesktopInstallProfile,
@@ -32,6 +33,7 @@ impl Default for InstallOptions {
             desktop_shortcut: None,
             menu_shortcut: None,
             startup: None,
+            repair: false,
             runtime_service: false,
             preserve_service_configuration: true,
             desktop: sinomo_runtime::installer::DesktopInstallProfile::Auto,
@@ -88,9 +90,13 @@ pub(crate) fn uninstall_cli_command_handler() -> DeclarativeCommandHandler<Unins
 fn install_cli_spec() -> CliCommandSpec {
     CliCommandSpec::new(
         "install",
-        "install, verify or reconfigure the CLI and optional bundled app",
+        "install, verify, reconfigure or repair the CLI and optional bundled app",
     )
     .with_options([
+        CliOptionSpec::flag(
+            "--repair",
+            "replace packaged runtime binaries, preserving data; downgrades are unsupported",
+        ),
         CliOptionSpec::value(
             "--install-dir",
             "setup and uninstall files directory",
@@ -189,6 +195,7 @@ fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, 
     let mut options = InstallOptions::default();
     options.install_dir = matches.value("--install-dir").map(PathBuf::from);
     options.data_dir = matches.value("--data-dir").map(PathBuf::from);
+    options.repair = matches.contains("--repair");
     if matches.contains("--add-to-path") && matches.contains("--no-add-to-path") {
         return Err(CliParseError::Parse {
             detail: "choose --add-to-path or --no-add-to-path".into(),
@@ -248,14 +255,15 @@ fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, 
     .iter()
     .any(|flag| matches.contains(flag));
     if options.runtime_service
-        && (options.install_dir.is_some()
+        && (options.repair
+            || options.install_dir.is_some()
             || options.data_dir.is_some()
             || options.add_to_path.is_some()
             || options.desktop_shortcut.is_some()
             || options.menu_shortcut.is_some()
             || options.startup.is_some())
     {
-        return Err(CliParseError::Parse { detail: "initial-setup directory/integration options cannot be combined with --runtime-service; use SINOMO_DATA_DIR for service deployment".into() });
+        return Err(CliParseError::Parse { detail: "repair and initial-setup directory/integration options cannot be combined with --runtime-service; use SINOMO_DATA_DIR for service deployment".into() });
     }
     if matches.contains("--desktop") && matches.contains("--headless") {
         return Err(CliParseError::Parse {
@@ -433,7 +441,7 @@ pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {
         let data = absolute_setup_path(data)?;
         let retained =
             root.join(initial_setup::RECEIPT).is_file() || initial_setup::runtime_present(&data);
-        let source = if retained {
+        let source = if retained && !options.repair {
             None
         } else {
             sinomo_runtime::installer::prepare_desktop_install(
@@ -442,7 +450,12 @@ pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {
             )
             .map_err(|detail| CliError::Parse { detail })?
         };
-        initial_setup::install(
+        let setup = if options.repair {
+            initial_setup::repair
+        } else {
+            initial_setup::install
+        };
+        setup(
             &executable,
             source.as_deref(),
             &root,
@@ -466,16 +479,30 @@ pub(crate) fn install(options: InstallOptions) -> Result<(), CliError> {
         .map_err(|e| CliError::Parse {
             detail: e.to_string(),
         })?;
-        println!("installation verified at: {}", root.display());
-        println!("data directory: {}", data.display());
         println!(
-            "Per-user daemon services registered; startup {}. Source and evolved releases preserved.",
-            if options.start {
-                "verified"
+            "installation {} at: {}",
+            if options.repair {
+                "repaired"
             } else {
-                "skipped (--no-start)"
-            }
+                "verified"
+            },
+            root.display()
         );
+        println!("data directory: {}", data.display());
+        if options.repair {
+            println!(
+                "Packaged runtime binaries replaced; application data and managed source preserved. Downgrades are not supported."
+            );
+        } else {
+            println!(
+                "Per-user daemon services registered; startup {}. Source and evolved releases preserved.",
+                if options.start {
+                    "verified"
+                } else {
+                    "skipped (--no-start)"
+                }
+            );
+        }
         return Ok(());
     }
     let data_dir = SinomoDataDir::from_env_or_home()?;

@@ -102,6 +102,17 @@ if ([Environment]::GetEnvironmentVariable('Path','User') -cne $originalPath) { t
 if ((Invoke-Cli $installedCli 'install --add-to-path --startup' 'reconfigure-enable') -ne 0) { throw 'Re-enabling PATH/startup failed.' }
 foreach ($entry in $serviceEntries) { if (-not (Test-Path -LiteralPath $entry)) { throw 'Re-enabled startup entry missing.' } }
 
+foreach ($role in @('daemon shadow', 'daemon')) {
+    if ((Invoke-Cli $installedCli "$role stop" ($role.Replace(' ','-')+'-before-repair')) -ne 0) { throw 'Cannot stop fixture before damaging its binaries.' }
+}
+$sentinel=Join-Path $data 'repair-retained-data'
+[IO.File]::WriteAllText($sentinel,'application data survives repair')
+[IO.File]::WriteAllBytes($installedCli,[Text.Encoding]::UTF8.GetBytes('damaged CLI'))
+[IO.File]::WriteAllBytes((Join-Path $data 'bin/sinomo-shadow.exe'),[Text.Encoding]::UTF8.GetBytes('damaged shadow'))
+if ((Invoke-Cli $Cli ($installArguments+' --repair --no-start') 'repair-damaged-runtime') -ne 0) { throw 'Offline CLI repair failed.' }
+if ((Get-CliDigest $installedCli) -ne $before -or [IO.File]::ReadAllText($sentinel) -cne 'application data survives repair') { throw 'Repair did not restore packaged binaries and preserve data.' }
+if ((Invoke-Cli $Cli $installArguments 'start-repaired-runtime') -ne 0) { throw 'Repaired runtime failed to start.' }
+
 if ((Invoke-Cli $installedCli '--help' 'help') -ne 0) { throw 'Installed CLI did not launch.' }
 if ((Invoke-Cli $installedCli 'uninstall' 'self-uninstall') -ne 0) { throw 'Installed CLI could not uninstall itself.' }
 $deadline = (Get-Date).AddSeconds(30)

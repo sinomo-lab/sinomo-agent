@@ -1,5 +1,6 @@
 //! Shared initial-installation, integration and removal contract for CLI and graphical setup.
 mod removal;
+mod repair;
 pub mod services;
 mod transaction;
 use serde::{Deserialize, Serialize};
@@ -259,6 +260,47 @@ pub fn install(
     integrations: &IntegrationOptions,
     services: &services::Options,
 ) -> Result<()> {
+    install_inner(
+        executable,
+        desktop_source,
+        root,
+        data,
+        integrations,
+        services,
+        false,
+    )
+}
+
+/// Replace the packaged runtime offline, preserving application data. Older
+/// binaries are allowed; data downgrade/migration is not supported by repair.
+pub fn repair(
+    executable: &Path,
+    desktop_source: Option<&Path>,
+    root: &Path,
+    data: &Path,
+    integrations: &IntegrationOptions,
+    services: &services::Options,
+) -> Result<()> {
+    install_inner(
+        executable,
+        desktop_source,
+        root,
+        data,
+        integrations,
+        services,
+        true,
+    )
+}
+
+fn install_inner(
+    executable: &Path,
+    desktop_source: Option<&Path>,
+    root: &Path,
+    data: &Path,
+    integrations: &IntegrationOptions,
+    services: &services::Options,
+    repairing: bool,
+) -> Result<()> {
     if !root.is_absolute() || !data.is_absolute() {
         return Err("installation and data directories must be absolute".into());
     }
@@ -278,13 +320,13 @@ pub fn install(
     }
     let retained = data.join("bin").join(binary("sinomo")).is_file()
         && data.join("bin").join(binary("sinomo-shadow")).is_file();
-    if retained {
+    if retained && !repairing {
         verify_runtime(data)?;
     }
-    if existing && !retained && read_receipt(root)?.complete {
+    if existing && !retained && !repairing && read_receipt(root)?.complete {
         verify_runtime(data)?;
     }
-    let prepared = if retained {
+    let prepared = if retained || repairing {
         None
     } else {
         if let Some(source) = desktop_source {
@@ -298,6 +340,9 @@ pub fn install(
             .ok_or("no package directory")?;
         crate::bundle::prepare(package, data, executable)?
     };
+    if repairing && !existing && !retained {
+        return Err("no installation found to repair; use install for a new deployment".into());
+    }
     fs::create_dir_all(root)?;
     fs::create_dir_all(data)?;
     validate_locations(root, data)?;
@@ -346,7 +391,12 @@ pub fn install(
     }
     let desktop_available =
         data.join("bin").join(binary("sinomo-app")).is_file() || desktop_source.is_some();
-    if !desktop_available && (desired.menu_shortcut || desired.desktop_shortcut) {
+    if !desktop_available
+        && (desired.menu_shortcut || desired.desktop_shortcut)
+        && (!repairing
+            || integrations.menu_shortcut == Some(true)
+            || integrations.desktop_shortcut == Some(true))
+    {
         return Err(
             "App shortcuts require a desktop bundle; supply --app-bundle DIRECTORY.".into(),
         );
@@ -354,12 +404,47 @@ pub fn install(
     let _admission =
         sinomo_rollout::acquire_installation_guard(&sinomo_rollout::SelfRolloutPaths::new(&data))?;
     transaction::recover(&root, &data)?;
-    let mut transaction = transaction::SetupTransaction::begin(&root, &data, prepared.is_some())?;
+    // Native selection/predecessor metadata is projected under the same local
+    // admission used by module mutations. Incoming validation precedes fencing
+    // or shutdown and never depends on an installed daemon or its data stores.
+    let repair_plan = if repairing {
+        Some(repair::RepairPlan::prepare(
+            executable,
+            desktop_source,
+            &root,
+            &data,
+        )?)
+    } else {
+        None
+    };
+    let mut transaction = if repairing {
+        None
+    } else {
+        Some(transaction::SetupTransaction::begin(
+            &root,
+            &data,
+            prepared.is_some(),
+        )?)
+    };
     let mut readiness_options = services.clone();
     readiness_options.startup = Some(desired.startup);
+    let reconcile_integrations = !repairing
+        || !existing
+        || integrations.add_to_path.is_some()
+        || integrations.menu_shortcut.is_some()
+        || integrations.desktop_shortcut.is_some();
     let result = (|| -> Result<()> {
-        if !retained {
+        if !retained || repairing {
             local::inhibit_deployment(&data)?;
+        }
+        if let Some(plan) = &repair_plan {
+            let services = if existing {
+                read_receipt(&root)?.services
+            } else {
+                None
+            };
+            removal::stop(&root, &data, services.as_ref())?;
+            plan.apply(&data)?;
         }
         fs::create_dir_all(data.join("bin"))?;
         if !data.join("bin").join(binary("sinomo")).exists() {
@@ -398,7 +483,7 @@ pub fn install(
             payload.install(&data, true)?;
         }
         local::enable_deployment(&data)?;
-        if !retained {
+        if !retained && !repairing {
             if let Some(source) = desktop_source {
                 let manifest = desktop::read_manifest(source)?;
                 for file in &manifest.files {
@@ -464,41 +549,70 @@ pub fn install(
             if desired.desktop_shortcut {
                 args.push("--desktop".into());
             }
-            windows_integration(&root, "install", &args)?;
+            if reconcile_integrations {
+                windows_integration(&root, "install", &args)?;
+            }
         }
         #[cfg(target_os = "linux")]
-        linux_integration(
-            &root,
-            desired.add_to_path,
-            desired.menu_shortcut,
-            desired.desktop_shortcut,
-        )?;
+        if reconcile_integrations {
+            linux_integration(
+                &root,
+                desired.add_to_path,
+                desired.menu_shortcut,
+                desired.desktop_shortcut,
+            )?;
+        }
         let mut receipt = read_receipt(&root)?;
         if receipt.configuration.as_ref() != Some(&desired) || !receipt.complete {
             receipt.configuration = Some(desired);
             receipt.complete = true;
             write_receipt(&root, &receipt)?;
         }
-        verify_runtime(&data)?;
+        if !repairing {
+            verify_runtime(&data)?;
+        }
         Ok(())
     })();
+    #[cfg(windows)]
+    if repairing && root.join("windows-integration.ps1").is_file() {
+        if let Err(finalization) = windows_integration(&root, "commit", &[]) {
+            return Err(match result {
+                Err(error) => {
+                    format!("{error}; shell configuration finalization failed: {finalization}")
+                        .into()
+                }
+                Ok(()) => finalization,
+            });
+        }
+    }
     match result {
         Ok(()) => {
-            transaction.commit()?;
+            if let Some(transaction) = &mut transaction {
+                transaction.commit()?;
+            }
             drop(_admission);
             if readiness_options.start {
-                complete_services(&root,&readiness_options).map_err(|error|->Box<dyn std::error::Error>{format!("Installation configured, but daemon readiness verification failed: {error}. Run install again to verify or repair startup.").into()})?;
+                complete_services(&root,&readiness_options).map_err(|error|->Box<dyn std::error::Error>{
+                    if repairing {
+                        format!("Packaged binaries repaired and data retained, but daemon readiness verification failed: {error}. Downgrades are not supported; existing data may require a newer release. The repaired binaries remain installed.").into()
+                    } else {
+                        format!("Installation configured, but daemon readiness verification failed: {error}. Run install again to verify or repair startup.").into()
+                    }
+                })?;
             }
             Ok(())
         }
         Err(error) => {
-            if let Err(recovery) = transaction.rollback() {
-                return Err(format!(
-                    "{error}; setup recovery failed: {recovery}; recovery journal retained at {}",
-                    root.join("sinomo-setup-recovery.json").display()
-                )
-                .into());
+            if let Some(transaction) = &mut transaction {
+                if let Err(recovery) = transaction.rollback() {
+                    return Err(format!(
+                        "{error}; setup recovery failed: {recovery}; recovery journal retained at {}",
+                        root.join("sinomo-setup-recovery.json").display()
+                    )
+                    .into());
+                }
             }
+            drop(_admission);
             Err(error)
         }
     }

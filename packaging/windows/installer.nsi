@@ -27,6 +27,13 @@ Function .onInit
   StrCpy $DataFlag ""
   ${GetParameters} $0
   ClearErrors
+  ${GetOptions} $0 "/REPAIR" $1
+  ${IfNot} ${Errors}
+    ${If} $1 == ""
+      StrCpy $SetupFlags "$SetupFlags --repair"
+    ${EndIf}
+  ${EndIf}
+  ClearErrors
   ${GetOptions} $0 "/DATA_DIR=" $1
   ${IfNot} ${Errors}
     StrCpy $DataFlag '--data-dir $\"$1$\"'

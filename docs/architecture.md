@@ -489,8 +489,13 @@ digests, source revision, platform, daemon protocol, and restoration schema.
 Installation selects a desktop or headless profile; desktop packages install
 stable launcher entries beside the runtime.
 Command-line and graphical setup reconcile one installation identity and default
-configuration. Existing deployments are verified; explicit integration changes
-preserve component versions owned by rollout. Both removal entry points detach
+configuration. Existing deployments are verified by default; explicit integration
+changes preserve component versions owned by rollout. Operator-requested offline
+repair may replace packaged runtime components without a working daemon while
+preserving application stores, managed source, identity and node-local consent.
+Repair overwrites runtime files without binary backups or rollback.
+Data migration and downgrade compatibility are not installation responsibilities.
+Both removal entry points detach
 and stop the same deployment, retaining its entire data directory unless deletion
 is explicitly requested.
 Failed startup retains the previous bundle and the pre-update presentation

@@ -210,16 +210,23 @@ fn install_options(args: &[String]) -> Result<(IntegrationOptions, services::Opt
 fn install_command(args: &[String]) -> Result<()> {
     let (root, data) = selected_paths(args)?;
     let (integrations, options) = install_options(args)?;
-    apply_install(&root, &data, &integrations, &options)
+    apply_install(
+        &root,
+        &data,
+        &integrations,
+        &options,
+        args.iter().any(|arg| arg == "--repair"),
+    )
 }
 fn apply_install(
     root: &Path,
     data: &Path,
     integrations: &IntegrationOptions,
     options: &services::Options,
+    repairing: bool,
 ) -> Result<()> {
     let exe = env::current_exe()?;
-    if root.join(RECEIPT).is_file() || runtime_present(data) {
+    if !repairing && (root.join(RECEIPT).is_file() || runtime_present(data)) {
         return install(&exe, None, root, data, integrations, options);
     }
     let package = exe.parent().ok_or("no package directory")?;
@@ -228,7 +235,8 @@ fn apply_install(
     #[cfg(not(target_os = "linux"))]
     let source = package.to_path_buf();
     desktop::verify_bundle(&source, &desktop::read_manifest(&source)?)?;
-    install(
+    let setup = if repairing { repair } else { install };
+    setup(
         &source.join(binary("sinomo")),
         Some(&source),
         root,
@@ -240,6 +248,19 @@ fn apply_install(
 fn install_gui(args: &[String]) -> Result<()> {
     let (mut root, mut data) = selected_paths(args)?;
     let existing = root.join(RECEIPT).is_file() || runtime_present(&data);
+    let mut repairing = args.iter().any(|arg| arg == "--repair");
+    if existing && !repairing {
+        let choice = MessageDialog::new()
+            .set_title("Sinomo maintenance")
+            .set_description("Verify/configure the installation, or repair its binaries from this package. Repair stops this node and replaces packaged runtime files while preserving your data. Downgrades are not supported.")
+            .set_buttons(MessageButtons::YesNoCancelCustom("Verify/configure".into(), "Repair binaries".into(), "Cancel".into()))
+            .show();
+        match choice {
+            MessageDialogResult::Custom(value) if value == "Repair binaries" => repairing = true,
+            MessageDialogResult::Custom(value) if value == "Verify/configure" => {}
+            _ => return Ok(()),
+        }
+    }
     if !existing {
         info(
             "Choose the setup metadata folder and a separate data folder. Program files live in the data folder. Existing installations are verified and reconfigured without replacing evolved components.",
@@ -268,7 +289,9 @@ fn install_gui(args: &[String]) -> Result<()> {
         .desktop_shortcut
         .unwrap_or(current.desktop_shortcut);
     current.startup = options.startup.unwrap_or(current.startup);
-    if confirm(if existing {
+    if confirm(if repairing {
+        "Change PATH, startup or shortcut settings before repair? Choose No to preserve the current settings. Repair replaces packaged binaries and retains application data; downgrades are not supported."
+    } else if existing {
         "Verify this Sinomo installation and change PATH, startup or shortcut settings? Choose No to verify and preserve the current settings."
     } else {
         "Configure optional PATH, startup and shortcuts? Choose No to use the shared default settings."
@@ -295,10 +318,12 @@ fn install_gui(args: &[String]) -> Result<()> {
                     .or(integrations.desktop_shortcut);
         }
     }
-    apply_install(&root, &data, &integrations, &options)?;
-    info(
-        "Sinomo installation verified. Selected PATH, startup and shortcut settings are applied. Existing component versions and data are preserved.",
-    );
+    apply_install(&root, &data, &integrations, &options, repairing)?;
+    info(if repairing {
+        "Packaged runtime binaries repaired. Application data and managed source were preserved. Downgrades are not supported."
+    } else {
+        "Sinomo installation verified. Selected PATH, startup and shortcut settings are applied. Existing component versions and data are preserved."
+    });
     Ok(())
 }
 

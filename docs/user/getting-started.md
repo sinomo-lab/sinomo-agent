@@ -113,7 +113,7 @@ startup and verifies main and shadow readiness before reporting success.
 startup. `--no-startup` disables boot/login startup without stopping processes
 that are already running.
 
-An existing installation is verified instead of overwritten. Running either
+By default, an existing installation is verified instead of overwritten. Running either
 frontend after the other preserves evolved binaries, modules, source, data and
 omitted integration settings. Healthy daemons are not restarted. Missing owned
 registration or integration files are repaired; conflicting ownership is reported.
@@ -126,14 +126,32 @@ sinomo install --add-to-path --startup --menu-shortcut
 sinomo install --no-add-to-path --no-startup --no-menu-shortcut --no-desktop-shortcut
 ```
 
+To recover a node that cannot start, run the CLI from a complete distribution
+with `sinomo install --repair`, or choose **Repair binaries** in graphical setup.
+The Windows package also accepts `/REPAIR` in silent mode. Repair validates the
+incoming package before stopping the selected node, then replaces its CLI,
+main/shadow daemons, runtime libraries, installed packaged native modules and
+desktop components. It preserves application data, identity, node-local consent,
+managed source, module selection and omitted integration settings. Interrupted
+local activation intents are cleared so they cannot replay over the repaired
+binaries. Repair directly overwrites package-owned runtime files without backups
+or binary rollback. If copying fails partway through, rerun repair to finish;
+files already overwritten remain in place.
+Use `--no-start` to replace files without starting daemons immediately.
+
+Downgrades are not supported. Repair does not reject an older package based on
+the retained data format and does not migrate or reset that data. If the repaired
+runtime cannot read it, startup can fail. Setup reports the readiness failure and
+leaves the repaired binaries installed.
+
 Use `--install-dir PATH` and `--data-dir PATH` to choose locations for a new
 installation. The defaults are `%LOCALAPPDATA%/Programs/Sinomo` on Windows and
 `~/.local/opt/sinomo` on Linux, with data selected by `SINOMO_DATA_DIR` or
 `~/.sinomo`. Existing installation bindings are reused when those options are
 omitted. Optional PATH and shortcuts are disabled on a fresh installation;
 startup is enabled. Either frontend can subsequently enable or disable them.
-App shortcuts require a desktop profile. Component upgrades use rollout rather
-than setup.
+App shortcuts require a desktop profile. Routine component upgrades use rollout;
+explicit repair replaces the runtime from the selected installation package.
 
 A source-built CLI without a sibling desktop manifest installs only the CLI.
 Use `--app-bundle DIRECTORY` to install a verified desktop release; `--headless`

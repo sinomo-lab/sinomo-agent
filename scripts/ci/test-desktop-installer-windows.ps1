@@ -78,6 +78,19 @@ $null=$process.Handle
 if (-not $process.WaitForExit(120000)) {throw 'Cross-frontend verification timed out.'}
 $process.Refresh()
 if ($process.ExitCode -ne 0 -or (Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash -ne $before) {throw 'CLI verification of GUI install changed the runtime or failed.'}
+foreach ($role in @('daemon shadow','daemon')) {
+    $process=Start-Process -FilePath $cli -ArgumentList "$role stop" -WindowStyle Hidden -PassThru
+    $null=$process.Handle
+    if (-not $process.WaitForExit(30000) -or $process.ExitCode -ne 0) {throw 'Cannot stop fixture before damaging its binaries.'}
+}
+$sentinel=Join-Path $data 'repair-retained-data'
+[IO.File]::WriteAllText($sentinel,'application data survives repair')
+[IO.File]::WriteAllBytes($cli,[Text.Encoding]::UTF8.GetBytes('damaged CLI'))
+[IO.File]::WriteAllBytes((Join-Path $data 'bin/sinomo-shadow.exe'),[Text.Encoding]::UTF8.GetBytes('damaged shadow'))
+$process=Start-Process -FilePath $Installer -ArgumentList "/S /REPAIR /NO_START /DATA_DIR=`"$data`" /D=$application" -WindowStyle Hidden -PassThru
+$null=$process.Handle
+if (-not $process.WaitForExit(120000) -or $process.ExitCode -ne 0) {throw 'Packaged graphical repair failed.'}
+if ((Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash -ne $before -or [IO.File]::ReadAllText($sentinel) -cne 'application data survives repair') {throw 'Graphical repair changed data or failed to restore the runtime.'}
 Install-Fixture
 Uninstall-Fixture
 if (-not (Test-Path -LiteralPath $data)) { throw 'Default uninstall deleted data.' }

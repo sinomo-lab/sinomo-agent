@@ -1,5 +1,6 @@
-//! Offline bootstrap payload. Initial setup seeds missing state only; subsequent
-//! source replacement and module activation remain owned by rollout/evolution.
+//! Offline package validation for initial setup and explicit binary repair.
+//! Ordinary setup seeds missing state; repair retains managed source and uses
+//! the module owner to prepare replacement artifacts independently of user data.
 use crate::initial_setup::Result;
 use serde::{Deserialize, Serialize};
 use sinomo_build::NativeDylibArtifactMetadata;
@@ -72,7 +73,25 @@ fn unpack(archive: &Path, destination: &Path) -> Result<()> {
 /// Validate every artifact before touching installed state. No compiler, Git,
 /// display server or network access is needed on the installing machine.
 pub fn prepare(package: &Path, data: &Path, executable: &Path) -> Result<Option<PreparedPayload>> {
-    if data.join(RETAINED_PAYLOAD).try_exists()? {
+    prepare_payload(package, data, executable, false)
+}
+
+pub(super) fn prepare_repair(
+    package: &Path,
+    data: &Path,
+    executable: &Path,
+) -> Result<PreparedPayload> {
+    prepare_payload(package, data, executable, true)?
+        .ok_or_else(|| "repair payload is missing".into())
+}
+
+fn prepare_payload(
+    package: &Path,
+    data: &Path,
+    executable: &Path,
+    repair: bool,
+) -> Result<Option<PreparedPayload>> {
+    if !repair && data.join(RETAINED_PAYLOAD).try_exists()? {
         validate_retained(data)?;
         return Ok(None);
     }
@@ -101,8 +120,8 @@ pub fn prepare(package: &Path, data: &Path, executable: &Path) -> Result<Option<
     }
     let source = sinomo_build::BuildPaths::new(data).managed_source;
     let retained_cli = local::SinomoDataDir::new(data).binary("sinomo");
-    if !source.exists()
-        && hash(if retained_cli.is_file() {
+    if (repair || !source.exists())
+        && hash(if !repair && retained_cli.is_file() {
             &retained_cli
         } else {
             executable
@@ -127,7 +146,7 @@ pub fn prepare(package: &Path, data: &Path, executable: &Path) -> Result<Option<
             return Err("invalid runtime dependency".into());
         }
     }
-    if !source.exists() {
+    if !repair && !source.exists() {
         let prepared = stage.join("source");
         unpack(&stage.join("source.tar"), &prepared)?;
         if !prepared.join(".git/HEAD").is_file() || !prepared.join("Cargo.lock").is_file() {
@@ -148,6 +167,64 @@ pub struct PreparedPayload {
 }
 
 impl PreparedPayload {
+    /// Construct replacement module metadata through its owning installer in an
+    /// isolated directory. Existing user/module configuration is never seeded.
+    pub(super) fn stage_repair(
+        &self,
+        data: &Path,
+        stage: &Path,
+    ) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+        let mut files = Vec::new();
+        for library in &self.manifest.libraries {
+            files.push((
+                self.scratch.path().join("lib").join(&library.file),
+                data.join("bin/lib").join(&library.file),
+            ));
+        }
+        for module in &self.manifest.modules {
+            let meta = &module.metadata;
+            let state_path =
+                sinomo_module::native_dylib_module_loader_state_path(data, &meta.module_id);
+            // An absent selection can be intentional (including disabled profiles).
+            if !state_path.try_exists()? {
+                continue;
+            }
+            let previous =
+                sinomo_module::native_dylib_module_loader_state_path(stage, &meta.module_id);
+            fs::create_dir_all(previous.parent().ok_or("no module metadata parent")?)?;
+            fs::copy(&state_path, &previous)?;
+            // Read/recover only the isolated copy. Preflight must not replay an
+            // installed loader transaction or reject an unreadable data format.
+            if sinomo_module::read_native_dylib_module_loader_state(stage, &meta.module_id).is_err()
+            {
+                fs::remove_file(previous)?;
+            }
+            let installed = sinomo_module::install_native_dylib_module_from_file(
+                stage,
+                &self.scratch.path().join(&module.file),
+                sinomo_module::NativeDylibModuleInstallRequest {
+                    expected_module_id: Some(meta.module_id.clone()),
+                    artifact_id: None,
+                    expected_interface_version: Some(meta.interface_version.clone()),
+                    cache_key: Some(meta.cache_key.clone()),
+                    library_name: Some(meta.library_name.clone()),
+                    source: meta.source.clone(),
+                },
+            )?;
+            files.push((
+                installed.cache_path,
+                sinomo_module::native_module_cache_path(
+                    data,
+                    &installed.state.cache_key,
+                    &installed.state.content_hash,
+                    &installed.state.library_name,
+                ),
+            ));
+            files.push((installed.state_path, state_path));
+        }
+        Ok(files)
+    }
+
     pub fn install(self, data: &Path, seed_defaults: bool) -> Result<()> {
         let stage = self.scratch.path();
         let manifest = self.manifest;

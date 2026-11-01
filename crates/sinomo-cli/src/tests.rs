@@ -6584,6 +6584,12 @@ fn install_parser_separates_initial_setup_from_service_deployment() {
     );
     assert!(!parsed.runtime_service);
     assert!(parsed.start);
+    let repair = parse_install_schema_for_test(&["--repair".into(), "--no-start".into()]).unwrap();
+    assert!(repair.repair && !repair.start);
+    assert!(!InstallOptions::default().repair);
+    assert!(
+        parse_install_schema_for_test(&["--repair".into(), "--runtime-service".into()]).is_err()
+    );
     let changes = parse_install_schema_for_test(&[
         "--no-add-to-path".into(),
         "--no-menu-shortcut".into(),
