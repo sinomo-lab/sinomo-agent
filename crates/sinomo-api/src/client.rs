@@ -694,6 +694,24 @@ impl DaemonApiClient {
         )
     }
 
+    /// Providers of `capability` as the connected daemon's service catalog
+    /// resolves them, in the order to use them. The daemon owns liveness
+    /// evidence; callers send each operation to one selected provider.
+    pub fn service_providers(
+        &self,
+        capability: &str,
+    ) -> Result<Vec<sinomo_core::node::NodeId>, DaemonApiError> {
+        let response: sinomo_core::service::ServiceProvidersResponse = self.call_encoded_value(
+            sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE,
+            sinomo_core::service::CLUSTER_SERVICES_RPC_CATEGORY,
+            sinomo_core::service::ServiceProvidersRequest {
+                capability: capability.to_string(),
+            },
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
+        )?;
+        Ok(response.providers)
+    }
+
     /// Requests a daemon shutdown; returns the daemon's acknowledgement line.
     pub fn shutdown(&self) -> Result<String, DaemonApiError> {
         self.call_encoded_value(

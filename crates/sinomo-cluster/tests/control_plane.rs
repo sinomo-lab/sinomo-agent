@@ -53,9 +53,9 @@ use sinomo_cluster::{
     replicate_cluster_raft_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
     replicate_cluster_raft_to_endpoint_with_local_host,
-    reset_cluster_kv_cached_snapshot_reads_for_test, sync_cluster_certificate_to_kv,
-    sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
-    sync_cluster_state_to_local_raft_unchecked,
+    reset_cluster_kv_cached_snapshot_reads_for_test, resolve_cluster_service_providers,
+    sync_cluster_certificate_to_kv, sync_cluster_network_info_to_kv,
+    sync_cluster_node_status_to_kv, sync_cluster_state_to_local_raft_unchecked,
 };
 use sinomo_cluster::{
     ClusterRaftAppendReplicationOptions, ClusterRaftCommittedFanoutOptions,
@@ -24921,6 +24921,137 @@ fn cluster_read_view_fails_closed_when_local_raft_state_is_corrupt() {
         NetworkError::Directory { detail }
             if detail.contains("hard-state.sobj") && detail.contains("unexpected end of input")
     ));
+}
+
+#[test]
+fn service_provider_resolution_requires_ready_authorized_reachable_providers() {
+    let root = sinomo_testdir::TestDir::new("sinomo-service-provider-resolution");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let capability = "fixture.path.access";
+    let cluster_id = ClusterId::from_legacy_named("cluster_provider_resolution").expect("cluster");
+    let local = NodeId::from_legacy_named("node_provider_resolution_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "provider resolution",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let endpoint = |node_id: &NodeId, port: u16| ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named(format!("endpoint_{node_id}"))
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: format!("192.0.2.{port}:21353"),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let node = |name: &str| NodeId::from_legacy_named(name).expect("node");
+    let reachable = node("node_provider_resolution_reachable");
+    let unrouted = node("node_provider_resolution_unrouted");
+    let degraded = node("node_provider_resolution_degraded");
+    let pending = node("node_provider_resolution_pending");
+    for (index, node_id) in [&reachable, &unrouted, &degraded, &pending]
+        .into_iter()
+        .enumerate()
+    {
+        let mut member = if node_id == &pending {
+            ClusterMemberRecord::pending_learner(
+                cluster_id.clone(),
+                node_id.clone(),
+                "pending",
+                "pk-pending",
+                now,
+            )
+        } else {
+            ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id.clone(),
+                "remote",
+                format!("pk-{index}"),
+                now,
+            )
+        };
+        member.endpoints = vec![endpoint(node_id, 20 + index as u16)];
+        state.members.push(member);
+    }
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    // A usable route to every remote provider except `unrouted`.
+    let routed = [&reachable, &degraded, &pending]
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let target_endpoint = endpoint(target, [20, 22, 23][index]);
+            ClusterConnectivityRecord {
+                cluster_id: cluster_id.clone(),
+                source_node_id: local.clone(),
+                target_node_id: target.clone(),
+                endpoint_id: target_endpoint.endpoint_id,
+                transport: target_endpoint.transport,
+                address: target_endpoint.address,
+                state: ClusterConnectivityState::Healthy,
+                latency_ms: Some(5),
+                consecutive_failures: 0,
+                last_success_at: None,
+                last_failure_at: None,
+                failure_reason: None,
+                observed_at: now,
+                expires_at: now + time::Duration::seconds(900),
+            }
+        })
+        .collect();
+    sync_cluster_connectivity_records_to_kv(&paths, &local, routed).expect("sync connectivity");
+
+    for (node_id, health) in [
+        (&local, sinomo_service::ServiceDiscoveryHealth::Ready),
+        (&reachable, sinomo_service::ServiceDiscoveryHealth::Ready),
+        (&unrouted, sinomo_service::ServiceDiscoveryHealth::Ready),
+        (&degraded, sinomo_service::ServiceDiscoveryHealth::Degraded),
+        (&pending, sinomo_service::ServiceDiscoveryHealth::Ready),
+    ] {
+        let mut record = sinomo_service::ServiceInstanceRecord::new("fixture", node_id.clone());
+        record.provider_capabilities = vec![capability.to_string()];
+        record.health = health;
+        append_cluster_raft_command(
+            &paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    sinomo_service::cluster_service_instance_key("fixture", node_id),
+                    &record,
+                    None,
+                )
+                .expect("service op"),
+            ),
+        )
+        .expect("append service record");
+    }
+
+    assert_eq!(
+        resolve_cluster_service_providers(&paths, &state, capability, true)
+            .expect("resolve with a live local offer"),
+        vec![local.clone(), reachable.clone()]
+    );
+    assert_eq!(
+        resolve_cluster_service_providers(&paths, &state, capability, false)
+            .expect("resolve without a live local offer"),
+        vec![reachable],
+        "the live registry, not a committed record, decides the local offer"
+    );
+    assert!(
+        resolve_cluster_service_providers(&paths, &state, "fixture.other", false)
+            .expect("resolve an unprovided capability")
+            .is_empty()
+    );
 }
 
 #[test]

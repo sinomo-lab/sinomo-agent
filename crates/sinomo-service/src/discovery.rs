@@ -23,6 +23,23 @@ use time::OffsetDateTime;
 /// Cluster-KV key prefix for all service instance records.
 pub const CLUSTER_SERVICES_KV_PREFIX: &str = "/cluster/services/";
 
+/// Route through which a node's service catalog resolves the cluster providers
+/// of one capability for its local clients.
+pub const CLUSTER_SERVICE_PROVIDERS_ROUTE: &str = "/cluster/services/providers";
+pub const CLUSTER_SERVICES_RPC_CATEGORY: &str = "cluster-services";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ServiceProvidersRequest {
+    pub capability: String,
+}
+
+/// Ready providers in the order to use them: the resolving node first when it
+/// provides the capability, then reachable members by route cost.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ServiceProvidersResponse {
+    pub providers: Vec<NodeId>,
+}
+
 /// Key for one service instance record.
 pub fn cluster_service_instance_key(service: &str, node_id: &NodeId) -> String {
     format!("{CLUSTER_SERVICES_KV_PREFIX}{service}/{node_id}")

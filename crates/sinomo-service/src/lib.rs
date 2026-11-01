@@ -23,9 +23,10 @@ pub use observed_task::observed_blocking_task;
 
 pub mod discovery;
 pub use discovery::{
-    CLUSTER_SERVICES_KV_PREFIX, ServiceInstanceRecord, ServiceTargetSelector,
-    TargetSelectionPolicy, cluster_service_instance_key, cluster_service_prefix,
-    discover_service_instances, publish_local_service_instances,
+    CLUSTER_SERVICE_PROVIDERS_ROUTE, CLUSTER_SERVICES_KV_PREFIX, CLUSTER_SERVICES_RPC_CATEGORY,
+    ServiceInstanceRecord, ServiceProvidersRequest, ServiceProvidersResponse,
+    ServiceTargetSelector, TargetSelectionPolicy, cluster_service_instance_key,
+    cluster_service_prefix, discover_service_instances, publish_local_service_instances,
     service_instance_key_belongs_to_node, service_instance_records_from_registry,
     service_instances_from_entries, service_instances_providing_capability,
 };

@@ -62,6 +62,7 @@ pub use raft_peer_queue::send_shared_cluster_raft_append;
 #[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;
+mod service_providers;
 mod state_authority_reachability;
 mod status_publish;
 
@@ -322,6 +323,7 @@ pub use raft_rpc::{
     handle_cluster_kv_consensus_rpc_request_async, handle_cluster_raft_append_request_async,
     handle_cluster_raft_vote_request_async,
 };
+pub use service_providers::resolve_cluster_service_providers;
 pub use state_authority_reachability::{
     ClusterStateAuthorityQuorumStatus, ClusterStateAuthorityReachabilityAsyncHost,
     ClusterStateAuthorityReachabilityHost, ClusterStateAuthorityReachabilityOptions,

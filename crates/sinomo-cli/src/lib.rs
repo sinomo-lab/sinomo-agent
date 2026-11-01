@@ -829,6 +829,7 @@ pub fn hosted_agent_chat_component_factory(
                 let shutdown = scope.shutdown_receiver();
                 scope.on_host_ready(move || {
                     let service = chat_service.clone();
+                    service.mark_host_ready();
                     let data_dir = data_dir.clone();
                     let runtime = runtime.clone();
                     if let Err(error) = service.recover(data_dir, runtime, shutdown.clone()) {

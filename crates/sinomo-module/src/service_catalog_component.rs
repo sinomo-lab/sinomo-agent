@@ -102,6 +102,14 @@ pub fn cluster_service_catalog_publisher_component_factory()
                 state.local_node_id.clone(),
                 Arc::clone(&records_changed),
             );
+            scope.set_services(
+                sinomo_core::service::ServiceRegistry::builder()
+                    .register(ServiceProvidersService {
+                        cluster_paths: cluster_paths.clone(),
+                        registry: registry.clone(),
+                    })
+                    .build(),
+            );
             let host: Arc<dyn ServiceCatalogPublisherHost> =
                 Arc::new(ComponentServiceCatalogPublisherHost {
                     cluster,
@@ -124,6 +132,96 @@ pub fn cluster_service_catalog_publisher_component_factory()
 struct ComponentServiceCatalogPublisherHost {
     cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
     local_node_id: sinomo_core::node::NodeId,
+}
+
+/// Resolves cluster providers of a capability for local clients from this
+/// node's live registry, the committed catalog and the routing graph, so
+/// callers send one operation to a selected provider instead of probing.
+struct ServiceProvidersService {
+    cluster_paths: sinomo_core::network::ClusterPaths,
+    registry: sinomo_core::service::ServiceRegistrySnapshotStore,
+}
+
+fn service_providers_route() -> sinomo_core::service::ServiceRoute {
+    sinomo_core::service::ServiceRoute::describe(
+        sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE,
+        sinomo_core::service::CLUSTER_SERVICES_RPC_CATEGORY,
+        "resolve the cluster providers of one capability",
+        "sinomo_service::ServiceProvidersRequest",
+        "sinomo_service::ServiceProvidersResponse",
+    )
+    .with_auth_scope("local-command")
+}
+
+/// Whether this node's live registry offers `capability` as ready. A stopping
+/// host has withdrawn its admission and offers nothing.
+fn live_registry_offers(
+    snapshot: &ServiceRegistrySnapshot,
+    local_node_id: &sinomo_core::node::NodeId,
+    capability: &str,
+) -> bool {
+    !snapshot.host_stopping()
+        && sinomo_core::service::service_instance_records_from_registry(
+            snapshot.registry(),
+            local_node_id,
+            snapshot.version(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .iter()
+        .any(|record| {
+            record.health == sinomo_core::service::ServiceDiscoveryHealth::Ready
+                && record
+                    .provider_capabilities
+                    .iter()
+                    .any(|provided| provided == capability)
+        })
+}
+
+impl sinomo_core::service::Service for ServiceProvidersService {
+    fn name(&self) -> &'static str {
+        sinomo_core::service::CLUSTER_SERVICES_RPC_CATEGORY
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE]
+    }
+
+    fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
+        vec![service_providers_route()]
+    }
+
+    fn handle(
+        &self,
+        mut ctx: sinomo_core::service::ServiceContext,
+        request: sinomo_core::network::ObjectRpcRequest,
+    ) -> sinomo_core::service::ServiceFuture<'_> {
+        Box::pin(async move {
+            if request.route != sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE {
+                return Err(sinomo_core::service::ServiceError::UnknownRoute(
+                    request.route,
+                ));
+            }
+            let payload: sinomo_core::service::ServiceProvidersRequest =
+                ctx.decode_request_body(&request).await?;
+            let state = sinomo_core::cluster::read_cluster_state(&self.cluster_paths)?;
+            let local_offer = live_registry_offers(
+                &self.registry.active_snapshot(),
+                &state.local_node_id,
+                &payload.capability,
+            );
+            let providers = sinomo_core::cluster::resolve_cluster_service_providers(
+                &self.cluster_paths,
+                &state,
+                &payload.capability,
+                local_offer,
+            )?;
+            ctx.respond_value(
+                sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE,
+                sinomo_core::service::ServiceProvidersResponse { providers },
+            )?;
+            Ok(sinomo_core::service::ServiceDisposition::Continue)
+        })
+    }
 }
 
 /// This node owns its service records. Wake the publisher when a committed
@@ -587,6 +685,83 @@ mod tests {
         );
         shutdown_tx.send_replace(true);
         task.await.expect("publisher task");
+    }
+
+    struct OfferingService(sinomo_core::service::ServiceDiscoveryHealth);
+
+    impl sinomo_core::service::Service for OfferingService {
+        fn name(&self) -> &'static str {
+            "fixture.offer"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/fixture/offer"]
+        }
+
+        fn route_categories(&self) -> Vec<sinomo_core::service::ServiceRoute> {
+            vec![
+                sinomo_core::service::ServiceRoute::new("/fixture/offer", "fixture.offer")
+                    .with_discovery_identity(sinomo_core::service::ServiceDiscoveryIdentity {
+                        service_id: "fixture-offer".into(),
+                        interface_id: "sinomo.fixture.offer".into(),
+                        interface_version: "1.0.0".into(),
+                        provider_capabilities: vec!["fixture.offer.read".into()],
+                        caller_requirements: Vec::new(),
+                        component_id: "fixture.offer".into(),
+                        component_version: "1.0.0".into(),
+                        artifact_id: None,
+                        component_generation: 1,
+                        health: self.0,
+                        locality: sinomo_core::service::ServiceDiscoveryLocality::Cluster,
+                    }),
+            ]
+        }
+
+        fn handle(
+            &self,
+            _ctx: sinomo_core::service::ServiceContext,
+            _request: sinomo_core::network::ObjectRpcRequest,
+        ) -> sinomo_core::service::ServiceFuture<'_> {
+            Box::pin(async { Ok(sinomo_core::service::ServiceDisposition::Continue) })
+        }
+    }
+
+    #[test]
+    fn live_local_offer_requires_a_ready_running_provider() {
+        let node =
+            sinomo_core::node::NodeId::from_legacy_named("catalog_offer_local").expect("node");
+        let offering = |health| {
+            sinomo_core::service::ServiceRegistry::builder()
+                .register(OfferingService(health))
+                .build()
+        };
+        let store = sinomo_core::service::ServiceRegistrySnapshotStore::new(offering(
+            sinomo_core::service::ServiceDiscoveryHealth::Ready,
+        ));
+        let ready = store.active_snapshot();
+        assert!(live_registry_offers(&ready, &node, "fixture.offer.read"));
+        assert!(!live_registry_offers(&ready, &node, "fixture.offer.write"));
+
+        store
+            .replace_registry(offering(
+                sinomo_core::service::ServiceDiscoveryHealth::Degraded,
+            ))
+            .expect("degrade provider");
+        assert!(!live_registry_offers(
+            &store.active_snapshot(),
+            &node,
+            "fixture.offer.read"
+        ));
+
+        store
+            .withdraw_for_host_stop(offering(
+                sinomo_core::service::ServiceDiscoveryHealth::Ready,
+            ))
+            .expect("stop host");
+        assert!(
+            !live_registry_offers(&store.active_snapshot(), &node, "fixture.offer.read"),
+            "a stopping host offers nothing"
+        );
     }
 
     #[test]

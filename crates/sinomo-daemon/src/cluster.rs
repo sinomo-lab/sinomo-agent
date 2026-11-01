@@ -2108,6 +2108,9 @@ pub(crate) struct ClusterNetworkMaintenance {
     /// cancellation never discards it.
     retained_connectivity_publish: Option<ClusterConnectivityPendingPublish>,
     pub idle_stats: Arc<IdleStatsAtomics>,
+    /// Raised once this process owns its local Raft node after startup
+    /// deferred it, so cluster-storage consumers start on that edge.
+    local_raft_resident_ready: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 fn effective_network_maintenance_role(
@@ -2269,7 +2272,16 @@ impl ClusterNetworkMaintenance {
             tick: 0,
             idle_stats,
             retained_connectivity_publish: None,
+            local_raft_resident_ready: None,
         }
+    }
+
+    /// Report the deferred local Raft ownership edge to `ready`.
+    pub(crate) fn notify_local_raft_resident_ready(
+        &mut self,
+        ready: tokio::sync::watch::Sender<bool>,
+    ) {
+        self.local_raft_resident_ready = Some(ready);
     }
 
     async fn retry_main_local_raft_resident_initialization(
@@ -2321,6 +2333,9 @@ impl ClusterNetworkMaintenance {
         })?;
         if initialized? {
             self.local_raft_resident_initialization = LocalRaftResidentInitialization::Ready;
+            if let Some(ready) = &self.local_raft_resident_ready {
+                ready.send_replace(true);
+            }
         }
         Ok(storage_guard)
     }
@@ -8568,6 +8583,7 @@ mod tests {
                     $($cadence)*
                 },
                 resource_mode: sinomo_device::NodeResourceMode::Normal,
+                local_raft_resident_ready: None,
                 $($host)*
             }
         };
@@ -9458,6 +9474,8 @@ mod tests {
 
         let runtime = daemon_cluster_test_runtime();
         let mut maintenance = cluster_network_scheduler_maintenance_for_test(Instant::now());
+        let (ready, observed_ready) = tokio::sync::watch::channel(false);
+        maintenance.notify_local_raft_resident_ready(ready);
         assert!(matches!(
             &maintenance.local_raft_resident_initialization,
             LocalRaftResidentInitialization::Pending
@@ -9476,12 +9494,20 @@ mod tests {
             &maintenance.local_raft_resident_initialization,
             LocalRaftResidentInitialization::Pending
         ));
+        assert!(
+            !*observed_ready.borrow(),
+            "host readiness must wait while the predecessor holds the node"
+        );
         drop(predecessor);
 
         runtime
             .block_on(maintenance.retry_main_local_raft_resident_initialization(&daemon_paths))
             .expect("maintenance retry after predecessor handoff");
         assert!(maintenance.local_raft_resident_initialization.is_ready());
+        assert!(
+            *observed_ready.borrow(),
+            "owning the local Raft node raises the host readiness edge"
+        );
         sinomo_core::kv::read_cluster_kv_resident_local_entry(
             &cluster_paths.kv_paths(),
             &state.local_node_id,
