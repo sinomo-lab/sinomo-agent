@@ -69,6 +69,10 @@ restart paths; a success response alone does not identify the commit boundary.
   cannot grant authority or weaken durability and pin requirements. Observation
   reads do not become generic KV/DFS maintenance polling triggers.
 
+When fixing existing behavior, prefer tracing and repairing its owning mechanism
+before adding another system. This preference does not override the architecture,
+correctness or availability requirements above.
+
 For a wire or persistence change, decide whether mixed-version operation is
 required. Use explicit versions/capability gates for new semantics that old peers
 must reject. An additive default is safe only if ignoring it preserves behavior.
