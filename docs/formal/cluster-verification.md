@@ -427,13 +427,11 @@ logical contract is:
   acknowledgement for that exact operation; the production prepare contains
   intent/receipt metadata and any namespace transaction, never visible file
   metadata in KV;
-- the exceptional partition path may instead use a permit bound to the same
-  operation and current control-plane revisions, issued by a quorum of the
-  committed cluster voter configuration;
-- a component with `W` content receipts but neither complete fresh shard
-  acknowledgements nor a matching quorum permit cannot publish;
-- acknowledgements or permits from a stale operation, shard assignment, epoch,
-  or cluster configuration cannot satisfy the gate; and
+- a component with `W` content receipts but without complete fresh shard
+  acknowledgements cannot publish; no cluster-quorum permit substitutes for a
+  missing participant;
+- acknowledgements from a stale operation, shard assignment, epoch, or cluster
+  configuration cannot satisfy the gate; and
 - a quorum-side membership update retains the current primary and does not
   activate a replacement writer. It first records a bounded pending handoff;
   that control-plane commit is not itself a retiring-primary write fence;
@@ -445,10 +443,9 @@ logical contract is:
 - activation transfers the exact fenced prefix across the retiring and desired
   assignments and requires a majority of each assignment, explicit
   acknowledgements from both primaries, and no foreign acknowledger. The
-  completion proof must equal the immutable retiring-primary fence and carry
-  the captured operation floor and exact Raft watermark. This permits an
-  offline configured replica while carrying writes admitted before the pending
-  decision and finished before the retiring freeze;
+  completion proof must equal the immutable retiring-primary fence. This
+  permits an offline configured replica while carrying writes admitted before
+  the pending decision and finished before the retiring freeze;
 - only after the joint proof succeeds does the desired assignment become the
   active writer. The durable local marker advances to the activated epoch;
   only an instance rebound after observing that exact generation may write,
@@ -472,14 +469,22 @@ storage barriers, and canonical rebasing are additionally exercised in Rust.
 
 This is a focused canonical publication contract with the handoff coverage
 restriction above, not a model of storing file metadata in KV. Cluster KV supplies committed DFS
-configuration facts plus the bounded operation permit and head watermark used
-when the exact metadata shard cannot all acknowledge the operation. This
-reuses the cluster's existing Raft election, commit index, and linearizable log;
-DFS does not implement a second quorum-election protocol, and the DFS prepare,
-journal, snapshot, and object state remain outside KV. The bounded partition
-cases deliberately set `W=1`, below cluster quorum, so the unsafe minority-side
-case remains reachable. POSIX fsync/lock and all local-first models are kept
-unchanged and outside this slice.
+configuration facts. This reuses the cluster's existing Raft election, commit
+index, and linearizable log; DFS does not implement a second quorum-election
+protocol, and the DFS prepare, journal, snapshot, and object state remain
+outside KV.
+
+The model also admits an exceptional partition path that the contract above
+excludes: a permit bound to the operation and current control-plane revisions,
+issued by a quorum of the committed cluster voters, with the captured operation
+floor and Raft head watermark carried through handoff. The
+`dfs-canonical-write-quorum-fallback` scenario exercises that path. This
+KV-assisted fallback is a superseded design, not a requirement, so its
+transitions are not evidence of required behavior; the
+[whole-shard case](#whole-shard-prepare-publication-and-handoff) states the
+current authority boundary. The bounded partition cases deliberately set `W=1`,
+below cluster quorum, so the unsafe minority-side case remains reachable. POSIX
+fsync/lock and all local-first models are kept unchanged and outside this slice.
 
 ### Whole-shard prepare, publication and handoff
 

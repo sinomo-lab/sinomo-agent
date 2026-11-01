@@ -3265,36 +3265,6 @@ pub(crate) fn sync_cluster_state_to_kv(
         .map_err(Into::into)
 }
 
-#[cfg(test)]
-pub(crate) fn expire_cluster_network_records_in_kv(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    now: OffsetDateTime,
-) -> Result<Option<KvSnapshot>, CliError> {
-    struct CliClusterNetworkRecordExpiryHost;
-
-    impl cluster::ClusterNetworkRecordExpiryHost for CliClusterNetworkRecordExpiryHost {
-        type Error = CliError;
-
-        fn commit_cluster_kv_txn_with_quorum(
-            &mut self,
-            paths: &ClusterPaths,
-            state: &mut ClusterBootstrapState,
-            request: KvTxnRequest,
-        ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
-            cli_commit_cluster_kv_request_with_quorum_response(paths, state, request)
-                .map_err(Into::into)
-        }
-    }
-
-    cluster::expire_cluster_network_records_with_host(
-        paths,
-        state,
-        now,
-        &mut CliClusterNetworkRecordExpiryHost,
-    )
-}
-
 struct CliClusterInvitePublishHost;
 
 impl cluster::ClusterInvitePublishHost for CliClusterInvitePublishHost {

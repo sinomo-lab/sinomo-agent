@@ -537,8 +537,8 @@ and boundary note:
 - replica records separate exact frame decoding, durable ingest before
   acknowledgement, authority-context lookup, routed journal source validation,
   and handoff prefix verification;
-- `metadata-authority-confirmation` distinguishes replica-probe, assignment
-  revalidation, and cluster-quorum permit time;
+- `metadata-authority-confirmation` records full-shard replica-probe and total
+  confirmation time;
 - `content-root-catalog-shard-refresh` and `content-root-catalog-refresh`
   expose exact-cut page/entry counts and shard/installed-generation latency;
 - content ingest records expose loose, streamed, and content-addressed blob
