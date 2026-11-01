@@ -2005,23 +2005,6 @@ pub(crate) fn read_resident_raft_local_prefix_matching(
     })
 }
 
-pub(crate) fn read_resident_raft_local_materialized_generation(
-    paths: &KvWalPaths,
-    node_id: &NodeId,
-) -> Option<Result<KvLocalRead<(KvRevision, u64)>, KvError>> {
-    // Preserve the complete local snapshot reader's durable-state choice: an
-    // empty initialized resident must not replace a materialized-only view.
-    match crate::wal::raft_view_identity_for_read(paths) {
-        Ok((true, _)) => {}
-        Ok((false, _)) => return None,
-        Err(error) => return Some(Err(error)),
-    }
-    // This scalar is advisory comparison data, never authority.
-    with_idle_resident_raft_node(paths, node_id, |node| {
-        Ok(node.store.materialized_generation())
-    })
-}
-
 pub(crate) fn read_resident_raft_local_snapshot(
     paths: &KvWalPaths,
     node_id: &NodeId,
@@ -8365,63 +8348,6 @@ impl ClusterKvRaftStore {
             path: error_path,
             detail: source.to_string(),
         })?
-    }
-
-    pub fn cache_snapshot_if_newer_than_raft(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let source =
-            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
-        let cache = self
-            .paths
-            .local_cache()
-            .with_observation_source(source, true);
-        let result = cache.cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot);
-        let delivery = cache.finish_observation();
-        result.and_then(|changed| delivery.map(|()| changed))
-    }
-
-    pub fn cache_snapshot_if_newer_than_raft_and_notify(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let cache_changed = self.cache_snapshot_if_newer_than_raft(node_id, snapshot)?;
-        if cache_changed {
-            notify_cluster_kv_watchers(&self.paths);
-        }
-        Ok(cache_changed)
-    }
-
-    pub fn locked_cache_snapshot_if_newer_than_raft_and_notify(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let source =
-            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
-        let fence = source.storage_owner()?;
-        let mut owner = KvObservedOperationGuard {
-            guard: None,
-            fence: Some(fence),
-        };
-        owner.guard = Some(self.lock_operation()?);
-        // The inner file owner releases before this call returns. One outer
-        // fence covers that nested owner and the native operation permit.
-        let cache = self
-            .paths
-            .local_cache()
-            .with_observation_source(source, false);
-        let result = cache.cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot);
-        drop(owner);
-        let delivery = cache.finish_observation();
-        let changed = result.and_then(|changed| delivery.map(|()| changed))?;
-        if changed {
-            notify_cluster_kv_watchers(&self.paths);
-        }
-        Ok(changed)
     }
 
     pub fn local_vote_metadata(

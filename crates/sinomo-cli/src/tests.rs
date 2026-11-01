@@ -12133,12 +12133,12 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .any(|entry| entry.key == "/config/current")
     );
 
-    let cached_ahead = paths
-        .kv_paths()
-        .local_cache()
-        .cache_snapshot_if_newer_than_raft(state.local_node_id.clone(), stale_snapshot)
-        .expect("cache stale snapshot");
-    assert!(!cached_ahead);
+    let wrote_stale = sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+        &paths.kv_paths(),
+        &stale_snapshot,
+    )
+    .expect("write stale snapshot");
+    assert!(!wrote_stale);
     let snapshot_after_stale = read_cluster_kv_local_snapshot_for_test(&paths)
         .expect("snapshot after stale cache attempt");
     assert!(
