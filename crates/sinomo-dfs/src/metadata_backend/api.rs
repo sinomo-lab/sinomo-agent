@@ -8,17 +8,6 @@ thread_local! {
     static INITIAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static FINAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
-#[cfg(test)]
-pub(super) fn final_namespace_batch_before_materialize_for_test(action: impl FnOnce() + 'static) {
-    FINAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE
-        .with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
-}
-
-#[cfg(test)]
-pub(super) fn initial_namespace_batch_before_materialize_for_test(action: impl FnOnce() + 'static) {
-    INITIAL_NAMESPACE_BATCH_BEFORE_MATERIALIZE
-        .with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
-}
 
 impl DfsMetadataBackend for LocalSobjMetadataBackend {
     #[cfg(test)]

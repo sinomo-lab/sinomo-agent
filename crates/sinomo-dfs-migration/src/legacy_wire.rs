@@ -2,7 +2,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sinomo_dfs::*;
-use std::collections::BTreeMap;
 
 type Result<T, E = MetadataBackendError> = std::result::Result<T, E>;
 fn invalid(message: impl std::fmt::Display) -> MetadataBackendError {
@@ -602,6 +601,7 @@ pub fn convert_version_wire(mut wire: serde_json::Value) -> Result<DfsObjectVers
     Ok(current)
 }
 /// Historical minimums become the same generic rule grants as current rows.
+#[cfg(test)]
 pub fn convert_file_system_wire(wire: serde_json::Value) -> Result<serde_json::Value, String> {
     convert_file_system_wire_with_current_import_defaults(wire, None)
 }
@@ -1323,9 +1323,6 @@ pub(crate) fn normalize_file_system_with_current_import_defaults(
     count: Option<usize>,
 ) -> Result<DfsFileSystem> {
     decode(convert_file_system_wire_with_current_import_defaults(value, count).map_err(invalid)?)
-}
-pub(crate) fn normalize_file_system(value: Value) -> Result<DfsFileSystem> {
-    decode(convert_file_system_wire(value).map_err(invalid)?)
 }
 pub(crate) fn normalize_object(value: Value) -> Result<DfsObjectMetadata> {
     decode(object_wire(value)?)
@@ -2052,6 +2049,7 @@ impl Serialize for OriginalV7Payload<'_> {
 }
 /// Check the original routed input before a converter changes IDs or tags.
 /// Source custody is not encoded into this semantic command identity.
+#[cfg(test)]
 pub(crate) fn original_namespace_request_digest(raw: &Value) -> Result<String> {
     source_namespace_request_digest(raw, SourceGeneration::Released)
 }

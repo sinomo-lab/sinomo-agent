@@ -753,72 +753,6 @@ fn metadata_receipt_projection_input(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub(crate) fn resolve_prepared_operation(
-        &mut self,
-        record: &crate::DfsPreparedOperationRecord,
-        status: crate::DfsPreparedOperationStatus,
-        mut effects: Vec<crate::DfsPreparedMetadataEffect>,
-    ) -> Result<(), DfsError> {
-        if record.status == status {
-            return Ok(());
-        }
-        if record.status != crate::DfsPreparedOperationStatus::Prepared
-            || !matches!(
-                status,
-                crate::DfsPreparedOperationStatus::Aborted
-                    | crate::DfsPreparedOperationStatus::Superseded
-            )
-        {
-            return Err(DfsError::Metadata {
-                message: "only an actual hidden preparation can be resolved".into(),
-            });
-        }
-        let epoch = if let Some(control) = self.control_plane.as_mut() {
-            let shard = DfsControlPlaneStore::new(control.as_mut())
-                .get_metadata_shard(&record.digest.file_system_id, &record.digest.shard_id.0)?
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "preparation resolution has no current assignment".into(),
-                })?;
-            if shard.primary_node_id != self.node_id {
-                return Err(DfsError::StaleOwnerEpoch {
-                    file_system_id: shard.file_system_id,
-                    local_node_id: self.node_id.clone(),
-                    primary_node_id: shard.primary_node_id,
-                    epoch: shard.epoch,
-                });
-            }
-            shard.epoch
-        } else {
-            0
-        };
-        let operation_id = format!("resolve:{}:{status:?}:{epoch}", record.digest.operation_id);
-        if let Some(digest) = self
-            .metadata_backend
-            .as_ref()
-            .expect("resolution backend")
-            .prepared_operation_digest(&operation_id)?
-        {
-            self.commit_stored_prepared_operation(&digest)?;
-            return Ok(());
-        }
-        effects.push(crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
-            digest: record.digest.clone(),
-            status,
-        });
-        self.publish_metadata_effects_on_shard(
-            DfsPreparedOperationScope {
-                file_system_id: record.digest.file_system_id.clone(),
-                shard_id: record.digest.shard_id.clone(),
-                owner_epoch: epoch,
-                operation_id,
-            },
-            Vec::new(),
-            Vec::new(),
-            effects,
-        )?;
-        Ok(())
-    }
-
     pub(crate) fn publish_metadata_effects_on_shard(
         &mut self,
         scope: DfsPreparedOperationScope,
@@ -2066,37 +2000,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(Some(prepare.payload))
-    }
-
-    fn materialize_namespace_transaction_in_memory(
-        &mut self,
-        transaction: &DfsNamespaceTransaction,
-    ) -> Result<(), DfsError> {
-        for object in transaction
-            .objects
-            .iter()
-            .filter(|object| object.kind == DfsObjectKind::Tombstone)
-            .chain(
-                transaction
-                    .objects
-                    .iter()
-                    .filter(|object| object.kind != DfsObjectKind::Tombstone),
-            )
-            .cloned()
-        {
-            self.transient_metadata_object_ids.remove(&object.object_id);
-            self.transient_metadata_predecessor_object_ids
-                .remove(&object.object_id);
-            self.coordinator.set_committed_version(
-                object.file_system_id.clone(),
-                object.object_id.clone(),
-                object.version.clone(),
-            );
-            self.track_metadata_tombstone(&object);
-            self.metadata.add_object(object)?;
-        }
-        self.clear_metadata_lookup_cache();
-        Ok(())
     }
 
     pub(crate) fn apply_local_eventual_batch_commit(

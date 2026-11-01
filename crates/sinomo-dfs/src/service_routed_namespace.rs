@@ -52,9 +52,6 @@ fn dfs_error_from_posix_namespace_sync(error: posix_model::DfsPosixError) -> Dfs
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::kv::InProcessKvStore;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn durable_namespace_prepare_keeps_ambiguous_failure_pending() {
@@ -4571,7 +4568,6 @@ where
 mod admission_tests {
     use super::*;
     use crate::protocol::DfsNamespaceObjectPrecondition;
-    use sinomo_core::DfsObjectPolicy;
 
     #[test]
     fn caller_operation_ids_are_bounded_and_reconciliation_is_structured() {

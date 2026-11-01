@@ -2,8 +2,6 @@
 
 use std::fs;
 use std::io;
-#[cfg(test)]
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::time::{Duration, Instant};

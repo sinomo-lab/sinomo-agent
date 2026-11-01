@@ -3084,50 +3084,7 @@ fn prepare_daemon_dfs_verified_original_history_query(
     Ok(Some(verified))
 }
 
-pub(crate) fn process_daemon_dfs_message_command_on_runtime(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    peer_snapshot: &DaemonDfsMessagePeerSnapshot,
-    command: DfsMessageCommand,
-    preingested_blob: Option<sinomo_dfs::ContentStoreQuarantinedBlob>,
-    execution_scope: &DfsMessageExecutionScope,
-    allow_exact_service_lane: bool,
-    allow_generation_rollover: bool,
-    metadata_authority_preflight: Option<DaemonDfsMetadataAuthorityPreflight>,
-    peer_snapshot_elapsed: Duration,
-    mutation_admission: &mut Option<DaemonDfsMutationAdmission>,
-    runtime: &tokio::runtime::Handle,
-    traceparent: Option<String>,
-) -> Result<Option<DaemonDfsMessageCommandProcessResult>, sinomo_dfs::DfsError> {
-    match attempt_daemon_dfs_message_command_on_runtime(
-        data_dir,
-        cluster_paths,
-        peer_snapshot,
-        command,
-        preingested_blob,
-        None,
-        execution_scope,
-        allow_exact_service_lane,
-        allow_generation_rollover,
-        metadata_authority_preflight,
-        peer_snapshot_elapsed,
-        mutation_admission,
-        runtime,
-        traceparent,
-    )? {
-        DaemonDfsMessageDispatchAttempt::Complete(result) => Ok(result),
-        DaemonDfsMessageDispatchAttempt::AuthorityPreflightStale(retry) => {
-            Err(retry.stale.into_dfs_error())
-        }
-        DaemonDfsMessageDispatchAttempt::RemoteNamespacePhase(_, phase) => {
-            phase.cancel_before_dispatch()?;
-            Err(crate::DfsError::Metadata {
-                message: "remote phase requires the normal asynchronous host continuation".into(),
-            })
-        }
-    }
-}
-
+#[cfg(test)]
 pub(super) fn attempt_daemon_dfs_message_command_on_runtime(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,

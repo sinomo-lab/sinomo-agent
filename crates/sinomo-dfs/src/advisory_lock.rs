@@ -9,7 +9,6 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::metadata_records::{DfsMetadataJournalEntry, DfsMetadataShardId};
 use crate::{DfsFileSystemId, DfsObjectId};
 
 /// Completed outcomes currently remain durable for the lifetime of the lock

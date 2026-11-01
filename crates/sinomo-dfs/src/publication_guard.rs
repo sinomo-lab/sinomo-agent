@@ -2066,6 +2066,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
 
     /// The sole V7 author mint. It reads the actual prepared record and
     /// obtains actual operation-bound evidence; callers supply no ACK claims.
+    #[cfg(test)]
     pub(crate) fn authorize_prepared_publication(
         &mut self,
         digest: &DfsPreparedOperationDigest,

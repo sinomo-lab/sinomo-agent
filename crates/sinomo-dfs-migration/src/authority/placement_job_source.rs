@@ -2,7 +2,7 @@
 //! No writer permission, executor, reader or queue is constructed here.
 use super::*;
 use serde_json::Value;
-use sinomo_dfs::{DfsFileSystemConfig, DfsPlacementScope, DfsPlacementUpdatePlan};
+use sinomo_dfs::{DfsFileSystemConfig, DfsPlacementScope};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -757,29 +757,6 @@ impl OriginalPlacementJob {
             capsule_digest: actual,
         })
     }
-    pub(super) fn reservation_capsules(
-        &self,
-        assignments: &[DfsMetadataShardConfig],
-    ) -> Result<Vec<Value>> {
-        if self.terminal {
-            return Ok(Vec::new());
-        }
-        let mut scopes = BTreeSet::new();
-        let mut rows = Vec::new();
-        for assignment in assignments
-            .iter()
-            .filter(|a| a.file_system_id == self.file_system_id)
-        {
-            if !scopes.insert(&assignment.shard_id) {
-                return Err(error("original placement routing repeats a scope"));
-            }
-            rows.push(self.capsule_for_scope(assignment)?);
-        }
-        if rows.is_empty() {
-            return Err(error("original placement has no actual captured routing"));
-        }
-        Ok(rows)
-    }
     pub(super) fn is_adaptive(&self) -> bool {
         self.source_schema == OriginalPlacementSchema::V1Adaptive
             && self.original_value["adaptive"].as_bool() == Some(true)
@@ -837,49 +814,6 @@ impl OriginalPlacementJob {
             current_time,
         )
         .map_err(error)
-    }
-    /// AFTER actual old-key retirement and Ready current storage. Caller freezes
-    /// the real first candidate/config job plus the returned native request for
-    /// replay; a retry does not rebuild the job from new clocks/samples.
-    pub(super) fn exact_current_publication(
-        &self,
-        config: &DfsFileSystemConfig,
-        job: &sinomo_dfs::DfsPlacementReconciliationJob,
-        entries: Vec<Option<KvEntry>>,
-        queued_entries: Vec<Option<KvEntry>>,
-    ) -> Result<Option<KvTxn>> {
-        if self.terminal
-            || config.file_system_id != self.file_system_id
-            || job.file_system_id != self.file_system_id
-            || job.job_id != self.current_job_id()?
-            || job.path != self.path
-            || job.scope != self.scope
-        {
-            return Err(error(
-                "current placement publication changes its original DATA goal",
-            ));
-        }
-        let plan = DfsPlacementUpdatePlan::new(config, config, job).map_err(error)?;
-        let Some(mut txn) = plan.transaction(entries, queued_entries).map_err(error)? else {
-            return Ok(None);
-        };
-        if self.entry.key == self.current_job_key()? {
-            return Err(error("old/new placement keys alias"));
-        }
-        txn.compares.push(KvCompare::Missing {
-            key: self.entry.key.clone(),
-        });
-        Ok(Some(txn))
-    }
-    pub(super) fn current_read_keys(
-        &self,
-        config: &DfsFileSystemConfig,
-        job: &sinomo_dfs::DfsPlacementReconciliationJob,
-    ) -> Result<Vec<String>> {
-        Ok(DfsPlacementUpdatePlan::new(config, config, job)
-            .map_err(error)?
-            .keys()
-            .to_vec())
     }
 }
 

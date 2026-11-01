@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_keys::{
-    dentry_key, directory_inode_id, normalize_path, normalize_posix_path, parent_inode_id,
-    path_record_for_object,
+    directory_inode_id, normalize_path, normalize_posix_path, parent_inode_id,
 };
+#[cfg(test)]
 use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_pages::child_objects_for_directory_from_tables;
 use crate::metadata_records::{
@@ -903,8 +903,8 @@ fn apply_namespace_transaction_planned_op(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata_keys::{dentry_key, path_record_for_object};
-    use crate::metadata_records::{DfsInodeRecord, DfsObjectVersionRecord};
+
+    use crate::metadata_records::DfsObjectVersionRecord;
     use crate::{DfsAdvisoryLockStateRecord, DfsFileSystemId, DfsVersion};
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::node::NodeId;

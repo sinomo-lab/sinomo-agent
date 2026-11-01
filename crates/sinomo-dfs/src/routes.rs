@@ -656,11 +656,10 @@ mod tests {
     use super::*;
     use crate::{
         DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
-        DfsDistributedWriteCommand, DfsMetadataJournalBatch, DfsMetadataJournalFrameBatch,
-        DfsMetadataShardAssignment, DfsMetadataTableSnapshot, DfsNamespaceChangeCursor,
-        DfsNamespaceChangePollRequest, DfsNamespaceCommand, DfsNamespaceOperation,
-        DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsObjectId,
-        DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
+        DfsDistributedWriteCommand, DfsMetadataJournalFrameBatch, DfsMetadataShardAssignment,
+        DfsNamespaceChangeCursor, DfsNamespaceChangePollRequest, DfsNamespaceCommand,
+        DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
+        DfsObjectId, DfsReadRequest, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
         dfs_content_root_catalog_topology_digest,
     };
     use sinomo_core::node::NodeId;

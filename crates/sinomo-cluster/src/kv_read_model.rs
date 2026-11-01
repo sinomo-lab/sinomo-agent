@@ -103,6 +103,7 @@ impl ClusterDirectoryKvEntries for ClusterDirectoryKvInput {
     }
 }
 impl ClusterDirectoryKvInput {
+    #[cfg(test)]
     fn from_snapshot(snapshot: &KvSnapshot) -> Result<Arc<Self>, NetworkError> {
         let prefixes = CLUSTER_DIRECTORY_PREFIXES
             .map(|prefix| (prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES));
@@ -455,6 +456,7 @@ fn cluster_directory_projection_mark(
     })
 }
 
+#[cfg(test)]
 fn read_cluster_directory_projection(
     paths: &ClusterPaths,
     snapshot: Arc<KvSnapshot>,
@@ -467,6 +469,7 @@ fn read_cluster_directory_projection(
     )
 }
 
+#[cfg(test)]
 fn read_cluster_directory_projection_at_module_generation(
     paths: &ClusterPaths,
     snapshot: Arc<KvSnapshot>,
@@ -725,13 +728,6 @@ fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
     // join; preferring any readable local snapshot hid the newly admitted
     // member while reporting the newer directory generation.
     read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
-}
-
-fn read_cluster_member_endpoints_from_snapshot(
-    snapshot: &KvSnapshot,
-    node_id: &NodeId,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    read_cluster_member_endpoints_from_directory_entries(snapshot, node_id)
 }
 
 fn read_cluster_member_endpoints_from_directory_entries(

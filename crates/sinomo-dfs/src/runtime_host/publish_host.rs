@@ -1291,36 +1291,6 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
     start
 }
 
-#[cfg(test)]
-pub(super) fn publish_default_dfs_metadata_journal_with_sender(
-    paths: &DaemonPaths,
-    sender: DfsMetadataJournalBatchSender,
-) -> Result<DfsMetadataJournalReplicationReport, DaemonError> {
-    publish_default_dfs_metadata_journal_with_senders(
-        paths,
-        sender,
-        daemon_dfs_metadata_snapshot_install_sender(),
-    )
-}
-
-#[cfg(test)]
-pub(super) fn publish_default_dfs_metadata_journal_with_senders(
-    paths: &DaemonPaths,
-    sender: DfsMetadataJournalBatchSender,
-    snapshot_sender: DfsMetadataSnapshotInstallSender,
-) -> Result<DfsMetadataJournalReplicationReport, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    Ok(sinomo_dfs::publish_cluster_dfs_metadata_journal(
-        &data_dir,
-        &cluster_paths,
-        sender,
-        snapshot_sender,
-        DfsMetadataJournalReplicationOptions::default(),
-    )?)
-}
-
 pub(super) async fn run_daemon_dfs_smoke_async(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,

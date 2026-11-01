@@ -3242,6 +3242,7 @@ pub(crate) fn write_cluster_kv_snapshot(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) fn write_imported_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,

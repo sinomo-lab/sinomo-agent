@@ -413,20 +413,6 @@ pub(super) fn record_daemon_dfs_allocator_cleanup_request(data_dir: &SinomoDataD
 }
 
 #[cfg(test)]
-pub(super) fn daemon_dfs_allocator_cleanup_request_count(data_dir: &SinomoDataDir) -> u64 {
-    DAEMON_DFS_TEST_ALLOCATOR_CLEANUP_REQUESTS
-        .get()
-        .and_then(|counts| {
-            counts
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&data_dir.root())
-                .copied()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
 pub(super) fn record_daemon_dfs_allocator_trim_completion(data_dir: &SinomoDataDir) {
     *DAEMON_DFS_TEST_ALLOCATOR_TRIM_COMPLETIONS
         .get_or_init(|| Mutex::new(BTreeMap::new()))

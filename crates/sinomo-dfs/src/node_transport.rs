@@ -15,10 +15,12 @@ use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_core::network::ClusterPaths;
 #[cfg(test)]
+use sinomo_core::network::ObjectRpcBodySource;
+#[cfg(test)]
 use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::network::{
-    NetworkError, ObjectRpcBodySource, ObjectRpcCall, ObjectRpcIncomingBody,
-    ObjectRpcReplayableCall, ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
+    NetworkError, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcReplayableCall,
+    ObjectRpcResponse, ObjectRpcResult, SinomoObjectCodec,
 };
 use sinomo_core::node::NodeId;
 use tracing::Instrument;
@@ -41,12 +43,7 @@ use crate::{
     dfs_rejection_is_replica_not_desired, retained_networked_dfs_service_events,
 };
 #[cfg(test)]
-use crate::{
-    DfsControlPlaneKvClient, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, LocalContentStore,
-    open_cluster_aware_dfs_metadata_backend,
-    run_cluster_dfs_metadata_publish_after_events_with_peer_transport,
-};
+use crate::{DfsControlPlaneKvClient, LocalContentStore, open_cluster_aware_dfs_metadata_backend};
 
 const DFS_SERVED_MESSAGE_REPAIR_MAX_JOBS: usize = 2;
 
@@ -429,6 +426,7 @@ pub struct DfsMetadataPrefixProbeReturn {
     pub evidence: DfsMetadataPrefixEvidence,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DfsNativePrefixRoundPeerStatus {
     Unattempted,
@@ -440,6 +438,7 @@ pub(crate) enum DfsNativePrefixRoundPeerStatus {
 
 /// One fixed slot in one round. Attempted means the R63 producer was invoked,
 /// not that a wire effect is known to have happened. Unknown stays unknown.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct DfsNativePrefixRoundPeer {
     peer: NodeId,
@@ -452,6 +451,7 @@ pub(crate) struct DfsNativePrefixRoundPeer {
     unattempted_reason: Option<String>,
 }
 
+#[cfg(test)]
 impl DfsNativePrefixRoundPeer {
     pub(crate) fn peer(&self) -> &NodeId {
         &self.peer
@@ -486,6 +486,7 @@ impl DfsNativePrefixRoundPeer {
 
 /// The common LOCAL source DATA observed by both genuine native returns. This
 /// is neither an invented self acknowledgement nor current serving authority.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct DfsNativePrefixRoundSourceObservation {
     assignment: crate::DfsMetadataShardConfig,
@@ -493,6 +494,7 @@ pub(crate) struct DfsNativePrefixRoundSourceObservation {
     physical: crate::runtime_host::NativeMetadataPrefixPhysicalOwner,
 }
 
+#[cfg(test)]
 impl DfsNativePrefixRoundSourceObservation {
     pub(crate) fn assignment(&self) -> &crate::DfsMetadataShardConfig {
         &self.assignment
@@ -510,6 +512,7 @@ impl DfsNativePrefixRoundSourceObservation {
 
 /// Private, call-local complete/incomplete observation. No Clone, serde, raw
 /// constructor or merge/adopt operation; retained values own no native lease.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct OwnedNativeMetadataPrefixRound {
     round_id: String,
@@ -520,6 +523,7 @@ pub(crate) struct OwnedNativeMetadataPrefixRound {
     finalization_error: Option<NetworkError>,
 }
 
+#[cfg(test)]
 impl OwnedNativeMetadataPrefixRound {
     pub(crate) fn round_id(&self) -> &str {
         &self.round_id
@@ -691,6 +695,7 @@ pub(crate) fn collect_metadata_prefix_probe_return(
     Ok(actual)
 }
 
+#[cfg(test)]
 fn collect_dfs_attachment_source_sync(
     attachment: ObjectRpcBodySource,
     max_bytes: usize,
@@ -718,34 +723,6 @@ fn collect_dfs_attachment_source_sync(
         .map_err(|source| DfsPeerTransportError::new(source.to_string()));
     runtime.shutdown_timeout(Duration::from_millis(250));
     result
-}
-
-/// Materializes an ordinary outgoing value call for synchronous compatibility
-/// adapters and in-process transport doubles.
-///
-/// Production network transports consume the owned body source directly. This
-/// helper deliberately rejects semantic attachments so a non-empty owned value
-/// body cannot be mistaken for one.
-#[cfg(test)]
-pub(crate) async fn materialize_dfs_value_call(
-    mut call: ObjectRpcCall,
-    max_bytes: usize,
-) -> Result<ObjectRpcRequest, DfsPeerTransportError> {
-    if call.has_streamed_value_body() {
-        call.request.body = call
-            .body
-            .collect_to_vec(max_bytes)
-            .await
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        return Ok(call.request);
-    }
-    if !call.body.is_empty() {
-        return Err(DfsPeerTransportError::new(format!(
-            "DFS route {} carries a semantic attachment, not an ordinary value",
-            call.request.route
-        )));
-    }
-    Ok(call.request)
 }
 
 /// Synchronous form of [`materialize_dfs_value_call`].
@@ -1378,15 +1355,6 @@ pub(crate) struct DfsTestMetadataDirectRpcProbe {
 
 #[cfg(test)]
 impl DfsTestMetadataDirectRpcProbe {
-    pub(crate) fn records(&self) -> Vec<DfsTestMetadataDirectRpcObservation> {
-        self.records
-            .lock()
-            .expect("direct metadata observation records")
-            .clone()
-    }
-    pub(crate) fn dropped_count(&self) -> usize {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
-    }
     fn record(&self, record: DfsTestMetadataDirectRpcObservation) {
         if let Ok(mut records) = self.records.lock() {
             if records.len() < 4096 {
@@ -2245,19 +2213,6 @@ impl DfsNodeDetachedSendWorker {
         }
     }
 
-    #[cfg(test)]
-    fn scheduling_snapshot_at(
-        &self,
-        now: Instant,
-    ) -> Result<(bool, Option<Instant>, u64), DfsError> {
-        self.transport
-            .detached_send_scheduling_snapshot_at_excluding_targets(
-                now,
-                &self.deferred_target_node_ids,
-            )
-            .map_err(DfsError::from_network)
-    }
-
     /// Wait without spinning until cooling work becomes eligible or a new
     /// ready send is accepted by any lane sharing this outbox.
     pub async fn wait_for_ready_or_retry(
@@ -2640,27 +2595,6 @@ impl DfsNodeTransport {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_peer_senders(
-        local_node_id: NodeId,
-        peer_node_ids: impl IntoIterator<Item = NodeId>,
-        sender: DfsMessageSender,
-        async_sender: AsyncDfsMessageSender,
-        direct_read_sender: DfsDirectReadSender,
-    ) -> Self {
-        Self::with_senders_for_nodes(
-            local_node_id,
-            peer_node_ids,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            Some(sender),
-            Some(async_sender),
-            Some(direct_read_sender),
-            None,
-            None,
-            None,
-        )
-    }
-
     /// Route caller effects through its authenticated resident Main senders.
     /// This chooses delivery only; it grants no author or publication custody.
     pub fn with_registered_main_namespace_dispatch(mut self) -> Self {
@@ -2732,28 +2666,6 @@ impl DfsNodeTransport {
             Some(peer_transport),
             Some(async_peer_transport),
             detached_send_state,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_message_peer_senders(
-        local_node_id: NodeId,
-        peer_node_ids: impl IntoIterator<Item = NodeId>,
-        sender: DfsMessageSender,
-        async_sender: AsyncDfsMessageSender,
-        direct_read_sender: DfsDirectReadSender,
-        async_direct_read_sender: AsyncDfsDirectReadSender,
-    ) -> Self {
-        Self::with_senders_for_nodes(
-            local_node_id,
-            peer_node_ids,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            Some(sender),
-            Some(async_sender),
-            Some(direct_read_sender),
-            Some(async_direct_read_sender),
-            None,
-            None,
         )
     }
 
@@ -3058,20 +2970,6 @@ impl DfsNodeTransport {
             .terminal_commit_promotions
             .values()
             .filter(|promotion| promotion.outcome == DfsCommitPromotionTerminalOutcome::Committed)
-            .count()
-    }
-
-    #[cfg(test)]
-    fn retired_not_desired_commit_promotion_count(&self) -> usize {
-        self.detached_send_state
-            .inner
-            .lock()
-            .expect("detached send outbox")
-            .terminal_commit_promotions
-            .values()
-            .filter(|promotion| {
-                promotion.outcome == DfsCommitPromotionTerminalOutcome::RetiredNotDesired
-            })
             .count()
     }
 
@@ -5217,6 +5115,7 @@ impl DfsNodeTransport {
     /// One explicit round over an already initialized three-member scope.
     /// Both commands precede dispatch; every invoked peer gets exactly one R63
     /// call under the SAME absolute deadline. No input partial can be adopted.
+    #[cfg(test)]
     pub(crate) fn capture_metadata_prefix_full_assignment_round(
         &mut self,
         target: &crate::DfsMetadataQuorumSyncTarget,
@@ -5422,6 +5321,7 @@ impl DfsNodeTransport {
 
     /// Opt-in, one-call direct PREFIX producer. Routed/fanout output remains
     /// DATA; no second RPC is issued to obtain provenance for an earlier call.
+    #[cfg(test)]
     pub(crate) fn capture_metadata_prefix_probe_direct(
         &mut self,
         peer: &NodeId,
@@ -6157,14 +6057,13 @@ mod tests {
     use crate::{
         DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalogCoverage,
         DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
-        DfsContentRootCatalogShardIdentity, DfsDistributedWriteCommand,
-        DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataShardAssignment,
+        DfsContentRootCatalogShardIdentity, DfsDistributedWriteCommand, DfsMetadataShardAssignment,
         DfsMetadataShardConfig, DfsNamespaceCommand, DfsNamespaceOperation, DfsObjectId,
         DfsReadResult, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
         dfs_content_root_catalog_topology_digest, sifs_file_system_id,
     };
     use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     #[test]
@@ -10223,44 +10122,6 @@ pub(crate) fn process_cluster_dfs_message_command(
 }
 
 #[cfg(test)]
-pub(crate) fn run_cluster_dfs_message_command_with_metadata_publish<R, E>(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    command: DfsMessageCommand,
-    peer_transport: Arc<dyn DfsPeerTransport>,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    replication_options: DfsMetadataJournalReplicationOptions,
-    on_report: R,
-    on_error: E,
-) -> Result<Option<DfsMessageCommandHandleResult>, DfsError>
-where
-    R: FnMut(DfsMetadataJournalReplicationReport),
-    E: FnMut(String),
-{
-    let Some(result) =
-        process_cluster_dfs_message_command(data_dir, cluster_paths, command, control_plane)?
-    else {
-        return Ok(None);
-    };
-    let DfsMessageCommandProcessResult { response, events } = result;
-    let metadata_publish_requested =
-        run_cluster_dfs_metadata_publish_after_events_with_peer_transport(
-            data_dir,
-            cluster_paths,
-            peer_transport,
-            &events,
-            replication_options,
-            on_report,
-            on_error,
-        );
-    Ok(Some(DfsMessageCommandHandleResult {
-        response,
-        metadata_publish_requested,
-        metadata_publish_schedule_error: None,
-    }))
-}
-
-#[cfg(test)]
 mod response_delivery_tests;
 
 #[cfg(test)]
@@ -10272,11 +10133,5 @@ impl DfsNodeTransport {
         let attempts = Arc::new(StdAtomicUsize::new(0));
         self.test_routed_call_attempts = Some(Arc::clone(&attempts));
         attempts
-    }
-
-    pub(crate) fn metadata_direct_rpc_probe_for_test(&mut self) -> DfsTestMetadataDirectRpcProbe {
-        let probe = DfsTestMetadataDirectRpcProbe::default();
-        self.test_metadata_direct_probe = Some(probe.clone());
-        probe
     }
 }

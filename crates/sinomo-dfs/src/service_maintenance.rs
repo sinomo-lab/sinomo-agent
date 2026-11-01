@@ -9,7 +9,6 @@ use sinomo_core::node::NodeId;
 
 use std::collections::BTreeSet;
 
-use crate::service_state::PendingMetadataReplicationResponseKind;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {

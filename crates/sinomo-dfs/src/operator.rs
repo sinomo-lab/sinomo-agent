@@ -1047,11 +1047,10 @@ mod tests {
     use super::*;
     use crate::{
         DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
-        DfsObjectKind, DfsObjectMetadata, DfsReplicaReceiptRecord, DfsReplicationPolicy,
-        DfsWriteIntentRecord, LocalSobjMetadataBackend,
+        DfsReplicationPolicy,
     };
-    use sinomo_core::events::EventId;
-    use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
+
+    use sinomo_core::DfsObjectPolicy;
 
     fn empty_operator_status() -> DfsOperatorStatus {
         DfsOperatorStatus {
@@ -2177,10 +2176,6 @@ mod tests {
 
     fn object_id() -> DfsObjectId {
         DfsObjectId::from_legacy_named("obj_artifact").expect("object")
-    }
-
-    fn version(value: &str) -> DfsVersion {
-        DfsVersion::from_legacy_named(value).expect("version")
     }
 
     fn node(value: &str) -> NodeId {

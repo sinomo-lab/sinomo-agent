@@ -139,6 +139,7 @@ impl OwnedNativeMetadataPrefixReturn {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn validate_attempt_binding(
         &self,
         attempt: &DfsMetadataPrefixProbeAttempt,

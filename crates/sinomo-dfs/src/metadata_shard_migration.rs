@@ -9,14 +9,12 @@ use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_pages::collect_metadata_pages;
-use crate::metadata_receipt::receipt_for_replica_from_backend;
 use crate::metadata_records::{
     DfsCrossShardPinTransferRecord, DfsCrossShardSourceFamily, DfsMetadataShardId,
-    DfsMetadataVersionPinRecord, DfsNamespaceTransaction, DfsObjectVersionRecord,
-    DfsReplicaReceiptRecord, DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState,
-    DfsWriteIntentRecord,
+    DfsMetadataVersionPinRecord, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
+    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
 };
-use crate::{DfsFileSystem, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsTombstoneProvenance};
+use crate::{DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsTombstoneProvenance};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 

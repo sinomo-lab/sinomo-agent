@@ -13,8 +13,8 @@ pub use sinomo_runtime::api::app::chat::{
 };
 pub use sinomo_runtime::api::app::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
+#[cfg(test)]
 use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
-use sinomo_runtime::dfs_history::DfsHistoryExt;
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -170,11 +170,13 @@ use sinomo_runtime::daemon::{
 use sinomo_runtime::daemon::{
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
 };
+#[cfg(test)]
+use sinomo_runtime::dfs::DfsMetadataBackend;
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
-    DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsObjectId,
-    DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView, DfsVersion,
-    LocalShardedMetadataBackend, LocalSobjMetadataBackend,
+    DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId, DfsOperatorInspectionCursor,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsVersion, LocalShardedMetadataBackend,
+    LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
     DfsPinAddRequest, add_local_dfs_pin, default_dfs_metadata_root,
@@ -308,10 +310,10 @@ mod error;
 mod help;
 mod media_transport;
 pub mod module_commands;
-mod providers;
-mod sandbox_host;
 #[cfg(test)]
 mod native_test_fixture;
+mod providers;
+mod sandbox_host;
 #[cfg(test)]
 mod tests;
 mod tui;

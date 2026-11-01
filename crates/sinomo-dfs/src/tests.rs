@@ -1,26 +1,20 @@
 use super::*;
-use crate::service_write::{
-    DfsDistributedWriteOptions, DfsWriteCreation, DfsWriteDispatch, DfsWriteRepair,
-};
-use sinomo_core::cluster::ClusterKvPathsExt;
+use crate::service_write::{DfsDistributedWriteOptions, DfsWriteRepair};
 use sinomo_core::events::EventId;
 use sinomo_core::kv::{InProcessKvStore, KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::{
-    ClusterPaths, NetworkError, ObjectRpcCall, ObjectRpcIncomingBody, ObjectRpcRequest,
-    ObjectRpcResponse, ObjectRpcResult,
-};
+use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_core::object::Value;
-use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest};
+use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use time::OffsetDateTime;
 
-use crate::transfer::{PendingNetworkedRead, PendingNetworkedWrite};
+use crate::transfer::PendingNetworkedWrite;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn test_dfs_lookup_routed_message(
@@ -87,101 +81,6 @@ fn test_dfs_message_command_from_message(
     }
 }
 
-struct CanonicalDfsMessagePeerTransport {
-    sender: DfsMessageSender,
-}
-
-impl CanonicalDfsMessagePeerTransport {
-    async fn call_object_rpc_inner(
-        &self,
-        target_node_id: &NodeId,
-        call: ObjectRpcCall,
-        options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-        let streamed_value = call.has_streamed_value_body();
-        let ObjectRpcCall { mut request, body } = call;
-        if !dfs_route_is_message_data_plane(&request.route) {
-            return Err(DfsPeerTransportError::new(format!(
-                "unexpected DFS message peer route {}",
-                request.route
-            )));
-        }
-        let command = if streamed_value {
-            request.body = body
-                .collect_to_vec(usize::MAX)
-                .await
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            decode_dfs_message_rpc_request(&request)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
-        } else if body.is_empty() {
-            decode_dfs_message_rpc_request(&request)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
-        } else {
-            let head = crate::body_rpc::decode_dfs_attachment_message_rpc_request(&request)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            let max_bytes = usize::try_from(head.attachment.total_size_bytes).map_err(|_| {
-                DfsPeerTransportError::new(
-                    "DFS request attachment does not fit this platform address space",
-                )
-            })?;
-            let bytes = body
-                .collect_to_vec(max_bytes)
-                .await
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-            crate::body_rpc::attach_dfs_message_request_attachment(head, bytes)
-                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
-        };
-        let response = (self.sender)(target_node_id, &command, options)?;
-        ObjectRpcResponse::encode_body(&request.route, &response)
-            .map(ObjectRpcResult::value)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    }
-}
-
-impl DfsPeerTransport for CanonicalDfsMessagePeerTransport {
-    fn call_object_rpc(
-        &self,
-        target_node_id: &NodeId,
-        call: ObjectRpcCall,
-        options: DfsObjectRpcSendOptions,
-    ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let result = runtime.block_on(self.call_object_rpc_inner(target_node_id, call, options));
-        runtime.shutdown_timeout(Duration::from_millis(250));
-        result
-    }
-}
-
-impl AsyncDfsPeerTransport for CanonicalDfsMessagePeerTransport {
-    fn call_object_rpc_async<'a>(
-        &'a self,
-        target_node_id: &'a NodeId,
-        call: ObjectRpcCall,
-        options: DfsObjectRpcSendOptions,
-    ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
-        Box::pin(self.call_object_rpc_inner(target_node_id, call, options))
-    }
-}
-
-fn served_transport_with_canonical_message_peer(
-    local_node_id: NodeId,
-    peer_node_ids: impl IntoIterator<Item = NodeId>,
-    sender: DfsMessageSender,
-    connect_timeout: Duration,
-) -> DfsNodeTransport {
-    let peer_transport: Arc<dyn DfsPeerTransport> =
-        Arc::new(CanonicalDfsMessagePeerTransport { sender });
-    DfsNodeTransport::new_with_peer_transport_for_nodes(
-        local_node_id,
-        peer_node_ids,
-        peer_transport,
-        connect_timeout,
-    )
-}
-
 fn process_dfs_message_command_for_test(
     local_node_id: NodeId,
     command: DfsMessageCommand,
@@ -230,93 +129,6 @@ fn assert_native_bytes_field(value: &impl serde::Serialize, key: &str) {
     );
 }
 
-fn dfs_message_trace_label(message: &DfsNetworkMessage) -> String {
-    match message {
-        DfsNetworkMessage::ReadRequest(_) => "read-request".to_string(),
-        DfsNetworkMessage::ReadResponse(_) => "read-response".to_string(),
-        DfsNetworkMessage::BulkReadRequest(_) => "bulk-read-request".to_string(),
-        DfsNetworkMessage::BulkReadResponse(_) => "bulk-read-response".to_string(),
-        DfsNetworkMessage::WriteRequest(_) => "write-request".to_string(),
-        DfsNetworkMessage::WriteResponse(_) => "write-response".to_string(),
-        DfsNetworkMessage::DistributedWriteRequest(command) => {
-            format!("distributed-write-request:{}", command.request_id)
-        }
-        DfsNetworkMessage::ExclusiveCreateRequest(command) => {
-            format!("exclusive-create-request:{}", command.request_id)
-        }
-        DfsNetworkMessage::RetainedWriteRequest(command) => {
-            format!("retained-write-request:{}", command.request_id)
-        }
-        DfsNetworkMessage::DistributedWriteResponse(response) => {
-            format!("distributed-write-response:{}", response.request_id)
-        }
-        DfsNetworkMessage::StableWriteReconciliationRequest(request) => {
-            format!("stable-write-reconciliation-request:{}", request.request_id)
-        }
-        DfsNetworkMessage::StableWriteReconciliationResponse(response) => {
-            format!(
-                "stable-write-reconciliation-response:{}",
-                response.request_id
-            )
-        }
-        DfsNetworkMessage::StableNamespaceReconciliationRequest(request) => {
-            format!(
-                "stable-namespace-reconciliation-request:{}",
-                request.request_id
-            )
-        }
-        DfsNetworkMessage::StableNamespaceReconciliationResponse(response) => {
-            format!(
-                "stable-namespace-reconciliation-response:{}",
-                response.request_id
-            )
-        }
-        DfsNetworkMessage::NamespaceRequest(_) => "namespace-request".to_string(),
-        DfsNetworkMessage::NamespaceResponse(_) => "namespace-response".to_string(),
-        DfsNetworkMessage::FetchBlob(command) => {
-            format!("fetch-blob:{}", command.intent_id)
-        }
-        DfsNetworkMessage::FetchBlobResponse(response) => {
-            format!("fetch-blob-response:{}", response.intent_id)
-        }
-        DfsNetworkMessage::StageBlob(stage) | DfsNetworkMessage::StageRetainedBlob(stage) => {
-            format!("stage-blob:{}", stage.intent_id)
-        }
-        DfsNetworkMessage::RepairRetainedBlob(stage) => {
-            format!("repair-retained-blob:{}", stage.intent_id)
-        }
-        DfsNetworkMessage::StageBlobResponse(response) => {
-            format!("stage-blob-response:{}", response.intent_id)
-        }
-        DfsNetworkMessage::StagePatch(_) => "stage-patch".to_string(),
-        DfsNetworkMessage::CommitVersion(_) => "commit-version".to_string(),
-        DfsNetworkMessage::CommitVersionResponse(_) => "commit-version-response".to_string(),
-        DfsNetworkMessage::RepairReplica(_) => "repair-replica".to_string(),
-        DfsNetworkMessage::SelectedOriginalRepair(_) => "selected-original-repair".to_string(),
-        DfsNetworkMessage::OriginalRepairHistoryRequest(_) => "original-repair-history-request".to_string(),
-        DfsNetworkMessage::OriginalRepairHistoryResponse(_) => "original-repair-history-response".to_string(),
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceRequest(_) => "selected-local-recovery-fence-request".to_string(),
-        #[cfg(test)]
-        DfsNetworkMessage::SelectedLocalRecoveryFenceResponse(_) => "selected-local-recovery-fence-response".to_string(),
-        DfsNetworkMessage::RepairReplicaResponse(_) => "repair-replica-response".to_string(),
-        DfsNetworkMessage::MetadataJournalBatch(_) => "metadata-journal-batch".to_string(),
-        DfsNetworkMessage::MetadataJournalBatchResponse(_) => {
-            "metadata-journal-batch-response".to_string()
-        }
-        DfsNetworkMessage::MetadataSnapshotInstall(_) => "metadata-snapshot-install".to_string(),
-        DfsNetworkMessage::MetadataSnapshotInstallResponse(_) => {
-            "metadata-snapshot-install-response".to_string()
-        }
-        DfsNetworkMessage::ContentRootCatalogPageRequest(_) => {
-            "content-root-catalog-page-request".to_string()
-        }
-        DfsNetworkMessage::ContentRootCatalogPageResponse(_) => {
-            "content-root-catalog-page-response".to_string()
-        }
-    }
-}
-
 fn protocol_test_bytes() -> Vec<u8> {
     vec![0, 1, 2, 3, 253, 254, 255]
 }
@@ -360,31 +172,6 @@ fn test_routed_write_command(
         foreground_replica_repair: true,
         exclusive_create: false,
     }
-}
-
-fn test_routed_authority_shard(primary_node_id: &NodeId, epoch: u64) -> DfsMetadataShardConfig {
-    DfsMetadataShardConfig {
-        file_system_id: sifs_file_system_id(),
-        shard_id: "root".to_string(),
-        primary_node_id: primary_node_id.clone(),
-        replica_node_ids: Vec::new(),
-        epoch,
-        assignment: DfsMetadataShardAssignment::Root,
-
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    }
-}
-
-fn test_routed_authority_control_plane(
-    authority_shard: &DfsMetadataShardConfig,
-) -> SharedDfsControlPlaneKvClient<InProcessKvStore> {
-    let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
-    control_plane.with_client(|kv| {
-        DfsControlPlaneStore::new(kv)
-            .put_metadata_shard(authority_shard)
-            .expect("routed response authority shard")
-    });
-    control_plane
 }
 
 // Observation-only wrapper over the SAME native configuration client.

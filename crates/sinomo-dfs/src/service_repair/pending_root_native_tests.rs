@@ -3,7 +3,6 @@
 //! does not claim that native storage legally lost a committed anchor.
 use super::*;
 use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcOrigin};
-use crate::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};

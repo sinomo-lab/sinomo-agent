@@ -15,20 +15,6 @@ fn sort_prepared_operations(prepares: &mut [DfsPreparedOperationRecord]) {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub(crate) fn has_recoverable_standalone_namespace_prepare_on_shard(
-        &self,
-        shard_id: &DfsMetadataShardId,
-    ) -> Result<bool, DfsError> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
-            return Ok(false);
-        };
-        Ok(backend.list_prepared_operations()?.iter().any(|record| {
-            record.status == DfsPreparedOperationStatus::Prepared
-                && record.digest.shard_id == *shard_id
-                && record.payload.prepared_intent.is_none()
-        }))
-    }
-
     pub(crate) fn certified_local_recovery_shard(
         &mut self,
         _object: &DfsObjectMetadata,
@@ -47,6 +33,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(shard))
     }
 
+    #[cfg(test)]
     pub(crate) fn recover_durable_namespace_prepares(&mut self) -> Result<(), DfsError> {
         self.recover_durable_namespace_prepares_until_cancelled(&|| false)?;
         Ok(())

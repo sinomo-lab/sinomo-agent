@@ -4,6 +4,7 @@
 //! selection and local service assembly.
 
 use sinomo_core::ClusterBootstrapState;
+#[cfg(test)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;

@@ -1,7 +1,7 @@
 use super::*;
 use sinomo_runtime::dfs::*;
+#[cfg(test)]
 use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
-use sinomo_runtime::dfs_history::DfsHistoryExt;
 
 sinomo_runtime::test::sinomo_test_case! {
     pub fn dfs_file_attachments(ctx) {
