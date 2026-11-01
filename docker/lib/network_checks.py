@@ -116,10 +116,15 @@ class Checks:
         with binary.open('rb') as source:
             digest = hashlib.file_digest(source, 'sha256').hexdigest()
         network_sets = []
+        # Keep full executable verification from filling the capped daemon's
+        # file cache with a debug binary that can exceed a GiB.
         script = ('for exe in /proc/[0-9]*/exe; do target=$(readlink "$exe") || continue; '
-                  'case "$target" in */sinomo|*/sinomo-shadow) sha256sum "$exe";; esac; done')
+                  'case "$target" in */sinomo|*/sinomo-shadow) '
+                  'digest=$(dd if="$exe" iflag=nocache bs=1M status=none | sha256sum) || exit 1; '
+                  'printf "%s  %s\\n" "${digest%% *}" "$exe";; esac; done')
         for node in NODES:
-            code, raw = self.run('processes-'+node, [*self.compose, 'exec', '-T', node, 'sh', '-c', script])
+            code, raw = self.run('processes-'+node,
+                                 [*self.compose, 'exec', '-T', node, 'bash', '-o', 'pipefail', '-c', script])
             hashes = [line.split()[0] for line in raw.decode().splitlines()]
             if code or len(hashes) != 2 or set(hashes) != {digest}:
                 raise RuntimeError(f'{node}: expected exactly main/shadow running binary {digest}, got {hashes}')

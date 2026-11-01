@@ -19,11 +19,8 @@ use crate::kv_forward::{
 use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
-    LocalClusterRaftCommandStorage, LocalClusterRaftReadProjection,
-    imported_snapshot_advances_local_kv, locked_kv_state_authority_id,
-    write_imported_cluster_kv_snapshot_if_changed,
+    LocalClusterRaftCommandStorage, LocalClusterRaftReadProjection, locked_kv_state_authority_id,
 };
-use crate::kv_snapshot::refresh_current_cluster_kv_store_with_host;
 #[cfg(any(test, feature = "test-support"))]
 use crate::local_state_store::read_cluster_state_without_kv;
 use crate::local_state_store::{
@@ -79,14 +76,6 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 pub trait ClusterKvTxnQuorumHost {
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Result<(), NetworkError> {
-        Ok(())
-    }
-
     fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
@@ -485,20 +474,6 @@ impl<T> ClusterKvTxnQuorumHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<(), NetworkError> {
-        refresh_current_cluster_kv_store_with_host(
-            paths,
-            state,
-            self.timeouts.kv_snapshot_refresh_options(),
-            self,
-        )
-        .map(|_| ())
-    }
-
     fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
@@ -616,14 +591,6 @@ where
 
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
-    }
-
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        state: &ClusterBootstrapState,
-    ) -> Result<(), Self::Error> {
-        self.host
-            .refresh_current_cluster_kv_store(self.paths, state)
     }
 
     fn local_is_raft_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, Self::Error> {
@@ -2527,11 +2494,7 @@ pub fn handle_cluster_kv_txn_request_with_host(
         },
         other => other,
     })?;
-    let result = commit_cluster_kv_txn_with_quorum_response_with_host(
-        paths, &mut state, request, options, host,
-    )?;
-    write_imported_cluster_kv_snapshot_if_changed(paths, &result.snapshot)?;
-    Ok(result)
+    commit_cluster_kv_txn_with_quorum_response_with_host(paths, &mut state, request, options, host)
 }
 
 pub(crate) fn locked_cluster_raft_local_is_leader(
@@ -3193,35 +3156,6 @@ async fn locked_cluster_raft_local_is_leader_before_deadline(
     .await
 }
 
-async fn write_imported_cluster_kv_snapshot_if_changed_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> Result<(), NetworkError> {
-    let paths = paths.clone();
-    let snapshot = snapshot.clone();
-    runtime
-        .spawn_blocking(move || {
-            write_imported_cluster_kv_snapshot_if_it_advances(&paths, &snapshot)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster kv snapshot import".to_string(),
-            detail: format!("cluster kv snapshot import task failed: {source}"),
-        })?
-        .map(|_| ())
-}
-
-fn write_imported_cluster_kv_snapshot_if_it_advances(
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> Result<bool, NetworkError> {
-    if !imported_snapshot_advances_local_kv(paths, snapshot) {
-        return Ok(false);
-    }
-    write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)
-}
-
 struct NetworkClusterKvTxnQuorumAsyncHost<'a, H> {
     runtime: &'a tokio::runtime::Handle,
     paths: &'a ClusterPaths,
@@ -3510,27 +3444,9 @@ where
     .await?;
     state.term = state.term.max(consensus_state.term);
     state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
-    // A forwarded commit observes the voter's post-commit snapshot; import it
-    // when it advances the local view so the forwarding node reads its own
-    // write immediately. The committed-append fan-out runs on the voter and
-    // can miss this node (cold formation: no relay route back yet), and
-    // re-committing the same payload is a semantic no-effect that triggers no
-    // new fan-out. Importing the response here makes convergence owned by the
-    // forwarded operation instead of relying on a background snapshot sweep.
-    let import_paths = paths.clone();
-    let import_snapshot = result.snapshot.clone();
-    runtime
-        .spawn_blocking(move || {
-            if imported_snapshot_advances_local_kv(&import_paths, &import_snapshot) {
-                write_imported_cluster_kv_snapshot_if_changed(&import_paths, &import_snapshot)?;
-            }
-            Ok::<_, NetworkError>(())
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster kv snapshot import".to_string(),
-            detail: format!("cluster kv snapshot import task failed: {source}"),
-        })??;
+    // The post-commit snapshot is this operation's result. The forwarding
+    // node's own view converges through Raft: a missed fan-out leaves it
+    // known-behind at the leader until a restored route or its contact.
     Ok(result)
 }
 
@@ -5416,12 +5332,10 @@ where
             },
             other => other,
         })?;
-    let result = commit_cluster_kv_txn_with_quorum_response_async_with_host(
+    commit_cluster_kv_txn_with_quorum_response_async_with_host(
         runtime, paths, &mut state, request, options, host,
     )
-    .await?;
-    write_imported_cluster_kv_snapshot_if_changed_async(runtime, paths, &result.snapshot).await?;
-    Ok(result)
+    .await
 }
 
 /// Executes a daemon/service transaction without constructing an owned view of
@@ -5516,17 +5430,10 @@ where
             },
             other => other,
         })?;
-    let read = read_cluster_kv_authoritative_snapshot_async_with_host(
+    read_cluster_kv_authoritative_snapshot_async_with_host(
         runtime, paths, &mut state, options, host,
     )
-    .await?;
-    // A follower's local Raft materialization can intentionally trail the
-    // leader even after it has accepted the committed log. Preserve the exact
-    // quorum-confirmed view returned by an authoritative read so local readers
-    // (including DFS replica authority validation) can converge without a
-    // separate mutation or operator-triggered snapshot refresh.
-    write_imported_cluster_kv_snapshot_if_changed_async(runtime, paths, &read.value).await?;
-    Ok(read)
+    .await
 }
 
 #[cfg(test)]
@@ -7047,46 +6954,6 @@ mod tests {
         let cached = sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .expect("read unchanged materialized conflict");
         assert_eq!(cached, materialized_conflict);
-    }
-
-    #[test]
-    fn authoritative_snapshot_imports_when_it_advances_local_raft() {
-        let root = sinomo_testdir::TestDir::new(
-            "sinomo-cluster-authoritative-snapshot-advances-local-raft",
-        );
-        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-        let state = initialize_single_voter_read_index_leader(
-            &paths,
-            "cluster_authoritative_snapshot_advances",
-            "node_authoritative_snapshot_advances",
-        );
-        let local = commit_single_voter_test_value(
-            &paths,
-            &state,
-            "/config/authoritative-snapshot-local",
-            b"local",
-        );
-        let mut imported_store = InProcessKvStore::restore(local).expect("restore local snapshot");
-        imported_store
-            .put(
-                "/config/authoritative-snapshot-newer",
-                b"newer".to_vec(),
-                None,
-            )
-            .expect("advance imported snapshot");
-        let imported = imported_store
-            .try_snapshot()
-            .expect("newer imported snapshot");
-
-        assert!(
-            write_imported_cluster_kv_snapshot_if_it_advances(&paths, &imported)
-                .expect("import newer authoritative snapshot")
-        );
-        assert_eq!(
-            sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-                .expect("read imported materialized snapshot"),
-            imported
-        );
     }
 
     #[test]

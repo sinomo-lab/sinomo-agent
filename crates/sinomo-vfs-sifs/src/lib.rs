@@ -879,11 +879,12 @@ impl DaemonSifsVfsBackend {
         timeout: Duration,
     ) -> std::result::Result<sinomo_core::network::ObjectRpcResponse, String> {
         if let Some(data_dir) = &self.discovery_data_dir {
-            // Select using read-only catalog/status requests. Once selected,
-            // this exact operation has one transport owner and one destination.
-            // A failed send is returned unchanged, without another provider send.
+            // Select through the daemon's read-only catalog resolution. Once
+            // selected, this exact operation has one transport owner and one
+            // destination. A failed send is returned unchanged, without another
+            // provider send.
             let deadline = Instant::now() + timeout;
-            let target = self.discover_provider(data_dir, deadline)?;
+            let target = self.discover_provider(deadline)?;
             let timeout = remaining_provider_budget(deadline)?;
             return match target {
                 Some(target) => Self::on_node(data_dir.clone(), self.address.clone(), target)
@@ -908,11 +909,7 @@ impl DaemonSifsVfsBackend {
             .map_err(|source| source.to_string())
     }
 
-    fn discover_provider(
-        &self,
-        data_dir: &SinomoDataDir,
-        deadline: Instant,
-    ) -> std::result::Result<Option<NodeId>, String> {
+    fn discover_provider(&self, deadline: Instant) -> std::result::Result<Option<NodeId>, String> {
         let client = sinomo_api::DaemonApiClient::at_address(self.address.clone())
             .with_timeout(remaining_provider_budget(deadline)?);
         let status = client.status().map_err(|error| error.to_string())?;
@@ -931,69 +928,18 @@ impl DaemonSifsVfsBackend {
         {
             return Err("filesystem source cluster namespace changed".into());
         }
-        let request = ObjectRpcRequest::encode_body(
-            sinomo_core::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
-            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
-            &sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX.to_string(),
-        )
-        .map_err(|error| error.to_string())?;
-        let response = client
+        // The connected daemon's catalog selects ready, reachable providers
+        // from its routing evidence. This operation has one destination.
+        let providers = client
             .with_timeout(remaining_provider_budget(deadline)?)
-            .call_request(&request)
+            .service_providers(sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY)
             .map_err(|error| error.to_string())?;
-        let entries: sinomo_core::kv::KvLocalRead<Vec<sinomo_core::kv::KvEntry>> =
-            response.decode_body().map_err(|error| error.to_string())?;
-        let instances = sinomo_core::service::service_instances_from_entries(&entries.value)
-            .map_err(|error| error.to_string())?;
-        let mut providers: Vec<_> = sinomo_core::service::service_instances_providing_capability(
-            instances,
-            sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY,
-        )
-        .into_iter()
-        .map(|instance| instance.node_id)
-        .collect();
-        providers.sort();
-        providers.dedup();
-        providers.sort_by_key(|node| node != &cluster.node_id);
-        let mut failures = Vec::new();
-        let probe = ObjectRpcRequest::encode_body(
-            sinomo_api::DAEMON_DFS_BROWSER_STATUS_ROUTE,
-            sinomo_api::DAEMON_RPC_CATEGORY,
-            &sinomo_api::DaemonDfsBrowserStatusRequest::default(),
-        )
-        .map_err(|error| error.to_string())?;
-        let provider_count = providers.len();
-        for (index, provider) in providers.into_iter().enumerate() {
-            // Preserve time for every later candidate and for the selected
-            // operation. Reuse the control-plane foreground route-health cap;
-            // this remains inside the caller's one absolute deadline.
-            let remaining = remaining_provider_budget(deadline)?;
-            let slots = u32::try_from(provider_count - index + 1).unwrap_or(u32::MAX);
-            let probe_budget = (remaining / slots).min(
-                sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
-            );
-            if probe_budget.is_zero() {
-                return Err(
-                    "filesystem provider discovery exhausted the operation deadline".into(),
-                );
-            }
-            match Self::on_node(data_dir.clone(), self.address.clone(), provider.clone())
-                .send_rpc_with_timeout(&probe, probe_budget)
-                .and_then(|response| {
-                    response
-                        .decode_body::<sinomo_api::DaemonDfsBrowserStatusResponse>()
-                        .map_err(|error| error.to_string())
-                }) {
-                Ok(status) if status.node_id == provider.as_str() => return Ok(Some(provider)),
-                Ok(_) => failures.push(format!("{provider}: provider identity mismatch")),
-                Err(error) => failures.push(format!("{provider}: {error}")),
-            }
-        }
-        Err(format!(
-            "no reachable cluster service instance provides {} ({})",
-            sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY,
-            failures.join("; ")
-        ))
+        providers.into_iter().next().map(Some).ok_or_else(|| {
+            format!(
+                "no reachable cluster service instance provides {}",
+                sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY
+            )
+        })
     }
 
     fn no_links(

@@ -10,9 +10,8 @@ use super::{
     ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
     ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStatusOptions, DfsCliCommand,
-    DfsCommonOptions, DfsFilterOptions, DfsHostMountOptions,
-    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
-    DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
+    DfsCommonOptions, DfsHostMountOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions,
+    DfsPinCliCommand, DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
     DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
     InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
@@ -35,15 +34,14 @@ use super::{
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
     daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
     data_dir_storage_contract_findings, default_dfs_file_system_id, ensure_rollout_layout,
-    enter_cli_default_main_daemon_status, expire_cluster_network_records_in_kv,
-    explicit_rollout_targets_from_state, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_prepared_native_dylib_modules,
-    install_should_update_binary, install_with_layout, load_tui_model_runtime_config,
-    local_daemon_matches_cluster_state, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, main_agent_tool_registry_for_workspace,
-    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
-    normalize_model_provider, observe_cli_rpc_via_daemon,
+    enter_cli_default_main_daemon_status, explicit_rollout_targets_from_state,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
+    install_prepared_native_dylib_modules, install_should_update_binary, install_with_layout,
+    load_tui_model_runtime_config, local_daemon_matches_cluster_state,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    main_agent_tool_registry_for_workspace, managed_source_status, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider, observe_cli_rpc_via_daemon,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
     parse_cluster_join_invite_argument, parse_cluster_schema_for_test,
     parse_daemon_schema_for_test, parse_dfs_schema_for_test, parse_install_schema_for_test,
@@ -95,16 +93,12 @@ use sinomo_runtime::core::{
     ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
     ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase, ClusterMigrationRecord,
     ClusterNodeAvailability, ClusterNodeRole, ClusterNodeStatusRecord, ClusterTransportKind,
-    Confidence, DfsObjectPolicy, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind,
-    Id, LatencyClass, PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy,
-    RoutingMetadata, RoutingScope, Salience, Source, TrustDomain, TrustRing,
+    Confidence, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass,
+    PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
-use sinomo_runtime::dfs::{
-    DfsMetadataBackend, DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsObjectVersionRecord,
-    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
-    metadata_shard_key,
-};
+use sinomo_runtime::dfs::default_dfs_metadata_shards_root;
 use sinomo_runtime::events::{
     EventId, EventStore, InMemoryEventStore, JsonlEventStore, ReplayQuery, SessionId,
 };
@@ -6894,87 +6888,6 @@ fn cluster_raft_role_update_sets_state_and_capabilities() {
 }
 
 #[test]
-fn cluster_network_expiration_keeps_local_owned_records() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-local-network-expiration");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_local_network_expiration").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_local_network_expiration").expect("node");
-    let remote_node_id = NodeId::from_legacy_named("node_remote_network_expiration").expect("node");
-    let now = OffsetDateTime::now_utc();
-    let expired = now - time::Duration::seconds(10);
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "local network expiration",
-        node_id.clone(),
-        "local",
-        "local-public-key",
-        now,
-    );
-    sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("cluster state");
-
-    let mut store = InProcessKvStore::new();
-    for node_id in [&node_id, &shadow_daemon_node_id(&node_id)] {
-        let info = sinomo_runtime::network::ClusterNetworkInfoRecord {
-            cluster_id: cluster_id.clone(),
-            node_id: node_id.clone(),
-            environment_id: "env_local".to_string(),
-            observed_addresses: vec!["192.0.2.11:21353".to_string()],
-            endpoints: Vec::new(),
-            observed_at: expired,
-            expires_at: expired,
-        };
-        store
-            .put_serde(cluster_network_info_key(node_id), &info, None)
-            .expect("local network info");
-    }
-    let connectivity = sinomo_runtime::network::ClusterConnectivityRecord {
-        cluster_id: cluster_id.clone(),
-        source_node_id: node_id.clone(),
-        target_node_id: remote_node_id.clone(),
-        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_remote").expect("endpoint"),
-        transport: ClusterTransportKind::LanTcp,
-        address: "192.0.2.12:21353".to_string(),
-        state: sinomo_runtime::network::ClusterConnectivityState::Unreachable,
-        latency_ms: None,
-        consecutive_failures: 3,
-        last_success_at: None,
-        last_failure_at: Some("2026-05-06T00:00:00Z".to_string()),
-        failure_reason: None,
-        observed_at: expired,
-        expires_at: expired,
-    };
-    store
-        .put_serde(
-            cluster_connectivity_key(
-                &connectivity.source_node_id,
-                &connectivity.target_node_id,
-                &connectivity.endpoint_id,
-            ),
-            &connectivity,
-            None,
-        )
-        .expect("local connectivity");
-    sinomo_runtime::kv::write_cluster_kv_snapshot(
-        &paths.kv_paths(),
-        &store.snapshot().expect("snapshot"),
-    )
-    .expect("cluster kv snapshot");
-
-    let snapshot =
-        expire_cluster_network_records_in_kv(&paths, &state, now).expect("expire local records");
-
-    assert!(snapshot.is_none());
-    assert!(
-        !paths.kv_paths().raft_wal_paths(&node_id).wal.exists(),
-        "skipping local expiration must not append a raft delete transaction"
-    );
-}
-
-#[test]
 fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-imported-daemon-snapshot-defer");
     let data_dir = SinomoDataDir::new(&root);
@@ -9820,7 +9733,6 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         &merged_state,
         cluster::ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
-            force_kv_snapshot_sync: false,
         },
         &mut CliLocalMemberPublishHost,
     )
@@ -12308,12 +12220,12 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .any(|entry| entry.key == "/config/current")
     );
 
-    let cached_ahead = paths
-        .kv_paths()
-        .local_cache()
-        .cache_snapshot_if_newer_than_raft(state.local_node_id.clone(), stale_snapshot)
-        .expect("cache stale snapshot");
-    assert!(!cached_ahead);
+    let wrote_stale = sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+        &paths.kv_paths(),
+        &stale_snapshot,
+    )
+    .expect("write stale snapshot");
+    assert!(!wrote_stale);
     let snapshot_after_stale = read_cluster_kv_local_snapshot_for_test(&paths)
         .expect("snapshot after stale cache attempt");
     assert!(

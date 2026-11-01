@@ -1,17 +1,13 @@
 use super::*;
-use sinomo_core::events::EventId;
-use sinomo_core::network::NetworkError;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::test_support::{
     self as core_test, TestDistributedWriteOptions as DfsDistributedWriteOptions,
     TestWriteRepair as DfsWriteRepair,
 };
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use time::OffsetDateTime;
 
 use crate::{DfsHistoryExt, decode_history_capture, decode_history_policy, install_history_policy};
 

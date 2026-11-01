@@ -473,21 +473,21 @@ pub fn cluster_member_removal_txns_from_store(
     let explicit_delete_batch_limit =
         sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH.min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);
     for member in members {
-        let mut connectivity_delete_ops = Vec::new();
-        for key in cluster_member_connectivity_delete_keys_from_store(store, &member.node_id)? {
-            connectivity_delete_ops.push(KvOp::Delete { key });
-            if connectivity_delete_ops.len() >= explicit_delete_batch_limit {
+        let mut record_delete_ops = Vec::new();
+        for key in cluster_member_record_delete_keys_from_store(store, &member.node_id)? {
+            record_delete_ops.push(KvOp::Delete { key });
+            if record_delete_ops.len() >= explicit_delete_batch_limit {
                 txns.push(KvTxn {
                     compares: Vec::new(),
-                    success: std::mem::take(&mut connectivity_delete_ops),
+                    success: std::mem::take(&mut record_delete_ops),
                     failure: Vec::new(),
                 });
             }
         }
-        if !connectivity_delete_ops.is_empty() {
+        if !record_delete_ops.is_empty() {
             txns.push(KvTxn {
                 compares: Vec::new(),
-                success: connectivity_delete_ops,
+                success: record_delete_ops,
                 failure: Vec::new(),
             });
         }
@@ -538,7 +538,9 @@ pub fn cluster_member_removal_txns_from_store(
     Ok(txns)
 }
 
-fn cluster_member_connectivity_delete_keys_from_store(
+/// Connectivity naming the member and the member's own service records. A
+/// stopping process keeps its service offer, so removal retires it.
+fn cluster_member_record_delete_keys_from_store(
     store: &InProcessKvStore,
     node_id: &NodeId,
 ) -> Result<Vec<String>, NetworkError> {
@@ -552,6 +554,11 @@ fn cluster_member_connectivity_delete_keys_from_store(
         }
         let record: ClusterConnectivityRecord = entry.decode().map_err(kv_err)?;
         if record.source_node_id == *node_id || record.target_node_id == *node_id {
+            keys.insert(entry.key.clone());
+        }
+    }
+    for entry in store.prefix_entries(sinomo_service::CLUSTER_SERVICES_KV_PREFIX) {
+        if sinomo_service::service_instance_key_belongs_to_node(&entry.key, node_id) {
             keys.insert(entry.key.clone());
         }
     }
@@ -603,7 +610,7 @@ pub(crate) fn cluster_legacy_shadow_orphan_artifact_cleanup_txns_from_store(
     let mut txns = Vec::new();
     let mut ops = Vec::new();
     for node_id in node_ids {
-        for key in cluster_member_connectivity_delete_keys_from_store(store, node_id)? {
+        for key in cluster_member_record_delete_keys_from_store(store, node_id)? {
             ops.push(KvOp::Delete { key });
             if ops.len() >= explicit_delete_batch_limit {
                 txns.push(KvTxn {

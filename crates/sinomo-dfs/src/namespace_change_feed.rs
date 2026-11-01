@@ -6,8 +6,6 @@
 //! authority epoch; callers must rescan their subtree instead of carrying a
 //! cursor across an authority change or a missing journal prefix.
 
-use std::borrow::Cow;
-
 use serde::{Deserialize, Serialize};
 use sinomo_core::events::EventId;
 use time::OffsetDateTime;
@@ -1122,8 +1120,6 @@ mod tests {
     use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 
     use crate::control_plane::DfsMetadataShardAssignment;
-    use crate::metadata_records::{DfsNamespaceRequestRecord, DfsNamespaceRequestStatus};
-    use crate::protocol::{DfsNamespaceOperation, DfsNamespaceResult};
 
     fn id(value: &str) -> sinomo_core::Id {
         sinomo_core::Id::from_legacy_named(value).expect("test id")

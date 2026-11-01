@@ -20,7 +20,6 @@ use crate::intent::{
     stable_distributed_intent_matches_routed_write_command, stable_operation_order_token,
     stable_write_intent_id, stable_write_intent_record_matches_routed_write_command,
 };
-use crate::metadata_pages::walk_metadata_pages;
 use crate::*;
 
 pub(crate) const DFS_ROUTED_WRITE_LATE_RESPONSE_TTL: Duration = Duration::from_secs(60);

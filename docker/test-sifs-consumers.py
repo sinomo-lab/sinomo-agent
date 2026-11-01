@@ -412,12 +412,12 @@ done
 test -n "$selected" || exit 0
 pid=${selected##*/}
 before=$(sed 's/^.*) //' "$selected/stat" | awk '{print $20}')
-digest=$(sha256sum "$selected/exe") || exit 1
+digest=$(dd if="$selected/exe" iflag=nocache bs=1M status=none | sha256sum) || exit 1
 after=$(sed 's/^.*) //' "$selected/stat" | awk '{print $20}')
 test "$before" = "$after" || exit 1
 printf '%s %s %s\n' "$pid" "$before" "${digest%% *}"
 '''
-        raw = self.run(label, [*self.compose, "exec", "-T", node, "sh", "-c", script], timeout=15)
+        raw = self.run(label, [*self.compose, "exec", "-T", node, "bash", "-o", "pipefail", "-c", script], timeout=15)
         if not raw.strip():
             return None
         values = raw.decode().split()
@@ -431,11 +431,11 @@ test "$#" -ge 4 || exit 1
 case "$1" in /usr/local/bin/sinomo|/usr/local/bin/sinomo-shadow) ;; *) exit 1 ;; esac
 test "$2" = daemon && test "$3" = shadow && test "$4" = run || exit 1
 before=$(sed 's/^.*) //' /proc/1/stat | awk '{print $20}')
-digest=$(sha256sum /proc/1/exe) || exit 1
+digest=$(dd if=/proc/1/exe iflag=nocache bs=1M status=none | sha256sum) || exit 1
 test "$(sed 's/^.*) //' /proc/1/stat | awk '{print $20}')" = "$before" || exit 1
 printf '1 %s %s\n' "$before" "${digest%% *}"
 '''
-        raw = self.run(label, [*self.compose, "exec", "-T", node, "sh", "-c", script], timeout=15)
+        raw = self.run(label, [*self.compose, "exec", "-T", node, "bash", "-o", "pipefail", "-c", script], timeout=15)
         values = raw.decode().split()
         require(len(values) == 3 and values[0] == "1" and values[1].isdigit()
                 and values[2] == self.binary_hash, f"{node}: PID1 Shadow identity/hash differs from the owned artifact")
@@ -451,13 +451,13 @@ printf '1 %s %s\n' "$before" "${digest%% *}"
 set -- $(tr '\000' ' ' < "/proc/$pid/cmdline")
 test "$#" -ge 3 && test "$1" = /usr/local/bin/sinomo && test "$2" = daemon && test "$3" = run || exit 1
 actual_start=$(sed 's/^.*) //' "/proc/$pid/stat" | awk '{print $20}')
-digest=$(sha256sum "/proc/$pid/exe") || exit 1
+digest=$(dd if="/proc/$pid/exe" iflag=nocache bs=1M status=none | sha256sum) || exit 1
 test "$actual_start" = "$expected_start" && test "${digest%% *}" = "$expected_hash" || exit 1
 test "$(sed 's/^.*) //' "/proc/$pid/stat" | awk '{print $20}')" = "$expected_start" || exit 1
 kill -TERM "$pid"
 '''
-        self.run(label + "-terminate-exact-main", [*self.compose, "exec", "-T", node, "sh", "-c", script,
-            "sh", str(before["pid"]), str(before["start_ticks"]), before["sha256"]], timeout=15)
+        self.run(label + "-terminate-exact-main", [*self.compose, "exec", "-T", node, "bash", "-o", "pipefail", "-c", script,
+            "bash", str(before["pid"]), str(before["start_ticks"]), before["sha256"]], timeout=15)
         deadline, index, start_attempted = time.monotonic() + 90, 0, False
         while True:
             after = self.main_identity(node, f"{label}-after-{index}")

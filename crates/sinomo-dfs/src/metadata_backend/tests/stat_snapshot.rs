@@ -1,5 +1,4 @@
 use super::*;
-use crate::DfsMetadataBackend;
 
 #[test]
 fn native_stat_pin_keeps_its_exact_proof_after_read_cache_eviction() {

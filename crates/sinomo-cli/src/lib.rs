@@ -172,9 +172,9 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
-    DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsObjectId,
-    DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView, DfsVersion,
-    LocalShardedMetadataBackend, LocalSobjMetadataBackend,
+    DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId, DfsOperatorInspectionCursor,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsVersion, LocalShardedMetadataBackend,
+    LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
     DfsPinAddRequest, add_local_dfs_pin, default_dfs_metadata_root,
@@ -308,10 +308,10 @@ mod error;
 mod help;
 mod media_transport;
 pub mod module_commands;
-mod providers;
-mod sandbox_host;
 #[cfg(test)]
 mod native_test_fixture;
+mod providers;
+mod sandbox_host;
 #[cfg(test)]
 mod tests;
 mod tui;
@@ -829,6 +829,7 @@ pub fn hosted_agent_chat_component_factory(
                 let shutdown = scope.shutdown_receiver();
                 scope.on_host_ready(move || {
                     let service = chat_service.clone();
+                    service.mark_host_ready();
                     let data_dir = data_dir.clone();
                     let runtime = runtime.clone();
                     if let Err(error) = service.recover(data_dir, runtime, shutdown.clone()) {

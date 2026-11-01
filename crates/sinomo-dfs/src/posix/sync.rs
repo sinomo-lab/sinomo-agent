@@ -758,10 +758,7 @@ mod tests {
     use sinomo_core::node::NodeId;
 
     use super::*;
-    use crate::{
-        DfsMetadataShardId, DfsReplicationPolicy, DfsWriteOptions, LocalContentStore,
-        LocalSobjMetadataBackend, NetworkedDfsService,
-    };
+    use crate::{DfsReplicationPolicy, DfsWriteOptions, NetworkedDfsService};
 
     struct PosixSyncFixture {
         _runtime: crate::test_runtime::DfsTestRuntime,

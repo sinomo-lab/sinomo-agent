@@ -119,11 +119,12 @@ fn native_member_state_reads_keep_imported_tie_busy_shadow_and_owner_fences() {
         }),
     );
     assert!(
-        selected
+        !selected
             .unwrap()
             .members
             .iter()
-            .any(|member| member.node_id == joined.node_id)
+            .any(|member| member.node_id == joined.node_id),
+        "member state reads the resident Raft view, not a newer materialized file"
     );
     // Both same-revision inputs have valid, nonempty but different members.
     // The real native command advances to the same semantic revision as the
@@ -309,18 +310,15 @@ fn native_member_state_reads_keep_imported_tie_busy_shadow_and_owner_fences() {
 
 #[test]
 fn member_state_keeps_old_per_member_endpoint_bounds_without_a_new_global_cap() {
-    let (root, paths, state, native) = resident("native-member-state-endpoint-aggregate");
+    let (root, paths, state, _native) = resident("native-member-state-endpoint-aggregate");
     let other = ClusterMemberRecord::pending_learner(
         state.cluster_id.clone(),
         NodeId::generate(),
-        "imported-endpoint-member",
+        "endpoint-member",
         "pk-endpoints",
         OffsetDateTime::UNIX_EPOCH,
     );
-    let mut imported_store = sinomo_kv::InProcessKvStore::restore(native).unwrap();
-    imported_store
-        .put_serde(cluster_member_key(&other.node_id), &other, None)
-        .unwrap();
+    let mut ops = vec![KvOp::put_serde(cluster_member_key(&other.node_id), &other, None).unwrap()];
     let per_member = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES / 2 + 1;
     assert!(per_member <= CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES);
     let mut expected = Vec::new();
@@ -332,26 +330,27 @@ fn member_state_keeps_old_per_member_endpoint_bounds_without_a_new_global_cap() 
                 format!("198.51.100.{}:{}", member_index + 1, 20_000 + i),
                 10,
             );
-            imported_store
-                .put_serde(
+            ops.push(
+                KvOp::put_serde(
                     crate::keyspace::cluster_endpoint_key(&member.node_id, &endpoint),
                     &endpoint,
                     None,
                 )
-                .unwrap();
+                .unwrap(),
+            );
             endpoint_ids.push(endpoint.endpoint_id);
         }
         expected.push((member.node_id.clone(), endpoint_ids));
     }
-    let imported = imported_store.try_snapshot().unwrap();
-    crate::write_imported_cluster_kv_snapshot_if_changed(&paths, &imported).unwrap();
+    crate::kv_local_store::append_cluster_raft_ops_in_batches(&paths, &state.local_node_id, ops)
+        .unwrap();
     let actual = crate::read_cluster_state(&paths);
     let directory = read_cluster_directory_input(&paths);
     export(
         &root,
         "member-state-endpoint-bounds.json",
         serde_json::json!({
-            "qualification":"existing imported read-model DATA seam, not a fabricated native owner or quorum certificate; each member stays within its original endpoint range bound",
+            "qualification":"native Raft commands, not a fabricated owner or quorum certificate; each member stays within its original endpoint range bound",
             "per_member_endpoint_count":per_member,"aggregate_endpoint_count":per_member * 2,
             "directory_original_aggregate_limit":CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
             "actual_state":actual.as_ref().map_err(ToString::to_string),

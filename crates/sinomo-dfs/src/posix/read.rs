@@ -2074,7 +2074,7 @@ impl NetworkedDfsService<DfsNodeTransport> {
 mod opened_stat_tests {
     use super::*;
     use crate::DfsWriteOptions;
-    use crate::LocalContentStore;
+
     use sinomo_core::DfsObjectPolicy;
 
     #[test]

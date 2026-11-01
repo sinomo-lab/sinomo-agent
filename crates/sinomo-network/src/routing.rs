@@ -236,7 +236,7 @@ pub fn plan_routes(
     )
 }
 
-pub(crate) fn plan_routes_with_destination_process_affinity(
+fn plan_routes_with_destination_process_affinity(
     directory: &DirectorySnapshot,
     connectivity: &ConnectivitySnapshot,
     source_node_id: &NodeId,
@@ -2009,8 +2009,8 @@ async fn initiate_routed_session(
     ).await.map_err(NetworkError::from)
 }
 
-// Keep the existing frame owner's typed close/error distinction until the
-// actual connection owner classifies it. Public callers retain NetworkError.
+// The shared frame helpers carry a typed peer-closure distinction for daemon
+// ingress. Initiators report the public NetworkError.
 async fn initiate_routed_session_with_failure(
     mut stream: AuthenticatedDirectStream,
     directory: &DirectorySnapshot,
@@ -3219,67 +3219,7 @@ pub struct MultiHopRoutedConnector {
     identity: Arc<dyn RoutedSessionIdentity>,
 }
 
-// Request-owned connection diagnostics, never a wire value or effect permit.
-// Fields/constructors stay with the actual pre-service connection owner.
-pub(crate) struct CarrierEstablishmentFailure {
-    error: NetworkError,
-    refresh_eligible: bool,
-}
-impl CarrierEstablishmentFailure {
-    pub(crate) fn allows_source_read(&self) -> bool {
-        self.refresh_eligible
-    }
-    pub(crate) fn error(&self) -> &NetworkError {
-        &self.error
-    }
-    pub(crate) fn into_error(self) -> NetworkError {
-        self.error
-    }
-}
-
-fn carrier_failure_allows_source_read(error: &RoutedHandshakeFailure) -> bool {
-    // Positive transport provenance from the actual opened session's frame IO.
-    // Provider policy/identity/capability and unrelated local Io stay failures.
-    matches!(error, RoutedHandshakeFailure::PeerClosed { .. })
-}
-
 impl MultiHopRoutedConnector {
-    pub(crate) fn has_live_observed_route(
-        &self, target: &NodeId, affinity: DestinationProcessAffinity,
-    ) -> bool {
-        let connectivity = self.connectivity.snapshot();
-        let now = time::OffsetDateTime::now_utc();
-        plan_routes_with_destination_process_affinity(
-            &self.directory, &connectivity, &self.local_node_id, target,
-            RouteConstraints::default(), affinity,
-        ).iter().any(|path| !path.hops.is_empty() && path.hops.iter().all(|hop| {
-            connectivity.edges().iter().any(|edge| {
-                edge.source_node_id == hop.source_node_id && edge.target_node_id == hop.target_node_id
-                    && edge.endpoint.endpoint_id == hop.endpoint.endpoint_id && edge.expires_at > now
-                    && edge.state != DirectConnectivityState::Unreachable
-            })
-        }))
-    }
-
-    // Planner DATA only. Unlike a live-observation hint this includes the
-    // existing recovery candidates, with the caller's exact process affinity.
-    pub(crate) fn candidate_routes(
-        &self,
-        target: &NodeId,
-        constraints: RouteConstraints,
-        affinity: DestinationProcessAffinity,
-    ) -> Vec<CandidatePath> {
-        let connectivity = self.connectivity.snapshot();
-        plan_routes_with_destination_process_affinity(
-            &self.directory,
-            &connectivity,
-            &self.local_node_id,
-            target,
-            constraints,
-            affinity,
-        )
-    }
-
     pub fn new(
         local_node_id: NodeId,
         directory: Arc<dyn ClusterDirectory>,
@@ -3324,7 +3264,6 @@ impl MultiHopRoutedConnector {
         destination_node_id: NodeId,
         options: ConnectOptions,
         destination_process_affinity: DestinationProcessAffinity,
-        refresh_eligible: &mut bool,
     ) -> Result<PeerStream, NetworkError> {
         let directory = &self.directory;
         if !directory.is_authorized(&self.local_node_id) {
@@ -3353,8 +3292,6 @@ impl MultiHopRoutedConnector {
             path_count, phase = "planned", "routed candidate boundary");
         let mut attempts = 0_usize;
         let mut failures = Vec::new();
-        let mut saw_transport_failure = false;
-        let mut only_transport_failures = true;
         for (path_index, path) in paths.iter().enumerate() {
             let Some(first_hop) = path.hops.first() else {
                 continue;
@@ -3368,7 +3305,7 @@ impl MultiHopRoutedConnector {
             let attempt_deadline_unix_millis = routed_session_deadline_unix_millis(attempt_timeout);
             enum PathAttemptError {
                 DirectEdge(NetworkError),
-                RoutedSession(RoutedHandshakeFailure),
+                RoutedSession(NetworkError),
             }
             let direct_edge_established = Arc::new(AtomicBool::new(false));
             let established = Arc::clone(&direct_edge_established);
@@ -3401,7 +3338,7 @@ impl MultiHopRoutedConnector {
                 established.store(true, Ordering::Release);
                 tracing::trace!(target: "sinomo.perf", path_index,
                     phase = "routed-session-acceptance", "routed candidate boundary");
-                initiate_routed_session_with_failure(
+                initiate_routed_session(
                     stream,
                     directory,
                     path,
@@ -3419,9 +3356,6 @@ impl MultiHopRoutedConnector {
                     return Ok(stream);
                 }
                 Ok(Err(PathAttemptError::DirectEdge(error))) => {
-                    // A provider/adjacent-open Io can be an unsupported module
-                    // or capability refusal; it is no positive session proof.
-                    only_transport_failures = false;
                     report_routed_edge_failure(
                         Some(self.failure_sink.as_ref()),
                         &first_hop.source_node_id,
@@ -3431,26 +3365,15 @@ impl MultiHopRoutedConnector {
                     );
                     failures.push(format!("{}: {error}", first_hop.endpoint.address));
                 }
-                Ok(Err(PathAttemptError::RoutedSession(error))) => {
-                    let transport = carrier_failure_allows_source_read(&error);
-                    saw_transport_failure |= transport;
-                    only_transport_failures &= transport;
-                    let error = NetworkError::from(error);
-                    failures.push(format!(
-                        "path {}: {error}",
-                        path.nodes
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(" -> ")
-                    ));
-                }
+                Ok(Err(PathAttemptError::RoutedSession(error))) => failures.push(format!(
+                    "path {}: {error}",
+                    path.nodes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                )),
                 Err(_) => {
-                    // Only a timeout AFTER a real adjacent stream opened can
-                    // describe this routed-session transport stage.
-                    let transport = direct_edge_established.load(Ordering::Acquire);
-                    saw_transport_failure |= transport;
-                    only_transport_failures &= transport;
                     let error = NetworkError::timeout(
                         format!(
                             "establish routed candidate path {}",
@@ -3477,9 +3400,6 @@ impl MultiHopRoutedConnector {
                 }
             }
         }
-        // Only this actual pre-service connection owner records eligibility.
-        // Preserve every typed terminal/auth failure before formatting details.
-        *refresh_eligible = attempts > 0 && saw_transport_failure && only_transport_failures;
         Err(NetworkError::RetryExhausted {
             operation: format!("establish routed session to {destination_node_id}"),
             attempts,
@@ -3499,50 +3419,19 @@ impl MultiHopRoutedConnector {
         destination_process_affinity: DestinationProcessAffinity,
     ) -> RoutedConnectFuture<'a> {
         Box::pin(async move {
-            self.connect_with_source_freshness_observation(
-                destination_node_id,
-                options,
-                destination_process_affinity,
-            )
-            .await
-            .map_err(CarrierEstablishmentFailure::into_error)
-        })
-    }
-
-    pub(crate) fn connect_with_source_freshness_observation<'a>(
-        &'a self,
-        destination_node_id: NodeId,
-        options: ConnectOptions,
-        destination_process_affinity: DestinationProcessAffinity,
-    ) -> Pin<Box<dyn Future<Output = Result<PeerStream, CarrierEstablishmentFailure>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let mut refresh_eligible = false;
-            match tokio::time::timeout(
+            tokio::time::timeout(
                 options.timeout,
-                self.connect_inner(
-                    destination_node_id,
-                    options,
-                    destination_process_affinity,
-                    &mut refresh_eligible,
-                ),
+                self.connect_inner(destination_node_id, options, destination_process_affinity),
             )
             .await
-            {
-                Ok(result) => result.map_err(|error| CarrierEstablishmentFailure {
-                    error,
-                    refresh_eligible,
-                }),
-                Err(_) => Err(CarrierEstablishmentFailure {
-                    error: NetworkError::timeout(
-                        "establish multi-hop routed session",
-                        NetworkTimeoutPhase::Connect,
-                        options.timeout,
-                        NetworkDeliveryState::DefinitelyNotSent,
-                    ),
-                    refresh_eligible: false,
-                }),
-            }
+            .map_err(|_| {
+                NetworkError::timeout(
+                    "establish multi-hop routed session",
+                    NetworkTimeoutPhase::Connect,
+                    options.timeout,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                )
+            })?
         })
     }
 }

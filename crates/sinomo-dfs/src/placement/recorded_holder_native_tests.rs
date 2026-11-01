@@ -5,7 +5,7 @@ use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
 use crate::*;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const PATH: &str = "/recorded-holder-native.bin";
 const BYTES: &[u8] = b"real native immutable placement holder content";

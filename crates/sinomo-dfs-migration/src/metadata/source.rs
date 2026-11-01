@@ -3,6 +3,7 @@
 use super::{MetadataBackendError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
 use sinomo_core::object::serde_ext;
 use sinomo_core::storage::migration::stream::{MigrationStreamReader, StreamCursor};
 use std::fs::{self, File};

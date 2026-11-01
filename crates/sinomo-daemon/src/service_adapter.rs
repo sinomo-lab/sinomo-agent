@@ -1347,32 +1347,26 @@ impl DaemonClusterControlServiceHost {
 }
 
 impl sinomo_core::cluster::ClusterControlServiceHost for DaemonClusterControlServiceHost {
-    fn recover_endpoint(
+    fn route_hint(
         &self,
-        request: sinomo_core::cluster::EndpointRecoveryRequest,
+        request: sinomo_core::cluster::ClusterRouteHintRequest,
     ) -> sinomo_core::cluster::ClusterControlServiceFuture<
         '_,
-        sinomo_core::cluster::EndpointRecoveryResponse,
+        sinomo_core::cluster::ClusterRouteHintResponse,
     > {
         let paths = self.paths.clone();
-        let runtime = self.runtime.clone();
         Box::pin(async move {
-            let runtime = require_service_runtime(runtime.as_ref(), "endpoint recovery")?.clone();
             run_blocking_service_task(
-                sinomo_core::cluster::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
-                "endpoint recovery",
+                sinomo_core::cluster::CLUSTER_CONTROL_ROUTE_HINT_ROUTE,
+                "route hint",
                 move || {
                     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(&paths)
                         .map_err(daemon_error)?;
-                    let mut host =
-                        crate::endpoint_recovery::DaemonEndpointRecoveryHost::new(&paths, &runtime);
-                    let response = sinomo_core::cluster::recover_endpoint(
-                        &cluster_paths,
-                        &request,
-                        &mut host,
-                    )?;
-                    if response.needs_transport_refresh {
-                        host.record_validated_read(&request.spec)?;
+                    let response =
+                        sinomo_core::cluster::apply_cluster_route_hint(&cluster_paths, &request)?;
+                    if response.changed {
+                        // Probe and publish over the new route now; contact
+                        // with the leader starts this node's catch-up.
                         crate::control::request_daemon_cluster_maintenance(
                             crate::control::DaemonClusterMaintenanceReason::ManualBroad,
                         );
@@ -3533,6 +3527,44 @@ pub(crate) async fn dispatch_rpc_via_registry_to_response_async(
     Ok((response, stop))
 }
 
+/// A known-behind member that reaches this daemon has a usable route back.
+/// Its authenticated contact starts that peer's targeted Raft catch-up; the
+/// catch-up replicates only while this process leads.
+fn observe_cluster_peer_contact(paths: &DaemonPaths, authenticated: &AuthenticatedDaemonCommand) {
+    let Some((cluster_paths, node_id)) = cluster_peer_contact_owes_catch_up(paths, authenticated)
+    else {
+        return;
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Ok(state) = sinomo_core::cluster::read_cluster_state(&cluster_paths) else {
+        return;
+    };
+    crate::cluster::spawn_cluster_raft_member_catch_up(
+        &runtime,
+        cluster_paths,
+        state,
+        vec![node_id],
+    );
+}
+
+fn cluster_peer_contact_owes_catch_up(
+    paths: &DaemonPaths,
+    authenticated: &AuthenticatedDaemonCommand,
+) -> Option<(ClusterPaths, sinomo_core::node::NodeId)> {
+    if !matches!(
+        authenticated.signer,
+        DaemonSignerAuthority::Voter | DaemonSignerAuthority::Member
+    ) {
+        return None;
+    }
+    let node_id = authenticated.signer_node_id.parse().ok()?;
+    let cluster_paths = cluster_paths_from_daemon_paths(paths).ok()?;
+    sinomo_core::cluster::cluster_raft_peer_is_behind(&cluster_paths, &node_id)
+        .then_some((cluster_paths, node_id))
+}
+
 pub(crate) async fn dispatch_rpc_via_registry_with_body_async(
     service_host: &DaemonServiceRegistryHost,
     authenticated: &AuthenticatedDaemonCommand,
@@ -3580,6 +3612,7 @@ pub(crate) async fn dispatch_rpc_via_registry_with_body_async(
     if !daemon_route_local_permissions_are_granted(&service_host.paths, &descriptor) {
         return Err(DaemonError::AuthDenied);
     }
+    observe_cluster_peer_contact(&service_host.paths, authenticated);
     let registry = service_host
         .service_registry
         .active_snapshot()
@@ -5517,6 +5550,54 @@ mod tests {
             .expect("recovered service route readiness");
         assert_eq!(recovered.available_concurrency, Some(1));
         assert!(recovered.is_ready());
+    }
+
+    #[test]
+    fn only_contact_from_a_known_behind_member_owes_raft_catch_up() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-peer-contact-catch-up");
+        let paths = DaemonPaths::with_root(root.path().join("daemon"));
+        let cluster_paths = cluster_paths_from_daemon_paths(&paths).expect("cluster paths");
+        let behind =
+            sinomo_core::node::NodeId::from_legacy_named("node_contact_behind").expect("behind");
+        let current =
+            sinomo_core::node::NodeId::from_legacy_named("node_contact_current").expect("current");
+        sinomo_core::cluster::record_cluster_raft_peer_append_results(
+            &cluster_paths,
+            std::slice::from_ref(&current),
+            std::slice::from_ref(&behind),
+        );
+        let contact = |signer: DaemonSignerAuthority, node_id: &sinomo_core::node::NodeId| {
+            AuthenticatedDaemonCommand {
+                route: "/cluster/kv/txn".to_string(),
+                signer,
+                signer_node_id: node_id.to_string(),
+                signer_public_key: "pk".to_string(),
+            }
+        };
+
+        assert_eq!(
+            cluster_peer_contact_owes_catch_up(
+                &paths,
+                &contact(DaemonSignerAuthority::Member, &behind)
+            )
+            .map(|(_, node_id)| node_id),
+            Some(behind.clone())
+        );
+        assert!(
+            cluster_peer_contact_owes_catch_up(
+                &paths,
+                &contact(DaemonSignerAuthority::Voter, &current)
+            )
+            .is_none()
+        );
+        assert!(
+            cluster_peer_contact_owes_catch_up(
+                &paths,
+                &contact(DaemonSignerAuthority::Local, &behind)
+            )
+            .is_none(),
+            "a local command is not contact from a cluster peer"
+        );
     }
 
     #[test]

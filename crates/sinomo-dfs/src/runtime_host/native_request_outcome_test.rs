@@ -1,5 +1,4 @@
 //! Real retained native outcome observations; no handcrafted success receipt.
-use super::*;
 
 // This proof test needs an admitted authoritative observation, not a claim
 // about a concurrent local Raft lock. Retry only the explicit fail-closed busy

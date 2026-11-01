@@ -537,6 +537,7 @@ fn encode_inline<T: Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|error| ContentStoreError::Serde(error.to_string()))
 }
 
+#[cfg(test)]
 fn read_catalog(root: &Path, incarnation: &str) -> Result<InlineCatalog> {
     read_catalog_for_format(root, incarnation, INLINE_FORMAT_VERSION)
 }

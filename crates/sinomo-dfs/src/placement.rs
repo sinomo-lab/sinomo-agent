@@ -31,7 +31,7 @@ use crate::{
     DfsObjectPageCursor, DfsPlacementScope, DfsReplicaCandidate, DfsReplicaPlacementExplanation,
     DfsReplicaPlacementRequest, DfsReplicationPolicy, DfsStat, DfsSubtreePolicy, DfsVersion,
     DfsWriteIntentState, DistributedWriteIntent, NetworkedDfsService, dfs_now_unix_nanos,
-    explain_replicas, explain_replicas_with_placement_snapshot, validate_replication_plan,
+    explain_replicas, validate_replication_plan,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::kv::KvCompare;
@@ -5338,14 +5338,10 @@ where
 mod tests {
     use super::*;
     use crate::{
-        DfsBlobTransferResult, DfsFileSystem, DfsMetadataBackend, DfsMetadataShardAssignment,
-        DfsMetadataShardConfig, DfsNodeTransport, DfsRepairReplicaResponse, DfsRoutedCall,
-        DfsRoutedMessage, DfsTransportIdentity, DfsWriteIntentStatus, LocalContentStore,
-        NetworkedDfsServiceEvent, SharedDfsControlPlaneKvClient, open_root_local_metadata_backend,
+        DfsFileSystem, DfsMetadataBackend, LocalContentStore, SharedDfsControlPlaneKvClient,
         sifs_file_system_id,
     };
     use sinomo_core::kv::InProcessKvStore;
-    use sinomo_core::network::NetworkError;
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("node")
@@ -8039,7 +8035,7 @@ mod tests {
 
 #[cfg(test)]
 mod admitted_placement_coordinator_native_tests {
-    use super::*;
+
     use crate::DfsControlPlaneKvClient;
     use std::sync::{
         Arc,

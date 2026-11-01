@@ -719,17 +719,6 @@ impl InProcessKvStore {
         self.revision
     }
 
-    /// The existing read-model generation, not a consensus or authority index.
-    /// The maintained request-order index contains exactly the retained memo.
-    pub(crate) fn materialized_generation(&self) -> (KvRevision, u64) {
-        let retained_request_index = self
-            .committed_request_order
-            .iter()
-            .next_back()
-            .map_or(0, |(log_index, _)| *log_index);
-        (self.revision, retained_request_index)
-    }
-
     pub fn compacted_revision(&self) -> KvRevision {
         self.compacted_revision
     }

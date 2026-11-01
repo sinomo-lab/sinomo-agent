@@ -2088,29 +2088,6 @@ pub fn fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime(
     Ok(read)
 }
 
-/// Explicit recovery read from one native authoritative snapshot. Old servers
-/// reject the distinct route instead of degrading to an incomplete prefix.
-pub fn fetch_cluster_kv_authoritative_complete_range_prefix_from_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    prefix: &str,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, DaemonError> {
-    let read: KvAuthoritativeRead<Vec<KvEntry>> =
-        send_daemon_rpc_borrowed_value_to_endpoint_on_runtime(
-            endpoint,
-            sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE,
-            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
-            &ClusterKvAuthoritativeRangePrefixRequest {
-                prefix: prefix.to_string(),
-            },
-            timeout,
-            runtime,
-        )?;
-    sinomo_core::kv::validate_cluster_kv_authoritative_complete_range_prefix_read(prefix, &read)?;
-    Ok(read)
-}
-
 /// Starts a barrier-backed watch on the addressed authority. The current
 /// server contract deliberately fails on a non-leader rather than forwarding
 /// only the barrier and registering against a potentially stale local store.

@@ -8,10 +8,10 @@ use crate::raft_quorum::{
 };
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
+use sinomo_network::ClusterConnectivityRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
 use sinomo_network::current_io_observer as io_observer;
-use sinomo_network::{ClusterConnectivityRecord, cluster_network_record_live};
 use sinomo_network::{ClusterFileMark, cluster_file_mark};
 
 use sinomo_base::ClusterBootstrapState;
@@ -534,8 +534,8 @@ fn route_connectivity_projection_changed(
     incoming: &KvSnapshot,
     now: OffsetDateTime,
 ) -> Result<bool, NetworkError> {
-    let existing_records = live_connectivity_records_by_key(existing, now)?;
-    let incoming_records = live_connectivity_records_by_key(incoming, now)?;
+    let existing_records = committed_connectivity_records_by_key(existing)?;
+    let incoming_records = committed_connectivity_records_by_key(incoming)?;
     if existing_records.len() != incoming_records.len() {
         return Ok(true);
     }
@@ -550,18 +550,16 @@ fn route_connectivity_projection_changed(
     Ok(false)
 }
 
-fn live_connectivity_records_by_key(
+// Routing reads every committed row as its source's current statement, so
+// the route projection changes with committed semantics, not with row age.
+fn committed_connectivity_records_by_key(
     snapshot: &KvSnapshot,
-    now: OffsetDateTime,
 ) -> Result<BTreeMap<String, ClusterConnectivityRecord>, NetworkError> {
     let mut records = BTreeMap::new();
     for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
         let record = entry
             .decode::<ClusterConnectivityRecord>()
             .map_err(kv_err)?;
-        if !cluster_network_record_live(record.expires_at, now) {
-            continue;
-        }
         records.insert(
             cluster_connectivity_key(
                 &record.source_node_id,
@@ -638,24 +636,19 @@ pub fn read_cluster_kv_latest_observed_snapshot_arc_if_present(
     paths: &ClusterPaths,
 ) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
     // Shadow daemons install a one-way local-Raft ownership denial for this
-    // root. Their routing/authentication read model is the materialized or
-    // imported projection only; trying the current voter first would either
-    // seize the main voter's node lock or repeatedly fail before reaching the
-    // safe cache.
+    // root. Their routing/authentication read model is the materialized
+    // projection only; trying the current voter first would either seize the
+    // main voter's node lock or repeatedly fail before reaching the safe cache.
     if sinomo_kv::process_local_raft_access_is_denied(&paths.kv_paths().raft) {
         return read_cluster_kv_cached_snapshot_if_present(paths);
     }
-    let current = match read_cluster_kv_current_snapshot_arc(paths) {
-        Ok(snapshot) => Some(snapshot),
-        Err(NetworkError::ClusterOrphan) => None,
-        Err(error) => return Err(error),
-    };
-    let cached = read_cluster_kv_cached_snapshot_if_present(paths)?;
-    Ok(match (current, cached) {
-        (Some(current), Some(cached)) if cached.revision > current.revision => Some(cached),
-        (Some(current), _) => Some(current),
-        (None, cached) => cached,
-    })
+    // The resident applied Raft state is the canonical view wherever it
+    // exists; the materialized checkpoint serves only a root without it.
+    match read_cluster_kv_current_snapshot_arc(paths) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(NetworkError::ClusterOrphan) => read_cluster_kv_cached_snapshot_if_present(paths),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn read_cluster_kv_latest_observed_snapshot(
@@ -821,48 +814,6 @@ pub fn read_cluster_kv_local_snapshot(
     Ok(local)
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub fn cache_cluster_kv_snapshot_if_newer_than_raft(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    snapshot: KvSnapshot,
-) -> Result<bool, NetworkError> {
-    let observed = snapshot.clone();
-    let changed = paths
-        .kv_paths()
-        .cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
-        .map_err(kv_err)?;
-    if changed {
-        let _ = &observed;
-    }
-    Ok(changed)
-}
-
-pub(crate) fn locked_cache_cluster_kv_snapshot_if_newer_than_raft(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    snapshot: KvSnapshot,
-) -> Result<bool, NetworkError> {
-    let observed = snapshot.clone();
-    let changed = match paths
-        .kv_paths()
-        .locked_cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
-    {
-        Ok(changed) => changed,
-        // Snapshot refresh materializes the imported view before invoking this
-        // reconciliation hook. If a foreground quorum command currently owns
-        // the Raft node, do not fail the read-only refresh: the holder will
-        // publish its local view when it commits, and a later refresh can
-        // reconcile again. Other storage errors still fail closed.
-        Err(KvError::Busy { .. }) => return Ok(false),
-        Err(error) => return Err(kv_err(error)),
-    };
-    if changed {
-        let _ = &observed;
-    }
-    Ok(changed)
-}
-
 pub(crate) fn locked_kv_state_authority_id(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -968,18 +919,6 @@ pub(crate) fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option
     sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(&paths.kv_paths(), node_id)
         .map(|snapshot| snapshot.revision)
         .ok()
-}
-
-pub(crate) fn imported_snapshot_advances_local_kv(
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> bool {
-    let Ok(node_id) = read_cluster_kv_reader_node_id(paths) else {
-        return true;
-    };
-    paths
-        .kv_paths()
-        .imported_snapshot_advances_current_for_node(&node_id, snapshot)
 }
 
 pub(crate) fn append_cluster_raft_ops_in_batches(
@@ -3117,35 +3056,5 @@ mod tests {
                     .unwrap();
             assert!(!Arc::ptr_eq(&cached_before, &refreshed));
         }
-    }
-
-    #[test]
-    fn imported_snapshot_reconciliation_defers_while_local_raft_node_is_busy() {
-        let root = sinomo_testdir::TestDir::new("sinomo-cluster-kv-import-busy");
-        let data_dir = sinomo_local::SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-        let node_id = NodeId::from_legacy_named("node_kv_import_busy").expect("node");
-        let held = open_cluster_raft_kv_node(&paths, &node_id).expect("hold local raft node");
-        let mut imported = InProcessKvStore::new();
-        imported
-            .put("/imported", b"value".to_vec(), None)
-            .expect("imported value");
-        let snapshot = imported.try_snapshot().expect("imported snapshot");
-
-        assert!(
-            !locked_cache_cluster_kv_snapshot_if_newer_than_raft(
-                &paths,
-                &node_id,
-                snapshot.clone(),
-            )
-            .expect("busy reconciliation is deferred")
-        );
-
-        drop(held);
-        assert!(
-            locked_cache_cluster_kv_snapshot_if_newer_than_raft(&paths, &node_id, snapshot)
-                .expect("reconcile after lock release")
-        );
     }
 }

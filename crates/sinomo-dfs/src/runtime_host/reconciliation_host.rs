@@ -636,48 +636,6 @@ enum DaemonDefaultDfsLifecycleOutcome {
     WaitingForTopology,
 }
 
-#[cfg(test)]
-pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
-    paths: &DaemonPaths,
-    options: &DaemonRunOptions,
-    publish_cluster_control: bool,
-    runtime: tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
-    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(
-        &ClusterPaths::new(&data_dir),
-    )?;
-    match ensure_default_distributed_dfs_outcome_async_on_runtime(
-        paths,
-        options,
-        &state.cluster_id,
-        &state.local_node_id,
-        publish_cluster_control,
-        publish_cluster_control,
-        runtime,
-        false,
-    )
-    .await?
-    .0
-    {
-        DaemonDefaultDfsLifecycleOutcome::Completed => Ok(()),
-        DaemonDefaultDfsLifecycleOutcome::Parked(handoff) => {
-            Err(sinomo_dfs::DfsError::MetadataShardMembershipHandoffParked {
-                file_system_id: handoff.file_system_id,
-                shard_id: handoff.shard_id.0,
-                handoff_id: handoff.handoff_id,
-                retiring_epoch: handoff.retiring_epoch,
-                desired_epoch: handoff.desired_epoch,
-            }
-            .into())
-        }
-        DaemonDefaultDfsLifecycleOutcome::DeferredBeforeAdmission
-        | DaemonDefaultDfsLifecycleOutcome::WaitingForTopology => Err(DaemonError::Parse {
-            detail: "nonpreemptible startup lifecycle was deferred before admission".into(),
-        }),
-    }
-}
-
 fn default_dfs_lifecycle_admission_scope(
     publishes_control: bool,
     publishes_metadata: bool,

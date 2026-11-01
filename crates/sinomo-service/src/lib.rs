@@ -23,12 +23,12 @@ pub use observed_task::observed_blocking_task;
 
 pub mod discovery;
 pub use discovery::{
-    CLUSTER_SERVICES_KV_PREFIX, ServiceInstanceRecord, ServiceTargetSelector,
-    TargetSelectionPolicy, cluster_service_instance_key, cluster_service_prefix,
-    discover_service_instances, publish_local_service_instances,
-    publish_local_service_instances_with_authoritative_recheck,
-    service_instance_records_from_registry, service_instances_from_entries,
-    service_instances_providing_capability,
+    CLUSTER_SERVICE_PROVIDERS_ROUTE, CLUSTER_SERVICES_KV_PREFIX, CLUSTER_SERVICES_RPC_CATEGORY,
+    ServiceInstanceRecord, ServiceProvidersRequest, ServiceProvidersResponse,
+    ServiceTargetSelector, TargetSelectionPolicy, cluster_service_instance_key,
+    cluster_service_prefix, discover_service_instances, publish_local_service_instances,
+    service_instance_key_belongs_to_node, service_instance_records_from_registry,
+    service_instances_from_entries, service_instances_providing_capability,
 };
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1074,6 +1074,7 @@ fn validate_service_body_mode(
 pub struct ServiceRegistrySnapshot {
     version: u64,
     registry: Arc<ServiceRegistry>,
+    host_stopping: bool,
 }
 
 impl std::fmt::Debug for ServiceRegistrySnapshot {
@@ -1083,20 +1084,28 @@ impl std::fmt::Debug for ServiceRegistrySnapshot {
             .field("version", &self.version)
             .field("service_names", &self.registry.service_names())
             .field("route_count", &self.registry.route_count())
+            .field("host_stopping", &self.host_stopping)
             .finish()
     }
 }
 
 impl ServiceRegistrySnapshot {
-    fn new(version: u64, registry: ServiceRegistry) -> Self {
+    fn new(version: u64, registry: ServiceRegistry, host_stopping: bool) -> Self {
         Self {
             version,
             registry: Arc::new(registry),
+            host_stopping,
         }
     }
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Whether this generation only withdraws local admission while the host
+    /// process stops. It is not a change to the node's service offer.
+    pub fn host_stopping(&self) -> bool {
+        self.host_stopping
     }
 
     pub fn registry(&self) -> &ServiceRegistry {
@@ -1138,7 +1147,7 @@ impl Default for ServiceRegistrySnapshotStore {
 
 impl ServiceRegistrySnapshotStore {
     pub fn new(registry: ServiceRegistry) -> Self {
-        let snapshot = Arc::new(ServiceRegistrySnapshot::new(1, registry));
+        let snapshot = Arc::new(ServiceRegistrySnapshot::new(1, registry, false));
         let (version_tx, _) = tokio::sync::watch::channel(snapshot.version());
         Self {
             active: Arc::new(ArcSwap::from(snapshot)),
@@ -1162,6 +1171,24 @@ impl ServiceRegistrySnapshotStore {
         &self,
         registry: ServiceRegistry,
     ) -> Result<Arc<ServiceRegistrySnapshot>, ServiceRegistrySnapshotError> {
+        self.install(registry, false)
+    }
+
+    /// Withdraw local admission while the host process stops. The node's
+    /// published service offer is unchanged: a replacement process owns the
+    /// same records and may already have published them.
+    pub fn withdraw_for_host_stop(
+        &self,
+        registry: ServiceRegistry,
+    ) -> Result<Arc<ServiceRegistrySnapshot>, ServiceRegistrySnapshotError> {
+        self.install(registry, true)
+    }
+
+    fn install(
+        &self,
+        registry: ServiceRegistry,
+        host_stopping: bool,
+    ) -> Result<Arc<ServiceRegistrySnapshot>, ServiceRegistrySnapshotError> {
         let _guard = self.update_lock.lock().map_err(|source| {
             ServiceRegistrySnapshotError::SnapshotLock {
                 detail: source.to_string(),
@@ -1171,6 +1198,7 @@ impl ServiceRegistrySnapshotStore {
         let snapshot = Arc::new(ServiceRegistrySnapshot::new(
             active.version().saturating_add(1),
             registry,
+            host_stopping,
         ));
         self.active.store(Arc::clone(&snapshot));
         self.version_tx.send_replace(snapshot.version());
@@ -2143,6 +2171,30 @@ mod tests {
         }
 
         let _ = ServiceRegistry::builder().register(InvalidPermissionService);
+    }
+
+    #[tokio::test]
+    async fn host_stop_withdrawal_is_a_distinct_generation_and_does_not_persist() {
+        let store = ServiceRegistrySnapshotStore::default();
+        let mut versions = store.subscribe_versions();
+        assert!(!store.active_snapshot().host_stopping());
+
+        let stopping = store
+            .withdraw_for_host_stop(ServiceRegistry::default())
+            .expect("withdraw admission");
+        assert_eq!(stopping.version(), 2);
+        assert!(stopping.host_stopping());
+        versions
+            .changed()
+            .await
+            .expect("withdrawal generation edge");
+        assert!(store.active_snapshot().host_stopping());
+
+        let reopened = store
+            .replace_registry(ServiceRegistry::default())
+            .expect("reinstall registry");
+        assert_eq!(reopened.version(), 3);
+        assert!(!reopened.host_stopping());
     }
 
     #[tokio::test]

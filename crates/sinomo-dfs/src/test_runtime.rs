@@ -2458,7 +2458,7 @@ impl DeferredNativeGenesis {
 #[cfg(all(test, unix))]
 mod retained_fixture;
 #[cfg(all(test, unix))]
-pub(crate) use retained_fixture::{RetainedNativeHealthyFixture, RetainedNativeHealthyShard};
+pub(crate) use retained_fixture::RetainedNativeHealthyFixture;
 
 #[cfg(all(test, unix))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

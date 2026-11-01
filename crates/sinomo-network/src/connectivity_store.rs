@@ -413,26 +413,6 @@ pub fn write_local_cluster_connectivity_records(
     write_local_cluster_connectivity_records_inner(paths, source_node_id, records, false, false)
 }
 
-pub async fn write_local_cluster_connectivity_records_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<(), NetworkError> {
-    let paths = paths.clone();
-    let source_node_id = source_node_id.clone();
-    let records = records.to_vec();
-    runtime
-        .spawn_blocking(move || {
-            write_local_cluster_connectivity_records(&paths, &source_node_id, &records)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "write local cluster connectivity records".to_string(),
-            detail: format!("local cluster connectivity write task failed: {source}"),
-        })?
-}
-
 /// Replaces the complete set owned by `source_node_id`.
 ///
 /// This is an authoritative-current operation for synchronous source owners

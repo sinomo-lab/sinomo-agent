@@ -168,6 +168,7 @@ fn encode_metadata_journal_entry(entry: &DfsMetadataJournalEntry) -> Result<Arc<
     Ok(Arc::from(exact_bytes))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn encode_metadata_journal_frame_record(
     entry: &DfsMetadataJournalEntry,
 ) -> Result<crate::DfsMetadataJournalFrameRecord> {
@@ -206,13 +207,6 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn before_journal_prune_for_test(root: &Path, action: impl FnOnce() + 'static) {
-    BEFORE_JOURNAL_PRUNE_HOOK.with(|hook| {
-        *hook.borrow_mut() = Some((root.to_path_buf(), Box::new(action)));
-    });
-}
-
-#[cfg(test)]
 fn run_before_journal_prune_hook_for_test(root: &Path) {
     let action = BEFORE_JOURNAL_PRUNE_HOOK.with(|hook| {
         let mut hook = hook.borrow_mut();
@@ -233,11 +227,6 @@ pub(crate) struct JournalAppendFault {
     pub(crate) skip_appends: usize,
     pub(crate) complete_frames: usize,
     pub(crate) partial_frame_bytes: usize,
-}
-
-#[cfg(test)]
-pub(crate) fn fail_journal_append_for_test(fault: JournalAppendFault) {
-    METADATA_JOURNAL_APPEND_FAULT.set(Some(fault));
 }
 
 #[cfg(test)]
@@ -306,21 +295,6 @@ fn fail_journal_certification_for_test() -> Result<()> {
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn reset_metadata_journal_segment_scan_calls() {
-    METADATA_JOURNAL_SEGMENT_SCAN_CALLS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn metadata_journal_segment_scan_calls() -> usize {
-    METADATA_JOURNAL_SEGMENT_SCAN_CALLS.get()
-}
-
-#[cfg(test)]
-pub(crate) fn reset_metadata_journal_tail_recovery_calls() {
-    METADATA_JOURNAL_TAIL_RECOVERY_CALLS.set(0);
 }
 
 #[cfg(test)]

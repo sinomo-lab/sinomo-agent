@@ -1,7 +1,7 @@
 //! Real native inventory/cursor control. No repair row, receipt, intent or ACK
 //! is seeded. The finite current fixture earns both coprime page counts first.
 use super::*;
-use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
+use crate::test_runtime::{FaultAction, FaultRule, RpcPhase};
 use crate::*;
 use std::time::Instant;
 

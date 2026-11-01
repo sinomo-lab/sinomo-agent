@@ -27,8 +27,6 @@ static CLUSTER_DIRECTORY_PROJECTION_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 // Local route recovery changes routing without advancing KV authority. These
 // process-local cache generations fence cold captures and prepared connectors;
 // they are never exposed as KvRevision or used for membership authorization.
-static ENDPOINT_RECOVERY_CAPTURE_EPOCH: AtomicU64 = AtomicU64::new(0);
-static ENDPOINT_RECOVERY_ROUTING_CLOCK: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_DIRECTORY_PROJECTIONS: LazyLock<
     Mutex<HashMap<PathBuf, ClusterDirectoryProjectionCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -103,6 +101,7 @@ impl ClusterDirectoryKvEntries for ClusterDirectoryKvInput {
     }
 }
 impl ClusterDirectoryKvInput {
+    #[cfg(test)]
     fn from_snapshot(snapshot: &KvSnapshot) -> Result<Arc<Self>, NetworkError> {
         let prefixes = CLUSTER_DIRECTORY_PREFIXES
             .map(|prefix| (prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES));
@@ -190,12 +189,6 @@ fn read_cluster_directory_input_for_prefixes(
         return fallback();
     };
     let entries = current.value.map_err(kv_err)?;
-    // This existing identity-aware materialized read is also used by the old
-    // selector. Equal revision still chooses the actual native current cut.
-    let imported = crate::kv_local_store::read_cluster_kv_cached_snapshot_if_present(paths)?;
-    if let Some(imported) = imported.filter(|snapshot| snapshot.revision > current.revision) {
-        return ClusterDirectoryKvInput::from_snapshot_for_prefixes(&imported, prefixes).map(Some);
-    }
     Ok(Some(Arc::new(ClusterDirectoryKvInput {
         revision: current.revision,
         entries,
@@ -289,13 +282,33 @@ impl ClusterDirectoryProjection {
         (members, endpoints)
     }
 
-    fn live_connectivity_records(&self, now: OffsetDateTime) -> Vec<ClusterConnectivityRecord> {
+    /// Committed connectivity as current routing evidence.
+    ///
+    /// Quorum publication is semantic: a source commits a new, removed or
+    /// changed edge and never renews an unchanged one by time. A committed row
+    /// therefore remains its source's current statement until that source
+    /// commits a change or the directory revokes its source, target or
+    /// endpoint. The row's own lifetime restarts at this read, so routing,
+    /// which bounds uncommitted evidence by TTL, does not age it out.
+    fn routing_connectivity_records(
+        &self,
+        read_at: OffsetDateTime,
+    ) -> Vec<ClusterConnectivityRecord> {
         self.connectivity_records
             .iter()
-            .filter(|record| cluster_network_record_live(record.expires_at, now))
-            .cloned()
+            .map(|record| committed_connectivity_record_current_at(record, read_at))
             .collect()
     }
+}
+
+fn committed_connectivity_record_current_at(
+    record: &ClusterConnectivityRecord,
+    read_at: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    let mut current = record.clone();
+    let lifetime = record.expires_at - record.observed_at;
+    current.expires_at = record.expires_at.max(read_at + lifetime);
+    current
 }
 
 struct ClusterDirectoryProjectionCacheEntry {
@@ -340,28 +353,6 @@ fn cached_cluster_directory_routing_version(
 pub(crate) fn invalidate_cluster_directory_projection(paths: &ClusterPaths) {
     if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() {
         cache.remove(&paths.root);
-    }
-}
-
-pub(crate) fn invalidate_endpoint_recovery_routes(paths: &ClusterPaths) {
-    ENDPOINT_RECOVERY_CAPTURE_EPOCH.fetch_add(1, Ordering::AcqRel);
-    invalidate_cluster_directory_projection(paths);
-    sinomo_network::invalidate_cluster_route_graph_cache(paths);
-}
-
-fn recovery_routing_version(minimum: u64) -> sinomo_network::DirectoryVersion {
-    let mut current = ENDPOINT_RECOVERY_ROUTING_CLOCK.load(Ordering::Acquire);
-    loop {
-        let next = current.saturating_add(1).max(minimum);
-        match ENDPOINT_RECOVERY_ROUTING_CLOCK.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return sinomo_network::DirectoryVersion(next),
-            Err(observed) => current = observed,
-        }
     }
 }
 
@@ -441,6 +432,7 @@ fn cluster_directory_projection_mark(
     })
 }
 
+#[cfg(test)]
 fn read_cluster_directory_projection(
     paths: &ClusterPaths,
     snapshot: Arc<KvSnapshot>,
@@ -453,6 +445,7 @@ fn read_cluster_directory_projection(
     )
 }
 
+#[cfg(test)]
 fn read_cluster_directory_projection_at_module_generation(
     paths: &ClusterPaths,
     snapshot: Arc<KvSnapshot>,
@@ -470,7 +463,6 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
     snapshot: Arc<ClusterDirectoryKvInput>,
     module_routing_generation: u64,
 ) -> Result<Arc<ClusterDirectoryProjection>, NetworkError> {
-    let recovery_epoch = ENDPOINT_RECOVERY_CAPTURE_EPOCH.load(Ordering::Acquire);
     if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
         && let Some(entry) = cache.get_mut(&paths.root)
         && Arc::ptr_eq(&entry.snapshot, &snapshot)
@@ -483,7 +475,7 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
     // Unrelated KV writes reuse the payload. Renewal/latency observations must
     // replace the decoded records, while retaining the semantic route generation
     // so existing carriers are not invalidated by observation-only changes.
-    let mut mark = cluster_directory_projection_mark(snapshot.as_ref())?;
+    let mark = cluster_directory_projection_mark(snapshot.as_ref())?;
     if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock()
         && let Some(entry) = cache.get_mut(&paths.root)
         && entry.mark == mark
@@ -494,48 +486,16 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
         return Ok(Arc::clone(&entry.projection));
     }
 
-    let mut members = read_cluster_members_from_directory_entries(snapshot.as_ref())?;
-    let local_recovery_root = paths.root.join("endpoint-recovery").is_dir();
-    let hints = if local_recovery_root {
-        match crate::local_state_store::read_cluster_state_without_kv_cached_shared(paths) {
-            Ok(stored) => crate::endpoint_recovery::preserve_verified_recovery_routes(
-                paths,
-                &stored,
-                &mut members,
-                snapshot.revision,
-            )?,
-            Err(NetworkError::ClusterOrphan) => Vec::new(),
-            Err(error) => return Err(error),
-        }
-    } else {
-        Vec::new()
-    };
-    if !hints.is_empty() {
-        let encoded = sinomo_kv::encode_kv_value(&hints).map_err(kv_err)?;
-        let mix = |original: blake3::Hash| {
-            let mut hash = blake3::Hasher::new();
-            hash.update(original.as_bytes());
-            hash.update(&encoded);
-            hash.finalize()
-        };
-        mark.payload = mix(mark.payload);
-        mark.routing = mix(mark.routing);
-    }
+    let members = read_cluster_members_from_directory_entries(snapshot.as_ref())?;
     let (endpoint_map, endpoint_freshness) =
         read_cluster_endpoints_with_freshness_from_directory_entries(snapshot.as_ref())?;
-    let mut endpoints: Vec<_> = endpoint_map.into_values().flatten().collect();
-    endpoints.extend(hints);
+    let endpoints: Vec<_> = endpoint_map.into_values().flatten().collect();
     let connectivity_records =
-        // Keep the decoded records, not their time-dependent live view. Route
-        // capture filters lease expiry on every call below.
+        // Keep the decoded committed records. Route capture states them as
+        // current evidence at each read below.
         read_all_cluster_connectivity_records_from_directory_entries(snapshot.as_ref())?;
 
     let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() else {
-        if local_recovery_root {
-            return Err(NetworkError::directory(
-                "endpoint recovery routing cache is unavailable",
-            ));
-        }
         return Ok(Arc::new(ClusterDirectoryProjection {
             routing_version: sinomo_network::DirectoryVersion(snapshot.revision.0),
             members,
@@ -544,13 +504,6 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
             connectivity_records,
         }));
     };
-    if recovery_epoch != ENDPOINT_RECOVERY_CAPTURE_EPOCH.load(Ordering::Acquire)
-        && (local_recovery_root || paths.root.join("endpoint-recovery").is_dir())
-    {
-        return Err(NetworkError::directory(
-            "local endpoint recovery changed during routing capture",
-        ));
-    }
     // Another reader may have populated this exact generation while the
     // projection was decoded outside the cache lock. Reuse its allocation.
     if let Some(entry) = cache.get_mut(&paths.root)
@@ -561,7 +514,7 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
         entry.last_used = cluster_directory_projection_cache_tick();
         return Ok(Arc::clone(&entry.projection));
     }
-    let mut routing_version = cache
+    let routing_version = cache
         .get(&paths.root)
         .map(|entry| {
             if entry.mark.routing == mark.routing
@@ -579,9 +532,6 @@ fn read_cluster_directory_projection_from_input_at_module_generation(
             )
         })
         .unwrap_or(sinomo_network::DirectoryVersion(snapshot.revision.0));
-    if local_recovery_root {
-        routing_version = recovery_routing_version(routing_version.0.saturating_add(1));
-    }
     let projection = Arc::new(ClusterDirectoryProjection {
         routing_version,
         members,
@@ -625,7 +575,7 @@ pub fn read_cluster_members_from_kv(
 /// bounds and unrelated transaction history cannot change this input.
 pub(crate) fn read_cluster_members_for_state(
     paths: &ClusterPaths,
-) -> Result<(Vec<ClusterMemberRecord>, sinomo_kv::KvRevision), NetworkError> {
+) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
     // The old member decoder bounds endpoints per member, not globally.
     // Keep that existing bound in the decoder after selecting this prefix.
     let prefixes = [
@@ -634,9 +584,9 @@ pub(crate) fn read_cluster_members_for_state(
         (CLUSTER_MEMBER_PREFIXES[2], CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES),
     ];
     let Some(input) = read_cluster_directory_input_for_prefixes(paths, &prefixes)? else {
-        return Ok((Vec::new(), sinomo_kv::KvRevision::ZERO));
+        return Ok(Vec::new());
     };
-    Ok((read_cluster_members_from_directory_entries(input.as_ref())?, input.revision))
+    read_cluster_members_from_directory_entries(input.as_ref())
 }
 
 pub fn read_cluster_members_from_snapshot(
@@ -711,13 +661,6 @@ fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
     // join; preferring any readable local snapshot hid the newly admitted
     // member while reporting the newer directory generation.
     read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)
-}
-
-fn read_cluster_member_endpoints_from_snapshot(
-    snapshot: &KvSnapshot,
-    node_id: &NodeId,
-) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    read_cluster_member_endpoints_from_directory_entries(snapshot, node_id)
 }
 
 fn read_cluster_member_endpoints_from_directory_entries(
@@ -963,26 +906,6 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
         read_cluster_connectivity_graph_from_kv(&self.paths)
     }
 
-    fn connectivity_freshness_baseline(
-        &self,
-    ) -> Result<sinomo_network::DirectoryConnectivityBaseline, NetworkError> {
-        let Some(snapshot) = read_cluster_directory_input(&self.paths)? else {
-            return Ok(sinomo_network::DirectoryConnectivityBaseline {
-                version: sinomo_network::DirectoryVersion(0),
-                records: Vec::new(),
-            });
-        };
-        let projection = read_cluster_directory_projection_from_input_at_module_generation(
-            &self.paths,
-            snapshot,
-            sinomo_network::network_module_routing_generation(),
-        )?;
-        Ok(sinomo_network::DirectoryConnectivityBaseline {
-            version: projection.routing_version,
-            records: projection.connectivity_records.clone(),
-        })
-    }
-
     fn version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
         // Same source as the read methods above (max of the local raft view
         // and the imported snapshot cache): a version computed from a
@@ -1038,7 +961,7 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
             projection.routing_version,
             members,
             endpoints,
-            projection.live_connectivity_records(OffsetDateTime::now_utc()),
+            projection.routing_connectivity_records(OffsetDateTime::now_utc()),
         ))
     }
 
@@ -1792,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_directory_projection_rechecks_connectivity_expiry() {
+    fn committed_connectivity_remains_current_for_routing_after_its_ttl() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
             ClusterId::from_legacy_named("cluster_kv_read_model_expiry").expect("cluster");
@@ -1823,13 +1746,24 @@ mod tests {
             connectivity_records: vec![record.clone()],
         };
 
-        assert_eq!(projection.live_connectivity_records(now), vec![record]);
-        assert!(
-            projection
-                .live_connectivity_records(now + time::Duration::seconds(2))
-                .is_empty(),
-            "a cache hit must not extend a connectivity lease"
+        assert_eq!(
+            projection.routing_connectivity_records(now),
+            vec![record.clone()],
+            "a row inside its own lifetime is projected unchanged"
         );
+        // Publication is semantic, so an unchanged committed row is never
+        // renewed in KV. Routing keeps it until its source commits a change.
+        let later = now + time::Duration::hours(1);
+        let mut current = record;
+        current.expires_at = later + time::Duration::seconds(1);
+        assert_eq!(
+            projection.routing_connectivity_records(later),
+            vec![current.clone()]
+        );
+        assert!(sinomo_network::cluster_network_record_live(
+            current.expires_at,
+            later
+        ));
     }
 
     #[test]
@@ -1884,7 +1818,10 @@ mod tests {
             .unwrap();
         store.put_serde(&key, &record, None).unwrap();
         let first = read(store.try_snapshot().unwrap());
-        assert_eq!(first.live_connectivity_records(now), vec![record.clone()]);
+        assert_eq!(
+            first.routing_connectivity_records(now),
+            vec![record.clone()]
+        );
 
         record.observed_at = now + time::Duration::seconds(2);
         record.expires_at = now + time::Duration::seconds(60);
@@ -1896,15 +1833,14 @@ mod tests {
             "a real renewal must not invalidate established routing topology"
         );
         assert_eq!(
-            renewed.live_connectivity_records(now + time::Duration::seconds(2)),
+            renewed.routing_connectivity_records(now + time::Duration::seconds(2)),
             vec![record.clone()],
             "the cache must expose the actual newer observation rather than its expired predecessor"
         );
-        assert!(
-            renewed
-                .live_connectivity_records(now + time::Duration::seconds(61))
-                .is_empty(),
-            "the replacement observation still expires normally"
+        assert_eq!(
+            renewed.routing_connectivity_records(now + time::Duration::seconds(61))[0].observed_at,
+            record.observed_at,
+            "the committed replacement stays current without a time-only renewal"
         );
 
         record.state = ClusterConnectivityState::Unreachable;
@@ -1922,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_read_model_prefers_newer_imported_membership_over_stale_local_raft_view() {
+    fn kv_read_model_reads_resident_raft_even_when_the_materialized_file_is_newer() {
         let root = sinomo_testdir::TestDir::new("kv-read-model-latest-observed-membership");
         let data_dir = sinomo_local::SinomoDataDir::new(root.path());
         let paths = ClusterPaths::new(&data_dir);
@@ -1973,10 +1909,12 @@ mod tests {
             local_current.get(&cluster_member_key(&joined)).is_none(),
             "the regression requires local Raft materialization to trail the imported acceptance"
         );
+        // The resident applied Raft state is canonical; this node learns the
+        // accepted member through Raft catch-up, not a file written ahead of it.
         let members = read_cluster_members_from_kv(&paths).expect("latest observed members");
         assert!(
-            members.iter().any(|member| member.node_id == joined),
-            "the directory read model must expose the newer accepted member"
+            !members.iter().any(|member| member.node_id == joined),
+            "the directory read model must not adopt a materialized file ahead of Raft"
         );
         let records = KvClusterDirectory::new(paths.clone())
             .records_snapshot()
@@ -1984,22 +1922,18 @@ mod tests {
         let (version, members, _) = records.into_parts();
         assert_eq!(
             version,
-            sinomo_network::DirectoryVersion(accepted.revision.0)
+            sinomo_network::DirectoryVersion(local_current.revision.0)
         );
         assert!(
-            members.iter().any(|member| member.node_id == joined),
-            "the transactional routing snapshot must use that same accepted revision"
+            !members.iter().any(|member| member.node_id == joined),
+            "the transactional routing snapshot must use the resident revision"
         );
     }
 }
 
 #[cfg(test)]
-#[path = "kv_read_model/live_freshness_tests.rs"]
-mod live_freshness_tests;
-
-#[cfg(test)]
-#[path = "kv_read_model/multihop_freshness_tests.rs"]
-mod multihop_freshness_tests;
+#[path = "kv_read_model/committed_route_tests.rs"]
+mod committed_route_tests;
 
 #[cfg(test)]
 #[path = "kv_read_model/directory_input_native_tests.rs"]

@@ -23,10 +23,10 @@ use sinomo_cluster::{
     ClusterRaftQuorumTransportHost, ClusterRaftVoteTransportHost, append_cluster_raft_command,
     append_cluster_raft_command_uncommitted, append_cluster_raft_command_with_response,
     apply_cluster_raft_append, apply_cluster_raft_role, apply_local_daemon_membership_observation,
-    cache_cluster_kv_snapshot_if_newer_than_raft, cached_cluster_kv_reader_node_id_for_test,
-    cluster_connectivity_full_sync_batch_ops, cluster_connectivity_sync_is_noop,
-    cluster_invitation_publish_txn_from_kv, cluster_kv_cached_snapshot_reads_for_test,
-    cluster_kv_metadata_cache_capacity_for_test, cluster_kv_reader_node_id_cache_contains_for_test,
+    cached_cluster_kv_reader_node_id_for_test, cluster_connectivity_full_sync_batch_ops,
+    cluster_connectivity_sync_is_noop, cluster_invitation_publish_txn_from_kv,
+    cluster_kv_cached_snapshot_reads_for_test, cluster_kv_metadata_cache_capacity_for_test,
+    cluster_kv_reader_node_id_cache_contains_for_test,
     cluster_member_publish_authorized_for_signer, cluster_member_publish_matches_kv,
     cluster_member_publish_txn, cluster_member_publish_txn_from_snapshot,
     cluster_member_put_command, cluster_network_info_key,
@@ -34,8 +34,7 @@ use sinomo_cluster::{
     cluster_raft_wal_paths, cluster_semantic_txn_no_effect_response,
     commit_cluster_raft_command_with_local_storage_and_transport,
     commit_cluster_raft_command_with_quorum_driver, elect_cluster_raft_leader_with_host,
-    ensure_main_daemon_cluster_member, expire_cluster_network_record_ops,
-    expire_cluster_network_records,
+    ensure_main_daemon_cluster_member,
     forward_cluster_join_challenge_rpc_to_state_authority_with_host,
     forward_cluster_kv_txn_to_state_authority_with_host,
     forward_cluster_membership_rpc_to_state_authority_with_host,
@@ -54,9 +53,9 @@ use sinomo_cluster::{
     replicate_cluster_raft_to_endpoint_async_with_host,
     replicate_cluster_raft_to_endpoint_with_host,
     replicate_cluster_raft_to_endpoint_with_local_host,
-    reset_cluster_kv_cached_snapshot_reads_for_test, sync_cluster_certificate_to_kv,
-    sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv,
-    sync_cluster_state_to_local_raft_unchecked,
+    reset_cluster_kv_cached_snapshot_reads_for_test, resolve_cluster_service_providers,
+    sync_cluster_certificate_to_kv, sync_cluster_network_info_to_kv,
+    sync_cluster_node_status_to_kv, sync_cluster_state_to_local_raft_unchecked,
 };
 use sinomo_cluster::{
     ClusterRaftAppendReplicationOptions, ClusterRaftCommittedFanoutOptions,
@@ -7089,6 +7088,56 @@ fn cluster_kv_watch_event_fanout_batches_split_on_payload_size() {
 }
 
 #[tokio::test]
+async fn committed_fanout_reports_unreached_targets_as_lagging() {
+    let root = sinomo_testdir::TestDir::new("sinomo-committed-raft-fanout-lagging");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, _local, peer) = cluster_raft_handler_test_state(
+        "cluster_committed_raft_fanout_lagging",
+        "node_committed_raft_fanout_lagging_local",
+        "node_committed_raft_fanout_lagging_peer",
+    );
+    let unreachable =
+        NodeId::from_legacy_named("node_committed_raft_fanout_lagging_unreachable").expect("node");
+    let mut member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == peer)
+        .expect("peer member")
+        .clone();
+    member.node_id = unreachable.clone();
+    member.node_public_key = "pk-committed-raft-fanout-lagging-unreachable".to_string();
+    state.members.push(member);
+    write_cluster_state(&paths, &state).expect("write cluster state");
+    let mut host = RecordingCommittedFanoutHost {
+        unreachable: BTreeSet::from([unreachable.clone()]),
+        ..RecordingCommittedFanoutHost::default()
+    };
+
+    let report = sinomo_cluster::fan_out_committed_cluster_raft_command_async_with_host(
+        &tokio::runtime::Handle::current(),
+        &paths,
+        &state,
+        &[],
+        ClusterRaftCommittedFanoutOptions {
+            raft_append_timeout: Duration::from_millis(21),
+            watch_event_timeout: Duration::from_millis(31),
+        },
+        &mut host,
+    )
+    .await
+    .expect("fanout wave");
+
+    assert_eq!(report.replicated_nodes, vec![peer]);
+    assert_eq!(
+        report.lagging_nodes,
+        vec![unreachable],
+        "an unreached target is known-behind for its restored route or contact"
+    );
+}
+
+#[tokio::test]
 async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_events() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-async-committed-raft-fanout");
     let data_dir = SinomoDataDir::new(&root);
@@ -7500,6 +7549,50 @@ fn cluster_member_removal_txns_bound_large_endpoint_prefix_cleanup() {
             .expect("range prefix")
             .is_empty(),
         "endpoint records should be removed"
+    );
+}
+
+#[test]
+fn cluster_member_removal_retires_only_the_member_service_records() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_removal_services").expect("cluster");
+    let removed = NodeId::from_legacy_named("node_member_removal_services_gone").expect("node");
+    let retained = NodeId::from_legacy_named("node_member_removal_services_kept").expect("node");
+    let member =
+        ClusterMemberRecord::local_voter(cluster_id, removed.clone(), "removed", "pk-removed", now);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(cluster_member_key(&removed), &member, None)
+        .expect("member");
+    let removed_keys = ["dfs", "daemon"]
+        .map(|service| sinomo_service::cluster_service_instance_key(service, &removed));
+    let retained_key = sinomo_service::cluster_service_instance_key("dfs", &retained);
+    for (key, node) in removed_keys
+        .iter()
+        .map(|key| (key, &removed))
+        .chain([(&retained_key, &retained)])
+    {
+        let record = sinomo_service::ServiceInstanceRecord::new("dfs", node.clone());
+        store
+            .put_serde(key.clone(), &record, None)
+            .expect("service record");
+    }
+
+    for txn in
+        cluster_member_removal_txns_from_store(&store, std::slice::from_ref(&member)).expect("txns")
+    {
+        store
+            .apply_command(KvCommand::Txn(txn))
+            .expect("apply removal txn");
+    }
+
+    for key in &removed_keys {
+        assert!(store.get(key).is_none(), "{key} should be removed");
+    }
+    assert!(
+        store.get(&retained_key).is_some(),
+        "another member's service record must remain"
     );
 }
 
@@ -9130,6 +9223,7 @@ struct RecordingCommittedFanoutHost {
     appended_event_counts: Vec<usize>,
     append_timeouts: Vec<Duration>,
     watch_batches: Vec<RecordedWatchBatch>,
+    unreachable: BTreeSet<NodeId>,
 }
 
 struct RecordedWatchBatch {
@@ -9151,8 +9245,12 @@ impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
         self.appended_nodes.push(target_node_id.clone());
         self.appended_event_counts.push(watch_events.len());
         self.append_timeouts.push(timeout);
+        let unreachable = self.unreachable.contains(target_node_id);
         let state = state.clone();
         Box::pin(async move {
+            if unreachable {
+                return Err(NetworkError::directory("no route to fanout target"));
+            }
             Ok(ClusterKvRaftAppendReplicationOutcome {
                 response: ClusterRaftAppendResponse {
                     accepted: true,
@@ -9453,7 +9551,6 @@ struct RecordingKvSnapshotRefreshHost {
     known_authority: Option<NodeId>,
     snapshots: BTreeMap<NodeId, KvSnapshot>,
     fetches: Vec<(NodeId, Duration)>,
-    cache_change: Option<(NodeId, KvRevision)>,
 }
 
 impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
@@ -9463,16 +9560,6 @@ impl ClusterKvSnapshotRefreshHost for RecordingKvSnapshotRefreshHost {
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         Ok(self.known_authority.clone())
-    }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        _paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError> {
-        self.cache_change = Some((local_node_id.clone(), snapshot.revision));
-        Ok(true)
     }
 
     fn call_node_object_rpc(
@@ -10506,7 +10593,7 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
-    let (mut state, local_node_id, first_peer_id) = cluster_raft_handler_test_state(
+    let (mut state, _local_node_id, first_peer_id) = cluster_raft_handler_test_state(
         "cluster_kv_snapshot_refresh_driver",
         "node_kv_refresh_local",
         "node_kv_refresh_first_peer",
@@ -10563,7 +10650,6 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
             (authority_id.clone(), authority_snapshot.clone()),
         ]),
         fetches: Vec::new(),
-        cache_change: None,
     };
 
     let refreshed = refresh_current_cluster_kv_store_with_host(
@@ -10579,20 +10665,16 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_state_authority_and_imports_
         Some(&authority_id),
         "snapshot refresh should try the known state authority before other state authorities"
     );
-    assert_eq!(
-        host.cache_change,
-        Some((local_node_id, authority_snapshot.revision)),
-        "snapshot refresh should ask the host to cache the newest imported read model"
-    );
     assert!(
         refreshed.get("/refresh/authority/two").is_some(),
         "the returned store should be restored from the newest fetched snapshot"
     );
-    assert_eq!(
+    assert_ne!(
         read_cluster_kv_snapshot(&paths)
-            .expect("materialized imported snapshot")
+            .expect("local snapshot")
             .revision,
-        authority_snapshot.revision
+        authority_snapshot.revision,
+        "refresh is an authoritative read; the local view converges through Raft"
     );
 }
 
@@ -10658,11 +10740,12 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
         refreshed.get("/refresh/local-driver").is_some(),
         "the local driver should return the newest fetched snapshot"
     );
-    assert_eq!(
+    assert_ne!(
         read_cluster_kv_snapshot(&paths)
-            .expect("materialized imported snapshot")
+            .expect("local snapshot")
             .revision,
-        remote_snapshot.revision
+        remote_snapshot.revision,
+        "refresh is an authoritative read; the local view converges through Raft"
     );
 }
 
@@ -13744,79 +13827,6 @@ fn cluster_member_read_view_prefers_local_raft_over_stale_materialized_snapshot(
 }
 
 #[test]
-fn telemetry_kv_read_views_prefer_newer_materialized_snapshot() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-telemetry-newer-cache");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_telemetry_newer_cache").expect("cluster");
-    let local_node = NodeId::from_legacy_named("node_telemetry_newer_cache_local").expect("local");
-    let remote_node =
-        NodeId::from_legacy_named("node_telemetry_newer_cache_remote").expect("remote");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "telemetry newer cache",
-        local_node.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-    let current = append_cluster_raft_command(
-        &paths,
-        &local_node,
-        KvCommand::Op(KvOp::Put {
-            key: "/local-only".to_string(),
-            value: b"raft".to_vec(),
-            lease_id: None,
-        }),
-    )
-    .expect("seed stale local raft");
-
-    let endpoint = daemon_lan_endpoint(&remote_node, "10.42.0.2:21353".to_string(), 10);
-    let connectivity = cluster_connectivity_record(
-        &state,
-        &endpoint,
-        ClusterConnectivityState::Healthy,
-        Some(4),
-        0,
-        Some("ok".to_string()),
-        None,
-        now,
-        60,
-    );
-    let mut imported = InProcessKvStore::new();
-    imported
-        .put("/cache-revision-bump", b"cache".to_vec(), None)
-        .expect("bump cache revision");
-    imported
-        .put_serde(
-            cluster_connectivity_key(
-                &connectivity.source_node_id,
-                &connectivity.target_node_id,
-                &connectivity.endpoint_id,
-            ),
-            &connectivity,
-            None,
-        )
-        .expect("cache connectivity");
-    let imported_snapshot = imported.snapshot().expect("snapshot");
-    assert!(
-        imported_snapshot.revision > current.revision,
-        "test requires a materialized snapshot newer than local raft"
-    );
-    write_cluster_kv_snapshot(&paths, &imported_snapshot).expect("write imported snapshot");
-
-    let graph = read_cluster_connectivity_graph_from_kv(&paths).expect("read connectivity graph");
-    assert!(
-        graph.iter().any(|record| record == &connectivity),
-        "telemetry read views should use a fresher imported snapshot when local raft lags"
-    );
-}
-
-#[test]
 fn telemetry_kv_read_views_keep_current_raft_over_stale_materialized_snapshot() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-kv-telemetry-stale-cache");
     let data_dir = SinomoDataDir::new(&root);
@@ -14127,121 +14137,6 @@ fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structura
 }
 
 #[test]
-fn imported_connectivity_route_change_and_renewal_materialize_snapshot() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-imported-connectivity-route");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_imported_connectivity_route").expect("cluster");
-    let local_node =
-        NodeId::from_legacy_named("node_imported_connectivity_route_local").expect("local");
-    let remote_node =
-        NodeId::from_legacy_named("node_imported_connectivity_route_remote").expect("remote");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "imported connectivity route",
-        local_node.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
-    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-    let endpoint = daemon_lan_endpoint(&remote_node, "10.45.0.20:21353".to_string(), 20);
-    let mut remote_member = ClusterMemberRecord::local_voter(
-        cluster_id,
-        remote_node.clone(),
-        "remote",
-        "pk-remote",
-        now,
-    );
-    remote_member.capabilities = main_daemon_capabilities(&remote_member.role);
-    remote_member.allowed_capabilities = remote_member.capabilities.clone();
-    remote_member.endpoints = vec![endpoint.clone()];
-    state.members.push(remote_member);
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync structural state");
-    let materialized_baseline = read_cluster_kv_snapshot(&paths).expect("baseline materialized");
-
-    let connectivity = cluster_connectivity_record(
-        &state,
-        &endpoint,
-        ClusterConnectivityState::Healthy,
-        Some(7),
-        0,
-        Some("ok".to_string()),
-        None,
-        now,
-        600,
-    );
-    let connectivity_key = cluster_connectivity_key(
-        &connectivity.source_node_id,
-        &connectivity.target_node_id,
-        &connectivity.endpoint_id,
-    );
-    let mut imported_store =
-        InProcessKvStore::restore(materialized_baseline.clone()).expect("restore");
-    imported_store
-        .put_serde(connectivity_key.clone(), &connectivity, None)
-        .expect("imported connectivity");
-    let connectivity_snapshot = imported_store.snapshot().expect("snapshot");
-
-    assert!(
-        write_imported_cluster_kv_snapshot_if_changed(&paths, &connectivity_snapshot)
-            .expect("import connectivity snapshot"),
-        "new route-relevant connectivity imports must materialize immediately"
-    );
-    assert_eq!(
-        read_cluster_kv_snapshot(&paths)
-            .expect("materialized after connectivity import")
-            .revision,
-        connectivity_snapshot.revision
-    );
-    assert!(
-        read_cluster_connectivity_graph_from_kv(&paths)
-            .expect("read connectivity graph")
-            .iter()
-            .any(|record| record == &connectivity),
-        "route read models must see imported connectivity without waiting for a structural import"
-    );
-
-    let mut stable_refresh_store =
-        InProcessKvStore::restore(connectivity_snapshot).expect("restore connectivity");
-    let mut refreshed_connectivity = connectivity;
-    refreshed_connectivity.latency_ms = Some(2);
-    refreshed_connectivity.last_success_at = Some("later".to_string());
-    refreshed_connectivity.observed_at = now + time::Duration::seconds(5);
-    refreshed_connectivity.expires_at = now + time::Duration::seconds(605);
-    stable_refresh_store
-        .put_serde(connectivity_key.clone(), &refreshed_connectivity, None)
-        .expect("refreshed connectivity");
-    let stable_refresh_snapshot = stable_refresh_store.snapshot().expect("snapshot");
-
-    assert!(
-        write_imported_cluster_kv_snapshot_if_changed(&paths, &stable_refresh_snapshot)
-            .expect("import stable connectivity refresh"),
-        "committed renewals must reach independent readers even without a route change"
-    );
-    assert_eq!(
-        read_cluster_kv_snapshot(&paths)
-            .expect("materialized after stable connectivity refresh")
-            .revision,
-        stable_refresh_snapshot.revision
-    );
-    assert_eq!(
-        read_cluster_kv_snapshot(&paths)
-            .expect("renewed materialized connectivity")
-            .get(&connectivity_key)
-            .expect("renewed connectivity record")
-            .decode::<ClusterConnectivityRecord>()
-            .expect("decode renewed connectivity"),
-        refreshed_connectivity
-    );
-}
-
-#[test]
 fn refresh_cluster_connectivity_environment_clears_stale_local_probe_state() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-environment-clear");
     let data_dir = SinomoDataDir::new(&root);
@@ -14378,133 +14273,6 @@ fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
     assert_eq!(
         read_cluster_invitation_from_kv(&paths, &invite.invite_id).expect("read invitation"),
         invite
-    );
-}
-
-#[test]
-fn join_introducer_reads_newer_invite_cache_only_for_non_voter_bridge() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-join-bridge-invite-cache");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_join_bridge_invite_cache").expect("cluster");
-    let issuer_node_id =
-        NodeId::from_legacy_named("node_join_bridge_invite_cache_issuer").expect("issuer");
-    let bridge_node_id =
-        NodeId::from_legacy_named("node_join_bridge_invite_cache_bridge").expect("bridge");
-    let joined_node_id =
-        NodeId::from_legacy_named("node_join_bridge_invite_cache_joined").expect("joined");
-    let issuer_identity =
-        sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "join bridge invite cache",
-        issuer_node_id.clone(),
-        "issuer",
-        issuer_identity.public_key.clone(),
-        now,
-    );
-    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
-    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-    state.members[0].endpoints = vec![daemon_lan_endpoint(
-        &issuer_node_id,
-        "authority:21353".to_string(),
-        0,
-    )];
-    let mut bridge = ClusterMemberRecord::pending_learner(
-        cluster_id.clone(),
-        bridge_node_id.clone(),
-        "bridge",
-        "pk-bridge",
-        now,
-    );
-    bridge.state = ClusterMemberState::Learner;
-    bridge.capabilities = sinomo_node::main_daemon_capabilities(&bridge.role);
-    bridge.allowed_capabilities = bridge.capabilities.clone();
-    state.members.push(bridge);
-
-    let mut invite = ClusterJoinInvite {
-        invite_id: ClusterInviteId::from_legacy_named("invite_join_bridge_cache").expect("invite"),
-        cluster_id: cluster_id.clone(),
-        cluster_name: Some("join bridge invite cache".to_string()),
-        cluster_public_key: issuer_identity.public_key.clone(),
-        invitation_secret: "secret-join-bridge-cache".to_string(),
-        communication_channels: Vec::new(),
-        introducers: Vec::new(),
-        token_id: "token-join-bridge-cache".to_string(),
-        expires_at: now + time::Duration::hours(1),
-        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
-        allowed_member_roles: vec![ClusterMemberRole::Learner],
-        issuer_node_id: issuer_node_id.clone(),
-        issuer_public_key: issuer_identity.public_key.clone(),
-        signature: String::new(),
-    };
-    invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
-
-    state.local_node_id = bridge_node_id;
-    state.local_node_display_name = "bridge".to_string();
-    write_cluster_state(&paths, &state).expect("write bridge state");
-
-    let current_snapshot = append_cluster_raft_command(
-        &paths,
-        &state.local_node_id,
-        KvCommand::Op(KvOp::Put {
-            key: "/test/join-bridge-applied-baseline".to_string(),
-            value: b"baseline".to_vec(),
-            lease_id: None,
-        }),
-    )
-    .expect("seed applied learner view");
-    let mut cached_store =
-        InProcessKvStore::restore(current_snapshot).expect("restore applied learner view");
-    cached_store
-        .put_serde(
-            sinomo_node::cluster_invitation_key(&invite.invite_id),
-            &invite,
-            None,
-        )
-        .expect("cache invitation");
-    write_cluster_kv_snapshot(&paths, &cached_store.snapshot().expect("cached snapshot"))
-        .expect("write newer read cache");
-
-    assert!(
-        read_cluster_invitation_from_kv(&paths, &invite.invite_id).is_err(),
-        "the applied learner Raft view intentionally remains behind the imported cache"
-    );
-    assert_eq!(
-        read_cluster_invitation_for_join_introducer(&paths, &state, &invite.invite_id)
-            .expect("bridge invite read"),
-        invite
-    );
-
-    let registration_request = ClusterJoinRegistrationRequest {
-        invite: invite.clone(),
-        invitation_secret: invite.invitation_secret.clone(),
-        members: vec![ClusterMemberRecord::pending_learner(
-            cluster_id,
-            joined_node_id,
-            "joined",
-            "pk-joined",
-            now,
-        )],
-    };
-    let accepted = prepare_cluster_join_registration_response(
-        &paths,
-        state.clone(),
-        registration_request.clone(),
-        now,
-    )
-    .expect("bridge join preflight");
-    assert!(accepted.accepted);
-
-    let mut authority_view = state.clone();
-    authority_view.local_node_id = issuer_node_id.clone();
-    assert!(
-        read_cluster_invitation_for_join_introducer(&paths, &authority_view, &invite.invite_id,)
-            .is_err(),
-        "a voter must not authorize from a materialized snapshot ahead of applied Raft"
     );
 }
 
@@ -15510,6 +15278,111 @@ fn cluster_join_registration_hydrates_compact_uri_from_authoritative_invite() {
             .expect("accepted compact join snapshot")
             .get(&cluster_member_key(&fixture.joined_node_id))
             .is_some()
+    );
+}
+
+fn join_authority_fixture_observation(
+    fixture: &JoinAuthorityFixture,
+    main_endpoint: &ClusterEndpointRecord,
+) -> ClusterLocalDaemonMembershipObservation {
+    ClusterLocalDaemonMembershipObservation {
+        main_endpoints: vec![main_endpoint.clone()],
+        shadow_endpoints: Vec::new(),
+        main_public_key: fixture.state.members[0].node_public_key.clone(),
+        shadow_public_key: "observed-shadow-public-key".to_string(),
+        timestamp: fixture.now,
+    }
+}
+
+#[test]
+fn cluster_join_registration_commits_acceptor_listener_endpoints() {
+    // The fixture's committed issuer record has no endpoints, as in a
+    // single-node cluster that has never published its listeners.
+    let fixture = join_authority_fixture("join_acceptor_endpoints");
+    let issuer_node_id = fixture.state.local_node_id.clone();
+    let listener = daemon_lan_endpoint(&issuer_node_id, "10.42.1.10:21353".to_string(), 10);
+    let before = read_cluster_kv_current_snapshot(&fixture.paths).expect("pre-join snapshot");
+    assert!(
+        read_cluster_members_from_snapshot(&before)
+            .expect("pre-join members")
+            .iter()
+            .find(|member| member.node_id == issuer_node_id)
+            .is_some_and(|member| member.endpoints.is_empty())
+    );
+
+    let mut host = RecordingJoinRegistrationHost {
+        observation: Some(join_authority_fixture_observation(&fixture, &listener)),
+        ..Default::default()
+    };
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle join registration");
+
+    assert!(response.accepted, "{}", response.detail);
+    let snapshot = response.kv_snapshot.expect("accepted join snapshot");
+    let committed_issuer = read_cluster_members_from_snapshot(&snapshot)
+        .expect("committed members")
+        .into_iter()
+        .find(|member| member.node_id == issuer_node_id)
+        .expect("committed issuer");
+    assert!(
+        committed_issuer.endpoints.contains(&listener),
+        "the joiner's snapshot must route to its acceptor: {:?}",
+        committed_issuer.endpoints
+    );
+    assert!(
+        snapshot
+            .get(&cluster_endpoint_key(&issuer_node_id, &listener))
+            .is_some()
+    );
+}
+
+#[test]
+fn cluster_join_registration_leaves_current_acceptor_endpoints_unwritten() {
+    let fixture = join_authority_fixture("join_acceptor_endpoints_current");
+    let issuer_node_id = fixture.state.local_node_id.clone();
+    let listener = daemon_lan_endpoint(&issuer_node_id, "10.42.2.10:21353".to_string(), 10);
+    let mut published = fixture.state.clone();
+    published.members[0].endpoints = vec![listener.clone()];
+    sync_cluster_state_to_local_raft_unchecked(&fixture.paths, &published)
+        .expect("publish current listener");
+    let before = read_cluster_kv_current_snapshot(&fixture.paths).expect("pre-join snapshot");
+    let member_key = cluster_member_key(&issuer_node_id);
+    let endpoint_key = cluster_endpoint_key(&issuer_node_id, &listener);
+    let member_revision = before.get(&member_key).expect("issuer").modify_revision;
+    let endpoint_revision = before
+        .get(&endpoint_key)
+        .expect("issuer endpoint")
+        .modify_revision;
+
+    let mut host = RecordingJoinRegistrationHost {
+        observation: Some(join_authority_fixture_observation(&fixture, &listener)),
+        ..Default::default()
+    };
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle join registration");
+
+    assert!(response.accepted, "{}", response.detail);
+    let snapshot = response.kv_snapshot.expect("accepted join snapshot");
+    assert_eq!(
+        snapshot.get(&member_key).expect("issuer").modify_revision,
+        member_revision
+    );
+    assert_eq!(
+        snapshot
+            .get(&endpoint_key)
+            .expect("issuer endpoint")
+            .modify_revision,
+        endpoint_revision
     );
 }
 
@@ -18306,49 +18179,6 @@ fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
 }
 
 #[test]
-fn stale_cluster_kv_cache_refreshes_materialized_cache_from_raft() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-stale-cache-refresh");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let node_id = NodeId::from_legacy_named("node_stale_cache_refresh").expect("node");
-
-    append_cluster_raft_command(
-        &paths,
-        &node_id,
-        KvCommand::Op(KvOp::Put {
-            key: "/current".to_string(),
-            value: b"current".to_vec(),
-            lease_id: None,
-        }),
-    )
-    .expect("seed raft");
-    let current = read_cluster_kv_snapshot(&paths).expect("current snapshot");
-
-    let stale = InProcessKvStore::new().snapshot().expect("snapshot");
-    write_cluster_kv_snapshot(&paths, &stale).expect("write stale cache");
-    assert_eq!(
-        read_cluster_kv_snapshot(&paths)
-            .expect("stale cache")
-            .revision,
-        stale.revision
-    );
-
-    assert!(
-        cache_cluster_kv_snapshot_if_newer_than_raft(&paths, &node_id, stale)
-            .expect("reconcile stale materialized cache")
-    );
-    let refreshed = read_cluster_kv_snapshot(&paths).expect("refreshed cache");
-    assert_eq!(refreshed.revision, current.revision);
-    assert!(
-        InProcessKvStore::restore(refreshed)
-            .expect("restore")
-            .get("/current")
-            .is_some()
-    );
-}
-
-#[test]
 fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-compacted");
     let data_dir = SinomoDataDir::new(&root);
@@ -21040,7 +20870,10 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
 
     assert!(response.accepted);
     assert_eq!(response.detail, "member endpoints published");
-    assert!(response.kv_snapshot.is_some());
+    assert!(
+        response.kv_snapshot.is_none(),
+        "the publisher converges through Raft; no snapshot is handed back"
+    );
     assert_eq!(host.commits, 1);
     let txn = host.last_txn.expect("committed txn");
     assert!(
@@ -21080,7 +20913,7 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
         .expect("async member publish response");
     assert!(async_response.accepted);
     assert_eq!(async_response.detail, "member endpoints published");
-    assert!(async_response.kv_snapshot.is_some());
+    assert!(async_response.kv_snapshot.is_none());
     assert_eq!(async_host.commits, 1);
     assert!(
         async_host
@@ -21262,7 +21095,6 @@ fn local_member_publish_with_host_skips_noop_commit_when_local_voter_has_quorum(
         &state,
         ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
-            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -21276,7 +21108,6 @@ fn local_member_publish_with_host_skips_noop_commit_when_local_voter_has_quorum(
         &state,
         ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
-            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -21327,7 +21158,6 @@ fn local_member_publish_async_with_host_skips_noop_commit_when_local_voter_has_q
             &state,
             ClusterLocalMemberPublishOptions {
                 member_publish_timeout: Duration::from_secs(1),
-                force_kv_snapshot_sync: false,
             },
             &mut host,
         ))
@@ -21343,7 +21173,6 @@ fn local_member_publish_async_with_host_skips_noop_commit_when_local_voter_has_q
             &state,
             ClusterLocalMemberPublishOptions {
                 member_publish_timeout: Duration::from_secs(1),
-                force_kv_snapshot_sync: false,
             },
             &mut host,
         ))
@@ -21418,7 +21247,6 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
         &state,
         ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(7),
-            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -21430,13 +21258,6 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
     assert_eq!(host.sends[0].0, voter);
     assert_eq!(host.sends[0].1, vec![local.clone()]);
     assert_eq!(host.sends[0].2, Duration::from_secs(7));
-    assert!(
-        read_cluster_kv_current_snapshot(&paths)
-            .expect("imported snapshot")
-            .get("/member/published/by/voter")
-            .is_some(),
-        "accepted voter publish responses should refresh the local KV snapshot"
-    );
 }
 
 #[test]
@@ -21526,7 +21347,6 @@ fn local_member_publish_async_skips_forward_when_source_is_unchanged() {
             &state,
             ClusterLocalMemberPublishOptions {
                 member_publish_timeout: Duration::from_secs(7),
-                force_kv_snapshot_sync: false,
             },
             &mut host,
         ))
@@ -24881,7 +24701,138 @@ fn cluster_read_view_fails_closed_when_local_raft_state_is_corrupt() {
 }
 
 #[test]
-fn cluster_network_records_publish_overwrite_and_expire() {
+fn service_provider_resolution_requires_ready_authorized_reachable_providers() {
+    let root = sinomo_testdir::TestDir::new("sinomo-service-provider-resolution");
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let capability = "fixture.path.access";
+    let cluster_id = ClusterId::from_legacy_named("cluster_provider_resolution").expect("cluster");
+    let local = NodeId::from_legacy_named("node_provider_resolution_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "provider resolution",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let endpoint = |node_id: &NodeId, port: u16| ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named(format!("endpoint_{node_id}"))
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: format!("192.0.2.{port}:21353"),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let node = |name: &str| NodeId::from_legacy_named(name).expect("node");
+    let reachable = node("node_provider_resolution_reachable");
+    let unrouted = node("node_provider_resolution_unrouted");
+    let degraded = node("node_provider_resolution_degraded");
+    let pending = node("node_provider_resolution_pending");
+    for (index, node_id) in [&reachable, &unrouted, &degraded, &pending]
+        .into_iter()
+        .enumerate()
+    {
+        let mut member = if node_id == &pending {
+            ClusterMemberRecord::pending_learner(
+                cluster_id.clone(),
+                node_id.clone(),
+                "pending",
+                "pk-pending",
+                now,
+            )
+        } else {
+            ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                node_id.clone(),
+                "remote",
+                format!("pk-{index}"),
+                now,
+            )
+        };
+        member.endpoints = vec![endpoint(node_id, 20 + index as u16)];
+        state.members.push(member);
+    }
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    // A usable route to every remote provider except `unrouted`.
+    let routed = [&reachable, &degraded, &pending]
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let target_endpoint = endpoint(target, [20, 22, 23][index]);
+            ClusterConnectivityRecord {
+                cluster_id: cluster_id.clone(),
+                source_node_id: local.clone(),
+                target_node_id: target.clone(),
+                endpoint_id: target_endpoint.endpoint_id,
+                transport: target_endpoint.transport,
+                address: target_endpoint.address,
+                state: ClusterConnectivityState::Healthy,
+                latency_ms: Some(5),
+                consecutive_failures: 0,
+                last_success_at: None,
+                last_failure_at: None,
+                failure_reason: None,
+                observed_at: now,
+                expires_at: now + time::Duration::seconds(900),
+            }
+        })
+        .collect();
+    sync_cluster_connectivity_records_to_kv(&paths, &local, routed).expect("sync connectivity");
+
+    for (node_id, health) in [
+        (&local, sinomo_service::ServiceDiscoveryHealth::Ready),
+        (&reachable, sinomo_service::ServiceDiscoveryHealth::Ready),
+        (&unrouted, sinomo_service::ServiceDiscoveryHealth::Ready),
+        (&degraded, sinomo_service::ServiceDiscoveryHealth::Degraded),
+        (&pending, sinomo_service::ServiceDiscoveryHealth::Ready),
+    ] {
+        let mut record = sinomo_service::ServiceInstanceRecord::new("fixture", node_id.clone());
+        record.provider_capabilities = vec![capability.to_string()];
+        record.health = health;
+        append_cluster_raft_command(
+            &paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    sinomo_service::cluster_service_instance_key("fixture", node_id),
+                    &record,
+                    None,
+                )
+                .expect("service op"),
+            ),
+        )
+        .expect("append service record");
+    }
+
+    assert_eq!(
+        resolve_cluster_service_providers(&paths, &state, capability, true)
+            .expect("resolve with a live local offer"),
+        vec![local.clone(), reachable.clone()]
+    );
+    assert_eq!(
+        resolve_cluster_service_providers(&paths, &state, capability, false)
+            .expect("resolve without a live local offer"),
+        vec![reachable],
+        "the live registry, not a committed record, decides the local offer"
+    );
+    assert!(
+        resolve_cluster_service_providers(&paths, &state, "fixture.other", false)
+            .expect("resolve an unprovided capability")
+            .is_empty()
+    );
+}
+
+#[test]
+fn cluster_network_records_publish_overwrite_and_ignore_expired() {
     let root = sinomo_testdir::TestDir::new("sinomo-network-graph");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
@@ -25020,352 +24971,6 @@ fn cluster_network_records_publish_overwrite_and_expire() {
             .len(),
         1,
         "expired connectivity should be ignored by read views"
-    );
-
-    expire_cluster_network_records(&paths, now + time::Duration::seconds(31))
-        .expect("expire network");
-    assert!(
-        read_cluster_network_info_from_kv(&paths)
-            .expect("read expired infos")
-            .is_empty()
-    );
-    assert!(
-        read_cluster_connectivity_graph_from_kv(&paths)
-            .expect("read expired graph")
-            .is_empty()
-    );
-}
-
-#[test]
-fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-large-prefix");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::from_legacy_named("cluster_network_expire_large").expect("cluster");
-    let source_node =
-        NodeId::from_legacy_named("node_network_expire_large_source").expect("source");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "network expire large",
-        source_node.clone(),
-        "source",
-        "pk-source",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-
-    let mut store = InProcessKvStore::new();
-    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
-        let target_node =
-            NodeId::from_legacy_named(format!("node_network_expire_large_target_{index}"))
-                .expect("target");
-        let endpoint_id =
-            ClusterEndpointId::from_legacy_named(format!("endpoint_network_expire_large_{index}"))
-                .expect("endpoint");
-        let record = ClusterConnectivityRecord {
-            cluster_id: cluster_id.clone(),
-            source_node_id: source_node.clone(),
-            target_node_id: target_node,
-            endpoint_id: endpoint_id.clone(),
-            transport: ClusterTransportKind::LanTcp,
-            address: format!("10.42.{}.{}:21353", index / 256, index % 256),
-            state: ClusterConnectivityState::Healthy,
-            latency_ms: Some(5),
-            consecutive_failures: 0,
-            last_success_at: Some("expired".to_string()),
-            last_failure_at: None,
-            failure_reason: None,
-            observed_at: now - time::Duration::seconds(120),
-            expires_at: now - time::Duration::seconds(1),
-        };
-        match KvOp::put_serde(
-            cluster_connectivity_key(&source_node, &record.target_node_id, &endpoint_id),
-            &record,
-            None,
-        )
-        .expect("connectivity put op")
-        {
-            KvOp::Put {
-                key,
-                value,
-                lease_id,
-            } => {
-                store.put(key, value, lease_id).expect("seed connectivity");
-            }
-            _ => unreachable!("put_serde creates put op"),
-        }
-    }
-    let first_batch = sinomo_cluster::cluster_network_expiry_delete_ops(
-        &store.snapshot().expect("snapshot"),
-        now,
-        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-    );
-    assert_eq!(
-        first_batch.len(),
-        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-        "expiry planning should return one bounded mutation batch"
-    );
-    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
-        .expect("write large snapshot");
-
-    read_cluster_kv_prefix_entries(&paths, "/cluster/network/connectivity/")
-        .expect_err("public range reader should reject the oversized prefix");
-
-    expire_cluster_network_records(&paths, now).expect("expire oversized prefix");
-    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("read current snapshot");
-    assert!(
-        snapshot
-            .prefix_entries("/cluster/network/connectivity/")
-            .next()
-            .is_none(),
-        "expiration should clear all records even when the prefix exceeds the public range limit"
-    );
-}
-
-#[test]
-fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-bounded-ops");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_network_expire_bounded").expect("cluster");
-    let local_node = NodeId::from_legacy_named("node_network_expire_bounded_local").expect("local");
-    let remote_node =
-        NodeId::from_legacy_named("node_network_expire_bounded_remote").expect("remote");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "network expire bounded",
-        local_node.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-
-    for index in 0..=sinomo_kv::MAX_KV_TXN_COMPARES {
-        let target_node =
-            NodeId::from_legacy_named(format!("node_network_expire_bounded_target_{index}"))
-                .expect("target");
-        let endpoint_id = ClusterEndpointId::from_legacy_named(format!(
-            "endpoint_network_expire_bounded_{index}"
-        ))
-        .expect("endpoint");
-        let record = ClusterConnectivityRecord {
-            cluster_id: cluster_id.clone(),
-            source_node_id: remote_node.clone(),
-            target_node_id: target_node,
-            endpoint_id: endpoint_id.clone(),
-            transport: ClusterTransportKind::LanTcp,
-            address: format!("10.44.{}.{}:21353", index / 256, index % 256),
-            state: ClusterConnectivityState::Healthy,
-            latency_ms: Some(13),
-            consecutive_failures: 0,
-            last_success_at: Some("expired".to_string()),
-            last_failure_at: None,
-            failure_reason: None,
-            observed_at: now - time::Duration::seconds(7200),
-            expires_at: now - time::Duration::seconds(7200),
-        };
-        append_cluster_raft_command(
-            &paths,
-            &local_node,
-            KvCommand::Op(
-                KvOp::put_serde(
-                    cluster_connectivity_key(&remote_node, &record.target_node_id, &endpoint_id),
-                    &record,
-                    None,
-                )
-                .expect("connectivity put op"),
-            ),
-        )
-        .expect("seed connectivity in raft");
-    }
-
-    let (compares, success) =
-        expire_cluster_network_record_ops(&paths, &state, now).expect("expire ops");
-    assert_eq!(compares.len(), sinomo_kv::MAX_KV_TXN_COMPARES);
-    assert_eq!(success.len(), sinomo_kv::MAX_KV_TXN_COMPARES);
-
-    append_cluster_raft_command(
-        &paths,
-        &local_node,
-        KvCommand::Txn(KvTxn {
-            compares,
-            success,
-            failure: Vec::new(),
-        }),
-    )
-    .expect("commit bounded expire batch");
-
-    let (remaining_compares, remaining_success) =
-        expire_cluster_network_record_ops(&paths, &state, now).expect("remaining expire ops");
-    assert_eq!(remaining_compares.len(), 1);
-    assert_eq!(remaining_success.len(), 1);
-}
-
-#[derive(Default)]
-struct RecordingNetworkRecordExpiryHost {
-    commits: usize,
-    last_txn: Option<KvTxn>,
-}
-
-impl ClusterNetworkRecordExpiryHost for RecordingNetworkRecordExpiryHost {
-    type Error = NetworkError;
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        _state: &mut ClusterBootstrapState,
-        request: KvTxnRequest,
-    ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
-        self.commits += 1;
-        self.last_txn = Some(request.txn.clone());
-        let request_id = request.request_id;
-        let mut store = read_cluster_kv_store(paths)?;
-        let response = store.txn(request.txn).map_err(kv_err)?;
-        let snapshot = store.snapshot().expect("snapshot");
-        write_cluster_kv_snapshot(paths, &snapshot)?;
-        Ok(test_cluster_kv_txn_commit_result_for_request(
-            request_id,
-            snapshot,
-            Some(response),
-        ))
-    }
-}
-
-#[test]
-fn expire_cluster_network_records_with_host_delegates_commit() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-host");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id = ClusterId::from_legacy_named("cluster_network_expire_host").expect("cluster");
-    let local_node = NodeId::from_legacy_named("node_network_expire_host_local").expect("local");
-    let remote_node = NodeId::from_legacy_named("node_network_expire_host_remote").expect("remote");
-    let target_node = NodeId::from_legacy_named("node_network_expire_host_target").expect("target");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "network expire host",
-        local_node.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-
-    let endpoint_id =
-        ClusterEndpointId::from_legacy_named("endpoint_network_expire_host").expect("endpoint");
-    let record = ClusterConnectivityRecord {
-        cluster_id,
-        source_node_id: remote_node.clone(),
-        target_node_id: target_node.clone(),
-        endpoint_id: endpoint_id.clone(),
-        transport: ClusterTransportKind::LanTcp,
-        address: "10.45.1.2:21353".to_string(),
-        state: ClusterConnectivityState::Healthy,
-        latency_ms: Some(9),
-        consecutive_failures: 0,
-        last_success_at: Some("expired".to_string()),
-        last_failure_at: None,
-        failure_reason: None,
-        observed_at: now - time::Duration::seconds(7200),
-        expires_at: now - time::Duration::seconds(7200),
-    };
-    let key = cluster_connectivity_key(&remote_node, &target_node, &endpoint_id);
-    let mut store = InProcessKvStore::new();
-    store
-        .put_serde(key.clone(), &record, None)
-        .expect("seed connectivity record");
-    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
-        .expect("write snapshot");
-
-    let mut host = RecordingNetworkRecordExpiryHost::default();
-    let expired =
-        expire_cluster_network_records_with_host(&paths, &state, now, &mut host).expect("expire");
-    assert!(
-        expired.is_some(),
-        "expired records should produce a snapshot"
-    );
-    assert_eq!(host.commits, 1, "network driver should delegate one commit");
-    let txn = host.last_txn.expect("committed txn");
-    assert_eq!(txn.compares.len(), 1);
-    assert_eq!(txn.success.len(), 1);
-    assert!(matches!(&txn.success[0], KvOp::Delete { key: deleted } if deleted == &key));
-    assert!(
-        read_cluster_kv_current_snapshot(&paths)
-            .expect("snapshot after expiry")
-            .get(&key)
-            .is_none(),
-        "host-applied deletion should remove the stale connectivity record"
-    );
-
-    let mut idle_host = RecordingNetworkRecordExpiryHost::default();
-    let idle = expire_cluster_network_records_with_host(&paths, &state, now, &mut idle_host)
-        .expect("idle");
-    assert!(idle.is_none(), "no remaining records should skip commit");
-    assert_eq!(idle_host.commits, 0);
-}
-
-#[test]
-fn expire_cluster_network_record_ops_prunes_missing_target_endpoint() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-missing-endpoint");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_network_expire_missing_endpoint").expect("cluster");
-    let local_node =
-        NodeId::from_legacy_named("node_network_expire_missing_endpoint_local").expect("local");
-    let remote_node =
-        NodeId::from_legacy_named("node_network_expire_missing_endpoint_remote").expect("remote");
-    let target_node =
-        NodeId::from_legacy_named("node_network_expire_missing_endpoint_target").expect("target");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "network expire missing endpoint",
-        local_node,
-        "local",
-        "pk-local",
-        now,
-    );
-    let endpoint = daemon_lan_endpoint(&target_node, "10.45.2.2:21353".to_string(), 10);
-    let record = ClusterConnectivityRecord {
-        cluster_id,
-        source_node_id: remote_node.clone(),
-        target_node_id: target_node.clone(),
-        endpoint_id: endpoint.endpoint_id.clone(),
-        transport: endpoint.transport.clone(),
-        address: endpoint.address.clone(),
-        state: ClusterConnectivityState::Healthy,
-        latency_ms: Some(9),
-        consecutive_failures: 0,
-        last_success_at: Some("ok".to_string()),
-        last_failure_at: None,
-        failure_reason: None,
-        observed_at: now,
-        expires_at: now + time::Duration::seconds(7200),
-    };
-    let key = cluster_connectivity_key(&remote_node, &target_node, &endpoint.endpoint_id);
-    let mut store = InProcessKvStore::new();
-    store
-        .put_serde(key.clone(), &record, None)
-        .expect("seed orphaned connectivity record");
-    write_cluster_kv_snapshot(&paths, &store.snapshot().expect("snapshot"))
-        .expect("write snapshot");
-
-    let (compares, success) =
-        expire_cluster_network_record_ops(&paths, &state, now).expect("expire ops");
-    assert_eq!(compares.len(), 1);
-    assert_eq!(success.len(), 1);
-    assert!(
-        matches!(&success[0], KvOp::Delete { key: deleted } if deleted == &key),
-        "live connectivity records whose target endpoint disappeared should be pruned"
     );
 }
 
@@ -26399,7 +26004,7 @@ fn connectivity_sync_does_not_persist_time_only_freshness() {
     write_cluster_kv_snapshot(&paths, &store.snapshot().unwrap()).unwrap();
     assert!(cluster_connectivity_full_sync_batch_ops(
         &paths, &source_node_id, &[incoming.clone()], sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-    ).unwrap().is_empty(), "raw expired canonical rows remain semantic baselines, never live routes");
+    ).unwrap().is_empty(), "an unchanged committed row is never rewritten by time alone");
     incoming.state = ClusterConnectivityState::Unreachable;
     incoming.consecutive_failures = 3;
     assert_eq!(cluster_connectivity_full_sync_batch_ops(
@@ -31745,415 +31350,6 @@ fn write_object_file_cleans_temp_file_after_replace_failure() {
     );
 }
 
-#[test]
-fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-stale-snapshot");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_member_publish_stale_snapshot").expect("cluster");
-    let local = NodeId::from_legacy_named("node_member_publish_stale_snapshot").expect("local");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id,
-        "member publish stale snapshot",
-        local.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
-    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state to kv");
-
-    let mut published = state.members[0].clone();
-    published.endpoints = vec![daemon_lan_endpoint(
-        &local,
-        "10.49.0.7:21353".to_string(),
-        10,
-    )];
-
-    // First publish commits the endpoint records.
-    let mut host = RecordingClusterMemberPublishHost::default();
-    let committed = handle_cluster_member_publish_request_with_host(
-        &paths,
-        ClusterMemberPublishRequest {
-            members: vec![published.clone()],
-            local_kv_revision: None,
-        },
-        local.as_str(),
-        &mut host,
-    )
-    .expect("first member publish");
-    assert!(committed.accepted);
-    assert_eq!(host.commits, 1);
-    let current_revision = read_cluster_kv_current_snapshot(&paths)
-        .expect("snapshot after commit")
-        .revision;
-
-    // Re-publishing identical records stops after the authoritative read
-    // barrier instead of appending an empty transaction.
-    // The response carries the authoritative snapshot only when the publisher
-    // is stale or did not report a revision; current and ahead publishers do
-    // not receive a redundant full snapshot.
-    for (publisher_revision, expected_snapshot_revision) in [
-        (Some(current_revision), None),
-        (Some(KvRevision(current_revision.0 + 1)), None),
-        (Some(KvRevision(0)), Some(current_revision)),
-        (None, Some(current_revision)),
-    ] {
-        let mut repeat_host = RecordingClusterMemberPublishHost::default();
-        let response = handle_cluster_member_publish_request_with_host(
-            &paths,
-            ClusterMemberPublishRequest {
-                members: vec![published.clone()],
-                local_kv_revision: publisher_revision,
-            },
-            local.as_str(),
-            &mut repeat_host,
-        )
-        .expect("repeat member publish");
-        assert!(response.accepted);
-        assert_eq!(response.detail, "member endpoints already current");
-        assert_eq!(
-            repeat_host.commits, 0,
-            "accepted no-op publish must not append an empty Raft transaction"
-        );
-        assert_eq!(
-            response
-                .kv_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.revision),
-            expected_snapshot_revision,
-            "publisher revision {publisher_revision:?} returned the wrong snapshot payload"
-        );
-        assert_eq!(
-            read_cluster_kv_current_snapshot(&paths)
-                .expect("snapshot after repeat publish")
-                .revision,
-            current_revision,
-            "publisher revision {publisher_revision:?} must not change state revision"
-        );
-    }
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let mut async_repeat_host = RecordingClusterMemberPublishHost::default();
-    let async_response = runtime
-        .block_on(handle_cluster_member_publish_request_async_with_host(
-            runtime.handle(),
-            &paths,
-            ClusterMemberPublishRequest {
-                members: vec![published],
-                local_kv_revision: None,
-            },
-            local.as_str(),
-            &mut async_repeat_host,
-        ))
-        .expect("repeat async member publish");
-    assert!(async_response.accepted);
-    assert_eq!(async_response.detail, "member endpoints already current");
-    assert_eq!(async_repeat_host.commits, 0);
-    assert_eq!(
-        async_response
-            .kv_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.revision),
-        Some(current_revision),
-        "async no-op publish should return the exact authoritative snapshot"
-    );
-}
-
-#[test]
-fn local_member_publish_forced_sync_publishes_even_when_records_current() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-local-member-publish-forced-sync");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_local_member_publish_forced_sync").expect("cluster");
-    let local = NodeId::from_legacy_named("node_local_member_publish_forced_sync").expect("local");
-    let voter =
-        NodeId::from_legacy_named("node_local_member_publish_forced_sync_voter").expect("voter");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "local member publish forced sync",
-        local.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
-    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-    let mut remote = ClusterMemberRecord::local_voter(
-        cluster_id,
-        voter.clone(),
-        "remote voter",
-        "pk-voter",
-        now,
-    );
-    remote.capabilities = sinomo_node::main_daemon_capabilities(&remote.role);
-    remote.allowed_capabilities = remote.capabilities.clone();
-    remote.endpoints = vec![daemon_lan_endpoint(
-        &voter,
-        "10.49.1.7:21353".to_string(),
-        10,
-    )];
-    state.members.push(remote);
-    write_cluster_state(&paths, &state).expect("write state");
-
-    // Seed the local snapshot so the local member records already match —
-    // the historical short-circuit that froze learner snapshots forever.
-    let mut seeded = InProcessKvStore::new();
-    for member in sinomo_node::cluster_local_process_members(&state) {
-        let txn = KvTxn {
-            compares: Vec::new(),
-            success: vec![
-                KvOp::put_serde(cluster_member_key(&member.node_id), &member, None)
-                    .expect("member op"),
-            ],
-            failure: Vec::new(),
-        };
-        seeded.txn(txn).expect("seed member");
-    }
-    write_cluster_kv_snapshot(&paths, &seeded.snapshot().expect("snapshot"))
-        .expect("seed snapshot");
-    assert!(
-        cluster_member_publish_matches_kv(
-            &paths,
-            &sinomo_node::cluster_local_process_members(&state)
-        )
-        .expect("matches kv"),
-        "fixture must reproduce the already-published state"
-    );
-
-    let mut imported_store = seeded;
-    imported_store
-        .put("/kv/forced-sync/imported", b"ok".to_vec(), None)
-        .expect("imported marker");
-
-    // A normal source publication is terminal when its records are current.
-    // Snapshot recovery must remain an explicit operation rather than hiding
-    // a periodic pull inside unchanged member publication.
-    let mut idle_host = RecordingClusterLocalMemberPublishHost {
-        has_quorum: false,
-        response: Some(ClusterMemberPublishResponse {
-            accepted: true,
-            detail: "published".to_string(),
-            state: state.clone(),
-            kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
-        }),
-        ..Default::default()
-    };
-    publish_local_members_to_quorum_if_needed_with_host(
-        &paths,
-        &state,
-        ClusterLocalMemberPublishOptions {
-            member_publish_timeout: Duration::from_secs(5),
-            force_kv_snapshot_sync: false,
-        },
-        &mut idle_host,
-    )
-    .expect("non-forced publish");
-    assert!(idle_host.sends.is_empty());
-    assert!(
-        read_cluster_kv_current_snapshot(&paths)
-            .expect("snapshot after normal sync")
-            .get("/kv/forced-sync/imported")
-            .is_none(),
-        "unchanged publication must not pull an unrelated snapshot"
-    );
-
-    // An explicit forced recovery does contact a voter and imports its newer
-    // snapshot.
-    let mut forced_host = RecordingClusterLocalMemberPublishHost {
-        has_quorum: false,
-        response: Some(ClusterMemberPublishResponse {
-            accepted: true,
-            detail: "published".to_string(),
-            state: state.clone(),
-            kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
-        }),
-        ..Default::default()
-    };
-    publish_local_members_to_quorum_if_needed_with_host(
-        &paths,
-        &state,
-        ClusterLocalMemberPublishOptions {
-            member_publish_timeout: Duration::from_secs(5),
-            force_kv_snapshot_sync: true,
-        },
-        &mut forced_host,
-    )
-    .expect("forced publish");
-    assert_eq!(forced_host.sends.len(), 1);
-    assert!(
-        read_cluster_kv_current_snapshot(&paths)
-            .expect("snapshot after forced sync")
-            .get("/kv/forced-sync/imported")
-            .is_some(),
-        "explicit forced recovery must import the voter's newer snapshot"
-    );
-
-    // A stale responder (e.g. a lagging bridge) answering with an OLDER
-    // snapshot must never roll the local KV back.
-    let local_revision_before = read_cluster_kv_current_snapshot(&paths)
-        .expect("snapshot before stale response")
-        .revision;
-    let mut stale_store = InProcessKvStore::new();
-    stale_store
-        .put("/kv/forced-sync/stale-marker", b"old".to_vec(), None)
-        .expect("stale marker");
-    let stale_snapshot = stale_store.snapshot().expect("snapshot");
-    assert!(stale_snapshot.revision < local_revision_before);
-    let mut stale_host = RecordingClusterLocalMemberPublishHost {
-        has_quorum: false,
-        response: Some(ClusterMemberPublishResponse {
-            accepted: true,
-            detail: "published".to_string(),
-            state: state.clone(),
-            kv_snapshot: Some(stale_snapshot),
-        }),
-        ..Default::default()
-    };
-    publish_local_members_to_quorum_if_needed_with_host(
-        &paths,
-        &state,
-        ClusterLocalMemberPublishOptions {
-            member_publish_timeout: Duration::from_secs(5),
-            force_kv_snapshot_sync: true,
-        },
-        &mut stale_host,
-    )
-    .expect("forced publish against stale responder");
-    let after = read_cluster_kv_current_snapshot(&paths).expect("snapshot after stale response");
-    assert_eq!(after.revision, local_revision_before);
-    assert!(
-        after.get("/kv/forced-sync/stale-marker").is_none(),
-        "an older responder snapshot must not be imported"
-    );
-}
-
-#[test]
-fn local_member_publish_forced_sync_continues_after_stale_accepted_response() {
-    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-stale-accepted");
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_member_publish_stale_accepted").expect("cluster");
-    let local =
-        NodeId::from_legacy_named("node_member_publish_stale_accepted_local").expect("local");
-    let stale_bridge =
-        NodeId::from_legacy_named("node_member_publish_stale_accepted_bridge").expect("bridge");
-    let current_voter =
-        NodeId::from_legacy_named("node_member_publish_stale_accepted_voter").expect("voter");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "member publish stale accepted",
-        local.clone(),
-        "local",
-        "pk-local",
-        now,
-    );
-    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
-    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
-
-    let mut bridge = ClusterMemberRecord::local_voter(
-        cluster_id.clone(),
-        stale_bridge.clone(),
-        "stale bridge",
-        "pk-bridge",
-        now,
-    );
-    bridge.capabilities = sinomo_node::main_daemon_capabilities(&bridge.role);
-    bridge.allowed_capabilities = bridge.capabilities.clone();
-    let mut bridge_endpoint = daemon_lan_endpoint(&stale_bridge, "bridge:21353".to_string(), 1);
-    bridge_endpoint.source = ClusterEndpointSource::Observed;
-    bridge_endpoint.privacy = ClusterEndpointPrivacy::Lan;
-    bridge.endpoints = vec![bridge_endpoint];
-
-    let mut voter = ClusterMemberRecord::local_voter(
-        cluster_id,
-        current_voter.clone(),
-        "current voter",
-        "pk-voter",
-        now,
-    );
-    voter.capabilities = sinomo_node::main_daemon_capabilities(&voter.role);
-    voter.allowed_capabilities = voter.capabilities.clone();
-    voter.endpoints = vec![daemon_lan_endpoint(
-        &current_voter,
-        "10.49.2.7:21353".to_string(),
-        10,
-    )];
-    state.members.push(bridge);
-    state.members.push(voter);
-    write_cluster_state(&paths, &state).expect("write state");
-    write_cluster_kv_snapshot(
-        &paths,
-        &InProcessKvStore::new().snapshot().expect("snapshot"),
-    )
-    .expect("seed local snapshot");
-
-    let mut imported_store = InProcessKvStore::new();
-    imported_store
-        .put("/kv/forced-sync/current-voter", b"ok".to_vec(), None)
-        .expect("imported marker");
-    let mut host = RecordingClusterLocalMemberPublishHost {
-        has_quorum: false,
-        responses: vec![
-            ClusterMemberPublishResponse {
-                accepted: true,
-                detail: "stale bridge accepted without snapshot".to_string(),
-                state: state.clone(),
-                kv_snapshot: None,
-            },
-            ClusterMemberPublishResponse {
-                accepted: true,
-                detail: "current voter returned snapshot".to_string(),
-                state: state.clone(),
-                kv_snapshot: Some(imported_store.snapshot().expect("snapshot")),
-            },
-        ],
-        ..Default::default()
-    };
-
-    publish_local_members_to_quorum_if_needed_with_host(
-        &paths,
-        &state,
-        ClusterLocalMemberPublishOptions {
-            member_publish_timeout: Duration::from_secs(5),
-            force_kv_snapshot_sync: true,
-        },
-        &mut host,
-    )
-    .expect("forced publish");
-
-    assert_eq!(
-        host.sends
-            .iter()
-            .map(|(node_id, _, _)| node_id.clone())
-            .collect::<Vec<_>>(),
-        vec![stale_bridge, current_voter],
-        "forced sync should keep walking targets after a stale accepted response"
-    );
-    assert!(
-        read_cluster_kv_current_snapshot(&paths)
-            .expect("snapshot after forced sync")
-            .get("/kv/forced-sync/current-voter")
-            .is_some(),
-        "forced sync must import a later target's newer snapshot"
-    );
-}
-
 #[derive(Default)]
 struct NodeOnlySnapshotRefreshHost {
     node_snapshot: Option<KvSnapshot>,
@@ -32167,15 +31363,6 @@ impl ClusterKvSnapshotRefreshHost for NodeOnlySnapshotRefreshHost {
         _state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         Ok(None)
-    }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        _paths: &ClusterPaths,
-        _local_node_id: &NodeId,
-        _snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError> {
-        Ok(false)
     }
 
     fn call_node_object_rpc(
@@ -32279,10 +31466,10 @@ fn refresh_current_cluster_kv_store_uses_node_snapshot_fetch() {
     );
     assert!(
         read_cluster_kv_current_snapshot(&paths)
-            .expect("imported snapshot")
+            .expect("local snapshot")
             .get("/kv/relay/imported")
-            .is_some(),
-        "relayed snapshot must be written locally"
+            .is_none(),
+        "the fetched snapshot is the caller's read; it is not imported locally"
     );
 }
 

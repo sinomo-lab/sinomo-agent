@@ -4,7 +4,7 @@ use crate::{
     DfsAdvisoryLockCommand, DfsAdvisoryLockOutcome, DfsAdvisoryLockStateRecord,
     DfsContentReferenceRequest, DfsContentRootCatalogPage, DfsContentRootCatalogPageRequest,
     DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataJournalFrameRecord,
-    DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataTableSnapshot,
+    DfsMetadataPrefixProof, DfsMetadataShardConfig, DfsMetadataShardId,
     DfsMetadataVersionPinRecord, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor,
     DfsNamespaceJobRecord, DfsNamespaceTransaction, DfsObjectId, DfsObjectMetadata,
     DfsObjectVersionRecord, DfsPosixCreateAttrs, DfsPosixDirectorySyncCertificate,

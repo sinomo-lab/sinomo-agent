@@ -1653,6 +1653,7 @@ pub(crate) fn daemon_dfs_control_plane_client_on_runtime(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn daemon_dfs_node_transport(
     local_node_id: sinomo_core::node::NodeId,
     peer_node_ids: impl IntoIterator<Item = NodeId>,
@@ -2908,15 +2909,6 @@ pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)
-}
-
-#[cfg(test)]
-pub(super) fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
-    Arc::new(|_endpoint, _command, _timeout| {
-        Err(DfsMetadataPeerTransportError::new(
-            "test DFS metadata snapshot sender has no daemon runtime",
-        ))
-    })
 }
 
 // DFS inspection request/response types live in `sinomo-dfs`; this module only

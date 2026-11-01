@@ -5277,14 +5277,6 @@ impl FilesState {
         self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
     }
 
-    fn reveal_storage_issue_path(&mut self, path: String, waker: Option<sui::UiHandle>) {
-        self.close_storage_center();
-        let path = normalize_path(&path);
-        let parent = parent_path(&path).unwrap_or_else(|| "/".to_string());
-        self.pending_select_path = Some(path);
-        self.open_location(FilesSourceKind::Sifs, parent, waker);
-    }
-
     fn stage_history_decision(&mut self, decision: HistoryDecision) {
         if self.history_loading {
             return;

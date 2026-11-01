@@ -1332,7 +1332,6 @@ fn pause_materialized_cache_raft_write_after_compare_for_test(path: &Path) {
 /// The immutable Arc is the same allocation installed in the materialized cache.
 struct KvSnapshotObservationContext {
     source: crate::KvObservationCapacityPermit,
-    owns_writer_fence: bool,
     staged: Mutex<KvSnapshotObservationStaged>,
 }
 
@@ -1348,21 +1347,13 @@ struct KvSnapshotObservationStaged {
 impl KvSnapshotObservationContext {
     fn admit(cache: &KvMaterializedCache) -> Result<Self, KvError> {
         let paths = ClusterKvPaths::new(cache.path.parent().unwrap_or_else(|| Path::new("")));
-        Ok(Self::new(
-            crate::try_admit_committed_observation(
+        Ok(Self {
+            source: crate::try_admit_committed_observation(
                 &paths,
                 crate::KvObservationProposalOwnership::Absent,
             )?,
-            true,
-        ))
-    }
-
-    fn new(source: crate::KvObservationCapacityPermit, owns_writer_fence: bool) -> Self {
-        Self {
-            source,
-            owns_writer_fence,
             staged: Mutex::new(Default::default()),
-        }
+        })
     }
 
     fn begin(&self, previous: KvRevision) -> Result<(), KvError> {
@@ -1459,32 +1450,6 @@ impl Drop for KvSnapshotWriteOwner {
         // source fence can dispatch callbacks or wake a delivery waiter.
         drop(self.file.take());
         drop(self.fence.take());
-    }
-}
-
-/// A caller-owned publication stage for reconciliation whose outer Raft guard
-/// already holds the source's storage fence. Finish only after that guard and
-/// fence have both released; the inner File is released before methods return.
-pub(crate) struct KvObservedLocalCache {
-    cache: KvLocalCache,
-    observation: KvSnapshotObservationContext,
-}
-
-impl KvObservedLocalCache {
-    pub(crate) fn cache_snapshot_if_newer_than_raft(
-        &self,
-        node_id: NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        self.cache.cache_snapshot_if_newer_than_raft_inner(
-            node_id,
-            snapshot,
-            Some(&self.observation),
-        )
-    }
-
-    pub(crate) fn finish_observation(self) -> Result<(), KvError> {
-        self.observation.finish().map(|_| ())
     }
 }
 
@@ -1815,12 +1780,9 @@ impl KvMaterializedCache {
         &self,
         observation: Option<&KvSnapshotObservationContext>,
     ) -> Result<KvSnapshotWriteOwner, KvError> {
-        let fence = match observation {
-            Some(observation) if observation.owns_writer_fence => {
-                Some(observation.source.storage_owner()?)
-            }
-            _ => None,
-        };
+        let fence = observation
+            .map(|observation| observation.source.storage_owner())
+            .transpose()?;
         let file = self.lock_write()?;
         Ok(KvSnapshotWriteOwner {
             file: Some(file),
@@ -1946,17 +1908,8 @@ impl KvMaterializedCache {
     }
 
     fn write_raft_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
-        self.write_raft_snapshot_with_observation(snapshot, None)
-    }
-
-    fn write_raft_snapshot_with_observation(
-        &self,
-        snapshot: &KvSnapshot,
-        observation: Option<&KvSnapshotObservationContext>,
-    ) -> Result<bool, KvError> {
-        let _write_owner = self.lock_write_observed(observation)?;
+        let _write_owner = self.lock_write()?;
         let existing = self.read_snapshot_arc_if_present_locked()?;
-        self.begin_observation(observation, existing.as_deref())?;
         if existing.as_deref().is_some_and(|existing| {
             kv_snapshot_materialized_generation(existing)
                 > kv_snapshot_materialized_generation(snapshot)
@@ -1965,11 +1918,7 @@ impl KvMaterializedCache {
         }
         #[cfg(test)]
         pause_materialized_cache_raft_write_after_compare_for_test(&self.path);
-        self.write_raft_read_state_if_changed_against_locked(
-            snapshot,
-            existing.as_deref(),
-            observation,
-        )
+        self.write_raft_read_state_if_changed_against_locked(snapshot, existing.as_deref(), None)
     }
 
     #[cfg(test)]
@@ -2101,17 +2050,6 @@ pub struct KvLocalCache {
 }
 
 impl KvLocalCache {
-    pub(crate) fn with_observation_source(
-        &self,
-        source: crate::KvObservationCapacityPermit,
-        owns_writer_fence: bool,
-    ) -> KvObservedLocalCache {
-        KvObservedLocalCache {
-            cache: self.clone(),
-            observation: KvSnapshotObservationContext::new(source, owns_writer_fence),
-        }
-    }
-
     pub fn new(materialized_snapshot: impl Into<PathBuf>, raft_root: impl Into<PathBuf>) -> Self {
         Self {
             materialized: KvMaterializedCache::new(materialized_snapshot),
@@ -2444,56 +2382,6 @@ impl KvLocalCache {
             .write_authoritative_snapshot_if_changed(snapshot)
     }
 
-    /// Cache a remote read model when it is newer than the local applied Raft
-    /// state. This deliberately does not restore Raft: `KvSnapshot` has no
-    /// log index or term and therefore cannot be a consensus baseline.
-    ///
-    /// Returns `true` when reconciling the materialized cache changed it.
-    pub fn cache_snapshot_if_newer_than_raft(
-        &self,
-        node_id: NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let observation = KvSnapshotObservationContext::admit(&self.materialized)?;
-        let result =
-            self.cache_snapshot_if_newer_than_raft_inner(node_id, snapshot, Some(&observation));
-        finish_snapshot_observation(observation, result)
-    }
-
-    fn cache_snapshot_if_newer_than_raft_inner(
-        &self,
-        node_id: NodeId,
-        snapshot: KvSnapshot,
-        observation: Option<&KvSnapshotObservationContext>,
-    ) -> Result<bool, KvError> {
-        let wal_paths = self.raft_wal_paths(&node_id);
-        let local_snapshot = match read_resident_raft_local_snapshot(&wal_paths, &node_id) {
-            Some(read) => read?.value,
-            None => {
-                let node = DurableRaftKvNode::open_with_materialized_cache(
-                    node_id.clone(),
-                    wal_paths,
-                    &self.materialized,
-                )?;
-                node.store().try_snapshot()?
-            }
-        };
-        if kv_snapshot_materialized_generation(&snapshot)
-            <= kv_snapshot_materialized_generation(&local_snapshot)
-        {
-            return self
-                .materialized
-                .write_raft_snapshot_with_observation(&local_snapshot, observation);
-        }
-        // Cache the newer read model, but do not install it into Raft. A plain
-        // `KvSnapshot` carries no last-included index or term, so it cannot
-        // establish a safe consensus baseline. The learner must replay from its
-        // actual log position or receive an anchored `RaftSnapshot` from the
-        // leader.
-        self.materialized
-            .write_imported_snapshot_with_observation(&snapshot, observation)
-    }
-
     pub fn open_raft_node(&self, node_id: NodeId) -> Result<DurableRaftKvNode, KvError> {
         DurableRaftKvNode::open_with_materialized_cache(
             node_id.clone(),
@@ -2655,7 +2543,7 @@ pub(crate) fn build_lease_deadline_index(
 #[cfg(test)]
 mod observed_snapshot_writer_tests {
     use super::*;
-    use crate::{KvCommittedObservationValue, KvObservationProposalOwnership};
+    use crate::KvCommittedObservationValue;
 
     fn snapshot(value: &[u8], puts: usize) -> KvSnapshot {
         let mut store = InProcessKvStore::new();
@@ -3169,49 +3057,5 @@ mod observed_snapshot_writer_tests {
             events[0].value,
             KvCommittedObservationValue::Snapshot(_)
         ));
-    }
-
-    #[test]
-    fn observed_cache_reconciliation_finishes_after_outer_raft_owner_releases() {
-        let root = sinomo_testdir::TestDir::new("observed-cache-outer-raft-owner");
-        let paths = ClusterKvPaths::new(root.join("cluster"));
-        let node = NodeId::from_legacy_named("observed-cache-local").unwrap();
-        let store = paths.raft_store();
-        let source =
-            crate::try_admit_committed_observation(&paths, KvObservationProposalOwnership::Absent)
-                .unwrap();
-        let fence = source.storage_owner().unwrap();
-        let actual_owner = store.lock_operation().unwrap();
-        let outer_released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let released = Arc::clone(&outer_released);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&seen);
-        let callback_store = store.clone();
-        let callback_path = paths.snapshot.clone();
-        let _subscription = crate::subscribe_committed_observations(&paths, move |event| {
-            assert!(
-                released.load(Ordering::Acquire),
-                "combined outer owner must drop before callback entry"
-            );
-            let _operation = callback_store.lock_operation().unwrap();
-            require_writer_released(&callback_path);
-            captured.lock().unwrap().push(event.clone());
-        });
-        let observed = paths.local_cache().with_observation_source(source, false);
-        assert!(
-            observed
-                .cache_snapshot_if_newer_than_raft(node, snapshot(b"remote", 1))
-                .unwrap()
-        );
-        assert!(seen.lock().unwrap().is_empty());
-        drop(actual_owner);
-        outer_released.store(true, Ordering::Release);
-        drop(fence);
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "captured payload remains staged until explicit finish"
-        );
-        observed.finish_observation().unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }
