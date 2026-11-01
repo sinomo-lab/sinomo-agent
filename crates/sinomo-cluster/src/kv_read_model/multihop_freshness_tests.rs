@@ -35,8 +35,37 @@ enum SourceCase {
     HealthyUnrelatedSource,
     HealthyFailedSource,
     HealthySlowSource,
+    CanonicalBridgeCalibrated,
+    MissingCanonicalBridge,
+    BridgeWrongSource,
+    BridgeWrongCluster,
+    BridgeUnknownMember,
+    BridgeEndpointMismatch,
+    BridgeFutureClock,
+    BridgeExpiredClock,
+    BridgeCanonicalFailure,
+    BridgeCanonicalQuarantine,
+    BridgeIdentityReason,
+    BridgeAuthReason,
+    BridgePendingTarget,
+    BridgeRemovedTarget,
 }
 impl SourceCase {
+    fn canonical_bridge(self) -> bool {
+        matches!(self, Self::CanonicalBridgeCalibrated | Self::MissingCanonicalBridge
+            | Self::BridgeWrongSource | Self::BridgeWrongCluster | Self::BridgeUnknownMember
+            | Self::BridgeEndpointMismatch | Self::BridgeFutureClock | Self::BridgeExpiredClock
+            | Self::BridgeCanonicalFailure | Self::BridgeCanonicalQuarantine
+            | Self::BridgeIdentityReason | Self::BridgeAuthReason
+            | Self::BridgePendingTarget | Self::BridgeRemovedTarget)
+    }
+    fn canonical_bridge_missing(self) -> bool {
+        self.canonical_bridge() && !matches!(self, Self::CanonicalBridgeCalibrated
+            | Self::BridgeCanonicalFailure | Self::BridgeCanonicalQuarantine)
+    }
+    fn canonical_bridge_succeeds(self) -> bool {
+        matches!(self, Self::CanonicalBridgeCalibrated | Self::MissingCanonicalBridge)
+    }
     fn healthy_guard(self) -> bool {
         matches!(self, Self::HealthyNoSources | Self::HealthyUnrelatedSource
             | Self::HealthyFailedSource | Self::HealthySlowSource)
@@ -77,6 +106,42 @@ impl sinomo_network::ClusterDirectory for AdvisoryFailureDirectory {
     fn records_snapshot(&self) -> Result<sinomo_network::DirectoryRecordsSnapshot, sinomo_network::NetworkError> { self.inner.records_snapshot() }
     fn routing_records_snapshot(&self) -> Result<sinomo_network::DirectoryRoutingRecordsSnapshot, sinomo_network::NetworkError> { self.inner.routing_records_snapshot() }
     fn snapshot(&self) -> Result<sinomo_network::DirectorySnapshot, sinomo_network::NetworkError> { self.inner.snapshot() }
+}
+
+// This host consumes ONLY the actual endpoint observation delivered by
+// call_endpoint after its real authenticated one-hop RPC. It projects through
+// the same cluster-owned coordinator/store boundary as the normal host.
+struct NativeSourceObservationHost {
+    owner: Option<(ClusterPaths, sinomo_base::ClusterBootstrapState)>,
+    coordinator: Arc<crate::ClusterCommandObservationCoordinator>,
+    emitted: Arc<std::sync::Mutex<Vec<sinomo_network::ClusterConnectivityRecord>>>,
+}
+impl ClusterObjectRpcAsyncHost for NativeSourceObservationHost {
+    fn observe_endpoint_rpc_async<'a>(
+        &'a mut self,
+        endpoint: &'a sinomo_base::ClusterEndpointRecord,
+        observation: sinomo_network::ClusterObjectRpcObservation,
+    ) -> sinomo_network::ClusterObjectRpcFuture<'a, ()> {
+        Box::pin(async move {
+            let Some((paths, state)) = &self.owner else { return Ok(()); };
+            let projected = crate::ClusterCommandConnectivityObservation::from_rpc(observation);
+            let key = crate::cluster_command_observation_key(Some(paths), endpoint);
+            let sequence = self.coordinator.next_sequence();
+            let reservation = if observation.is_success() {
+                self.coordinator.try_reserve_success(key, sequence)
+            } else {
+                self.coordinator.try_reserve_failure(key, sequence)
+            };
+            if let Some(reservation) = reservation {
+                let mut actual = None;
+                reservation.publish(|| { actual = Some(projected.record_daemon_owned(paths, state, endpoint)); });
+                if let Some(actual) = actual {
+                    self.emitted.lock().unwrap().push(actual?);
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 async fn multihop_source_scenario(case: SourceCase) {
@@ -257,16 +322,27 @@ async fn multihop_source_scenario(case: SourceCase) {
         if case == SourceCase::LiveFailureCountReset && i == 2 {
             expired.consecutive_failures = 1;
         }
-        kv.put_serde(
-            cluster_connectivity_key(
-                &expired.source_node_id,
-                &expired.target_node_id,
-                &expired.endpoint_id,
-            ),
-            &expired,
-            None,
-        )
-        .unwrap();
+        if i == 1 && matches!(case, SourceCase::BridgeCanonicalFailure | SourceCase::BridgeCanonicalQuarantine) {
+            expired = observation.clone();
+            expired.state = sinomo_network::ClusterConnectivityState::Unreachable;
+            expired.consecutive_failures = 3;
+            if case == SourceCase::BridgeCanonicalQuarantine {
+                expired.failure_reason = Some(sinomo_network::ClusterConnectivityFailureReason::IdentityMismatch);
+            }
+        }
+        // A negative canonical-publication cut: no success/edge/ACK is added.
+        // B's later source row must come from its actual endpoint-RPC observer.
+        if !(case.canonical_bridge_missing() && i == 1) {
+            kv.put_serde(
+                cluster_connectivity_key(
+                    &expired.source_node_id,
+                    &expired.target_node_id,
+                    &expired.endpoint_id,
+                ),
+                &expired,
+                None,
+            ).unwrap();
+        }
         live.push(observation);
     }
     if case.calibrated() {
@@ -372,7 +448,8 @@ async fn multihop_source_scenario(case: SourceCase) {
     let observed = Arc::new(KvClusterDirectory::new(paths.clone()));
     assert_eq!(
         observed.connectivity_records().unwrap().len(),
-        usize::from(matches!(
+        usize::from(matches!(case, SourceCase::BridgeCanonicalFailure | SourceCase::BridgeCanonicalQuarantine))
+        + usize::from(matches!(
             case,
             SourceCase::PartiallyLiveMain
                 | SourceCase::ColdSourceProcess
@@ -387,8 +464,20 @@ async fn multihop_source_scenario(case: SourceCase) {
     assert_eq!(
         baseline.records.len(),
         3 + extra_endpoints.len() + usize::from(case.calibrated() || case.healthy_guard())
+            - usize::from(case.canonical_bridge_missing())
     );
     for record in &live {
+        if case.canonical_bridge() && record.source_node_id == nodes[1]
+            && record.target_node_id == nodes[2] {
+            let canonical = baseline.records.iter().find(|old|
+                old.source_node_id == record.source_node_id && old.target_node_id == record.target_node_id
+                    && old.endpoint_id == record.endpoint_id);
+            if case.canonical_bridge_missing() { assert!(canonical.is_none()); }
+            else if matches!(case, SourceCase::BridgeCanonicalFailure | SourceCase::BridgeCanonicalQuarantine) {
+                assert_eq!(canonical.unwrap().state, sinomo_network::ClusterConnectivityState::Unreachable);
+            } else { assert!(sinomo_network::cluster_connectivity_stable_eq(canonical.unwrap(), record)); }
+            continue;
+        }
         assert!(
             baseline
                 .records
@@ -449,6 +538,9 @@ async fn multihop_source_scenario(case: SourceCase) {
     let hot_binding = Arc::new(std::sync::Mutex::new(None::<[u8; 32]>));
     let failed_source_calls = Arc::new(AtomicUsize::new(0));
     let slow_source_calls = Arc::new(AtomicUsize::new(0));
+    let native_source_rows = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let bridge_reports = Arc::new(std::sync::Mutex::new(Vec::<Vec<sinomo_network::ClusterConnectivityRecord>>::new()));
+    let native_observation_coordinator = Arc::new(crate::ClusterCommandObservationCoordinator::production());
     let first_bridge_read_refusals = Arc::new(AtomicUsize::new(usize::MAX));
     let mut servers = tokio::task::JoinSet::new();
     for (i, listener, cold_source_process) in listeners {
@@ -465,7 +557,8 @@ async fn multihop_source_scenario(case: SourceCase) {
                 }
             }
         }
-        let server_paths = paths.clone();
+        let server_paths = if case.canonical_bridge() { ClusterPaths::new(&data[i]) } else { paths.clone() };
+        let bridge_reports = bridge_reports.clone();
         let replacement = replacement.clone();
 
         let reads = reads.clone();
@@ -511,6 +604,7 @@ async fn multihop_source_scenario(case: SourceCase) {
                 let provider = provider.clone();
                 let replies = replies.clone();
                 let server_paths = server_paths.clone();
+                let bridge_reports = bridge_reports.clone();
                 let replacement = replacement.clone();
 
                 let reads = reads.clone();
@@ -616,7 +710,7 @@ async fn multihop_source_scenario(case: SourceCase) {
                     {
                         let mut acceptor = sinomo_network::accept_routed_stream_carrier(carrier);
                         while let Some(stream) = acceptor.accept().await? {
-                            if case.calibrated() && !original_started.load(Ordering::SeqCst) {
+                            if (case.calibrated() || case.canonical_bridge()) && !original_started.load(Ordering::SeqCst) {
                                 assert!(stream.peer_node_id == caller || stream.peer_node_id == adjacent,
                                     "calibration still requires an actual admitted caller or adjacent signer");
                             } else {
@@ -630,6 +724,7 @@ async fn multihop_source_scenario(case: SourceCase) {
                             )?;
                             let replies = replies.clone();
                             let server_paths = server_paths.clone();
+                            let bridge_reports = bridge_reports.clone();
                             let replacement = replacement.clone();
 
                             let reads = reads.clone();
@@ -651,6 +746,7 @@ async fn multihop_source_scenario(case: SourceCase) {
                                 move |mut request, _| {
                                     let replies = replies.clone();
                                     let server_paths = server_paths.clone();
+                                    let bridge_reports = bridge_reports.clone();
                                     let replacement = replacement.clone();
 
                                     let reads = reads.clone();
@@ -722,10 +818,31 @@ async fn multihop_source_scenario(case: SourceCase) {
                                                 std::future::pending::<()>().await;
                                             }
 
-                                            // Deliberately include third-party rows. Only source i is trusted.
-                                            sinomo_network::ObjectRpcOutgoingResponse::encode_value(
-                                                route, replies,
-                                            )
+                                            // New bridge controls report the real source owner's local
+                                            // store. Only negative cases alter an earned response row.
+                                            let mut replies = if case.canonical_bridge() {
+                                                sinomo_network::read_local_cluster_connectivity_records(&server_paths)?
+                                            } else { replies };
+                                            if case.canonical_bridge() && i == 1 && original_started.load(Ordering::SeqCst) {
+                                                assert_eq!(replies.len(), 1, "actual B owner report prerequisite");
+                                                let row = &mut replies[0];
+                                                match case {
+                                                    SourceCase::BridgeWrongSource => row.source_node_id = NodeId::from_legacy_named("untrusted-third-party-source").unwrap(),
+                                                    SourceCase::BridgeWrongCluster => row.cluster_id = sinomo_node::ClusterId::from_legacy_named("unrelated-live-cluster").unwrap(),
+                                                    SourceCase::BridgeUnknownMember => row.target_node_id = NodeId::from_legacy_named("unaccepted-bridge-target").unwrap(),
+                                                    SourceCase::BridgeEndpointMismatch => row.endpoint_id = sinomo_network::ClusterEndpointId::derived("unaccepted-bridge-endpoint", b"negative"),
+                                                    SourceCase::BridgeFutureClock => { row.observed_at = OffsetDateTime::now_utc() + time::Duration::hours(1); row.expires_at = row.observed_at + time::Duration::hours(1); }
+                                                    SourceCase::BridgeExpiredClock => row.expires_at = OffsetDateTime::now_utc() - time::Duration::seconds(1),
+                                                    SourceCase::BridgeIdentityReason => row.failure_reason = Some(sinomo_network::ClusterConnectivityFailureReason::IdentityMismatch),
+                                                    SourceCase::BridgeAuthReason => row.failure_reason = Some(sinomo_network::ClusterConnectivityFailureReason::CommandAuthDenied),
+                                                    _ => {},
+                                                }
+                                                let mut reported = bridge_reports.lock().unwrap();
+                                                assert!(reported.len() < 32, "bounded native source report capture");
+                                                reported.push(replies.clone());
+                                            }
+                                            // Other original cases retain their controlled third-party DATA.
+                                            sinomo_network::ObjectRpcOutgoingResponse::encode_value(route, replies)
                                         } else {
                                             assert_eq!(i, 3);
                                             assert_eq!(route, "/test/cold-multihop-original");
@@ -770,7 +887,7 @@ async fn multihop_source_scenario(case: SourceCase) {
     // the end-to-end connector never enters the object-RPC pool. No business
     // call, KV/DFS effect authority, or successful native ACK is fabricated.
     let calibration_started_at = std::time::Instant::now();
-    let calibration = if case.calibrated() {
+    let calibration = if case.calibrated() || case.canonical_bridge() {
         async {
             let mut facts = Vec::new();
             for index in 1usize..=3 {
@@ -779,7 +896,11 @@ async fn multihop_source_scenario(case: SourceCase) {
                     let actor_paths = ClusterPaths::new(&data[actor]);
                     let mut actor_state = state.clone();
                     actor_state.local_node_id = nodes[actor].clone();
-                    let mut host = ReadOnlyHost;
+                    let mut host = NativeSourceObservationHost {
+                        owner: (case.canonical_bridge() && actor > 0).then(|| (actor_paths.clone(), actor_state.clone())),
+                        coordinator: native_observation_coordinator.clone(),
+                        emitted: native_source_rows.clone(),
+                    };
                     let mut client = ClusterObjectRpcClient::routed(&mut host, &actor_paths);
                     let response = client.call_endpoint(&actor_state, &endpoints[index-1],
                         ObjectRpcCall::encode_value(
@@ -791,7 +912,7 @@ async fn multihop_source_scenario(case: SourceCase) {
                     ).await.map_err(|e|e.to_string())?;
                     let payload = response.decode_body::<Vec<sinomo_network::ClusterConnectivityRecord>>()
                         .await.map_err(|e|e.to_string())?;
-                    if index == 2 && !payload.iter().any(|r|
+                    if !case.canonical_bridge() && index == 2 && !payload.iter().any(|r|
                         r.source_node_id == nodes[2] && r.target_node_id == nodes[3]
                             && r.state == sinomo_network::ClusterConnectivityState::Healthy
                             && r.expires_at > OffsetDateTime::now_utc()) {
@@ -803,6 +924,27 @@ async fn multihop_source_scenario(case: SourceCase) {
                 };
                 facts.push(tokio::time::timeout(sinomo_network::DEFAULT_NETWORK_TIMEOUT, one)
                     .await.map_err(|e|format!("calibration original5s action budget expired: {e}"))??);
+            }
+            if case.canonical_bridge() {
+                let mut host = ReadOnlyHost;
+                let mut probe = ClusterObjectRpcClient::routed(&mut host, &paths);
+                let raw = probe.call_endpoint(&state, &endpoints[0],
+                    ObjectRpcCall::encode_value(sinomo_network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
+                        sinomo_network::CLUSTER_NETWORK_RPC_CATEGORY, ()).map_err(|e|e.to_string())?,
+                    ClusterObjectRpcOptions::default().with_overall_timeout(sinomo_network::DEFAULT_NETWORK_TIMEOUT),
+                ).await.map_err(|e|e.to_string())?
+                    .decode_body::<Vec<sinomo_network::ClusterConnectivityRecord>>()
+                    .await.map_err(|e|e.to_string())?;
+                let earned = sinomo_network::read_local_cluster_connectivity_records(&ClusterPaths::new(&data[1]))
+                    .map_err(|e|e.to_string())?;
+                if raw != earned || raw.len() != 1 || raw[0].source_node_id != nodes[1]
+                    || raw[0].target_node_id != nodes[2]
+                    || raw[0].endpoint_id != endpoints[1].endpoint_id
+                    || raw[0].state != sinomo_network::ClusterConnectivityState::Healthy {
+                    return Err(format!("actual authenticated B source did not serve its earned B-C row: {raw:?}"));
+                }
+                facts.push(serde_json::json!({"actual_authenticated_B_raw_report":raw,
+                    "source_owner":"actual B direct-endpoint observation callback/store"}));
             }
             let full_chain = async {
                 let identity = Arc::new(sinomo_network::DaemonRoutedSessionIdentity::new(
@@ -834,6 +976,19 @@ async fn multihop_source_scenario(case: SourceCase) {
         Ok(Vec::new())
     };
     let calibration_elapsed = calibration_started_at.elapsed();
+    // Negative membership DATA applies only after genuine B/C production and
+    // full-chain calibration. The Original's own fenced current membership
+    // must exclude a Pending/Removed intermediate target, even while its
+    // physical endpoint and positive historical observation still exist.
+    if matches!(case, SourceCase::BridgePendingTarget | SourceCase::BridgeRemovedTarget) && calibration.is_ok() {
+        state.members.iter_mut().find(|m| m.node_id == nodes[2]).unwrap().state =
+            if case == SourceCase::BridgePendingTarget { sinomo_base::ClusterMemberState::Pending }
+            else { sinomo_base::ClusterMemberState::Removed };
+        let fenced = sinomo_network::DirectorySnapshot::try_from_members(
+            sinomo_network::DirectoryVersion(1), state.members.clone()).unwrap();
+        assert!(!fenced.is_authorized(&nodes[2]));
+        assert!(fenced.node(&nodes[2]).is_none());
+    }
     let reads_before_original = reads
         .iter()
         .map(|n| n.load(Ordering::SeqCst))
@@ -877,6 +1032,21 @@ async fn multihop_source_scenario(case: SourceCase) {
         options = options.with_destination_process_affinity(
             sinomo_network::DestinationProcessAffinity::MainDaemon,
         );
+    }
+    if case.canonical_bridge() && calibration.is_ok() {
+        let actual = native_source_rows.lock().unwrap();
+        assert_eq!(actual.len(), 2, "B-C and C-D must come from actual endpoint callbacks");
+        for (source, target, endpoint) in [(1usize, 2usize, &endpoints[1]), (2, 3, &endpoints[2])] {
+            let row = actual.iter().find(|row| row.source_node_id == nodes[source]
+                && row.target_node_id == nodes[target] && row.endpoint_id == endpoint.endpoint_id).unwrap();
+            assert_eq!(row.cluster_id, cluster);
+            assert_eq!(row.address, endpoint.address);
+            assert_eq!(row.transport, endpoint.transport);
+            assert_eq!(row.state, sinomo_network::ClusterConnectivityState::Healthy);
+            assert!(row.observed_at <= OffsetDateTime::now_utc() && row.expires_at > OffsetDateTime::now_utc());
+            let owned = sinomo_network::read_local_cluster_connectivity_records(&ClusterPaths::new(&data[source])).unwrap();
+            assert_eq!(owned, vec![row.clone()], "served owner is the actual normal local observation store");
+        }
     }
     let original_started_at = std::time::Instant::now();
     let response = if calibration.is_ok() {
@@ -1112,6 +1282,71 @@ async fn multihop_source_scenario(case: SourceCase) {
         }
     }
     let response = response.expect("SETUP UNREACHED: calibration failed before the Original call");
+    if case.canonical_bridge() {
+        let facts = serde_json::json!({
+            "qualification":"real four-node TCP/prelude/session/relay/RPC with existing endpoint-observation coordinator/source store; no Main/Raft/DFS or C20 offered-row attribution",
+            "case":format!("{case:?}"),"actual_calibration":calibration,
+            "calibration_elapsed_us":calibration_elapsed.as_micros(),
+            "native_source_observer_rows":*native_source_rows.lock().unwrap(),
+            "actual_original_B_reports":bridge_reports.lock().unwrap().clone(),
+            "caller_fenced_membership_data":state.members,
+            "canonical_baseline":baseline.records,"missing_only":case.canonical_bridge_missing(),
+            "actual_original_response":format!("{response:#?}"),"actual_original_elapsed_us":original_elapsed.as_micros(),
+            "reads_before_original":reads_before_original,"reads_after_original":reads.iter().map(|x|x.load(Ordering::SeqCst)).collect::<Vec<_>>(),
+            "single_original_effects":effects.load(Ordering::SeqCst),"original_budget_ms":5000,
+            "candidate_cap":sinomo_network::MAX_ROUTE_CANDIDATES,"source_inflight_cap":16,"record_search_cap":4096,
+            "search_cap_limit":"production unchanged; not measured search-state count",
+        });
+        let export = std::fs::write(data[0].root().join("missing-canonical-bridge.json"),
+            serde_json::to_vec_pretty(&facts).unwrap());
+        if let Err(error)=&export { eprintln!("bridge evidence export failed: {error}"); }
+        assert!(calibration.is_ok(), "SETUP: same real source/full-chain calibration failed: {calibration:?}");
+        assert!(reads[1].load(Ordering::SeqCst) > reads_before_original[1], "SETUP: genuine B source report not consulted");
+        if response.is_err() {
+            assert_eq!(effects.load(Ordering::SeqCst), 0, "failed Original cannot reach service effect");
+            assert_eq!(reads[2].load(Ordering::SeqCst), reads_before_original[2],
+                "SETUP: a failure after C was consulted is not the missing B bridge gap");
+            let pre_service = matches!(&response,
+                Err(sinomo_network::NetworkError::Timeout { delivery_state: sinomo_network::NetworkDeliveryState::DefinitelyNotSent, .. }))
+                || matches!(&response, Err(sinomo_network::NetworkError::RetryExhausted {
+                    attempts, delivery_state: sinomo_network::NetworkDeliveryState::DefinitelyNotSent, .. }) if *attempts > 0)
+                // Missing executable paths can exhaust before any target
+                // carrier attempt. Preserve the exact observed typed fate.
+                || matches!(&response, Err(sinomo_network::NetworkError::RetryExhausted {
+                    operation, attempts: 0,
+                    delivery_state: sinomo_network::NetworkDeliveryState::DefinitelyNotSent, detail,
+                }) if operation == &format!("establish routed session to {}", nodes[3])
+                    && detail == "no executable path in the current snapshots");
+            assert!(pre_service, "SETUP: actual failed call must be typed pre-service exhaustion: {response:?}");
+        }
+        let reported = bridge_reports.lock().unwrap();
+        assert!(!reported.is_empty(), "SETUP: Original received no actual B source report");
+        for report in reported.iter() {
+            assert_eq!(report.len(), 1);
+            let row = &report[0];
+            match case {
+                SourceCase::BridgeWrongSource => assert_ne!(row.source_node_id, nodes[1]),
+                SourceCase::BridgeWrongCluster => assert_ne!(row.cluster_id, cluster),
+                SourceCase::BridgeUnknownMember => assert!(!state.members.iter().any(|m| m.node_id == row.target_node_id)),
+                SourceCase::BridgeEndpointMismatch => assert_ne!(row.endpoint_id, endpoints[1].endpoint_id),
+                SourceCase::BridgeFutureClock => assert!(row.observed_at > OffsetDateTime::now_utc()),
+                SourceCase::BridgeExpiredClock => assert!(row.expires_at <= OffsetDateTime::now_utc()),
+                SourceCase::BridgeIdentityReason => { assert_eq!(row.state, sinomo_network::ClusterConnectivityState::Healthy); assert_eq!(row.failure_reason, Some(sinomo_network::ClusterConnectivityFailureReason::IdentityMismatch)); }
+                SourceCase::BridgeAuthReason => { assert_eq!(row.state, sinomo_network::ClusterConnectivityState::Healthy); assert_eq!(row.failure_reason, Some(sinomo_network::ClusterConnectivityFailureReason::CommandAuthDenied)); }
+                _ => {},
+            }
+        }
+        if case.canonical_bridge_succeeds() {
+            assert_eq!(response.as_ref().unwrap(), "original response");
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert!(reads[2].load(Ordering::SeqCst) > reads_before_original[2], "C's own report required");
+        } else {
+            assert!(response.is_err(), "invalid source evidence cannot dispatch Original");
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+        }
+        export.expect("bridge evidence retained after actual semantics");
+        return;
+    }
     match case {
         SourceCase::Success
         | SourceCase::PartiallyLiveMain
@@ -1150,6 +1385,12 @@ async fn multihop_source_scenario(case: SourceCase) {
             );
             assert_eq!(effects.load(Ordering::SeqCst), 0);
         }
+        SourceCase::CanonicalBridgeCalibrated | SourceCase::MissingCanonicalBridge
+        | SourceCase::BridgeWrongSource | SourceCase::BridgeWrongCluster | SourceCase::BridgeUnknownMember
+        | SourceCase::BridgeEndpointMismatch | SourceCase::BridgeFutureClock | SourceCase::BridgeExpiredClock
+        | SourceCase::BridgeCanonicalFailure | SourceCase::BridgeCanonicalQuarantine
+        | SourceCase::BridgeIdentityReason | SourceCase::BridgeAuthReason
+        | SourceCase::BridgePendingTarget | SourceCase::BridgeRemovedTarget => unreachable!("handled source-owner bridge controls"),
     }
     if case.healthy_guard() {
         assert!(original_elapsed < sinomo_network::DEFAULT_NETWORK_TIMEOUT);
@@ -1269,3 +1510,16 @@ async fn healthy_first_carrier_survives_actual_source_response_failure() {
 async fn healthy_first_carrier_does_not_wait_for_actual_slow_source_response() {
     multihop_source_scenario(SourceCase::HealthySlowSource).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_bridge_present_control_uses_real_source_observer() {
+    multihop_source_scenario(SourceCase::CanonicalBridgeCalibrated).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_canonical_bridge_uses_actual_authenticated_source_owner() {
+    multihop_source_scenario(SourceCase::MissingCanonicalBridge).await;
+}
+
+#[path = "multihop_freshness_tests/canonical_bridge_security.rs"]
+mod canonical_bridge_security;

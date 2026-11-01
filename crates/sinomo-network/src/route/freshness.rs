@@ -48,10 +48,23 @@ fn matching_source_records(
         // health state. Quorum publication coalesces those count-only changes;
         // use its semantic predicate while retaining the actual live count
         // for route ordering and the source's existing failure-budget policy.
+        let canonical_key_present = baseline.iter().any(|canonical| {
+            canonical.source_node_id == live.source_node_id
+                && canonical.target_node_id == live.target_node_id
+                && canonical.endpoint_id == live.endpoint_id
+        });
         if baseline.iter().any(|canonical| {
             crate::cluster_connectivity_stable_eq(canonical, &live)
                 && live.observed_at >= canonical.observed_at
-        }) {
+        }) || (!canonical_key_present
+            && live.state == ClusterConnectivityState::Healthy
+            && live.failure_reason.is_none())
+        {
+            // A live authenticated source can supply a previously unrepresented
+            // healthy edge within the same member/endpoint fence. It remains
+            // request-local candidate DATA. Existing canonical keys retain their
+            // semantic predicate, including failures and identity quarantine;
+            // the normal merge still preserves newer accepted observations.
             records.push(live);
         }
     }
@@ -1047,12 +1060,68 @@ mod tests {
                 "case {change}"
             );
         }
-        assert!(
-            matching_source_records(&directory, &state, &source, &[], vec![live], now)
-                .unwrap()
-                .is_empty(),
-            "live claims cannot introduce uncommitted remote semantics"
-        );
+    }
+
+    #[test]
+    fn absent_canonical_healthy_observation_is_bounded_candidate_data() {
+        let (directory, state, source, mut live, now) = fixture();
+        live.observed_at = now;
+        live.expires_at = now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+        let canonical = Vec::new();
+        assert_eq!(matching_source_records(&directory, &state, &source, &canonical,
+            vec![live.clone()], now).unwrap(), vec![live]);
+        assert!(canonical.is_empty(), "candidate DATA does not publish canonical connectivity");
+    }
+
+    #[test]
+    fn absent_canonical_candidates_preserve_source_member_endpoint_clock_and_quarantine() {
+        let (directory, state, source, mut live, now) = fixture();
+        live.observed_at = now;
+        live.expires_at = now + time::Duration::seconds(crate::CLUSTER_CONNECTIVITY_TTL_SECONDS);
+        for change in 0..12 {
+            let mut rejected = live.clone();
+            match change {
+                0 => rejected.source_node_id = state.local_node_id.clone(),
+                1 => rejected.cluster_id = ClusterId::from_legacy_named("wrong-live-cluster").unwrap(),
+                2 => rejected.target_node_id = NodeId::from_legacy_named("unknown-live-target").unwrap(),
+                3 => rejected.endpoint_id = crate::ClusterEndpointId::derived("unknown-live-endpoint", b"negative"),
+                4 => rejected.address = "127.0.0.1:39999".into(),
+                5 => rejected.transport = ClusterTransportKind::Loopback,
+                6 => rejected.observed_at = now + time::Duration::seconds(1),
+                7 => rejected.expires_at = now,
+                8 => rejected.state = ClusterConnectivityState::Degraded,
+                9 => rejected.state = ClusterConnectivityState::Unreachable,
+                10 => rejected.failure_reason = Some(crate::ClusterConnectivityFailureReason::IdentityMismatch),
+                _ => rejected.failure_reason = Some(crate::ClusterConnectivityFailureReason::CommandAuthDenied),
+            }
+            assert!(matching_source_records(&directory, &state, &source, &[],
+                vec![rejected], now).unwrap().is_empty(), "absent key case {change}");
+        }
+        for member_state in [sinomo_base::ClusterMemberState::Pending, sinomo_base::ClusterMemberState::Removed] {
+            let mut cut = state.clone();
+            cut.members.iter_mut().find(|m| m.node_id == live.target_node_id).unwrap().state = member_state.clone();
+            let directory = DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), cut.members.clone()).unwrap();
+            assert!(!directory.is_authorized(&live.target_node_id));
+            assert!(matching_source_records(&directory, &cut, &source, &[],
+                vec![live.clone()], now).unwrap().is_empty(), "target member state {member_state:?}");
+        }
+        let mut private_cut = state.clone();
+        private_cut.members.iter_mut().find(|m| m.node_id == live.target_node_id).unwrap()
+            .endpoints[0].privacy = sinomo_base::ClusterEndpointPrivacy::LocalOnly;
+        let private = DirectorySnapshot::try_from_members(crate::DirectoryVersion(7), private_cut.members.clone()).unwrap();
+        assert!(matching_source_records(&private, &private_cut, &source, &[], vec![live.clone()], now).unwrap().is_empty());
+        let mut failed = live.clone();
+        failed.state = ClusterConnectivityState::Unreachable;
+        failed.failure_reason = Some(crate::ClusterConnectivityFailureReason::IdentityMismatch);
+        assert!(matching_source_records(&directory, &state, &source,
+            std::slice::from_ref(&failed), vec![live.clone()], now).unwrap().is_empty(),
+            "existing canonical quarantine remains controlling");
+        let mut older = live;
+        older.observed_at -= time::Duration::seconds(1);
+        let incoming = matching_source_records(&directory, &state, &source, &[], vec![older], now).unwrap();
+        let mut accepted = vec![failed.clone()];
+        assert!(!merge_observations(&mut accepted, incoming));
+        assert_eq!(accepted, vec![failed], "a new candidate cannot replace a newer accepted failure");
     }
 
     #[test]
