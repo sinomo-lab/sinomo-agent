@@ -20,11 +20,10 @@ mod control_plane_driver;
 mod control_plane_options;
 mod control_routes;
 mod control_service;
-mod endpoint_recovery;
-pub use endpoint_recovery::{
-    CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE, ENDPOINT_RECOVERY_PROOF_TIMEOUT,
-    EndpointRecoveryAction, EndpointRecoveryHost, EndpointRecoveryOutcome, EndpointRecoveryRequest,
-    EndpointRecoveryResponse, EndpointRecoverySpec, endpoint_recovery_state_digest, recover_endpoint,
+mod route_hint;
+pub use route_hint::{
+    CLUSTER_CONTROL_ROUTE_HINT_ROUTE, ClusterRouteHintRequest, ClusterRouteHintResponse,
+    apply_cluster_route_hint,
 };
 mod health;
 mod invite;
@@ -368,17 +367,6 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             .field("members", "Vec<ClusterMemberRecord>"),
     )?;
     layout.register_binary("sinomo-cluster", StorageRing::R1, "cluster/state.sobj.lock")?;
-    layout.register_sinomo_object(
-        "sinomo-cluster",
-        StorageRing::R1,
-        "cluster/endpoint-recovery/{operation_id}.sobj",
-        ObjectSchema::new("EndpointRecoveryReceipt", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("spec", "EndpointRecoverySpec")
-            .field("before", "ClusterBootstrapState")
-            .field("after", "ClusterBootstrapState")
-            .field("phase", "EndpointRecoveryOutcome")
-            .field("authority", "KvAuthorityProof"),
-    )?;
     Ok(())
 }
 

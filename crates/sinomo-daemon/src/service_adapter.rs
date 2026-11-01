@@ -1347,32 +1347,26 @@ impl DaemonClusterControlServiceHost {
 }
 
 impl sinomo_core::cluster::ClusterControlServiceHost for DaemonClusterControlServiceHost {
-    fn recover_endpoint(
+    fn route_hint(
         &self,
-        request: sinomo_core::cluster::EndpointRecoveryRequest,
+        request: sinomo_core::cluster::ClusterRouteHintRequest,
     ) -> sinomo_core::cluster::ClusterControlServiceFuture<
         '_,
-        sinomo_core::cluster::EndpointRecoveryResponse,
+        sinomo_core::cluster::ClusterRouteHintResponse,
     > {
         let paths = self.paths.clone();
-        let runtime = self.runtime.clone();
         Box::pin(async move {
-            let runtime = require_service_runtime(runtime.as_ref(), "endpoint recovery")?.clone();
             run_blocking_service_task(
-                sinomo_core::cluster::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
-                "endpoint recovery",
+                sinomo_core::cluster::CLUSTER_CONTROL_ROUTE_HINT_ROUTE,
+                "route hint",
                 move || {
                     let cluster_paths = crate::cluster::cluster_paths_from_daemon_paths(&paths)
                         .map_err(daemon_error)?;
-                    let mut host =
-                        crate::endpoint_recovery::DaemonEndpointRecoveryHost::new(&paths, &runtime);
-                    let response = sinomo_core::cluster::recover_endpoint(
-                        &cluster_paths,
-                        &request,
-                        &mut host,
-                    )?;
-                    if response.needs_transport_refresh {
-                        host.record_validated_read(&request.spec)?;
+                    let response =
+                        sinomo_core::cluster::apply_cluster_route_hint(&cluster_paths, &request)?;
+                    if response.changed {
+                        // Probe and publish over the new route now; contact
+                        // with the leader starts this node's catch-up.
                         crate::control::request_daemon_cluster_maintenance(
                             crate::control::DaemonClusterMaintenanceReason::ManualBroad,
                         );

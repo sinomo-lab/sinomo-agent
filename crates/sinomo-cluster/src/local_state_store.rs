@@ -220,22 +220,16 @@ pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState,
         .cloned();
     let local_remote_route_endpoints = locally_learned_remote_route_endpoints(&state);
     let projected = read_cluster_members_for_state(paths);
-    let (mut kv_members, observed_revision) = match projected {
+    let kv_members = match projected {
         Ok(projected) => projected,
         Err(error) => {
             eprintln!(
                 "warning: ignoring unreadable cluster kv snapshot while loading members: {error}"
             );
-            (Vec::new(), sinomo_kv::KvRevision(0))
+            Vec::new()
         }
     };
     if !kv_members.is_empty() {
-        crate::endpoint_recovery::preserve_verified_recovery_routes(
-            paths,
-            &state,
-            &mut kv_members,
-            observed_revision,
-        )?;
         let mut local_process_members = Vec::new();
         for member in state.members.iter().filter(|member| {
             cluster_node_is_local_process(&state, &member.node_id) && member.state.is_authorized()
