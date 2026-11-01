@@ -9,29 +9,16 @@ use crate::{
 };
 use sinomo_core::network::NetworkError;
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(super) struct NativePrefixContactScope {
-    pub(super) owned: std::collections::BTreeMap<NodeId, (String, String)>,
-    /// Route observations only; the actual native call still authenticates the
-    /// peer and validates its current endpoint before returning any provenance.
-    pub(super) hints: std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>,
-}
-
 #[derive(Clone)]
 pub(super) struct NativePrefixOwnerContext {
     pub(super) data_dir: SinomoDataDir,
     pub(super) runtime: tokio::runtime::Handle,
-    #[cfg(test)]
-    pub(super) contact_scope: Option<NativePrefixContactScope>,
 }
 impl NativePrefixOwnerContext {
     pub(super) fn new(data_dir: &SinomoDataDir, runtime: &tokio::runtime::Handle) -> Self {
         Self {
             data_dir: data_dir.clone(),
             runtime: runtime.clone(),
-            #[cfg(test)]
-            contact_scope: None,
         }
     }
 }
@@ -377,57 +364,11 @@ fn capture_source(
 }
 
 fn dispatch_native_prefix_call(
-    context: &NativePrefixOwnerContext,
     host: &DfsRuntimeHost,
     attempt: &DfsMetadataPrefixProbeAttempt,
     call: sinomo_core::network::ObjectRpcCall,
     options: DfsObjectRpcSendOptions,
 ) -> Result<sinomo_core::network::ObjectRpcResult, DfsPeerTransportError> {
-    #[cfg(test)]
-    if let Some(scope) = &context.contact_scope {
-        // Contact scope restricts an actual registered native carrier; it never
-        // supplies a signer, response, source admission or current authority.
-        let (address, key) = scope.owned
-            .get(attempt.peer())
-            .ok_or_else(|| invalid("native PREFIX peer has no owned contact"))?;
-        let paths = ClusterPaths::new(&context.data_dir);
-        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).map_err(invalid)?;
-        if attempt.command().source_node_id.as_ref() != Some(&state.local_node_id) {
-            return Err(invalid("native PREFIX contact source changed"));
-        }
-        let member = state
-            .members
-            .iter()
-            .find(|member| {
-                member.node_id == *attempt.peer()
-                    && member.cluster_id == state.cluster_id
-                    && member.state.is_authorized()
-                    && member.node_public_key == *key
-            })
-            .ok_or_else(|| invalid("native PREFIX contact has no matching current member/key"))?;
-        let endpoint = scope.hints.get(attempt.peer())
-            .ok_or_else(|| invalid("native PREFIX actual observed endpoint hint is absent"))?;
-        if endpoint.node_id != member.node_id || endpoint.address != *address
-            || !matches!(endpoint.transport, sinomo_core::ClusterTransportKind::Loopback
-                | sinomo_core::ClusterTransportKind::LanTcp)
-        {
-            return Err(invalid("native PREFIX endpoint hint differs from owned peer"));
-        }
-        let mut scoped = options;
-        let left = remaining(attempt)?;
-        scoped.overall_timeout = Some(scoped.overall_timeout.map_or(left, |cap| cap.min(left)));
-        return host
-            .object_rpc
-            .call_endpoint(
-                endpoint,
-                call,
-                scoped.cluster_rpc_options(),
-                scoped.observe_connectivity,
-            )
-            .map_err(DfsPeerTransportError::from_network);
-    }
-    #[cfg(not(test))]
-    let _ = context;
     host.object_rpc
         .call(
             attempt.peer(),
@@ -453,7 +394,7 @@ pub(super) fn call_native_prefix_probe(
         .map_err(DfsPeerTransportError::from_network)?;
     let left = remaining(attempt)?;
     options.overall_timeout = Some(options.overall_timeout.map_or(left, |old| old.min(left)));
-    let result = dispatch_native_prefix_call(context, host, attempt, call, options)?;
+    let result = dispatch_native_prefix_call(host, attempt, call, options)?;
     let response = {
         let _runtime = context.runtime.enter();
         crate::node_transport::collect_metadata_prefix_probe_return(result, attempt)

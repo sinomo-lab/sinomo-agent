@@ -42,23 +42,6 @@ pub trait ComponentObjectRpcTransport: Send + Sync {
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResult, NetworkError>;
 
-    /// Call exactly one current native endpoint. No node-routing fallback is
-    /// permitted. This selects a carrier, never membership or effect authority.
-    /// Hosts without this native operation must refuse, not delegate to `call`.
-    fn call_endpoint(
-        &self,
-        _endpoint: &sinomo_core::ClusterEndpointRecord,
-        _call: ObjectRpcCall,
-        _options: ClusterObjectRpcOptions,
-        _observe_connectivity: bool,
-    ) -> Result<ObjectRpcResult, NetworkError> {
-        Err(NetworkError::delivery_failed(
-            "component explicit endpoint RPC",
-            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-            "registered component carrier does not support explicit native endpoints",
-        ))
-    }
-
     fn call_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
