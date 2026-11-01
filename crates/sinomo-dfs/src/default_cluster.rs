@@ -25,8 +25,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-#[cfg(test)]
-use crate::DfsControlPlaneKvClient;
 use crate::control_plane::topology_preserving_metadata_shard_replicas;
 use crate::service_sync::rebind_completed_metadata_shard_membership_handoff;
 use crate::{
