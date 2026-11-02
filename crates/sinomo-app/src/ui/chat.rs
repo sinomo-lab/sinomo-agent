@@ -14856,7 +14856,83 @@ impl TranscriptLayoutContext for PaintCtx {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ConversationMarker {
+    key: u64,
+    index: usize,
+    preview: String,
+    offset: f32,
+    end: f32,
+}
+
+fn conversation_turn_preview(messages: &[ChatMessage], index: usize) -> String {
+    let Some(message) = messages.get(index) else { return String::new(); };
+    let user = messages[..=index].iter().rposition(|message| message.source == ChatMessageSource::User);
+    let start = user.map_or(0, |index| index + 1);
+    let end = messages[start..].iter().position(|message| message.source == ChatMessageSource::User)
+        .map_or(messages.len(), |next| start + next);
+    let title = user.map(|index| compact_line(&transcript_message_display_text(&messages[index]), 100))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| if message.source == ChatMessageSource::User {
+            "User message".into()
+        } else {
+            "Earlier user message not loaded".into()
+        });
+    let response = messages[start..end].iter().rev()
+        .find(|message| message.source == ChatMessageSource::Model && !message.text.trim().is_empty())
+        .map(|message| preview_multiline(&transcript_message_display_text(message), 240, 4))
+        .unwrap_or_else(|| "No agent response yet".into());
+    format!("{title}\n{response}")
+}
+
+fn conversation_marker_indices(count: usize, capacity: usize) -> Vec<usize> {
+    let shown = count.min(capacity);
+    if shown < 2 { return Vec::new(); }
+    (0..shown).map(|index| index * (count - 1) / (shown - 1)).collect()
+}
+
+// Capture the initiating touch so its release cannot activate a newly opened preview.
+struct MinimapTouchTrigger {
+    child: WidgetPod,
+    key: u64,
+    preview: Rc<Cell<Option<(u64, Rect)>>>,
+    pointer: Option<u64>,
+}
+
+impl Widget for MinimapTouchTrigger {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        let Event::Pointer(pointer) = event else { return; };
+        if pointer.pointer_kind != sui::PointerKind::Touch { return; }
+        if pointer.kind == PointerEventKind::Down && ctx.bounds().contains(pointer.position) {
+            self.pointer = Some(pointer.pointer_id);
+            self.preview.set(Some((self.key, ctx.bounds())));
+            ctx.request_pointer_capture(pointer.pointer_id);
+            TranscriptView::request_recovery_action_refresh(ctx);
+            ctx.set_handled();
+        } else if self.pointer == Some(pointer.pointer_id) {
+            if matches!(pointer.kind, PointerEventKind::Up | PointerEventKind::Cancel) {
+                self.pointer = None;
+                ctx.release_pointer_capture(pointer.pointer_id);
+                if pointer.kind == PointerEventKind::Cancel { self.preview.set(None); }
+                TranscriptView::request_recovery_action_refresh(ctx);
+            }
+            ctx.set_handled();
+        }
+    }
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size { self.child.measure(ctx, constraints) }
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) { self.child.arrange(ctx, bounds); }
+    fn paint(&self, ctx: &mut PaintCtx) { self.child.paint(ctx); }
+    fn semantics(&self, ctx: &mut SemanticsCtx) { self.child.semantics(ctx); }
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) { visitor.visit(&self.child); }
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) { visitor.visit(&mut self.child); }
+}
+
 struct TranscriptView {
+    minimap: WidgetPod,
+    minimap_touch: Rc<Cell<Option<(u64, Rect)>>>,
+    minimap_preview: WidgetPod,
+    minimap_preview_key: Option<u64>,
+    minimap_markers: Vec<ConversationMarker>,
     shared: Shared,
     selection_scope: SelectionScope,
     controls: WidgetPod,
@@ -14884,6 +14960,11 @@ impl TranscriptView {
             Rc::clone(&rich_message_layouts),
         ));
         Self {
+            minimap: WidgetPod::new(SizedBox::new()),
+            minimap_touch: Rc::new(Cell::new(None)),
+            minimap_preview: WidgetPod::new(SizedBox::new()),
+            minimap_preview_key: None,
+            minimap_markers: Vec::new(),
             shared,
             selection_scope,
             controls,
@@ -14899,6 +14980,104 @@ impl TranscriptView {
             transcript_trace_semantics: RefCell::new(Vec::new()),
             menu_target_key: Cell::new(None),
         }
+    }
+
+    fn sync_minimap(&mut self, ctx: &mut MeasureCtx, size: Size, messages: &[ChatMessage], layouts: &[TranscriptRichMessageLayout]) {
+        let max_scroll = (self.content_height.get() - size.height).max(0.0);
+        let capacity = ((size.height - 32.0) / 12.0).max(0.0) as usize;
+        let indices = if size.width >= 320.0 && max_scroll > 0.0 {
+            conversation_marker_indices(layouts.len(), capacity.min(48))
+        } else { Vec::new() };
+        let mut offset = PAD + Self::timeline_header_height(&self.shared.chat());
+        let gap = TranscriptLayoutMode::for_width(size.width).message_gap();
+        let traces = self.trace_heights.borrow();
+        let mut offsets = Vec::new();
+        for (index, layout) in layouts.iter().enumerate() {
+            offsets.push(offset);
+            offset += traces.get(index).copied().unwrap_or(0.0) + layout.bubble_h + gap;
+        }
+        let markers: Vec<_> = indices.iter().enumerate().map(|(slot, &index)| {
+            ConversationMarker {
+                key: layouts[index].message_key,
+                index,
+                preview: conversation_turn_preview(messages, index),
+                offset: offsets[index].min(max_scroll),
+                end: indices.get(slot + 1).map_or(f32::INFINITY, |&next| offsets[next].min(max_scroll)),
+            }
+        }).collect();
+        drop(traces);
+        if markers != self.minimap_markers {
+            self.minimap_touch.set(None);
+            let reader = shared_reader(&self.shared);
+            let mut rail = Flex::vertical().justify(sui::FlexJustify::Center).align_items(Alignment::Center);
+            for marker in &markers {
+                let target = marker.offset;
+                let start = if marker.index == 0 { 0.0 } else { target };
+                let end = marker.end;
+                let selected = self.shared.clone();
+                let action = self.shared.clone();
+                let button = IconButton::new(IconGlyph::Remove, format!("Jump to message {}", marker.index + 1))
+                    .size(12.0)
+                    .icon_size(12.0)
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .theme_when(clone_reader(&reader))
+                    .selected_when(move || {
+                        let chat = selected.chat();
+                        let scroll = if chat.stick_bottom { f32::INFINITY } else { chat.scroll };
+                        (scroll >= start && scroll < end) || (chat.stick_bottom && end.is_infinite())
+                    })
+                    .on_press_with_ctx(move |ctx| {
+                        let mut chat = action.chat_mut();
+                        chat.scroll = target;
+                        chat.stick_bottom = false;
+                        drop(chat);
+                        TranscriptView::request_recovery_action_refresh(ctx);
+                    });
+                rail = rail.with_child(SizedBox::new().width(28.0).height(12.0).child(MinimapTouchTrigger {
+                    key: marker.key, preview: Rc::clone(&self.minimap_touch), pointer: None,
+                    child: WidgetPod::new(
+                    Tooltip::new(marker.preview.clone(), button)
+                        .placement(TooltipPlacement::Above)
+                        .alignment(TooltipAlignment::End)
+                        .theme_when(clone_reader(&reader))),
+                }));
+            }
+            self.minimap = WidgetPod::new(rail);
+            self.minimap_markers = markers;
+        }
+        self.minimap.measure(ctx, Constraints::tight(Size::new(28.0, size.height)));
+        let key = self.minimap_touch.get().map(|(key, _)| key);
+        if key != self.minimap_preview_key {
+            self.minimap_preview_key = key;
+            self.minimap_preview = if let Some(marker) = self.minimap_markers.iter().find(|marker| Some(marker.key) == key) {
+                let state = Rc::clone(&self.minimap_touch);
+                let dismiss = Rc::clone(&self.minimap_touch);
+                let jump = Rc::clone(&self.minimap_touch);
+                let shared = self.shared.clone();
+                let offset = marker.offset;
+                let reader = shared_reader(&self.shared);
+                let button = sui::Button::new(format!("{}\n{}", compact_line(marker.preview.lines().next().unwrap_or("User message"), 40), compact_line(marker.preview.split_once('\n').map_or("", |(_, text)| text), 40)))
+                    .semantic_name(format!("Open message {} preview", marker.index + 1))
+                    .description("Tap to jump to this message")
+                    .min_height(64.0)
+                    .theme_when(clone_reader(&reader))
+                    .on_press_with_ctx(move |ctx| {
+                        let mut chat = shared.chat_mut();
+                        chat.scroll = offset;
+                        chat.stick_bottom = false;
+                        drop(chat);
+                        jump.set(None);
+                        TranscriptView::request_recovery_action_refresh(ctx);
+                    });
+                WidgetPod::new(sui::Popover::new("Message preview", SizedBox::new(),
+                    SizedBox::new().width((size.width - 48.0).min(340.0)).child(button))
+                    .alignment(sui::PopoverAlignment::End)
+                    .theme_when(clone_reader(&reader))
+                    .open_when(move || state.get().is_some())
+                    .on_open_change(move |open| { if !open { dismiss.set(None); } }))
+            } else { WidgetPod::new(SizedBox::new()) };
+        }
+        self.minimap_preview.measure(ctx, Constraints::tight(Size::ZERO));
     }
 
     fn rich_message_source(message: &ChatMessage) -> String {
@@ -17208,7 +17387,9 @@ impl Widget for TranscriptView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let size = constraints.max;
+        let available_size = constraints.max;
+        let rail_width = if available_size.width >= 320.0 { 36.0 } else { 0.0 };
+        let size = Size::new(available_size.width - rail_width, available_size.height);
         let messages = self.sync_rich_message_documents();
         let layouts = self.measure_rich_messages(ctx, &messages, size);
         *self.rich_message_layouts.borrow_mut() = layouts.clone();
@@ -17245,13 +17426,16 @@ impl Widget for TranscriptView {
         *self.trace_heights.borrow_mut() = trace_heights;
         self.content_height.set(total);
         drop(chat);
+        self.sync_minimap(ctx, available_size, &messages, &layouts);
         self.controls.measure(ctx, Constraints::tight(size));
-        size
+        available_size
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
         self.bounds.set(bounds);
         self.viewport_height.set(bounds.height());
+        self.minimap.arrange(ctx, Rect::new(bounds.max_x() - 28.0, bounds.y(), 28.0, bounds.height()));
+        let bounds = Rect::new(bounds.x(), bounds.y(), bounds.width() - if bounds.width() >= 320.0 { 36.0 } else { 0.0 }, bounds.height());
         let layouts = self.rich_message_layouts.borrow().clone();
         let layout_mode = TranscriptLayoutMode::for_width(bounds.width());
         let max_scroll = (self.content_height.get() - bounds.height()).max(0.0);
@@ -17280,6 +17464,9 @@ impl Widget for TranscriptView {
             y += item.bubble_h + layout_mode.message_gap();
         }
         self.controls.arrange(ctx, bounds);
+        if let Some((_, anchor)) = self.minimap_touch.get() {
+            self.minimap_preview.arrange(ctx, Rect::new(anchor.max_x(), anchor.y(), 0.0, 0.0));
+        }
     }
 
     fn accepts_focus(&self) -> bool {
@@ -17293,6 +17480,7 @@ impl Widget for TranscriptView {
         let area = ctx.bounds();
         self.bounds.set(area);
         self.viewport_height.set(area.height());
+        let area = Rect::new(area.x(), area.y(), area.width() - if area.width() >= 320.0 { 36.0 } else { 0.0 }, area.height());
 
         let chat = self.shared.chat();
         if chat.messages.is_empty() {
@@ -17466,6 +17654,8 @@ impl Widget for TranscriptView {
                     .padding(0.0, 0.0),
             );
         }
+        self.minimap.paint(ctx);
+        self.minimap_preview.paint(ctx);
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -17619,10 +17809,14 @@ impl Widget for TranscriptView {
             ctx.push(node);
         }
         self.controls.semantics(ctx);
+        self.minimap.semantics(ctx);
+        self.minimap_preview.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.controls);
+        visitor.visit(&self.minimap);
+        visitor.visit(&self.minimap_preview);
         for key in &self.message_order {
             if let Some(retained) = self.message_documents.get(key) {
                 visitor.visit(&retained.pod);
@@ -17632,6 +17826,8 @@ impl Widget for TranscriptView {
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.controls);
+        visitor.visit(&mut self.minimap);
+        visitor.visit(&mut self.minimap_preview);
         for key in self.message_order.clone() {
             if let Some(retained) = self.message_documents.get_mut(&key) {
                 visitor.visit(&mut retained.pod);
@@ -21163,6 +21359,115 @@ mod tests {
                 .count()?,
             1
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_minimap_preview_pairs_user_and_agent_within_turn() {
+        let messages = vec![
+            ChatMessage::model("Earlier response"),
+            ChatMessage::user("First question"),
+            ChatMessage::system_info("Working"),
+            ChatMessage::model("First answer"),
+            ChatMessage::user("Second question"),
+            ChatMessage::model(""),
+        ];
+        assert_eq!(conversation_turn_preview(&messages, 0), "Earlier user message not loaded\nEarlier response");
+        for index in 1..=3 {
+            assert_eq!(conversation_turn_preview(&messages, index), "First question\nFirst answer");
+        }
+        assert_eq!(conversation_turn_preview(&messages, 4), "Second question\nNo agent response yet");
+        assert_eq!(conversation_turn_preview(&messages, 5), "Second question\nNo agent response yet");
+    }
+
+    #[test]
+    fn conversation_minimap_samples_bounded_history() {
+        assert!(conversation_marker_indices(0, 24).is_empty());
+        assert!(conversation_marker_indices(1, 24).is_empty());
+        assert_eq!(conversation_marker_indices(3, 24), vec![0, 1, 2]);
+        let sampled = conversation_marker_indices(400, 24);
+        assert_eq!(sampled.len(), 24);
+        assert_eq!(sampled[0], 0);
+        assert_eq!(sampled[23], 399);
+        assert!(sampled.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn conversation_minimap_hover_and_jump() -> sui::Result<()> {
+        let shared = mock_chunked_timeline_shared("Minimap", 40, 1, 40, 1);
+        let runtime = sui::Application::new().window(
+            sui::WindowBuilder::new().title("Conversation minimap")
+                .root(TranscriptView::new(shared.clone(), SelectionScope::new()))
+        ).build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window.root().dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(1200.0, 720.0))))?;
+        app.run_until_idle()?;
+        let last = window.get_by_role(SemanticsRole::Button).with_name("Jump to message 40");
+        last.hover()?;
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+        window.capture_screenshot()?.write_png(std::env::temp_dir().join("sinomo-conversation-minimap.png"))?;
+        assert!(window.get_by_role(SemanticsRole::Tooltip).count()? > 0);
+        last.click()?;
+        app.run_until_idle()?;
+        assert!(shared.chat().scroll > 0.0);
+        window.get_by_role(SemanticsRole::Button).with_name("Jump to message 1").click()?;
+        app.run_until_idle()?;
+        assert!(shared.chat().scroll < 100.0);
+        window.root().dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(280.0, 720.0))))?;
+        app.run_until_idle()?;
+        assert_eq!(window.get_by_role(SemanticsRole::Button).with_name("Jump to message 1").count()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_minimap_touch_previews_before_navigating() -> sui::Result<()> {
+        let shared = mock_chunked_timeline_shared("Touch minimap", 40, 1, 40, 1);
+        let runtime = sui::Application::new().window(
+            sui::WindowBuilder::new().title("Touch minimap")
+                .root(TranscriptView::new(shared.clone(), SelectionScope::new()))
+        ).build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window.root().dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(360.0, 720.0))))?;
+        app.run_until_idle()?;
+        let bounds_for = |name: &str| {
+            window.snapshot().unwrap().accessibility.nodes.iter()
+                .find(|node| node.role == SemanticsRole::Button && node.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}")).bounds
+        };
+        let touch = |kind, bounds: Rect| -> sui::Result<()> {
+            let mut pointer = sui::PointerEvent::new(kind, Point::new(bounds.x() + bounds.width() / 2.0, bounds.y() + bounds.height() / 2.0));
+            pointer.pointer_id = 19;
+            pointer.pointer_kind = sui::PointerKind::Touch;
+            pointer.button = Some(PointerButton::Primary);
+            pointer.buttons = if kind == PointerEventKind::Down { sui::PointerButtons::new(1) } else { sui::PointerButtons::NONE };
+            window.root().dispatch_event(Event::Pointer(pointer))?;
+            app.run_until_idle()?;
+            Ok(())
+        };
+        let marker = bounds_for("Jump to message 40");
+        assert!(marker.height() <= 12.0);
+        let original_scroll = shared.chat().scroll;
+        touch(PointerEventKind::Down, marker)?;
+        assert_eq!(shared.chat().scroll, original_scroll);
+        touch(PointerEventKind::Up, marker)?;
+        assert_eq!(shared.chat().scroll, original_scroll, "releasing the first touch must not jump");
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+        let preview = bounds_for("Open message 40 preview");
+        window.capture_screenshot()?.write_png(std::env::temp_dir().join("sinomo-minimap-touch-preview.png"))?;
+        touch(PointerEventKind::Down, preview)?;
+        touch(PointerEventKind::Up, preview)?;
+        assert!(shared.chat().scroll > original_scroll);
+        assert_eq!(window.get_by_role(SemanticsRole::Button).with_name("Open message 40 preview").count()?, 0);
+        let after_jump = shared.chat().scroll;
+        let first = bounds_for("Jump to message 1");
+        touch(PointerEventKind::Down, first)?;
+        touch(PointerEventKind::Cancel, first)?;
+        assert_eq!(shared.chat().scroll, after_jump);
+        assert_eq!(window.get_by_role(SemanticsRole::Button).with_name("Open message 1 preview").count()?, 0);
         Ok(())
     }
 
