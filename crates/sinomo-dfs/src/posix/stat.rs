@@ -172,7 +172,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.stat_object_from_authorities(&object, path, Some(shards))
     }
 
-    pub(super) fn with_stat_deadline<R>(
+    pub(crate) fn with_stat_deadline<R>(
         &mut self,
         run: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
@@ -433,7 +433,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 }
 
-fn stat_from_projection<T: DfsMessageTransport>(
+pub(super) fn stat_from_projection<T: DfsMessageTransport>(
     service: &NetworkedDfsService<T>,
     mut object: DfsObjectMetadata,
     path: &str,

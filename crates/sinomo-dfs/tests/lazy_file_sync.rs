@@ -482,3 +482,162 @@ fn native_file_sync_stale_authority_redirects_to_local_main_after_real_handoff()
     drop(control);
     runtime.close().unwrap();
 }
+
+#[test]
+fn backendless_main_file_sync_preserves_opened_inode_across_writes_links_and_rename() {
+    use sinomo_dfs::{DfsNodeTransport, LocalContentStore, NetworkedDfsService};
+    const PATH: &str = "/services/backendless-file-sync.bin";
+    const ALIAS: &str = "/services/backendless-file-sync.link";
+    const SYMLINK: &str = "/services/backendless-file-sync.symlink";
+    const RENAMED: &str = "/backendless-file-sync-renamed.bin";
+    let (runtime, nodes) = DfsTestRuntime::start_cluster("backendless-file-sync", 3).unwrap();
+    let primary = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap()
+        .primary_node_id;
+    let mut writer = runtime.client(&primary).unwrap();
+    let options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(2, 2).unwrap(),
+        replica_candidates: nodes.clone(),
+        wait_for_commit: true,
+        foreground_replica_repair: true,
+    };
+    let first = writer
+        .posix_write_file(PATH, b"first actual version", options.clone())
+        .unwrap();
+    let (sync_peer, async_peer) = runtime.peer_transports(&primary).unwrap();
+    let transport = DfsNodeTransport::with_peer_transports_for_nodes(
+        primary.clone(),
+        nodes
+            .iter()
+            .filter(|node| **node != primary)
+            .cloned()
+            .collect::<Vec<_>>(),
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync_peer,
+        async_peer,
+    )
+    .with_registered_main_namespace_dispatch();
+    let content =
+        LocalContentStore::new(runtime.data_dir(&primary).dfs_dir().join("content")).unwrap();
+    let mut requester = NetworkedDfsService::new(transport, content)
+        .with_boxed_control_plane(runtime.control_plane_client().unwrap());
+    requester.bootstrap_distributed_sifs().unwrap();
+    requester.disable_implicit_read_replica_ingest();
+    assert!(requester.metadata_backend().is_none());
+    let initial = requester
+        .posix_capture_file_sync_target(PATH, DfsPosixSyncKind::File)
+        .unwrap();
+    assert_eq!(initial.object_id, first.object_id);
+    let latest = writer
+        .posix_write_file(
+            PATH,
+            b"another descriptor's committed version",
+            options.clone(),
+        )
+        .unwrap();
+    assert_eq!(latest.object_id, first.object_id);
+    assert_ne!(latest.version, first.version);
+    let current = requester
+        .posix_capture_file_sync_target_for_object(&first.object_id, DfsPosixSyncKind::File)
+        .unwrap();
+    assert_eq!(current.version, latest.version);
+    assert_eq!(current.content_hash, latest.content_hash.unwrap());
+    writer.posix_hardlink(PATH, ALIAS).unwrap();
+    let linked = writer.posix_stat_distributed(PATH).unwrap();
+    let alias = requester
+        .posix_capture_file_sync_target(ALIAS, DfsPosixSyncKind::File)
+        .unwrap();
+    assert_eq!(alias.object_id, current.object_id);
+    assert_eq!(alias.version, linked.version);
+    assert_eq!(alias.path, PATH);
+    let raw_alias = requester.posix_namespace_lstat_distributed(ALIAS).unwrap();
+    assert_eq!(raw_alias.kind, sinomo_dfs::DfsObjectKind::Hardlink);
+    assert_ne!(raw_alias.object_id, current.object_id);
+    assert_eq!(raw_alias.path, ALIAS);
+    assert_eq!(raw_alias.link_count, 2);
+    writer
+        .posix_symlink(PATH, SYMLINK, options.clone())
+        .unwrap();
+    assert_eq!(requester.posix_readlink_distributed(SYMLINK).unwrap(), PATH);
+    writer.posix_unlink(SYMLINK).unwrap();
+    assert_eq!(
+        requester.posix_read_file_distributed(ALIAS).unwrap(),
+        b"another descriptor's committed version"
+    );
+    let alias_write = requester
+        .posix_write_file(
+            ALIAS,
+            b"actual Main write through an alias",
+            options.clone(),
+        )
+        .unwrap();
+    assert_eq!(alias_write.object_id, current.object_id);
+    assert_eq!(
+        writer.posix_read_file_distributed(PATH).unwrap(),
+        b"actual Main write through an alias"
+    );
+    let reader_write = requester
+        .posix_write_file_from_reader(
+            ALIAS,
+            std::io::Cursor::new(b"actual Main reader write through an alias"),
+            options,
+        )
+        .unwrap();
+    assert_eq!(reader_write.object_id, current.object_id);
+    assert_eq!(
+        writer.posix_read_file_distributed(PATH).unwrap(),
+        b"actual Main reader write through an alias"
+    );
+    writer.posix_unlink(ALIAS).unwrap();
+    writer.posix_rename(PATH, RENAMED).unwrap();
+    let renamed = writer.posix_stat_distributed(RENAMED).unwrap();
+    assert_eq!(renamed.object_id, current.object_id);
+    let root_primary = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "root")
+        .unwrap()
+        .primary_node_id;
+    let receiver = runtime
+        .capture_namespace_requests(&root_primary, 32)
+        .unwrap();
+    let certificate = requester.posix_sync_file_target(&current).unwrap();
+    assert_eq!(
+        certificate.target, current,
+        "routing must not rewrite the frozen version/hash/path"
+    );
+    assert_eq!(certificate.content_evidence.required_receipts, 2);
+    assert!(certificate.content_evidence.receipt_node_ids.len() >= 2);
+    assert!(
+        receiver.records().iter().any(|frame| {
+            frame.target_node_id == root_primary
+                && matches!(
+                    &frame.message,
+                    sinomo_dfs::DfsNetworkMessage::NamespaceRequest(request)
+                        if matches!(&request.operation,
+                            sinomo_dfs::DfsNamespaceOperation::FileSync { path, target }
+                                if path == RENAMED && target == &current)
+                )
+        }),
+        "Main must receive the frozen target at its current namespace authority"
+    );
+    drop(receiver);
+    let after_rename = requester
+        .posix_capture_file_sync_target_for_object(&first.object_id, DfsPosixSyncKind::File)
+        .unwrap();
+    assert_eq!(after_rename.path, RENAMED);
+    assert_eq!(after_rename.version, renamed.version);
+    writer.posix_unlink(RENAMED).unwrap();
+    let unlinked_certificate = requester.posix_sync_file_target(&current).unwrap();
+    assert_eq!(unlinked_certificate.target, current);
+    assert_eq!(unlinked_certificate.content_evidence.required_receipts, 2);
+    assert!(requester.metadata_backend().is_none());
+    drop(requester);
+    drop(writer);
+    runtime.close().unwrap();
+}

@@ -39,6 +39,7 @@ fn write_configuration_no_links_pending_preserves_original_create_and_cas() {
         ),
     )
         as Box<dyn crate::DfsControlPlaneKvClient>);
+    let native_observer = runtime.metadata_primary_service(root).unwrap();
     let gap = runtime
         .lose_configuration_delta_and_pause_rebuild(
             &nodes[0],
@@ -74,9 +75,7 @@ fn write_configuration_no_links_pending_preserves_original_create_and_cas() {
             },
         ),
     ];
-    let before = backend
-        .lock_service()
-        .unwrap()
+    let before = native_observer
         .metadata_backend()
         .unwrap()
         .journal_last_sequence()
@@ -100,8 +99,7 @@ fn write_configuration_no_links_pending_preserves_original_create_and_cas() {
             _ => unreachable!(),
         };
         assert_eq!(bytes.as_ptr(), allocation);
-        let service = backend.lock_service().unwrap();
-        let metadata = service.metadata_backend().unwrap();
+        let metadata = native_observer.metadata_backend().unwrap();
         assert_eq!(metadata.journal_last_sequence().unwrap(), before);
         assert!(
             metadata
@@ -135,10 +133,9 @@ fn write_configuration_no_links_pending_preserves_original_create_and_cas() {
         else {
             panic!("one actual native content operation after readiness");
         };
-        let service = backend.lock_service().unwrap();
         let object = crate::DfsObjectId::new(&metadata.object_id).unwrap();
         let version = crate::DfsVersion::new(&metadata.version).unwrap();
-        let intents = service
+        let intents = native_observer
             .metadata_backend()
             .unwrap()
             .intents_for_object_version_page(&object, &version, None, 16)
@@ -156,7 +153,7 @@ fn write_configuration_no_links_pending_preserves_original_create_and_cas() {
         backend
             .lock_service()
             .unwrap()
-            .posix_read_file(&fresh_path)
+            .posix_read_file_distributed(&fresh_path)
             .unwrap(),
         b"fresh bytes"
     );
@@ -164,10 +161,11 @@ fn write_configuration_no_links_pending_preserves_original_create_and_cas() {
         backend
             .lock_service()
             .unwrap()
-            .posix_read_file(&existing_path)
+            .posix_read_file_distributed(&existing_path)
             .unwrap(),
         b"replaced bytes"
     );
+    drop(native_observer);
     drop(gap);
     drop(control);
     drop(backend);

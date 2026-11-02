@@ -10,6 +10,7 @@ pub(crate) struct RuntimeDfsBrowserServiceHost {
     task_owner: Arc<DfsRuntimeHost>,
     data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
     metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
+    data_plane: Arc<dyn crate::DfsDataPlaneHost>,
 }
 
 impl RuntimeDfsBrowserServiceHost {
@@ -20,6 +21,7 @@ impl RuntimeDfsBrowserServiceHost {
         task_owner: Arc<DfsRuntimeHost>,
         data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
         metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
+        data_plane: Arc<dyn crate::DfsDataPlaneHost>,
     ) -> Self {
         Self {
             paths,
@@ -28,11 +30,16 @@ impl RuntimeDfsBrowserServiceHost {
             task_owner,
             data_owner,
             metadata_authority,
+            data_plane,
         }
     }
 }
 
 impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
+    fn data_plane_host(&self) -> Option<Arc<dyn crate::DfsDataPlaneHost>> {
+        Some(Arc::clone(&self.data_plane))
+    }
+
     fn browser_open_runtime(&self) -> Option<tokio::runtime::Handle> {
         Some(self.runtime.clone())
     }

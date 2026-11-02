@@ -309,6 +309,58 @@ pub(crate) fn open_mounted_sifs_service_with_peer_transports_and_configuration(
     )
 }
 
+/// Build the hosted browser as a requester of its registered Main. Metadata
+/// queries and mutations use that owner; the browser retains no native image.
+pub(crate) fn open_hosted_browser_sifs_service(
+    data_dir: SinomoDataDir,
+    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    configuration: Option<Arc<crate::DfsWriteConfigurationProjection>>,
+) -> Result<OpenedMountedSifsService, DfsError> {
+    let (_, cluster_state, local_node_id, peer_node_ids) = mounted_sifs_cluster_context(&data_dir)?;
+    let control_plane = control_plane.ok_or_else(|| DfsError::Metadata {
+        message: "hosted SIFS browser requires its Main control-plane client".into(),
+    })?;
+    if cluster_state.is_none() {
+        return Err(DfsError::Metadata {
+            message: "hosted SIFS browser requires an initialized cluster".into(),
+        });
+    }
+    let replica_candidates = match configuration {
+        Some(configuration) => configuration.content_replica_candidates()?,
+        None => mounted_sifs_replica_candidates_from_context(
+            cluster_state.as_ref(),
+            local_node_id.clone(),
+            Some(control_plane.as_ref()),
+        )?,
+    };
+    let transport = DfsNodeTransport::with_peer_transports_for_nodes(
+        local_node_id,
+        peer_node_ids,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync_peer_transport,
+        async_peer_transport,
+    )
+    .with_registered_main_namespace_dispatch();
+    let content = crate::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let mut service =
+        NetworkedDfsService::new(transport, content).with_boxed_control_plane(control_plane);
+    service
+        .bootstrap_distributed_sifs()
+        .map_err(|source| match source {
+            DfsPosixError::Dfs(error) => error,
+            other => DfsError::Metadata {
+                message: other.to_string(),
+            },
+        })?;
+    service.disable_implicit_read_replica_ingest();
+    Ok(OpenedMountedSifsService {
+        service,
+        replica_candidates,
+    })
+}
+
 fn mounted_sifs_cluster_context(
     data_dir: &SinomoDataDir,
 ) -> Result<

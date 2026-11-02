@@ -59,9 +59,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target: &DfsPosixFileSyncTarget,
     ) -> Result<DfsPosixFileSyncCertificate> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let authority_path = self
-            .current_read_object_metadata(&target.object_id)
-            .ok()
+        let current_object = if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+        {
+            self.current_object_from_authority(&target.file_system_id, &target.object_id)?
+        } else {
+            self.current_read_object_metadata(&target.object_id).ok()
+        };
+        let authority_path = current_object
             .filter(|object| object.file_system_id == target.file_system_id)
             .map(|object| object.path)
             .unwrap_or_else(|| target.path.clone());
@@ -114,7 +119,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
         let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        let object = self.resolve_hardlink_target(&object)?;
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
@@ -158,9 +163,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: format!("{object_id}: directory sync kind used for a file"),
             });
         }
-        let object = self
-            .current_read_object_metadata(object_id)
-            .map_err(DfsPosixError::from)?;
+        let object = if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+        {
+            self.current_object_from_authority(&super::sifs_file_system_id(), object_id)?
+                .ok_or_else(|| DfsPosixError::NotFound {
+                    path: object_id.to_string(),
+                })?
+        } else {
+            self.current_read_object_metadata(object_id)
+                .map_err(DfsPosixError::from)?
+        };
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path: object.path });
         }

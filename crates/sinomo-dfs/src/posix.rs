@@ -3432,6 +3432,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
+    fn posix_write_parent_from_main(&mut self, path: &str) -> Result<DfsObjectMetadata> {
+        let parent = parent_posix_path(path)
+            .ok_or_else(|| DfsPosixError::IsDirectory { path: path.into() })?;
+        match self.lookup_sifs_path_direct_distributed_synced(&parent)? {
+            Some(object) if object.kind == DfsObjectKind::Directory => Ok(object),
+            Some(object) if object.kind != DfsObjectKind::Tombstone => {
+                Err(DfsPosixError::NotDirectory { path: parent })
+            }
+            _ => Err(DfsPosixError::MissingParent { path: parent }),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn posix_write_file_bytes_checked_parent_once_with_operation_id(
         &mut self,
@@ -3470,6 +3482,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
+        let main_requester = self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some();
+        let authoritative_parent = if check_parent && opened_parent.is_none() && main_requester {
+            Some(self.posix_write_parent_from_main(&path)?)
+        } else {
+            None
+        };
+        let opened_parent = opened_parent.or(authoritative_parent.as_ref());
         if check_parent {
             if let Some(parent) = opened_parent {
                 // The no-link caller already checked this exact authoritative
@@ -3491,7 +3512,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_path = path.clone();
         let trace_bytes = bytes.len();
         let mut transient_create = false;
-        let mut object = match self.lookup_sifs_path(&path)? {
+        let current_object = if main_requester {
+            self.lookup_sifs_path_direct_distributed_synced(&path)?
+        } else {
+            self.lookup_sifs_path(&path)?
+        };
+        let mut object = match current_object {
             Some(object)
                 if exclusive_create
                     && object.kind != DfsObjectKind::Tombstone
@@ -3525,7 +3551,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::IsDirectory { path });
             }
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                self.resolve_hardlink_target(&object)?
+                self.resolve_hardlink_target_distributed(&object, None)?
             }
             Some(object)
                 if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
@@ -3788,6 +3814,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // Main owns the committed object and parent update. Its
                     // validated reply retired the planning overlay; use the
                     // actual durable head rather than rebuilding that overlay.
+                    if self.metadata_backend.is_none() {
+                        return self.with_stat_deadline(|service| {
+                            let authoritative = service
+                                .current_object_from_authority(
+                                    &object.file_system_id,
+                                    &object.object_id,
+                                )?
+                                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                            service.with_stat_read_rounds(|service| {
+                                service.stat_object_from_authorities(&authoritative, &path, None)
+                            })
+                        });
+                    }
                     let authoritative = self.stat_target_for_path(&path)?;
                     return self.stat_object_for_path(&authoritative, &path);
                 }
@@ -4312,11 +4351,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        if check_parent {
-            self.ensure_parent_directory(&path)?;
-        }
+        let main_requester = self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some();
+        let authoritative_parent = if check_parent && main_requester {
+            Some(self.posix_write_parent_from_main(&path)?)
+        } else {
+            if check_parent {
+                self.ensure_parent_directory(&path)?;
+            }
+            None
+        };
+        let current_object = if main_requester {
+            self.lookup_sifs_path_direct_distributed_synced(&path)?
+        } else {
+            self.lookup_sifs_path(&path)?
+        };
         let mut transient_create = false;
-        let mut object = match self.lookup_sifs_path(&path)? {
+        let mut object = match current_object {
             Some(object)
                 if exclusive_create
                     && object.kind != DfsObjectKind::Tombstone
@@ -4338,7 +4390,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::IsDirectory { path });
             }
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                self.resolve_hardlink_target(&object)?
+                self.resolve_hardlink_target_distributed(&object, None)?
             }
             Some(object)
                 if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
@@ -4349,7 +4401,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object =
                     recreated_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
-                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                let attrs = match authoritative_parent.as_ref() {
+                    Some(parent) => {
+                        inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid)
+                    }
+                    None => self.posix_create_attrs_for_object_authority(&object, attrs, false)?,
+                };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id.as_deref() {
                     object.object_id =
@@ -4367,7 +4424,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object =
                     new_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
-                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                let attrs = match authoritative_parent.as_ref() {
+                    Some(parent) => {
+                        inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid)
+                    }
+                    None => self.posix_create_attrs_for_object_authority(&object, attrs, false)?,
+                };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id.as_deref() {
                     object.object_id =
@@ -4552,6 +4614,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if self.transport.delegates_local_namespace_authority()
                     && self.is_local_metadata_primary_for_object(&object)?
                 {
+                    if self.metadata_backend.is_none() {
+                        return self.with_stat_deadline(|service| {
+                            let authoritative = service
+                                .current_object_from_authority(
+                                    &object.file_system_id,
+                                    &object.object_id,
+                                )?
+                                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                            service.with_stat_read_rounds(|service| {
+                                service.stat_object_from_authorities(&authoritative, &path, None)
+                            })
+                        });
+                    }
                     let authoritative = self.stat_target_for_path(&path)?;
                     return self.stat_object_for_path(&authoritative, &path);
                 }

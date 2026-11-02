@@ -20,9 +20,10 @@ use crate::posix_path::{
     subtree_prefix,
 };
 use crate::{
-    DfsMessageCommittedWork, DfsMessageTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind,
-    DfsNamespaceJobOrigin, DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation,
-    DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService,
+    DfsError, DfsMessageCommittedWork, DfsMessageTransport, DfsMetadataQueryResult,
+    DfsMetadataSelection, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobOrigin,
+    DfsNamespaceJobRecord, DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceTransaction,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, NetworkedDfsService, sifs_file_system_id,
 };
 
 pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
@@ -85,7 +86,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
         self.check_cancelled("namespace job resume")?;
-        let Some(mut job) = self.namespace_job(job_id)? else {
+        let job = if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some()
+        {
+            // Main owns the durable job. A requester can have no local tables,
+            // including immediately after Main accepted its original begin.
+            let file_system_id = sifs_file_system_id();
+            let mut current = None;
+            for shard in self.metadata_shard_authorities(&file_system_id)? {
+                let DfsMetadataQueryResult::NamespaceJob { job, .. } = self
+                    .query_metadata_authority_impl(
+                        &shard,
+                        DfsMetadataSelection::NamespaceJob {
+                            job_id: job_id.to_owned(),
+                        },
+                    )?
+                else {
+                    return Err(DfsError::Metadata {
+                        message: "namespace job authority returned the wrong query kind".into(),
+                    }
+                    .into());
+                };
+                if let Some(job) = job {
+                    if job.job_id != job_id || job.file_system_id != file_system_id {
+                        return Err(DfsError::Metadata {
+                            message: "namespace job authority returned a foreign job".into(),
+                        }
+                        .into());
+                    }
+                    current = Some(*job);
+                    break;
+                }
+            }
+            current
+        } else {
+            self.namespace_job(job_id)?
+        };
+        let Some(mut job) = job else {
             return Err(DfsPosixError::NotFound {
                 path: job_id.to_string(),
             });

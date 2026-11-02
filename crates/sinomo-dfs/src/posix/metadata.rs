@@ -20,9 +20,10 @@ use crate::posix_path::{
     posix_path_has_dot_components, posix_path_is_at_or_under_prefix, resolve_posix_symlink_target,
 };
 use crate::{
-    DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileSystemId, DfsMessageTransport,
-    DfsMetadataShardConfig, DfsNamespaceOperation, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsReadData, NetworkedDfsReadOutcome, NetworkedDfsService, sifs_file_system_id,
+    DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystemId, DfsMessageTransport,
+    DfsMetadataQueryResult, DfsMetadataSelection, DfsMetadataShardConfig, DfsNamespaceOperation,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReadData, NetworkedDfsReadOutcome,
+    NetworkedDfsService, sifs_file_system_id,
 };
 
 #[cfg(test)]
@@ -610,7 +611,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     });
                 }
                 known_live_ancestors = true;
-                let object = self.resolve_hardlink_target(&object)?;
+                let object = self.resolve_hardlink_target_distributed(
+                    &object,
+                    target_shard_snapshot.as_deref(),
+                )?;
                 if object.kind == DfsObjectKind::Symlink {
                     let target = self.symlink_target_for_object_distributed(&candidate, &object)?;
                     followed_symlink = Some(candidate.clone());
@@ -1352,6 +1356,66 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
     ) -> Result<DfsObjectMetadata> {
         resolve_hardlink_target_with(object, |target_id| self.object_by_id(target_id))
+    }
+
+    pub(super) fn resolve_hardlink_target_distributed(
+        &mut self,
+        object: &DfsObjectMetadata,
+        captured_catalog: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<DfsObjectMetadata> {
+        if object.kind != DfsObjectKind::Hardlink
+            || self.metadata_backend.is_some()
+            || !self.transport.delegates_local_namespace_authority()
+            || self.control_plane.is_none()
+        {
+            return self.resolve_hardlink_target(object);
+        }
+        let owned_catalog;
+        let catalog = match captured_catalog {
+            Some(catalog) => catalog,
+            None => {
+                owned_catalog = self.metadata_shard_authorities(&object.file_system_id)?;
+                &owned_catalog
+            }
+        };
+        resolve_hardlink_target_with(object, |target_id| {
+            for shard in catalog {
+                let DfsMetadataQueryResult::CurrentObject { object: target } = self
+                    .query_metadata_authority_from_snapshot(
+                        shard,
+                        DfsMetadataSelection::CurrentObject {
+                            object_id: target_id.clone(),
+                        },
+                        Some(catalog),
+                    )?
+                else {
+                    return Err(DfsError::Metadata {
+                        message: "hardlink authority returned the wrong query kind".into(),
+                    }
+                    .into());
+                };
+                if let Some(target) = target {
+                    if target.file_system_id != object.file_system_id
+                        || &target.object_id != target_id
+                        || target.tombstone_provenance.is_some()
+                    {
+                        return Err(DfsError::Metadata {
+                            message: "hardlink authority returned a foreign target".into(),
+                        }
+                        .into());
+                    }
+                    if !self.transient_metadata_object_ids.contains(target_id) {
+                        self.namespace_execution.observe_path(
+                            &target.file_system_id,
+                            &target.path,
+                            Some(target.as_ref()),
+                        );
+                    }
+                    return Ok(Some(*target));
+                }
+            }
+            Ok(None)
+        })
     }
 
     /// Stat for a path that a routed unlink/rmdir just tombstoned; the
