@@ -388,9 +388,13 @@ without attempting an eligible candidate.
 When a path cannot be realized, routing returns a structured establishment
 failure identifying the rejected or failed edge, submits that evidence to
 connectivity, and tries a bounded eligible alternative within the connection
-deadline. This closes the loop between the control-plane graph and the data
-plane: stale graph reachability is corrected rather than repeatedly advertised
-as usable.
+deadline. Alternatives overlap: the next ranked candidate starts when the
+previous one fails or after a short stagger, and the first established session
+wins, so a wrong rank order costs the stagger rather than an attempt budget. A
+candidate over an unverified edge is speculative and gets only a hop-scaled
+handshake window. This closes the loop between the control-plane graph and the
+data plane: stale graph reachability is corrected rather than repeatedly
+advertised as usable.
 
 ### Routed-Session Establishment
 

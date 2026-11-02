@@ -22,6 +22,7 @@ use crate::owned_chunk::{
 };
 #[cfg(test)]
 use crate::owned_chunk::{ChunkPool, MUX_RECORD_MAX, SECURE_WIRE_MAX};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use sinomo_base::{ClusterEndpointRecord, Id};
 use sinomo_node::NodeId;
@@ -42,6 +43,9 @@ const MAX_ROUTE_SEARCH_STATES: usize = 4096;
 const MAX_ROUTED_SESSION_HOPS: usize = 16;
 const ROUTED_CANDIDATE_BASE_HANDSHAKE_BUDGET: Duration = Duration::from_millis(100);
 const ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET: Duration = Duration::from_millis(250);
+/// Delay before the next ranked candidate starts while the previous one is
+/// still in flight, as in the connection attempt delay of RFC 8305.
+const ROUTED_CANDIDATE_STAGGER: Duration = Duration::from_millis(250);
 /// Receiver-side wall-clock tolerance for a signed routed-session deadline.
 ///
 /// The caller's monotonic timeout still bounds its own work. This tolerance
@@ -3303,114 +3307,51 @@ impl MultiHopRoutedConnector {
         tracing::trace!(target: "sinomo.perf", local_node_id = %self.local_node_id,
             peer_node_id = %destination_node_id, ?destination_process_affinity,
             path_count, phase = "planned", "routed candidate boundary");
+        // Candidates start in rank order: the next one as soon as the previous
+        // fails, or after a short stagger while it is still in flight. The
+        // first established session wins and the others are dropped, so a
+        // wrong rank order costs the stagger rather than an attempt budget.
+        let mut candidates = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| !path.hops.is_empty())
+            .collect::<VecDeque<_>>();
+        let mut in_flight = FuturesUnordered::new();
         let mut attempts = 0_usize;
         let mut failures = Vec::new();
-        for (path_index, path) in paths.iter().enumerate() {
-            let Some(first_hop) = path.hops.first() else {
-                continue;
-            };
-            attempts = attempts.saturating_add(1);
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let paths_left =
-                u32::try_from(path_count.saturating_sub(path_index)).unwrap_or(u32::MAX);
-            let attempt_timeout =
-                routed_candidate_attempt_timeout(remaining, paths_left, path.hops.len());
-            let attempt_deadline_unix_millis = routed_session_deadline_unix_millis(attempt_timeout);
-            enum PathAttemptError {
-                DirectEdge(NetworkError),
-                RoutedSession(NetworkError),
-            }
-            let direct_edge_established = Arc::new(AtomicBool::new(false));
-            let established = Arc::clone(&direct_edge_established);
-            tracing::trace!(target: "sinomo.perf", local_node_id = %self.local_node_id,
-                peer_node_id = %destination_node_id, path_index, path_count,
-                path = ?path.nodes, endpoint_id = %first_hop.endpoint.endpoint_id,
-                address = %first_hop.endpoint.address, budget_us = attempt_timeout.as_micros() as u64,
-                phase = "direct-connect", "routed candidate boundary");
-            let attempt = async {
-                let link = self
-                    .link_provider
-                    .connect(&first_hop.endpoint)
-                    .await
-                    .map_err(PathAttemptError::DirectEdge)?;
-                if link.local_node_id() != &self.local_node_id
-                    || link.peer_node_id() != &first_hop.target_node_id
-                    || !options
-                        .constraints
-                        .accepts_capabilities(link.capabilities())
-                    || (path.hops.len() > 1 && !link.capabilities().relay_forwarding)
-                {
-                    return Err(PathAttemptError::DirectEdge(NetworkError::AuthDenied));
-                }
-                tracing::trace!(target: "sinomo.perf", path_index,
-                    phase = "authenticated-link-open", "routed candidate boundary");
-                let stream = link
-                    .open_stream()
-                    .await
-                    .map_err(PathAttemptError::DirectEdge)?;
-                established.store(true, Ordering::Release);
-                tracing::trace!(target: "sinomo.perf", path_index,
-                    phase = "routed-session-acceptance", "routed candidate boundary");
-                initiate_routed_session(
-                    stream,
-                    directory,
+        let mut next_start = tokio::time::Instant::now();
+        loop {
+            let now = tokio::time::Instant::now();
+            if (in_flight.is_empty() || now >= next_start)
+                && let Some((path_index, path)) = candidates.pop_front()
+            {
+                attempts = attempts.saturating_add(1);
+                let remaining = deadline.saturating_duration_since(now);
+                next_start = now
+                    + routed_candidate_stagger(remaining, path_count.saturating_sub(path_index));
+                in_flight.push(self.attempt_routed_candidate(
+                    &destination_node_id,
+                    path_index,
+                    path_count,
                     path,
-                    self.identity.as_ref(),
-                    attempt_deadline_unix_millis,
-                    options.protection,
-                )
-                .await
-                .map_err(PathAttemptError::RoutedSession)
-            };
-            match tokio::time::timeout(attempt_timeout, attempt).await {
-                Ok(Ok(stream)) => {
-                    tracing::trace!(target: "sinomo.perf", path_index,
-                        phase = "established", "routed candidate boundary");
-                    return Ok(stream);
-                }
-                Ok(Err(PathAttemptError::DirectEdge(error))) => {
-                    report_routed_edge_failure(
-                        Some(self.failure_sink.as_ref()),
-                        &first_hop.source_node_id,
-                        &first_hop.target_node_id,
-                        &first_hop.endpoint.endpoint_id,
-                        &error,
-                    );
-                    failures.push(format!("{}: {error}", first_hop.endpoint.address));
-                }
-                Ok(Err(PathAttemptError::RoutedSession(error))) => failures.push(format!(
-                    "path {}: {error}",
-                    path.nodes
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" -> ")
-                )),
-                Err(_) => {
-                    let error = NetworkError::timeout(
-                        format!(
-                            "establish routed candidate path {}",
-                            path.nodes
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(" -> ")
-                        ),
-                        NetworkTimeoutPhase::Connect,
-                        attempt_timeout,
-                        NetworkDeliveryState::DefinitelyNotSent,
-                    );
-                    if !direct_edge_established.load(Ordering::Acquire) {
-                        report_routed_edge_failure(
-                            Some(self.failure_sink.as_ref()),
-                            &first_hop.source_node_id,
-                            &first_hop.target_node_id,
-                            &first_hop.endpoint.endpoint_id,
-                            &error,
-                        );
+                    options,
+                    remaining,
+                ));
+                continue;
+            }
+            if in_flight.is_empty() {
+                break;
+            }
+            let more_candidates = !candidates.is_empty();
+            tokio::select! {
+                Some(outcome) = in_flight.next() => match outcome {
+                    Ok(stream) => return Ok(stream),
+                    Err(failure) => {
+                        failures.push(failure);
+                        next_start = tokio::time::Instant::now();
                     }
-                    failures.push(error.to_string());
-                }
+                },
+                () = tokio::time::sleep_until(next_start), if more_candidates => {}
             }
         }
         Err(NetworkError::RetryExhausted {
@@ -3423,6 +3364,121 @@ impl MultiHopRoutedConnector {
                 failures.join("; ")
             },
         })
+    }
+
+    /// One candidate path attempt, bounded by `routed_candidate_attempt_timeout`.
+    /// A failed direct edge submits failure evidence; an attempt dropped because
+    /// another candidate won submits none.
+    async fn attempt_routed_candidate(
+        &self,
+        destination_node_id: &NodeId,
+        path_index: usize,
+        path_count: usize,
+        path: &CandidatePath,
+        options: ConnectOptions,
+        remaining: Duration,
+    ) -> Result<PeerStream, String> {
+        let Some(first_hop) = path.hops.first() else {
+            return Err("candidate path has no hops".to_string());
+        };
+        let attempt_timeout = routed_candidate_attempt_timeout(remaining, path);
+        let attempt_deadline_unix_millis = routed_session_deadline_unix_millis(attempt_timeout);
+        enum PathAttemptError {
+            DirectEdge(NetworkError),
+            RoutedSession(NetworkError),
+        }
+        let direct_edge_established = Arc::new(AtomicBool::new(false));
+        let established = Arc::clone(&direct_edge_established);
+        tracing::trace!(target: "sinomo.perf", local_node_id = %self.local_node_id,
+            peer_node_id = %destination_node_id, path_index, path_count,
+            path = ?path.nodes, endpoint_id = %first_hop.endpoint.endpoint_id,
+            address = %first_hop.endpoint.address, budget_us = attempt_timeout.as_micros() as u64,
+            phase = "direct-connect", "routed candidate boundary");
+        let attempt = async {
+            let link = self
+                .link_provider
+                .connect(&first_hop.endpoint)
+                .await
+                .map_err(PathAttemptError::DirectEdge)?;
+            if link.local_node_id() != &self.local_node_id
+                || link.peer_node_id() != &first_hop.target_node_id
+                || !options
+                    .constraints
+                    .accepts_capabilities(link.capabilities())
+                || (path.hops.len() > 1 && !link.capabilities().relay_forwarding)
+            {
+                return Err(PathAttemptError::DirectEdge(NetworkError::AuthDenied));
+            }
+            tracing::trace!(target: "sinomo.perf", path_index,
+                phase = "authenticated-link-open", "routed candidate boundary");
+            let stream = link
+                .open_stream()
+                .await
+                .map_err(PathAttemptError::DirectEdge)?;
+            established.store(true, Ordering::Release);
+            tracing::trace!(target: "sinomo.perf", path_index,
+                phase = "routed-session-acceptance", "routed candidate boundary");
+            initiate_routed_session(
+                stream,
+                &self.directory,
+                path,
+                self.identity.as_ref(),
+                attempt_deadline_unix_millis,
+                options.protection,
+            )
+            .await
+            .map_err(PathAttemptError::RoutedSession)
+        };
+        match tokio::time::timeout(attempt_timeout, attempt).await {
+            Ok(Ok(stream)) => {
+                tracing::trace!(target: "sinomo.perf", path_index,
+                    phase = "established", "routed candidate boundary");
+                Ok(stream)
+            }
+            Ok(Err(PathAttemptError::DirectEdge(error))) => {
+                report_routed_edge_failure(
+                    Some(self.failure_sink.as_ref()),
+                    &first_hop.source_node_id,
+                    &first_hop.target_node_id,
+                    &first_hop.endpoint.endpoint_id,
+                    &error,
+                );
+                Err(format!("{}: {error}", first_hop.endpoint.address))
+            }
+            Ok(Err(PathAttemptError::RoutedSession(error))) => Err(format!(
+                "path {}: {error}",
+                path.nodes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            )),
+            Err(_) => {
+                let error = NetworkError::timeout(
+                    format!(
+                        "establish routed candidate path {}",
+                        path.nodes
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    ),
+                    NetworkTimeoutPhase::Connect,
+                    attempt_timeout,
+                    NetworkDeliveryState::DefinitelyNotSent,
+                );
+                if !direct_edge_established.load(Ordering::Acquire) {
+                    report_routed_edge_failure(
+                        Some(self.failure_sink.as_ref()),
+                        &first_hop.source_node_id,
+                        &first_hop.target_node_id,
+                        &first_hop.endpoint.endpoint_id,
+                        &error,
+                    );
+                }
+                Err(error.to_string())
+            }
+        }
     }
 
     pub(crate) fn connect_with_destination_process_affinity<'a>(
@@ -3449,33 +3505,38 @@ impl MultiHopRoutedConnector {
     }
 }
 
-fn routed_candidate_attempt_timeout(
-    remaining: Duration,
-    paths_left: u32,
-    hop_count: usize,
-) -> Duration {
-    let paths_left = paths_left.max(1);
-    let equal_share = remaining.checked_div(paths_left).unwrap_or(remaining);
-    if paths_left == 1 {
-        return remaining.max(Duration::from_millis(1));
-    }
+/// Budget for one candidate attempt. Attempts overlap, so a proven path may
+/// use the rest of the connection deadline without starving the candidates
+/// ranked behind it. A path over an unverified edge is speculative: it gets
+/// only a hop-scaled handshake window, so a connect whose proven candidates
+/// already failed does not wait out the deadline on an endpoint that nobody
+/// has reached yet.
+fn routed_candidate_attempt_timeout(remaining: Duration, path: &CandidatePath) -> Duration {
+    let budget = if path.unverified_hop_count() == 0 {
+        remaining
+    } else {
+        routed_candidate_handshake_budget(path.hops.len()).min(remaining)
+    };
+    budget.max(Duration::from_millis(1))
+}
 
-    // A routed-session open is verified and forwarded once per hop. Dividing
-    // the operation deadline equally across every graph candidate can leave a
-    // multi-hop candidate only a few milliseconds at its final relay when the
-    // planner emits the full candidate set. Preserve a usable hop-scaled
-    // handshake window while reserving at least half of the current budget for
-    // another candidate. Fast authentication or dial failures still move to
-    // the next path immediately.
-    let hop_budget = ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET
+// A routed-session open is verified and forwarded once per hop, so a
+// multi-hop handshake needs a proportionally larger window.
+fn routed_candidate_handshake_budget(hop_count: usize) -> Duration {
+    ROUTED_CANDIDATE_PER_HOP_HANDSHAKE_BUDGET
         .checked_mul(u32::try_from(hop_count).unwrap_or(u32::MAX))
         .unwrap_or(Duration::MAX)
-        .saturating_add(ROUTED_CANDIDATE_BASE_HANDSHAKE_BUDGET);
-    let fallback_preserving_cap = remaining.checked_div(2).unwrap_or(remaining);
-    equal_share
-        .max(hop_budget.min(fallback_preserving_cap))
-        .min(remaining)
-        .max(Duration::from_millis(1))
+        .saturating_add(ROUTED_CANDIDATE_BASE_HANDSHAKE_BUDGET)
+}
+
+/// How long the next candidate waits behind one still in flight: long enough
+/// for a reachable handshake to win, short enough that every remaining
+/// candidate starts before the connection deadline.
+fn routed_candidate_stagger(remaining: Duration, candidates_left: usize) -> Duration {
+    let share = remaining
+        .checked_div(u32::try_from(candidates_left.max(1)).unwrap_or(u32::MAX))
+        .unwrap_or(remaining);
+    ROUTED_CANDIDATE_STAGGER.min(share)
 }
 
 impl RoutedConnector for MultiHopRoutedConnector {
@@ -4968,14 +5029,11 @@ mod tests {
         }));
 
         let overall_timeout = Duration::from_millis(700);
-        let first_attempt_timeout = routed_candidate_attempt_timeout(
-            overall_timeout,
-            u32::try_from(paths.len()).expect("candidate count"),
-            paths[0].hops.len(),
-        );
+        let fallback_stagger = routed_candidate_stagger(overall_timeout, paths.len());
         assert!(
-            first_attempt_timeout < overall_timeout,
-            "Iroh must share the unchanged deadline with every stale fallback candidate"
+            fallback_stagger.saturating_mul(u32::try_from(paths.len()).expect("candidate count"))
+                <= overall_timeout,
+            "every stale fallback must start within the unchanged deadline while Iroh is in flight"
         );
 
         let network = TestRelayNetwork::new(directory.clone(), connectivity);
@@ -6207,7 +6265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_hop_connector_timeslices_candidates_before_retrying_another_endpoint() {
+    async fn multi_hop_connector_staggers_past_a_stalled_candidate() {
         let source = node("node_relay_endpoint_budget_source");
         let destination = node("node_relay_endpoint_budget_destination");
         let first = edge(
@@ -6245,16 +6303,22 @@ mod tests {
         )
         .expect("multi-hop connector");
 
+        let started = tokio::time::Instant::now();
         let mut stream = connector
             .connect(
                 destination.clone(),
                 ConnectOptions {
-                    timeout: Duration::from_millis(400),
+                    timeout: Duration::from_secs(5),
                     ..ConnectOptions::default()
                 },
             )
             .await
-            .expect("second endpoint should retain a bounded attempt window");
+            .expect("the second endpoint starts while the first is still stalled");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a stalled candidate must delay the next one by the stagger, not its budget: {:?}",
+            started.elapsed()
+        );
         stream
             .write_all(TEST_ROUTED_PAYLOAD)
             .await
@@ -6281,7 +6345,8 @@ mod tests {
                 .find(|edge| edge.endpoint.endpoint_id == first_endpoint_id)
                 .expect("first endpoint")
                 .state,
-            DirectConnectivityState::Unreachable
+            DirectConnectivityState::Reachable,
+            "an attempt overtaken by another candidate neither failed nor succeeded"
         );
         assert_eq!(stream.route_trace.endpoint_ids, vec![second_endpoint_id]);
     }
@@ -6301,15 +6366,21 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let first_endpoint_id = edges[0].endpoint.endpoint_id.clone();
         let second_endpoint_id = edges[1].endpoint.endpoint_id.clone();
+        // Every other candidate stalls, so only the delayed second one can
+        // establish; overlapping attempts must not cut its handshake short.
+        let stalled = edges
+            .iter()
+            .map(|edge| edge.endpoint.endpoint_id.clone())
+            .filter(|endpoint_id| *endpoint_id != second_endpoint_id)
+            .collect::<BTreeSet<_>>();
         let (directory, connectivity) = fixtures(57, std::mem::take(&mut edges));
         let network = TestRelayNetwork::new(directory.clone(), connectivity);
         network
             .stalled_endpoints
             .lock()
             .expect("stalled endpoints lock")
-            .insert(first_endpoint_id);
+            .extend(stalled);
         network
             .delayed_endpoints
             .lock()
@@ -6350,6 +6421,92 @@ mod tests {
         assert_eq!(stream.route_trace.endpoint_ids, vec![second_endpoint_id]);
         stream.shutdown().await.expect("close routed session");
         network.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn multi_hop_connector_does_not_wait_out_the_deadline_on_unverified_candidates() {
+        let source = node("node_relay_unverified_budget_source");
+        let destination = node("node_relay_unverified_budget_destination");
+        let proven = edge(
+            &source,
+            &destination,
+            "endpoint_relay_unverified_budget_proven",
+            61,
+            1,
+        );
+        let mut unverified = edge(
+            &source,
+            &destination,
+            "endpoint_relay_unverified_budget_unverified",
+            61,
+            1,
+        );
+        unverified.state = DirectConnectivityState::Unverified;
+        unverified.latency_micros = None;
+        let unverified_endpoint_id = unverified.endpoint.endpoint_id.clone();
+        let (directory, connectivity) = fixtures(61, vec![proven, unverified]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        // The destination has not yet learned the source's membership, as a
+        // just-admitted member has not, and its unverified endpoint is one
+        // the source cannot reach.
+        network
+            .rejected_origins
+            .lock()
+            .expect("rejected origins lock")
+            .entry(destination.clone())
+            .or_default()
+            .insert(source.clone());
+        network
+            .stalled_endpoints
+            .lock()
+            .expect("stalled endpoints lock")
+            .insert(unverified_endpoint_id.clone());
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source.clone(),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let started = tokio::time::Instant::now();
+        let error = connector
+            .connect(
+                destination,
+                ConnectOptions {
+                    timeout: Duration::from_secs(5),
+                    ..ConnectOptions::default()
+                },
+            )
+            .await
+            .err()
+            .expect("the refused and the unreachable candidate both fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an unverified candidate must not hold the connect until its deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(error, NetworkError::RetryExhausted { attempts: 2, .. }),
+            "{error}"
+        );
+        network.wait_idle().await;
+        assert_eq!(
+            network
+                .connectivity
+                .snapshot()
+                .edges()
+                .iter()
+                .find(|edge| edge.endpoint.endpoint_id == unverified_endpoint_id)
+                .expect("unverified endpoint")
+                .state,
+            DirectConnectivityState::Unreachable,
+            "the timed-out speculative edge submits failure evidence"
+        );
     }
 
     #[tokio::test]
