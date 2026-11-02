@@ -26315,6 +26315,37 @@ mod tests {
         assert!(window.get_by_text("Storage needs attention").count()? >= 1);
         assert!(window.get_by_text("Missing copies").count()? >= 1);
         assert!(window.get_by_text("Attempt evidence").count()? >= 1);
+        // Missing-copy rows identify immutable objects and versions; paths and
+        // Show file belonged to the removed conflict-record view.
+        let overview = test_storage_overview();
+        let snapshot = window.snapshot()?;
+        for repair in &overview.repairs {
+            for (label, value) in [
+                (
+                    "Missing from",
+                    short_node_label(repair.missing_replica_node_id.as_str()),
+                ),
+                ("Version", middle_short(repair.version.as_str(), 24)),
+                ("Object", middle_short(repair.object_id.as_str(), 24)),
+            ] {
+                assert!(
+                    snapshot
+                        .accessibility
+                        .nodes
+                        .iter()
+                        .any(|node| node.name.as_deref() == Some(label)
+                            && node.value == Some(sui::SemanticsValue::Text(value.clone()))),
+                    "missing {label}: {value}"
+                );
+            }
+        }
+        for name in ["Open Cluster", "Mount & sync", "Reconciliation activity"] {
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name(name)
+                .expect()
+                .to_be_visible()?;
+        }
         Ok(())
     }
 
