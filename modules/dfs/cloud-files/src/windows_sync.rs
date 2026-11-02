@@ -186,15 +186,6 @@ pub(crate) fn fresh_writable_scopes_are_absent(
     fresh_reconciliation_scope_is_absent(data_dir, mount, root).map_err(reconcile_error)
 }
 
-/// Apply the mounted-reader policy used by the production Cloud Files service.
-/// Explicit directory refresh remains handoff-wrapped, but stat/lstat must not
-/// implicitly ingest replica journals through an unowned SyncPath fallback.
-pub(crate) fn configure_cloud_files_mounted_read_policy<T: dfs::DfsMessageTransport>(
-    service: &mut dfs::NetworkedDfsService<T>,
-) {
-    service.disable_implicit_read_replica_ingest();
-}
-
 fn cloud_files_mount_open_committed_work() -> dfs::DfsCommittedWork {
     // Backend constructors and bootstrap recovery predate operation-local work
     // tracking. Conservatively transfer every bounded daemon ownership bit.
@@ -6027,13 +6018,9 @@ mod tests {
             assert!(
                 actual.primary_node_id != local_node
                     && !actual.replica_node_ids.contains(&local_node),
-                "replica locality must not mask the disabled implicit-sync branch"
+                "replica locality must not mask the authority-only read branch"
             );
         };
-
-        // This is the exact policy hook invoked by open_sifs_service after its
-        // Armed-window bootstrap and before the service can reach CFAPI.
-        configure_cloud_files_mounted_read_policy(&mut service);
 
         assert_current_reader_is_outside();
         let baseline = runtime.rpc_observations().len();

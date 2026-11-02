@@ -1,9 +1,10 @@
 /// DFS metadata journal and snapshot source validation.
 ///
 /// This module models source validation before a node applies metadata journal
-/// batches or compact snapshot installs. It deliberately separates the strict
-/// standalone replica processor from the service-level routed catch-up handler,
-/// because the latter accepts primary-sourced data for non-replica mirrors.
+/// batches or compact snapshot installs, through the standalone replica
+/// processor or the service. Only a shard's configured replicas ingest its
+/// metadata; `localConfiguredReplica` includes a replica that a pending
+/// membership handoff is adding.
 module dfs_metadata_journal_source {
   import common.* from "../../lib/common"
 
@@ -78,8 +79,8 @@ module dfs_metadata_journal_source {
   /// `NetworkedDfsService::validate_metadata_journal_batch_source`: a claimed
   /// source id, when present, must match the transport source. With control
   /// plane and filesystem evidence, the configured shard primary must be the
-  /// transport source and the primary must not apply its own replica batch.
-  /// Non-replica mirrors are allowed for routed response/SyncPath catch-up.
+  /// transport source, the primary must not apply its own replica batch, and
+  /// the local node must be a configured replica.
   pure def canAcceptServiceJournal(case: ValidationCase): bool =
     all {
       claimedSourceMatchesTransport(case),
@@ -90,14 +91,16 @@ module dfs_metadata_journal_source {
           case.shardConfigured,
           transportSourceIsPrimary(case),
           case.localNode != case.primary,
+          case.localConfiguredReplica,
         },
       },
     }
 
   /// `NetworkedDfsService::handle_metadata_snapshot_install`: snapshot install
   /// always carries a payload source, which must match transport source. With a
-  /// control-plane shard config, that source must be the current primary and
-  /// primary self-install is rejected. Non-replica mirrors are accepted.
+  /// control-plane shard config, that source must be the current primary,
+  /// primary self-install is rejected, and the local node must be a configured
+  /// replica.
   pure def canAcceptServiceSnapshot(case: ValidationCase): bool =
     all {
       claimedSourceMatchesTransport(case),
@@ -108,6 +111,7 @@ module dfs_metadata_journal_source {
           case.shardConfigured,
           transportSourceIsPrimary(case),
           case.localNode != case.primary,
+          case.localConfiguredReplica,
         },
       },
     }

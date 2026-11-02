@@ -3653,10 +3653,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn placement_object_page(
-        &self,
+        &mut self,
         job: &DfsPlacementReconciliationJob,
         max_objects: usize,
     ) -> Result<DfsObjectPage, DfsError> {
+        if let Some(shards) = self.metadata_shard_config_snapshot(&job.file_system_id)?
+            && !shards.is_empty()
+        {
+            return self.placement_object_page_from_authorities(shards, job, max_objects);
+        }
         if let Some(backend) = self.metadata_backend.as_ref() {
             return match job.scope {
                 DfsPlacementScope::SelfOnly => Ok(DfsObjectPage {
@@ -3714,6 +3719,97 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(DfsObjectPage {
             objects,
             next_cursor,
+        })
+    }
+
+    /// A placement job's objects read from every shard at its primary, one
+    /// shard after another, so objects in shards this coordinator does not
+    /// replicate are reconciled too. Cursors name the shard they resume in.
+    fn placement_object_page_from_authorities(
+        &mut self,
+        shards: Vec<crate::DfsMetadataShardConfig>,
+        job: &DfsPlacementReconciliationJob,
+        max_objects: usize,
+    ) -> Result<DfsObjectPage, DfsError> {
+        let mut pager = PlacementShardPager::new(shards, job, max_objects)?;
+        while let Some((shard, path, after, limit)) = pager.next_request() {
+            let (objects, next) =
+                self.subtree_object_page_from_authority(&shard, &path, after.as_ref(), limit)?;
+            pager.accept(objects, next);
+        }
+        Ok(pager.finish())
+    }
+
+    /// One page of `shard`'s objects under `path`. This node's own shards are
+    /// read from its backend; every other shard is asked at its primary.
+    fn subtree_object_page_from_authority(
+        &mut self,
+        shard: &crate::DfsMetadataShardConfig,
+        path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        limit: usize,
+    ) -> Result<(Vec<DfsObjectMetadata>, Option<DfsObjectPageCursor>), DfsError> {
+        let selection = crate::DfsMetadataSelection::SubtreeObjectPageV1 {
+            path: path.to_string(),
+            after: after.cloned(),
+            limit,
+        };
+        let result = if shard.primary_node_id == self.node_id {
+            self.query_own_shard_metadata(shard, selection)?
+        } else {
+            self.query_metadata_authority_impl(shard, selection)?
+        };
+        subtree_object_page_result(result)
+    }
+
+    /// Reads a shard this node is primary of from its own backend.
+    fn query_own_shard_metadata(
+        &self,
+        shard: &crate::DfsMetadataShardConfig,
+        selection: crate::DfsMetadataSelection,
+    ) -> Result<crate::DfsMetadataQueryResult, DfsError> {
+        let backend = self
+            .metadata_backend
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message: "a shard primary reads its own shard from a durable backend".into(),
+            })?;
+        Ok(
+            backend.query_file_history_on_shard(&crate::DfsMetadataShardQuery {
+                file_system_id: shard.file_system_id.clone(),
+                shard_id: crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                epoch: shard.epoch,
+                selection,
+            })?,
+        )
+    }
+
+    /// The resume point after `object` in a page read from the authorities.
+    fn placement_cursor_for_object(
+        &self,
+        shards: Option<&[crate::DfsMetadataShardConfig]>,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsObjectPageCursor, DfsError> {
+        if let Some(shards) = shards {
+            let shard_id = crate::control_plane::select_metadata_shard_config_for_path(
+                &object.file_system_id,
+                shards,
+                &object.path,
+            )?
+            .map(|shard| crate::DfsMetadataShardId::new(shard.shard_id));
+            return Ok(DfsObjectPageCursor {
+                path: object.path.clone(),
+                object_id: object.object_id.clone(),
+                shard_id,
+            });
+        }
+        if let Some(backend) = self.metadata_backend.as_ref() {
+            return Ok(backend.object_page_cursor_for_object(object)?);
+        }
+        Ok(DfsObjectPageCursor {
+            path: object.path.clone(),
+            object_id: object.object_id.clone(),
+            shard_id: None,
         })
     }
 
@@ -4739,6 +4835,188 @@ fn placement_scope_matches(scope: DfsPlacementScope, root: &str, path: &str) -> 
     }
 }
 
+fn subtree_object_page_result(
+    result: crate::DfsMetadataQueryResult,
+) -> Result<(Vec<DfsObjectMetadata>, Option<DfsObjectPageCursor>), DfsError> {
+    match result {
+        crate::DfsMetadataQueryResult::SubtreeObjectPageV1 {
+            objects,
+            next_cursor,
+        } => Ok((objects, next_cursor)),
+        _ => Err(DfsError::Distributed {
+            message: "subtree object page authority returned another result".into(),
+        }),
+    }
+}
+
+/// Pages a placement job's scope shard by shard in shard-id order. The caller
+/// fetches each requested page from that shard's authority.
+struct PlacementShardPager {
+    shards: Vec<crate::DfsMetadataShardConfig>,
+    index: usize,
+    path: String,
+    self_only: bool,
+    /// Resume point inside `shards[index]`, local to that shard.
+    after: Option<DfsObjectPageCursor>,
+    page: DfsObjectPage,
+    /// The shard each paged object was read from at its primary.
+    sources: BTreeMap<DfsObjectId, crate::DfsMetadataShardConfig>,
+    max_objects: usize,
+    done: bool,
+}
+
+impl PlacementShardPager {
+    fn new(
+        shards: Vec<crate::DfsMetadataShardConfig>,
+        job: &DfsPlacementReconciliationJob,
+        max_objects: usize,
+    ) -> Result<Self, DfsError> {
+        Self::for_scope(
+            shards,
+            &job.file_system_id,
+            &job.path,
+            job.scope,
+            job.cursor.as_ref(),
+            max_objects,
+        )
+    }
+
+    fn for_scope(
+        mut shards: Vec<crate::DfsMetadataShardConfig>,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        scope: DfsPlacementScope,
+        cursor: Option<&DfsObjectPageCursor>,
+        max_objects: usize,
+    ) -> Result<Self, DfsError> {
+        let self_only = scope == DfsPlacementScope::SelfOnly;
+        let (index, after) = if self_only {
+            // Only the shard owning the job path can hold the path itself.
+            let owner = crate::control_plane::select_metadata_shard_config_for_path(
+                file_system_id,
+                &shards,
+                path,
+            )?;
+            shards = owner.into_iter().collect();
+            (0, None)
+        } else {
+            shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+            let resume = cursor.and_then(|cursor| {
+                cursor
+                    .shard_id
+                    .as_ref()
+                    .map(|shard_id| (shard_id.0.clone(), cursor))
+            });
+            match resume {
+                Some((shard_id, cursor)) => {
+                    let index = shards
+                        .iter()
+                        .position(|shard| shard.shard_id >= shard_id)
+                        .unwrap_or(shards.len());
+                    let after = shards
+                        .get(index)
+                        .filter(|shard| shard.shard_id == shard_id)
+                        .map(|_| DfsObjectPageCursor {
+                            shard_id: None,
+                            ..cursor.clone()
+                        });
+                    (index, after)
+                }
+                None => (0, None),
+            }
+        };
+        Ok(Self {
+            shards,
+            index,
+            path: path.to_string(),
+            self_only,
+            after,
+            page: DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            },
+            sources: BTreeMap::new(),
+            max_objects,
+            done: max_objects == 0,
+        })
+    }
+
+    /// The next shard page to fetch, or `None` once the page is complete.
+    fn next_request(
+        &self,
+    ) -> Option<(
+        crate::DfsMetadataShardConfig,
+        String,
+        Option<DfsObjectPageCursor>,
+        usize,
+    )> {
+        if self.done {
+            return None;
+        }
+        let shard = self.shards.get(self.index)?;
+        let limit = if self.self_only {
+            1
+        } else {
+            self.max_objects - self.page.objects.len()
+        };
+        Some((shard.clone(), self.path.clone(), self.after.clone(), limit))
+    }
+
+    fn accept(&mut self, objects: Vec<DfsObjectMetadata>, next: Option<DfsObjectPageCursor>) {
+        let source = self.shards[self.index].clone();
+        if self.self_only {
+            self.page.objects = objects
+                .into_iter()
+                .filter(|object| object.path == self.path)
+                .collect();
+            for object in &self.page.objects {
+                self.sources
+                    .insert(object.object_id.clone(), source.clone());
+            }
+            self.done = true;
+            return;
+        }
+        let shard_id = crate::DfsMetadataShardId::new(source.shard_id.clone());
+        for object in objects {
+            self.sources
+                .insert(object.object_id.clone(), source.clone());
+            self.page.next_cursor = Some(DfsObjectPageCursor {
+                path: object.path.clone(),
+                object_id: object.object_id.clone(),
+                shard_id: Some(shard_id.clone()),
+            });
+            self.page.objects.push(object);
+        }
+        if self.page.objects.len() >= self.max_objects {
+            self.done = true;
+            return;
+        }
+        match next {
+            Some(next) => self.after = Some(next),
+            None => {
+                self.index += 1;
+                self.after = None;
+            }
+        }
+    }
+
+    fn finish(self) -> DfsObjectPage {
+        self.finish_with_sources().0
+    }
+
+    fn finish_with_sources(
+        mut self,
+    ) -> (
+        DfsObjectPage,
+        BTreeMap<DfsObjectId, crate::DfsMetadataShardConfig>,
+    ) {
+        if self.self_only || self.page.objects.len() < self.max_objects {
+            self.page.next_cursor = None;
+        }
+        (self.page, self.sources)
+    }
+}
+
 // Remote placement work must yield so foreground requests can preempt
 // maintenance before its global admission is released. Synchronous callers
 // retain their existing execution path.
@@ -4746,6 +5024,7 @@ impl<T> NetworkedDfsService<T>
 where
     T: crate::AsyncDfsMessageTransport + crate::DfsTransportIdentity + DfsMessageTransport,
 {
+    #[cfg(test)]
     fn prepare_placement_reconciliation_objects(
         &mut self,
         config: &DfsFileSystemConfig,
@@ -4755,6 +5034,21 @@ where
         authority: Option<&PlacementPageAuthority>,
     ) -> Result<Vec<PreparedPlacementObject>, DfsError> {
         let page = self.placement_object_page(job, budget.max_objects_per_tick)?;
+        self.prepare_placement_reconciliation_page(config, page, job, budget, started, authority)
+    }
+
+    fn prepare_placement_reconciliation_page(
+        &mut self,
+        config: &DfsFileSystemConfig,
+        page: DfsObjectPage,
+        job: &DfsPlacementReconciliationJob,
+        budget: &DfsAdaptivePlacementBudget,
+        started: Instant,
+        authority: Option<&PlacementPageAuthority>,
+    ) -> Result<Vec<PreparedPlacementObject>, DfsError> {
+        let cursor_shards = self
+            .metadata_shard_config_snapshot(&job.file_system_id)?
+            .filter(|shards| !shards.is_empty());
         let count = page.objects.len();
         let mut prepared = Vec::with_capacity(count);
         let mut transfer_bytes = 0u64;
@@ -4767,14 +5061,8 @@ where
             }
             let next_cursor = if index + 1 == count {
                 page.next_cursor.clone()
-            } else if let Some(backend) = self.metadata_backend.as_ref() {
-                Some(backend.object_page_cursor_for_object(&object)?)
             } else {
-                Some(DfsObjectPageCursor {
-                    path: object.path.clone(),
-                    object_id: object.object_id.clone(),
-                    shard_id: None,
-                })
+                Some(self.placement_cursor_for_object(cursor_shards.as_deref(), &object)?)
             };
             let plan = if object.kind == DfsObjectKind::Tombstone
                 || !placement_job_matches(job, &object.path)
@@ -4832,14 +5120,92 @@ where
         Ok(prepared)
     }
 
+    /// `placement_object_page`, with remote shard pages read through the
+    /// yielding placement sender so foreground work can preempt it.
+    async fn placement_object_page_async(
+        &mut self,
+        job: &DfsPlacementReconciliationJob,
+        max_objects: usize,
+    ) -> Result<
+        (
+            DfsObjectPage,
+            BTreeMap<DfsObjectId, crate::DfsMetadataShardConfig>,
+        ),
+        DfsError,
+    > {
+        let Some(shards) = self
+            .metadata_shard_config_snapshot(&job.file_system_id)?
+            .filter(|shards| !shards.is_empty())
+        else {
+            return Ok((
+                self.placement_object_page(job, max_objects)?,
+                BTreeMap::new(),
+            ));
+        };
+        let mut pager = PlacementShardPager::new(shards, job, max_objects)?;
+        while let Some((shard, path, after, limit)) = pager.next_request() {
+            let selection = crate::DfsMetadataSelection::SubtreeObjectPageV1 { path, after, limit };
+            let result = if shard.primary_node_id == self.node_id {
+                self.query_own_shard_metadata(&shard, selection)?
+            } else {
+                let query = crate::DfsMetadataShardQuery {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: crate::DfsMetadataShardId::new(shard.shard_id.clone()),
+                    epoch: shard.epoch,
+                    selection,
+                };
+                let request_id = self.next_request_id();
+                let response = self
+                    .route_placement_namespace_operation_to_metadata_primary_with_request_id_and_options(
+                        request_id,
+                        shard.file_system_id.clone(),
+                        shard.primary_node_id.clone(),
+                        DfsNamespaceOperation::MetadataQuery { query: query.clone() },
+                        crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+                        false,
+                        false,
+                    )
+                    .await?;
+                match (response.result, response.posix_coordination_result) {
+                    (
+                        crate::DfsNamespaceResult::Applied,
+                        Some(crate::DfsPosixCoordinationResult::MetadataQuery(response)),
+                    ) if response.file_system_id == query.file_system_id
+                        && response.shard_id == query.shard_id
+                        && response.epoch == query.epoch =>
+                    {
+                        response.result
+                    }
+                    (crate::DfsNamespaceResult::Rejected { reason, .. }, _) => {
+                        return Err(DfsError::Distributed { message: reason });
+                    }
+                    _ => {
+                        return Err(DfsError::Distributed {
+                            message: "subtree object page authority omitted its typed response"
+                                .into(),
+                        });
+                    }
+                }
+            };
+            let (objects, next) = subtree_object_page_result(result)?;
+            pager.accept(objects, next);
+        }
+        Ok(pager.finish_with_sources())
+    }
+
     async fn read_remote_placement_noop_proofs(
         &mut self,
         config: &DfsFileSystemConfig,
         objects: &[PreparedPlacementObject],
+        page_sources: &BTreeMap<DfsObjectId, DfsMetadataShardConfig>,
         started: Instant,
         max_millis: u64,
     ) -> Result<PlacementRemoteNoopProofs, DfsError> {
         const MAX_LOOKUP_PATHS: usize = 64;
+        let mut proofs = PlacementRemoteNoopProofs {
+            config: config.clone(),
+            objects: BTreeMap::new(),
+        };
         let mut by_primary =
             BTreeMap::<NodeId, Vec<(&DfsObjectMetadata, &DfsMetadataShardConfig)>>::new();
         let mut primary_order = Vec::new();
@@ -4847,6 +5213,20 @@ where
             if let Some(plan) = object.plan.as_ref()
                 && let PlacementNoopCheck::LookupRemote(shard) = &plan.noop_check
             {
+                // An object this page read from its own primary is already a
+                // current authority read; it needs no second lookup.
+                if page_sources.get(&object.object.object_id) == Some(shard)
+                    && self
+                        .select_metadata_shard_for_object(&object.object)?
+                        .as_ref()
+                        == Some(shard)
+                {
+                    proofs.objects.insert(
+                        object.object.object_id.clone(),
+                        (object.object.clone(), shard.clone()),
+                    );
+                    continue;
+                }
                 if !by_primary.contains_key(&shard.primary_node_id) {
                     primary_order.push(shard.primary_node_id.clone());
                 }
@@ -4856,10 +5236,6 @@ where
                     .push((&object.object, shard));
             }
         }
-        let mut proofs = PlacementRemoteNoopProofs {
-            config: config.clone(),
-            objects: BTreeMap::new(),
-        };
         let mut requests = 0usize;
         for primary in primary_order {
             let expected = by_primary.remove(&primary).expect("prepared primary group");
@@ -5181,12 +5557,17 @@ where
             };
         // Plan one bounded page once, then share its independently authorized
         // primary reads. No speculative page or durable proof cache is retained.
-        let objects = self
-            .prepare_placement_reconciliation_objects(config, job, &budget, started, authority)?;
+        let (page, page_sources) = self
+            .placement_object_page_async(job, budget.max_objects_per_tick)
+            .await?;
+        let objects = self.prepare_placement_reconciliation_page(
+            config, page, job, &budget, started, authority,
+        )?;
         let mut remote_proofs = self
             .read_remote_placement_noop_proofs(
                 config,
                 &objects,
+                &page_sources,
                 started,
                 budget.max_millis_per_tick,
             )
@@ -8213,5 +8594,162 @@ mod admitted_placement_coordinator_native_tests {
         ));
         drop(owner);
         runtime.close().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod shard_pager_tests {
+    use super::*;
+    use crate::DfsMetadataShardAssignment;
+
+    fn shard(id: &str, assignment: DfsMetadataShardAssignment) -> crate::DfsMetadataShardConfig {
+        crate::DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: id.to_string(),
+            primary_node_id: NodeId::from_legacy_named(format!("node_pager_{id}")).unwrap(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment,
+            default_policy: DfsObjectPolicy::LocalOwned,
+        }
+    }
+
+    fn shards() -> Vec<crate::DfsMetadataShardConfig> {
+        vec![
+            shard(
+                "services",
+                DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".into(),
+                },
+            ),
+            shard("root", DfsMetadataShardAssignment::Root),
+        ]
+    }
+
+    fn object(path: &str) -> DfsObjectMetadata {
+        let owner = NodeId::from_legacy_named("node_pager_owner").unwrap();
+        DfsObjectMetadata {
+            object_id: DfsObjectId::from_legacy_named(format!("obj_pager_{}", path.len())).unwrap(),
+            file_system_id: crate::sifs_file_system_id(),
+            path: path.to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: owner.clone(),
+            current_locations: vec![owner],
+            content_hash: None,
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: crate::DfsVersion::from_legacy_named("version_pager").unwrap(),
+            policy: DfsObjectPolicy::LocalOwned,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        }
+    }
+
+    fn pager(
+        path: &str,
+        scope: DfsPlacementScope,
+        cursor: Option<&DfsObjectPageCursor>,
+        max: usize,
+    ) -> PlacementShardPager {
+        PlacementShardPager::for_scope(
+            shards(),
+            &crate::sifs_file_system_id(),
+            path,
+            scope,
+            cursor,
+            max,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pages_every_shard_in_order_and_resumes_inside_the_last_one() {
+        let mut first = pager("/", DfsPlacementScope::Subtree, None, 3);
+        let (shard, _, after, limit) = first.next_request().unwrap();
+        assert_eq!((shard.shard_id.as_str(), after, limit), ("root", None, 3));
+        first.accept(vec![object("/a"), object("/bb")], None);
+        let (shard, _, after, limit) = first.next_request().unwrap();
+        assert_eq!(
+            (shard.shard_id.as_str(), after, limit),
+            ("services", None, 1)
+        );
+        let next = DfsObjectPageCursor {
+            path: "/services/c".into(),
+            object_id: object("/services/c").object_id,
+            shard_id: None,
+        };
+        first.accept(vec![object("/services/c")], Some(next));
+        assert!(first.next_request().is_none(), "a full page stops paging");
+        let (page, sources) = first.finish_with_sources();
+        assert_eq!(page.objects.len(), 3);
+        let resume = page.next_cursor.expect("a full page resumes");
+        assert_eq!(resume.path, "/services/c");
+        assert_eq!(
+            resume.shard_id,
+            Some(crate::DfsMetadataShardId::new("services".to_string()))
+        );
+        assert_eq!(sources[&object("/a").object_id].shard_id, "root");
+        assert_eq!(
+            sources[&object("/services/c").object_id].shard_id,
+            "services"
+        );
+
+        let second = pager("/", DfsPlacementScope::Subtree, Some(&resume), 3);
+        let (shard, _, after, _) = second.next_request().unwrap();
+        assert_eq!(shard.shard_id, "services");
+        assert_eq!(
+            after.map(|after| (after.path, after.shard_id)),
+            Some(("/services/c".to_string(), None)),
+            "the resume point is passed on local to its shard"
+        );
+    }
+
+    #[test]
+    fn a_resume_point_in_a_removed_shard_continues_at_the_next_shard() {
+        let cursor = DfsObjectPageCursor {
+            path: "/old".into(),
+            object_id: object("/old").object_id,
+            shard_id: Some(crate::DfsMetadataShardId::new("s-retired".to_string())),
+        };
+        let mut pager = pager("/", DfsPlacementScope::Subtree, Some(&cursor), 4);
+        let (shard, _, after, _) = pager.next_request().unwrap();
+        assert_eq!((shard.shard_id.as_str(), after), ("services", None));
+        pager.accept(vec![object("/services/d")], None);
+        assert!(pager.next_request().is_none());
+        let page = pager.finish();
+        assert_eq!(page.objects.len(), 1);
+        assert!(page.next_cursor.is_none(), "a partial page ends the scan");
+    }
+
+    #[test]
+    fn an_exact_path_reads_only_its_owner_shard() {
+        let mut pager = pager("/services/x", DfsPlacementScope::SelfOnly, None, 8);
+        let (shard, path, after, limit) = pager.next_request().unwrap();
+        assert_eq!(
+            (shard.shard_id.as_str(), path.as_str(), after, limit),
+            ("services", "/services/x", None, 1)
+        );
+        pager.accept(
+            vec![object("/services/x"), object("/services/x/child")],
+            None,
+        );
+        assert!(pager.next_request().is_none());
+        let page = pager.finish();
+        assert_eq!(
+            page.objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/services/x"]
+        );
+        assert!(page.next_cursor.is_none());
     }
 }

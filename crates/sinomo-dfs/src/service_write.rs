@@ -488,24 +488,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         request: &DfsWriteRequest,
     ) -> Result<DfsObjectMetadata, DfsError> {
-        if self.metadata_backend.is_none()
-            && self.transport.delegates_local_namespace_authority()
-            && self.control_plane.is_some()
-            && !self
-                .transient_metadata_object_ids
-                .contains(&request.object_id)
-        {
-            // This is requester planning DATA. Main still owns the original
-            // write admission, current-head comparison and native publication.
-            let object = self
-                .current_object_from_authority(&request.file_system_id, &request.object_id)?
-                .ok_or_else(|| DfsError::UnknownObject {
-                    object_id: request.object_id.clone(),
-                })?;
-            self.ensure_object_not_in_cross_shard_flight(&object)?;
-            return Ok(object);
-        }
-        self.current_object_for_write(&request.object_id)
+        let crate::service_read::DfsObjectReadSource::Authority { hinted_shard, .. } =
+            self.object_read_source(&request.object_id, Some(&request.file_system_id))?
+        else {
+            return self.current_object_for_write(&request.object_id);
+        };
+        // This is requester planning DATA. The metadata primary still owns
+        // write admission, the current-head comparison and publication.
+        let object = self
+            .current_object_from_hinted_authority(
+                &request.file_system_id,
+                &request.object_id,
+                hinted_shard,
+            )?
+            .ok_or_else(|| DfsError::UnknownObject {
+                object_id: request.object_id.clone(),
+            })?;
+        self.ensure_object_not_in_cross_shard_flight(&object)?;
+        Ok(object)
     }
 
     fn prepare_distributed_write(
@@ -2875,7 +2875,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && replay_response_journal
             && shard.primary_node_id != self.node_id
         {
-            self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
+            self.local_metadata_journal_after_sequence_for_shard(&shard)?
         } else {
             None
         };
@@ -3024,9 +3024,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let after = if primary == self.node_id {
             None
         } else {
-            self.local_metadata_journal_after_sequence_for_shard(&DfsMetadataShardId::new(
-                shard.shard_id.clone(),
-            ))?
+            self.local_metadata_journal_after_sequence_for_shard(&shard)?
         };
         let command = DfsDistributedWriteCommand {
             publication: Default::default(),
@@ -3119,7 +3117,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && replay_response_journal
             && shard.primary_node_id != self.node_id
         {
-            self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
+            self.local_metadata_journal_after_sequence_for_shard(&shard)?
         } else {
             None
         };
@@ -3279,7 +3277,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let metadata_journal_after_sequence = if shard.primary_node_id == self.node_id {
             None
         } else {
-            self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
+            self.local_metadata_journal_after_sequence_for_shard(&shard)?
         };
         let metadata_sequence_elapsed = metadata_sequence_started.elapsed();
         self.route_distributed_captured_reader(

@@ -11,45 +11,48 @@ module dfs_routed_namespace_freshness_safety {
     terminalOutcome == CompletedFresh implies returnedPathState == primaryPathState
 
 
-  def completedOnlyWhenRequesterFresh: bool =
-    terminalOutcome == CompletedFresh implies
+  def localCompletionOnlyFromFreshReplica: bool =
+    all {
+      terminalOutcome == CompletedFresh,
+      not(answeredByPrimary),
+    } implies all {
+      requesterRole == MetadataReplica,
       requesterHasFreshPath(
         localPathState,
         primaryPathState,
         requesterSeq,
         targetSeq,
         syncedPathApplied
-      )
+      ),
+    }
 
 
-  def partialJournalBatchCannotComplete: bool =
-    terminalOutcome == CompletedFresh implies not(lastBatchLimitReached)
-
-
-  def nonReplicaCompletionRequiresPrimaryCatchUp: bool =
+  def partialJournalBatchCannotCompleteLocally: bool =
     all {
       terminalOutcome == CompletedFresh,
-      requesterRole == NonReplicaMirror,
-    } implies any {
-      requesterSeq >= targetSeq,
-      syncedPathApplied,
+      not(answeredByPrimary),
+    } implies not(lastBatchLimitReached)
+
+
+  def nonReplicaNeverIngests: bool =
+    requesterRole == NonReplica implies all {
+      acceptedJournalBatchSources.size() == 0,
+      not(syncedPathApplied),
     }
+
+
+  def nonReplicaCompletesFromPrimary: bool =
+    all {
+      terminalOutcome == CompletedFresh,
+      requesterRole == NonReplica,
+    } implies answeredByPrimary
 
 
   def routedMutationReadYourWrite: bool =
     all {
       terminalOutcome == CompletedFresh,
       operation == RoutedCreate or operation == RoutedDelete,
-    } implies all {
-      returnedPathState == mutationTargetState(operation),
-      requesterHasFreshPath(
-        localPathState,
-        mutationTargetState(operation),
-        requesterSeq,
-        targetSeq,
-        syncedPathApplied
-      ),
-    }
+    } implies returnedPathState == mutationTargetState(operation)
 
 
   def primaryTombstoneWinsOverStaleLiveLocal: bool =
@@ -76,9 +79,10 @@ module dfs_routed_namespace_freshness_safety {
   def safety: bool = all {
     journalSourceIsCurrentPrimary,
     completedReturnsAuthoritativePathState,
-    completedOnlyWhenRequesterFresh,
-    partialJournalBatchCannotComplete,
-    nonReplicaCompletionRequiresPrimaryCatchUp,
+    localCompletionOnlyFromFreshReplica,
+    partialJournalBatchCannotCompleteLocally,
+    nonReplicaNeverIngests,
+    nonReplicaCompletesFromPrimary,
     routedMutationReadYourWrite,
     primaryTombstoneWinsOverStaleLiveLocal,
     terminalOutcomesAreConsistent,

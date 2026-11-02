@@ -209,7 +209,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
                 self.stat_routed_namespace_result(&normalized_link, false)
             }
-            (Some(target_primary), link_primary) => {
+            (Some(target_primary), _) => {
                 // The link target's shard primary coordinates; it adopts the
                 // alias into the link path's shard when that lives elsewhere.
                 self.route_namespace_operation(
@@ -219,9 +219,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         link_path: link_path.to_string(),
                     },
                 )?;
-                if link_primary.is_some_and(|link_primary| link_primary != target_primary) {
-                    self.sync_remote_namespace_path(&normalized_link)?;
-                }
                 self.stat_routed_namespace_result(&normalized_link, false)
             }
         }

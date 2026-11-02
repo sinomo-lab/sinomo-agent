@@ -157,23 +157,6 @@ impl NativePlacementFixture {
         }
         let mut service = runtime.client(&root_primary).unwrap();
         if remote {
-            // The ordinary lookup remains part of the fixture, but its reply
-            // cannot substitute for the physical acknowledgement above.
-            let synced = service
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    sifs_file_system_id(),
-                    primary.clone(),
-                    DfsNamespaceOperation::SyncPath { path: path.into() },
-                    crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-                    true,
-                    false,
-                )
-                .unwrap();
-            assert_eq!(synced.result, crate::DfsNamespaceResult::Applied);
-            assert!(
-                !synced.metadata_journal_has_more,
-                "the fixture's bounded native writes must fit the ordinary sync response"
-            );
             let backend = service.metadata_backend().unwrap();
             for object in &objects {
                 assert_eq!(
@@ -654,7 +637,13 @@ async fn native_remote_noop_requires_real_primary_and_rejects_changed_generation
     let before = case.namespace_calls();
     let proofs = case
         .service
-        .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+        .read_remote_placement_noop_proofs(
+            &config,
+            &prepared,
+            &BTreeMap::new(),
+            Instant::now(),
+            5_000,
+        )
         .await
         .unwrap();
     assert_eq!(proofs.objects[&original.object_id].0, original);
@@ -672,7 +661,13 @@ async fn native_remote_noop_requires_real_primary_and_rejects_changed_generation
         .unwrap();
     let stale = case
         .service
-        .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+        .read_remote_placement_noop_proofs(
+            &config,
+            &prepared,
+            &BTreeMap::new(),
+            Instant::now(),
+            5_000,
+        )
         .await
         .unwrap();
     assert!(
@@ -712,14 +707,26 @@ async fn native_remote_noop_delivery_failure_produces_no_authority() {
     });
     assert!(
         case.service
-            .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+            .read_remote_placement_noop_proofs(
+                &config,
+                &prepared,
+                &BTreeMap::new(),
+                Instant::now(),
+                5_000
+            )
             .await
             .is_err()
     );
     case.runtime.clear_faults();
     let recovered = case
         .service
-        .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+        .read_remote_placement_noop_proofs(
+            &config,
+            &prepared,
+            &BTreeMap::new(),
+            Instant::now(),
+            5_000,
+        )
         .await
         .unwrap();
     assert_eq!(recovered.objects[&object.object_id].0, object);
@@ -835,7 +842,13 @@ async fn native_remote_noop_proof_binds_complete_config_assignment_and_row_once(
     ] {
         let mut proofs = case
             .service
-            .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+            .read_remote_placement_noop_proofs(
+                &config,
+                &prepared,
+                &BTreeMap::new(),
+                Instant::now(),
+                5_000,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -863,7 +876,13 @@ async fn native_remote_noop_proof_binds_complete_config_assignment_and_row_once(
     }
     let mut proofs = case
         .service
-        .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+        .read_remote_placement_noop_proofs(
+            &config,
+            &prepared,
+            &BTreeMap::new(),
+            Instant::now(),
+            5_000,
+        )
         .await
         .unwrap();
     assert!(proofs.take_matches(&config, &original, &shard));
@@ -2031,7 +2050,13 @@ async fn native_remote_response_validator_rejects_ambiguous_or_foreign_captured_
         .unwrap();
     let proofs = case
         .service
-        .read_remote_placement_noop_proofs(&config, &prepared, Instant::now(), 5_000)
+        .read_remote_placement_noop_proofs(
+            &config,
+            &prepared,
+            &BTreeMap::new(),
+            Instant::now(),
+            5_000,
+        )
         .await
         .unwrap();
     let captured: Vec<_> = case

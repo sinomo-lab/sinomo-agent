@@ -198,6 +198,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .and_then(|backend| backend.resident_exact_shard_id())
             .cloned();
+        // Guards belong to shards this node replicates. A local copy of any
+        // other shard is not kept current, so its Running jobs would block
+        // paths after they finished; that shard's primary enforces its own.
+        let replicated = if exact_shard_id.is_none() {
+            self.locally_replicated_sifs_metadata_shards()
+        } else {
+            None
+        };
         let Some(backend) = self.metadata_backend.as_ref() else {
             self.cross_shard_namespace_locks
                 .replace_jobs(std::iter::empty::<(
@@ -252,6 +260,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if should_cancel() {
             return Ok(false);
         }
+        if let Some(replicated) = replicated.as_ref() {
+            let sifs = sifs_file_system_id();
+            locks.retain(|(shard_id, _, file_system_id, _)| {
+                file_system_id != &sifs
+                    || shard_id
+                        .as_ref()
+                        .is_none_or(|shard_id| replicated.contains(shard_id))
+            });
+        }
         #[cfg(test)]
         if let Some((root, _)) = self.native_publication_owner_for_observation()
             && crate::native_boundary_diagnostics::enabled(&root)
@@ -283,6 +300,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             self.cross_shard_namespace_locks.replace_jobs(locks);
         }
         Ok(!should_cancel())
+    }
+
+    /// The SIFS metadata shards this node holds as primary or replica, or
+    /// `None` when the shard configuration cannot be read; callers then keep
+    /// treating every local shard as the node's own.
+    pub(crate) fn locally_replicated_sifs_metadata_shards(
+        &mut self,
+    ) -> Option<BTreeSet<DfsMetadataShardId>> {
+        let kv = self.control_plane.as_mut()?;
+        let shards = DfsControlPlaneStore::new(kv.as_mut())
+            .list_metadata_shards(&sifs_file_system_id())
+            .ok()?;
+        Some(
+            shards
+                .into_iter()
+                .filter(|shard| {
+                    shard.primary_node_id == self.node_id
+                        || shard.replica_node_ids.contains(&self.node_id)
+                })
+                .map(|shard| DfsMetadataShardId::new(shard.shard_id))
+                .collect(),
+        )
+    }
+
+    /// Whether `path` lies in a SIFS shard outside `replicated`. An unknown
+    /// replicated set (`None`) keeps every local shard.
+    pub(crate) fn path_in_unreplicated_sifs_shard(
+        &self,
+        replicated: Option<&BTreeSet<DfsMetadataShardId>>,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<bool, DfsError> {
+        let (Some(replicated), Some(backend)) = (replicated, self.metadata_backend.as_ref()) else {
+            return Ok(false);
+        };
+        if *file_system_id != sifs_file_system_id() {
+            return Ok(false);
+        }
+        Ok(backend
+            .metadata_shard_id_for_path(file_system_id, path)?
+            .is_some_and(|shard_id| !replicated.contains(&shard_id)))
     }
 
     pub(crate) fn apply_cross_shard_namespace_job_guard(
@@ -499,6 +557,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         reconstruct_commit_promotions: bool,
         should_cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<bool, DfsError> {
+        // Only shards this node replicates are kept current; a local copy of
+        // any other shard stays out of the service's view.
+        let replicated = self.locally_replicated_sifs_metadata_shards();
         let file_systems = self
             .metadata_backend
             .as_ref()
@@ -525,6 +586,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                 crate::background_observation::hydration_items("objects", page.objects.len());
                 for object in page.objects {
+                    if self.path_in_unreplicated_sifs_shard(
+                        replicated.as_ref(),
+                        &object.file_system_id,
+                        &object.path,
+                    )? {
+                        continue;
+                    }
                     self.coordinator.set_committed_version(
                         object.file_system_id.clone(),
                         object.object_id.clone(),
@@ -583,6 +651,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.coordinator
                     .observe_restored_intent_id(&intent_record.intent_id);
                 if !write_intent_status_requires_hydrate_restore(&intent_record.status) {
+                    continue;
+                }
+                if replicated.as_ref().is_some_and(|replicated| {
+                    intent_record.file_system_id == sifs_file_system_id()
+                        && durable_write_intent_shards
+                            .get(&(
+                                intent_record.object_id.clone(),
+                                intent_record.intent_id.clone(),
+                            ))
+                            .is_some_and(|shard_id| !replicated.contains(shard_id))
+                }) {
                     continue;
                 }
                 if !intent_record.publication.is_current() {

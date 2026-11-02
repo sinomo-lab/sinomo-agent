@@ -213,30 +213,31 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
                 .any(|mount| sandbox_mount_path_tail(&mount.mount_path, path).is_some())
     }
 
+    /// Metadata for a mount ancestor that has no SIFS object of its own. The
+    /// caller has already established that nothing exists at `path`.
+    fn absent_mount_ancestor_metadata(&self, path: &SandboxPath) -> Option<SandboxMetadata> {
+        (self.mount_resolution(path).is_none() && self.path_is_mount_ancestor(path))
+            .then(|| mount_ancestor_metadata(path))
+    }
+
     fn synthetic_mount_directory_metadata(&self, path: &SandboxPath) -> Option<SandboxMetadata> {
-        if self.mount_resolution(path).is_some() || !self.path_is_mount_ancestor(path) {
-            return None;
-        }
-        if self.dfs.posix_lstat(&self.sifs_path(path)).is_ok() {
-            return None;
-        }
-        Some(SandboxMetadata {
-            path: path.clone(),
-            is_dir: true,
-            is_symlink: false,
-            len: 0,
-            link_count: 2,
-            mode: 0o555,
-            uid: 0,
-            gid: 0,
-            inode: sifs_inode_for_object(&format!("mount-ancestor:{path}"), 0),
-            object_identity: None,
-            content_hash: None,
-            accessed_at_unix_nanos: 1_000_000_000,
-            modified_at_unix_nanos: 1_000_000_000,
-            created_at_unix_nanos: 1_000_000_000,
-            changed_at_unix_nanos: 1_000_000_000,
-        })
+        let metadata = self.absent_mount_ancestor_metadata(path)?;
+        self.dfs
+            .posix_lstat(&self.sifs_path(path))
+            .is_err()
+            .then_some(metadata)
+    }
+
+    fn synthetic_mount_directory_metadata_mut(
+        &mut self,
+        path: &SandboxPath,
+    ) -> Option<SandboxMetadata> {
+        let metadata = self.absent_mount_ancestor_metadata(path)?;
+        let sifs_path = self.sifs_path(path);
+        self.dfs
+            .posix_lstat_distributed(&sifs_path)
+            .is_err()
+            .then_some(metadata)
     }
 
     fn direct_mount_child_for_list(
@@ -256,8 +257,8 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         path.join(child).map(Some).map_err(Into::into)
     }
 
-    fn ensure_writable_path(&self, path: &SandboxPath) -> Result<(), SandboxFsError> {
-        if self.synthetic_mount_directory_metadata(path).is_some() {
+    fn ensure_writable_path(&mut self, path: &SandboxPath) -> Result<(), SandboxFsError> {
+        if self.synthetic_mount_directory_metadata_mut(path).is_some() {
             return Err(SandboxFsError::ReadOnly { path: path.clone() });
         }
         if matches!(
@@ -323,6 +324,29 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         } else {
             self.dfs.posix_read_file_distributed(sifs_path)
         }
+    }
+
+    fn read_checked_mut(
+        &mut self,
+        path: &SandboxPath,
+        range: Option<ByteRange>,
+        update_access: bool,
+    ) -> Result<Vec<u8>, SandboxFsError> {
+        if sandbox_virtual_device_path(path).is_some() {
+            return read_sandbox_virtual_device(path, range);
+        }
+        if sandbox_path_is_dev_tree(path) {
+            return Err(SandboxFsError::NotFound { path: path.clone() });
+        }
+        let resolved = self.resolve_path_mut(path, true)?;
+        if sandbox_virtual_device_path(&resolved).is_some() {
+            return read_sandbox_virtual_device(&resolved, range);
+        }
+        if sandbox_path_is_dev_tree(&resolved) {
+            return Err(SandboxFsError::NotFound { path: path.clone() });
+        }
+        self.ensure_file_allows_read_mut(&resolved)?;
+        self.read_sifs_file_mut(path, &resolved, range, update_access)
     }
 
     fn read_sifs_file_mut(
@@ -395,7 +419,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         match self.dfs.posix_lstat(&self.sifs_path(path)) {
             Ok(stat) => Ok(self.metadata_from_stat(path, stat)),
             Err(error) => {
-                if let Some(metadata) = self.synthetic_mount_directory_metadata(path) {
+                if let Some(metadata) = self.absent_mount_ancestor_metadata(path) {
                     Ok(metadata)
                 } else {
                     Err(sandbox_fs_error_from_dfs(path, error))
@@ -415,7 +439,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         match self.dfs.posix_lstat_distributed(&self.sifs_path(path)) {
             Ok(stat) => Ok(self.metadata_from_stat(path, stat)),
             Err(error) => {
-                if let Some(metadata) = self.synthetic_mount_directory_metadata(path) {
+                if let Some(metadata) = self.absent_mount_ancestor_metadata(path) {
                     Ok(metadata)
                 } else {
                     Err(sandbox_fs_error_from_dfs(path, error))
@@ -756,7 +780,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
                     .expect("virtual device metadata"),
                 path: dev_path,
             });
-            self.merge_mount_entries(&mut entries, path, false)?;
+            self.merge_mount_entries_mut(&mut entries, path, false)?;
             return Ok(entries);
         }
         if matches!(
@@ -802,7 +826,11 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             .posix_list_dir_distributed(&self.sifs_path(&resolved))
         {
             Ok(entries) => entries,
-            Err(_error) if self.synthetic_mount_directory_metadata(&resolved).is_some() => {
+            Err(_error)
+                if self
+                    .synthetic_mount_directory_metadata_mut(&resolved)
+                    .is_some() =>
+            {
                 Vec::new()
             }
             Err(error) => return Err(sandbox_fs_error_from_dfs(path, error)),
@@ -818,8 +846,22 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
                 })
             })
             .collect::<Result<Vec<_>, SandboxFsError>>()?;
-        self.merge_mount_entries(&mut entries, path, false)?;
+        self.merge_mount_entries_mut(&mut entries, path, false)?;
         Ok(entries)
+    }
+
+    fn mount_children_for_list(
+        &self,
+        path: &SandboxPath,
+    ) -> Result<Vec<(SandboxPath, bool)>, SandboxFsError> {
+        let mut children = Vec::new();
+        for mount in &self.mounts {
+            if let Some(child_path) = self.direct_mount_child_for_list(path, &mount.mount_path)? {
+                let is_mount = child_path == mount.mount_path;
+                children.push((child_path, is_mount));
+            }
+        }
+        Ok(children)
     }
 
     fn mount_entries_for_list(
@@ -828,44 +870,37 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         unchecked: bool,
     ) -> Result<Vec<SandboxDirEntry>, SandboxFsError> {
         let mut entries = Vec::new();
-        for mount in &self.mounts {
-            let Some(child_path) = self.direct_mount_child_for_list(path, &mount.mount_path)?
-            else {
-                continue;
-            };
-            let metadata = if child_path == mount.mount_path {
-                if unchecked {
-                    self.stat_unchecked(&child_path)?
-                } else {
-                    self.stat(&child_path)?
-                }
-            } else {
-                self.synthetic_mount_directory_metadata(&child_path)
-                    .unwrap_or_else(|| SandboxMetadata {
-                        path: child_path.clone(),
-                        is_dir: true,
-                        is_symlink: false,
-                        len: 0,
-                        link_count: 2,
-                        mode: 0o555,
-                        uid: 0,
-                        gid: 0,
-                        inode: sifs_inode_for_object(&format!("mount-ancestor:{child_path}"), 0),
-                        object_identity: None,
-                        content_hash: None,
-                        accessed_at_unix_nanos: 1_000_000_000,
-                        modified_at_unix_nanos: 1_000_000_000,
-                        created_at_unix_nanos: 1_000_000_000,
-                        changed_at_unix_nanos: 1_000_000_000,
-                    })
+        for (child_path, is_mount) in self.mount_children_for_list(path)? {
+            let metadata = match (is_mount, unchecked) {
+                (false, _) => mount_ancestor_metadata(&child_path),
+                (true, true) => self.stat_unchecked(&child_path)?,
+                (true, false) => self.stat(&child_path)?,
             };
             entries.push(SandboxDirEntry {
                 path: child_path,
                 metadata,
             });
         }
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        entries.dedup_by(|left, right| left.path == right.path);
+        Ok(entries)
+    }
+
+    fn mount_entries_for_list_mut(
+        &mut self,
+        path: &SandboxPath,
+        unchecked: bool,
+    ) -> Result<Vec<SandboxDirEntry>, SandboxFsError> {
+        let mut entries = Vec::new();
+        for (child_path, is_mount) in self.mount_children_for_list(path)? {
+            let metadata = match (is_mount, unchecked) {
+                (false, _) => mount_ancestor_metadata(&child_path),
+                (true, true) => self.stat_unchecked_mut(&child_path)?,
+                (true, false) => self.stat_mut(&child_path)?,
+            };
+            entries.push(SandboxDirEntry {
+                path: child_path,
+                metadata,
+            });
+        }
         Ok(entries)
     }
 
@@ -875,7 +910,30 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
         path: &SandboxPath,
         unchecked: bool,
     ) -> Result<(), SandboxFsError> {
-        for mount_entry in self.mount_entries_for_list(path, unchecked)? {
+        let mount_entries = self.mount_entries_for_list(path, unchecked)?;
+        self.merge_listed_mount_entries(entries, mount_entries);
+        Ok(())
+    }
+
+    fn merge_mount_entries_mut(
+        &mut self,
+        entries: &mut Vec<SandboxDirEntry>,
+        path: &SandboxPath,
+        unchecked: bool,
+    ) -> Result<(), SandboxFsError> {
+        let mount_entries = self.mount_entries_for_list_mut(path, unchecked)?;
+        self.merge_listed_mount_entries(entries, mount_entries);
+        Ok(())
+    }
+
+    fn merge_listed_mount_entries(
+        &self,
+        entries: &mut Vec<SandboxDirEntry>,
+        mut mount_entries: Vec<SandboxDirEntry>,
+    ) {
+        mount_entries.sort_by(|left, right| left.path.cmp(&right.path));
+        mount_entries.dedup_by(|left, right| left.path == right.path);
+        for mount_entry in mount_entries {
             if let Some(existing) = entries
                 .iter_mut()
                 .find(|entry| entry.path == mount_entry.path)
@@ -888,7 +946,26 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
             }
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(())
+    }
+}
+
+fn mount_ancestor_metadata(path: &SandboxPath) -> SandboxMetadata {
+    SandboxMetadata {
+        path: path.clone(),
+        is_dir: true,
+        is_symlink: false,
+        len: 0,
+        link_count: 2,
+        mode: 0o555,
+        uid: 0,
+        gid: 0,
+        inode: sifs_inode_for_object(&format!("mount-ancestor:{path}"), 0),
+        object_identity: None,
+        content_hash: None,
+        accessed_at_unix_nanos: 1_000_000_000,
+        modified_at_unix_nanos: 1_000_000_000,
+        created_at_unix_nanos: 1_000_000_000,
+        changed_at_unix_nanos: 1_000_000_000,
     }
 }
 
@@ -994,7 +1071,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
     }
 
     fn path_for_open_identity(
-        &self,
+        &mut self,
         identity: Option<&str>,
         inode: u64,
     ) -> Result<Option<SandboxPath>, SandboxFsError> {
@@ -1134,26 +1211,20 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         self.read_sifs_file_mut(path, &resolved, range, false)
     }
 
+    fn read_mut(
+        &mut self,
+        path: &SandboxPath,
+        range: Option<ByteRange>,
+    ) -> Result<Vec<u8>, SandboxFsError> {
+        self.read_checked_mut(path, range, false)
+    }
+
     fn read_file(
         &mut self,
         path: &SandboxPath,
         range: Option<ByteRange>,
     ) -> Result<Vec<u8>, SandboxFsError> {
-        if sandbox_virtual_device_path(path).is_some() {
-            return read_sandbox_virtual_device(path, range);
-        }
-        if sandbox_path_is_dev_tree(path) {
-            return Err(SandboxFsError::NotFound { path: path.clone() });
-        }
-        let resolved = self.resolve_path_mut(path, true)?;
-        if sandbox_virtual_device_path(&resolved).is_some() {
-            return read_sandbox_virtual_device(&resolved, range);
-        }
-        if sandbox_path_is_dev_tree(&resolved) {
-            return Err(SandboxFsError::NotFound { path: path.clone() });
-        }
-        self.ensure_file_allows_read_mut(&resolved)?;
-        self.read_sifs_file_mut(path, &resolved, range, true)
+        self.read_checked_mut(path, range, true)
     }
 
     fn read_unchecked_update_access(
@@ -1490,6 +1561,10 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         Ok(entries)
     }
 
+    fn list_mut(&mut self, path: &SandboxPath) -> Result<Vec<SandboxDirEntry>, SandboxFsError> {
+        self.list_with_access_checks_mut(path)
+    }
+
     fn list_update_access(
         &mut self,
         path: &SandboxPath,
@@ -1505,7 +1580,10 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         if sandbox_virtual_device_path(&resolved).is_some() || sandbox_path_is_dev_tree(&resolved) {
             return Ok(entries);
         }
-        if self.synthetic_mount_directory_metadata(&resolved).is_some() {
+        if self
+            .synthetic_mount_directory_metadata_mut(&resolved)
+            .is_some()
+        {
             return Ok(entries);
         }
         self.dfs
@@ -1626,7 +1704,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
                     .expect("virtual device metadata"),
                 path: dev_path,
             });
-            self.merge_mount_entries(&mut entries, path, true)?;
+            self.merge_mount_entries_mut(&mut entries, path, true)?;
             return Ok(entries);
         }
         if matches!(
@@ -1671,7 +1749,11 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
             .posix_list_dir_distributed(&self.sifs_path(&resolved))
         {
             Ok(entries) => entries,
-            Err(_error) if self.synthetic_mount_directory_metadata(&resolved).is_some() => {
+            Err(_error)
+                if self
+                    .synthetic_mount_directory_metadata_mut(&resolved)
+                    .is_some() =>
+            {
                 Vec::new()
             }
             Err(error) => return Err(sandbox_fs_error_from_dfs(path, error)),
@@ -1687,7 +1769,7 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
                 })
             })
             .collect::<Result<Vec<_>, SandboxFsError>>()?;
-        self.merge_mount_entries(&mut entries, path, true)?;
+        self.merge_mount_entries_mut(&mut entries, path, true)?;
         Ok(entries)
     }
 
@@ -1736,7 +1818,8 @@ impl<T: DfsMessageTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
         self.ensure_writable_path(path)?;
         self.ensure_writable_path(&resolved)?;
         self.ensure_parent_allows_mutation_mut(&resolved)?;
-        match self.dfs.posix_lstat(&self.sifs_path(&resolved)) {
+        let sifs_path = self.sifs_path(&resolved);
+        match self.dfs.posix_lstat_distributed(&sifs_path) {
             Ok(stat) if stat.kind == DfsObjectKind::Directory => {
                 Err(SandboxFsError::IsDirectory { path: path.clone() })
             }

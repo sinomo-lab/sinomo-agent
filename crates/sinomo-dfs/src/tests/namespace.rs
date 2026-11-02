@@ -3533,7 +3533,7 @@ fn compound_posix_routing_refresh_invalidates_prior_config_revision() {
 }
 
 #[test]
-fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
+fn sifs_non_replica_directory_listing_reads_the_owner_without_ingest() {
     let cluster = sifs_outsider_cluster("sifs-outsider-directory-pull-capture");
     let SifsPosixCluster {
         primary_node,
@@ -3565,9 +3565,8 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
     assert_eq!(config.primary_node_id, primary_node);
     assert!(!config.replica_node_ids.contains(&observer_node));
     assert_ne!(observer_node, primary_node);
-    // Public Main clients page through their owner and deliberately do not
-    // ingest reply journals. Exercise the ordinary embedded Core pull with
-    // the same native backend, owner, provider and daemon peer transport.
+    // Exercise the ordinary embedded Core listing with the same native
+    // backend, owner, provider and daemon peer transport a Main uses.
     observer.transport = crate::runtime_host::daemon_dfs_node_transport_on_runtime(
         observer_node.clone(),
         [primary_node.clone(), writer_node],
@@ -3587,39 +3586,15 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
         .unwrap()
         .unwrap();
     let before_generation = progress.latest().map_or(0, |row| row.generation);
-    observer.disable_implicit_read_replica_ingest();
     let listed =
         observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
-    let entries = listed.outcome.expect("outsider pulls directory journal");
+    let entries = listed
+        .outcome
+        .expect("outsider lists the directory from its owner");
     assert!(entries.iter().any(|entry| entry.path == path));
     assert!(
-        listed.committed_work.metadata_replica_progress,
-        "a non-replica SyncPath pull must retain its durable replica-progress edge"
-    );
-    let after = observer
-        .metadata_backend()
-        .unwrap()
-        .metadata_prefix_proof(&shard)
-        .unwrap()
-        .expect("actual durable pulled prefix");
-    assert!(after.journal_sequence > before.map_or(0, |prefix| prefix.journal_sequence));
-    let observed = progress
-        .latest()
-        .expect("actual authorized ingest observation");
-    assert!(observed.generation > before_generation);
-    assert_eq!(observed.file_system_id, config.file_system_id);
-    assert_eq!(observed.shard_id, shard);
-    assert_eq!(observed.source_node_id, primary_node);
-    assert_eq!(observed.source_epoch, config.epoch);
-    assert_eq!(observed.prefix, after);
-
-    let settled =
-        observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
-    let settled_entries = settled.outcome.expect("settled outsider directory pull");
-    assert!(settled_entries.iter().any(|entry| entry.path == path));
-    assert!(
-        !settled.committed_work.metadata_replica_progress,
-        "an explicit directory pull with no newly applied entries must not report replica progress"
+        !listed.committed_work.metadata_replica_progress,
+        "a non-replica listing reads its owner and applies no journal"
     );
     assert_eq!(
         observer
@@ -3627,9 +3602,13 @@ fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
             .unwrap()
             .metadata_prefix_proof(&shard)
             .unwrap(),
-        Some(after)
+        before,
+        "a non-replica listing leaves the local copy of the shard untouched"
     );
-    assert_eq!(progress.latest(), Some(observed));
+    assert_eq!(
+        progress.latest().map_or(0, |row| row.generation),
+        before_generation
+    );
     drop(observer);
     drop(primary);
     _runtime.close().expect("normal native owner drain");

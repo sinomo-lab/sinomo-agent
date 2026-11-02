@@ -740,7 +740,7 @@ fn sifs_cluster_posix_reverse_direction_move_resolves_by_id_on_replicas() {
 }
 
 #[test]
-fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
+fn non_replica_read_surfaces_authority_failure_without_sync_path() {
     fn read_service(
         root: &Path,
         name: &str,
@@ -766,7 +766,6 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
             };
             let label = match &namespace.operation {
                 DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
-                DfsNamespaceOperation::SyncPath { .. } => "sync-path",
                 DfsNamespaceOperation::MetadataQuery { query }
                     if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
                 {
@@ -821,7 +820,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
         (service, calls)
     }
 
-    let root = temp_root("mounted-read-no-implicit-sync-path");
+    let root = temp_root("non-replica-read-no-sync-path");
     // Only the transport's rejection is synthetic. All authority and member
     // capability records come from an actual mounted native configuration.
     let nodes = crate::test_runtime::DfsTestRuntime::ordered_node_ids(
@@ -846,8 +845,7 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
         .into_iter()
         .find(|node| node != &primary_node)
         .unwrap();
-    // The compatibility fallback is specifically an unassigned observer path;
-    // an assigned replica correctly refuses this uncorroborated lookup failure.
+    // The reader is outside the services shard's replica set.
     let assignment = runtime
         .reassign_metadata_shard(
             &services.file_system_id,
@@ -861,55 +859,31 @@ fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
     let control_plane = observed_client.control_plane.take().unwrap();
     drop(observed_client);
 
-    let (mut ordinary, ordinary_calls) =
-        read_service(&root, "ordinary", &local_node, &primary_node, control_plane);
+    let (mut reader, calls) =
+        read_service(&root, "reader", &local_node, &primary_node, control_plane);
+    let error = reader
+        .posix_read_file_distributed("/services/missing.txt")
+        .expect_err("the injected authority failure");
     assert!(
-        ordinary
-            .posix_read_file_distributed("/services/missing.txt")
-            .is_err()
+        !matches!(error, DfsPosixError::NotFound { .. }),
+        "a failed authority lookup must not become NotFound: {error:?}"
     );
     assert_eq!(
-        ordinary_calls
-            .lock()
-            .expect("ordinary read calls")
-            .as_slice(),
-        ["lookup-path", "sync-path"],
-        "the ordinary compatibility policy should exercise the fallback this test fences"
-    );
-
-    let mut observed_client = runtime.client(&local_node).unwrap();
-    let control_plane = observed_client.control_plane.take().unwrap();
-    drop(observed_client);
-    let (mut mounted, mounted_calls) =
-        read_service(&root, "mounted", &local_node, &primary_node, control_plane);
-    mounted.disable_implicit_read_replica_ingest();
-    assert!(
-        mounted
-            .posix_read_file_distributed("/services/missing.txt")
-            .is_err()
-    );
-    assert_eq!(
-        mounted_calls.lock().expect("mounted read calls").as_slice(),
+        calls.lock().expect("read calls").as_slice(),
         ["lookup-path"],
-        "a mounted read must not turn an authority lookup failure into an unowned durable SyncPath apply"
+        "a non-replica read answers only from its primary, never from a local copy"
     );
 
-    // Keep both original lookup-policy assertions above. Authoritative stat is
-    // a different approved contract: even the compatibility caller must not
-    // ingest a journal to manufacture a complete stat after authority failure.
-    for (service, calls) in [
-        (&mut ordinary, &ordinary_calls),
-        (&mut mounted, &mounted_calls),
-    ] {
-        calls.lock().unwrap().clear();
-        assert!(
-            service
-                .posix_stat_distributed("/services/missing.txt")
-                .is_err()
-        );
-        assert_eq!(calls.lock().unwrap().as_slice(), ["stat-query"]);
-    }
-    drop((ordinary, mounted));
+    // Authoritative stat resolves the non-replica path through the same
+    // primary, whose failure ends the stat; it never ingests a journal.
+    calls.lock().unwrap().clear();
+    assert!(
+        reader
+            .posix_stat_distributed("/services/missing.txt")
+            .is_err()
+    );
+    assert_eq!(calls.lock().unwrap().as_slice(), ["lookup-path"]);
+    drop(reader);
     runtime.close().unwrap();
     std::fs::remove_dir_all(root).ok();
 }

@@ -600,19 +600,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(plan.desired_replica_nodes)
     }
 
-    fn sync_blocking_routed_write_namespace(
-        &mut self,
-        path: &str,
-        wait_for_commit: bool,
-        foreground_replica_repair: bool,
-        replay_response_journal: bool,
-    ) -> Result<()> {
-        if !wait_for_commit || !foreground_replica_repair || !replay_response_journal {
-            return Ok(());
-        }
-        self.sync_remote_namespace_path_until_quiet(path)
-    }
-
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
@@ -3482,14 +3469,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        let main_requester = self.metadata_backend.is_none()
-            && self.transport.delegates_local_namespace_authority()
-            && self.control_plane.is_some();
-        let authoritative_parent = if check_parent && opened_parent.is_none() && main_requester {
-            Some(self.posix_write_parent_from_main(&path)?)
-        } else {
-            None
-        };
+        let plans_from_authority = !self.plans_write_from_local_metadata(&path)?;
+        let authoritative_parent =
+            if check_parent && opened_parent.is_none() && plans_from_authority {
+                Some(self.posix_write_parent_from_main(&path)?)
+            } else {
+                None
+            };
         let opened_parent = opened_parent.or(authoritative_parent.as_ref());
         if check_parent {
             if let Some(parent) = opened_parent {
@@ -3512,7 +3498,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_path = path.clone();
         let trace_bytes = bytes.len();
         let mut transient_create = false;
-        let current_object = if main_requester {
+        let current_object = if plans_from_authority {
             self.lookup_sifs_path_direct_distributed_synced(&path)?
         } else {
             self.lookup_sifs_path(&path)?
@@ -3858,12 +3844,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.touch_parent_directory_modified(&path)?;
                 }
-                self.sync_blocking_routed_write_namespace(
-                    &path,
-                    options.wait_for_commit,
-                    options.foreground_replica_repair,
-                    replay_response_journal,
-                )?;
                 if !options.foreground_replica_repair {
                     if transient_create && remote_metadata_primary {
                         let authoritative = self.stat_target_for_path(&path)?;
@@ -3871,23 +3851,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     return self.stat_object_for_path(&committed_object, &path);
                 }
-                let object = match self.stat_target_for_path(&path) {
-                    Err(DfsPosixError::NotFound { .. }) => {
-                        let mut refreshed = None;
-                        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-                            self.sync_remote_namespace_path(&path)?;
-                            match self.stat_target_for_path(&path) {
-                                Err(DfsPosixError::NotFound { .. }) => continue,
-                                result => {
-                                    refreshed = Some(result);
-                                    break;
-                                }
-                            }
-                        }
-                        refreshed.unwrap_or_else(|| self.stat_target_for_path(&path))?
-                    }
-                    result => result?,
-                };
+                let object = self.committed_write_stat_target(&path)?;
                 self.stat_object_for_path(&object, &path)
             }
             NetworkedDfsWriteOutcome::Pending {
@@ -4351,10 +4315,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        let main_requester = self.metadata_backend.is_none()
-            && self.transport.delegates_local_namespace_authority()
-            && self.control_plane.is_some();
-        let authoritative_parent = if check_parent && main_requester {
+        let plans_from_authority = !self.plans_write_from_local_metadata(&path)?;
+        let authoritative_parent = if check_parent && plans_from_authority {
             Some(self.posix_write_parent_from_main(&path)?)
         } else {
             if check_parent {
@@ -4362,7 +4324,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None
         };
-        let current_object = if main_requester {
+        let current_object = if plans_from_authority {
             self.lookup_sifs_path_direct_distributed_synced(&path)?
         } else {
             self.lookup_sifs_path(&path)?
@@ -4663,12 +4625,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.touch_parent_directory_modified(&path)?;
                 }
-                self.sync_blocking_routed_write_namespace(
-                    &path,
-                    options.wait_for_commit,
-                    options.foreground_replica_repair,
-                    true,
-                )?;
                 if !options.foreground_replica_repair {
                     if transient_create {
                         let authoritative = self.stat_target_for_path(&path)?;
@@ -4676,26 +4632,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     return self.stat_object_for_path(&committed_object, &path);
                 }
-                // Bounded response replay may not have covered a deep
-                // catch-up; pull further batches before surfacing NotFound
-                // for a write that committed.
-                let object = match self.stat_target_for_path(&path) {
-                    Err(DfsPosixError::NotFound { .. }) => {
-                        let mut refreshed = None;
-                        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-                            self.sync_remote_namespace_path(&path)?;
-                            match self.stat_target_for_path(&path) {
-                                Err(DfsPosixError::NotFound { .. }) => continue,
-                                result => {
-                                    refreshed = Some(result);
-                                    break;
-                                }
-                            }
-                        }
-                        refreshed.unwrap_or_else(|| self.stat_target_for_path(&path))?
-                    }
-                    result => result?,
-                };
+                // The local view may not show the committed object; its
+                // metadata authority does.
+                let object = self.committed_write_stat_target(&path)?;
                 self.stat_object_for_path(&object, &path)
             }
             NetworkedDfsWriteOutcome::Pending {
@@ -4965,7 +4904,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
-            .current_read_object_metadata(object_id)
+            .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });
@@ -5178,7 +5117,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
-            .current_read_object_metadata(object_id)
+            .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });

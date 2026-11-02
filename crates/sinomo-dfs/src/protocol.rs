@@ -651,12 +651,6 @@ pub enum DfsNamespaceOperation {
     ClearDirRecursive {
         path: String,
     },
-    /// No-op operation whose response carries journal catch-up batches for
-    /// the path's shard. Requesters use it to read their own writes after an
-    /// operation that mutated a shard owned by a different primary.
-    SyncPath {
-        path: String,
-    },
     /// Read-only lookup against the path's metadata primary. The primary may
     /// include the authoritative object in the response; requesters may cache
     /// it in memory but do not replay journals or write it to the local mirror.
@@ -815,7 +809,6 @@ impl DfsNamespaceOperation {
         !matches!(
             self,
             Self::PollNamespaceChanges { .. }
-                | Self::SyncPath { .. }
                 | Self::LookupPath { .. }
                 | Self::LookupPaths { .. }
                 | Self::AbortPendingWrite { .. }
@@ -857,7 +850,6 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SetTimes { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
-            | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AbortPendingWrite { path, .. }
@@ -922,7 +914,6 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SetTimes { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
-            | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AbortPendingWrite { path, .. }
@@ -1064,9 +1055,7 @@ pub struct DfsNamespaceResponse {
     /// This is scheduling evidence, never publication or durability authority.
     pub committed_work: crate::DfsCommittedWork,
     pub result: DfsNamespaceResult,
-    /// For SyncPath, the primary may include the authoritative object at the
-    /// requested path so an outsider read is not blocked on unrelated shard
-    /// journal backlog. Journal batches remain the durable convergence path.
+    /// For LookupPath, the primary's authoritative object at the requested path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_path_object: Option<DfsObjectMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2045,12 +2034,6 @@ mod reactive_namespace_event_tests {
             !DfsNamespaceOperation::LookupPath {
                 path: "/services/reactive".to_string(),
                 inline_range: None,
-            }
-            .changes_visible_namespace()
-        );
-        assert!(
-            !DfsNamespaceOperation::SyncPath {
-                path: "/services/reactive".to_string(),
             }
             .changes_visible_namespace()
         );

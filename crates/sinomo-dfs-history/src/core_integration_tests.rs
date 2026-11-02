@@ -2064,8 +2064,8 @@ fn repin_after_gc_has_fresh_repair_ownership(evict_receipt: bool, clustered: boo
         let current_head = dfs
             .test_current_read_object_metadata(&current.object_id)
             .unwrap();
-        let peer_heads_before = [&a, &b]
-            .map(|node| native_history_settled_peer_head(&runtime, &owner, node, &current_head));
+        let peer_heads_before =
+            [&a, &b].map(|node| native_history_settled_peer_head(&runtime, node, &current_head));
         drop(negative_guard);
         runtime.clear_faults();
         let (repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
@@ -2369,8 +2369,7 @@ fn file_history_repin_reactivates_only_the_retained_versions_repair() {
     let current_head = dfs
         .test_current_read_object_metadata(&stat.object_id)
         .unwrap();
-    let peer_head_before =
-        native_history_settled_peer_head(&runtime, &owner, &remote, &current_head);
+    let peer_head_before = native_history_settled_peer_head(&runtime, &remote, &current_head);
     runtime.clear_faults();
     drop(negative_guard);
     let (repairs, settled) = drain_native_history_repairs(&runtime, &owner, &mut dfs);
@@ -3497,7 +3496,7 @@ fn file_history_pending_preservation_does_not_block_current_writes_and_publishes
                 && event.route == sinomo_dfs::DFS_DATA_STAGE_BLOB_ROUTE
         })
     });
-    let peer_head_before = native_history_settled_peer_head(&runtime, &owner, &remote, &current);
+    let peer_head_before = native_history_settled_peer_head(&runtime, &remote, &current);
     runtime.clear_faults();
     // The old fixture advanced a private retry tick by 100. Use only the
     // ordinary Main's finite repair passes, within the SAME existing network
@@ -3639,7 +3638,7 @@ fn file_history_repairs_retained_bytes_without_rewinding_the_replica() {
         .test_current_read_object_metadata(&first.object_id)
         .unwrap();
     fail_native_history_live_repairs(&runtime, &owner, &mut primary);
-    let before = native_history_settled_peer_head(&runtime, &owner, &remotes[0], &current);
+    let before = native_history_settled_peer_head(&runtime, &remotes[0], &current);
     let peer = runtime.client(&remotes[0]).unwrap();
     assert!(
         matches!(peer.content().read_blob(first.content_hash.as_deref().unwrap()),
@@ -6171,11 +6170,10 @@ fn current_history_shard_sequence<T: DfsMessageTransport>(
 
 fn native_history_settled_peer_head(
     runtime: &sinomo_dfs::test_support::DfsTestRuntime,
-    owner: &NodeId,
     peer_node: &NodeId,
     current: &DfsObjectMetadata,
 ) -> Option<DfsObjectMetadata> {
-    let mut peer = runtime.client(peer_node).unwrap();
+    let peer = runtime.client(peer_node).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -6183,19 +6181,6 @@ fn native_history_settled_peer_head(
             !remaining.is_zero(),
             "ordinary current metadata replication must settle before retained-only repair"
         );
-        let synced = peer
-            .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                current.file_system_id.clone(),
-                owner.clone(),
-                DfsNamespaceOperation::SyncPath {
-                    path: current.path.clone(),
-                },
-                remaining,
-                true,
-                true,
-            )
-            .unwrap();
-        assert!(matches!(synced.result, DfsNamespaceResult::Applied));
         let observed = peer
             .metadata_backend()
             .unwrap()
@@ -6204,6 +6189,7 @@ fn native_history_settled_peer_head(
         if observed.as_ref() == Some(current) {
             break;
         }
+        std::thread::sleep(Duration::from_millis(20));
     }
     let actual = peer
         .metadata_backend()

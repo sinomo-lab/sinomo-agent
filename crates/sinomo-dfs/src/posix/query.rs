@@ -285,9 +285,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    pub(crate) fn posix_object_policy(&self, path: &str) -> Result<sinomo_core::DfsObjectPolicy> {
-        self.posix_object_metadata_hint(path)
-            .map(|object| object.policy)
+    /// Policy of the object a write to `path` would replace, or `None` when
+    /// nothing exists there yet. A node whose durable store replicates the
+    /// path's shard uses that view; any other asks the shard's authority, since
+    /// a missing local record does not mean the path is new.
+    pub fn posix_existing_object_policy(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<sinomo_core::DfsObjectPolicy>> {
+        let requested = normalize_posix_path(path)?;
+        let local_store_replicates = match self.refresh_sifs_metadata_shards()? {
+            Some(shards) => self
+                .select_sifs_metadata_shard_for_path_from_snapshot(&requested, &shards)?
+                .is_none_or(|shard| {
+                    self.metadata_backend.is_some()
+                        && crate::service_routed_journal::shard_lists_node(&shard, &self.node_id)
+                }),
+            None => true,
+        };
+        if local_store_replicates {
+            return Ok(self
+                .posix_object_metadata_hint(path)
+                .ok()
+                .map(|object| object.policy));
+        }
+        match self.with_stat_deadline(|service| service.file_history_capture_object(path)) {
+            Ok(object) => Ok(Some(object.policy)),
+            Err(DfsPosixError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
@@ -472,9 +498,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.namespace_lstat_object_for_path(&object, &path)
     }
 
-    pub fn posix_stat_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsStat>> {
-        let Some(object) = self.object_by_id(object_id)? else {
-            return Ok(None);
+    pub fn posix_stat_object(&mut self, object_id: &DfsObjectId) -> Result<Option<DfsStat>> {
+        let object = match self.current_read_object_metadata_distributed(object_id) {
+            Ok(object) => object,
+            Err(crate::DfsError::UnknownObject { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         if object.kind == DfsObjectKind::Tombstone {
             return Ok(None);
@@ -490,33 +518,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
-        if self.transport.delegates_local_namespace_authority() {
-            let mut entries = Vec::new();
-            try_walk_metadata_pages(|after| {
-                let page = self.posix_list_dir_distributed_page(
-                    path,
-                    after,
-                    POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
-                )?;
-                entries.extend(page.entries);
-                Ok::<_, DfsPosixError>(page.next_cursor)
-            })?;
-            entries.sort_by(|left, right| left.name.cmp(&right.name));
-            return Ok(entries);
-        }
-        let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_posix_dot_components_distributed(path)?;
-        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
-            service.check_cancelled("distributed list")?;
-            let path = service.resolve_existing_posix_path_distributed(&path, true)?;
-            if service
-                .local_metadata_replica_can_list_resolved_dir_from_snapshot(&path, shard_snapshot)?
-            {
-                return service.posix_collect_resolved_dir(&path);
+        if !self.transport.delegates_local_namespace_authority() {
+            let _namespace_plan = self.namespace_execution.begin_planning();
+            let path = self.resolve_posix_dot_components_distributed(path)?;
+            let local = self.with_local_primary_metadata_read_snapshot(
+                &path,
+                |service, shard_snapshot| {
+                    service.check_cancelled("distributed list")?;
+                    let path = service.resolve_existing_posix_path_distributed(&path, true)?;
+                    if service
+                        .local_metadata_can_list_resolved_dir_from_snapshot(&path, shard_snapshot)?
+                    {
+                        return service.posix_collect_resolved_dir(&path).map(Some);
+                    }
+                    Ok(None)
+                },
+            )?;
+            if let Some(entries) = local {
+                return Ok(entries);
             }
-            service.sync_remote_namespace_path_until_quiet(&path)?;
-            service.posix_collect_resolved_dir(&path)
-        })
+        }
+        let mut entries = Vec::new();
+        try_walk_metadata_pages(|after| {
+            let page = self.posix_list_dir_distributed_page(
+                path,
+                after,
+                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+            )?;
+            entries.extend(page.entries);
+            Ok::<_, DfsPosixError>(page.next_cursor)
+        })?;
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
     }
 
     pub fn posix_list_dir_page(
@@ -539,15 +572,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsDirEntryPage> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        if self.transport.delegates_local_namespace_authority() {
-            let opened = self.posix_namespace_lstat_distributed(&path)?;
-            return self.owner_directory_page(&opened, after, max_entries, true);
-        }
-        if self.local_metadata_replica_can_list_resolved_dir(&path)? {
+        if self.local_metadata_can_list_resolved_dir(&path)? {
             return self.posix_list_resolved_dir_page(&path, after, max_entries);
         }
-        self.sync_remote_namespace_path_until_quiet(&path)?;
-        self.posix_list_resolved_dir_page(&path, after, max_entries)
+        let opened = self.posix_namespace_lstat_distributed(&path)?;
+        self.owner_directory_page(&opened, after, max_entries, true)
     }
 
     /// List one bounded page from an exact no-link directory open beneath
@@ -568,16 +597,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: opened.path.clone(),
             });
         }
-        if self.transport.delegates_local_namespace_authority() {
-            let page = self.owner_directory_page(&opened, after, max_entries, false)?;
-            return Ok((opened, page));
-        }
-        if let Some(shard) = self.routed_namespace_shard_for_path(&opened.path)?
-            && !self.is_local_metadata_replica_for_shard(&shard)
-        {
-            self.sync_remote_namespace_path_until_quiet(&opened.path)?;
-        }
-        let page = self.posix_list_opened_dir_no_links_page(&opened, after, max_entries)?;
+        let local = match self.routed_namespace_shard_for_path(&opened.path)? {
+            Some(shard) => self.reads_shard_from_local_metadata(&shard),
+            None => !self.transport.delegates_local_namespace_authority(),
+        };
+        let page = if local {
+            self.posix_list_opened_dir_no_links_page(&opened, after, max_entries)?
+        } else {
+            self.owner_directory_page(&opened, after, max_entries, false)?
+        };
         Ok((opened, page))
     }
 
@@ -727,19 +755,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    fn local_metadata_replica_can_list_resolved_dir(&mut self, path: &str) -> Result<bool> {
+    fn local_metadata_can_list_resolved_dir(&mut self, path: &str) -> Result<bool> {
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        self.local_metadata_replica_can_list_resolved_dir_from_snapshot(
-            path,
-            shard_snapshot.as_deref(),
-        )
+        self.local_metadata_can_list_resolved_dir_from_snapshot(path, shard_snapshot.as_deref())
     }
 
-    fn local_metadata_replica_can_list_resolved_dir_from_snapshot(
+    /// Whether this service lists `path` from its own metadata. Every other
+    /// listing, including a replica that does not yet hold the directory, is
+    /// read page by page from the directory's owner.
+    fn local_metadata_can_list_resolved_dir_from_snapshot(
         &mut self,
         path: &str,
         shard_snapshot: Option<&[crate::DfsMetadataShardConfig]>,
     ) -> Result<bool> {
+        if self.transport.delegates_local_namespace_authority() {
+            return Ok(false);
+        }
         let Some(shard) = shard_snapshot
             .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(path, shards))
             .transpose()?
@@ -747,7 +778,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return Ok(true);
         };
-        if !self.is_local_metadata_replica_for_shard(&shard) {
+        if !self.reads_shard_from_local_metadata(&shard) {
             return Ok(false);
         }
         Ok(self

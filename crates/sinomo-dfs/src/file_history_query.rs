@@ -75,7 +75,18 @@ pub enum DfsMetadataSelection {
     RevisionMetadata {
         identity: DfsRevisionReference,
     },
+    /// One shard's current objects at or under `path`, in path order, served
+    /// by that shard's primary. Placement reconciliation pages every shard
+    /// this way. Older peers reject this selection.
+    SubtreeObjectPageV1 {
+        path: String,
+        after: Option<DfsObjectPageCursor>,
+        limit: usize,
+    },
 }
+
+/// Largest subtree object page one authority returns per query.
+pub(crate) const DFS_SUBTREE_OBJECT_PAGE_LIMIT: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataShardQuery {
@@ -90,6 +101,11 @@ pub struct DfsMetadataShardQuery {
 pub enum DfsMetadataQueryResult {
     StatAtPathV1 {
         view: Box<DfsStatPathView>,
+    },
+    /// `next_cursor` is local to the queried shard.
+    SubtreeObjectPageV1 {
+        objects: Vec<DfsObjectMetadata>,
+        next_cursor: Option<DfsObjectPageCursor>,
     },
     StatObjectV1 {
         object: Option<Box<DfsObjectMetadata>>,
@@ -198,6 +214,20 @@ pub(crate) fn query_backend_metadata<B: DfsMetadataBackend + ?Sized>(
                 *limit,
             )?;
             Ok(DfsMetadataQueryResult::DirectoryPage { entries, after })
+        }
+        DfsMetadataSelection::SubtreeObjectPageV1 { path, after, limit } => {
+            let path = crate::posix_path::normalize_posix_path(path)
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+            let page = backend.objects_for_subtree_page(
+                &query.file_system_id,
+                &path,
+                after.as_ref(),
+                (*limit).min(DFS_SUBTREE_OBJECT_PAGE_LIMIT),
+            )?;
+            Ok(DfsMetadataQueryResult::SubtreeObjectPageV1 {
+                objects: page.objects,
+                next_cursor: page.next_cursor,
+            })
         }
         DfsMetadataSelection::ObjectLifecycle { object_id } => {
             let object = backend.get_object(object_id)?.filter(|object| {
