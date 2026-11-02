@@ -471,12 +471,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut followed_symlink = None::<String>;
         let resolve_authoritatively = self.transport.delegates_local_namespace_authority()
             || posix_path_has_dot_components(path);
+        // Every walk needs the routing cut: a component in a shard this
+        // service does not replicate is resolved through that shard's primary.
+        // A walk inside a read reuses that read's cut.
         let mut target_shard_snapshot = if let Some(shards) = shard_snapshot {
             Some(shards.to_vec())
-        } else if resolve_authoritatively {
-            self.refresh_sifs_metadata_shards()?
+        } else if let Some(shards) = self.read_shard_snapshot.clone() {
+            Some(shards)
         } else {
-            None
+            self.refresh_sifs_metadata_shards()?
         };
         for _ in 0..40 {
             let components = current
@@ -501,10 +504,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     resolved = candidate;
                     continue;
                 }
-                // Main callers resolve through the actual metadata owner.
+                // Main callers, and components in shards this service does
+                // not replicate, resolve through the actual metadata owner.
                 // Keep one routing cut throughout this component/symlink walk;
                 // selected objects remain in the existing request-scoped cache.
-                // Core/local callers retain their ordinary local component path.
+                // Components this service replicates use its local metadata.
                 let object = if let Some(link_path) = followed_symlink.as_deref() {
                     match self.lookup_sifs_path_direct_distributed_synced_from_snapshot(
                         &candidate,
@@ -523,7 +527,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             return Err(error);
                         }
                     }
-                } else if resolve_authoritatively {
+                } else if resolve_authoritatively
+                    || !self.local_metadata_answers_path_from_snapshot(
+                        &candidate,
+                        target_shard_snapshot.as_deref(),
+                    )?
+                {
                     self.lookup_sifs_path_direct_distributed_synced_from_snapshot(
                         &candidate,
                         target_shard_snapshot.as_deref(),
@@ -1442,6 +1451,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: path.to_string(),
             });
         }
+        self.resolve_hardlink_target(&object)
+    }
+
+    /// The object a committed write reports. A shard this service does not
+    /// replicate is read from its primary; otherwise the local view answers,
+    /// and the primary only when that view does not show the object yet.
+    pub(super) fn committed_write_stat_target(&mut self, path: &str) -> Result<DfsObjectMetadata> {
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        if !self.local_metadata_answers_path_from_snapshot(path, shard_snapshot.as_deref())? {
+            return self.stat_target_from_authority(path);
+        }
+        match self.stat_target_for_path(path) {
+            Err(DfsPosixError::NotFound { .. }) => self.stat_target_from_authority(path),
+            result => result,
+        }
+    }
+
+    /// The committed head of `path` as its metadata authority reports it.
+    fn stat_target_from_authority(&mut self, path: &str) -> Result<DfsObjectMetadata> {
+        let (_, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        let object = object
+            .filter(|object| object.kind != DfsObjectKind::Tombstone)
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: path.to_string(),
+            })?;
         self.resolve_hardlink_target(&object)
     }
 

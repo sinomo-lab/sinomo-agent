@@ -86,7 +86,7 @@ use crate::registration_journal::{
 use crate::windows_sync::{
     CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesMountedMutationHandoff,
     CloudFilesObjectProjection, CloudFilesWritableSyncState, cloud_files_object_projection,
-    configure_cloud_files_mounted_read_policy, fresh_writable_scopes_are_absent,
+    fresh_writable_scopes_are_absent,
 };
 use crate::{
     DecodedCloudFilesPlaceholderIdentity, decode_placeholder_identity, encode_placeholder_identity,
@@ -7139,7 +7139,6 @@ fn open_sifs_service(
         .with_boxed_metadata_backend_lazy(metadata)
         .map_err(error("dfs"))?;
     service.bootstrap_distributed_sifs().map_err(error("dfs"))?;
-    configure_cloud_files_mounted_read_policy(&mut service);
     Ok(OpenedSifsService {
         service,
         replica_candidates,

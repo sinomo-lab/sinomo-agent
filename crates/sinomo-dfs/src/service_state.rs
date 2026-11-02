@@ -528,15 +528,14 @@ pub struct NetworkedDfsService<T> {
     pub(crate) metadata_lookup_cache:
         Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
     pub(crate) metadata_lookup_cache_depth: Mutex<usize>,
+    /// The shard routing cut of the read in progress, so its path walk
+    /// resolves every component against the same snapshot as the read.
+    pub(crate) read_shard_snapshot: Option<Vec<DfsMetadataShardConfig>>,
     /// Wall-clock starts for passive repair/fetch throughput observations.
     /// Retry ticks remain the durable scheduling clock; these instants are
     /// deliberately process-local measurement evidence only.
     pub(crate) passive_fetch_started_at: BTreeMap<(String, NodeId), Instant>,
     pub(crate) repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
-    /// Whether a failed read-only authority lookup may fall back to applying
-    /// the primary's journal locally. Mounted clients disable this and bracket
-    /// their explicit directory refreshes with a durable host handoff.
-    pub(crate) implicit_read_replica_ingest_enabled: bool,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
     pub(crate) stable_namespace_reconciliation_results:
         BTreeMap<String, DfsStableNamespaceOperationReconciliation>,

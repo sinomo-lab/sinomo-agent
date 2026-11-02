@@ -496,7 +496,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 self.namespace_coordinator_dispatch_rename(&sifs_file_system_id(), from, to)?;
                 self.stat_routed_namespace_result(&normalized_to, true)
             }
-            (Some(source_primary), to_primary) => {
+            (Some(source_primary), _) => {
                 // The source-side shard primary coordinates; it adopts the
                 // record into the destination shard when that lives
                 // elsewhere.
@@ -507,9 +507,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         to: to.to_string(),
                     },
                 )?;
-                if to_primary.is_some_and(|to_primary| to_primary != source_primary) {
-                    self.sync_remote_namespace_path(&normalized_to)?;
-                }
                 self.stat_routed_namespace_result(&normalized_to, true)
             }
         }
@@ -565,7 +562,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
                 self.stat_routed_namespace_result(&normalized_to, true)
             }
-            (Some(source_primary), to_primary) => {
+            (Some(source_primary), _) => {
                 // The source-side shard primary coordinates; it adopts the
                 // record into the destination shard when that lives
                 // elsewhere.
@@ -574,9 +571,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     source_primary.clone(),
                     operation,
                 )?;
-                if to_primary.is_some_and(|to_primary| to_primary != source_primary) {
-                    self.sync_remote_namespace_path(&normalized_to)?;
-                }
                 self.stat_routed_namespace_result(&normalized_to, true)
             }
         }

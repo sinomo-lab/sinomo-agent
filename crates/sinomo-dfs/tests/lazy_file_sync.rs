@@ -526,7 +526,6 @@ fn backendless_main_file_sync_preserves_opened_inode_across_writes_links_and_ren
     let mut requester = NetworkedDfsService::new(transport, content)
         .with_boxed_control_plane(runtime.control_plane_client().unwrap());
     requester.bootstrap_distributed_sifs().unwrap();
-    requester.disable_implicit_read_replica_ingest();
     assert!(requester.metadata_backend().is_none());
     let initial = requester
         .posix_capture_file_sync_target(PATH, DfsPosixSyncKind::File)
