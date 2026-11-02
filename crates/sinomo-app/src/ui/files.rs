@@ -11,8 +11,10 @@
 //! [`FilesState`]; the interactive app lists SIFS and generates bounded thumbnails on separate
 //! background lanes so tab layout never blocks on DFS metadata, network work, or image decoding.
 //!
-//! The file listing changes on navigation and sort. It is rebuilt by
-//! [`RebuildOnChange`] and rendered as either a [`VirtualTable`] or a visible-range icon grid, so
+//! Controls, dialogs, and sheets stay mounted while their state changes: stock controls read the
+//! model through bindings and readers, and a [`RebuildOnChange`] host replaces only a narrow body
+//! whose structure really changed. The populated listing is rebuilt when its entries, sort, or
+//! view change and is rendered as either a [`VirtualTable`] or a visible-range icon grid, so
 //! large folders only paint visible content while the details header stays pinned. Medium and
 //! large icon views and the masonry Flow view request exact-version raster snapshots, decode them
 //! under strict limits, and keep decoded pixels plus renderer registrations bounded. Sorting and
@@ -33,25 +35,25 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use sui::WindowEvent;
 use sui::{
-    Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
-    CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView, Constraints,
-    ContextMenu, ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx,
-    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, ImageHandle,
+    Alignment, ArrangeCtx, Axis, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance,
+    Checkbox, CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView,
+    Constraints, ContextMenu, ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event,
+    EventCtx, EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, ImageHandle,
     ImageSource, Insets, KeyState, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx,
     MenuItem, NumberInput, Observable, PaintCtx, PanelSection, PlacementBadgePaint, Point,
-    PointerButton, PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect,
-    RegisteredImage, RichText, ScrollDelta, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction,
-    SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
-    SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack, StackHostOptions, StatusBadge,
-    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextAlign,
-    TextBlockPaint, TextCellPaint, TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement,
-    TrailingSlotRow, Vector, VirtualCollectionModel, VirtualList, VirtualListChrome,
-    VirtualListSelectionMode, VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind,
-    VirtualTableRowContext, VirtualTableSortDirection, VirtualTableState, Widget, WidgetId,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
-    draw_glyph, paint_checkbox_indicator, paint_leading_label_cell, paint_placement_badge_with,
-    paint_text_block, paint_text_cell,
+    PointerButton, PointerEventKind, Popover, PopoverAlignment, Presence, RadioButton,
+    RebuildOnChange, Rect, RegisteredImage, RichText, ScrollDelta, ScrollState, ScrollView,
+    SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone,
+    SemanticsAction, SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole,
+    SemanticsValue, Separator, SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack,
+    StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface, SurfaceBorder,
+    SurfaceRole, SwitchView, TextAlign, TextBlockPaint, TextCellPaint, TextDocument, TextStyle,
+    TextSurface, TextWrap, ThemeTextToken, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow,
+    Vector, VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode,
+    VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
+    VirtualTableSortDirection, VirtualTableState, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_checkbox_indicator,
+    paint_leading_label_cell, paint_placement_badge_with, paint_text_block, paint_text_cell,
 };
 
 #[cfg(test)]
@@ -98,7 +100,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::backend::Backend;
 use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutcome};
 use crate::state::{Shared, Tab};
-use crate::theme::{AppTextScale, AppThemeMode, Palette};
+use crate::theme::{AppTextScale, AppThemeMode};
 use crate::ui::files_thumbnail::{
     THUMBNAIL_CACHE_MAX_BYTES, THUMBNAIL_CACHE_MAX_ENTRIES, THUMBNAIL_MAX_SOURCE_BYTES,
     ThumbnailBitmap, ThumbnailBucket, ThumbnailCache, ThumbnailCacheEntry, ThumbnailIdentity,
@@ -107,7 +109,8 @@ use crate::ui::files_thumbnail::{
 use crate::ui::module_widget::{ModuleWidget, ModuleWidgetSession};
 use crate::ui::offline::DaemonOfflinePanel;
 use crate::ui::settings::SettingsSection;
-use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
+use crate::ui::widgets::{self, Restyle, VirtualCollectionHost, VirtualCollectionSnapshot};
+use sui::SurfacePalette;
 
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
 /// The wide branch reserves enough room for Places, the inspector, and the compact file table so
@@ -128,7 +131,6 @@ const HEADER_H: f32 = 44.0;
 /// depending on a right click, while the full command inventory remains in grouped menus.
 const FILE_ACTION_BAR_H: f32 = 48.0;
 const HEADER_COMMAND_GAP: f32 = 4.0;
-const HEADER_PAD_Y: f32 = 8.0;
 /// Minimum inner width for the complete desktop command row. Below this, the wide Files layout
 /// keeps its inspector but uses a picker-first row with secondary commands in an overflow sheet.
 const FULL_HEADER_INNER_MIN_W: f32 = 860.0;
@@ -1402,8 +1404,8 @@ pub struct FilesState {
 
 #[derive(Clone, Debug, PartialEq)]
 struct FilesListStructure {
-    theme: (AppThemeMode, AppTextScale),
     source: FilesSourceKind,
+    path: String,
     loaded: bool,
     loading: bool,
     error: Option<String>,
@@ -1418,7 +1420,6 @@ struct FilesListStructure {
 
 #[derive(Clone, Debug, PartialEq)]
 struct FilesHeaderStructure {
-    theme: (AppThemeMode, AppTextScale),
     source: FilesSourceKind,
     clustered: bool,
     loading: bool,
@@ -1437,7 +1438,6 @@ struct FilesHeaderStructure {
 
 #[derive(Clone, Debug, PartialEq)]
 struct FilesInspectorStructure {
-    theme: (AppThemeMode, AppTextScale),
     source: FilesSourceKind,
     clustered: bool,
     loaded: bool,
@@ -1462,11 +1462,12 @@ struct FilesInspectorStructure {
     preview_error: Option<String>,
     custom_preview_id: Option<String>,
     inspector_details_open: bool,
+    attachment_loading: bool,
+    attachment_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct FilesPlacementActivityStructure {
-    theme: (AppThemeMode, AppTextScale),
     filter: PlacementActivityFilter,
     activities: Vec<sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary>,
     next_cursor: Option<sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor>,
@@ -1479,19 +1480,18 @@ struct FilesPlacementActivityStructure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FilesDialogStructure {
-    Closed {
-        theme: (AppThemeMode, AppTextScale),
-    },
-    DocumentConfirmation {
-        theme: (AppThemeMode, AppTextScale),
-        revision: u64,
-    },
+    Closed,
+    /// An open document, optionally under its unsaved-close confirmation.
     Document {
-        theme: (AppThemeMode, AppTextScale),
+        document: Option<(FilesSourceKind, String)>,
         revision: u64,
+        dirty: bool,
+        saving: bool,
+        save_error: Option<String>,
+        save_warning: Option<String>,
+        confirmation: bool,
     },
     Action {
-        theme: (AppThemeMode, AppTextScale),
         source: FilesSourceKind,
         path: String,
         kind: FileActionPromptKind,
@@ -1507,34 +1507,130 @@ enum FilesDialogStructure {
         placement_loading: bool,
         placement_applying: bool,
         placement_error: Option<String>,
+        placement_shape: Option<PlacementBodyShape>,
     },
     Compact {
-        theme: (AppThemeMode, AppTextScale),
         overlay: CompactFilesOverlay,
-        source: FilesSourceKind,
-        path: String,
-        list_revision: u64,
-        selected: Option<usize>,
-        details_loading: bool,
-        preview_loading: bool,
-        inspector_details_open: bool,
     },
-    PlacementActivity {
-        theme: (AppThemeMode, AppTextScale),
-    },
+    PlacementActivity,
     History {
-        theme: (AppThemeMode, AppTextScale),
+        target: Option<HistoryTarget>,
         revision: u64,
     },
     StorageCenter {
-        theme: (AppThemeMode, AppTextScale),
         revision: u64,
     },
 }
 
+/// Draft-derived facts that decide which placement editor sections exist. Edits that only change
+/// values (goal, counts, node constraints) leave the shape unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlacementBodyShape {
+    preview_is_current: bool,
+    editor_locked: bool,
+    constraints_locked: bool,
+    /// See [`placement_count_bounds`].
+    count_bounds: (usize, usize, usize),
+    goal_editable: bool,
+    unsupported_reason: Option<String>,
+    subtree_scope: bool,
+    draft_has_actionable_change: bool,
+}
+
+impl PlacementBodyShape {
+    fn new(state: &FilesState) -> Self {
+        let policy = state
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy);
+        let goal_editable = policy.is_some_and(|policy| policy.consistency.is_editable());
+        Self {
+            preview_is_current: state.placement_preview_is_current(),
+            editor_locked: state.placement_editor_locked(),
+            constraints_locked: state.placement_editor_locked() || !goal_editable,
+            count_bounds: placement_count_bounds(state),
+            goal_editable,
+            unsupported_reason: policy.and_then(|policy| policy.consistency.policy().err()),
+            subtree_scope: state
+                .placement_draft
+                .as_ref()
+                .is_some_and(|draft| draft.scope == SifsPlacementScope::Subtree),
+            draft_has_actionable_change: state
+                .placement_draft
+                .as_ref()
+                .is_some_and(PlacementEditorDraft::has_actionable_change),
+        }
+    }
+}
+
+/// The identity of the mounted dialog or sheet. While it is unchanged the host keeps the shell
+/// mounted and each builder updates only its own body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FilesDialogShell {
+    Closed,
+    Document(Option<(FilesSourceKind, String)>),
+    Action {
+        source: FilesSourceKind,
+        path: String,
+        kind: FileActionPromptKind,
+        target_path: Option<String>,
+        targets: Vec<FileActionTarget>,
+    },
+    Compact(CompactFilesOverlay),
+    PlacementActivity,
+    History(Option<HistoryTarget>),
+    StorageCenter,
+}
+
+impl FilesDialogStructure {
+    fn shell(&self) -> FilesDialogShell {
+        match self {
+            Self::Closed => FilesDialogShell::Closed,
+            Self::Document { document, .. } => FilesDialogShell::Document(document.clone()),
+            Self::Action {
+                source,
+                path,
+                kind,
+                target_path,
+                targets,
+                ..
+            } => FilesDialogShell::Action {
+                source: *source,
+                path: path.clone(),
+                kind: *kind,
+                target_path: target_path.clone(),
+                targets: targets.clone(),
+            },
+            Self::Compact { overlay } => FilesDialogShell::Compact(*overlay),
+            Self::PlacementActivity => FilesDialogShell::PlacementActivity,
+            Self::History { target, .. } => FilesDialogShell::History(target.clone()),
+            Self::StorageCenter { .. } => FilesDialogShell::StorageCenter,
+        }
+    }
+
+    fn confirmation(&self) -> bool {
+        matches!(
+            self,
+            Self::Document {
+                confirmation: true,
+                ..
+            }
+        )
+    }
+
+    /// The load revision of a document, history, or storage body.
+    fn revision(&self) -> u64 {
+        match self {
+            Self::Document { revision, .. }
+            | Self::History { revision, .. }
+            | Self::StorageCenter { revision } => *revision,
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FilesStructureKey {
-    theme: (AppThemeMode, AppTextScale),
     list: FilesListStructure,
     header: FilesHeaderStructure,
     places: Vec<FilePlace>,
@@ -1553,18 +1649,18 @@ impl FilesStructureKey {
         self
     }
 
+    /// Theme and text scale are not part of the key: widgets read the live theme, and the shell
+    /// refreshes the window when it changes.
     pub(crate) fn new(
-        theme_mode: AppThemeMode,
-        text_scale: AppTextScale,
+        _theme_mode: AppThemeMode,
+        _text_scale: AppTextScale,
         state: Option<&FilesState>,
     ) -> Self {
-        let theme = (theme_mode, text_scale);
         let Some(state) = state else {
             return Self {
-                theme,
                 list: FilesListStructure {
-                    theme,
                     source: FilesSourceKind::Sifs,
+                    path: "/".to_string(),
                     loaded: false,
                     loading: false,
                     error: None,
@@ -1577,7 +1673,6 @@ impl FilesStructureKey {
                     tasks: Vec::new(),
                 },
                 header: FilesHeaderStructure {
-                    theme,
                     source: FilesSourceKind::Sifs,
                     clustered: false,
                     loading: false,
@@ -1595,7 +1690,6 @@ impl FilesStructureKey {
                 },
                 places: Vec::new(),
                 inspector: FilesInspectorStructure {
-                    theme,
                     source: FilesSourceKind::Sifs,
                     clustered: false,
                     loaded: false,
@@ -1620,10 +1714,11 @@ impl FilesStructureKey {
                     preview_error: None,
                     custom_preview_id: None,
                     inspector_details_open: false,
+                    attachment_loading: false,
+                    attachment_error: None,
                 },
                 tasks: Vec::new(),
                 placement_activity: FilesPlacementActivityStructure {
-                    theme,
                     filter: PlacementActivityFilter::All,
                     activities: Vec::new(),
                     next_cursor: None,
@@ -1633,13 +1728,13 @@ impl FilesStructureKey {
                     history_truncated: false,
                     refreshed_at_unix_nanos: None,
                 },
-                dialog: FilesDialogStructure::Closed { theme },
+                dialog: FilesDialogStructure::Closed,
                 daemon_available: true,
             };
         };
         let list = FilesListStructure {
-            theme,
             source: state.source,
+            path: state.path.clone(),
             loaded: state.loaded,
             loading: state.loading,
             error: state.error.clone(),
@@ -1652,7 +1747,6 @@ impl FilesStructureKey {
             tasks: state.tasks.clone(),
         };
         let header = FilesHeaderStructure {
-            theme,
             source: state.source,
             clustered: state.clustered,
             loading: state.loading,
@@ -1669,7 +1763,6 @@ impl FilesStructureKey {
             external_file_hovered: state.external_file_hovered,
         };
         let inspector = FilesInspectorStructure {
-            theme,
             source: state.source,
             clustered: state.clustered,
             loaded: state.loaded,
@@ -1697,9 +1790,10 @@ impl FilesStructureKey {
                 .as_ref()
                 .map(|preview| preview.contribution_id.clone()),
             inspector_details_open: state.inspector_details_open,
+            attachment_loading: state.attachment_loading,
+            attachment_error: state.attachment_error.clone(),
         };
         let placement_activity = FilesPlacementActivityStructure {
-            theme,
             filter: state.placement_activity_filter,
             activities: state.placement_activity.clone(),
             next_cursor: state.placement_activity_next_cursor.clone(),
@@ -1709,19 +1803,19 @@ impl FilesStructureKey {
             history_truncated: state.placement_activity_history_truncated,
             refreshed_at_unix_nanos: state.placement_activity_refreshed_at_unix_nanos,
         };
-        let dialog = if state.document_close_confirmation {
-            FilesDialogStructure::DocumentConfirmation {
-                theme,
-                revision: state.document_revision,
-            }
-        } else if state.document.is_some() {
+        let dialog = if state.document_close_confirmation || state.document.is_some() {
+            let document = state.document.as_ref();
             FilesDialogStructure::Document {
-                theme,
+                document: document.map(|document| (document.source, document.path.clone())),
                 revision: state.document_revision,
+                dirty: document.is_some_and(FilesDocument::dirty),
+                saving: document.is_some_and(|document| document.saving),
+                save_error: document.and_then(|document| document.save_error.clone()),
+                save_warning: document.and_then(|document| document.save_warning.clone()),
+                confirmation: state.document_close_confirmation,
             }
         } else if let Some(prompt) = &state.action_prompt {
             FilesDialogStructure::Action {
-                theme,
                 source: state.source,
                 path: state.path.clone(),
                 kind: prompt.kind,
@@ -1737,36 +1831,26 @@ impl FilesStructureKey {
                 placement_loading: state.placement_loading,
                 placement_applying: state.placement_applying,
                 placement_error: state.placement_error.clone(),
+                placement_shape: (prompt.kind == FileActionPromptKind::Placement)
+                    .then(|| PlacementBodyShape::new(state)),
             }
         } else if state.history_open {
             FilesDialogStructure::History {
-                theme,
+                target: state.history_target.clone(),
                 revision: state.history_revision,
             }
         } else if state.storage_center_open {
             FilesDialogStructure::StorageCenter {
-                theme,
                 revision: state.storage_center_revision,
             }
         } else if state.placement_activity_open {
-            FilesDialogStructure::PlacementActivity { theme }
+            FilesDialogStructure::PlacementActivity
         } else if let Some(overlay) = state.compact_overlay {
-            FilesDialogStructure::Compact {
-                theme,
-                overlay,
-                source: state.source,
-                path: state.path.clone(),
-                list_revision: state.list_revision,
-                selected: state.selected,
-                details_loading: state.details_loading,
-                preview_loading: state.preview_loading,
-                inspector_details_open: state.inspector_details_open,
-            }
+            FilesDialogStructure::Compact { overlay }
         } else {
-            FilesDialogStructure::Closed { theme }
+            FilesDialogStructure::Closed
         };
         Self {
-            theme,
             list,
             header,
             places: files_places(state),
@@ -11193,8 +11277,94 @@ fn clone_gray_data_scrollbar_reader(reader: &ThemeReader) -> impl Fn() -> Defaul
 }
 
 /// Resolve the app chrome palette for file rows and preview-specific paint helpers.
-fn palette(shared: &Shared) -> Palette {
-    Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
+fn palette(shared: &Shared) -> SurfacePalette {
+    shared.theme().surfaces
+}
+
+/// Body text in `color` at a step of the theme's type ramp.
+fn sized_text_style(theme: &DefaultTheme, color: Color, token: ThemeTextToken) -> TextStyle {
+    let mut style = theme.text_style(color);
+    style.font_size = token.size;
+    style.line_height = token.line_height;
+    style
+}
+
+/// A text style resolved from the live theme each time the label lays out.
+fn live_text_style(
+    reader: &ThemeReader,
+    style: impl Fn(&DefaultTheme) -> TextStyle + 'static,
+) -> impl Fn() -> TextStyle + 'static {
+    let reader = Rc::clone(reader);
+    move || style(&reader())
+}
+
+/// Muted secondary text at the small step, the style of Files hints and notes.
+fn live_note_style(reader: &ThemeReader) -> impl Fn() -> TextStyle + 'static {
+    live_text_style(reader, |theme| {
+        sized_text_style(theme, theme.palette.text_muted, theme.text.sm)
+    })
+}
+
+/// Plain wrapped text whose style follows the live theme.
+fn live_plain_text(
+    reader: &ThemeReader,
+    text: impl Into<String>,
+    style: impl Fn(&DefaultTheme) -> TextStyle + 'static,
+) -> RichText {
+    let text = text.into();
+    let reader = Rc::clone(reader);
+    let initial = TextDocument::from_plain_text(text.clone(), style(&reader()));
+    RichText::new(initial)
+        .document_when(move || TextDocument::from_plain_text(text.clone(), style(&reader())))
+}
+
+/// Keeps its child mounted and re-runs the child's layout, paint, and semantics when the observed
+/// key changes, so reader-bound stock controls follow state that changed without a rebuild.
+struct RefreshOn<K> {
+    source: Arc<dyn Observable<K>>,
+    child: WidgetPod,
+}
+
+impl<K: 'static> RefreshOn<K> {
+    fn new<O, W>(source: O, child: W) -> Self
+    where
+        O: Observable<K> + 'static,
+        W: Widget + 'static,
+    {
+        Self {
+            source: Arc::new(source),
+            child: WidgetPod::new(child),
+        }
+    }
+}
+
+impl<K: 'static> Widget for RefreshOn<K> {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let _ = ctx.observe(self.source.as_ref());
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let _ = ctx.observe(self.source.as_ref());
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let _ = ctx.observe(self.source.as_ref());
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
 }
 
 fn toolbar_tooltip<W>(text: impl Into<String>, child: W, reader: &ThemeReader) -> Tooltip
@@ -11203,7 +11373,7 @@ where
 {
     Tooltip::new(text, child)
         .placement(TooltipPlacement::Below)
-        .theme(reader())
+        .theme_when(clone_reader(reader))
 }
 
 fn human_size(size: Option<u64>) -> String {
@@ -12541,103 +12711,128 @@ fn unix_nanos_label(nanos: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Breadcrumb header (path bar) — rebuilt on navigation by `RebuildOnChange`.
+// Navigation header (path bar) — retained; only the breadcrumb trail is rebuilt on navigation.
 // ---------------------------------------------------------------------------
 
-/// Build the header: navigation buttons + a `Breadcrumb` over the current path segments. Each
-/// segment activates a navigate-to-that-segment; the up button goes to the parent.
-fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let crumbs = shared.files().crumbs();
-    let current = crumbs.len().saturating_sub(1);
-    let targets: Vec<String> = crumbs.iter().map(|(_, target)| target.clone()).collect();
+fn files_source_index(shared: &Shared) -> impl Observable<usize> + use<> {
+    shared
+        .signals()
+        .files_structure
+        .select_named("files source", |key| {
+            usize::from(key.header.source == FilesSourceKind::Local)
+        })
+}
 
-    let back = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronLeft, "Back")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_go_back()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().go_back(waker);
-            })
-    };
+fn header_back_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::ChevronLeft, "Back")
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || s.files().can_go_back()
+        })
+        .on_press(move || {
+            let waker = { s.borrow().waker.clone() };
+            s.files_mut().go_back(waker);
+        })
+}
 
-    let forward = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronRight, "Forward")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_go_forward()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().go_forward(waker);
-            })
-    };
+fn header_forward_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::ChevronRight, "Forward")
+        .theme_when(clone_reader(reader))
+        .enabled_when({
+            let s = s.clone();
+            move || s.files().can_go_forward()
+        })
+        .on_press(move || {
+            let waker = { s.borrow().waker.clone() };
+            s.files_mut().go_forward(waker);
+        })
+}
 
-    let up = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronUp, "Up")
-            .theme_when(clone_reader(reader))
-            .on_press(move || {
-                s.files_mut().go_up();
-            })
-    };
+fn header_up_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
+    let s = shared.clone();
+    IconButton::new(IconGlyph::ChevronUp, "Up")
+        .theme_when(clone_reader(reader))
+        .on_press(move || s.files_mut().go_up())
+}
 
-    let breadcrumb = {
-        let s = shared.clone();
-        let path_label = shared.files().source.path_label();
-        Breadcrumb::new(path_label)
-            .items(
-                crumbs
-                    .iter()
-                    .map(|(label, _)| BreadcrumbItem::new(label.clone())),
-            )
-            .current(current)
-            .theme_when(clone_reader(reader))
-            .on_activate(move |index, _label| {
-                if let Some(target) = targets.get(index) {
-                    s.files_mut().navigate(target.clone());
-                }
-            })
-    };
+/// The SIFS / Local switch follows the model, so a switch made elsewhere (the offline panel, a
+/// place, a command) is reflected without rebuilding the control.
+fn files_source_control(shared: &Shared, reader: &ThemeReader) -> SegmentedControl {
+    let selected = shared.clone();
+    let s = shared.clone();
+    SegmentedControl::new("Files source")
+        .items([
+            SegmentedControlItem::new("SIFS")
+                .semantic_name("Browse SIFS")
+                .description("Browse distributed SIFS objects"),
+            SegmentedControlItem::new("Local")
+                .semantic_name("Browse local files")
+                .description("Browse this node's local filesystem"),
+        ])
+        .selected_when(move || {
+            Some(usize::from(
+                selected.files().source == FilesSourceKind::Local,
+            ))
+        })
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _label| {
+            let source = if index == 1 {
+                FilesSourceKind::Local
+            } else {
+                FilesSourceKind::Sifs
+            };
+            let waker = { s.borrow().waker.clone() };
+            s.files_mut().switch_source(source, waker);
+        })
+}
 
-    let source = {
-        let s = shared.clone();
-        let selected = match shared.files().source {
-            FilesSourceKind::Sifs => 0,
-            FilesSourceKind::Local => 1,
-        };
-        SegmentedControl::new("Files source")
-            .items([
-                SegmentedControlItem::new("SIFS")
-                    .semantic_name("Browse SIFS")
-                    .description("Browse distributed SIFS objects"),
-                SegmentedControlItem::new("Local")
-                    .semantic_name("Browse local files")
-                    .description("Browse this node's local filesystem"),
-            ])
-            .selected(selected)
-            .theme_when(clone_reader(reader))
-            .on_change(move |index, _label| {
-                let source = if index == 1 {
-                    FilesSourceKind::Local
-                } else {
-                    FilesSourceKind::Sifs
-                };
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().switch_source(source, waker);
-            })
-    };
+/// The path trail. Breadcrumb items are static, so only this control is rebuilt when the location
+/// changes; activation resolves its target from the current crumbs.
+fn files_breadcrumb(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files breadcrumb location", |key| {
+            (key.header.source, key.header.path.clone())
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |(source, _path)| {
+        let crumbs = s.files().crumbs();
+        let current = crumbs.len().saturating_sub(1);
+        let activate = s.clone();
+        WidgetPod::new(
+            Breadcrumb::new(source.path_label())
+                .items(
+                    crumbs
+                        .iter()
+                        .map(|(label, _)| BreadcrumbItem::new(label.clone())),
+                )
+                .current(current)
+                .theme_when(clone_reader(&r))
+                .on_activate(move |index, _label| {
+                    let target = activate
+                        .files()
+                        .crumbs()
+                        .get(index)
+                        .map(|(_, target)| target.clone());
+                    if let Some(target) = target {
+                        activate.files_mut().navigate(target);
+                    }
+                }),
+        )
+    })
+}
 
-    let refresh = {
+/// Refresh for the current source. Both labelled variants stay mounted; the source selects one.
+fn files_refresh_control(shared: &Shared, reader: &ThemeReader) -> SwitchView {
+    let refresh = |source: FilesSourceKind| {
+        let label = format!("Refresh {}", source.label());
         let s = shared.clone();
-        let label = format!("Refresh {}", shared.files().source.label());
-        IconButton::new(IconGlyph::Redo, label)
+        let button = IconButton::new(IconGlyph::Redo, label.clone())
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -12650,35 +12845,62 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             .on_press(move || {
                 let waker = { s.borrow().waker.clone() };
                 s.files_mut().refresh(waker);
-            })
+            });
+        toolbar_tooltip(label, button, reader)
     };
+    SwitchView::new()
+        .selected_from(files_source_index(shared))
+        .with_child(refresh(FilesSourceKind::Sifs))
+        .with_child(refresh(FilesSourceKind::Local))
+}
 
-    let toolbar_row = Flex::horizontal()
+/// The desktop command row: navigation, source, path trail, refresh, and file commands. The
+/// `intermediate` density is used while the inspector is visible but the complete row would
+/// overflow; it drops the navigation tooltips and lets the trail shrink further.
+fn navigation_header(
+    shared: &Shared,
+    reader: &ThemeReader,
+    intermediate: bool,
+) -> impl Widget + use<> {
+    let back = header_back_button(shared, reader);
+    let forward = header_forward_button(shared, reader);
+    let up = header_up_button(shared, reader);
+    let mut toolbar_row = Flex::horizontal()
         .main_gap(HEADER_COMMAND_GAP)
-        .align_items(Alignment::Center)
+        .align_items(Alignment::Center);
+    toolbar_row = if intermediate {
+        toolbar_row
+            .with_item(back, FlexItem::new().no_shrink())
+            .with_item(forward, FlexItem::new().no_shrink())
+            .with_item(up, FlexItem::new().no_shrink())
+    } else {
+        toolbar_row
+            .with_item(
+                toolbar_tooltip("Back", back, reader),
+                FlexItem::new().no_shrink(),
+            )
+            .with_item(
+                toolbar_tooltip("Forward", forward, reader),
+                FlexItem::new().no_shrink(),
+            )
+            .with_item(
+                toolbar_tooltip("Up", up, reader),
+                FlexItem::new().no_shrink(),
+            )
+    };
+    let toolbar_row = toolbar_row
         .with_item(
-            toolbar_tooltip("Back", back, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Forward", forward, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            toolbar_tooltip("Up", up, reader),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            SizedBox::new().width(120.0).child(source),
+            SizedBox::new()
+                .width(120.0)
+                .child(files_source_control(shared, reader)),
             FlexItem::fixed(120.0),
         )
-        .with_item(breadcrumb, FlexItem::fill().min_width(160.0))
         .with_item(
-            toolbar_tooltip(
-                format!("Refresh {}", shared.files().source.label()),
-                refresh,
-                reader,
-            ),
+            files_breadcrumb(shared, reader),
+            FlexItem::fill().min_width(if intermediate { 96.0 } else { 160.0 }),
+        )
+        .with_item(
+            files_refresh_control(shared, reader),
             FlexItem::new().no_shrink(),
         )
         .with_item(
@@ -12686,203 +12908,79 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         );
 
-    Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
-        .with_child(toolbar_row)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+    Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .justify(sui::FlexJustify::Center)
+        .with_item(toolbar_row, FlexItem::new().no_shrink())
+}
+
+/// Build the header: navigation buttons + a `Breadcrumb` over the current path segments. Each
+/// segment activates a navigate-to-that-segment; the up button goes to the parent.
+fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    navigation_header(shared, reader, false)
 }
 
 /// Intermediate desktop header used while the inspector is still visible but the complete
 /// command row would overflow. It preserves navigation and moves location commands into the same
 /// context menu as the full desktop header.
 fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let crumbs = shared.files().crumbs();
-    let current = crumbs.len().saturating_sub(1);
-    let targets: Vec<String> = crumbs.iter().map(|(_, target)| target.clone()).collect();
+    navigation_header(shared, reader, true)
+}
 
-    let back = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronLeft, "Back")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_go_back()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().go_back(waker);
-            })
+fn compact_location_label(files: &FilesState) -> String {
+    let source_label = match files.source {
+        FilesSourceKind::Sifs => "SIFS",
+        FilesSourceKind::Local => "Local",
     };
-    let forward = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronRight, "Forward")
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_go_forward()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().go_forward(waker);
-            })
+    let leaf = match files.source {
+        FilesSourceKind::Sifs => files
+            .path
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or("/"),
+        FilesSourceKind::Local => Path::new(&files.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(files.path.as_str()),
     };
-    let up = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronUp, "Up")
-            .theme_when(clone_reader(reader))
-            .on_press(move || s.files_mut().go_up())
-    };
-    let source = {
-        let s = shared.clone();
-        let selected = match shared.files().source {
-            FilesSourceKind::Sifs => 0,
-            FilesSourceKind::Local => 1,
-        };
-        SegmentedControl::new("Files source")
-            .items([
-                SegmentedControlItem::new("SIFS")
-                    .semantic_name("Browse SIFS")
-                    .description("Browse distributed SIFS objects"),
-                SegmentedControlItem::new("Local")
-                    .semantic_name("Browse local files")
-                    .description("Browse this node's local filesystem"),
-            ])
-            .selected(selected)
-            .theme_when(clone_reader(reader))
-            .on_change(move |index, _label| {
-                let source = if index == 1 {
-                    FilesSourceKind::Local
-                } else {
-                    FilesSourceKind::Sifs
-                };
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().switch_source(source, waker);
-            })
-    };
-    let breadcrumb = {
-        let s = shared.clone();
-        Breadcrumb::new(shared.files().source.path_label())
-            .items(
-                crumbs
-                    .iter()
-                    .map(|(label, _)| BreadcrumbItem::new(label.clone())),
-            )
-            .current(current)
-            .theme_when(clone_reader(reader))
-            .on_activate(move |index, _label| {
-                if let Some(target) = targets.get(index) {
-                    s.files_mut().navigate(target.clone());
-                }
-            })
-    };
-    let refresh = {
-        let s = shared.clone();
-        IconButton::new(
-            IconGlyph::Redo,
-            format!("Refresh {}", shared.files().source.label()),
-        )
-        .theme_when(clone_reader(reader))
-        .selected_when({
-            let s = s.clone();
-            move || s.files().loading
-        })
-        .enabled_when({
-            let s = s.clone();
-            move || !s.files().loading
-        })
-        .on_press(move || {
-            let waker = { s.borrow().waker.clone() };
-            s.files_mut().refresh(waker);
-        })
-    };
-    let toolbar_row = Flex::horizontal()
-        .main_gap(HEADER_COMMAND_GAP)
-        .align_items(Alignment::Center)
-        .with_item(back, FlexItem::new().no_shrink())
-        .with_item(forward, FlexItem::new().no_shrink())
-        .with_item(up, FlexItem::new().no_shrink())
-        .with_item(
-            SizedBox::new().width(120.0).child(source),
-            FlexItem::fixed(120.0),
-        )
-        .with_item(breadcrumb, FlexItem::fill().min_width(96.0))
-        .with_item(
-            toolbar_tooltip(
-                format!("Refresh {}", shared.files().source.label()),
-                refresh,
-                reader,
-            ),
-            FlexItem::new().no_shrink(),
-        )
-        .with_item(
-            files_action_bar(shared, reader, false),
-            FlexItem::new().no_shrink(),
-        );
-
-    Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
-        .with_child(toolbar_row)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+    format!("{source_label} · {}", middle_short(leaf, 18))
 }
 
 /// Narrow file-manager chrome keeps the essential navigation controls visible
 /// and moves the remaining commands plus the hidden wide inspector into
 /// explicit, keyboard-focusable overlays.
 fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let back = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronLeft, "Back")
-            .size(30.0)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.files().can_go_back()
-            })
-            .on_press(move || {
-                let waker = { s.borrow().waker.clone() };
-                s.files_mut().go_back(waker);
-            })
-    };
-    let up = {
-        let s = shared.clone();
-        IconButton::new(IconGlyph::ChevronUp, "Up")
-            .size(30.0)
-            .theme_when(clone_reader(reader))
-            .on_press(move || s.files_mut().go_up())
-    };
+    let back = header_back_button(shared, reader);
+    let up = header_up_button(shared, reader);
     let location = {
-        let files = shared.files();
-        let theme = shared.theme();
-        let pal = palette(shared);
-        let source_label = match files.source {
-            FilesSourceKind::Sifs => "SIFS",
-            FilesSourceKind::Local => "Local",
-        };
-        let leaf = match files.source {
-            FilesSourceKind::Sifs => files
-                .path
-                .rsplit('/')
-                .find(|segment| !segment.is_empty())
-                .unwrap_or("/"),
-            FilesSourceKind::Local => Path::new(&files.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(files.path.as_str()),
-        };
-        Label::new(format!("{source_label} · {}", middle_short(leaf, 18)))
-            .semantic_name(format!(
-                "Current {} path {}",
-                files.source.label(),
-                files.path
-            ))
-            .text_style(pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text))
+        let text = shared.clone();
+        let label = Label::new(compact_location_label(&shared.files()))
+            .text_when(move || compact_location_label(&text.files()))
+            .text_style_when(live_text_style(reader, |theme| {
+                crate::theme::token_text_style(
+                    theme,
+                    theme.text.xs,
+                    FontWeight::MEDIUM,
+                    theme.surfaces.text,
+                )
+            }));
+        let location = shared
+            .signals()
+            .files_structure
+            .select_named("files compact location", |key| {
+                (key.header.source, key.header.path.clone())
+            });
+        Restyle::new(
+            label,
+            location,
+            |label, (source, path): &(FilesSourceKind, String)| {
+                label.semantic_name(format!("Current {} path {path}", source.label()))
+            },
+        )
     };
     let commands = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Folder, "More file commands")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -12898,7 +12996,6 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         let enabled = shared.clone();
         let action = shared.clone();
         IconButton::new(IconGlyph::MoreHorizontal, "Selected item actions")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || {
                 let files = enabled.files();
@@ -12920,7 +13017,6 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
     let placement_activity = {
         let s = shared.clone();
         IconButton::new(IconGlyph::History, "Reconciliation activity")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -12935,7 +13031,6 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
     let inspector = {
         let s = shared.clone();
         IconButton::new(IconGlyph::FileText, "Open selection info")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .selected_when({
                 let s = s.clone();
@@ -12960,31 +13055,74 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         .with_item(inspector, FlexItem::new().no_shrink())
 }
 
+/// The selection an action bar acts on. Only a change in this shape (or the source and view)
+/// alters which controls exist; enablement and menu contents follow the model live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilesActionSelection {
+    None,
+    Single { is_dir: bool },
+    Marked,
+}
+
+fn files_action_bar_shape(
+    key: &FilesStructureKey,
+    contextual_selection: bool,
+) -> (FilesActionSelection, FilesSourceKind, FilesViewMode) {
+    if !contextual_selection {
+        // Location commands do not depend on the selection or the source.
+        return (
+            FilesActionSelection::None,
+            FilesSourceKind::Sifs,
+            key.header.view_mode,
+        );
+    }
+    let selection = if !key.header.marked_entries.is_empty() {
+        FilesActionSelection::Marked
+    } else if let Some(entry) = key
+        .header
+        .selected
+        .and_then(|index| key.list.entries.get(index))
+    {
+        FilesActionSelection::Single {
+            is_dir: entry.is_dir,
+        }
+    } else {
+        FilesActionSelection::None
+    };
+    (selection, key.header.source, key.header.view_mode)
+}
+
+fn files_view_menu_items(current: FilesViewMode) -> Vec<MenuItem> {
+    FilesViewMode::OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            MenuItem::new(if index == current.selected_index() {
+                format!("✓ {label}")
+            } else {
+                label.to_string()
+            })
+        })
+        .collect()
+}
+
 fn files_action_bar_content(
     shared: &Shared,
     reader: &ThemeReader,
     contextual_selection: bool,
+    selection: FilesActionSelection,
+    source: FilesSourceKind,
+    current_view_mode: FilesViewMode,
 ) -> WidgetPod {
-    let (marked_count, selected_entry, source, current_view_mode) = {
-        let files = shared.files();
-        (
-            files.marked_count(),
-            files.selected_entry().cloned(),
-            files.source,
-            files.view_mode,
-        )
-    };
-
-    let controls = if contextual_selection && (marked_count > 0 || selected_entry.is_some()) {
+    let controls = if selection != FilesActionSelection::None {
         let mut row = Flex::horizontal().gap(6.0).align_items(Alignment::Center);
-        if marked_count == 0 {
-            let entry = selected_entry.as_ref().expect("selected entry");
+        if let FilesActionSelection::Single { is_dir } = selection {
             row = row.with_child(file_action_button(
                 shared,
                 reader,
                 FileContextAction::Open,
-                if entry.is_dir { "Open folder" } else { "Open" },
-                if entry.is_dir {
+                if is_dir { "Open folder" } else { "Open" },
+                if is_dir {
                     IconGlyph::Folder
                 } else {
                     IconGlyph::FileText
@@ -12993,7 +13131,7 @@ fn files_action_bar_content(
             ));
         }
 
-        let transfer_action = if marked_count > 0 {
+        let transfer_action = if selection == FilesActionSelection::Marked {
             FileContextAction::TransferSelected
         } else {
             FileContextAction::Transfer
@@ -13017,7 +13155,6 @@ fn files_action_bar_content(
 
         let trigger = sui::Button::new("Actions")
             .icon(IconGlyph::MoreHorizontal)
-            .min_height(32.0)
             .appearance(ButtonAppearance::Ghost)
             .theme_when(clone_reader(reader));
         row = row.with_child(files_primary_menu(
@@ -13035,7 +13172,6 @@ fn files_action_bar_content(
             reader,
             FileContextMenuTarget::Create,
             IconButton::new(IconGlyph::Add, "New")
-                .size(32.0)
                 .appearance(ButtonAppearance::Tonal)
                 .tone(SemanticTone::Accent)
                 .theme_when(clone_reader(reader)),
@@ -13046,7 +13182,6 @@ fn files_action_bar_content(
             reader,
             FileContextMenuTarget::Import,
             IconButton::new(IconGlyph::Download, "Import")
-                .size(32.0)
                 .appearance(ButtonAppearance::Ghost)
                 .theme_when(clone_reader(reader)),
         );
@@ -13056,7 +13191,6 @@ fn files_action_bar_content(
             reader,
             FileContextMenuTarget::LocationMore,
             IconButton::new(IconGlyph::MoreHorizontal, "More folder actions")
-                .size(32.0)
                 .theme_when(clone_reader(reader)),
         );
         Flex::horizontal()
@@ -13067,25 +13201,13 @@ fn files_action_bar_content(
             .with_child(toolbar_tooltip("More folder actions", more, reader))
     };
 
+    let items = shared.clone();
     let s = shared.clone();
     let view_control = ContextMenu::new(
         "files-view-menu",
-        IconButton::new(IconGlyph::Monitor, "File view")
-            .size(32.0)
-            .theme_when(clone_reader(reader)),
+        IconButton::new(IconGlyph::Monitor, "File view").theme_when(clone_reader(reader)),
     )
-    .items(
-        FilesViewMode::OPTIONS
-            .iter()
-            .enumerate()
-            .map(|(index, label)| {
-                MenuItem::new(if index == current_view_mode.selected_index() {
-                    format!("✓ {label}")
-                } else {
-                    label.to_string()
-                })
-            }),
-    )
+    .items_when(move || files_view_menu_items(items.files().view_mode))
     .theme_when(clone_reader(reader))
     .activation_button(PointerButton::Primary)
     .on_activate(move |index, _item| {
@@ -13149,43 +13271,46 @@ fn files_action_bar_content(
     )
 }
 
+const FILES_SORT_OPTIONS: [(FileSortMode, &str); 5] = [
+    (FileSortMode::NameAsc, "Name (A to Z)"),
+    (FileSortMode::NameDesc, "Name (Z to A)"),
+    (FileSortMode::Kind, "Kind"),
+    (FileSortMode::SizeDesc, "Size (largest first)"),
+    (FileSortMode::SizeAsc, "Size (smallest first)"),
+];
+
 fn files_sort_menu(shared: &Shared, reader: &ThemeReader) -> ContextMenu {
-    let current = shared.files().sort_mode;
-    let options = [
-        (FileSortMode::NameAsc, "Name (A to Z)"),
-        (FileSortMode::NameDesc, "Name (Z to A)"),
-        (FileSortMode::Kind, "Kind"),
-        (FileSortMode::SizeDesc, "Size (largest first)"),
-        (FileSortMode::SizeAsc, "Size (smallest first)"),
-    ];
-    let items = options.map(|(mode, label)| {
-        MenuItem::new(if mode == current {
-            format!("✓ {label}")
-        } else {
-            label.to_string()
-        })
-    });
     let trigger = IconButton::new(IconGlyph::ChevronDown, "Sort file view")
-        .size(32.0)
         .appearance(ButtonAppearance::Ghost)
         .theme_when(clone_reader(reader));
+    let items = shared.clone();
     let s = shared.clone();
     ContextMenu::new("files-sort-menu", trigger)
-        .items(items)
+        .items_when(move || {
+            let current = items.files().sort_mode;
+            FILES_SORT_OPTIONS
+                .iter()
+                .map(|(mode, label)| {
+                    MenuItem::new(if *mode == current {
+                        format!("✓ {label}")
+                    } else {
+                        label.to_string()
+                    })
+                })
+                .collect()
+        })
         .theme_when(clone_reader(reader))
         .activation_button(PointerButton::Primary)
         .on_activate(move |index, _item| {
-            let mode = match index {
-                1 => FileSortMode::NameDesc,
-                2 => FileSortMode::Kind,
-                3 => FileSortMode::SizeDesc,
-                4 => FileSortMode::SizeAsc,
-                _ => FileSortMode::NameAsc,
-            };
+            let mode = FILES_SORT_OPTIONS
+                .get(index)
+                .map_or(FileSortMode::NameAsc, |(mode, _)| *mode);
             s.files_mut().set_sort_mode(mode);
         })
 }
 
+/// File commands for the current location, or for the selection in the narrow column. The bar is
+/// rebuilt only when its control set changes (see [`files_action_bar_shape`]).
 fn files_action_bar(
     shared: &Shared,
     reader: &ThemeReader,
@@ -13194,35 +13319,63 @@ fn files_action_bar(
     let source = shared
         .signals()
         .files_structure
-        .select_named("files visible action bar", |key| {
-            (key.header.clone(), key.list.entries_total_count)
+        .select_named("files visible action bar", move |key| {
+            files_action_bar_shape(key, contextual_selection)
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        files_action_bar_content(&s, &r, contextual_selection)
+    RebuildOnChange::key_from(source, move |(selection, source, view_mode)| {
+        files_action_bar_content(
+            &s,
+            &r,
+            contextual_selection,
+            *selection,
+            *source,
+            *view_mode,
+        )
     })
 }
 
 // ---------------------------------------------------------------------------
-// File listing — rebuilt on navigation by `RebuildOnChange`.
+// File listing — every presentation stays mounted; the populated body is rebuilt only when the
+// listed entries, sort, or view change.
 // ---------------------------------------------------------------------------
 
-/// Build the file-list body for the current location: an error/empty placeholder, or a virtual
-/// table whose pinned header owns sorting and whose rows support select/open interactions.
-fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
-    let (loading, error, is_empty): (bool, Option<String>, bool) = {
-        let files = shared.files();
-        (files.loading, files.error.clone(), files.entries.is_empty())
-    };
-    let source = shared.files().source;
-
-    if sifs_daemon_offline(shared) {
-        return WidgetPod::new(sifs_offline_panel(shared, reader));
+/// Which listing presentation applies: offline, loading, error, empty, or populated.
+fn files_listing_index(key: &FilesStructureKey) -> usize {
+    if key.list.source == FilesSourceKind::Sifs && !key.daemon_available {
+        0
+    } else if key.list.loading {
+        1
+    } else if key.list.error.is_some() {
+        2
+    } else if key.list.entries.is_empty() {
+        3
+    } else {
+        4
     }
+}
 
-    if loading {
-        let body = centered_note(
+/// Build the file-list body for the current location: an offline, loading, error, or empty
+/// placeholder, or a virtual table whose pinned header owns sorting and whose rows support
+/// select/open interactions.
+fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> SwitchView {
+    let selected = shared
+        .signals()
+        .files_structure
+        .select_named("files listing presentation", files_listing_index);
+    SwitchView::new()
+        .selected_from(selected)
+        .with_child(sifs_offline_panel(shared, reader))
+        .with_child(files_listing_loading(shared, reader))
+        .with_child(files_listing_error(shared, reader))
+        .with_child(files_listing_empty(shared, reader))
+        .with_child(files_list_body_rebuild(shared, reader, scroll_state))
+}
+
+fn files_listing_loading(shared: &Shared, reader: &ThemeReader) -> SwitchView {
+    let note = |source: FilesSourceKind| {
+        centered_note(
             reader,
             IconGlyph::Storage,
             format!("Loading {}", source.label()),
@@ -13230,104 +13383,152 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
                 FilesSourceKind::Sifs => "Opening the distributed filesystem...",
                 FilesSourceKind::Local => "Reading the local directory...",
             },
-        );
-        return WidgetPod::new(body);
-    }
-    if let Some(error) = error {
-        let retry = {
-            let s = shared.clone();
-            sui::Button::new(format!("Retry {}", source.label()))
-                .icon(IconGlyph::Redo)
-                .theme_when(clone_reader(reader))
-                .on_press(move || {
-                    let waker = { s.borrow().waker.clone() };
-                    s.files_mut().retry(waker);
-                })
-        };
-        let mut actions = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(8.0)
-            .justify(sui::FlexJustify::Center)
-            .align_items(Alignment::Center)
-            .with_child(retry);
-        if source == FilesSourceKind::Sifs {
-            let settings = {
-                let s = shared.clone();
-                sui::Button::new("Connection settings")
-                    .theme_when(clone_reader(reader))
-                    .appearance(sui::ButtonAppearance::Tonal)
-                    .tone(SemanticTone::Neutral)
-                    .on_press(move || open_settings_section(&s, SettingsSection::System))
-            };
-            let browse_local = {
-                let s = shared.clone();
-                sui::Button::new(BROWSE_LOCAL_FILES_LABEL)
-                    .icon(IconGlyph::Folder)
-                    .theme_when(clone_reader(reader))
-                    .appearance(sui::ButtonAppearance::Tonal)
-                    .tone(SemanticTone::Neutral)
-                    .on_press(move || {
-                        let waker = { s.borrow().waker.clone() };
-                        s.files_mut().switch_source(FilesSourceKind::Local, waker);
-                    })
-            };
-            actions = actions.with_child(settings).with_child(browse_local);
-        }
-        let body = centered_note(
-            reader,
-            IconGlyph::Storage,
-            format!("{} unavailable", source.label()),
-            source_unavailable_summary(source, &error),
         )
-        .action(actions)
-        .action_max_width(480.0);
-        return WidgetPod::new(body);
-    }
-    if is_empty {
-        let create_file = {
-            let s = shared.clone();
-            sui::Button::new("Create file")
-                .icon(IconGlyph::File)
-                .min_width(130.0)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    s.files_mut()
-                        .open_action_prompt(FileActionPromptKind::NewFile);
-                    request_files_overlay_rebuild(ctx);
-                })
-        };
-        let create_folder = {
-            let s = shared.clone();
-            sui::Button::new("Create folder")
-                .icon(IconGlyph::Folder)
-                .min_width(150.0)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    s.files_mut()
-                        .open_action_prompt(FileActionPromptKind::NewFolder);
-                    request_files_overlay_rebuild(ctx);
-                })
-        };
-        let actions = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(8.0)
-            .align_items(Alignment::Center)
-            .with_child(create_file)
-            .with_child(create_folder);
-        let body = centered_note(
-            reader,
-            IconGlyph::Folder,
-            "Empty directory",
-            "Nothing here yet.",
-        )
-        .action(actions)
-        .action_height(72.0);
-        return WidgetPod::new(body);
-    }
-
-    WidgetPod::new(files_list_body_rebuild(shared, reader, scroll_state))
+    };
+    SwitchView::new()
+        .selected_from(files_source_index(shared))
+        .with_child(note(FilesSourceKind::Sifs))
+        .with_child(note(FilesSourceKind::Local))
 }
 
+/// The error placeholder names the failure, so it is rebuilt when the error text changes.
+fn files_listing_error(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files listing error", |key| {
+            (key.list.source, key.list.error.clone())
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |(source, error)| {
+        WidgetPod::new(files_listing_error_note(
+            &s,
+            &r,
+            *source,
+            error.as_deref().unwrap_or_default(),
+        ))
+    })
+}
+
+fn files_listing_error_note(
+    shared: &Shared,
+    reader: &ThemeReader,
+    source: FilesSourceKind,
+    error: &str,
+) -> EmptyState {
+    let retry = {
+        let s = shared.clone();
+        sui::Button::new(format!("Retry {}", source.label()))
+            .icon(IconGlyph::Redo)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                let waker = { s.borrow().waker.clone() };
+                s.files_mut().retry(waker);
+            })
+    };
+    let mut actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .justify(sui::FlexJustify::Center)
+        .align_items(Alignment::Center)
+        .with_child(retry);
+    if source == FilesSourceKind::Sifs {
+        let settings = {
+            let s = shared.clone();
+            sui::Button::new("Connection settings")
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || open_settings_section(&s, SettingsSection::System))
+        };
+        let browse_local = {
+            let s = shared.clone();
+            sui::Button::new(BROWSE_LOCAL_FILES_LABEL)
+                .icon(IconGlyph::Folder)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || {
+                    let waker = { s.borrow().waker.clone() };
+                    s.files_mut().switch_source(FilesSourceKind::Local, waker);
+                })
+        };
+        actions = actions.with_child(settings).with_child(browse_local);
+    }
+    centered_note(
+        reader,
+        IconGlyph::Storage,
+        format!("{} unavailable", source.label()),
+        source_unavailable_summary(source, error),
+    )
+    .action(actions)
+    .action_max_width(480.0)
+}
+
+fn files_listing_empty(shared: &Shared, reader: &ThemeReader) -> EmptyState {
+    let create_file = {
+        let s = shared.clone();
+        sui::Button::new("Create file")
+            .icon(IconGlyph::File)
+            .min_width(130.0)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut()
+                    .open_action_prompt(FileActionPromptKind::NewFile);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let create_folder = {
+        let s = shared.clone();
+        sui::Button::new("Create folder")
+            .icon(IconGlyph::Folder)
+            .min_width(150.0)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.files_mut()
+                    .open_action_prompt(FileActionPromptKind::NewFolder);
+                request_files_overlay_rebuild(ctx);
+            })
+    };
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(create_file)
+        .with_child(create_folder);
+    centered_note(
+        reader,
+        IconGlyph::Folder,
+        "Empty directory",
+        "Nothing here yet.",
+    )
+    .action(actions)
+    .action_height(72.0)
+}
+
+/// Listing data rows paint from without changing which rows exist: load revision, placement
+/// metadata, and task progress. Painters observe it instead of the list being rebuilt.
+type FilesRowProjection = (u64, BTreeMap<String, SifsEntryMetadata>, Vec<FilesTask>);
+
+fn files_row_projection(shared: &Shared) -> Arc<dyn Observable<FilesRowProjection>> {
+    Arc::new(
+        shared
+            .signals()
+            .files_structure
+            .select_named("files list rows", |key| {
+                (
+                    key.list.list_revision,
+                    key.list.entry_metadata.clone(),
+                    key.list.tasks.clone(),
+                )
+            }),
+    )
+}
+
+/// The populated listing captures its entries, so it is rebuilt when they, the sort, or the view
+/// change. The table state and thumbnail registrations outlive those rebuilds so paging keeps the
+/// scroll position; a new location starts at the top with fresh registrations.
 fn files_list_body_rebuild(
     shared: &Shared,
     reader: &ThemeReader,
@@ -13336,13 +13537,28 @@ fn files_list_body_rebuild(
     let source = shared
         .signals()
         .files_structure
-        .select_named("files list structure", |key| key.list.clone());
+        .select_named("files list body", |key| {
+            (
+                key.list.source,
+                key.list.path.clone(),
+                key.list.view_mode,
+                key.list.sort_mode,
+                key.list.entries.clone(),
+                key.list.entries_total_count,
+            )
+        });
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
     let table_state = VirtualTableState::new();
     let thumbnail_registration = Rc::new(RefCell::new(ThumbnailRegistrationPool::default()));
-    RebuildOnChange::key_from(source, move |_key| {
+    let location = RefCell::new(None::<(FilesSourceKind, String)>);
+    RebuildOnChange::key_from(source, move |(source, path, ..)| {
+        let next = Some((*source, path.clone()));
+        if location.replace(next.clone()) != next {
+            table_state.scroll_state().set_offset(Vector::ZERO);
+            *thumbnail_registration.borrow_mut() = ThumbnailRegistrationPool::default();
+        }
         files_list_body(&s, &r, &ss, &table_state, &thumbnail_registration)
     })
 }
@@ -13597,11 +13813,10 @@ fn file_action_button(
     icon: IconGlyph,
     appearance: ButtonAppearance,
 ) -> sui::Button {
-    let enabled = action.enabled(&shared.files());
+    let enabled = shared.clone();
     let action_shared = shared.clone();
     sui::Button::new(label)
         .icon(icon)
-        .min_height(32.0)
         .appearance(appearance)
         .tone(if action.destructive() {
             SemanticTone::Warning
@@ -13609,7 +13824,7 @@ fn file_action_button(
             SemanticTone::Neutral
         })
         .theme_when(clone_reader(reader))
-        .enabled(enabled)
+        .enabled_when(move || action.enabled(&enabled.files()))
         .on_press_with_ctx(move |ctx| {
             activate_file_context_action(&action_shared, action, ctx);
         })
@@ -13666,8 +13881,10 @@ fn files_list_body_table(
         ));
     }
 
+    let rows = files_row_projection(shared);
     let build_table = |show_details: bool| {
         let row_entries = entries.clone();
+        let paint_rows = Arc::clone(&rows);
         let paint_shared = shared.clone();
         let name_entries = entries.clone();
         let description_entries = entries.clone();
@@ -13768,6 +13985,7 @@ fn files_list_body_table(
                 description
             })
             .row_painter(move |ctx, row| {
+                let _ = ctx.observe(paint_rows.as_ref());
                 paint_file_table_row(
                     ctx,
                     &paint_shared,
@@ -13903,7 +14121,8 @@ fn paint_file_table_row(
             style.icon(entry_icon(entry)).padding(6.0, 8.0)
         };
         let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
-        let display_name = display_name_for_width(&entry.name, label_width, 7.1);
+        let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
+        let display_name = display_name_for_width(&entry.name, label_width, average_char_width);
         paint_leading_label_cell(ctx, &theme, name_cell, &display_name, style);
     }
 
@@ -13930,7 +14149,12 @@ fn paint_file_table_row(
 
     if let Some(meta_cell) = row.column_rects.get(3).copied() {
         let meta_text = entry_row_meta(entry, &files, active);
-        let display = display_name_for_width(&meta_text, (meta_cell.width() - 12.0).max(0.0), 6.2);
+        let average_char_width = (theme.text.xs.size * 0.55).max(5.0);
+        let display = display_name_for_width(
+            &meta_text,
+            (meta_cell.width() - 12.0).max(0.0),
+            average_char_width,
+        );
         paint_text_cell(
             ctx,
             &theme,
@@ -14168,6 +14392,7 @@ impl Widget for FileIconGridContextTarget {
 struct FileIconGrid {
     shared: Shared,
     thumbnail_revision: sui::Signal<u64>,
+    rows: Arc<dyn Observable<FilesRowProjection>>,
     entries: Vec<SifsEntry>,
     total_count: usize,
     mode: FilesViewMode,
@@ -14208,9 +14433,11 @@ impl FileIconGrid {
         thumbnail_registration: Rc<RefCell<ThumbnailRegistrationPool>>,
     ) -> Self {
         let thumbnail_revision = shared.signals().files_thumbnail_revision.clone();
+        let rows = files_row_projection(&shared);
         Self {
             shared,
             thumbnail_revision,
+            rows,
             entries,
             total_count,
             mode,
@@ -14675,7 +14902,12 @@ fn paint_file_thumbnail(
     if !ctx.image_registered(handle) || bitmap.width == 0 || bitmap.height == 0 {
         return false;
     }
-    widgets::fill_round_rect(ctx, frame, theme.palette.control, 5.0);
+    widgets::fill_round_rect(
+        ctx,
+        frame,
+        theme.palette.control,
+        theme.metrics.image_corner_radius,
+    );
     let source = Size::new(bitmap.width as f32, bitmap.height as f32);
     let scale = (frame.width() / source.width)
         .min(frame.height() / source.height)
@@ -14687,7 +14919,10 @@ fn paint_file_thumbnail(
         image_size.width,
         image_size.height,
     );
-    ctx.push_clip(sui::Path::rounded_rect(frame, 5.0));
+    ctx.push_clip(sui::Path::rounded_rect(
+        frame,
+        theme.metrics.image_corner_radius,
+    ));
     ctx.draw_image_source(image_rect, ImageSource::new(handle));
     ctx.pop_clip();
     true
@@ -14908,6 +15143,7 @@ impl Widget for FileIconGrid {
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
+        let _ = ctx.observe(self.rows.as_ref());
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
         let files = self.shared.files();
@@ -14930,17 +15166,22 @@ impl Widget for FileIconGrid {
                     ctx,
                     tile.inflate(-2.0, -2.0),
                     theme.palette.selection,
-                    6.0,
+                    theme.radius.md,
                 );
             } else if hovered || pressed {
                 widgets::fill_round_rect(
                     ctx,
                     tile.inflate(-2.0, -2.0),
                     theme.palette.control_hover,
-                    6.0,
+                    theme.radius.md,
                 );
             } else if self.mode == FilesViewMode::Flow {
-                widgets::fill_round_rect(ctx, tile.inflate(-2.0, -2.0), theme.palette.control, 8.0);
+                widgets::fill_round_rect(
+                    ctx,
+                    tile.inflate(-2.0, -2.0),
+                    theme.palette.control,
+                    theme.radius.lg,
+                );
             }
 
             let thumbnail = file_cached_thumbnail_buckets(self.mode)
@@ -14960,7 +15201,7 @@ impl Widget for FileIconGrid {
                         ctx,
                         self.thumbnail_rect(tile),
                         theme.palette.control,
-                        5.0,
+                        theme.metrics.image_corner_radius,
                     );
                 }
                 let icon_color = if entry.is_dir || entry.is_link || active {
@@ -15011,6 +15252,7 @@ impl Widget for FileIconGrid {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let _ = ctx.observe(self.rows.as_ref());
         let mut root = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
         root.name = Some(
             if self.mode == FilesViewMode::Flow {
@@ -15865,51 +16107,41 @@ fn marked_entries_label(count: usize) -> String {
 }
 
 fn files_task_popover(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .files_structure
-        .select_named("files task popover theme", |key| key.theme);
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_theme| {
-        let badge_label = {
-            let s = s.clone();
-            move || {
-                if sifs_daemon_offline(&s) {
-                    SIFS_OFFLINE_STATUS.to_string()
-                } else {
-                    files_task_badge_label(&s.files())
-                }
+    let badge_label = {
+        let s = shared.clone();
+        move || {
+            if sifs_daemon_offline(&s) {
+                SIFS_OFFLINE_STATUS.to_string()
+            } else {
+                files_task_badge_label(&s.files())
             }
-        };
-        let badge_tone = {
-            let s = s.clone();
-            move || {
-                if sifs_daemon_offline(&s) {
-                    SemanticTone::Neutral
-                } else {
-                    files_task_badge_tone(&s.files())
-                }
+        }
+    };
+    let badge_tone = {
+        let s = shared.clone();
+        move || {
+            if sifs_daemon_offline(&s) {
+                SemanticTone::Neutral
+            } else {
+                files_task_badge_tone(&s.files())
             }
-        };
-        WidgetPod::new(
-            Popover::new(
-                "File tasks",
-                SizedBox::new().width(FILES_TASK_BADGE_W).child(
-                    StatusBadge::new("SIFS unknown")
-                        .label_when(badge_label)
-                        .tone_when(badge_tone)
-                        .icon(IconGlyph::Storage)
-                        .theme_when(clone_reader(&r)),
-                ),
-                SizedBox::new()
-                    .width(FILES_TASK_POPOVER_W)
-                    .child(FilesTaskQueue::new(s.clone(), &r)),
-            )
-            .alignment(PopoverAlignment::Start)
-            .theme(r()),
-        )
-    })
+        }
+    };
+    Popover::new(
+        "File tasks",
+        SizedBox::new().width(FILES_TASK_BADGE_W).child(
+            StatusBadge::new("SIFS unknown")
+                .label_when(badge_label)
+                .tone_when(badge_tone)
+                .icon(IconGlyph::Storage)
+                .theme_when(clone_reader(reader)),
+        ),
+        SizedBox::new()
+            .width(FILES_TASK_POPOVER_W)
+            .child(FilesTaskQueue::new(shared.clone(), reader)),
+    )
+    .alignment(PopoverAlignment::Start)
+    .theme_when(clone_reader(reader))
 }
 
 fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -15963,8 +16195,24 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
         let s = shared.clone();
         move || palette(&s).sidebar
     });
+    // The status text and task badge re-read the model when the location, selection, listing
+    // size, tasks, or daemon availability change.
+    let status = shared
+        .signals()
+        .files_structure
+        .select_named("files status", |key| {
+            (
+                key.header.clone(),
+                key.list.entries_total_count,
+                key.list.entries.len(),
+                key.tasks.clone(),
+                key.daemon_available,
+            )
+        });
 
-    SizedBox::new().height(FILES_STATUS_H).child(body)
+    SizedBox::new()
+        .height(FILES_STATUS_H)
+        .child(RefreshOn::new(status, body))
 }
 
 fn files_places_content_height(sifs_count: usize, local_count: usize) -> f32 {
@@ -15975,12 +16223,23 @@ fn files_places_content_height(sifs_count: usize, local_count: usize) -> f32 {
         + PLACE_RAIL_BOTTOM_PAD
 }
 
+/// The Locations rail is rebuilt only when its places change. A "Go to path" place opens the
+/// path prompt and ignores its stored path, so following the current folder does not count.
 fn files_places_rail(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source = shared
         .signals()
         .files_structure
         .select_named("files places structure", |key| {
-            (key.theme, key.places.clone())
+            key.places
+                .iter()
+                .map(|place| match place.action {
+                    FilePlaceAction::OpenPath => place.clone(),
+                    FilePlaceAction::OpenPathPrompt => FilePlace {
+                        path: String::new(),
+                        ..place.clone()
+                    },
+                })
+                .collect::<Vec<_>>()
         });
     let s = shared.clone();
     let r = Rc::clone(reader);
@@ -16166,7 +16425,6 @@ fn file_task_recovery_button(
     let s = shared.clone();
     sui::Button::new("Connection")
         .icon(IconGlyph::Alert)
-        .icon_size(12.0)
         .semantic_name(format!("Open Connection settings for {}", task.title))
         .description(format!("{}: {}", task.title, task.detail))
         .min_width(92.0)
@@ -16184,36 +16442,58 @@ fn file_task_recovery_button(
         })
 }
 
-fn file_task_action_slot(
-    shared: &Shared,
-    reader: &ThemeReader,
-    task: &FilesTask,
-) -> (SwitchView, f32) {
-    let action_index = if task.state.can_cancel() {
+/// Which trailing action a task row offers: none, Cancel, or Connection recovery.
+fn file_task_action_index(task: &FilesTask) -> usize {
+    if task.state.can_cancel() {
         1
     } else if file_task_has_recovery(task) {
         2
     } else {
         0
-    };
-    let width = match action_index {
+    }
+}
+
+fn file_task_action_width(action_index: usize) -> f32 {
+    match action_index {
         1 => 58.0,
         2 => 92.0,
         _ => 0.0,
-    };
-    let slot = SwitchView::new()
-        .selected(action_index)
-        .with_child(SizedBox::new())
-        .with_child(file_task_cancel_button(shared, reader, task))
-        .with_child(file_task_recovery_button(shared, reader, task));
-    (slot, width)
+    }
 }
 
-fn file_task_progress_indicator(reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
+/// Both actions stay mounted; the task state selects one, and their descriptions follow the
+/// task's progress detail in place.
+fn file_task_action_slot(
+    shared: &Shared,
+    reader: &ThemeReader,
+    task: &sui::Signal<FilesTask>,
+) -> SwitchView {
+    let initial = task.get();
+    let cancel = Restyle::new(
+        file_task_cancel_button(shared, reader, &initial),
+        task.select(|task| task.detail.clone()),
+        |button, detail: &String| button.description(detail.clone()),
+    );
+    let recovery = Restyle::new(
+        file_task_recovery_button(shared, reader, &initial),
+        task.select(|task| format!("{}: {}", task.title, task.detail)),
+        |button, description: &String| button.description(description.clone()),
+    );
+    SwitchView::new()
+        .selected_from(task.select(file_task_action_index))
+        .with_child(SizedBox::new())
+        .with_child(cancel)
+        .with_child(recovery)
+}
+
+fn file_task_progress_indicator(
+    reader: &ThemeReader,
+    fraction: f32,
+    tone: SemanticTone,
+) -> impl Widget + use<> {
     const INDICATOR_H: f32 = 32.0;
     const INDICATOR_W: f32 = 3.0;
-    let fill_h = (INDICATOR_H * task_progress_fraction(task)).clamp(0.0, INDICATOR_H);
-    let tone = task_progress_tone(task);
+    let fill_h = (INDICATOR_H * fraction).clamp(0.0, INDICATOR_H);
     let track_reader = clone_reader(reader);
     let fill_reader = clone_reader(reader);
     let track = Background::new(
@@ -16234,39 +16514,78 @@ fn file_task_progress_indicator(reader: &ThemeReader, task: &FilesTask) -> impl 
         .child(Dock::new(track).bottom(fill_h, fill))
 }
 
-fn file_task_row(shared: &Shared, reader: &ThemeReader, task: &FilesTask) -> impl Widget + use<> {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
-    let detail_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
-    let progress = task_progress_fraction(task);
+fn file_task_title(task: &FilesTask) -> String {
     let progress_label = if matches!(
         task.state,
         FilesTaskState::Running | FilesTaskState::CancelRequested
     ) {
-        format!(" - {}%", (progress * 100.0).round() as u8)
+        format!(
+            " - {}%",
+            (task_progress_fraction(task) * 100.0).round() as u8
+        )
     } else {
         String::new()
     };
-    let title = format!("{} - {}{progress_label}", task.title, task.state.label());
-    let detail = file_task_detail_display(task);
-    let (action, action_w) = file_task_action_slot(shared, reader, task);
+    format!("{} - {}{progress_label}", task.title, task.state.label())
+}
+
+/// One queued operation, built once per task. Its text and action follow the task signal; only the
+/// small progress bar is rebuilt as the fraction moves.
+fn file_task_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    task: sui::Signal<FilesTask>,
+) -> impl Widget + use<> {
+    let initial = task.get();
+    let title = Label::new(file_task_title(&initial))
+        .text_from(task.select(file_task_title))
+        .text_style_when(live_text_style(reader, |theme| {
+            crate::theme::token_text_style(
+                theme,
+                theme.text.xs,
+                FontWeight::MEDIUM,
+                theme.surfaces.text,
+            )
+        }));
+    let detail = Label::new(file_task_detail_display(&initial))
+        .text_from(task.select(file_task_detail_display))
+        .text_style_when(live_text_style(reader, |theme| {
+            crate::theme::token_text_style(
+                theme,
+                theme.text.xs,
+                FontWeight::NORMAL,
+                theme.surfaces.text_faint,
+            )
+        }));
+    let progress = {
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(
+            task.select(|task| (task_progress_fraction(task), task_progress_tone(task))),
+            move |(fraction, tone)| {
+                WidgetPod::new(file_task_progress_indicator(&r, *fraction, *tone))
+            },
+        )
+    };
+    let action = file_task_action_slot(shared, reader, &task);
 
     let text = Flex::vertical()
         .main_gap(1.0)
         .align_items(Alignment::Stretch)
-        .with_child(Label::new(title).text_style(title_style))
-        .with_child(Label::new(detail).text_style(detail_style));
+        .with_child(title)
+        .with_child(detail);
     let body = Flex::horizontal()
         .main_gap(8.0)
         .align_items(Alignment::Center)
-        .with_child(file_task_progress_indicator(reader, task))
+        .with_child(progress)
         .with_item(text, FlexItem::flex(1.0).min_width(0.0));
 
-    TrailingSlotRow::new(body, action)
-        .trailing_width(action_w)
-        .trailing_height(22.0)
-        .gap(8.0)
+    Restyle::new(
+        TrailingSlotRow::new(body, action)
+            .trailing_height(22.0)
+            .gap(8.0),
+        task.select(file_task_action_index),
+        |row, action_index: &usize| row.trailing_width(file_task_action_width(*action_index)),
+    )
 }
 
 struct FilesTaskQueue {
@@ -16298,31 +16617,54 @@ impl FilesTaskQueue {
     }
 }
 
-fn file_task_queue_header(shared: &Shared, reader: &ThemeReader, tasks: &[FilesTask]) -> WidgetPod {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let summary_style = pal.text_style(&theme, 11.0, FontWeight::MEDIUM, pal.text_muted);
-    let has_finished = files_tasks_have_finished(tasks);
+fn files_tasks_source(shared: &Shared) -> impl Observable<Vec<FilesTask>> + Clone + use<> {
+    shared
+        .signals()
+        .files_structure
+        .select_named("files virtual task rows", |key| key.tasks.clone())
+}
 
+/// The queue heading, built once: its summary text and the Clear finished action follow the tasks.
+fn file_task_queue_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let tasks = &shared.signals().files_structure;
+    let summary = tasks.select_named("files task summary", |key| {
+        files_task_queue_summary(&key.tasks)
+    });
+    let has_finished = tasks.select_named("files tasks finished", |key| {
+        usize::from(files_tasks_have_finished(&key.tasks))
+    });
     let header_body = Flex::vertical()
         .main_gap(1.0)
         .align_items(Alignment::Stretch)
         .with_child(SectionLabel::new("File tasks").theme_when(clone_reader(reader)))
-        .with_child(Label::new(files_task_queue_summary(tasks)).text_style(summary_style));
+        .with_child(
+            Label::new(summary.get())
+                .text_from(summary)
+                .text_style_when(live_text_style(reader, |theme| {
+                    crate::theme::token_text_style(
+                        theme,
+                        theme.text.xs,
+                        FontWeight::MEDIUM,
+                        theme.surfaces.text_muted,
+                    )
+                })),
+        );
     let clear_slot = SwitchView::new()
-        .selected(if has_finished { 1 } else { 0 })
+        .selected_from(has_finished.clone())
         .with_child(SizedBox::new())
         .with_child(file_task_clear_button(shared, reader));
-    let header = TrailingSlotRow::new(header_body, clear_slot)
-        .trailing_width(if has_finished { 108.0 } else { 0.0 })
-        .trailing_height(22.0)
-        .gap(8.0);
-    WidgetPod::new(header)
+    WidgetPod::new(Restyle::new(
+        TrailingSlotRow::new(header_body, clear_slot)
+            .trailing_height(22.0)
+            .gap(8.0),
+        has_finished,
+        |row, has_finished: &usize| {
+            row.trailing_width(if *has_finished == 1 { 108.0 } else { 0.0 })
+        },
+    ))
 }
 
-fn file_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+fn file_task_queue_empty(reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(
         Flex::vertical()
             .main_gap(8.0)
@@ -16336,34 +16678,39 @@ fn file_task_queue_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 ),
             )
             .with_child(
-                Label::new("No active file operations").text_style(pal.text_style(
-                    &theme,
-                    12.0,
-                    FontWeight::MEDIUM,
-                    pal.text,
+                Label::new("No active file operations").text_style_when(live_text_style(
+                    reader,
+                    |theme| {
+                        crate::theme::token_text_style(
+                            theme,
+                            theme.text.xs,
+                            FontWeight::MEDIUM,
+                            theme.surfaces.text,
+                        )
+                    },
                 )),
             )
-            .with_child(Label::new("Worker queue empty").text_style(pal.text_style(
-                &theme,
-                11.0,
-                FontWeight::NORMAL,
-                pal.text_faint,
-            ))),
+            .with_child(
+                Label::new("Worker queue empty").text_style_when(live_text_style(
+                    reader,
+                    |theme| {
+                        crate::theme::token_text_style(
+                            theme,
+                            theme.text.xs,
+                            FontWeight::NORMAL,
+                            theme.surfaces.text_faint,
+                        )
+                    },
+                )),
+            ),
     )
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct FilesTaskRowsStructure {
-    theme: (AppThemeMode, AppTextScale),
-    tasks: Vec<FilesTask>,
-}
-
+/// The task popover's content. Header, empty state, and the virtual list are built once; the task
+/// model is replaced in place so retained rows update through their per-task signals.
 struct VirtualFileTaskContent {
-    source: Arc<dyn Observable<FilesTaskRowsStructure>>,
+    source: Arc<dyn Observable<Vec<FilesTask>>>,
     model: VirtualCollectionModel<u64, FilesTask>,
-    shared: Shared,
-    reader: ThemeReader,
-    header_key: (AppThemeMode, AppTextScale, String, bool),
     header: WidgetPod,
     empty: WidgetPod,
     list: WidgetPod,
@@ -16375,35 +16722,15 @@ impl VirtualFileTaskContent {
     const ROW_HEIGHT: f32 = FILES_TASK_ROW_H;
 
     fn new(shared: Shared, reader: &ThemeReader) -> Self {
-        let current = shared.signals().files_structure.get();
-        let tasks = current.tasks;
+        let source = files_tasks_source(&shared);
+        let tasks = source.get();
         let model = VirtualCollectionModel::named("File task collection");
-        let header_key = (
-            current.theme.0,
-            current.theme.1,
-            files_task_queue_summary(&tasks),
-            files_tasks_have_finished(&tasks),
-        );
-        let source =
-            shared
-                .signals()
-                .files_structure
-                .select_named("files virtual task rows", |key| FilesTaskRowsStructure {
-                    theme: key.theme,
-                    tasks: key.tasks.clone(),
-                });
         let row_shared = shared.clone();
         let row_reader = Rc::clone(reader);
         let list = VirtualList::new("File task queue", model.clone(), move |_id, task| {
-            let shared = row_shared.clone();
-            let reader = Rc::clone(&row_reader);
-            RebuildOnChange::key_from(task, move |task| {
-                WidgetPod::new(
-                    SizedBox::new()
-                        .height(Self::ROW_HEIGHT)
-                        .child(file_task_row(&shared, &reader, task)),
-                )
-            })
+            SizedBox::new()
+                .height(Self::ROW_HEIGHT)
+                .child(file_task_row(&row_shared, &row_reader, task))
         })
         .estimated_row_height(Self::ROW_HEIGHT)
         .gap(Self::GAP)
@@ -16413,42 +16740,30 @@ impl VirtualFileTaskContent {
         .theme_when(clone_reader(reader))
         .row_name(|_id, task| task.title.clone())
         .row_description(|_id, task| format!("{}; {}", task.state.label(), task.detail));
-        Self {
+        let mut content = Self {
             source: Arc::new(source),
             model,
-            header: file_task_queue_header(&shared, reader, &tasks),
-            empty: file_task_queue_empty(&shared, reader),
+            header: file_task_queue_header(&shared, reader),
+            empty: file_task_queue_empty(reader),
             list: WidgetPod::new(list),
-            shared,
-            reader: Rc::clone(reader),
-            header_key,
-            is_empty: tasks.is_empty(),
-        }
+            is_empty: true,
+        };
+        content.sync(tasks);
+        content
     }
 
-    fn sync(&mut self, structure: FilesTaskRowsStructure) {
-        let header_key = (
-            structure.theme.0,
-            structure.theme.1,
-            files_task_queue_summary(&structure.tasks),
-            files_tasks_have_finished(&structure.tasks),
-        );
-        if header_key != self.header_key {
-            self.header_key = header_key;
-            self.header = file_task_queue_header(&self.shared, &self.reader, &structure.tasks);
-            self.empty = file_task_queue_empty(&self.shared, &self.reader);
-        }
-        self.is_empty = structure.tasks.is_empty();
+    fn sync(&mut self, tasks: Vec<FilesTask>) {
+        self.is_empty = tasks.is_empty();
         self.model
-            .replace(structure.tasks.into_iter().map(|task| (task.id, task)))
+            .replace(tasks.into_iter().map(|task| (task.id, task)))
             .expect("file task ids must be unique");
     }
 }
 
 impl Widget for VirtualFileTaskContent {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let structure = ctx.observe(self.source.as_ref());
-        self.sync(structure);
+        let tasks = ctx.observe(self.source.as_ref());
+        self.sync(tasks);
         let width = if constraints.max.width.is_finite() {
             constraints.max.width
         } else {
@@ -17325,9 +17640,36 @@ fn inspector_detail_button_label(details_open: bool) -> &'static str {
 // Composed inspector — stock controls own generic chrome, focus, and semantics.
 // ---------------------------------------------------------------------------
 
-/// The interactive Files inspector is rebuilt from a compact state signature. Generic cards,
-/// fields, badges, and actions are composed from SUI widgets; only the file-list and placement
-/// data remain app-owned.
+/// What decides which inspector cards exist: the source, the selected item, the marked set, and
+/// whether the listing is loading, failed, or offline. Card contents rebuild from narrower keys.
+type InspectorShape = (
+    FilesSourceKind,
+    Option<String>,
+    BTreeSet<usize>,
+    bool,
+    bool,
+    bool,
+);
+
+fn inspector_shape(key: &FilesStructureKey) -> InspectorShape {
+    let inspector = &key.inspector;
+    (
+        inspector.source,
+        inspector
+            .selected
+            .and_then(|index| inspector.entries.get(index))
+            .map(|entry| entry.path.clone()),
+        inspector.marked_entries.clone(),
+        inspector.loading,
+        inspector.error.is_some(),
+        key.daemon_available,
+    )
+}
+
+/// The interactive Files inspector. Its cards are rebuilt only when the selection's shape
+/// changes; each card body follows its own data signature, and every retained control re-reads
+/// the inspector state when it changes. Generic cards, fields, badges, and actions are composed
+/// from SUI widgets; only the file-list and placement data remain app-owned.
 struct InspectorView {
     child: WidgetPod,
 }
@@ -17336,21 +17678,23 @@ impl InspectorView {
     fn new(shared: Shared) -> Self {
         let reader: ThemeReader = {
             let s = shared.clone();
-            Rc::new(move || s.theme().with_size(ControlSize::Small))
+            Rc::new(move || s.theme_sized(ControlSize::Small))
         };
         let source = shared
             .signals()
             .files_structure
-            .select_named("files inspector structure", |key| {
-                (key.inspector.clone(), key.daemon_available)
-            });
+            .select_named("files inspector shape", inspector_shape);
         let build_shared = shared.clone();
         let build_reader = Rc::clone(&reader);
-        let child = RebuildOnChange::key_from(source, move |_key| {
+        let cards = RebuildOnChange::key_from(source, move |_key| {
             composed_inspector_content(&build_shared, &build_reader)
         });
+        let state = shared
+            .signals()
+            .files_structure
+            .select_named("files inspector state", |key| key.inspector.clone());
         Self {
-            child: WidgetPod::new(child),
+            child: WidgetPod::new(RefreshOn::new(state, cards)),
         }
     }
 }
@@ -17454,27 +17798,21 @@ fn detail_rows_widget(
     body
 }
 
+/// The inspector's "Advanced details" toggle; its label and icon follow the model in place.
+type InspectorDetailsButton = Restyle<sui::Button, bool>;
+
 fn inspector_card<W>(
     title: impl Into<String>,
     child: W,
     reader: &ThemeReader,
-    header_action: Option<sui::Button>,
-    prominent_title: bool,
+    header_action: Option<InspectorDetailsButton>,
 ) -> Surface
 where
     W: Widget + 'static,
 {
-    let theme = reader();
     let mut section = PanelSection::new(title, child)
         .theme_when(clone_reader(reader))
         .gap(10.0);
-    if prominent_title {
-        let mut title_style = theme.text_style(theme.palette.text);
-        title_style.font_size = theme.text.xl.size;
-        title_style.line_height = theme.text.xl.line_height;
-        title_style.weight = FontWeight::SEMIBOLD;
-        section = section.title_style(title_style);
-    }
     if let Some(action) = header_action {
         section = section.header_action(action);
     }
@@ -17489,21 +17827,24 @@ where
         .fill_width(true)
 }
 
-fn inspector_details_button(
-    shared: &Shared,
-    reader: &ThemeReader,
-    details_open: bool,
-) -> sui::Button {
-    let label = inspector_detail_button_label(details_open);
-    let s = shared.clone();
-    sui::Button::new(label)
-        .semantic_name(label)
-        .description("Technical file, version, storage, and authority details")
-        .icon(if details_open {
-            IconGlyph::ChevronUp
-        } else {
-            IconGlyph::ChevronDown
+fn inspector_details_open(shared: &Shared) -> impl Observable<bool> + use<> {
+    shared
+        .signals()
+        .files_structure
+        .select_named("files inspector details", |key| {
+            key.inspector.inspector_details_open
         })
+}
+
+fn inspector_details_button(shared: &Shared, reader: &ThemeReader) -> InspectorDetailsButton {
+    let details_open = shared.files().inspector_details_open;
+    let label = shared.clone();
+    let s = shared.clone();
+    let button = sui::Button::new(inspector_detail_button_label(details_open))
+        .label_when(move || {
+            inspector_detail_button_label(label.files().inspector_details_open).to_string()
+        })
+        .description("Technical file, version, storage, and authority details")
         .appearance(ButtonAppearance::Ghost)
         .tone(SemanticTone::Accent)
         .min_height(24.0)
@@ -17512,7 +17853,49 @@ fn inspector_details_button(
             let open = s.files().inspector_details_open;
             s.files_mut().inspector_details_open = !open;
             request_files_overlay_rebuild(ctx);
-        })
+        });
+    Restyle::new(
+        button,
+        inspector_details_open(shared),
+        |button, open: &bool| {
+            button.icon(if *open {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            })
+        },
+    )
+}
+
+/// A card body rebuilt only when its slice of the Files state changes. The card shell and its
+/// header action stay mounted.
+fn inspector_keyed_body<K, F, B>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &'static str,
+    key: F,
+    build: B,
+) -> RebuildOnChange<K>
+where
+    K: Clone + PartialEq + Send + Sync + 'static,
+    F: Fn(&FilesStructureKey) -> K + Send + Sync + 'static,
+    B: Fn(&Shared, &ThemeReader) -> WidgetPod + 'static,
+{
+    let source = shared.signals().files_structure.select_named(name, key);
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |_| build(&s, &r))
+}
+
+/// Technical cards that only exist while "Advanced details" is open.
+fn inspector_details_only<W>(shared: &Shared, child: W) -> Presence
+where
+    W: Widget + 'static,
+{
+    Presence::new(child)
+        .transition(crate::ui::widgets::reveal_transition())
+        .shown_from(inspector_details_open(shared))
+        .collapse(Axis::Vertical)
 }
 
 fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx: &mut EventCtx) {
@@ -17706,7 +18089,6 @@ fn preview_card(
     custom_preview: Option<&CustomFilesPreview>,
     reader: &ThemeReader,
 ) -> Surface {
-    let theme = reader();
     let mut body = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
     if !loading
         && error.is_none()
@@ -17727,7 +18109,7 @@ fn preview_card(
                         reader.clone(),
                     )),
             );
-        return inspector_card("Preview", body, reader, None, false);
+        return inspector_card("Preview", body, reader, None);
     }
     let (badge, badge_tone, text, muted) = if loading {
         (
@@ -17780,17 +18162,15 @@ fn preview_card(
             .tone(badge_tone)
             .theme_when(clone_reader(reader)),
     );
-    let mut body_style = theme.text_style(theme.palette.text);
-    body_style.font_size = theme.text.sm.size;
-    body_style.line_height = theme.text.sm.line_height;
-    body = body.with_child(RichText::from_plain_text(text, body_style));
+    body = body.with_child(live_plain_text(reader, text, |theme| {
+        sized_text_style(theme, theme.palette.text, theme.text.sm)
+    }));
     if let Some(muted) = muted {
-        let mut muted_style = theme.text_style(theme.palette.text_muted);
-        muted_style.font_size = theme.text.xs.size;
-        muted_style.line_height = theme.text.xs.line_height;
-        body = body.with_child(RichText::from_plain_text(muted, muted_style));
+        body = body.with_child(live_plain_text(reader, muted, |theme| {
+            sized_text_style(theme, theme.palette.text_muted, theme.text.xs)
+        }));
     }
-    inspector_card("Preview", body, reader, None, false)
+    inspector_card("Preview", body, reader, None)
 }
 
 fn selected_item_actions(
@@ -17845,7 +18225,6 @@ fn selected_item_actions(
         FileContextMenuTarget::Selection,
         sui::Button::new("More")
             .icon(IconGlyph::MoreHorizontal)
-            .min_height(32.0)
             .appearance(ButtonAppearance::Ghost)
             .theme_when(clone_reader(reader)),
     );
@@ -17895,7 +18274,6 @@ fn availability_actions(shared: &Shared, reader: &ThemeReader) -> ContextMenu {
         FileContextMenuTarget::Availability,
         sui::Button::new("Manage availability")
             .icon(IconGlyph::Storage)
-            .min_height(32.0)
             .appearance(ButtonAppearance::Tonal)
             .tone(SemanticTone::Accent)
             .theme_when(clone_reader(reader)),
@@ -17943,10 +18321,6 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
     }
     drop(files);
 
-    let theme = reader();
-    let mut hint_style = theme.text_style(theme.palette.text_muted);
-    hint_style.font_size = theme.text.sm.size;
-    hint_style.line_height = theme.text.sm.line_height;
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
         .gap(10.0)
@@ -17957,7 +18331,7 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
                 .theme_when(clone_reader(reader)),
         )
         .with_child(detail_rows_widget(rows, reader))
-        .with_child(Label::new(hint).text_style(hint_style));
+        .with_child(Label::new(hint).text_style_when(live_note_style(reader)));
 
     if shared.files().source == FilesSourceKind::Sifs {
         let storage = file_action_button(
@@ -17987,7 +18361,6 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
         let settings_shared = shared.clone();
         let mount = sui::Button::new("Mount & sync")
             .icon(IconGlyph::Folder)
-            .min_height(32.0)
             .appearance(ButtonAppearance::Ghost)
             .theme_when(clone_reader(reader))
             .on_press(move || open_settings_section(&settings_shared, SettingsSection::Storage));
@@ -18014,158 +18387,284 @@ fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widg
 
 fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let files = shared.files();
-    let details_button = || inspector_details_button(shared, reader, files.inspector_details_open);
+    let source = files.source;
 
     if files.loading {
-        let rows = sifs_loading_rows(
-            &files.path,
-            files.inspector_details_open,
-            files.list_slow_after_secs,
+        drop(files);
+        let body = inspector_keyed_body(
+            shared,
+            reader,
+            "inspector loading rows",
+            |key| {
+                (
+                    key.inspector.path.clone(),
+                    key.inspector.inspector_details_open,
+                    key.inspector.list_slow_after_secs,
+                )
+            },
+            |s, r| {
+                let files = s.files();
+                let rows = sifs_loading_rows(
+                    &files.path,
+                    files.inspector_details_open,
+                    files.list_slow_after_secs,
+                );
+                WidgetPod::new(detail_rows_widget(rows, r))
+            },
         );
         return WidgetPod::new(inspector_card(
             "Loading SIFS",
-            detail_rows_widget(rows, reader),
+            body,
             reader,
-            Some(details_button()),
-            false,
+            Some(inspector_details_button(shared, reader)),
         ));
     }
 
     if sifs_daemon_offline(shared) {
         // The listing already explains the offline daemon; keep the inspector quiet instead of
         // repeating it.
-        let theme = reader();
-        let mut note_style = theme.text_style(theme.palette.text_muted);
-        note_style.font_size = theme.text.sm.size;
-        note_style.line_height = theme.text.sm.line_height;
         return WidgetPod::new(inspector_card(
-            unselected_inspector_title(files.source),
-            Label::new(SIFS_OFFLINE_INSPECTOR_NOTE).text_style(note_style),
+            unselected_inspector_title(source),
+            Label::new(SIFS_OFFLINE_INSPECTOR_NOTE).text_style_when(live_note_style(reader)),
             reader,
             None,
-            false,
         ));
     }
 
-    if let Some(error) = &files.error {
-        let rows = sifs_unavailable_rows(error, files.inspector_details_open);
+    if files.error.is_some() {
+        drop(files);
+        let body = inspector_keyed_body(
+            shared,
+            reader,
+            "inspector error rows",
+            |key| {
+                (
+                    key.inspector.error.clone(),
+                    key.inspector.inspector_details_open,
+                )
+            },
+            |s, r| {
+                let files = s.files();
+                let rows = sifs_unavailable_rows(
+                    files.error.as_deref().unwrap_or_default(),
+                    files.inspector_details_open,
+                );
+                WidgetPod::new(detail_rows_widget(rows, r))
+            },
+        );
         return WidgetPod::new(inspector_card(
             "SIFS unavailable",
-            detail_rows_widget(rows, reader),
+            body,
             reader,
-            Some(details_button()),
-            false,
+            Some(inspector_details_button(shared, reader)),
         ));
     }
 
     if let Some(selection) = marked_selection_summary(&files) {
-        let theme = reader();
-        let mut summary_style = theme.text_style(theme.palette.text_muted);
-        summary_style.font_size = theme.text.sm.size;
-        summary_style.line_height = theme.text.sm.line_height;
-        let summary_line = marked_selection_composition(&selection);
-        let overview_rows = vec![
-            ("Total size", marked_selection_size(&selection)),
-            ("Location", files.path.clone()),
-            ("Source", files.source.label().to_string()),
-        ];
-        let selected_body = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .gap(10.0)
-            .with_child(Label::new(summary_line).text_style(summary_style))
-            .with_child(detail_rows_widget(overview_rows, reader));
-        let mut content = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .gap(12.0)
-            .with_child(inspector_card(
-                marked_entries_label(selection.count),
-                selected_body,
-                reader,
-                Some(details_button()),
-                true,
-            ));
-
-        if files.source == FilesSourceKind::Sifs {
-            let (status, tone) = if selection.placement_attention_count > 0 {
-                (
-                    format!(
-                        "{} {}",
-                        selection.placement_attention_count,
-                        if selection.placement_attention_count == 1 {
-                            "needs attention"
-                        } else {
-                            "need attention"
-                        }
-                    ),
-                    SemanticTone::Warning,
-                )
-            } else if selection.placement_syncing_count > 0 {
-                (
-                    format!("{} syncing", selection.placement_syncing_count),
-                    SemanticTone::Accent,
-                )
-            } else if selection.placement_known_count == selection.count {
-                ("Selection available".to_string(), SemanticTone::Success)
-            } else {
-                (
-                    "Availability partly known".to_string(),
-                    SemanticTone::Neutral,
-                )
-            };
-            let rows = vec![
-                ("Placement", marked_selection_placement(&selection)),
-                (
-                    "Metadata",
-                    format!(
-                        "{} of {} items loaded",
-                        selection.placement_known_count, selection.count
-                    ),
-                ),
-                (
-                    "This device",
-                    format!(
-                        "{} of {} items available here",
-                        selection.local_available_count, selection.count
-                    ),
-                ),
-            ];
-            let body = Stack::vertical()
-                .alignment(Alignment::Stretch)
-                .gap(8.0)
-                .with_child(
-                    StatusBadge::new(status)
-                        .tone(tone)
-                        .theme_when(clone_reader(reader)),
-                )
-                .with_child(detail_rows_widget(rows, reader));
-            content = content.with_child(inspector_card("Availability", body, reader, None, false));
-        }
-
-        if files.inspector_details_open {
-            content = content.with_child(inspector_card(
-                "Selected items",
-                detail_rows_widget(vec![("Paths", marked_selection_paths(&selection))], reader),
-                reader,
-                None,
-                false,
-            ));
-        }
-        return WidgetPod::new(content);
+        drop(files);
+        return WidgetPod::new(marked_selection_inspector(
+            shared,
+            reader,
+            selection.count,
+            source,
+        ));
     }
 
     let Some(entry) = files.selected_entry().cloned() else {
-        let body = current_location_overview(shared, reader);
-        let header_action = (files.source == FilesSourceKind::Sifs).then(details_button);
+        drop(files);
+        let body = inspector_keyed_body(
+            shared,
+            reader,
+            "inspector location overview",
+            |key| {
+                let inspector = &key.inspector;
+                (
+                    inspector.path.clone(),
+                    inspector.entries.len(),
+                    key.list.entries_total_count,
+                    inspector.loaded,
+                    inspector.sifs_health.clone(),
+                    inspector.sifs_health_error.clone(),
+                    inspector.inspector_details_open,
+                    inspector.live_updates_connected,
+                    inspector.live_updates_error.clone(),
+                )
+            },
+            |s, r| WidgetPod::new(current_location_overview(s, r)),
+        );
+        let header_action =
+            (source == FilesSourceKind::Sifs).then(|| inspector_details_button(shared, reader));
         return WidgetPod::new(inspector_card(
-            unselected_inspector_title(files.source),
+            unselected_inspector_title(source),
             body,
             reader,
             header_action,
-            false,
         ));
     };
+    drop(files);
+    WidgetPod::new(selected_entry_inspector(shared, reader, &entry, source))
+}
 
+fn marked_selection_key(
+    key: &FilesStructureKey,
+) -> (
+    BTreeSet<usize>,
+    Vec<SifsEntry>,
+    BTreeMap<String, SifsEntryMetadata>,
+    String,
+) {
+    (
+        key.inspector.marked_entries.clone(),
+        key.inspector.entries.clone(),
+        key.inspector.entry_metadata.clone(),
+        key.inspector.path.clone(),
+    )
+}
+
+/// Cards for a marked multi-selection. The card set is fixed for one marked set; summaries
+/// follow the listing's metadata.
+fn marked_selection_inspector(
+    shared: &Shared,
+    reader: &ThemeReader,
+    count: usize,
+    source: FilesSourceKind,
+) -> Stack {
+    let selected_body = inspector_keyed_body(
+        shared,
+        reader,
+        "inspector marked summary",
+        marked_selection_key,
+        |s, r| {
+            let files = s.files();
+            let Some(selection) = marked_selection_summary(&files) else {
+                return WidgetPod::new(SizedBox::new());
+            };
+            let overview_rows = vec![
+                ("Total size", marked_selection_size(&selection)),
+                ("Location", files.path.clone()),
+                ("Source", files.source.label().to_string()),
+            ];
+            WidgetPod::new(
+                Stack::vertical()
+                    .alignment(Alignment::Stretch)
+                    .gap(10.0)
+                    .with_child(
+                        Label::new(marked_selection_composition(&selection))
+                            .text_style_when(live_note_style(r)),
+                    )
+                    .with_child(detail_rows_widget(overview_rows, r)),
+            )
+        },
+    );
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .gap(12.0)
+        .with_child(inspector_card(
+            marked_entries_label(count),
+            selected_body,
+            reader,
+            Some(inspector_details_button(shared, reader)),
+        ));
+
+    if source == FilesSourceKind::Sifs {
+        let body = inspector_keyed_body(
+            shared,
+            reader,
+            "inspector marked availability",
+            marked_selection_key,
+            |s, r| {
+                let files = s.files();
+                let Some(selection) = marked_selection_summary(&files) else {
+                    return WidgetPod::new(SizedBox::new());
+                };
+                let (status, tone) = if selection.placement_attention_count > 0 {
+                    (
+                        format!(
+                            "{} {}",
+                            selection.placement_attention_count,
+                            if selection.placement_attention_count == 1 {
+                                "needs attention"
+                            } else {
+                                "need attention"
+                            }
+                        ),
+                        SemanticTone::Warning,
+                    )
+                } else if selection.placement_syncing_count > 0 {
+                    (
+                        format!("{} syncing", selection.placement_syncing_count),
+                        SemanticTone::Accent,
+                    )
+                } else if selection.placement_known_count == selection.count {
+                    ("Selection available".to_string(), SemanticTone::Success)
+                } else {
+                    (
+                        "Availability partly known".to_string(),
+                        SemanticTone::Neutral,
+                    )
+                };
+                let rows = vec![
+                    ("Placement", marked_selection_placement(&selection)),
+                    (
+                        "Metadata",
+                        format!(
+                            "{} of {} items loaded",
+                            selection.placement_known_count, selection.count
+                        ),
+                    ),
+                    (
+                        "This device",
+                        format!(
+                            "{} of {} items available here",
+                            selection.local_available_count, selection.count
+                        ),
+                    ),
+                ];
+                WidgetPod::new(
+                    Stack::vertical()
+                        .alignment(Alignment::Stretch)
+                        .gap(8.0)
+                        .with_child(
+                            StatusBadge::new(status)
+                                .tone(tone)
+                                .theme_when(clone_reader(r)),
+                        )
+                        .with_child(detail_rows_widget(rows, r)),
+                )
+            },
+        );
+        content = content.with_child(inspector_card("Availability", body, reader, None));
+    }
+
+    let paths = inspector_keyed_body(
+        shared,
+        reader,
+        "inspector marked paths",
+        marked_selection_key,
+        |s, r| {
+            let paths = marked_selection_summary(&s.files())
+                .map(|selection| marked_selection_paths(&selection))
+                .unwrap_or_default();
+            WidgetPod::new(detail_rows_widget(vec![("Paths", paths)], r))
+        },
+    );
+    content.with_child(inspector_details_only(
+        shared,
+        inspector_card("Selected items", paths, reader, None),
+    ))
+}
+
+fn inspector_kind_line(files: &FilesState, entry: &SifsEntry) -> String {
     let details = files.selected_details.as_ref();
+    if files.source == FilesSourceKind::Sifs {
+        return sifs_compact_header_line(
+            entry,
+            details,
+            files.clustered,
+            files.details_loading,
+            files.details_error.as_deref(),
+        );
+    }
     let kind = details
         .map(|details| details.kind.as_str())
         .unwrap_or_else(|| {
@@ -18177,377 +18676,477 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                 "file"
             }
         });
-    let kind_line = if files.source == FilesSourceKind::Sifs {
-        sifs_compact_header_line(
-            &entry,
-            details,
-            files.clustered,
-            files.details_loading,
-            files.details_error.as_deref(),
-        )
-    } else {
-        format!("{kind} · {}", details_size(&entry, details))
-    };
-    let theme = reader();
-    let mut kind_style = theme.text_style(theme.palette.text_muted);
-    kind_style.font_size = theme.text.sm.size;
-    kind_style.line_height = theme.text.sm.line_height;
-    let mut selected_body = Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .gap(10.0)
-        .with_child(Label::new(kind_line).text_style(kind_style))
-        .with_child(
-            DetailRow::new("Path", entry.path.clone())
-                .theme_when(clone_reader(reader))
-                .max_value_lines(6),
-        );
-    let modified = match files.source {
-        FilesSourceKind::Sifs => {
-            details.map(|details| unix_nanos_label(details.modified_at_unix_nanos))
-        }
+    format!("{kind} · {}", details_size(entry, details))
+}
+
+fn inspector_modified(files: &FilesState) -> Option<String> {
+    match files.source {
+        FilesSourceKind::Sifs => files
+            .selected_details
+            .as_ref()
+            .map(|details| unix_nanos_label(details.modified_at_unix_nanos)),
         FilesSourceKind::Local => files
             .selected_local_details
             .as_ref()
             .and_then(|details| details.modified_at_unix_nanos)
             .map(unix_nanos_label),
+    }
+}
+
+/// Cards for one selected file or folder. The card set is fixed for the selected path; each
+/// body follows its own metadata, preview, or attachment state.
+fn selected_entry_inspector(
+    shared: &Shared,
+    reader: &ThemeReader,
+    entry: &SifsEntry,
+    source: FilesSourceKind,
+) -> Stack {
+    let kind_line = {
+        let s = shared.clone();
+        let entry = entry.clone();
+        move || inspector_kind_line(&s.files(), &entry)
     };
-    if let Some(modified) = modified {
-        selected_body = selected_body.with_child(
-            DetailRow::new("Modified", modified)
-                .theme_when(clone_reader(reader))
-                .max_value_lines(2),
-        );
-    }
-    selected_body = selected_body
-        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-        .with_child(selected_item_actions(shared, reader, &entry));
-    if files.attachment_loading {
-        selected_body = selected_body.with_child(
-            StatusBadge::new("Preparing chat attachment")
-                .tone(SemanticTone::Accent)
-                .theme_when(clone_reader(reader)),
-        );
-    } else if let Some(error) = files.attachment_error.as_deref() {
-        selected_body = selected_body.with_child(
-            Label::new(error.to_string()).text_style(theme.text_style(theme.palette.danger)),
-        );
-    }
-    let selected_card = inspector_card(
-        entry.name.clone(),
-        selected_body,
+    let modified = inspector_keyed_body(
+        shared,
         reader,
-        Some(details_button()),
-        true,
-    );
-
-    let mut content = Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .gap(12.0)
-        .with_child(selected_card);
-
-    if !entry.is_dir {
-        content = content.with_child(preview_card(
-            files.source,
-            files.preview_loading,
-            files.preview_error.as_deref(),
-            files.selected_preview.as_ref(),
-            files.custom_preview.as_ref(),
-            reader,
-        ));
-    }
-
-    if files.source == FilesSourceKind::Local {
-        let local = files.selected_local_details.as_ref();
-        let status_label = local_metadata_status_label(
-            files.details_loading,
-            files.details_error.as_deref(),
-            local,
-        );
-        let status_tone = local_metadata_status_tone(
-            files.details_loading,
-            files.details_error.as_deref(),
-            local,
-        );
-        let mut rows = vec![("Source", "Host filesystem".to_string())];
-        if let Some(local) = local {
-            rows.push((
-                "Permissions",
-                if local.readonly {
-                    "read-only".to_string()
-                } else {
-                    "writable".to_string()
-                },
-            ));
-            if let Some(canonical) = &local.canonical_path
-                && canonical != &local.path
-            {
-                rows.push(("Canonical", canonical.clone()));
-            }
-        } else if let Some(error) = &files.details_error {
-            rows.push(("Reason", error.clone()));
-        } else if files.details_loading {
-            rows.push(("Status", "Reading metadata".to_string()));
-        }
-        let body = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .gap(8.0)
-            .with_child(
-                StatusBadge::new(status_label)
-                    .tone(status_tone)
-                    .theme_when(clone_reader(reader)),
+        "inspector modified",
+        |key| {
+            (
+                key.inspector.selected_details.clone(),
+                key.inspector.selected_local_details.clone(),
             )
-            .with_child(detail_rows_widget(rows, reader));
-        content = content.with_child(inspector_card("Local file", body, reader, None, false));
-
-        if files.inspector_details_open {
-            let mut rows = Vec::new();
-            if let Some(local) = local {
-                rows.push(("Kind", local.kind.clone()));
-                rows.push(("Accessed", local_time_label(local.accessed_at_unix_nanos)));
-                rows.push(("Modified", local_time_label(local.modified_at_unix_nanos)));
-                rows.push(("Created", local_time_label(local.created_at_unix_nanos)));
-            }
-            if !rows.is_empty() {
-                content = content.with_child(inspector_card(
-                    "Technical details",
-                    detail_rows_widget(rows, reader),
-                    reader,
-                    None,
-                    false,
-                ));
-            }
-        }
-    } else {
-        let status_label = sifs_metadata_status_label(
-            files.details_loading,
-            files.details_error.as_deref(),
-            details,
-        );
-        let status_tone = sifs_metadata_status_tone(
-            files.details_loading,
-            files.details_error.as_deref(),
-            details,
-        );
-        let placement_rows = vec![
-            (
-                "Content copies",
-                sifs_replication_summary(details, files.clustered),
+        },
+        |s, r| match inspector_modified(&s.files()) {
+            Some(modified) => WidgetPod::new(
+                DetailRow::new("Modified", modified)
+                    .theme_when(clone_reader(r))
+                    .max_value_lines(2),
             ),
-            ("Metadata home", sifs_metadata_shard_summary(details)),
-            ("Object health", sifs_health_summary(details)),
-            ("This device", sifs_pin_summary(details)),
-            (
-                "Recommended",
-                sifs_inspector_next_step(
-                    details,
-                    files.clustered,
-                    files.details_loading,
-                    files.details_error.as_deref(),
-                ),
-            ),
-        ];
-        let (live_label, live_tone) = if files.live_updates_connected {
-            ("Live changes on", SemanticTone::Success)
-        } else if files.live_updates_error.is_some() {
-            ("Live changes reconnecting", SemanticTone::Warning)
-        } else {
-            ("Snapshot view", SemanticTone::Neutral)
-        };
-        let placement_body = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .gap(8.0)
+            None => WidgetPod::new(SizedBox::new()),
+        },
+    );
+    let attachment = {
+        let error = shared.clone();
+        let selected =
+            shared
+                .signals()
+                .files_structure
+                .select_named("inspector attachment", |key| {
+                    if key.inspector.attachment_loading {
+                        1
+                    } else if key.inspector.attachment_error.is_some() {
+                        2
+                    } else {
+                        0
+                    }
+                });
+        SwitchView::new()
+            .selected_from(selected)
+            .with_child(SizedBox::new())
             .with_child(
-                StatusBadge::new(short_node_label(&files.node_id))
-                    .icon(IconGlyph::Storage)
+                StatusBadge::new("Preparing chat attachment")
                     .tone(SemanticTone::Accent)
                     .theme_when(clone_reader(reader)),
             )
             .with_child(
-                StatusBadge::new(status_label)
-                    .tone(status_tone)
-                    .theme_when(clone_reader(reader)),
+                Label::new("Attachment failed")
+                    .text_when(move || error.files().attachment_error.clone().unwrap_or_default())
+                    .text_style_when(live_text_style(reader, |theme| {
+                        theme.text_style(theme.palette.danger)
+                    })),
             )
-            .with_child(
-                StatusBadge::new(live_label)
-                    .tone(live_tone)
-                    .theme_when(clone_reader(reader)),
-            )
-            .with_child(detail_rows_widget(placement_rows, reader));
-        content = content.with_child(inspector_card(
-            "Availability",
-            placement_body,
+    };
+    let selected_body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .gap(10.0)
+        .with_child(
+            Label::new(kind_line())
+                .text_when(kind_line)
+                .text_style_when(live_note_style(reader)),
+        )
+        .with_child(
+            DetailRow::new("Path", entry.path.clone())
+                .theme_when(clone_reader(reader))
+                .max_value_lines(6),
+        )
+        .with_child(modified)
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+        .with_child(selected_item_actions(shared, reader, entry))
+        .with_child(attachment);
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .gap(12.0)
+        .with_child(inspector_card(
+            entry.name.clone(),
+            selected_body,
             reader,
-            None,
-            false,
+            Some(inspector_details_button(shared, reader)),
         ));
 
-        if files.inspector_details_open {
-            let mut status_rows = Vec::new();
-            if let Some(error) = &files.live_updates_error {
-                status_rows.push(("Live updates", error.clone()));
-            }
-            if let Some(error) = &files.details_error {
-                status_rows.push(("Reason", error.clone()));
-                status_rows.push(("Source", "SIFS through daemon".to_string()));
-            } else if files.details_loading {
-                status_rows.push(("Status", "Reading DFS metadata".to_string()));
-            } else if details.is_none() {
-                status_rows.push((
-                    "Status",
-                    "Metadata has not returned for this object yet".to_string(),
-                ));
-                status_rows.push(("Source", "SIFS through daemon".to_string()));
-            }
-            if !status_rows.is_empty() {
-                content = content.with_child(inspector_card(
-                    "DFS details",
-                    detail_rows_widget(status_rows, reader),
-                    reader,
-                    None,
-                    false,
-                ));
-            }
-
-            if let Some(details) = details {
-                let metadata_rows = vec![
-                    ("Type", details.kind.clone()),
-                    ("Size", details_size(&entry, Some(details))),
-                    ("Modified", unix_nanos_label(details.modified_at_unix_nanos)),
-                    ("Created", unix_nanos_label(details.created_at_unix_nanos)),
-                    ("Accessed", unix_nanos_label(details.accessed_at_unix_nanos)),
-                    (
-                        "Permissions",
-                        format!("{:04o} · {} links", details.mode, details.link_count),
-                    ),
-                    (
-                        "Owner",
-                        format!("uid {} · gid {}", details.uid, details.gid),
-                    ),
-                ];
-                content = content.with_child(inspector_card(
-                    "File metadata",
-                    detail_rows_widget(metadata_rows, reader),
-                    reader,
-                    None,
-                    false,
-                ));
-
-                let mut identity_rows = vec![
-                    ("File system", details.file_system_id.clone()),
-                    ("Object ID", details.object_id.clone()),
-                    ("Version", details.version.clone()),
-                ];
-                if let Some(hash) = &details.content_hash {
-                    identity_rows.push(("Content hash", hash.clone()));
-                }
-                content = content.with_child(inspector_card(
-                    "DFS identity",
-                    detail_rows_widget(identity_rows, reader),
-                    reader,
-                    None,
-                    false,
-                ));
-
-                let mut placement_detail_rows = vec![
-                    ("Policy", details.policy.clone()),
-                    (
-                        "Durable nodes",
-                        details_locations_friendly(details, &files.node_id),
-                    ),
-                    ("Local pins", sifs_pin_detail_summary(details)),
-                ];
-                if let Some(placement) = details.placement.as_ref() {
-                    placement_detail_rows.push((
-                        "Managed placement",
-                        format!(
-                            "W={} · N={} · zones≥{}",
-                            placement.policy.min_commit_replicas,
-                            placement.policy.desired_replicas,
-                            placement.policy.min_distinct_zones
-                        ),
-                    ));
-                    placement_detail_rows.push(("Inheritance", placement.explanation.clone()));
-                    if !placement.policy.required_node_ids.is_empty() {
-                        placement_detail_rows.push((
-                            "Required nodes",
-                            placement
-                                .policy
-                                .required_node_ids
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        ));
-                    }
-                    if !placement.policy.forbidden_node_ids.is_empty() {
-                        placement_detail_rows.push((
-                            "Forbidden nodes",
-                            placement
-                                .policy
-                                .forbidden_node_ids
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        ));
-                    }
-                }
-                if let Some(shard) = details.metadata_shard.as_ref() {
-                    placement_detail_rows
-                        .push(("Metadata shard", sifs_metadata_shard_detail_summary(shard)));
-                }
-                if let Some(health) = details.health.as_ref() {
-                    placement_detail_rows.push(("Agent state", health.agent_state.clone()));
-                    placement_detail_rows.push((
-                        "DFS records",
-                        format!(
-                            "{} · {} · {}",
-                            plural(health.version_count, "version"),
-                            plural(health.receipt_count, "receipt"),
-                            plural(health.intent_count, "intent")
-                        ),
-                    ));
-                    placement_detail_rows.push((
-                        "Repair backlog",
-                        plural(health.pending_repair_count, "missing replica"),
-                    ));
-                    placement_detail_rows
-                        .push(("Missing nodes", sifs_missing_replica_summary(health)));
-                }
-                content = content.with_child(inspector_card(
-                    "Placement internals",
-                    detail_rows_widget(placement_detail_rows, reader),
-                    reader,
-                    None,
-                    false,
-                ));
-            }
-        }
-
-        if !files.clustered {
-            let mut note_style = theme.text_style(theme.palette.text_muted);
-            note_style.font_size = theme.text.xs.size;
-            note_style.line_height = theme.text.xs.line_height;
-            content = content.with_child(
-                Surface::panel(RichText::from_plain_text(
-                    "Join a cluster to spread this object across nodes and tune replication.",
-                    note_style,
+    if !entry.is_dir {
+        content = content.with_child(inspector_keyed_body(
+            shared,
+            reader,
+            "inspector preview",
+            |key| {
+                let inspector = &key.inspector;
+                (
+                    inspector.preview_loading,
+                    inspector.preview_error.clone(),
+                    inspector.selected_preview.clone(),
+                    inspector.custom_preview_id.clone(),
+                )
+            },
+            |s, r| {
+                let files = s.files();
+                WidgetPod::new(preview_card(
+                    files.source,
+                    files.preview_loading,
+                    files.preview_error.as_deref(),
+                    files.selected_preview.as_ref(),
+                    files.custom_preview.as_ref(),
+                    r,
                 ))
-                .appearance(sui::SurfaceAppearance::Soft)
-                .tone(SemanticTone::Neutral)
-                .theme_when(clone_reader(reader))
-                .padding(Insets {
-                    left: 12.0,
-                    top: 10.0,
-                    right: 12.0,
-                    bottom: 10.0,
-                })
-                .fill_width(true),
-            );
-        }
+            },
+        ));
     }
 
-    WidgetPod::new(content)
+    if source == FilesSourceKind::Local {
+        let local_key = |key: &FilesStructureKey| {
+            let inspector = &key.inspector;
+            (
+                inspector.details_loading,
+                inspector.details_error.clone(),
+                inspector.selected_local_details.clone(),
+            )
+        };
+        let body =
+            inspector_keyed_body(shared, reader, "inspector local file", local_key, |s, r| {
+                WidgetPod::new(local_file_details(&s.files(), r))
+            });
+        content = content.with_child(inspector_card("Local file", body, reader, None));
+        let technical = inspector_keyed_body(
+            shared,
+            reader,
+            "inspector local technical",
+            local_key,
+            |s, r| match local_technical_rows(&s.files()) {
+                Some(rows) => WidgetPod::new(inspector_card(
+                    "Technical details",
+                    detail_rows_widget(rows, r),
+                    r,
+                    None,
+                )),
+                None => WidgetPod::new(SizedBox::new()),
+            },
+        );
+        return content.with_child(inspector_details_only(shared, technical));
+    }
+
+    let sifs_key = |key: &FilesStructureKey| {
+        let inspector = &key.inspector;
+        (
+            inspector.details_loading,
+            inspector.details_error.clone(),
+            inspector.selected_details.clone(),
+            inspector.clustered,
+            inspector.live_updates_connected,
+            inspector.live_updates_error.clone(),
+            key.header.node_id.clone(),
+        )
+    };
+    let body = inspector_keyed_body(
+        shared,
+        reader,
+        "inspector availability",
+        sifs_key,
+        |s, r| WidgetPod::new(sifs_availability_details(&s.files(), r)),
+    );
+    content = content.with_child(inspector_card("Availability", body, reader, None));
+    let technical = {
+        let entry = entry.clone();
+        inspector_keyed_body(
+            shared,
+            reader,
+            "inspector dfs details",
+            sifs_key,
+            move |s, r| WidgetPod::new(sifs_technical_cards(&s.files(), &entry, r)),
+        )
+    };
+    content = content.with_child(inspector_details_only(shared, technical));
+    let standalone = shared
+        .signals()
+        .files_structure
+        .select_named("inspector standalone node", |key| !key.inspector.clustered);
+    content.with_child(
+        Presence::new(
+            Surface::panel(live_plain_text(
+                reader,
+                "Join a cluster to spread this object across nodes and tune replication.",
+                |theme| sized_text_style(theme, theme.palette.text_muted, theme.text.xs),
+            ))
+            .appearance(sui::SurfaceAppearance::Soft)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .padding(Insets {
+                left: 12.0,
+                top: 10.0,
+                right: 12.0,
+                bottom: 10.0,
+            })
+            .fill_width(true),
+        )
+        .transition(crate::ui::widgets::reveal_transition())
+        .shown_from(standalone)
+        .collapse(Axis::Vertical),
+    )
+}
+
+fn local_file_details(files: &FilesState, reader: &ThemeReader) -> Stack {
+    let local = files.selected_local_details.as_ref();
+    let status_label =
+        local_metadata_status_label(files.details_loading, files.details_error.as_deref(), local);
+    let status_tone =
+        local_metadata_status_tone(files.details_loading, files.details_error.as_deref(), local);
+    let mut rows = vec![("Source", "Host filesystem".to_string())];
+    if let Some(local) = local {
+        rows.push((
+            "Permissions",
+            if local.readonly {
+                "read-only".to_string()
+            } else {
+                "writable".to_string()
+            },
+        ));
+        if let Some(canonical) = &local.canonical_path
+            && canonical != &local.path
+        {
+            rows.push(("Canonical", canonical.clone()));
+        }
+    } else if let Some(error) = &files.details_error {
+        rows.push(("Reason", error.clone()));
+    } else if files.details_loading {
+        rows.push(("Status", "Reading metadata".to_string()));
+    }
+    Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .gap(8.0)
+        .with_child(
+            StatusBadge::new(status_label)
+                .tone(status_tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(detail_rows_widget(rows, reader))
+}
+
+fn local_technical_rows(files: &FilesState) -> Option<Vec<(&'static str, String)>> {
+    let local = files.selected_local_details.as_ref()?;
+    Some(vec![
+        ("Kind", local.kind.clone()),
+        ("Accessed", local_time_label(local.accessed_at_unix_nanos)),
+        ("Modified", local_time_label(local.modified_at_unix_nanos)),
+        ("Created", local_time_label(local.created_at_unix_nanos)),
+    ])
+}
+
+fn sifs_availability_details(files: &FilesState, reader: &ThemeReader) -> Stack {
+    let details = files.selected_details.as_ref();
+    let status_label = sifs_metadata_status_label(
+        files.details_loading,
+        files.details_error.as_deref(),
+        details,
+    );
+    let status_tone = sifs_metadata_status_tone(
+        files.details_loading,
+        files.details_error.as_deref(),
+        details,
+    );
+    let placement_rows = vec![
+        (
+            "Content copies",
+            sifs_replication_summary(details, files.clustered),
+        ),
+        ("Metadata home", sifs_metadata_shard_summary(details)),
+        ("Object health", sifs_health_summary(details)),
+        ("This device", sifs_pin_summary(details)),
+        (
+            "Recommended",
+            sifs_inspector_next_step(
+                details,
+                files.clustered,
+                files.details_loading,
+                files.details_error.as_deref(),
+            ),
+        ),
+    ];
+    let (live_label, live_tone) = if files.live_updates_connected {
+        ("Live changes on", SemanticTone::Success)
+    } else if files.live_updates_error.is_some() {
+        ("Live changes reconnecting", SemanticTone::Warning)
+    } else {
+        ("Snapshot view", SemanticTone::Neutral)
+    };
+    Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .gap(8.0)
+        .with_child(
+            StatusBadge::new(short_node_label(&files.node_id))
+                .icon(IconGlyph::Storage)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new(status_label)
+                .tone(status_tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            StatusBadge::new(live_label)
+                .tone(live_tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(detail_rows_widget(placement_rows, reader))
+}
+
+/// DFS status, metadata, identity, and placement internals for the selected SIFS object.
+fn sifs_technical_cards(files: &FilesState, entry: &SifsEntry, reader: &ThemeReader) -> Stack {
+    let details = files.selected_details.as_ref();
+    let mut content = Stack::vertical().alignment(Alignment::Stretch).gap(12.0);
+    let mut status_rows = Vec::new();
+    if let Some(error) = &files.live_updates_error {
+        status_rows.push(("Live updates", error.clone()));
+    }
+    if let Some(error) = &files.details_error {
+        status_rows.push(("Reason", error.clone()));
+        status_rows.push(("Source", "SIFS through daemon".to_string()));
+    } else if files.details_loading {
+        status_rows.push(("Status", "Reading DFS metadata".to_string()));
+    } else if details.is_none() {
+        status_rows.push((
+            "Status",
+            "Metadata has not returned for this object yet".to_string(),
+        ));
+        status_rows.push(("Source", "SIFS through daemon".to_string()));
+    }
+    if !status_rows.is_empty() {
+        content = content.with_child(inspector_card(
+            "DFS details",
+            detail_rows_widget(status_rows, reader),
+            reader,
+            None,
+        ));
+    }
+
+    let Some(details) = details else {
+        return content;
+    };
+    let metadata_rows = vec![
+        ("Type", details.kind.clone()),
+        ("Size", details_size(entry, Some(details))),
+        ("Modified", unix_nanos_label(details.modified_at_unix_nanos)),
+        ("Created", unix_nanos_label(details.created_at_unix_nanos)),
+        ("Accessed", unix_nanos_label(details.accessed_at_unix_nanos)),
+        (
+            "Permissions",
+            format!("{:04o} · {} links", details.mode, details.link_count),
+        ),
+        (
+            "Owner",
+            format!("uid {} · gid {}", details.uid, details.gid),
+        ),
+    ];
+    content = content.with_child(inspector_card(
+        "File metadata",
+        detail_rows_widget(metadata_rows, reader),
+        reader,
+        None,
+    ));
+
+    let mut identity_rows = vec![
+        ("File system", details.file_system_id.clone()),
+        ("Object ID", details.object_id.clone()),
+        ("Version", details.version.clone()),
+    ];
+    if let Some(hash) = &details.content_hash {
+        identity_rows.push(("Content hash", hash.clone()));
+    }
+    content = content.with_child(inspector_card(
+        "DFS identity",
+        detail_rows_widget(identity_rows, reader),
+        reader,
+        None,
+    ));
+
+    let mut placement_detail_rows = vec![
+        ("Policy", details.policy.clone()),
+        (
+            "Durable nodes",
+            details_locations_friendly(details, &files.node_id),
+        ),
+        ("Local pins", sifs_pin_detail_summary(details)),
+    ];
+    if let Some(placement) = details.placement.as_ref() {
+        placement_detail_rows.push((
+            "Managed placement",
+            format!(
+                "W={} · N={} · zones≥{}",
+                placement.policy.min_commit_replicas,
+                placement.policy.desired_replicas,
+                placement.policy.min_distinct_zones
+            ),
+        ));
+        placement_detail_rows.push(("Inheritance", placement.explanation.clone()));
+        if !placement.policy.required_node_ids.is_empty() {
+            placement_detail_rows.push((
+                "Required nodes",
+                placement
+                    .policy
+                    .required_node_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        if !placement.policy.forbidden_node_ids.is_empty() {
+            placement_detail_rows.push((
+                "Forbidden nodes",
+                placement
+                    .policy
+                    .forbidden_node_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+    if let Some(shard) = details.metadata_shard.as_ref() {
+        placement_detail_rows.push(("Metadata shard", sifs_metadata_shard_detail_summary(shard)));
+    }
+    if let Some(health) = details.health.as_ref() {
+        placement_detail_rows.push(("Agent state", health.agent_state.clone()));
+        placement_detail_rows.push((
+            "DFS records",
+            format!(
+                "{} · {} · {}",
+                plural(health.version_count, "version"),
+                plural(health.receipt_count, "receipt"),
+                plural(health.intent_count, "intent")
+            ),
+        ));
+        placement_detail_rows.push((
+            "Repair backlog",
+            plural(health.pending_repair_count, "missing replica"),
+        ));
+        placement_detail_rows.push(("Missing nodes", sifs_missing_replica_summary(health)));
+    }
+    content.with_child(inspector_card(
+        "Placement internals",
+        detail_rows_widget(placement_detail_rows, reader),
+        reader,
+        None,
+    ))
 }
 
 /// Assemble the wide inspector and the compact sheet body from the same stock SUI controls.
@@ -18596,39 +19195,40 @@ fn inspector(
 // Composed pods (wide split / narrow list-only) + responsive host.
 // ---------------------------------------------------------------------------
 
-/// The header bar wrapped so it rebuilds (breadcrumb segments and history affordances) whenever
-/// navigation state changes. A fixed-height titlebar surface over a hairline separator.
-fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+/// The header's controls stay mounted; they re-read navigation state whenever it changes.
+fn files_header_refresh<W>(shared: &Shared, header: W) -> RefreshOn<FilesHeaderStructure>
+where
+    W: Widget + 'static,
+{
     let source = shared
         .signals()
         .files_structure
-        .select_named("files header structure", |key| key.header.clone());
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::key_from(source, move |_key| WidgetPod::new(header(&s, &r)));
+        .select_named("files header state", |key| key.header.clone());
+    RefreshOn::new(source, header)
+}
+
+/// A fixed-height titlebar surface over a hairline separator.
+fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     Surface::window(
-        WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
-            .fill_child_width(true)
-            .fill_child_height(true),
+        WidgetPadding::horizontal(
+            CONTENT_PAD,
+            files_header_refresh(shared, header(shared, reader)),
+        )
+        .fill_child_width(true)
+        .fill_child_height(true),
     )
     .theme_when(clone_reader(reader))
     .fill_width(true)
 }
 
 fn picker_first_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .files_structure
-        .select_named("files picker header structure", |key| key.header.clone());
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let rebuilt = RebuildOnChange::key_from(source, move |_key| {
-        WidgetPod::new(picker_first_header(&s, &r))
-    });
     Surface::window(
-        WidgetPadding::horizontal(CONTENT_PAD, rebuilt)
-            .fill_child_width(true)
-            .fill_child_height(true),
+        WidgetPadding::horizontal(
+            CONTENT_PAD,
+            files_header_refresh(shared, picker_first_header(shared, reader)),
+        )
+        .fill_child_width(true)
+        .fill_child_height(true),
     )
     .theme_when(clone_reader(reader))
     .fill_width(true)
@@ -18645,14 +19245,6 @@ fn desktop_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
 }
 
 fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .files_structure
-        .select_named("files compact header structure", |key| key.header.clone());
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let rebuilt =
-        RebuildOnChange::key_from(source, move |_key| WidgetPod::new(compact_header(&s, &r)));
     Surface::window(
         WidgetPadding::new(
             Insets {
@@ -18661,7 +19253,7 @@ fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 right: 8.0,
                 bottom: 6.0,
             },
-            rebuilt,
+            files_header_refresh(shared, compact_header(shared, reader)),
         )
         .fill_child_width(true)
         .fill_child_height(true),
@@ -18670,34 +19262,16 @@ fn compact_header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     .fill_width(true)
 }
 
-/// The file-list column switches between loading, error, empty, and populated presentations. A shared
-/// `scroll_state` is threaded so the position is consistent across the wide/narrow swap.
+/// The file-list column: the listing's presentations, plus the selection action bar in the narrow
+/// branch. A shared `scroll_state` is threaded so the position is consistent across the wide/narrow
+/// swap.
 fn list_column(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
     contextual_selection: bool,
 ) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .files_structure
-        .select_named("files column structure", |key| {
-            // The populated body observes its own listing changes and retains thumbnail geometry
-            // across pagination. Rebuilding it here too would discard that retained state.
-            (
-                key.list.theme,
-                key.list.source,
-                key.list.loading,
-                key.list.error.clone(),
-                key.list.entries.is_empty(),
-                key.daemon_available,
-            )
-        });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let ss = scroll_state.clone();
-    let listing = RebuildOnChange::key_from(source, move |_key| listing(&s, &r, &ss));
-    let dock = Dock::new(listing);
+    let dock = Dock::new(listing(shared, reader, scroll_state));
     if contextual_selection {
         dock.top(FILE_ACTION_BAR_H, files_action_bar(shared, reader, true))
     } else {
@@ -18796,7 +19370,6 @@ where
     F: FnMut(&mut EventCtx) + 'static,
 {
     sui::Button::new(label)
-        .min_height(32.0)
         .theme_when(clone_reader(reader))
         .enabled_when(enabled)
         .on_press_with_ctx(on_press)
@@ -19093,15 +19666,13 @@ fn destination_chooser_controls(
     source: FilesSourceKind,
 ) -> Option<Stack> {
     let destination = prompt_destination_source(kind, source)?;
-    let theme = reader();
-    let mut hint_style = theme.text_style(theme.palette.text_muted);
-    hint_style.font_size = theme.text.sm.size;
-    hint_style.line_height = theme.text.sm.line_height;
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
         .gap(7.0)
         .with_child(
-            Label::new("Choose a destination").text_style(theme.text_style(theme.palette.text)),
+            Label::new("Choose a destination").text_style_when(live_text_style(reader, |theme| {
+                theme.text_style(theme.palette.text)
+            })),
         );
     if destination == FilesSourceKind::Local {
         let enabled = shared.clone();
@@ -19127,7 +19698,7 @@ fn destination_chooser_controls(
                 Label::new(
                     "The selected folder is combined with the original name. You can edit the exact path below before starting.",
                 )
-                .text_style(hint_style),
+                .text_style_when(live_note_style(reader)),
             );
     } else {
         let choice = |label: &'static str, path: &'static str| {
@@ -19156,7 +19727,7 @@ fn destination_chooser_controls(
                 Label::new(
                     "Choose a common Sinomo space, then edit the exact folder or name below if needed.",
                 )
-                .text_style(hint_style),
+                .text_style_when(live_note_style(reader)),
             );
     }
     Some(content)
@@ -19514,24 +20085,22 @@ fn placement_node_row(
     } else {
         format!("{}× weight", node.capacity_weight)
     };
-    let theme = reader();
-    let mut explanation_style = theme.text_style(theme.palette.text_muted);
-    explanation_style.font_size = theme.text.xs.size;
-    explanation_style.line_height = theme.text.xs.line_height;
     let mut row = Flex::horizontal()
         .gap(8.0)
         .align_items(Alignment::Center)
         .with_item(
             Stack::vertical()
                 .gap(2.0)
-                .with_child(Label::new(short_node_label(&node_id_text)).theme(reader()))
+                .with_child(
+                    Label::new(short_node_label(&node_id_text)).theme_when(clone_reader(reader)),
+                )
                 .with_child(
                     Label::new(if node.accepts_content {
                         "Content eligible"
                     } else {
                         "Not content eligible"
                     })
-                    .theme(reader()),
+                    .theme_when(clone_reader(reader)),
                 ),
             FlexItem::fixed(140.0),
         )
@@ -19541,7 +20110,7 @@ fn placement_node_row(
                     .clone()
                     .unwrap_or_else(|| "Unassigned".to_string()),
             )
-            .theme(reader()),
+            .theme_when(clone_reader(reader)),
             FlexItem::fixed(80.0),
         )
         .with_item(
@@ -19551,7 +20120,7 @@ fn placement_node_row(
             FlexItem::fixed(104.0),
         )
         .with_item(
-            Label::new(capacity.clone()).theme(reader()),
+            Label::new(capacity.clone()).theme_when(clone_reader(reader)),
             FlexItem::fixed(78.0),
         )
         .with_item(
@@ -19569,11 +20138,13 @@ fn placement_node_row(
     if constraints_locked {
         row = row
             .with_item(
-                Label::new(if node.required { "Required" } else { "—" }).theme(reader()),
+                Label::new(if node.required { "Required" } else { "—" })
+                    .theme_when(clone_reader(reader)),
                 FlexItem::fixed(92.0),
             )
             .with_item(
-                Label::new(if node.forbidden { "Forbidden" } else { "—" }).theme(reader()),
+                Label::new(if node.forbidden { "Forbidden" } else { "—" })
+                    .theme_when(clone_reader(reader)),
                 FlexItem::fixed(98.0),
             );
     } else {
@@ -19582,7 +20153,9 @@ fn placement_node_row(
             .with_item(forbidden, FlexItem::fixed(98.0));
     }
     row = row.with_item(
-        RichText::from_plain_text(node.explanation.clone(), explanation_style),
+        live_plain_text(reader, node.explanation.clone(), |theme| {
+            sized_text_style(theme, theme.palette.text_muted, theme.text.xs)
+        }),
         FlexItem::flex(1.0).basis(190.0).min_width(150.0),
     );
     let description = format!(
@@ -19922,6 +20495,41 @@ fn placement_user_preview_rows(preview: &SifsPlacementPreview) -> Vec<(&'static 
     ]
 }
 
+/// One projection of the open dialog's state, observable by the widgets that show it.
+fn placement_dialog_field<T, F>(
+    shared: &Shared,
+    name: &'static str,
+    field: F,
+) -> impl Observable<T> + Clone + use<T, F>
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+    F: Fn(&FilesDialogStructure) -> T + Send + Sync + 'static,
+{
+    shared
+        .signals()
+        .files_structure
+        .select_named(name, move |key| field(&key.dialog))
+}
+
+fn placement_shape(dialog: &FilesDialogStructure) -> Option<PlacementBodyShape> {
+    match dialog {
+        FilesDialogStructure::Action {
+            placement_shape, ..
+        } => placement_shape.clone(),
+        _ => None,
+    }
+}
+
+fn placement_advanced_open(dialog: &FilesDialogStructure) -> bool {
+    matches!(
+        dialog,
+        FilesDialogStructure::Action {
+            placement_advanced_open: true,
+            ..
+        }
+    )
+}
+
 fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
     let editable = shared
         .files()
@@ -19978,10 +20586,6 @@ fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
             changed.files_mut().set_placement_goal(index);
             request_files_overlay_rebuild(ctx);
         });
-    let theme = reader();
-    let mut hint_style = theme.text_style(theme.palette.text_muted);
-    hint_style.font_size = theme.text.sm.size;
-    hint_style.line_height = theme.text.sm.line_height;
     Stack::vertical()
         .alignment(Alignment::Stretch)
         .gap(7.0)
@@ -19990,8 +20594,77 @@ fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
             Label::new(
                 "Across devices favors responsiveness; Confirmed copies waits for the complete copy set before publishing a write.",
             )
-            .text_style(hint_style),
+            .text_style_when(live_note_style(reader)),
         )
+}
+
+/// The active scope's policy bounds: write threshold limit, desired-copy minimum, and the
+/// number of content-eligible candidates.
+fn placement_count_bounds(files: &FilesState) -> (usize, usize, usize) {
+    let (desired_limit, desired_minimum) = files
+        .placement_draft
+        .as_ref()
+        .and_then(PlacementEditorDraft::active_policy)
+        .map_or((1, 1), |draft| {
+            (
+                draft.desired_replicas.max(1),
+                1_usize
+                    .max(draft.required_node_ids.len())
+                    .max(draft.min_distinct_zones),
+            )
+        });
+    (
+        desired_limit,
+        desired_minimum,
+        files.placement_candidate_limit(),
+    )
+}
+
+/// A count field that stays mounted while edits move its bounds; the range is re-applied in place.
+fn placement_count_input(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &'static str,
+    range: fn((usize, usize, usize)) -> (f64, f64),
+    value: fn(&PlacementEditorPolicyDraft) -> f64,
+    on_change: fn(&mut FilesState, f64),
+) -> impl Widget + use<> {
+    let (min, max) = range(placement_count_bounds(&shared.files()));
+    let reader_shared = shared.clone();
+    let changed = shared.clone();
+    let input = NumberInput::new(name)
+        .range(min, max)
+        .step(1.0)
+        .precision(0)
+        .value_when(move || {
+            reader_shared
+                .files()
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .map_or(min, value)
+        })
+        .theme_when(clone_reader(reader))
+        .on_change(move |value| {
+            let waker = { changed.borrow().waker.clone() };
+            on_change(&mut changed.files_mut(), value);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+    Restyle::new(
+        input,
+        placement_dialog_field(shared, "placement count bounds", |dialog| {
+            placement_shape(dialog).map(|shape| shape.count_bounds)
+        }),
+        move |input, bounds: &Option<(usize, usize, usize)>| match bounds {
+            Some(bounds) => {
+                let (min, max) = range(*bounds);
+                input.range(min, max)
+            }
+            None => input,
+        },
+    )
 }
 
 fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_dir: bool) -> Stack {
@@ -20061,7 +20734,7 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
                 Label::new(
                     "The current non-replicated policy is shown read-only. Use the DFS administration surface for an explicit data migration.",
                 )
-                .theme(reader()),
+                .theme_when(clone_reader(reader)),
             );
     }
 
@@ -20104,121 +20777,85 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
             })
     };
 
-    let candidate_limit = shared.files().placement_candidate_limit();
-    let (confirmed, desired_limit, desired_minimum) = shared
-        .files()
-        .placement_draft
-        .as_ref()
-        .and_then(PlacementEditorDraft::active_policy)
-        .map_or((false, 1, 1), |draft| {
+    // Bounds follow the draft: W and zones never exceed N, and N stays between the
+    // required/zone minimum and the content-eligible candidates.
+    let min_commit = placement_count_input(
+        shared,
+        reader,
+        "Minimum write replicas W",
+        |(desired_limit, _, _)| (1.0, desired_limit as f64),
+        |draft| draft.min_commit_replicas as f64,
+        |files, value| {
+            files.set_placement_min_commit_replicas(value.round().max(1.0) as usize);
+        },
+    );
+    let desired = placement_count_input(
+        shared,
+        reader,
+        "Desired replicas N",
+        |(_, desired_minimum, candidate_limit)| {
             (
-                draft.consistency == PlacementEditorConsistency::Confirmed,
-                draft.desired_replicas.max(1),
-                1_usize
-                    .max(draft.required_node_ids.len())
-                    .max(draft.min_distinct_zones),
-            )
-        });
-    let min_commit = {
-        let value = shared.clone();
-        let changed = shared.clone();
-        NumberInput::new("Minimum write replicas W")
-            .range(1.0, desired_limit as f64)
-            .step(1.0)
-            .precision(0)
-            .value_when(move || {
-                value
-                    .files()
-                    .placement_draft
-                    .as_ref()
-                    .and_then(PlacementEditorDraft::active_policy)
-                    .map_or(1.0, |draft| draft.min_commit_replicas as f64)
-            })
-            .theme_when(clone_reader(reader))
-            .on_change(move |value| {
-                let waker = { changed.borrow().waker.clone() };
-                changed
-                    .files_mut()
-                    .set_placement_min_commit_replicas(value.round().max(1.0) as usize);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            })
-    };
-    let desired = {
-        let value = shared.clone();
-        let changed = shared.clone();
-        NumberInput::new("Desired replicas N")
-            .range(
                 desired_minimum as f64,
                 candidate_limit.max(desired_minimum) as f64,
             )
-            .step(1.0)
-            .precision(0)
-            .value_when(move || {
-                value
-                    .files()
-                    .placement_draft
-                    .as_ref()
-                    .and_then(PlacementEditorDraft::active_policy)
-                    .map_or(1.0, |draft| draft.desired_replicas as f64)
-            })
-            .theme_when(clone_reader(reader))
-            .on_change(move |value| {
-                let waker = { changed.borrow().waker.clone() };
-                changed.files_mut().set_placement_desired_replicas(
-                    value.round().max(desired_minimum as f64) as usize,
-                );
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            })
-    };
-    let zones = {
-        let value = shared.clone();
-        let changed = shared.clone();
-        NumberInput::new("Minimum distinct zones")
-            .range(0.0, desired_limit as f64)
-            .step(1.0)
-            .precision(0)
-            .value_when(move || {
-                value
-                    .files()
-                    .placement_draft
-                    .as_ref()
-                    .and_then(PlacementEditorDraft::active_policy)
-                    .map_or(0.0, |draft| draft.min_distinct_zones as f64)
-            })
-            .theme_when(clone_reader(reader))
-            .on_change(move |value| {
-                let waker = { changed.borrow().waker.clone() };
-                changed
-                    .files_mut()
-                    .set_placement_min_distinct_zones(value.round().max(0.0) as usize);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            })
-    };
-    let write_threshold = if confirmed {
+        },
+        |draft| draft.desired_replicas as f64,
+        |files, value| {
+            let (_, desired_minimum, _) = placement_count_bounds(files);
+            files
+                .set_placement_desired_replicas(value.round().max(desired_minimum as f64) as usize);
+        },
+    );
+    let zones = placement_count_input(
+        shared,
+        reader,
+        "Minimum distinct zones",
+        |(desired_limit, _, _)| (0.0, desired_limit as f64),
+        |draft| draft.min_distinct_zones as f64,
+        |files, value| {
+            files.set_placement_min_distinct_zones(value.round().max(0.0) as usize);
+        },
+    );
+    let confirmed_threshold = {
+        let label = shared.clone();
         Stack::vertical()
             .gap(4.0)
-            .with_child(Label::new("Write threshold (W)").theme(reader()))
+            .with_child(Label::new("Write threshold (W)").theme_when(clone_reader(reader)))
             .with_child(
                 SizedBox::new().width(152.0).child(
-                    StatusBadge::new(format!("W = {desired_limit}"))
+                    StatusBadge::new(format!("W = {}", placement_count_bounds(&shared.files()).0))
+                        .label_when(move || {
+                            format!("W = {}", placement_count_bounds(&label.files()).0)
+                        })
                         .tone(SemanticTone::Accent)
                         .theme_when(clone_reader(reader)),
                 ),
             )
-            .with_child(Label::new("Confirmed keeps W equal to N").theme(reader()))
-    } else {
-        Stack::vertical()
-            .gap(4.0)
-            .with_child(Label::new("Write threshold (W)").theme(reader()))
-            .with_child(SizedBox::new().width(152.0).child(min_commit))
-            .with_child(Label::new("Copies required before visibility").theme(reader()))
+            .with_child(Label::new("Confirmed keeps W equal to N").theme_when(clone_reader(reader)))
     };
+    let eventual_threshold = Stack::vertical()
+        .gap(4.0)
+        .with_child(Label::new("Write threshold (W)").theme_when(clone_reader(reader)))
+        .with_child(SizedBox::new().width(152.0).child(min_commit))
+        .with_child(
+            Label::new("Copies required before visibility").theme_when(clone_reader(reader)),
+        );
+    let confirmed = shared.clone();
+    let write_threshold = SwitchView::new()
+        .selected_when(move || {
+            usize::from(
+                confirmed
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .is_some_and(|draft| {
+                        draft.consistency == PlacementEditorConsistency::Confirmed
+                    }),
+            )
+        })
+        .with_child(eventual_threshold)
+        .with_child(confirmed_threshold);
     let counts = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(12.0)
@@ -20227,17 +20864,21 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_d
         .with_item(
             Stack::vertical()
                 .gap(4.0)
-                .with_child(Label::new("Desired copies (N)").theme(reader()))
+                .with_child(Label::new("Desired copies (N)").theme_when(clone_reader(reader)))
                 .with_child(SizedBox::new().width(152.0).child(desired))
-                .with_child(Label::new("Durable target after repair").theme(reader())),
+                .with_child(
+                    Label::new("Durable target after repair").theme_when(clone_reader(reader)),
+                ),
             FlexItem::fixed(230.0),
         )
         .with_item(
             Stack::vertical()
                 .gap(4.0)
-                .with_child(Label::new("Zone diversity").theme(reader()))
+                .with_child(Label::new("Zone diversity").theme_when(clone_reader(reader)))
                 .with_child(SizedBox::new().width(152.0).child(zones))
-                .with_child(Label::new("0 disables the zone constraint").theme(reader())),
+                .with_child(
+                    Label::new("0 disables the zone constraint").theme_when(clone_reader(reader)),
+                ),
             FlexItem::fixed(230.0),
         );
 
@@ -20376,58 +21017,340 @@ fn placement_preview_status(shared: &Shared, reader: &ThemeReader) -> StatusBadg
         .theme_when(clone_reader(reader))
 }
 
-fn files_placement_dialog(
+/// One row of the draft summary, read from the live draft.
+fn placement_draft_row(files: &FilesState, index: usize) -> Option<(&'static str, String)> {
+    files
+        .placement_draft
+        .as_ref()
+        .and_then(|draft| placement_draft_rows(draft).into_iter().nth(index))
+}
+
+/// The draft summary rows follow edits in place; a row hides when the draft has fewer rows.
+fn placement_draft_details(shared: &Shared, reader: &ThemeReader) -> Stack {
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).gap(4.0);
+    for index in 0..3 {
+        let (label, value) = placement_draft_row(&shared.files(), index).unwrap_or_default();
+        let label_shared = shared.clone();
+        let value_shared = shared.clone();
+        let shown = shared.clone();
+        body = body.with_child(
+            Presence::new(
+                DetailRow::new(label, value)
+                    .label_when(move || {
+                        placement_draft_row(&label_shared.files(), index)
+                            .map(|(label, _)| label.to_string())
+                            .unwrap_or_default()
+                    })
+                    .value_when(move || {
+                        placement_draft_row(&value_shared.files(), index)
+                            .map(|(_, value)| value)
+                            .unwrap_or_default()
+                    })
+                    .theme_when(clone_reader(reader))
+                    .max_value_lines(6),
+            )
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_when(move || placement_draft_row(&shown.files(), index).is_some())
+            .collapse(Axis::Vertical),
+        );
+    }
+    body
+}
+
+/// Preview-derived sections: stale-preview notice, policy warnings, the user summary, and in
+/// advanced mode the resolved policy, impact, and node table.
+fn placement_preview_sections(shared: &Shared, reader: &ThemeReader) -> Stack {
+    let mut content = Stack::vertical().alignment(Alignment::Stretch).gap(12.0);
+    let files = shared.files();
+    let Some(preview) = files.placement_preview.as_ref() else {
+        return content;
+    };
+    let advanced_open = files.placement_advanced_open;
+    let preview_is_current = files.placement_preview_is_current();
+    if !preview_is_current {
+        content = content.with_child(
+            StatusBadge::new(
+                "Previous preview — its warnings, impact totals, and desired node states are out of date. Preview changes to refresh them.",
+            )
+            .icon(IconGlyph::Alert)
+            .tone(SemanticTone::Warning)
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    if let Some(diagnostics) = placement_diagnostics_widget(preview, preview_is_current, reader) {
+        content = content.with_child(diagnostics);
+    }
+    let draft_has_actionable_change = files
+        .placement_draft
+        .as_ref()
+        .is_some_and(PlacementEditorDraft::has_actionable_change);
+    content = content.with_child(
+        PanelSection::new(
+            if preview_is_current {
+                "Preview"
+            } else {
+                "Previous preview"
+            },
+            detail_rows_widget(placement_user_preview_rows(preview), reader),
+        )
+        .theme_when(clone_reader(reader)),
+    );
+    if advanced_open {
+        content = content
+            .with_child(
+                PanelSection::new(
+                    if preview_is_current {
+                        "Resolved policy"
+                    } else {
+                        "Previous resolved policy"
+                    },
+                    detail_rows_widget(placement_preview_rows(preview), reader),
+                )
+                .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                PanelSection::new(
+                    if preview_is_current {
+                        if draft_has_actionable_change {
+                            "Before you apply"
+                        } else {
+                            "Current placement impact"
+                        }
+                    } else {
+                        "Previous impact estimate"
+                    },
+                    placement_impact_widget(preview, reader),
+                )
+                .theme_when(clone_reader(reader)),
+            );
+    }
+    if advanced_open && preview.supports_safe_apply() {
+        let subtree = files
+            .placement_draft
+            .as_ref()
+            .is_some_and(|draft| draft.scope == SifsPlacementScope::Subtree);
+        let preview = preview.clone();
+        drop(files);
+        content = content.with_child(
+            PanelSection::new(
+                if preview_is_current {
+                    "Selected path object's node placement"
+                } else {
+                    "Previous path-object node placement"
+                },
+                Stack::vertical()
+                    .alignment(Alignment::Stretch)
+                    .gap(6.0)
+                    .with_child(
+                        Label::new(if subtree {
+                            "This table is the selected folder object's plan. Descendants are evaluated individually during the subtree scan."
+                        } else {
+                            "This table is the selected object's current and desired plan."
+                        })
+                        .theme_when(clone_reader(reader)),
+                    )
+                    .with_child(
+                        ScrollView::horizontal(placement_node_table(shared, reader, &preview))
+                            .name("Placement node table")
+                            .theme_when(clone_gray_scrollbar_reader(reader)),
+                    ),
+            )
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    content
+}
+
+/// The accepted reconciliation job's notice and progress rows.
+fn placement_reconciliation_section(shared: &Shared, reader: &ThemeReader) -> Stack {
+    let mut content = Stack::vertical().alignment(Alignment::Stretch).gap(12.0);
+    let files = shared.files();
+    let Some(job) = files.placement_reconciliation.as_ref() else {
+        return content;
+    };
+    if !job.state.is_terminal() {
+        content = content.with_child(
+            StatusBadge::new(
+                "The accepted plan remains authoritative while this job runs. If a desired node stays unavailable, edit the policy and preview it; Apply replacement will atomically supersede this job.",
+            )
+            .icon(IconGlyph::Hourglass)
+            .tone(SemanticTone::Info)
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    content.with_child(
+        PanelSection::new(
+            "Reconciliation",
+            detail_rows_widget(placement_reconciliation_rows(job), reader),
+        )
+        .theme_when(clone_reader(reader)),
+    )
+}
+
+/// A badge that appears while the dialog carries `message` and follows its text in place.
+fn placement_message_badge(
+    shared: &Shared,
+    reader: &ThemeReader,
+    name: &'static str,
+    message: fn(&FilesDialogStructure) -> Option<String>,
+    tone: SemanticTone,
+) -> Presence {
+    let text = placement_dialog_field(shared, name, move |dialog| {
+        message(dialog).unwrap_or_default()
+    });
+    let shown = placement_dialog_field(shared, name, move |dialog| message(dialog).is_some());
+    Presence::new(
+        StatusBadge::new(text.get())
+            .label_from(text)
+            .tone(tone)
+            .theme_when(clone_reader(reader)),
+    )
+    .transition(crate::ui::widgets::reveal_transition())
+    .shown_from(shown)
+    .collapse(Axis::Vertical)
+}
+
+fn placement_advanced_label(open: bool) -> &'static str {
+    if open {
+        "Hide advanced settings"
+    } else {
+        "Advanced settings"
+    }
+}
+
+/// The availability editor. Its controls are built once per dialog and follow the draft through
+/// readers; sections whose existence depends on the preview, scope, or lock state are rebuilt
+/// only when that shape changes, never because a value was edited.
+fn files_placement_body(
     shared: &Shared,
     reader: &ThemeReader,
     prompt: &FileActionPrompt,
-) -> WidgetPod {
+    scroll: &ScrollState,
+) -> impl Widget + use<> {
     let target = prompt
         .target_path
         .as_deref()
         .unwrap_or("selected SIFS object");
-    let draft_rows = shared
-        .files()
-        .placement_draft
-        .as_ref()
-        .map(placement_draft_rows)
-        .unwrap_or_default();
-    let advanced_open = shared.files().placement_advanced_open;
     let advanced = {
-        let shared = shared.clone();
-        sui::Button::new(if advanced_open {
-            "Hide advanced settings"
-        } else {
-            "Advanced settings"
-        })
-        .icon(if advanced_open {
-            IconGlyph::ChevronUp
-        } else {
-            IconGlyph::ChevronDown
-        })
-        .appearance(ButtonAppearance::Ghost)
-        .tone(SemanticTone::Neutral)
-        .theme_when(clone_reader(reader))
-        .on_press_with_ctx(move |ctx| {
-            shared.files_mut().toggle_placement_advanced();
-            request_files_overlay_rebuild(ctx);
-        })
+        let label = shared.clone();
+        let toggle = shared.clone();
+        let open = shared.files().placement_advanced_open;
+        let button = sui::Button::new(placement_advanced_label(open))
+            .label_when(move || {
+                placement_advanced_label(label.files().placement_advanced_open).to_string()
+            })
+            .appearance(ButtonAppearance::Ghost)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                toggle.files_mut().toggle_placement_advanced();
+                request_files_overlay_rebuild(ctx);
+            });
+        Restyle::new(
+            button,
+            placement_dialog_field(shared, "placement advanced toggle", placement_advanced_open),
+            |button, open: &bool| {
+                button.icon(if *open {
+                    IconGlyph::ChevronUp
+                } else {
+                    IconGlyph::ChevronDown
+                })
+            },
+        )
     };
-    let mut content = Stack::vertical()
+    let goal = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(
+            placement_dialog_field(shared, "placement goal editable", |dialog| {
+                placement_shape(dialog).is_some_and(|shape| shape.goal_editable)
+            }),
+            move |_| WidgetPod::new(placement_goal_control(&s, &r)),
+        )
+    };
+    let policy = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let target_is_dir = prompt.target_is_dir;
+        RebuildOnChange::key_from(
+            placement_dialog_field(shared, "placement policy controls", |dialog| {
+                placement_shape(dialog).map(|shape| (shape.editor_locked, shape.unsupported_reason))
+            }),
+            move |_| WidgetPod::new(placement_policy_controls(&s, &r, target_is_dir)),
+        )
+    };
+    let advanced_sections = Presence::new(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .gap(12.0)
+            .with_child(PanelSection::new("Copy policy", policy).theme_when(clone_reader(reader)))
+            .with_child(
+                PanelSection::new("Policy details", placement_draft_details(shared, reader))
+                    .theme_when(clone_reader(reader)),
+            ),
+    )
+    .transition(crate::ui::widgets::reveal_transition())
+    .shown_from(placement_dialog_field(
+        shared,
+        "placement advanced sections",
+        placement_advanced_open,
+    ))
+    .collapse(Axis::Vertical);
+    let preview_sections = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(
+            placement_dialog_field(
+                shared,
+                "placement preview sections",
+                |dialog| match dialog {
+                    FilesDialogStructure::Action {
+                        placement_preview,
+                        placement_advanced_open,
+                        placement_shape,
+                        ..
+                    } => (
+                        placement_preview.clone(),
+                        *placement_advanced_open,
+                        placement_shape.as_ref().map(|shape| {
+                            (
+                                shape.preview_is_current,
+                                shape.constraints_locked,
+                                shape.subtree_scope,
+                                shape.draft_has_actionable_change,
+                            )
+                        }),
+                    ),
+                    _ => (None, false, None),
+                },
+            ),
+            move |_| WidgetPod::new(placement_preview_sections(&s, &r)),
+        )
+    };
+    let reconciliation = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(
+            placement_dialog_field(shared, "placement reconciliation", |dialog| match dialog {
+                FilesDialogStructure::Action {
+                    placement_reconciliation,
+                    ..
+                } => placement_reconciliation.clone(),
+                _ => None,
+            }),
+            move |_| WidgetPod::new(placement_reconciliation_section(&s, &r)),
+        )
+    };
+    let content = Stack::vertical()
         .alignment(Alignment::Stretch)
         .gap(12.0)
         .with_child(
             Label::new(format!(
                 "Choose how {target} stays available. Nothing changes until you preview the plan and apply it."
             ))
-            .theme(reader()),
-        )
-        .with_child(
-            PanelSection::new(
-                "Availability",
-                placement_goal_control(shared, reader),
-            )
             .theme_when(clone_reader(reader)),
         )
+        .with_child(PanelSection::new("Availability", goal).theme_when(clone_reader(reader)))
         .with_child(
             PanelSection::new(
                 "Apply to",
@@ -20436,156 +21359,32 @@ fn files_placement_dialog(
             .theme_when(clone_reader(reader)),
         )
         .with_child(advanced)
-        .with_child(placement_preview_status(shared, reader));
-
-    if advanced_open {
-        content = content
-            .with_child(
-                PanelSection::new(
-                    "Copy policy",
-                    placement_policy_controls(shared, reader, prompt.target_is_dir),
-                )
-                .theme_when(clone_reader(reader)),
-            )
-            .with_child(
-                PanelSection::new("Policy details", detail_rows_widget(draft_rows, reader))
-                    .theme_when(clone_reader(reader)),
-            );
-    }
-
-    if let Some(error) = prompt.error.as_ref() {
-        content = content.with_child(
-            StatusBadge::new(error.clone())
-                .tone(SemanticTone::Warning)
-                .theme_when(clone_reader(reader)),
-        );
-    }
-    {
-        let files = shared.files();
-        if let Some(preview) = files.placement_preview.as_ref() {
-            let preview_is_current = files.placement_preview_is_current();
-            if !preview_is_current {
-                content = content.with_child(
-                    StatusBadge::new(
-                        "Previous preview — its warnings, impact totals, and desired node states are out of date. Preview changes to refresh them.",
-                    )
-                    .icon(IconGlyph::Alert)
-                    .tone(SemanticTone::Warning)
-                    .theme_when(clone_reader(reader)),
-                );
-            }
-            if let Some(diagnostics) =
-                placement_diagnostics_widget(preview, preview_is_current, reader)
-            {
-                content = content.with_child(diagnostics);
-            }
-            let draft_has_actionable_change = files
-                .placement_draft
-                .as_ref()
-                .is_some_and(PlacementEditorDraft::has_actionable_change);
-            content = content.with_child(
-                PanelSection::new(
-                    if preview_is_current {
-                        "Preview"
-                    } else {
-                        "Previous preview"
-                    },
-                    detail_rows_widget(placement_user_preview_rows(preview), reader),
-                )
-                .theme_when(clone_reader(reader)),
-            );
-            if advanced_open {
-                content = content
-                    .with_child(
-                        PanelSection::new(
-                            if preview_is_current {
-                                "Resolved policy"
-                            } else {
-                                "Previous resolved policy"
-                            },
-                            detail_rows_widget(placement_preview_rows(preview), reader),
-                        )
-                        .theme_when(clone_reader(reader)),
-                    )
-                    .with_child(
-                        PanelSection::new(
-                            if preview_is_current {
-                                if draft_has_actionable_change {
-                                    "Before you apply"
-                                } else {
-                                    "Current placement impact"
-                                }
-                            } else {
-                                "Previous impact estimate"
-                            },
-                            placement_impact_widget(preview, reader),
-                        )
-                        .theme_when(clone_reader(reader)),
-                    );
-            }
-            if advanced_open && preview.supports_safe_apply() {
-                content = content.with_child(
-                    PanelSection::new(
-                        if preview_is_current {
-                            "Selected path object's node placement"
-                        } else {
-                            "Previous path-object node placement"
-                        },
-                        Stack::vertical()
-                            .alignment(Alignment::Stretch)
-                            .gap(6.0)
-                            .with_child(
-                                Label::new(if files
-                                    .placement_draft
-                                    .as_ref()
-                                    .is_some_and(|draft| {
-                                        draft.scope == SifsPlacementScope::Subtree
-                                    }) {
-                                    "This table is the selected folder object's plan. Descendants are evaluated individually during the subtree scan."
-                                } else {
-                                    "This table is the selected object's current and desired plan."
-                                })
-                                .theme(reader()),
-                            )
-                            .with_child(
-                                ScrollView::horizontal(placement_node_table(
-                                    shared, reader, preview,
-                                ))
-                                .name("Placement node table")
-                                .theme_when(clone_gray_scrollbar_reader(reader)),
-                            ),
-                    )
-                    .theme_when(clone_reader(reader)),
-                );
-            }
-        }
-        if let Some(job) = files.placement_reconciliation.as_ref() {
-            if !job.state.is_terminal() {
-                content = content.with_child(
-                    StatusBadge::new(
-                        "The accepted plan remains authoritative while this job runs. If a desired node stays unavailable, edit the policy and preview it; Apply replacement will atomically supersede this job.",
-                    )
-                    .icon(IconGlyph::Hourglass)
-                    .tone(SemanticTone::Info)
-                    .theme_when(clone_reader(reader)),
-                );
-            }
-            content = content.with_child(
-                PanelSection::new(
-                    "Reconciliation",
-                    detail_rows_widget(placement_reconciliation_rows(job), reader),
-                )
-                .theme_when(clone_reader(reader)),
-            );
-        }
-        if let Some(error) = files.placement_error.as_ref() {
-            content = content.with_child(
-                StatusBadge::new(error.clone())
-                    .tone(SemanticTone::Danger)
-                    .theme_when(clone_reader(reader)),
-            );
-        }
-    }
+        .with_child(placement_preview_status(shared, reader))
+        .with_child(advanced_sections)
+        .with_child(placement_message_badge(
+            shared,
+            reader,
+            "placement prompt error",
+            |dialog| match dialog {
+                FilesDialogStructure::Action { error, .. } => error.clone(),
+                _ => None,
+            },
+            SemanticTone::Warning,
+        ))
+        .with_child(preview_sections)
+        .with_child(reconciliation)
+        .with_child(placement_message_badge(
+            shared,
+            reader,
+            "placement error",
+            |dialog| match dialog {
+                FilesDialogStructure::Action {
+                    placement_error, ..
+                } => placement_error.clone(),
+                _ => None,
+            },
+            SemanticTone::Danger,
+        ));
 
     let preview = {
         let enabled = shared.clone();
@@ -20611,20 +21410,23 @@ fn files_placement_dialog(
             })
     };
     let apply = {
-        let label = if shared.files().placement_reconciliation_in_flight()
-            && shared
-                .files()
-                .placement_draft
-                .as_ref()
-                .is_some_and(PlacementEditorDraft::has_actionable_change)
-        {
-            "Apply replacement"
-        } else {
-            "Apply availability"
+        let apply_label = |files: &FilesState| {
+            if files.placement_reconciliation_in_flight()
+                && files
+                    .placement_draft
+                    .as_ref()
+                    .is_some_and(PlacementEditorDraft::has_actionable_change)
+            {
+                "Apply replacement"
+            } else {
+                "Apply availability"
+            }
         };
+        let label = shared.clone();
         let enabled = shared.clone();
         let apply = shared.clone();
-        sui::Button::new(label)
+        sui::Button::new(apply_label(&shared.files()))
+            .label_when(move || apply_label(&label.files()).to_string())
             .min_width(132.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.files().placement_apply_allowed())
@@ -20635,14 +21437,19 @@ fn files_placement_dialog(
             })
     };
     let cancel = {
-        let label = if shared.files().placement_reconciliation.is_some() {
-            "Close"
-        } else {
-            "Cancel"
+        let cancel_label = |files: &FilesState| {
+            if files.placement_reconciliation.is_some() {
+                "Close"
+            } else {
+                "Cancel"
+            }
         };
+        let initial = cancel_label(&shared.files());
+        let label = shared.clone();
         let enabled = shared.clone();
         let shared = shared.clone();
-        sui::Button::new(label)
+        sui::Button::new(initial)
+            .label_when(move || cancel_label(&label.files()).to_string())
             .min_width(112.0)
             .appearance(ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
@@ -20675,19 +21482,34 @@ fn files_placement_dialog(
                     },
                     content,
                 ))
+                .state(scroll.clone())
                 .name("Placement editor")
                 .theme_when(clone_gray_scrollbar_reader(reader))
                 .viewport_width_hint(true),
             ),
         )
         .with_child(actions);
+    // Every edit re-reads the retained controls; nothing here is remounted by it.
+    RefreshOn::new(
+        placement_dialog_field(shared, "placement editor state", |dialog| dialog.clone()),
+        body,
+    )
+}
+
+fn files_placement_dialog(
+    shared: &Shared,
+    reader: &ThemeReader,
+    prompt: &FileActionPrompt,
+) -> WidgetPod {
+    let scroll = ScrollState::new();
+    let body = files_placement_body(shared, reader, prompt, &scroll);
     let dismiss = {
         let shared = shared.clone();
         move || shared.files_mut().close_action_prompt()
     };
     WidgetPod::new(
         sui::Dialog::new("Manage availability", body)
-            .theme(shared.theme())
+            .theme_when(clone_reader(reader))
             .description("Choose where copies stay available, preview the plan, and apply it")
             .max_width(1040.0)
             .dismiss_on_scrim(true)
@@ -20695,6 +21517,9 @@ fn files_placement_dialog(
     )
 }
 
+/// A prompt dialog for one file action. The shell and its controls are built once per prompt;
+/// the input keeps its edit buffer while the user types and is rebuilt only when the app
+/// replaces its value (a picked destination).
 fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let prompt = shared.files().action_prompt.clone()?;
     if prompt.kind == FileActionPromptKind::Placement {
@@ -20791,7 +21616,6 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected
     ))
     .then(|| {
-        let s = shared.clone();
         let placeholder = match prompt.kind {
             FileActionPromptKind::GoTo => go_to_path_placeholder(source),
             FileActionPromptKind::CopyToSifs => "/services/artifact",
@@ -20810,14 +21634,35 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             }
             _ => input_label,
         };
-        sui::TextInput::new(format!("files-action-input-{title}"))
-            .value(prompt.input.clone())
-            .placeholder(placeholder)
-            .min_width(320.0)
-            .theme_when(clone_reader(reader))
-            .on_change(move |value| {
-                s.files_mut().set_action_prompt_input(value);
-            })
+        let revision =
+            placement_dialog_field(shared, "action prompt input", |dialog| match dialog {
+                FilesDialogStructure::Action {
+                    action_prompt_revision,
+                    ..
+                } => *action_prompt_revision,
+                _ => 0,
+            });
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(revision, move |_| {
+            let value = s
+                .files()
+                .action_prompt
+                .as_ref()
+                .map(|prompt| prompt.input.clone())
+                .unwrap_or_default();
+            let changed = s.clone();
+            WidgetPod::new(
+                sui::TextInput::new(format!("files-action-input-{title}"))
+                    .value(value)
+                    .placeholder(placeholder)
+                    .min_width(320.0)
+                    .theme_when(clone_reader(&r))
+                    .on_change(move |value| {
+                        changed.files_mut().set_action_prompt_input(value);
+                    }),
+            )
+        })
     });
     let primary_label = prompt.kind.primary_label();
     let submit = {
@@ -20845,31 +21690,17 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 request_files_overlay_rebuild(ctx);
             })
     };
-    let mut actions = Flex::horizontal()
+    let actions = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(8.0)
-        .align_items(Alignment::End);
-    if prompt.kind == FileActionPromptKind::Placement {
-        let preview_shared = shared.clone();
-        actions = actions.with_child(
-            sui::Button::new("Preview")
-                .appearance(ButtonAppearance::Outline)
-                .tone(SemanticTone::Accent)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    let waker = { preview_shared.borrow().waker.clone() };
-                    preview_shared.files_mut().start_placement_preview(waker);
-                    request_files_overlay_rebuild(ctx);
-                }),
-        );
-    }
-    actions = actions.with_child(submit).with_child(cancel);
+        .align_items(Alignment::End)
+        .with_child(submit)
+        .with_child(cancel);
 
-    let dialog_theme = shared.theme();
     let mut body = Stack::vertical()
         .gap(10.0)
         .alignment(Alignment::Stretch)
-        .with_child(sui::Label::new(description).theme(dialog_theme));
+        .with_child(sui::Label::new(description).theme_when(clone_reader(reader)));
     if let Some(chooser) = destination_chooser_controls(shared, reader, prompt.kind, source) {
         body = body.with_child(
             Surface::panel(chooser)
@@ -20882,36 +21713,25 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     if let Some(input) = input {
         body = body.with_child(input);
     }
-    if let Some(error) = prompt.error {
-        body = body.with_child(sui::Label::new(error).theme(dialog_theme));
-    }
-    if prompt.kind == FileActionPromptKind::Placement {
-        let files = shared.files();
-        if files.placement_loading {
-            body = body.with_child(
-                StatusBadge::new("Checking placement")
-                    .tone(SemanticTone::Info)
+    let error_text = placement_dialog_field(shared, "action prompt error", |dialog| match dialog {
+        FilesDialogStructure::Action { error, .. } => error.clone().unwrap_or_default(),
+        _ => String::new(),
+    });
+    let error_shown = placement_dialog_field(shared, "action prompt error shown", |dialog| {
+        matches!(dialog, FilesDialogStructure::Action { error: Some(_), .. })
+    });
+    body = body
+        .with_child(
+            Presence::new(
+                sui::Label::new(error_text.get())
+                    .text_from(error_text)
                     .theme_when(clone_reader(reader)),
-            );
-        }
-        if let Some(preview) = files.placement_preview.as_ref() {
-            body = body.with_child(detail_rows_widget(placement_preview_rows(preview), reader));
-        }
-        if let Some(job) = files.placement_reconciliation.as_ref() {
-            body = body.with_child(detail_rows_widget(
-                placement_reconciliation_rows(job),
-                reader,
-            ));
-        }
-        if let Some(error) = files.placement_error.as_ref() {
-            body = body.with_child(
-                StatusBadge::new(error.clone())
-                    .tone(SemanticTone::Warning)
-                    .theme_when(clone_reader(reader)),
-            );
-        }
-    }
-    body = body.with_child(actions);
+            )
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_from(error_shown)
+            .collapse(Axis::Vertical),
+        )
+        .with_child(actions);
 
     let dismiss = {
         let s = shared.clone();
@@ -20922,9 +21742,8 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
 
     Some(WidgetPod::new(
         sui::Dialog::new(title, body)
-            .theme(dialog_theme)
+            .theme_when(clone_reader(reader))
             .description(input_label)
-            .max_width(460.0)
             .dismiss_on_scrim(true)
             .on_dismiss(dismiss),
     ))
@@ -21030,25 +21849,56 @@ fn document_detail_text(shared: &Shared) -> String {
     }
 }
 
+fn document_view_index(files: &FilesState) -> usize {
+    match files.document.as_ref() {
+        Some(document) if document.loading => 0,
+        Some(document) if document.load_error.is_some() => 1,
+        _ => 2,
+    }
+}
+
+/// The open document's panel. It is mounted once per document; the editor owns its buffer,
+/// caret, and selection and is rebuilt only when a load replaces the text.
 fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let document = shared.files().document.clone()?;
-    let theme = reader();
-    let mut text_style = theme.mono_text_style(theme.palette.text);
-    text_style.font_size = theme.text.sm.size;
-    text_style.line_height = theme.text.sm.line_height;
-    let editor_shared = shared.clone();
-    let mut editor = TextSurface::new(format!("files-document:{}", document.path))
-        .theme(theme)
-        .text_style(text_style)
-        .padding(Insets::all(12.0))
-        .min_width(0.0)
-        .min_height(420.0)
-        .wrap(TextWrap::NoWrap)
-        .value(document.text.clone())
-        .on_change(move |value| editor_shared.files_mut().set_document_text(value));
-    if !document.editable() {
-        editor = editor.read_only(true);
-    }
+    let revision = |name: &'static str| {
+        shared
+            .signals()
+            .files_structure
+            .select_named(name, |key| key.dialog.revision())
+    };
+    let editor = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(revision("document editor load"), move |_| {
+            let Some(document) = s.files().document.clone() else {
+                return WidgetPod::new(SizedBox::new());
+            };
+            let editor_shared = s.clone();
+            let mut editor = TextSurface::new(format!("files-document:{}", document.path))
+                .theme_when(clone_reader(&r))
+                .text_style_when(|theme| {
+                    let mut style = theme.mono_text_style(theme.palette.text);
+                    style.font_size = theme.text.sm.size;
+                    style.line_height = theme.text.sm.line_height;
+                    style
+                })
+                .padding(Insets::all(12.0))
+                .min_width(0.0)
+                .min_height(420.0)
+                .wrap(TextWrap::NoWrap)
+                .value(document.text.clone())
+                .on_change(move |value| editor_shared.files_mut().set_document_text(value));
+            if !document.editable() {
+                editor = editor.read_only(true);
+            }
+            WidgetPod::new(
+                Surface::field(editor)
+                    .theme_when(clone_reader(&r))
+                    .fill_width(true),
+            )
+        })
+    };
     let status_shared = shared.clone();
     let detail_shared = shared.clone();
     let status = Surface::panel(
@@ -21058,12 +21908,16 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             .with_child(
                 Label::new("Document")
                     .text_when(move || document_status_text(&status_shared))
-                    .text_style(theme.text_style(theme.palette.text)),
+                    .text_style_when(live_text_style(reader, |theme| {
+                        theme.text_style(theme.palette.text)
+                    })),
             )
             .with_child(
                 Label::new("Document path")
                     .text_when(move || document_detail_text(&detail_shared))
-                    .text_style(theme.text_style(theme.palette.text_muted)),
+                    .text_style_when(live_text_style(reader, |theme| {
+                        theme.text_style(theme.palette.text_muted)
+                    })),
             ),
     )
     .theme_when(clone_reader(reader))
@@ -21074,42 +21928,43 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         bottom: 8.0,
     })
     .fill_width(true);
-    let editor_body = Dock::new(
-        Surface::field(editor)
-            .theme_when(clone_reader(reader))
-            .fill_width(true),
-    )
-    .bottom(
-        74.0,
-        ScrollView::vertical(status)
-            .name("Document status")
-            .viewport_width_hint(true),
-    )
-    .fallback_width(780.0)
-    .fallback_body_height(520.0);
-    let body = SwitchView::new()
-        .selected(if document.loading {
-            0
-        } else if document.load_error.is_some() {
-            1
-        } else {
-            2
+    let editor_body = Dock::new(editor)
+        .bottom(
+            74.0,
+            ScrollView::vertical(status)
+                .name("Document status")
+                .viewport_width_hint(true),
+        )
+        .fallback_width(780.0)
+        .fallback_body_height(520.0);
+    let load_error = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(revision("document load error"), move |_| {
+            let error = s
+                .files()
+                .document
+                .as_ref()
+                .and_then(|document| document.load_error.clone())
+                .unwrap_or_else(|| "The document could not be opened".to_string());
+            WidgetPod::new(centered_note(
+                &r,
+                IconGlyph::Alert,
+                "Document unavailable",
+                error,
+            ))
         })
+    };
+    let view_shared = shared.clone();
+    let body = SwitchView::new()
+        .selected_when(move || document_view_index(&view_shared.files()))
         .with_child(centered_note(
             reader,
             IconGlyph::Hourglass,
             "Opening document",
             "Reading the complete selected version on the Files background worker",
         ))
-        .with_child(centered_note(
-            reader,
-            IconGlyph::Alert,
-            "Document unavailable",
-            document
-                .load_error
-                .clone()
-                .unwrap_or_else(|| "The document could not be opened".to_string()),
-        ))
+        .with_child(load_error)
         .with_child(editor_body);
 
     let close_shared = shared.clone();
@@ -21147,58 +22002,72 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         attach_shared.files_mut().start_attach_document(waker);
         request_files_overlay_rebuild(ctx);
     });
-    let mut actions = Flex::horizontal().gap(8.0).with_child(attach);
-    if document.load_error.is_some() {
-        let retry_shared = shared.clone();
-        actions = actions.with_child(
-            sui::Button::new("Retry")
-                .appearance(ButtonAppearance::Tonal)
-                .tone(SemanticTone::Accent)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    let waker = { retry_shared.borrow().waker.clone() };
-                    retry_shared.files_mut().retry_document(waker);
-                    request_files_overlay_rebuild(ctx);
-                }),
-        );
-    } else if !document.loading {
-        let save_shared = shared.clone();
-        let save_enabled = shared.clone();
-        actions = actions.with_child(
-            sui::Button::new("Save")
-                .icon(IconGlyph::Check)
-                .appearance(ButtonAppearance::Filled)
-                .tone(SemanticTone::Accent)
-                .theme_when(clone_reader(reader))
-                .enabled_when(move || {
-                    save_enabled
-                        .files()
-                        .document
-                        .as_ref()
-                        .is_some_and(|document| {
-                            document.editable() && document.dirty() && !document.saving
-                        })
-                })
-                .on_press_with_ctx(move |ctx| {
-                    let waker = { save_shared.borrow().waker.clone() };
-                    save_shared.files_mut().save_document(waker);
-                    request_files_overlay_rebuild(ctx);
-                }),
-        );
-    }
-    if shared.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document) {
-        let header = TrailingSlotRow::new(Label::new(document.title).theme(theme), actions)
-            .trailing_width(200.0)
-            .trailing_height(36.0)
-            .gap(8.0);
-        return Some(WidgetPod::new(
+    let retry_shared = shared.clone();
+    let retry = sui::Button::new("Retry")
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            let waker = { retry_shared.borrow().waker.clone() };
+            retry_shared.files_mut().retry_document(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let save_shared = shared.clone();
+    let save_enabled = shared.clone();
+    let save = sui::Button::new("Save")
+        .icon(IconGlyph::Check)
+        .appearance(ButtonAppearance::Filled)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || {
+            save_enabled
+                .files()
+                .document
+                .as_ref()
+                .is_some_and(|document| document.editable() && document.dirty() && !document.saving)
+        })
+        .on_press_with_ctx(move |ctx| {
+            let waker = { save_shared.borrow().waker.clone() };
+            save_shared.files_mut().save_document(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    // Retry replaces Save while the load failed; neither shows while the document is opening.
+    let action_shared = shared.clone();
+    let document_action = SwitchView::new()
+        .selected_when(move || match document_view_index(&action_shared.files()) {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        })
+        .with_child(SizedBox::new())
+        .with_child(retry)
+        .with_child(save);
+    let actions = Flex::horizontal()
+        .gap(8.0)
+        .with_child(attach)
+        .with_child(document_action);
+    let document_state = shared
+        .signals()
+        .files_structure
+        .select_named("document state", |key| key.dialog.clone());
+    if in_tab {
+        let header = TrailingSlotRow::new(
+            Label::new(document.title).theme_when(clone_reader(reader)),
+            actions,
+        )
+        .trailing_width(200.0)
+        .trailing_height(36.0)
+        .gap(8.0);
+        return Some(WidgetPod::new(RefreshOn::new(
+            document_state,
             Surface::panel(Dock::new(body).top(52.0, WidgetPadding::all(8.0, header)))
                 .theme_when(clone_reader(reader))
                 .fill(),
-        ));
+        )));
     }
     let dismiss_shared = shared.clone();
-    Some(WidgetPod::new(
+    Some(WidgetPod::new(RefreshOn::new(
+        document_state,
         SideSheet::new(document.title.clone(), body)
             .theme_when(clone_reader(reader))
             .description(format!(
@@ -21212,7 +22081,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             .dismiss_on_scrim(true)
             .action(actions.with_child(close))
             .on_dismiss(move || dismiss_shared.files_mut().request_close_document()),
-    ))
+    )))
 }
 
 fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -21261,15 +22130,14 @@ fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<
             Label::new(format!(
                 "{title} has unsaved changes. Discarding closes the current snapshot without writing it."
             ))
-            .theme(reader()),
+            .theme_when(clone_reader(reader)),
         )
         .with_child(actions);
     let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
         sui::Dialog::new("Unsaved changes", body)
-            .theme(reader())
+            .theme_when(clone_reader(reader))
             .description("Choose whether to keep editing or discard the document changes")
-            .max_width(480.0)
             .dismiss_on_scrim(false)
             .on_dismiss(move || dismiss_shared.files_mut().cancel_document_close()),
     ))
@@ -21362,10 +22230,16 @@ fn placement_activity_row(
     reader: &ThemeReader,
     activity: &sinomo_runtime::dfs::DfsPlacementReconciliationActivitySummary,
 ) -> WidgetPod {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let title_style = pal.text_style(&theme, 14.0, FontWeight::SEMIBOLD, pal.text);
-    let detail_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted);
+    let detail_style = || {
+        live_text_style(reader, |theme| {
+            crate::theme::token_text_style(
+                theme,
+                theme.text.xs,
+                FontWeight::NORMAL,
+                theme.surfaces.text_muted,
+            )
+        })
+    };
     let status = StatusBadge::new(placement_activity_status_label(activity.status))
         .tone(placement_activity_status_tone(activity.status))
         .theme_when(clone_reader(reader));
@@ -21414,7 +22288,19 @@ fn placement_activity_row(
                     .with_child(status)
                     .with_child(phase),
             )
-            .with_child(Label::new(activity.path.clone()).text_style(title_style)),
+            .with_child(
+                Label::new(activity.path.clone()).text_style_when(live_text_style(
+                    reader,
+                    |theme| {
+                        crate::theme::token_text_style(
+                            theme,
+                            theme.text.sm,
+                            FontWeight::SEMIBOLD,
+                            theme.surfaces.text,
+                        )
+                    },
+                )),
+            ),
         reveal,
     )
     .trailing_width(108.0)
@@ -21432,7 +22318,7 @@ fn placement_activity_row(
                 activity.matched_object_count,
                 activity.updated_object_count,
             ))
-            .text_style(detail_style.clone()),
+            .text_style_when(detail_style()),
         )
         .with_child(
             SizedBox::new().height(5.0).child(
@@ -21450,7 +22336,7 @@ fn placement_activity_row(
                 activity.completed_repair_count,
                 activity.pending_repair_count,
             ))
-            .text_style(detail_style.clone()),
+            .text_style_when(detail_style()),
         );
     if let Some(error) = activity.last_error.as_deref() {
         let superseded = activity.status
@@ -21483,7 +22369,7 @@ fn placement_activity_row(
                         .tone(tone)
                         .theme_when(clone_reader(reader)),
                     )
-                    .with_child(Label::new(error.to_string()).text_style(detail_style.clone())),
+                    .with_child(Label::new(error.to_string()).text_style_when(detail_style())),
             )
             .appearance(sui::SurfaceAppearance::Soft)
             .padding(Insets::all(9.0))
@@ -21501,7 +22387,7 @@ fn placement_activity_row(
             placement_activity_relative_time(activity.updated_at_unix_nanos),
             middle_short(&activity.job_id, 28),
         ))
-        .text_style(detail_style)
+        .text_style_when(detail_style())
     });
     WidgetPod::new(
         Surface::panel(content)
@@ -21645,7 +22531,7 @@ fn placement_activity_error_notice(shared: &Shared, reader: &ThemeReader) -> imp
                                 .clone()
                                 .unwrap_or_default()
                         })
-                        .theme(reader()),
+                        .theme_when(clone_reader(reader)),
                 ),
         )
         .appearance(sui::SurfaceAppearance::Soft)
@@ -21695,7 +22581,7 @@ fn placement_activity_stream_notice(shared: &Shared, reader: &ThemeReader) -> im
                                 "{error} Snapshot polling remains active while this center is open."
                             )
                         })
-                        .theme(reader()),
+                        .theme_when(clone_reader(reader)),
                 ),
         )
         .appearance(sui::SurfaceAppearance::Soft)
@@ -21736,7 +22622,7 @@ fn placement_activity_completeness_notice(
                 )
                 .with_child(
                     Label::new("Active jobs are queried separately. Terminal activity written by older daemon versions may be omitted from retained operational history.")
-                        .theme(reader()),
+                        .theme_when(clone_reader(reader)),
                 ),
         )
         .appearance(sui::SurfaceAppearance::Soft)
@@ -21762,7 +22648,7 @@ fn placement_activity_completeness_notice(
                 )
                 .with_child(
                     Label::new("Older terminal jobs have fallen outside retained activity history. Active jobs are still queried separately, but terminal history can have gaps.")
-                        .theme(reader()),
+                        .theme_when(clone_reader(reader)),
                 ),
         )
         .appearance(sui::SurfaceAppearance::Soft)
@@ -21827,16 +22713,19 @@ fn apply_placement_activity_filter(shared: &Shared, filter: PlacementActivityFil
 fn placement_activity_filter_radio(
     shared: &Shared,
     reader: &ThemeReader,
-    selected: PlacementActivityFilter,
     filter: PlacementActivityFilter,
     label: &'static str,
 ) -> RadioButton {
     let changed = shared.clone();
-    let current = shared.clone();
+    let checked = shared
+        .signals()
+        .files_structure
+        .select_named("placement reconciliation activity filter", move |key| {
+            key.placement_activity.filter == filter
+        });
     RadioButton::new(label)
         .framed()
-        .checked(selected == filter)
-        .checked_when(move || current.files().placement_activity_filter == filter)
+        .checked_from(checked)
         .theme_when(clone_reader(reader))
         .on_change(move |checked| {
             if checked {
@@ -21845,56 +22734,41 @@ fn placement_activity_filter_radio(
         })
 }
 
+/// The filter radios stay mounted; each follows the model's filter.
 fn placement_activity_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .files_structure
-        .select_named("placement reconciliation activity filter", |key| {
-            key.placement_activity.filter
-        });
-    let filter_shared = shared.clone();
-    let filter_reader = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |selected| {
-        WidgetPod::new(
-            SemanticRegion::new(
-                "Reconciliation activity filter",
-                Flex::horizontal()
-                    .wrap(FlexWrap::Wrap)
-                    .gap(6.0)
-                    .align_items(Alignment::Center)
-                    .with_child(placement_activity_filter_radio(
-                        &filter_shared,
-                        &filter_reader,
-                        *selected,
-                        PlacementActivityFilter::All,
-                        "All",
-                    ))
-                    .with_child(placement_activity_filter_radio(
-                        &filter_shared,
-                        &filter_reader,
-                        *selected,
-                        PlacementActivityFilter::Active,
-                        "Active",
-                    ))
-                    .with_child(placement_activity_filter_radio(
-                        &filter_shared,
-                        &filter_reader,
-                        *selected,
-                        PlacementActivityFilter::Failed,
-                        "Failed",
-                    ))
-                    .with_child(placement_activity_filter_radio(
-                        &filter_shared,
-                        &filter_reader,
-                        *selected,
-                        PlacementActivityFilter::Completed,
-                        "Done",
-                    )),
-            )
-            .role(SemanticsRole::RadioGroup)
-            .description("Filter reconciliation jobs by durable status"),
-        )
-    })
+    SemanticRegion::new(
+        "Reconciliation activity filter",
+        Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(6.0)
+            .align_items(Alignment::Center)
+            .with_child(placement_activity_filter_radio(
+                shared,
+                reader,
+                PlacementActivityFilter::All,
+                "All",
+            ))
+            .with_child(placement_activity_filter_radio(
+                shared,
+                reader,
+                PlacementActivityFilter::Active,
+                "Active",
+            ))
+            .with_child(placement_activity_filter_radio(
+                shared,
+                reader,
+                PlacementActivityFilter::Failed,
+                "Failed",
+            ))
+            .with_child(placement_activity_filter_radio(
+                shared,
+                reader,
+                PlacementActivityFilter::Completed,
+                "Done",
+            )),
+    )
+    .role(SemanticsRole::RadioGroup)
+    .description("Filter reconciliation jobs by durable status")
 }
 
 fn scroll_placement_activity_summary(
@@ -22023,7 +22897,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
                     })
                     .unwrap_or_else(|| "Waiting for the first cluster snapshot".to_string())
             })
-            .theme(reader())
+            .theme_when(clone_reader(reader))
     };
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
@@ -22113,7 +22987,6 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
         let enabled = summary_scroll_state.clone();
         let action = summary_scroll_state.clone();
         IconButton::new(IconGlyph::ChevronUp, "Previous activity summary")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.current_offset().y > 0.5)
             .on_press_with_ctx(move |ctx| {
@@ -22124,7 +22997,6 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
         let enabled = summary_scroll_state.clone();
         let action = summary_scroll_state.clone();
         IconButton::new(IconGlyph::ChevronDown, "Next activity summary")
-            .size(30.0)
             .theme_when(clone_reader(reader))
             .enabled_when(move || enabled.current_offset().y + 0.5 < enabled.max_offset().y)
             .on_press_with_ctx(move |ctx| {
@@ -22210,8 +23082,79 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     )
 }
 
-fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> Surface {
-    let rows = vec![
+fn repair_evidence_rows(
+    repair: &DfsOperatorRepairView,
+    attempts: &[sinomo_runtime::dfs::DfsRepairAttemptRecord],
+) -> Vec<(&'static str, String)> {
+    let mut matching: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.intent_id == repair.intent_id
+                && attempt.object_id == repair.object_id
+                && attempt.version == repair.version
+                && attempt.missing_replica_node_id == repair.missing_replica_node_id
+                && repair
+                    .content_hash
+                    .as_ref()
+                    .is_none_or(|hash| hash == &attempt.content_hash)
+        })
+        .collect();
+    matching.sort_by_key(|attempt| attempt.last_attempt_unix_nanos);
+    if matching.is_empty() {
+        return vec![(
+            "Attempt evidence",
+            "Unavailable in this status snapshot; this does not mean no attempt was made.".into(),
+        )];
+    }
+    let mut rows = Vec::new();
+    for attempt in matching {
+        rows.push(("Attempts recorded", attempt.attempts.to_string()));
+        rows.push((
+            "Last attempt",
+            if attempt.last_attempt_unix_nanos == 0 {
+                "Time unavailable".into()
+            } else {
+                unix_nanos_label(attempt.last_attempt_unix_nanos)
+            },
+        ));
+        rows.push((
+            "Outcome",
+            if attempt.in_flight {
+                "Transfer in flight; completion not yet established".into()
+            } else if attempt.last_error.is_some() {
+                "Attempt blocked or failed; obligation remains open".into()
+            } else if attempt.completed_transfer_request_id.is_some() {
+                "Terminal transfer reply recorded; obligation still listed as missing".into()
+            } else {
+                "No terminal outcome recorded".into()
+            },
+        ));
+        if let Some(reason) = &attempt.last_error {
+            rows.push(("Last blocking reason", reason.clone()));
+        }
+        if let Some(delivery) = &attempt.transfer_delivery_state {
+            rows.push(("Delivery evidence", format!("{delivery:?}")));
+        }
+        if attempt.next_retry_unix_nanos != 0 {
+            rows.push((
+                "Recorded retry time",
+                unix_nanos_label(attempt.next_retry_unix_nanos),
+            ));
+        }
+        if let Some(request) = &attempt.transfer_request_id {
+            rows.push(("Transfer request", request.clone()));
+        }
+    }
+    rows.push(("Timeline coverage", "Latest attempt and scheduled retry only; earlier attempt outcomes are not retained in this snapshot.".into()));
+    rows
+}
+
+fn storage_repair_row(
+    reader: &ThemeReader,
+    repair: &DfsOperatorRepairView,
+    attempts: &[sinomo_runtime::dfs::DfsRepairAttemptRecord],
+) -> Surface {
+    let mut rows = vec![
         (
             "Missing from",
             short_node_label(repair.missing_replica_node_id.as_str()),
@@ -22219,6 +23162,7 @@ fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> S
         ("Version", middle_short(repair.version.as_str(), 24)),
         ("Object", middle_short(repair.object_id.as_str(), 24)),
     ];
+    rows.extend(repair_evidence_rows(repair, attempts));
     Surface::panel(detail_rows_widget(rows, reader))
         .appearance(sui::SurfaceAppearance::Soft)
         .tone(SemanticTone::Warning)
@@ -22227,10 +23171,74 @@ fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> S
         .fill_width(true)
 }
 
-fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+/// The storage health sheet is mounted once while open. Its body is rebuilt for each load
+/// revision and keeps its scroll position in the host-owned `scroll_state`.
+fn files_storage_center_sheet(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> Option<WidgetPod> {
     if !shared.files().storage_center_open {
         return None;
     }
+    let revision = || {
+        shared
+            .signals()
+            .files_structure
+            .select_named("storage center revision", |key| key.dialog.revision())
+    };
+    let body = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let scroll_state = scroll_state.clone();
+        RebuildOnChange::key_from(revision(), move |_| {
+            WidgetPod::new(files_storage_center_body(&s, &r, &scroll_state))
+        })
+    };
+
+    let refresh_shared = shared.clone();
+    let refresh_enabled = shared.clone();
+    let refresh = sui::Button::new("Refresh")
+        .icon(IconGlyph::Redo)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || !refresh_enabled.files().storage_center_loading)
+        .on_press_with_ctx(move |ctx| {
+            let waker = { refresh_shared.borrow().waker.clone() };
+            refresh_shared.files_mut().request_storage_overview(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let close_shared = shared.clone();
+    let close = sui::Button::new("Close")
+        .appearance(ButtonAppearance::Outline)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.files_mut().close_storage_center();
+            request_files_overlay_rebuild(ctx);
+        });
+    let dismiss = shared.clone();
+    Some(WidgetPod::new(RefreshOn::new(
+        revision(),
+        SideSheet::new("Storage health", body)
+            .theme_when(clone_reader(reader))
+            .description("DFS objects, pending work, and missing copies")
+            .placement(SideSheetPlacement::Right)
+            .width(780.0)
+            .modal(true)
+            .dismiss_on_scrim(true)
+            .action(refresh)
+            .action(close)
+            .on_dismiss(move || dismiss.files_mut().close_storage_center()),
+    )))
+}
+
+fn files_storage_center_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> SwitchView {
     let files = shared.files();
     let loading = files.storage_center_loading;
     let error = files.storage_center_error.clone();
@@ -22278,7 +23286,6 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
                 )),
             reader,
             None,
-            false,
         ));
         for reason in status.blocking_incomplete_reasons() {
             content = content.with_child(
@@ -22291,11 +23298,14 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
 
         let mut repair_rows = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
         for repair in overview.repairs.iter().take(20) {
-            repair_rows = repair_rows.with_child(storage_repair_row(reader, repair));
+            repair_rows =
+                repair_rows.with_child(storage_repair_row(reader, repair, &status.repair_attempts));
         }
         if overview.repairs.is_empty() {
-            repair_rows = repair_rows
-                .with_child(Label::new("No missing-copy records were returned.").theme(reader()));
+            repair_rows = repair_rows.with_child(
+                Label::new("No missing-copy records were returned.")
+                    .theme_when(clone_reader(reader)),
+            );
         } else if overview.repairs.len() > 20 || overview.repairs_have_more {
             repair_rows = repair_rows.with_child(
                 StatusBadge::new(
@@ -22386,6 +23396,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
         )
         .fill_child_width(true),
     )
+    .state(scroll_state.clone())
     .name("Storage health overview")
     .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true);
@@ -22396,7 +23407,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
     } else {
         1
     };
-    let body = SwitchView::new()
+    SwitchView::new()
         .selected(selected)
         .with_child(centered_note(
             reader,
@@ -22410,51 +23421,11 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
             "Storage health unavailable",
             error.unwrap_or_else(|| "The daemon did not return storage health.".to_string()),
         ))
-        .with_child(loaded);
-
-    let refresh_shared = shared.clone();
-    let refresh_enabled = shared.clone();
-    let refresh = sui::Button::new("Refresh")
-        .icon(IconGlyph::Redo)
-        .appearance(ButtonAppearance::Tonal)
-        .tone(SemanticTone::Accent)
-        .theme_when(clone_reader(reader))
-        .enabled_when(move || !refresh_enabled.files().storage_center_loading)
-        .on_press_with_ctx(move |ctx| {
-            let waker = { refresh_shared.borrow().waker.clone() };
-            refresh_shared.files_mut().request_storage_overview(waker);
-            request_files_overlay_rebuild(ctx);
-        });
-    let close_shared = shared.clone();
-    let close = sui::Button::new("Close")
-        .appearance(ButtonAppearance::Outline)
-        .tone(SemanticTone::Neutral)
-        .theme_when(clone_reader(reader))
-        .on_press_with_ctx(move |ctx| {
-            close_shared.files_mut().close_storage_center();
-            request_files_overlay_rebuild(ctx);
-        });
-    let dismiss = shared.clone();
-    Some(WidgetPod::new(
-        SideSheet::new("Storage health", body)
-            .theme_when(clone_reader(reader))
-            .description("DFS objects, pending work, and missing copies")
-            .placement(SideSheetPlacement::Right)
-            .width(780.0)
-            .modal(true)
-            .dismiss_on_scrim(true)
-            .action(refresh)
-            .action(close)
-            .on_dismiss(move || dismiss.files_mut().close_storage_center()),
-    ))
+        .with_child(loaded)
 }
 
 fn history_note(reader: &ThemeReader, text: impl Into<String>) -> Label {
-    let theme = reader();
-    let mut style = theme.text_style(theme.palette.text_muted);
-    style.font_size = theme.text.sm.size;
-    style.line_height = theme.text.sm.line_height;
-    Label::new(text).text_style(style)
+    Label::new(text).text_style_when(live_note_style(reader))
 }
 
 fn history_saved_label(nanos: u64) -> String {
@@ -22506,7 +23477,6 @@ fn history_card_button(
 }
 
 fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) -> Surface {
-    let theme = reader();
     let mut body = Stack::vertical().alignment(Alignment::Stretch).gap(6.0);
     let (badge, tone, text, note) = match preview.result.as_ref() {
         None => (
@@ -22548,10 +23518,9 @@ fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) ->
             .tone(tone)
             .theme_when(clone_reader(reader)),
     );
-    let mut text_style = theme.text_style(theme.palette.text);
-    text_style.font_size = theme.text.sm.size;
-    text_style.line_height = theme.text.sm.line_height;
-    body = body.with_child(RichText::from_plain_text(text, text_style));
+    body = body.with_child(live_plain_text(reader, text, |theme| {
+        sized_text_style(theme, theme.palette.text, theme.text.sm)
+    }));
     if let Some(note) = note {
         body = body.with_child(history_note(reader, note));
     }
@@ -22597,10 +23566,6 @@ fn history_entry_card(
             .theme_when(clone_reader(reader)),
     );
 
-    let theme = reader();
-    let mut meta_style = theme.text_style(theme.palette.text);
-    meta_style.font_size = theme.text.sm.size;
-    meta_style.line_height = theme.text.sm.line_height;
     let saved_path = normalize_path(&entry.captured.object.path);
     let mut body = Stack::vertical()
         .alignment(Alignment::Stretch)
@@ -22612,7 +23577,9 @@ fn history_entry_card(
                 history_saved_label(entry.captured.captured_at_unix_nanos),
                 human_size(Some(entry.size_bytes))
             ))
-            .text_style(meta_style),
+            .text_style_when(live_text_style(reader, |theme| {
+                sized_text_style(theme, theme.palette.text, theme.text.sm)
+            })),
         )
         .with_child(history_note(
             reader,
@@ -22786,7 +23753,7 @@ fn history_entry_card(
     } else {
         middle_short(&label, 64)
     };
-    inspector_card(title, body, reader, None, false)
+    inspector_card(title, body, reader, None)
 }
 
 fn history_capture_card(
@@ -22816,7 +23783,6 @@ fn history_capture_card(
         let save_shared = shared.clone();
         let save = sui::Button::new("Save version")
             .icon(IconGlyph::Add)
-            .min_height(32.0)
             .appearance(ButtonAppearance::Filled)
             .tone(SemanticTone::Accent)
             .theme_when(clone_reader(reader))
@@ -22844,7 +23810,7 @@ fn history_capture_card(
         ));
     }
     body = body.with_child(history_note(reader, history_retention_summary(retention)));
-    inspector_card("Save a version", body, reader, None, false)
+    inspector_card("Save a version", body, reader, None)
 }
 
 fn history_decision_panel(
@@ -22901,7 +23867,7 @@ fn history_decision_panel(
                 .tone(tone)
                 .theme_when(clone_reader(reader)),
         )
-        .with_child(Label::new(summary).theme(reader()));
+        .with_child(Label::new(summary).theme_when(clone_reader(reader)));
     match decision {
         HistoryDecision::Restore(request) => {
             let source = shared
@@ -23045,6 +24011,8 @@ fn history_issues_card(
         .fill_width(true)
 }
 
+/// The history sheet is mounted once per target. Its body is rebuilt for each history revision
+/// (a load, page, preview, or staged decision) and keeps its scroll position in `scroll_state`.
 fn files_history_sheet(
     shared: &Shared,
     reader: &ThemeReader,
@@ -23053,6 +24021,81 @@ fn files_history_sheet(
     if !shared.files().history_open {
         return None;
     }
+    let (title, folder_mode) = {
+        let files = shared.files();
+        let target = files.history_target.as_ref();
+        let title = match target {
+            Some(target) if target.path() == "/" => "SIFS".to_string(),
+            Some(target) => history_path_file_name(target.path()),
+            None => files
+                .selected_entry()
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| "History & issues".to_string()),
+        };
+        (title, target.is_some_and(HistoryTarget::is_folder))
+    };
+    let revision = || {
+        shared
+            .signals()
+            .files_structure
+            .select_named("history revision", |key| key.dialog.revision())
+    };
+    let body = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let scroll_state = scroll_state.clone();
+        RebuildOnChange::key_from(revision(), move |_| {
+            WidgetPod::new(files_history_body(&s, &r, &scroll_state))
+        })
+    };
+
+    let refresh_shared = shared.clone();
+    let refresh_enabled = shared.clone();
+    let refresh = sui::Button::new("Refresh")
+        .icon(IconGlyph::Redo)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || !refresh_enabled.files().history_loading)
+        .on_press_with_ctx(move |ctx| {
+            let waker = { refresh_shared.borrow().waker.clone() };
+            refresh_shared.files_mut().request_history(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let close_shared = shared.clone();
+    let close = sui::Button::new("Close")
+        .appearance(ButtonAppearance::Outline)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.files_mut().close_history();
+            request_files_overlay_rebuild(ctx);
+        });
+    let dismiss = shared.clone();
+    Some(WidgetPod::new(RefreshOn::new(
+        revision(),
+        SideSheet::new(title, body)
+            .theme_when(clone_reader(reader))
+            .description(if folder_mode {
+                "Saved versions in this folder, including deleted files"
+            } else {
+                "Saved versions and missing copies"
+            })
+            .placement(SideSheetPlacement::Right)
+            .width(720.0)
+            .modal(true)
+            .dismiss_on_scrim(true)
+            .action(refresh)
+            .action(close)
+            .on_dismiss(move || dismiss.files_mut().close_history()),
+    )))
+}
+
+fn files_history_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> SwitchView {
     let files = shared.files();
     let loading = files.history_loading;
     let loaded = files.history_loaded;
@@ -23068,14 +24111,6 @@ fn files_history_sheet(
     let retention = files.history_retention.clone();
     let preview = files.history_preview.clone();
     let folder_mode = target.as_ref().is_some_and(HistoryTarget::is_folder);
-    let title = match target.as_ref() {
-        Some(target) if target.path() == "/" => "SIFS".to_string(),
-        Some(target) => history_path_file_name(target.path()),
-        None => files
-            .selected_entry()
-            .map(|entry| entry.name.clone())
-            .unwrap_or_else(|| "History & issues".to_string()),
-    };
     drop(files);
 
     let mut content = Stack::vertical()
@@ -23175,7 +24210,6 @@ fn files_history_sheet(
                 "Search older versions"
             })
             .icon(IconGlyph::Search)
-            .min_height(32.0)
             .appearance(ButtonAppearance::Outline)
             .tone(SemanticTone::Neutral)
             .theme_when(clone_reader(reader))
@@ -23228,7 +24262,7 @@ fn files_history_sheet(
     } else {
         1
     };
-    let body = SwitchView::new()
+    SwitchView::new()
         .selected(selected)
         .with_child(centered_note(
             reader,
@@ -23242,50 +24276,12 @@ fn files_history_sheet(
             "History unavailable",
             error.unwrap_or_else(|| "No DFS object history was returned.".to_string()),
         ))
-        .with_child(body_content);
-
-    let refresh_shared = shared.clone();
-    let refresh_enabled = shared.clone();
-    let refresh = sui::Button::new("Refresh")
-        .icon(IconGlyph::Redo)
-        .appearance(ButtonAppearance::Tonal)
-        .tone(SemanticTone::Accent)
-        .theme_when(clone_reader(reader))
-        .enabled_when(move || !refresh_enabled.files().history_loading)
-        .on_press_with_ctx(move |ctx| {
-            let waker = { refresh_shared.borrow().waker.clone() };
-            refresh_shared.files_mut().request_history(waker);
-            request_files_overlay_rebuild(ctx);
-        });
-    let close_shared = shared.clone();
-    let close = sui::Button::new("Close")
-        .appearance(ButtonAppearance::Outline)
-        .tone(SemanticTone::Neutral)
-        .theme_when(clone_reader(reader))
-        .on_press_with_ctx(move |ctx| {
-            close_shared.files_mut().close_history();
-            request_files_overlay_rebuild(ctx);
-        });
-    let dismiss = shared.clone();
-    Some(WidgetPod::new(
-        SideSheet::new(title, body)
-            .theme_when(clone_reader(reader))
-            .description(if folder_mode {
-                "Saved versions in this folder, including deleted files"
-            } else {
-                "Saved versions and missing copies"
-            })
-            .placement(SideSheetPlacement::Right)
-            .width(720.0)
-            .modal(true)
-            .dismiss_on_scrim(true)
-            .action(refresh)
-            .action(close)
-            .on_dismiss(move || dismiss.files_mut().close_history()),
-    ))
+        .with_child(body_content)
 }
 
-fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+/// The concrete actions for the current selection. Rebuilt only when the selection or its
+/// metadata changes; enablement follows the model live.
+fn compact_file_selection_action_list(shared: &Shared, reader: &ThemeReader) -> Stack {
     let source = shared.files().source;
     let actions_for_selection = selection_context_actions(&shared.files());
     let mut previous_group = None;
@@ -23298,13 +24294,13 @@ fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl
         }
         previous_group = Some(group);
 
-        let enabled = action.enabled(&shared.files());
         let destructive = action.destructive();
+        let enabled = shared.clone();
         let action_shared = shared.clone();
         let mut button = sui::Button::new(action.label(source))
             .min_height(36.0)
             .theme_when(clone_reader(reader))
-            .enabled(enabled)
+            .enabled_when(move || action.enabled(&enabled.files()))
             .on_press_with_ctx(move |ctx| {
                 action_shared.files_mut().close_compact_overlay();
                 activate_file_context_action(&action_shared, action, ctx);
@@ -23317,6 +24313,33 @@ fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl
         }
         actions = actions.with_child(button);
     }
+    actions
+}
+
+fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source =
+        shared
+            .signals()
+            .files_structure
+            .select_named("files compact selection actions", |key| {
+                let inspector = &key.inspector;
+                (
+                    inspector.source,
+                    inspector
+                        .selected
+                        .and_then(|index| inspector.entries.get(index))
+                        .cloned(),
+                    inspector.marked_entries.clone(),
+                    inspector.selected_details.clone(),
+                    inspector.details_loading,
+                    inspector.details_error.clone(),
+                )
+            });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let actions = RebuildOnChange::key_from(source, move |_| {
+        WidgetPod::new(compact_file_selection_action_list(&s, &r))
+    });
 
     ScrollView::vertical(WidgetPadding::new(
         Insets {
@@ -23332,7 +24355,11 @@ fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl
     .viewport_width_hint(true)
 }
 
-fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+fn compact_files_dialog(
+    shared: &Shared,
+    reader: &ThemeReader,
+    inspector_scroll_state: &ScrollState,
+) -> Option<WidgetPod> {
     let overlay = shared.files().compact_overlay?;
     let (title, description, selected) = match overlay {
         CompactFilesOverlay::Commands => (
@@ -23351,12 +24378,11 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             2,
         ),
     };
-    let inspector_scroll_state = ScrollState::new();
     let body = SwitchView::new()
         .selected(selected)
         .with_child(compact_files_commands(shared, reader))
         .with_child(compact_file_selection_actions(shared, reader))
-        .with_child(inspector(shared, reader, &inspector_scroll_state));
+        .with_child(inspector(shared, reader, inspector_scroll_state));
     let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
         SideSheet::new(title, body)
@@ -23370,39 +24396,51 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     ))
 }
 
+/// Scroll positions owned by the dialog host, so sheet bodies keep their place while they update.
+#[derive(Default)]
+struct FilesDialogScrolls {
+    history: ScrollState,
+    storage: ScrollState,
+    inspector: ScrollState,
+}
+
 fn files_dialog(
     shared: &Shared,
     reader: &ThemeReader,
-    history_scroll: &ScrollState,
+    shell: &FilesDialogShell,
+    scrolls: &FilesDialogScrolls,
 ) -> Option<WidgetPod> {
     if shared.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document) {
-        return files_document_close_dialog(shared, reader);
+        // The document tab owns its editor; only the close confirmation is modal there.
+        return None;
     }
-    if shared.files().document_close_confirmation {
-        files_document_close_dialog(shared, reader)
-    } else if shared.files().document.is_some() {
-        files_document_sheet(shared, reader)
-    } else if shared.files().action_prompt.is_some() {
-        files_action_dialog(shared, reader)
-    } else if shared.files().history_open {
-        files_history_sheet(shared, reader, history_scroll)
-    } else if shared.files().storage_center_open {
-        files_storage_center_sheet(shared, reader)
-    } else if shared.files().placement_activity_open {
-        Some(files_placement_activity_sheet(shared, reader))
-    } else {
-        compact_files_dialog(shared, reader)
+    match shell {
+        FilesDialogShell::Closed => None,
+        FilesDialogShell::Document(_) => files_document_sheet(shared, reader),
+        FilesDialogShell::Action { .. } => files_action_dialog(shared, reader),
+        FilesDialogShell::Compact(_) => compact_files_dialog(shared, reader, &scrolls.inspector),
+        FilesDialogShell::PlacementActivity => Some(files_placement_activity_sheet(shared, reader)),
+        FilesDialogShell::History(_) => files_history_sheet(shared, reader, &scrolls.history),
+        FilesDialogShell::StorageCenter => {
+            files_storage_center_sheet(shared, reader, &scrolls.storage)
+        }
     }
 }
 
+/// Stacks the Files dialogs over the tab body. A dialog or sheet is mounted once per
+/// [`FilesDialogShell`]; clicks, typing, and background results inside it update its body only,
+/// so the modal entrance, focus, and scroll position survive.
 struct FilesDialogHost {
     shared: Shared,
     reader: ThemeReader,
+    source: Arc<dyn Observable<(FilesDialogShell, bool)>>,
     body: WidgetPod,
     dialog: Option<WidgetPod>,
-    dialog_key: FilesDialogStructure,
-    /// Keeps the history sheet's position across rebuilds after each action.
-    history_scroll: ScrollState,
+    /// The unsaved-close confirmation stacks over the retained document sheet.
+    confirmation: Option<WidgetPod>,
+    shell: FilesDialogShell,
+    confirming: bool,
+    scrolls: FilesDialogScrolls,
 }
 
 impl FilesDialogHost {
@@ -23410,30 +24448,62 @@ impl FilesDialogHost {
     where
         W: Widget + 'static,
     {
-        let dialog_key = shared.signals().files_structure.get().dialog;
-        let history_scroll = ScrollState::new();
-        let dialog = files_dialog(&shared, &reader, &history_scroll);
+        let source: Arc<dyn Observable<(FilesDialogShell, bool)>> = Arc::new(
+            shared
+                .signals()
+                .files_structure
+                .select_named("files dialog shell", |key| {
+                    (key.dialog.shell(), key.dialog.confirmation())
+                }),
+        );
+        let (shell, confirming) = source.get();
+        let scrolls = FilesDialogScrolls::default();
+        let dialog = files_dialog(&shared, &reader, &shell, &scrolls);
+        let confirmation = confirming
+            .then(|| files_document_close_dialog(&shared, &reader))
+            .flatten();
         Self {
             shared,
             reader,
+            source,
             body: WidgetPod::new(body),
             dialog,
-            dialog_key,
-            history_scroll,
+            confirmation,
+            shell,
+            confirming,
+            scrolls,
         }
     }
 
-    fn sync_dialog(&mut self, key: FilesDialogStructure) {
-        if key == self.dialog_key {
-            return;
+    fn sync_dialog(&mut self, (shell, confirming): (FilesDialogShell, bool)) {
+        if shell != self.shell {
+            // A newly opened sheet starts at the top; updates inside one keep their position.
+            match &shell {
+                FilesDialogShell::History(_)
+                    if !matches!(self.shell, FilesDialogShell::History(_)) =>
+                {
+                    self.scrolls.history = ScrollState::new();
+                }
+                FilesDialogShell::StorageCenter
+                    if self.shell != FilesDialogShell::StorageCenter =>
+                {
+                    self.scrolls.storage = ScrollState::new();
+                }
+                _ => {}
+            }
+            self.shell = shell;
+            self.dialog = files_dialog(&self.shared, &self.reader, &self.shell, &self.scrolls);
         }
-        if !matches!(self.dialog_key, FilesDialogStructure::History { .. })
-            && matches!(key, FilesDialogStructure::History { .. })
-        {
-            self.history_scroll = ScrollState::new();
+        if confirming != self.confirming {
+            self.confirming = confirming;
+            self.confirmation = confirming
+                .then(|| files_document_close_dialog(&self.shared, &self.reader))
+                .flatten();
         }
-        self.dialog_key = key;
-        self.dialog = files_dialog(&self.shared, &self.reader, &self.history_scroll);
+    }
+
+    fn overlays(&self) -> impl Iterator<Item = &WidgetPod> {
+        self.dialog.iter().chain(self.confirmation.iter())
     }
 }
 
@@ -23454,12 +24524,7 @@ impl Widget for FilesDialogHost {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let source = self
-            .shared
-            .signals()
-            .files_structure
-            .select_named("files dialog structure", |key| key.dialog.clone());
-        let key = ctx.observe(&source);
+        let key = ctx.observe(self.source.as_ref());
         self.sync_dialog(key);
         let size = constraints.clamp(Size::new(
             if constraints.max.width.is_finite() {
@@ -23478,6 +24543,9 @@ impl Widget for FilesDialogHost {
         if let Some(dialog) = &mut self.dialog {
             dialog.measure(ctx, tight);
         }
+        if let Some(confirmation) = &mut self.confirmation {
+            confirmation.measure(ctx, tight);
+        }
         size
     }
 
@@ -23486,19 +24554,22 @@ impl Widget for FilesDialogHost {
         if let Some(dialog) = &mut self.dialog {
             dialog.arrange(ctx, bounds);
         }
+        if let Some(confirmation) = &mut self.confirmation {
+            confirmation.arrange(ctx, bounds);
+        }
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.body.paint(ctx);
-        if let Some(dialog) = &self.dialog {
-            dialog.paint(ctx);
+        for overlay in self.overlays() {
+            overlay.paint(ctx);
         }
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         self.body.semantics(ctx);
-        if let Some(dialog) = &self.dialog {
-            dialog.semantics(ctx);
+        for overlay in self.overlays() {
+            overlay.semantics(ctx);
         }
     }
 
@@ -23508,8 +24579,8 @@ impl Widget for FilesDialogHost {
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.body);
-        if let Some(dialog) = &self.dialog {
-            visitor.visit(dialog);
+        for overlay in self.overlays() {
+            visitor.visit(overlay);
         }
     }
 
@@ -23517,6 +24588,9 @@ impl Widget for FilesDialogHost {
         visitor.visit(&mut self.body);
         if let Some(dialog) = &mut self.dialog {
             visitor.visit(dialog);
+        }
+        if let Some(confirmation) = &mut self.confirmation {
+            visitor.visit(confirmation);
         }
     }
 }
@@ -23596,7 +24670,7 @@ impl Widget for FilesView {
 pub fn view(shared: Shared) -> impl Widget {
     let reader: ThemeReader = {
         let s = shared.clone();
-        Rc::new(move || s.theme().with_size(ControlSize::Small))
+        Rc::new(move || s.theme_sized(ControlSize::Small))
     };
     FilesDialogHost::new(FilesView::new(shared.clone()), shared, reader)
 }
@@ -23604,22 +24678,18 @@ pub fn view(shared: Shared) -> impl Widget {
 /// A document occupies the tab body; only unsaved-close confirmation is modal.
 pub(crate) fn document_view(shared: Shared) -> impl Widget {
     let theme_shared = shared.clone();
-    let reader: ThemeReader = Rc::new(move || theme_shared.theme().with_size(ControlSize::Small));
+    let reader: ThemeReader = Rc::new(move || theme_shared.theme_sized(ControlSize::Small));
     let content_shared = shared.clone();
     let content_reader = reader.clone();
-    let source = shared
-        .signals()
-        .files_structure
-        .select_named("document contents", |key| {
-            // The revision changes on load/reload, not on typing or close confirmation.
-            match &key.dialog {
-                FilesDialogStructure::Document { theme, revision }
-                | FilesDialogStructure::DocumentConfirmation { theme, revision } => {
-                    Some((*theme, *revision))
-                }
+    // The tab shows one document. Loads, edits, and close confirmation update the retained panel.
+    let source =
+        shared
+            .signals()
+            .files_structure
+            .select_named("document identity", |key| match &key.dialog {
+                FilesDialogStructure::Document { document, .. } => document.clone(),
                 _ => None,
-            }
-        });
+            });
     let body = RebuildOnChange::key_from(source, move |_| {
         files_document_sheet(&content_shared, &content_reader)
             .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
@@ -23981,6 +25051,55 @@ mod tests {
         )
         .expect("valid module-owned history fixture");
         view
+    }
+
+    #[test]
+    fn repair_evidence_correlates_exact_obligations_and_preserves_uncertainty() {
+        let object = test_operator_object();
+        let repair = &object.repairs[0];
+        let mut attempt = sinomo_runtime::dfs::DfsRepairAttemptRecord {
+            intent_id: repair.intent_id.clone(),
+            object_id: repair.object_id.clone(),
+            version: repair.version.clone(),
+            content_hash: repair.content_hash.clone().unwrap_or_default(),
+            missing_replica_node_id: repair.missing_replica_node_id.clone(),
+            attempts: 3,
+            in_flight: false,
+            last_attempt_unix_nanos: 1_000_000_000,
+            next_retry_unix_nanos: 2_000_000_000,
+            transfer_request_id: None,
+            last_error: Some("Destination unavailable".into()),
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
+        };
+        let rows = repair_evidence_rows(repair, &[attempt.clone()]);
+        assert!(rows.contains(&("Last blocking reason", "Destination unavailable".into())));
+        assert!(
+            rows.iter()
+                .any(|(label, _)| *label == "Recorded retry time")
+        );
+        attempt.intent_id.push_str("-other");
+        assert_eq!(
+            repair_evidence_rows(repair, &[attempt.clone()])[0].0,
+            "Attempt evidence"
+        );
+        attempt.intent_id = repair.intent_id.clone();
+        attempt.last_error = None;
+        attempt.completed_transfer_request_id = Some("completed".into());
+        let rows = repair_evidence_rows(repair, &[attempt.clone()]);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| *label == "Outcome"
+                    && value.contains("still listed as missing"))
+        );
+        attempt.in_flight = true;
+        let rows = repair_evidence_rows(repair, &[attempt]);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| *label == "Outcome" && value.contains("in flight"))
+        );
+        assert_eq!(repair_evidence_rows(repair, &[])[0].0, "Attempt evidence");
     }
 
     fn test_storage_overview() -> FilesStorageOverview {
@@ -25194,21 +26313,8 @@ mod tests {
         app.run_until_idle()?;
 
         assert!(window.get_by_text("Storage needs attention").count()? >= 1);
-        assert!(window.get_by_text("/documents/report.txt").count()? >= 1);
-        assert!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Show file")
-                .count()?
-                >= 1
-        );
-        for name in ["Open Cluster", "Mount & sync", "Reconciliation activity"] {
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name(name)
-                .expect()
-                .to_be_visible()?;
-        }
+        assert!(window.get_by_text("Missing copies").count()? >= 1);
+        assert!(window.get_by_text("Attempt evidence").count()? >= 1);
         Ok(())
     }
 
@@ -25262,7 +26368,12 @@ mod tests {
             window
                 .root()
                 .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
-                    1280.0, 720.0,
+                    1280.0,
+                    if name == "files-storage-repair-evidence" {
+                        1600.0
+                    } else {
+                        720.0
+                    },
                 ))))?;
             app.run_until_idle()?;
             window.advance_time(1.0)?;
@@ -25357,7 +26468,29 @@ mod tests {
             files.storage_center_open = true;
             files.storage_overview = Some(test_storage_overview());
         }
-        capture("files-storage-health", storage_shared)?;
+        capture("files-storage-health", storage_shared.clone())?;
+        {
+            let mut files = storage_shared.files_mut();
+            let overview = files.storage_overview.as_mut().unwrap();
+            let repair = &overview.repairs[0];
+            overview.status.repair_attempts.push(sinomo_runtime::dfs::DfsRepairAttemptRecord {
+                intent_id: repair.intent_id.clone(),
+                object_id: repair.object_id.clone(),
+                version: repair.version.clone(),
+                content_hash: repair.content_hash.clone().unwrap_or_default(),
+                missing_replica_node_id: repair.missing_replica_node_id.clone(),
+                attempts: 3,
+                in_flight: false,
+                last_attempt_unix_nanos: 1_793_620_000_000_000_000,
+                next_retry_unix_nanos: 1_793_620_060_000_000_000,
+                transfer_request_id: Some("repair-transfer-example".into()),
+                last_error: Some("Destination is unreachable; waiting for an authorized route to the missing replica node.".into()),
+                transfer_delivery_state: None,
+                completed_transfer_request_id: None,
+                transfer_kind: None,
+            });
+        }
+        capture("files-storage-repair-evidence", storage_shared)?;
 
         let availability_backend = Backend::local_fallback();
         let availability_shared = Shared::new(AppState::ready(availability_backend));
@@ -26144,7 +27277,9 @@ mod tests {
     fn placement_activity_radios_follow_domain_across_retained_frames() -> sui::Result<()> {
         use sui::{Event, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
 
-        let fixture = sinomo_testdir::TestDir::new("app-ui-placement-activity-radios-follow-domain-across-retained-frames");
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-placement-activity-radios-follow-domain-across-retained-frames",
+        );
         let backend = Backend::local_fallback_for_data_dir(
             sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
         );
@@ -26155,7 +27290,6 @@ mod tests {
             let shared = shared.clone();
             Rc::new(move || shared.theme())
         };
-        let initial_filter = shared.files().placement_activity_filter;
         let choices = [
             (PlacementActivityFilter::All, "All"),
             (PlacementActivityFilter::Active, "Active"),
@@ -26168,11 +27302,7 @@ mod tests {
                 .into_iter()
                 .fold(Flex::horizontal().gap(6.0), |row, (filter, label)| {
                     row.with_child(placement_activity_filter_radio(
-                        &shared,
-                        &reader,
-                        initial_filter,
-                        filter,
-                        label,
+                        &shared, &reader, filter, label,
                     ))
                 });
         let runtime = sui::Application::new()
@@ -26256,7 +27386,10 @@ mod tests {
             assert_eq!(checked, vec![expected.to_string()]);
             Ok(())
         };
-        assert_eq!(initial_filter, PlacementActivityFilter::All);
+        assert_eq!(
+            shared.files().placement_activity_filter,
+            PlacementActivityFilter::All
+        );
         assert_visible("All")?;
 
         // X then the previously selected Y, with no frame or parent rebuild between inputs.
@@ -27753,7 +28886,10 @@ mod tests {
         );
 
         // Navigating the summary never dismisses or clears the durable read error.
-        reveal_summary_status("Previous activity summary", "Reconciliation activity read failed")?;
+        reveal_summary_status(
+            "Previous activity summary",
+            "Reconciliation activity read failed",
+        )?;
         let restored_snapshot = window.snapshot()?;
         let restored_error = restored_snapshot
             .accessibility
@@ -27826,6 +28962,223 @@ mod tests {
             shared.files().placement_activity_error.as_deref(),
             Some(full_error),
             "scrolling the job list preserves the durable activity read error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn placement_tabs_keep_dialog_mounted() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut preview = unsatisfiable_placement_preview();
+            preview.blocking_diagnostics.clear();
+            for node in &mut preview.nodes {
+                node.accepts_content = true;
+            }
+            let mut files = shared.files_mut();
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+            files.placement_advanced_open = false;
+            files.placement_preview = Some(preview);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Placement count bounds")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        window.advance_time(1.0)?;
+        let dialog_id = || {
+            window
+                .snapshot()
+                .unwrap()
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Dialog
+                        && node.name.as_deref() == Some("Manage availability")
+                })
+                .expect("availability dialog")
+                .id
+        };
+        let initial_id = dialog_id();
+        for name in [
+            "Confirmed availability",
+            "Available across devices",
+            "Use inherited availability",
+        ] {
+            window
+                .get_by_role(SemanticsRole::RadioButton)
+                .with_name(name)
+                .click()?;
+            app.run_until_idle()?;
+            assert_eq!(
+                dialog_id(),
+                initial_id,
+                "tab {name} must not remount the modal"
+            );
+        }
+        window
+            .capture_screenshot()?
+            .write_png(std::env::temp_dir().join("sinomo-availability-after-tabs.png"))?;
+        Ok(())
+    }
+
+    fn semantics_node_id(
+        window: &sui_testing::TestWindow,
+        role: SemanticsRole,
+        name: Option<&str>,
+    ) -> Option<WidgetId> {
+        window
+            .snapshot()
+            .expect("files dialog snapshot")
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == role && name.is_none_or(|name| node.name.as_deref() == Some(name))
+            })
+            .map(|node| node.id)
+    }
+
+    #[test]
+    fn action_dialog_typing_keeps_dialog_and_input_mounted() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.open_action_prompt(FileActionPromptKind::NewFolder);
+            files
+                .action_prompt
+                .as_mut()
+                .expect("new folder prompt")
+                .error = Some("A folder with that name already exists".to_string());
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Action dialog identity")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(900.0).height(700.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+
+        let title = FileActionPromptKind::NewFolder.title();
+        let input_name = format!("files-action-input-{title}");
+        let dialog =
+            semantics_node_id(&window, SemanticsRole::Dialog, Some(title)).expect("action dialog");
+        let input = semantics_node_id(&window, SemanticsRole::TextInput, Some(&input_name))
+            .expect("action input");
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name(input_name.as_str())
+            .fill("Reports")?;
+        app.run_until_idle()?;
+
+        assert_eq!(
+            semantics_node_id(&window, SemanticsRole::Dialog, Some(title)),
+            Some(dialog),
+            "typing must not remount the dialog"
+        );
+        assert_eq!(
+            semantics_node_id(&window, SemanticsRole::TextInput, Some(&input_name)),
+            Some(input),
+            "typing must not remount the input that owns the edit buffer"
+        );
+        let files = shared.files();
+        let prompt = files.action_prompt.as_ref().expect("prompt stays open");
+        assert!(prompt.input.contains("Reports"), "{:?}", prompt.input);
+        assert_eq!(prompt.error, None, "editing clears the previous error");
+        Ok(())
+    }
+
+    #[test]
+    fn history_sheet_stays_mounted_across_history_revisions() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let object = test_operator_object();
+        let entry = test_history_entry(&object, &object.versions[0], &[], 9);
+        {
+            let mut files = shared.files_mut();
+            files.history_open = true;
+            files.history_target = Some(HistoryTarget::Folder {
+                file_system_id: object.object.file_system_id.clone(),
+                path: "/documents".to_string(),
+            });
+            files
+                .apply_history_snapshot(FilesHistorySnapshot {
+                    object: None,
+                    entries: vec![entry.clone()],
+                    next_cursor: None,
+                    list_error: None,
+                    retention: None,
+                })
+                .unwrap();
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("History sheet identity")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1100.0).height(800.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+
+        let sheet = semantics_node_id(&window, SemanticsRole::Dialog, None).expect("history sheet");
+        let revision = shared.files().history_revision;
+        shared
+            .files_mut()
+            .stage_history_recover(entry.identity.clone());
+        app.run_until_idle()?;
+
+        assert_ne!(shared.files().history_revision, revision);
+        assert_eq!(
+            semantics_node_id(&window, SemanticsRole::Dialog, None),
+            Some(sheet),
+            "a history update must not remount the sheet"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::TextInput)
+                .with_name("files-history-recover-destination")
+                .count()?,
+            1,
+            "the staged recovery appears in the retained sheet"
         );
         Ok(())
     }
@@ -33994,6 +35347,11 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{label} command should be present"));
             assert!(
+                (node.bounds.y() + node.bounds.height() / 2.0 - HEADER_H / 2.0).abs() < 1.0,
+                "{label} must be vertically centered in the header: {:?}",
+                node.bounds
+            );
+            assert!(
                 node.bounds.width() >= 28.0 && node.bounds.height() >= 28.0,
                 "{label} command should keep a usable hit target, got {:?}",
                 node.bounds
@@ -36291,7 +37649,9 @@ mod tests {
                     let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
                     eprintln!("toolbar width={width:.0} {name}: {bounds:?}");
                     assert_inside(bounds, width, 720.0, name);
-                    assert!(bounds.width() >= 32.0 && bounds.height() >= 32.0);
+                    // Overflow commands use the stock control height of the Files dialog theme.
+                    let control_height = shared.theme_sized(ControlSize::Small).metrics.min_height;
+                    assert!(bounds.width() >= control_height && bounds.height() >= control_height);
                 }
             } else {
                 for name in [

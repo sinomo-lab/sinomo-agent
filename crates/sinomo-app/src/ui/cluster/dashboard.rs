@@ -621,25 +621,128 @@ pub(super) fn format_dashboard_value(metric: DashboardMetric, value: Option<f64>
     }
 }
 
+/// A label at a type-ramp step, weight, and ink resolved from the live theme.
 fn text(
-    theme: &DefaultTheme,
+    reader: &ThemeReader,
     value: impl Into<String>,
-    size: f32,
+    token: fn(&DefaultTheme) -> ThemeTextToken,
     weight: FontWeight,
-    color: Color,
+    ink: fn(&DefaultTheme) -> Color,
 ) -> Label {
-    Label::new(value).text_style(
-        Palette::from_theme(theme, theme.surfaces.dark).text_style(theme, size, weight, color),
+    Label::new(value).text_style_when(themed_style(reader, token, weight, ink))
+}
+
+/// What dashboard values read besides the structure key: sample history, node targets, and
+/// node availability. The observation revision and clock change with every sample.
+type SampleKey = (u64, Option<OffsetDateTime>, ClusterSnapshot);
+type Samples = ClusterSelector<SampleKey>;
+
+fn samples(shared: &Shared) -> Samples {
+    cluster_select(shared, "dashboard samples", |key| {
+        (
+            key.observation_revision,
+            key.observation_time,
+            key.snapshot.clone(),
+        )
+    })
+}
+
+/// A label whose text and ink follow the samples without being rebuilt.
+fn live_label(
+    shared: &Shared,
+    reader: &ThemeReader,
+    samples: &Samples,
+    token: fn(&DefaultTheme) -> ThemeTextToken,
+    weight: FontWeight,
+    read: impl Fn(&Shared, &DefaultTheme) -> (String, Color) + 'static,
+) -> widgets::Restyle<Label, SampleKey> {
+    let read = Rc::new(read);
+    let (text_shared, text_reader, text_read) =
+        (shared.clone(), Rc::clone(reader), Rc::clone(&read));
+    let (style_shared, style_reader) = (shared.clone(), Rc::clone(reader));
+    live(
+        Label::new(read(shared, &reader()).0)
+            .text_when(move || text_read(&text_shared, &text_reader()).0)
+            .text_style_when(move || {
+                let theme = style_reader();
+                let (_, ink) = read(&style_shared, &theme);
+                crate::theme::token_text_style(&theme, token(&theme), weight, ink)
+            }),
+        samples.clone(),
     )
 }
 
-fn live_content<F: Fn(&Shared, DefaultTheme) -> WidgetPod + 'static>(
-    shared: &Shared,
-    build: F,
-) -> impl Widget + use<F> {
-    let source = shared.signals().cluster_structure.clone();
-    let shared = shared.clone();
-    RebuildOnChange::key_from(source, move |_| build(&shared, shared.theme()))
+/// The ratio of the live body text size to the default, for geometry authored at the default.
+fn text_scale(theme: &DefaultTheme) -> f32 {
+    theme.text.base.size / DefaultTheme::default().text.base.size
+}
+
+/// A slot whose height is authored for the default text size and follows the live text scale,
+/// so a text-size change re-flows the dashboard without rebuilding it.
+struct ScaledHeight {
+    reader: ThemeReader,
+    height: f32,
+    at_least_authored: bool,
+    child: WidgetPod,
+}
+
+impl ScaledHeight {
+    fn new(reader: &ThemeReader, height: f32, child: impl Widget + 'static) -> Self {
+        Self {
+            reader: Rc::clone(reader),
+            height,
+            at_least_authored: false,
+            child: WidgetPod::new(child),
+        }
+    }
+
+    /// Never shorter than the authored height, even at smaller text sizes.
+    fn at_least_authored(mut self) -> Self {
+        self.at_least_authored = true;
+        self
+    }
+}
+
+impl Widget for ScaledHeight {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let scale = text_scale(&(self.reader)());
+        let scale = if self.at_least_authored {
+            scale.max(1.0)
+        } else {
+            scale
+        };
+        let height = constraints
+            .clamp(Size::new(0.0, self.height * scale))
+            .height;
+        let size = self.child.measure(
+            ctx,
+            Constraints::new(
+                Size::new(constraints.min.width, height),
+                Size::new(constraints.max.width, height),
+            ),
+        );
+        constraints.clamp(Size::new(size.width, height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
 }
 
 fn current(shared: &Shared, metric: DashboardMetric) -> (Option<f64>, usize, usize) {
@@ -670,11 +773,9 @@ fn inspect_button(shared: &Shared, metric: DashboardMetric) -> IconButton {
         format!("Inspect {}", metric.title()),
     )
     .description(format!("Inspect {} by node and labels", metric.title()))
-    .size(28.0)
-    .icon_size(14.0)
     .appearance(ButtonAppearance::Ghost)
     .tone(SemanticTone::Neutral)
-    .theme_when(move || theme.theme().with_size(sui::ControlSize::Small))
+    .theme_when(move || theme.theme_sized(sui::ControlSize::Small))
     .on_press_with_ctx(move |ctx| {
         let spec = metric.spec();
         action.cluster_mut().inspect_explorer_metric(
@@ -689,95 +790,119 @@ fn inspect_button(shared: &Shared, metric: DashboardMetric) -> IconButton {
     })
 }
 
-fn metric_panel(shared: &Shared, metric: DashboardMetric) -> impl Widget + use<> {
-    let theme = shared.theme();
-    let scale = theme.text.base.size / DefaultTheme::default().text.base.size;
+fn metric_panel(
+    shared: &Shared,
+    reader: &ThemeReader,
+    samples: &Samples,
+    metric: DashboardMetric,
+) -> impl Widget + use<> {
     let title = TrailingSlotRow::new(
         text(
-            &theme,
+            reader,
             metric.title(),
-            theme.text.sm.size,
+            |theme| theme.text.sm,
             FontWeight::SEMIBOLD,
-            theme.palette.text,
+            |theme| theme.palette.text,
         ),
         inspect_button(shared, metric),
     )
     .trailing_width(30.0)
     .trailing_height(30.0)
     .gap(4.0);
-    let value = live_content(shared, move |shared, theme| {
-        let (value, _, _) = current(shared, metric);
-        WidgetPod::new(text(
-            &theme,
-            format_dashboard_value(metric, value),
-            theme.text.xl.size * 1.3,
-            FontWeight::SEMIBOLD,
-            if value.is_some() {
-                theme.semantic_tone_color(metric.tone(value))
-            } else {
-                theme.palette.text_muted
-            },
-        ))
-    });
+    let value = live_label(
+        shared,
+        reader,
+        samples,
+        |theme| theme.text._3xl,
+        FontWeight::SEMIBOLD,
+        move |shared, theme| {
+            let (value, _, _) = current(shared, metric);
+            (
+                format_dashboard_value(metric, value),
+                if value.is_some() {
+                    theme.semantic_tone_color(metric.tone(value))
+                } else {
+                    theme.palette.text_muted
+                },
+            )
+        },
+    );
     let info = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(3.0)
-        .with_item(title, FlexItem::fixed(30.0 * scale))
-        .with_item(value, FlexItem::fixed(30.0 * scale))
+        .with_child(ScaledHeight::new(reader, 30.0, title))
+        .with_child(ScaledHeight::new(reader, 30.0, value))
         .with_child(text(
-            &theme,
+            reader,
             metric.spec().description,
-            theme.text.xs.size,
+            |theme| theme.text.xs,
             FontWeight::NORMAL,
-            theme.palette.text_muted,
+            |theme| theme.palette.text_muted,
         ));
-    let coverage = live_content(shared, move |shared, theme| {
-        let (_, reporting, targets) = current(shared, metric);
-        let conflict =
-            dashboard_metric_has_value_conflict(&shared.cluster().observation.metrics, metric);
-        WidgetPod::new(text(
-            &theme,
-            if conflict {
-                "Conflicting metric types or units".into()
-            } else {
-                format!(
-                    "Last {} · {reporting}/{targets} nodes reporting",
-                    metric.window().label()
-                )
-            },
-            theme.text.xs.size,
-            FontWeight::NORMAL,
-            theme.palette.text_muted,
-        ))
-    });
-    SizedBox::new().height(270.0 * scale.max(1.0)).child(
+    let coverage = live_label(
+        shared,
+        reader,
+        samples,
+        |theme| theme.text.xs,
+        FontWeight::NORMAL,
+        move |shared, theme| {
+            let (_, reporting, targets) = current(shared, metric);
+            let conflict =
+                dashboard_metric_has_value_conflict(&shared.cluster().observation.metrics, metric);
+            (
+                if conflict {
+                    "Conflicting metric types or units".into()
+                } else {
+                    format!(
+                        "Last {} · {reporting}/{targets} nodes reporting",
+                        metric.window().label()
+                    )
+                },
+                theme.palette.text_muted,
+            )
+        },
+    );
+    ScaledHeight::new(
+        reader,
+        270.0,
         Surface::panel(
-            Dock::new(DashboardChart::new(shared.clone(), metric))
-                .top(98.0 * scale, info)
-                .bottom(20.0 * scale, coverage),
+            Flex::vertical()
+                .align_items(Alignment::Stretch)
+                .with_child(ScaledHeight::new(reader, 98.0, info))
+                .with_item(
+                    DashboardChart::new(shared, reader, samples, metric),
+                    FlexItem::fill(),
+                )
+                .with_child(ScaledHeight::new(reader, 20.0, coverage)),
         )
         .name(metric.title())
         .padding(Insets::all(12.0))
         .fill()
-        .theme(theme),
+        .theme_when(clone_reader(reader)),
     )
+    .at_least_authored()
 }
 
+/// A curated panel's plot. It stays mounted; each sample refreshes its series from the
+/// dashboard history, and its tone follows the latest value.
 struct DashboardChart {
     shared: Shared,
+    samples: Samples,
     metric: DashboardMetric,
     chart: MetricChart,
 }
 
 impl DashboardChart {
-    fn new(shared: Shared, metric: DashboardMetric) -> Self {
-        let theme = shared.theme();
-        let pal = Palette::from_theme(&theme, theme.surfaces.dark);
+    fn new(
+        shared: &Shared,
+        reader: &ThemeReader,
+        samples: &Samples,
+        metric: DashboardMetric,
+    ) -> Self {
         let mut chart = MetricChart::new(
             metric.title().into(),
             Vec::new(),
-            theme,
-            pal.agent,
+            Rc::clone(reader),
             None,
             ExplorerTransform::Current,
             ObserveMetricKind::Gauge,
@@ -785,7 +910,8 @@ impl DashboardChart {
         chart.dashboard_metric = Some(metric);
         chart.height = 132.0;
         Self {
-            shared,
+            shared: shared.clone(),
+            samples: samples.clone(),
             metric,
             chart,
         }
@@ -794,20 +920,18 @@ impl DashboardChart {
 
 impl Widget for DashboardChart {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        ctx.observe(&self.shared.signals().cluster_structure);
+        ctx.observe(&self.samples);
         let cluster = self.shared.cluster();
-        self.chart.end_at = cluster.observation_time();
-        self.chart.window = self.metric.window();
-        self.chart.paused = cluster.observation.paused_at.is_some();
+        let end_at = cluster.observation_time();
+        let window = self.metric.window();
+        self.chart
+            .set_time_range(end_at, window, cluster.observation.paused_at.is_some());
         let current = cluster
             .observation
             .history
             .back()
             .and_then(|point| point.values.get(&self.metric).copied().flatten());
-        self.chart.colors[0] = self
-            .shared
-            .theme()
-            .semantic_tone_color(self.metric.tone(current));
+        self.chart.tone = Some(self.metric.tone(current));
         self.chart.series = vec![MetricSeries {
             key: MetricSeriesKey {
                 metric_name: self.metric.title().into(),
@@ -818,7 +942,7 @@ impl Widget for DashboardChart {
                 .observation
                 .history
                 .iter()
-                .filter(|point| point.at >= self.chart.end_at - self.chart.window.duration())
+                .filter(|point| point.at >= end_at - window.duration())
                 .map(|point| MetricPoint {
                     at: point.at,
                     value: point.values.get(&self.metric).copied().flatten(),
@@ -840,126 +964,130 @@ impl Widget for DashboardChart {
 
 fn stat_tile(
     shared: &Shared,
+    reader: &ThemeReader,
+    samples: &Samples,
     title: &'static str,
     metric: Option<DashboardMetric>,
 ) -> impl Widget + use<> {
-    live_content(shared, move |shared, theme| {
-        let (value, caption, tone) = if let Some(metric) = metric {
-            let (value, _, _) = current(shared, metric);
-            (
-                format_dashboard_value(metric, value),
-                "Max reported node".to_string(),
-                metric.tone(value),
-            )
-        } else {
-            let cluster = shared.cluster();
-            let counts = availability_counts(&cluster.snapshot);
-            (
-                if cluster.snapshot.nodes.is_empty() {
-                    "—".into()
-                } else {
-                    format!("{} / {}", counts.online, cluster.snapshot.nodes.len())
-                },
-                "Online / known nodes".into(),
-                if counts.offline > 0 {
-                    SemanticTone::Warning
-                } else {
-                    SemanticTone::Accent
-                },
-            )
-        };
-        WidgetPod::new(
-            Surface::panel(
-                Flex::vertical()
-                    .align_items(Alignment::Stretch)
-                    .gap(3.0)
-                    .with_child(text(
-                        &theme,
-                        title,
-                        theme.text.sm.size,
-                        FontWeight::MEDIUM,
-                        theme.palette.text_muted,
-                    ))
-                    .with_child(text(
-                        &theme,
-                        value,
-                        theme.text.xl.size * 1.4,
-                        FontWeight::SEMIBOLD,
-                        theme.semantic_tone_color(tone),
-                    ))
-                    .with_child(text(
-                        &theme,
-                        caption,
-                        theme.text.xs.size,
-                        FontWeight::NORMAL,
-                        theme.palette.text_muted,
-                    )),
-            )
-            .name(format!("Summary: {title}"))
-            .padding(Insets::all(12.0))
-            .fill_width(true)
-            .theme(theme),
-        )
-    })
+    let value = live_label(
+        shared,
+        reader,
+        samples,
+        |theme| theme.text._3xl,
+        FontWeight::SEMIBOLD,
+        move |shared, theme| {
+            let (value, tone) = if let Some(metric) = metric {
+                let (value, _, _) = current(shared, metric);
+                (format_dashboard_value(metric, value), metric.tone(value))
+            } else {
+                let cluster = shared.cluster();
+                let counts = availability_counts(&cluster.snapshot);
+                (
+                    if cluster.snapshot.nodes.is_empty() {
+                        "—".into()
+                    } else {
+                        format!("{} / {}", counts.online, cluster.snapshot.nodes.len())
+                    },
+                    if counts.offline > 0 {
+                        SemanticTone::Warning
+                    } else {
+                        SemanticTone::Accent
+                    },
+                )
+            };
+            (value, theme.semantic_tone_color(tone))
+        },
+    );
+    let caption = if metric.is_some() {
+        "Max reported node"
+    } else {
+        "Online / known nodes"
+    };
+    Surface::panel(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(3.0)
+            .with_child(text(
+                reader,
+                title,
+                |theme| theme.text.sm,
+                FontWeight::MEDIUM,
+                |theme| theme.palette.text_muted,
+            ))
+            .with_child(value)
+            .with_child(text(
+                reader,
+                caption,
+                |theme| theme.text.xs,
+                FontWeight::NORMAL,
+                |theme| theme.palette.text_muted,
+            )),
+    )
+    .name(format!("Summary: {title}"))
+    .padding(Insets::all(12.0))
+    .fill_width(true)
+    .theme_when(clone_reader(reader))
 }
 
-fn dashboard_header(shared: &Shared) -> impl Widget + use<> {
-    let theme = shared.theme();
-    let status = live_content(shared, |shared, theme| {
-        let cluster = shared.cluster();
-        let now = cluster.observation_time();
-        let targets = &cluster.observation.targets;
-        let fresh = targets
-            .values()
-            .filter(|target| target.freshness(now) == "Fresh")
-            .count();
-        let partial = targets
-            .values()
-            .filter(|target| target.freshness(now) == "Partial")
-            .count();
-        let unavailable = targets
-            .values()
-            .filter(|target| target.error.is_some())
-            .count();
-        let stale = targets.len().saturating_sub(fresh + partial + unavailable);
-        let summary = if targets.is_empty() {
-            "Waiting for node metrics".into()
-        } else {
-            format!(
-                "{fresh} fresh · {partial} partial · {stale} stale · {unavailable} unavailable · {}",
-                if cluster.observation.paused_at.is_some() {
-                    "Snapshot paused"
-                } else if cluster.observation.in_flight {
-                    "Collecting…"
-                } else {
-                    "Samples every 5s while visible"
-                }
-            )
-        };
-        WidgetPod::new(text(
-            &theme,
-            summary,
-            theme.text.sm.size,
-            FontWeight::NORMAL,
-            if partial + stale + unavailable > 0 {
-                theme.semantic_tone_color(SemanticTone::Warning)
+fn dashboard_header(
+    shared: &Shared,
+    reader: &ThemeReader,
+    samples: &Samples,
+) -> impl Widget + use<> {
+    let status = live_label(
+        shared,
+        reader,
+        samples,
+        |theme| theme.text.sm,
+        FontWeight::NORMAL,
+        |shared, theme| {
+            let cluster = shared.cluster();
+            let now = cluster.observation_time();
+            let targets = &cluster.observation.targets;
+            let fresh = targets
+                .values()
+                .filter(|target| target.freshness(now) == "Fresh")
+                .count();
+            let partial = targets
+                .values()
+                .filter(|target| target.freshness(now) == "Partial")
+                .count();
+            let unavailable = targets
+                .values()
+                .filter(|target| target.error.is_some())
+                .count();
+            let stale = targets.len().saturating_sub(fresh + partial + unavailable);
+            let summary = if targets.is_empty() {
+                "Waiting for node metrics".into()
             } else {
-                theme.palette.text_muted
-            },
-        ))
-    });
+                format!(
+                    "{fresh} fresh · {partial} partial · {stale} stale · {unavailable} unavailable · {}",
+                    if cluster.observation.paused_at.is_some() {
+                        "Snapshot paused"
+                    } else if cluster.observation.in_flight {
+                        "Collecting…"
+                    } else {
+                        "Samples every 5s while visible"
+                    }
+                )
+            };
+            (
+                summary,
+                if partial + stale + unavailable > 0 {
+                    theme.semantic_tone_color(SemanticTone::Warning)
+                } else {
+                    theme.palette.text_muted
+                },
+            )
+        },
+    );
     let live = live_toggle(shared);
     let refresh_shared = shared.clone();
-    let enabled = shared.clone();
+    let theme = shared.clone();
     let refresh = IconButton::new(IconGlyph::Redo, "Refresh now")
-        .size(30.0)
-        .icon_size(16.0)
         .appearance(ButtonAppearance::Ghost)
-        .theme(theme.with_size(sui::ControlSize::Small))
-        .enabled_when(move || {
-            let cluster = enabled.cluster();
-            cluster.observation.paused_at.is_none() && !cluster.observation.in_flight
-        })
+        .theme_when(move || theme.theme_sized(sui::ControlSize::Small))
+        .enabled_from(collection_idle(shared))
         .on_press_with_ctx(move |ctx| {
             request_refresh(&refresh_shared);
             request_observation(&refresh_shared);
@@ -975,11 +1103,11 @@ fn dashboard_header(shared: &Shared) -> impl Widget + use<> {
                 .align_items(Alignment::Center)
                 .with_item(
                     text(
-                        &theme,
+                        reader,
                         "System overview",
-                        theme.text.lg.size,
+                        |theme| theme.text.lg,
                         FontWeight::SEMIBOLD,
-                        theme.palette.text,
+                        |theme| theme.palette.text,
                     ),
                     FlexItem::flex(1.0).min_width(140.0),
                 )
@@ -989,8 +1117,12 @@ fn dashboard_header(shared: &Shared) -> impl Widget + use<> {
         .with_child(status)
 }
 
-fn group_panels(shared: &Shared, group: Group) -> impl Widget + use<> {
-    let theme = shared.theme();
+fn group_panels(
+    shared: &Shared,
+    reader: &ThemeReader,
+    samples: &Samples,
+    group: Group,
+) -> impl Widget + use<> {
     let mut cards = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .align_items(Alignment::Start)
@@ -1001,7 +1133,7 @@ fn group_panels(shared: &Shared, group: Group) -> impl Widget + use<> {
         .filter(|panel| panel.group == group)
     {
         cards.push_item(
-            metric_panel(shared, spec.metric),
+            metric_panel(shared, reader, samples, spec.metric),
             FlexItem::new()
                 .grow(1.0)
                 .basis_gap_aware_fraction(1.0 / 3.0)
@@ -1012,35 +1144,42 @@ fn group_panels(shared: &Shared, group: Group) -> impl Widget + use<> {
         .align_items(Alignment::Stretch)
         .gap(8.0)
         .with_child(text(
-            &theme,
+            reader,
             group.title(),
-            theme.text.base.size,
+            |theme| theme.text.base,
             FontWeight::SEMIBOLD,
-            theme.palette.text,
+            |theme| theme.palette.text,
         ))
         .with_child(text(
-            &theme,
+            reader,
             group.description(),
-            theme.text.sm.size,
+            |theme| theme.text.sm,
             FontWeight::NORMAL,
-            theme.palette.text_muted,
+            |theme| theme.palette.text_muted,
         ))
         .with_child(cards)
 }
 
-fn node_diagnostics(shared: &Shared) -> impl Widget + use<> {
-    live_content(shared, |shared, theme| {
-        let cluster = shared.cluster();
-        let now = cluster.observation_time();
-        let mut targets = cluster
-            .observation
-            .targets
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        sort_target_summaries(&mut targets, cluster.snapshot.local_node_id.as_deref());
-        let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
-        for target in targets {
+/// One node's row in the diagnostics list.
+#[derive(Clone, Debug, PartialEq)]
+struct NodeStatusRow {
+    node_id: String,
+    label: String,
+    value: String,
+}
+
+fn node_status_rows(cluster: &ClusterState) -> Vec<NodeStatusRow> {
+    let now = cluster.observation_time();
+    let mut targets = cluster
+        .observation
+        .targets
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_target_summaries(&mut targets, cluster.snapshot.local_node_id.as_deref());
+    targets
+        .into_iter()
+        .map(|target| {
             let node = cluster
                 .snapshot
                 .nodes
@@ -1050,7 +1189,7 @@ fn node_diagnostics(shared: &Shared) -> impl Widget + use<> {
                 .map(|node| node.display_name.clone())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| short(&target.node_id, 24));
-            let detail = if let Some(error) = &target.error {
+            let value = if let Some(error) = &target.error {
                 format!("Metrics unavailable: {error}")
             } else {
                 format!(
@@ -1062,27 +1201,57 @@ fn node_diagnostics(shared: &Shared) -> impl Widget + use<> {
                     format_optional(target.dfs_backlog, "")
                 )
             };
-            rows.push(
-                DetailRow::new(
-                    format!(
-                        "{name} · {}",
-                        node.map(|node| node.availability.as_str())
-                            .unwrap_or("unknown")
-                    ),
-                    detail,
-                )
-                .max_value_lines(3)
-                .theme(theme),
-            );
-        }
-        if cluster.observation.targets.is_empty() {
-            rows.push(Label::new("No observation results yet").theme(theme));
-        }
-        WidgetPod::new(PanelSection::new("Per-node status", rows).theme(theme))
-    })
+            NodeStatusRow {
+                label: format!(
+                    "{name} · {}",
+                    node.map(|node| node.availability.as_str())
+                        .unwrap_or("unknown")
+                ),
+                node_id: target.node_id,
+                value,
+            }
+        })
+        .collect()
 }
 
-fn page(shared: &Shared) -> WidgetPod {
+/// Per-node evidence. Rows are keyed by node and update in place as samples arrive.
+fn node_diagnostics(
+    shared: &Shared,
+    reader: &ThemeReader,
+    samples: &Samples,
+) -> impl Widget + use<> {
+    let rows_shared = shared.clone();
+    let rows = Projection::new(samples.clone(), move || {
+        node_status_rows(&rows_shared.cluster())
+    });
+    let row_reader = Rc::clone(reader);
+    let list = KeyedStack::vertical(
+        rows.clone(),
+        |row: &NodeStatusRow| row.node_id.clone(),
+        move |_, row| {
+            let initial = row.get();
+            let label = row.clone();
+            let value = row.clone();
+            live(
+                DetailRow::new(initial.label, initial.value)
+                    .label_when(move || label.get().label)
+                    .value_when(move || value.get().value)
+                    .max_value_lines(3)
+                    .theme_when(clone_reader(&row_reader)),
+                row,
+            )
+        },
+    )
+    .gap(8.0);
+    let body = SwitchView::new()
+        .selected_from(rows.map(|rows| usize::from(rows.is_empty())))
+        .with_child(list)
+        .with_child(Label::new("No observation results yet").theme_when(clone_reader(reader)));
+    PanelSection::new("Per-node status", body).theme_when(clone_reader(reader))
+}
+
+fn page(shared: &Shared, reader: &ThemeReader) -> Flex {
+    let samples = samples(shared);
     let mut summary = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(10.0)
@@ -1095,7 +1264,7 @@ fn page(shared: &Shared) -> WidgetPod {
         ("Nodes online", None),
     ] {
         summary.push_item(
-            stat_tile(shared, title, metric),
+            stat_tile(shared, reader, &samples, title, metric),
             FlexItem::new()
                 .grow(1.0)
                 .basis_gap_aware_fraction(1.0 / 6.0)
@@ -1105,36 +1274,23 @@ fn page(shared: &Shared) -> WidgetPod {
     let mut body = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(20.0)
-        .with_child(dashboard_header(shared))
+        .with_child(dashboard_header(shared, reader, &samples))
         .with_child(summary);
     for group in Group::ALL
         .into_iter()
         .filter(|group| *group != Group::Diagnostics)
     {
-        body.push(group_panels(shared, group));
+        body.push(group_panels(shared, reader, &samples, group));
     }
-    let source = shared
-        .signals()
-        .cluster_structure
-        .select_named("dashboard diagnostics visibility", |key| {
-            key.dashboard_diagnostics
-        });
+    let open = cluster_select(shared, "dashboard diagnostics visibility", |key| {
+        key.dashboard_diagnostics
+    });
     let action = shared.clone();
-    let toggle = RebuildOnChange::key_from(source.clone(), move |open| {
-        let action = action.clone();
-        WidgetPod::new(
-            Button::new(if *open {
-                "Hide diagnostics"
-            } else {
-                "Show diagnostics"
-            })
-            .icon(if *open {
-                IconGlyph::ChevronUp
-            } else {
-                IconGlyph::ChevronDown
-            })
+    let toggle = widgets::Restyle::new(
+        Button::new("Show diagnostics")
+            .icon(IconGlyph::ChevronDown)
             .appearance(ButtonAppearance::Ghost)
-            .theme(action.theme())
+            .theme_when(clone_reader(reader))
             .on_press_with_ctx(move |ctx| {
                 {
                     let mut cluster = action.cluster_mut();
@@ -1144,92 +1300,100 @@ fn page(shared: &Shared) -> WidgetPod {
                 }
                 request_metric_explorer_relayout(ctx);
             }),
-        )
-    });
+        open,
+        |mut button, open| {
+            button.set_label(if *open {
+                "Hide diagnostics"
+            } else {
+                "Show diagnostics"
+            });
+            button.icon(if *open {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            })
+        },
+    );
     body.push(toggle);
     let diagnostics = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(18.0)
-        .with_child(group_panels(shared, Group::Diagnostics))
-        .with_child(node_diagnostics(shared))
+        .with_child(group_panels(shared, reader, &samples, Group::Diagnostics))
+        .with_child(node_diagnostics(shared, reader, &samples))
         .with_child(
             Label::new(concat!(
                 "Snapshot gauges may describe replicated state, so these panels show reported maxima, ",
                 "not unique cluster totals. History is bounded to this app session; ",
                 "Explore exposes the underlying node and label series.",
             ))
-            .theme(shared.theme()),
+            .theme_when(clone_reader(reader)),
         );
-    let selected = shared
-        .signals()
-        .cluster_structure
-        .select_named("dashboard diagnostics page", |key| {
-            usize::from(key.dashboard_diagnostics)
-        });
     body.push(
         SwitchView::new()
-            .selected_from(selected)
+            .selected_from(cluster_select(
+                shared,
+                "dashboard diagnostics page",
+                |key| usize::from(key.dashboard_diagnostics),
+            ))
             .with_child(SizedBox::new().height(0.0))
             .with_child(diagnostics),
     );
-    WidgetPod::new(body)
+    body
 }
 
+/// The overview page is built once; samples, toggles, and theme changes update it in place.
 pub(super) fn view(shared: Shared) -> impl Widget {
-    let theme = shared.signals().theme.clone();
-    let content_shared = shared.clone();
-    let content = RebuildOnChange::key_from(theme, move |_| page(&content_shared));
-    let scroll = ScrollState::new();
+    let reader = cluster_theme_reader(&shared);
     Surface::window(
-        ScrollView::vertical(content)
-            .state(scroll)
+        ScrollView::vertical(page(&shared, &reader))
+            .state(ScrollState::new())
             .name("Cluster performance overview")
             .viewport_width_hint(true)
-            .theme_when({
-                let shared = shared.clone();
-                move || shared.theme()
-            }),
+            .theme_when(clone_reader(&reader)),
     )
     .padding(Insets::all(16.0))
     .fill()
-    .theme_when(move || shared.theme())
+    .theme_when(clone_reader(&reader))
 }
 
+/// Pauses or resumes live collection. The button stays mounted while its label and tone
+/// follow the live state.
 pub(super) fn live_toggle(shared: &Shared) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .cluster_structure
-        .select_named("dashboard live mode", |key| key.observation_live);
     let action = shared.clone();
-    RebuildOnChange::key_from(source, move |live| {
-        let change = action.clone();
-        let live = *live;
-        WidgetPod::new(
-            Button::new(if live {
-                "Live · 5s"
-            } else {
-                "Paused · Resume"
-            })
-            .semantic_name(if live {
-                "Pause live metrics"
-            } else {
-                "Resume live metrics"
-            })
+    let theme = shared.clone();
+    widgets::Restyle::new(
+        Button::new("Live · 5s")
+            .semantic_name("Pause live metrics")
             .description("Automatic collection while the metrics view is visible")
             .appearance(ButtonAppearance::Tonal)
-            .tone(if live {
-                SemanticTone::Success
-            } else {
-                SemanticTone::Warning
-            })
-            .theme(action.theme().with_size(sui::ControlSize::Small))
+            .tone(SemanticTone::Success)
+            .theme_when(move || theme.theme_sized(sui::ControlSize::Small))
             .on_press_with_ctx(move |ctx| {
-                change.cluster_mut().set_observation_live(!live);
+                let live = action.cluster().observation.paused_at.is_none();
+                action.cluster_mut().set_observation_live(!live);
                 if !live {
-                    request_observation(&change);
+                    request_observation(&action);
                 }
                 request_metric_explorer_relayout(ctx);
             }),
-        )
-    })
+        cluster_select(shared, "dashboard live mode", |key| key.observation_live),
+        |mut button, live| {
+            button.set_label(if *live {
+                "Live · 5s"
+            } else {
+                "Paused · Resume"
+            });
+            button
+                .semantic_name(if *live {
+                    "Pause live metrics"
+                } else {
+                    "Resume live metrics"
+                })
+                .tone(if *live {
+                    SemanticTone::Success
+                } else {
+                    SemanticTone::Warning
+                })
+        },
+    )
 }

@@ -33,16 +33,16 @@ use sinomo_client::chat_contract::fallback_agent_summaries;
 use sinomo_client::skill_contract::{SkillActivateRequest, SkillExportRequest, SkillImportRequest};
 use sinomo_client::skill_contract::{SkillDetail, SkillMutationResult, SkillSummary};
 use sui::{
-    Align, Alignment, ArrangeCtx, Checkbox, Command, ConstraintQuery, ConstraintView, Constraints,
-    ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, EventPhase, FieldGroup,
-    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Label, ListItem,
-    ListView, MeasureCtx, MenuItem, NumberInput, PaintCtx, PasswordInput, ProgressBar,
-    RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel, Select, SelectionScope,
-    SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator, Size, SizedBox, Spinner,
-    Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView, TextArea, TextCommand,
-    TextDocument, TextInput, ThemeTextToken, TimerToken, Tooltip, TooltipPlacement,
-    TrailingSlotRow, VirtualList, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding,
+    Align, Alignment, ArrangeCtx, Axis, Checkbox, Command, ConstraintQuery, ConstraintView,
+    Constraints, ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, EventPhase, FieldGroup,
+    FixedPaneSplit, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, KeyedStack, Label,
+    ListItem, ListView, MeasureCtx, MenuItem, NumberInput, Observable, PaintCtx, PasswordInput,
+    Presence, ProgressBar, RebuildOnChange, Rect, RichText, ScrollState, ScrollView, SectionLabel,
+    Select, SelectionScope, SemanticRegion, SemanticTone, SemanticsCtx, SemanticsRole, Separator,
+    Signal, Size, SizedBox, Spinner, Stack, StatusBadge, Surface, SurfaceRole, Switch, SwitchView,
+    TextArea, TextCommand, TextDocument, TextInput, ThemeTextToken, TimerToken, Tooltip,
+    TooltipPlacement, TrailingSlotRow, VirtualList, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding,
 };
 
 use sinomo_runtime::config::{
@@ -93,9 +93,10 @@ use crate::backend::remote_management::{
 };
 use crate::rendering::AppRenderMode;
 use crate::state::{Shared, Tab};
-use crate::theme::{AppTextScale, AppThemeMode, Palette};
-use crate::ui::widgets;
+use crate::theme::{AppTextScale, AppThemeMode};
+use crate::ui::widgets::{self, Restyle};
 use sinomo_runtime::module::ModuleRuntimeConfigSource;
+use sui::SurfacePalette;
 
 /// Budget for each SIFS-backed section (skills, stored agents) of the full settings
 /// snapshot; past this the section reports itself unavailable instead of wedging the
@@ -460,6 +461,7 @@ struct ConfigItemStructure {
     edit_kind: ConfigEditKind,
     bool_value: Option<bool>,
     read_only: bool,
+    node_scoped: bool,
     raw_value: Value,
     schema: Option<ConfigSchema>,
 }
@@ -476,6 +478,7 @@ impl From<&ConfigItem> for ConfigItemStructure {
             edit_kind: item.edit_kind,
             bool_value: item.bool_value,
             read_only: item.read_only,
+            node_scoped: item.node_scoped,
             raw_value: item.raw_value.clone(),
             schema: item.schema.clone(),
         }
@@ -489,22 +492,16 @@ struct SettingsConnectionIssueStructure {
     tab: Tab,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SettingsConnectionStructure {
-    theme: (AppThemeMode, AppTextScale),
     mode_label: String,
     status_detail: String,
     issues: Vec<SettingsConnectionIssueStructure>,
     expanded: Vec<Tab>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SettingsNodeStructure {
-    theme: (AppThemeMode, AppTextScale),
-    node_id: String,
-    role: String,
-    mode_label: String,
-    status_detail: String,
     clustered: bool,
     cluster_node_id: Option<String>,
     cluster_summary: Option<String>,
@@ -512,54 +509,29 @@ struct SettingsNodeStructure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SettingsSifsMountStructure {
-    theme: (AppThemeMode, AppTextScale),
     snapshot: SifsMountSettingsSnapshot,
-    form_flags: (bool, bool, bool, bool),
-    action_error: Option<String>,
-    action_status: Option<String>,
+    form: SifsMountForm,
     pending: bool,
+    dirty: bool,
     ui_revision: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SettingsSifsMountEditorStructure {
-    theme: (AppThemeMode, AppTextScale),
-    config: SifsMountConfig,
-    config_error: Option<String>,
-    form_flags: (bool, bool, bool, bool),
-    action_error: Option<String>,
-    action_status: Option<String>,
-    ui_revision: u64,
-}
-
-impl From<&SettingsSifsMountStructure> for SettingsSifsMountEditorStructure {
-    fn from(structure: &SettingsSifsMountStructure) -> Self {
-        Self {
-            theme: structure.theme,
-            config: structure.snapshot.config.clone(),
-            config_error: structure.snapshot.config_error.clone(),
-            form_flags: structure.form_flags,
-            action_error: structure.action_error.clone(),
-            action_status: structure.action_status.clone(),
-            ui_revision: structure.ui_revision,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SettingsClusterStructure {
-    theme: (AppThemeMode, AppTextScale),
     clustered: bool,
     cluster_summary: Option<String>,
+    cluster_id: Option<String>,
     invite: Option<(String, String, String, String)>,
     leave_confirming: bool,
     join_confirming: bool,
+    join_invite: String,
+    pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SettingsRemoteManagementStructure {
+    local: bool,
     external_integrations: (Option<String>, Option<String>, bool, bool),
-    theme: (AppThemeMode, AppTextScale),
     snapshot: RemoteManagementSettingsSnapshot,
     permission_error: Option<String>,
     permission_status: Option<String>,
@@ -570,52 +542,83 @@ struct SettingsRemoteManagementStructure {
     module_pending: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct SettingsConfigurationStructure {
-    theme: (AppThemeMode, AppTextScale),
+    error: Option<String>,
     items: Vec<ConfigItemStructure>,
-    query: String,
+    /// Owner groups of catalog indices that pass the search and the overrides filter.
+    groups: Vec<(String, Vec<usize>)>,
+    query_empty: bool,
     overrides_only: bool,
     controls_revision: u64,
     expanded: Vec<String>,
     ui_revision: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct SettingsProviderStructure {
-    theme: (AppThemeMode, AppTextScale),
     add_open: bool,
     add_provider_index: usize,
+    add_auth: ProviderAddAuth,
     action_error: Option<String>,
     action_status: Option<ProviderActionStatus>,
     remove_confirming: Option<(String, String)>,
     usage_expanded: Vec<String>,
     expanded: Vec<String>,
     providers: Vec<(ProviderForm, ProviderHealthState)>,
+    pending: bool,
+}
+
+/// How a provider being added signs in; picks the add form's authentication row.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProviderAddAuth {
+    #[default]
+    DeviceLogin,
+    ApiKey,
+    None,
+}
+
+impl ProviderAddAuth {
+    fn index(self) -> usize {
+        match self {
+            ProviderAddAuth::DeviceLogin => 0,
+            ProviderAddAuth::ApiKey => 1,
+            ProviderAddAuth::None => 2,
+        }
+    }
+}
+
+/// What the agent detail pane shows: the editor for a custom or unsaved agent, a read-only
+/// summary of a runtime-supplied one, or a prompt to pick an agent.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum SettingsAgentDetail {
+    Editor,
+    ReadOnly(Box<AgentDefinition>),
+    #[default]
+    Empty,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SettingsAgentMcpServerRow {
+    ui_id: u64,
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 struct SettingsAgentsStructure {
-    theme: (AppThemeMode, AppTextScale),
     agents: Vec<AgentConfigSummary>,
     error: Option<String>,
     selected_id: Option<String>,
-    delete_confirming: Option<String>,
+    detail_open: bool,
+    delete_confirming: bool,
     validation_report: Option<AgentValidationReport>,
     editor_previous_id: Option<String>,
+    detail: SettingsAgentDetail,
     editor_tools: Vec<AgentToolSpec>,
-    editor_mcp_servers: Vec<(u64, bool, bool)>,
-    external_integrations_enabled: bool,
-    external_integrations_error: Option<String>,
-    external_integrations_status: Option<String>,
-    external_integrations_confirming: bool,
-    external_integrations_pending: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SettingsAgentRow {
-    theme: (AppThemeMode, AppTextScale),
-    agent: AgentConfigSummary,
+    available_tools: Vec<String>,
+    editor_mcp_servers: Vec<SettingsAgentMcpServerRow>,
+    pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -642,13 +645,14 @@ struct SettingsModuleSummaryStructure {
 #[derive(Clone, Debug, PartialEq)]
 struct SettingsSelectedModuleNodeStructure {
     node_id: String,
+    display_name: String,
+    availability: String,
     error: Option<String>,
     config: Vec<(String, bool)>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct SettingsModulesStructure {
-    theme: (AppThemeMode, AppTextScale),
     selected_node_id: Option<String>,
     action_error: Option<String>,
     action_status: Option<String>,
@@ -661,20 +665,14 @@ struct SettingsModulesStructure {
     module_settings: Vec<ConfigItemStructure>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SettingsSkillsStructure {
-    theme: (AppThemeMode, AppTextScale),
+    pending: bool,
     include_all: bool,
     selected: Option<(String, String)>,
     detail_content_hash: Option<String>,
     text_expanded: bool,
     skills: Vec<SkillSummary>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SettingsSkillRow {
-    theme: (AppThemeMode, AppTextScale),
-    skill: SkillSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -684,11 +682,23 @@ struct SettingsDeviceLoginStructure {
     error: bool,
 }
 
+/// An error and a status message for one settings surface.
+type SettingsFeedback = (Option<String>, Option<String>);
+
+/// Action feedback for each surface, so feedback rows update in place.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SettingsFeedbackStructure {
+    agent: SettingsFeedback,
+    sifs_mount: SettingsFeedback,
+    cluster: SettingsFeedback,
+    provider_add: SettingsFeedback,
+    skill: SettingsFeedback,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct SettingsStructureSnapshot {
     node_target: (Option<String>, bool, Option<String>),
     selected: Option<SettingsSection>,
-    theme: (AppThemeMode, AppTextScale),
     navigation_previews: Vec<(SettingsSection, String)>,
     connection: SettingsConnectionStructure,
     node: SettingsNodeStructure,
@@ -701,6 +711,7 @@ struct SettingsStructureSnapshot {
     modules: SettingsModulesStructure,
     skills: SettingsSkillsStructure,
     device_logins: Vec<SettingsDeviceLoginStructure>,
+    feedback: SettingsFeedbackStructure,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -712,11 +723,9 @@ impl SettingsStructureKey {
     }
 }
 
+/// Project the settings state that retained widgets bind to. Theme changes are not part of it:
+/// widgets read the theme live and the shell re-lays them out when it changes.
 pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
-    let theme = {
-        let app = shared.borrow();
-        (app.theme_mode, app.text_scale)
-    };
     let issues = connection_issues(shared)
         .into_iter()
         .map(|issue| SettingsConnectionIssueStructure {
@@ -725,20 +734,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             tab: issue.tab,
         })
         .collect();
-    let (
-        selected,
-        connection,
-        node,
-        sifs_mount,
-        remote_management,
-        cluster,
-        configuration,
-        providers,
-        agents,
-        modules,
-        skills,
-        device_login_count,
-    ) = {
+    let mut snapshot = {
         let settings = shared.settings();
         let invite = settings.invite_result.as_ref().map(|invite| {
             (
@@ -749,22 +745,29 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             )
         });
         let configuration = SettingsConfigurationStructure {
-            theme,
+            error: settings.config_error.clone(),
             items: settings
                 .config_items
                 .iter()
                 .map(ConfigItemStructure::from)
                 .collect(),
-            query: settings.advanced_query.clone(),
+            groups: visible_config_groups(&settings),
+            query_empty: settings.advanced_query.trim().is_empty(),
             overrides_only: settings.advanced_overrides_only,
             controls_revision: settings.advanced_controls_revision,
             expanded: settings.advanced_detail_expanded.clone(),
             ui_revision: settings.config_ui_revision,
         };
         let providers = SettingsProviderStructure {
-            theme,
             add_open: settings.provider_add_open,
             add_provider_index: settings.provider_add_provider_index,
+            add_auth: if settings.provider_add_uses_device_login() {
+                ProviderAddAuth::DeviceLogin
+            } else if settings.provider_add_requires_api_key() {
+                ProviderAddAuth::ApiKey
+            } else {
+                ProviderAddAuth::None
+            },
             action_error: settings.provider_action_error.clone(),
             action_status: settings.provider_action_status.clone(),
             remove_confirming: settings.provider_remove_confirming.clone(),
@@ -776,43 +779,64 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                 .map(|form| {
                     (
                         form.clone(),
-                        settings
-                            .provider_health(&form.provider, &form.account)
-                            .clone(),
+                        settings.provider_health(&form.provider, &form.account),
                     )
                 })
                 .collect(),
+            pending: settings.domain_pending(SettingsOperationDomain::Providers),
         };
+        let selected_definition = settings.agent_snapshot.selected_agent.clone();
         let agents = SettingsAgentsStructure {
-            theme,
             agents: settings.agent_snapshot.agents.clone(),
             error: settings.agent_snapshot.error.clone(),
             selected_id: settings.agent_selected_id.clone(),
-            delete_confirming: settings.agent_delete_confirming.clone(),
+            detail_open: settings.agent_detail_open,
+            delete_confirming: settings
+                .agent_form
+                .previous_id
+                .as_ref()
+                .is_some_and(|id| settings.agent_delete_confirming.as_ref() == Some(id)),
             validation_report: settings.agent_validation_report.clone(),
             editor_previous_id: settings.agent_form.previous_id.clone(),
+            detail: if settings.agent_form.previous_id.is_none()
+                || selected_definition
+                    .as_ref()
+                    .is_some_and(agent_definition_is_editable)
+            {
+                SettingsAgentDetail::Editor
+            } else if let Some(definition) = selected_definition {
+                SettingsAgentDetail::ReadOnly(Box::new(definition))
+            } else {
+                SettingsAgentDetail::Empty
+            },
             editor_tools: settings.agent_form.definition.tools.clone(),
+            available_tools: available_agent_tool_specs(
+                &settings.agent_snapshot.available_tools,
+                &settings.agent_form.definition.tools,
+            )
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
             editor_mcp_servers: settings
                 .agent_form
                 .mcp_servers
                 .iter()
-                .map(|server| (server.ui_id, server.enabled, server.required))
+                .map(|server| SettingsAgentMcpServerRow {
+                    ui_id: server.ui_id,
+                    name: server.name.clone(),
+                    enabled: server.enabled,
+                })
                 .collect(),
-            external_integrations_enabled: settings.remote_management.external_integrations_enabled,
-            external_integrations_error: settings.external_integrations_permission_error.clone(),
-            external_integrations_status: settings.external_integrations_permission_status.clone(),
-            external_integrations_confirming: settings.external_integrations_enable_confirming,
-            external_integrations_pending: settings.external_integrations_permission_pending(),
+            pending: settings.domain_pending(SettingsOperationDomain::Agents),
         };
-        let snapshot = &settings.module_snapshot;
+        let module_snapshot = &settings.module_snapshot;
         let modules = SettingsModulesStructure {
-            theme,
             selected_node_id: settings.module_selected_node_id.clone(),
             action_error: settings.module_action_error.clone(),
             action_status: settings.module_action_status.clone(),
-            warnings: snapshot.warnings.clone(),
+            warnings: module_snapshot.warnings.clone(),
             config_ui_revision: settings.config_ui_revision,
-            nodes: snapshot
+            nodes: module_snapshot
                 .nodes
                 .iter()
                 .map(|node| SettingsModuleNodeStructure {
@@ -822,7 +846,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                     local: node.local,
                 })
                 .collect(),
-            modules: snapshot
+            modules: module_snapshot
                 .modules
                 .iter()
                 .map(|module| SettingsModuleSummaryStructure {
@@ -837,15 +861,17 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                     observed_detail: module.observed_detail.clone(),
                 })
                 .collect(),
-            cluster_config: snapshot
+            cluster_config: module_snapshot
                 .cluster_config
                 .modules
                 .iter()
                 .map(|(module_id, setting)| (module_id.clone(), setting.enabled))
                 .collect(),
-            selected_node: snapshot.selected_node.as_ref().map(|node| {
+            selected_node: module_snapshot.selected_node.as_ref().map(|node| {
                 SettingsSelectedModuleNodeStructure {
                     node_id: node.summary.node_id.clone(),
+                    display_name: node.summary.display_name.clone(),
+                    availability: node.summary.availability.clone(),
                     error: node.error.clone(),
                     config: node
                         .config
@@ -863,7 +889,7 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                 .collect(),
         };
         let skills = SettingsSkillsStructure {
-            theme,
+            pending: settings.domain_pending(SettingsOperationDomain::Skills),
             include_all: settings.skills_include_all,
             selected: settings.skill_selected.clone(),
             detail_content_hash: settings
@@ -873,47 +899,68 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             text_expanded: settings.skill_text_expanded,
             skills: settings.skills.clone(),
         };
-        (
-            settings.selected,
-            SettingsConnectionStructure {
-                theme,
+        let feedback = SettingsFeedbackStructure {
+            agent: (
+                settings.agent_action_error.clone(),
+                settings.agent_action_status.clone(),
+            ),
+            sifs_mount: (
+                settings.sifs_mount_action_error.clone(),
+                settings.sifs_mount_action_status.clone(),
+            ),
+            cluster: (
+                settings.cluster_action_error.clone(),
+                settings.cluster_action_status.clone(),
+            ),
+            provider_add: (
+                settings
+                    .provider_add_error
+                    .clone()
+                    .or_else(|| settings.provider_action_error.clone()),
+                settings
+                    .provider_action_status
+                    .as_ref()
+                    .map(|status| status.message.clone()),
+            ),
+            skill: (
+                settings.skill_action_error.clone(),
+                settings.skill_action_status.clone(),
+            ),
+        };
+        SettingsStructureSnapshot {
+            node_target: (
+                settings.module_selected_node_id.clone(),
+                settings.node_settings_loading,
+                settings.node_settings_error.clone(),
+            ),
+            selected: settings.selected,
+            navigation_previews: Vec::new(),
+            connection: SettingsConnectionStructure {
                 mode_label: settings.mode_label.clone(),
                 status_detail: settings.status_detail.clone(),
                 issues,
                 expanded: settings.connection_detail_expanded.clone(),
             },
-            SettingsNodeStructure {
-                theme,
-                node_id: settings.node_id.clone(),
-                role: settings.role.clone(),
-                mode_label: settings.mode_label.clone(),
-                status_detail: settings.status_detail.clone(),
+            node: SettingsNodeStructure {
                 clustered: settings.clustered,
                 cluster_node_id: settings.cluster_node_id.clone(),
                 cluster_summary: settings.cluster_summary.clone(),
             },
-            SettingsSifsMountStructure {
-                theme,
+            sifs_mount: SettingsSifsMountStructure {
                 snapshot: settings.sifs_mount_snapshot.clone(),
-                form_flags: (
-                    settings.sifs_mount_form.enabled,
-                    settings.sifs_mount_form.read_only,
-                    settings.sifs_mount_form.allow_other,
-                    settings.sifs_mount_form.sync_local_changes,
-                ),
-                action_error: settings.sifs_mount_action_error.clone(),
-                action_status: settings.sifs_mount_action_status.clone(),
+                form: settings.sifs_mount_form.clone(),
                 pending: settings.sifs_mount_pending(),
+                dirty: settings.sifs_mount_dirty(),
                 ui_revision: settings.sifs_mount_ui_revision,
             },
-            SettingsRemoteManagementStructure {
+            remote_management: SettingsRemoteManagementStructure {
+                local: settings.selected_settings_node_is_local(),
                 external_integrations: (
                     settings.external_integrations_permission_error.clone(),
                     settings.external_integrations_permission_status.clone(),
                     settings.external_integrations_enable_confirming,
                     settings.external_integrations_permission_pending(),
                 ),
-                theme,
                 snapshot: settings.remote_management.clone(),
                 permission_error: settings.remote_management_permission_error.clone(),
                 permission_status: settings.remote_management_permission_status.clone(),
@@ -923,23 +970,26 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
                 permission_pending: settings.remote_management_permission_pending(),
                 module_pending: settings.remote_management_module_pending(),
             },
-            SettingsClusterStructure {
-                theme,
+            cluster: SettingsClusterStructure {
                 clustered: settings.clustered,
                 cluster_summary: settings.cluster_summary.clone(),
+                cluster_id: settings.cluster_id.clone(),
                 invite,
                 leave_confirming: settings.leave_confirming,
                 join_confirming: settings.join_confirming,
+                join_invite: settings.join_invite.clone(),
+                pending: settings.domain_pending(SettingsOperationDomain::Cluster),
             },
             configuration,
             providers,
             agents,
             modules,
             skills,
-            settings.provider_forms.len(),
-        )
+            device_logins: Vec::new(),
+            feedback,
+        }
     };
-    let device_logins = (0..device_login_count)
+    snapshot.device_logins = (0..snapshot.providers.providers.len())
         .map(|index| {
             let (primary, prompt_url) = device_login_lines(shared, index);
             SettingsDeviceLoginStructure {
@@ -949,34 +999,11 @@ pub(crate) fn settings_structure_key(shared: &Shared) -> SettingsStructureKey {
             }
         })
         .collect();
-    let navigation_previews = SettingsSection::ALL
+    snapshot.navigation_previews = SettingsSection::ALL
         .into_iter()
         .map(|section| (section, section_preview(shared, section)))
         .collect();
-    SettingsStructureKey(Some(Box::new(SettingsStructureSnapshot {
-        node_target: {
-            let settings = shared.settings();
-            (
-                settings.module_selected_node_id.clone(),
-                settings.node_settings_loading,
-                settings.node_settings_error.clone(),
-            )
-        },
-        selected,
-        theme,
-        navigation_previews,
-        connection,
-        node,
-        sifs_mount,
-        remote_management,
-        cluster,
-        configuration,
-        providers,
-        agents,
-        modules,
-        skills,
-        device_logins,
-    })))
+    SettingsStructureKey(Some(Box::new(snapshot)))
 }
 
 /// Independent generations keep a slow preload or operation result from replacing newer state in
@@ -1199,6 +1226,12 @@ enum SettingsOperation {
         config: SifsMountConfig,
     },
     RefreshRemoteManagement,
+    #[cfg(target_os = "android")]
+    OpenAndroidMediaSettings,
+    SetDeviceExposure {
+        kind: String,
+        enabled: bool,
+    },
     SetRemoteManagementPermission {
         enabled: bool,
     },
@@ -2620,6 +2653,16 @@ impl SettingsState {
                 self.external_integrations_permission_error = None;
                 self.external_integrations_permission_status = None;
             }
+            #[cfg(target_os = "android")]
+            SettingsOperation::OpenAndroidMediaSettings => {
+                self.remote_management_permission_error = None;
+                self.remote_management_permission_status =
+                    Some("Opening Android App Use setup…".into());
+            }
+            SettingsOperation::SetDeviceExposure { .. } => {
+                self.remote_management_permission_error = None;
+                self.remote_management_permission_status = Some("Updating device sharing…".into());
+            }
             SettingsOperation::SetRemoteManagementPermission { enabled } => {
                 self.remote_management_permission_error = None;
                 self.remote_management_permission_status = Some(if *enabled {
@@ -3141,10 +3184,6 @@ impl SettingsState {
         }
     }
 
-    fn connection_detail_expanded(&self, tab: Tab) -> bool {
-        self.connection_detail_expanded.contains(&tab)
-    }
-
     fn toggle_connection_detail(&mut self, tab: Tab) {
         if let Some(index) = self
             .connection_detail_expanded
@@ -3195,12 +3234,6 @@ impl SettingsState {
         self.advanced_controls_revision = self.advanced_controls_revision.wrapping_add(1);
     }
 
-    fn advanced_detail_expanded(&self, key: &str) -> bool {
-        self.advanced_detail_expanded
-            .iter()
-            .any(|expanded| expanded == key)
-    }
-
     fn toggle_advanced_detail(&mut self, key: &str) {
         if let Some(index) = self
             .advanced_detail_expanded
@@ -3218,17 +3251,11 @@ impl SettingsState {
         self.provider_add_error = None;
     }
 
+    #[cfg(test)]
     fn provider_remove_confirming(&self, provider: &str, account: &str) -> bool {
         self.provider_remove_confirming
             .as_ref()
             .is_some_and(|(p, a)| p == provider && a == account)
-    }
-
-    fn provider_detail_expanded(&self, provider: &str, account: &str) -> bool {
-        let key = provider_account_key(provider, account);
-        self.provider_detail_expanded
-            .iter()
-            .any(|expanded| expanded == &key)
     }
 
     fn toggle_provider_detail(&mut self, provider: &str, account: &str) {
@@ -3242,13 +3269,6 @@ impl SettingsState {
         } else {
             self.provider_detail_expanded.push(key);
         }
-    }
-
-    fn provider_usage_expanded(&self, provider: &str, account: &str) -> bool {
-        let key = provider_account_key(provider, account);
-        self.provider_usage_expanded
-            .iter()
-            .any(|expanded| expanded == &key)
     }
 
     fn toggle_provider_usage(&mut self, provider: &str, account: &str) {
@@ -4643,6 +4663,38 @@ fn execute_settings_operation(
                 },
             ))
         }
+        #[cfg(target_os = "android")]
+        SettingsOperation::OpenAndroidMediaSettings => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                crate::android_media::request("app-use")?;
+                let permissions =
+                    sinomo_runtime::node::LocalNodePermissionStore::new(backend.data_dir.root())
+                        .load()
+                        .map_err(|error| error.to_string())?;
+                Ok(RemoteManagementOperationSuccess::PermissionChanged {
+                    permissions,
+                    target: LocalPermissionTarget::RemoteManagement,
+                    message: "App Use setup opened on this device".into(),
+                })
+            })())
+        }
+        SettingsOperation::SetDeviceExposure { kind, enabled } => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                #[cfg(target_os = "android")]
+                if enabled && matches!(kind.as_str(), "microphone" | "camera") {
+                    crate::android_media::request(&kind)?;
+                }
+                let mutation = backend.set_local_device_exposure(&kind, enabled)?;
+                Ok(RemoteManagementOperationSuccess::PermissionChanged {
+                    permissions: mutation.permissions,
+                    target: LocalPermissionTarget::RemoteManagement,
+                    message: format!(
+                        "{kind} sharing {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                })
+            })())
+        }
         SettingsOperation::SetRemoteManagementPermission { enabled } => {
             SettingsOperationPayload::RemoteManagement((|| {
                 let mutation = backend.set_local_remote_management_permission(enabled)?;
@@ -5805,14 +5857,13 @@ fn skill_catalog_row(shared: &Shared, skill: &SkillSummary) -> TrailingSlotRow {
     TrailingSlotRow::new(body, SizedBox::new())
 }
 
-/// Keep custom virtual-list content clear of the leading selection indicator. Canonical SUI has
-/// this behavior in `3a37e31`; the public GitHub dependency can drop this wrapper once it contains
-/// that change.
-fn padded_virtual_list_row<W>(reader: &ThemeReader, child: W) -> WidgetPadding
+/// Keep custom virtual-list content clear of the leading selection indicator, inset by the
+/// theme's data row padding.
+fn padded_virtual_list_row<W>(reader: &ThemeReader, child: W) -> ThemedPadding
 where
     W: Widget + 'static,
 {
-    WidgetPadding::new(reader().metrics.data_row_padding, child).fill_child_width(true)
+    ThemedPadding::new(reader, |theme| theme.metrics.data_row_padding, child)
 }
 
 fn provider_model_label(form: &ProviderForm) -> String {
@@ -6005,49 +6056,131 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
 }
 
 /// Resolve the app chrome palette for the current theme.
-fn palette(shared: &Shared) -> Palette {
-    Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
+fn palette(shared: &Shared) -> SurfacePalette {
+    shared.theme().surfaces
 }
 
-/// A muted `Label` whose color tracks the theme.
-fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
-    let token = shared.theme().text.base;
-    muted_label_with_token(shared, text, token)
+/// A step on the theme's type ramp. Labels resolve it whenever they lay out, so a text-size
+/// change restyles them in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextSize {
+    Xs,
+    Sm,
+    Base,
+    Lg,
+    Xl,
 }
 
-fn settings_text_style(shared: &Shared, token: ThemeTextToken) -> sui::TextStyle {
-    sui::TextStyle {
-        font_size: token.size,
-        line_height: token.line_height,
-        ..shared.theme().body_text_style()
+impl TextSize {
+    fn token(self, theme: &DefaultTheme) -> ThemeTextToken {
+        match self {
+            TextSize::Xs => theme.text.xs,
+            TextSize::Sm => theme.text.sm,
+            TextSize::Base => theme.text.base,
+            TextSize::Lg => theme.text.lg,
+            TextSize::Xl => theme.text.xl,
+        }
     }
 }
 
-fn settings_label(shared: &Shared, text: impl Into<String>, token: ThemeTextToken) -> Label {
+/// The settings body text style at `size`, from the current theme.
+fn settings_text_style(shared: &Shared, size: TextSize) -> sui::TextStyle {
+    let theme = shared.theme();
+    let token = size.token(&theme);
+    sui::TextStyle {
+        font_size: token.size,
+        line_height: token.line_height,
+        ..theme.body_text_style()
+    }
+}
+
+/// A `Label` in the settings text style at `size`, in the primary text color.
+fn settings_label(shared: &Shared, text: impl Into<String>, size: TextSize) -> Label {
+    let style = shared.clone();
     let color = shared.clone();
     Label::new(text)
-        .text_style(settings_text_style(shared, token))
+        .text_style_when(move || settings_text_style(&style, size))
         .color_when(move || palette(&color).text)
 }
 
-fn muted_label_with_token(
-    shared: &Shared,
-    text: impl Into<String>,
-    token: ThemeTextToken,
-) -> Label {
-    let s = shared.clone();
-    settings_label(shared, text, token).color_when(move || palette(&s).text_muted)
+/// Style `label` as muted settings text at `size`.
+fn muted_text(shared: &Shared, label: Label, size: TextSize) -> Label {
+    let style = shared.clone();
+    let color = shared.clone();
+    label
+        .text_style_when(move || settings_text_style(&style, size))
+        .color_when(move || palette(&color).text_muted)
+}
+
+/// A muted `Label` whose style and color track the theme.
+fn muted_label(shared: &Shared, text: impl Into<String>) -> Label {
+    muted_label_with_token(shared, text, TextSize::Base)
+}
+
+fn muted_label_with_token(shared: &Shared, text: impl Into<String>, size: TextSize) -> Label {
+    muted_text(shared, Label::new(text), size)
 }
 
 fn muted_meta_label(shared: &Shared, text: impl Into<String>) -> Label {
-    let token = shared.theme().text.sm;
-    muted_label_with_token(shared, text, token)
+    muted_label_with_token(shared, text, TextSize::Sm)
 }
 
 fn primary_label(shared: &Shared, text: impl Into<String>) -> Label {
-    let s = shared.clone();
-    let token = shared.theme().text.base;
-    settings_label(shared, text, token).color_when(move || palette(&s).text)
+    settings_label(shared, text, TextSize::Base)
+}
+
+/// A projection of the settings structure bound to retained widgets.
+type SettingsProjection<U> = sui::Selector<Signal<SettingsStructureKey>, SettingsStructureKey, U>;
+
+/// Project one value out of the settings structure. A widget bound to the projection updates in
+/// place, and only when the projected value changes.
+fn settings_projection<U>(
+    shared: &Shared,
+    name: &'static str,
+    select: impl Fn(&SettingsStructureSnapshot) -> U + Send + Sync + 'static,
+) -> SettingsProjection<U>
+where
+    U: Clone + PartialEq + Default + Send + Sync + 'static,
+{
+    shared
+        .signals()
+        .settings_structure
+        .select_named(name, move |key| {
+            key.0.as_deref().map(&select).unwrap_or_default()
+        })
+}
+
+/// Derive another value from a projection, under the same equality rules.
+fn derived<S, I, O>(
+    source: S,
+    name: &'static str,
+    select: impl Fn(&I) -> O + Send + Sync + 'static,
+) -> sui::Selector<S, I, O>
+where
+    S: Observable<I>,
+{
+    sui::Selector::new(name, source, select)
+}
+
+/// Show `child` while `shown` holds; the space it takes grows and shrinks with it.
+fn revealed<W>(child: W, shown: impl Observable<bool> + 'static) -> Presence
+where
+    W: Widget + 'static,
+{
+    Presence::new(child)
+        .transition(crate::ui::widgets::reveal_transition())
+        .shown_from(shown)
+        .collapse(Axis::Vertical)
+}
+
+/// Keep a leaf control mounted and re-measured whenever `source` changes, so its `*_when`
+/// readers pick up the new state.
+fn follow<W, K>(control: W, source: impl Observable<K> + 'static) -> Restyle<W, K>
+where
+    W: Widget,
+    K: Clone + PartialEq + 'static,
+{
+    Restyle::new(control, source, |control, _| control)
 }
 
 /// Fill the value column and align compact controls to the section's right edge.
@@ -6070,86 +6203,73 @@ fn value_row(
     label: &str,
     value: impl Into<String>,
 ) -> FormRow {
-    let value = value.into();
-    let shared = shared.clone();
-    let document = move || {
-        let mut style = settings_text_style(&shared, shared.theme().text.base);
-        style.color = palette(&shared).text_muted;
-        let mut document = TextDocument::from_plain_text(value.clone(), style);
-        for paragraph in &mut document.paragraphs {
-            paragraph.style.align = sui::TextAlign::Right;
-        }
-        document
-    };
-    let value = RichText::new(document()).document_when(document);
-    inline_row(label, value).theme_when(clone_reader(reader))
+    inline_row(label, value_text(shared, value)).theme_when(clone_reader(reader))
+}
+
+/// [`value_row`] whose value follows `value`.
+fn value_row_from<O>(shared: &Shared, reader: &ThemeReader, label: &str, value: O) -> FormRow
+where
+    O: Observable<String> + Clone + 'static,
+{
+    inline_row(label, value_text_from(shared, value)).theme_when(clone_reader(reader))
 }
 
 /// Feedback changes frequently while editing. Keep it in a retained switch so an update never
 /// replaces sibling text controls and invalidates their focus or caret state.
-fn feedback_slot<E, S>(
+fn feedback_slot(
     shared: &Shared,
     reader: &ThemeReader,
-    error_when: E,
-    status_when: S,
-) -> SwitchView
-where
-    E: Fn(&SettingsState) -> Option<String> + 'static,
-    S: Fn(&SettingsState) -> Option<String> + 'static,
-{
-    let error: Rc<dyn Fn() -> Option<String>> = {
-        let s = shared.clone();
-        Rc::new(move || error_when(&s.settings()))
-    };
-    let status: Rc<dyn Fn() -> Option<String>> = {
-        let s = shared.clone();
-        Rc::new(move || status_when(&s.settings()))
-    };
+    select: impl Fn(&SettingsStructureSnapshot) -> SettingsFeedback + Send + Sync + 'static,
+) -> SwitchView {
+    let feedback = settings_projection(shared, "settings feedback", select);
+    let error = derived(feedback.clone(), "settings feedback error", |(error, _)| {
+        error.clone().unwrap_or_default()
+    });
+    let status = derived(
+        feedback.clone(),
+        "settings feedback status",
+        |(_, status)| status.clone().unwrap_or_default(),
+    );
+    let selected = derived(feedback, "settings feedback slot", |(error, status)| {
+        if error.is_some() {
+            1
+        } else if status.is_some() {
+            2
+        } else {
+            0
+        }
+    });
     let error_selection = SelectionScope::new();
-    let error_style = {
-        let mut style = settings_text_style(shared, shared.theme().text.base);
-        style.color = palette(shared).danger_text;
-        style
+    let error_document = {
+        let error = error.clone();
+        let s = shared.clone();
+        move || {
+            let mut style = settings_text_style(&s, TextSize::Base);
+            style.color = palette(&s).bad_text;
+            TextDocument::from_plain_text(error.get(), style)
+        }
     };
-    let error_text = RichText::new(TextDocument::from_plain_text("", error_style))
-        .document_when({
-            let error = Rc::clone(&error);
-            let s = shared.clone();
-            move || {
-                let mut style = settings_text_style(&s, s.theme().text.base);
-                style.color = palette(&s).danger_text;
-                TextDocument::from_plain_text(error().unwrap_or_default(), style)
-            }
-        })
-        .semantic_name("Settings error")
-        .selectable(error_selection.clone())
-        .copy_to_clipboard(true);
+    let error_text = follow(
+        RichText::new(error_document())
+            .document_when(error_document)
+            .semantic_name("Settings error")
+            .selectable(error_selection.clone())
+            .copy_to_clipboard(true),
+        error,
+    );
     let error_text =
         read_only_text_menu(reader, "settings-error", error_text, error_selection, true);
-    let status_label = Label::new("Settings status")
-        .text_when({
-            let status = Rc::clone(&status);
-            move || status().unwrap_or_default()
-        })
-        .text_style(settings_text_style(shared, shared.theme().text.base))
-        .color_when({
-            let s = shared.clone();
-            move || palette(&s).text_muted
-        });
+    let status_label = muted_text(
+        shared,
+        Label::new(status.get()).text_from(status),
+        TextSize::Base,
+    );
 
     SwitchView::new()
         .with_child(SizedBox::new().height(0.0))
         .with_child(inline_row("Error", error_text).theme_when(clone_reader(reader)))
         .with_child(inline_row("Status", status_label).theme_when(clone_reader(reader)))
-        .selected_when(move || {
-            if error().is_some() {
-                1
-            } else if status().is_some() {
-                2
-            } else {
-                0
-            }
-        })
+        .selected_from(selected)
 }
 
 #[derive(Clone)]
@@ -6383,7 +6503,7 @@ fn copyable_text_row(
             .wrap(FlexWrap::Wrap)
             .gap(8.0)
             .align_items(Alignment::Center)
-            .with_item(input, FlexItem::fill().min_width(220.0))
+            .with_item(input, FlexItem::fill())
             .with_item(copy, FlexItem::new().no_shrink()),
     )
     .stacked()
@@ -6501,7 +6621,6 @@ where
         }
     })
 }
-
 /// A toggle row: `label` + a `Switch` seeded `on`, calling `on_toggle` when flipped.
 fn switch_row<F>(reader: &ThemeReader, label: &str, on: bool, on_toggle: F) -> FormRow
 where
@@ -6512,47 +6631,6 @@ where
         .theme_when(clone_reader(reader))
         .on_change(on_toggle);
     inline_row(label, switch).theme_when(clone_reader(reader))
-}
-
-/// A text-field row: `label` + a `TextInput` seeded with `value` (writing through on each change).
-fn text_row<F>(
-    reader: &ThemeReader,
-    name: &str,
-    label: &str,
-    value: impl Into<String>,
-    placeholder: &str,
-    on_change: F,
-) -> FormRow
-where
-    F: FnMut(String) + 'static,
-{
-    let input = TextInput::new(name)
-        .min_width(FIELD_INPUT_MIN_W)
-        .value(value)
-        .placeholder(placeholder)
-        .theme_when(clone_reader(reader))
-        .on_change(on_change);
-    inline_row(label, input).theme_when(clone_reader(reader))
-}
-
-fn password_row<F>(
-    reader: &ThemeReader,
-    name: &str,
-    label: &str,
-    value: impl Into<String>,
-    placeholder: &str,
-    on_change: F,
-) -> FormRow
-where
-    F: FnMut(String) + 'static,
-{
-    let input = PasswordInput::new(name)
-        .min_width(FIELD_INPUT_MIN_W)
-        .value(value)
-        .placeholder(placeholder)
-        .theme_when(clone_reader(reader))
-        .on_change(on_change);
-    inline_row(label, input).theme_when(clone_reader(reader))
 }
 
 /// A dropdown row: `label` + a `Select` over `options`, its selection read reactively.
@@ -6770,7 +6848,7 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     let preview = settings_label(
         shared,
         "Clear thinking starts with readable text.",
-        shared.theme().text.lg,
+        TextSize::Lg,
     );
 
     let theme_and_text = SettingsCard::new("Theme and text")
@@ -6804,64 +6882,99 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         .with_child(display)
 }
 
+/// Connection status first, since that is why people usually open this page, then the app build
+/// and diagnostics. Identifiers stay behind "Show details". Connection changes update the page in
+/// place; recovery issues are keyed by the surface they affect.
 fn section_system(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings system structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.connection.clone())
-        });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        WidgetPod::new(section_system_body(&s, &r))
-    })
+    section_system_body(shared, reader)
 }
 
-/// Connection status first, since that is why people usually open this page, then the app build
-/// and diagnostics. Identifiers stay behind "Show details".
 fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (
-        version,
-        mode_label,
-        status_detail,
-        app_surface_id,
-        surface_role,
-        cluster_node_id,
-        cluster_summary,
-        data_directory,
-    ) = {
+    let (version, app_surface_id, surface_role, data_directory) = {
         let settings = shared.settings();
         (
             settings.version.clone(),
-            settings.mode_label.clone(),
-            settings.status_detail.clone(),
             settings.node_id.clone(),
             app_surface_summary(&settings.role),
-            settings.cluster_node_id.clone(),
-            settings
-                .cluster_summary
-                .clone()
-                .map(|summary| short_one_line(&summary, 96))
-                .unwrap_or_else(|| {
-                    if settings.clustered {
-                        "cluster status unavailable".to_string()
-                    } else {
-                        "not clustered".to_string()
-                    }
-                }),
             settings.data_dir.root().display().to_string(),
         )
     };
     let platform = format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH);
-    let issues = connection_issues(shared);
-    let (issue_label, issue_tone) = match issues.len() {
-        0 => ("None".to_string(), SemanticTone::Success),
-        1 => ("1 needs attention".to_string(), SemanticTone::Warning),
-        count => (format!("{count} need attention"), SemanticTone::Warning),
-    };
+    let mode_label = settings_projection(shared, "settings system mode", |snapshot| {
+        snapshot.connection.mode_label.clone()
+    });
+    let status_detail = settings_projection(shared, "settings system status", |snapshot| {
+        snapshot.connection.status_detail.clone()
+    });
+    let cluster_summary = settings_projection(shared, "settings system cluster", |snapshot| {
+        snapshot
+            .node
+            .cluster_summary
+            .clone()
+            .map(|summary| short_one_line(&summary, 96))
+            .unwrap_or_else(|| {
+                if snapshot.node.clustered {
+                    "cluster status unavailable".to_string()
+                } else {
+                    "not clustered".to_string()
+                }
+            })
+    });
+    let issues = settings_projection(shared, "settings system issues", |snapshot| {
+        snapshot.connection.issues.clone()
+    });
+    let issue_label = derived(
+        issues.clone(),
+        "settings system issue label",
+        |issues: &Vec<SettingsConnectionIssueStructure>| match issues.len() {
+            0 => "None".to_string(),
+            1 => "1 needs attention".to_string(),
+            count => format!("{count} need attention"),
+        },
+    );
+    let issue_tone = derived(
+        issues.clone(),
+        "settings system issue tone",
+        |issues: &Vec<SettingsConnectionIssueStructure>| {
+            if issues.is_empty() {
+                SemanticTone::Success
+            } else {
+                SemanticTone::Warning
+            }
+        },
+    );
+    let has_issues = derived(
+        issues.clone(),
+        "settings system has issues",
+        |issues: &Vec<SettingsConnectionIssueStructure>| !issues.is_empty(),
+    );
 
-    let mut identity = vec![
+    let daemon_node_id = settings_projection(shared, "settings system daemon node", |snapshot| {
+        snapshot.node.cluster_node_id.clone()
+    });
+    let has_daemon_node = derived(
+        daemon_node_id.clone(),
+        "settings system has daemon node",
+        Option::is_some,
+    );
+    // A copyable identifier; rebuilt only if the daemon reports another node.
+    let daemon_node = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(daemon_node_id, move |node_id| {
+            WidgetPod::new(
+                SettingRow::new("Daemon node ID")
+                    .control(copy_control(
+                        &r,
+                        "system-daemon-node-id",
+                        "Daemon node ID",
+                        node_id.clone().unwrap_or_default(),
+                    ))
+                    .build(&s),
+            )
+        })
+    };
+    let identity = vec![
         widgets::Boxed::new(
             SettingRow::new("App surface ID")
                 .control(copy_control(
@@ -6877,39 +6990,28 @@ fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 .value(shared, surface_role.clone())
                 .build(shared),
         ),
+        widgets::Boxed::new(revealed(daemon_node, has_daemon_node)),
     ];
-    if let Some(cluster_node_id) = cluster_node_id {
-        identity.push(widgets::Boxed::new(
-            SettingRow::new("Daemon node ID")
-                .control(copy_control(
-                    reader,
-                    "system-daemon-node-id",
-                    "Daemon node ID",
-                    cluster_node_id,
-                ))
-                .build(shared),
-        ));
-    }
     let connection = SettingsCard::new("Connection")
         .row(
             SettingRow::new("Mode")
-                .value(shared, mode_label.clone())
+                .value_from(shared, mode_label)
                 .build(shared),
         )
         .row(
             SettingRow::new("Status")
-                .value(shared, status_detail.clone())
+                .value_from(shared, status_detail)
                 .build(shared),
         )
         .row(
             SettingRow::new("Cluster")
-                .value(shared, cluster_summary)
+                .value_from(shared, cluster_summary)
                 .build(shared),
         )
         .row(
             SettingRow::new("Recovery issues")
                 .help("Chat and file problems that need your action.")
-                .status(reader, issue_label, issue_tone)
+                .control(status_badge_from(reader, issue_label, issue_tone))
                 .build(shared),
         )
         .row(details(
@@ -6945,17 +7047,40 @@ fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         ))
         .build(shared, reader);
 
-    let short_status = short_one_line(&status_detail, 96);
-    let diagnostic_summary = format!(
-        "Sinomo App v{version}\nPlatform: {platform}\nMode: {mode_label}\nStatus: {short_status}\nApp surface: {app_surface_id}\nSurface role: {surface_role}\nData directory: {data_directory}"
+    let diagnostic_summary = settings_projection(
+        shared,
+        "settings system diagnostics",
+        move |snapshot| {
+            let mode_label = &snapshot.connection.mode_label;
+            let short_status = short_one_line(&snapshot.connection.status_detail, 96);
+            format!(
+                "Sinomo App v{version}\nPlatform: {platform}\nMode: {mode_label}\nStatus: {short_status}\nApp surface: {app_surface_id}\nSurface role: {surface_role}\nData directory: {data_directory}"
+            )
+        },
     );
     let copy_summary = {
         let summary = diagnostic_summary.clone();
         sui::Button::new(COPY_DIAGNOSTIC_SUMMARY_LABEL)
             .icon(IconGlyph::Restore)
             .theme_when(clone_reader(reader))
-            .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&summary))
+            .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(summary.get()))
     };
+    // The selectable summary text; rebuilt only when its contents change.
+    let summary_text = {
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(diagnostic_summary, move |summary| {
+            WidgetPod::new(
+                SizedBox::new()
+                    .height(112.0)
+                    .child(selectable_read_only_area(
+                        &r,
+                        "system-diagnostic-summary",
+                        summary.clone(),
+                    )),
+            )
+        })
+    };
+    let data_directory = shared.settings().data_dir.root().display().to_string();
     let diagnostics = SettingsCard::new("Diagnostics")
         .row(
             SettingRow::new("Diagnostic summary")
@@ -6978,43 +7103,75 @@ fn section_system_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             reader,
             "system-diagnostics",
             "summary text",
-            vec![widgets::Boxed::new(SizedBox::new().height(112.0).child(
-                selectable_read_only_area(reader, "system-diagnostic-summary", diagnostic_summary),
-            ))],
+            vec![widgets::Boxed::new(summary_text)],
         ))
         .build(shared, reader);
 
-    let mut page = Stack::vertical()
-        .gap(16.0)
-        .alignment(Alignment::Stretch)
-        .with_child(connection);
-    if !issues.is_empty() {
-        let mut attention = SettingsCard::new("Needs attention").description(
-            "Each of these needs your action; the daemon itself may still be connected.",
-        );
-        for issue in issues {
-            attention = attention.row(connection_issue_row(shared, reader, issue));
-        }
-        page = page.with_child(attention.build(shared, reader));
-    }
-    page.with_child(app).with_child(diagnostics)
+    let issue_rows = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        KeyedStack::vertical(
+            issues,
+            |issue: &SettingsConnectionIssueStructure| issue.title,
+            move |_, issue| {
+                let tab = issue.get().tab;
+                connection_issue_row(&s, &r, tab, issue)
+            },
+        )
+        .gap(14.0)
+    };
+    let attention = SettingsCard::new("Needs attention")
+        .description("Each of these needs your action; the daemon itself may still be connected.")
+        .row(issue_rows)
+        .build(shared, reader);
+
+    Column::new(reader, |_| 16.0)
+        .with_child(connection)
+        .with_child(revealed(attention, has_issues))
+        .with_child(app)
+        .with_child(diagnostics)
 }
 
-fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: ConnectionIssue) -> FormRow {
-    let detail = issue.detail.clone();
-    let tab = issue.tab;
-    let action = issue.action;
-    let expanded = shared.settings().connection_detail_expanded(tab);
+fn connection_issue_action(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Sinomo => "Open Chat",
+        Tab::Files => "Open Files",
+        _ => "Open Settings",
+    }
+}
+
+fn connection_issue_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    tab: Tab,
+    issue: Signal<SettingsConnectionIssueStructure>,
+) -> FormRow {
+    let as_issue = |issue: &SettingsConnectionIssueStructure| ConnectionIssue {
+        title: issue.title,
+        detail: issue.detail.clone(),
+        tab: issue.tab,
+        action: connection_issue_action(issue.tab),
+    };
+    let current = as_issue(&issue.get());
+    let expanded = settings_projection(
+        shared,
+        "settings connection issue expanded",
+        move |snapshot| snapshot.connection.expanded.contains(&tab),
+    );
     let status = {
         let s = shared.clone();
-        settings_label(shared, "Needs attention", shared.theme().text.sm)
-            .color_when(move || palette(&s).warn)
+        settings_label(shared, "Needs attention", TextSize::Sm).color_when(move || palette(&s).warn)
     };
-    let summary = muted_meta_label(shared, connection_issue_summary(&issue));
-    let recovery = muted_meta_label(shared, connection_issue_recovery_hint(&issue));
+    let summary = muted_meta_label(shared, connection_issue_summary(&current));
+    let recovery = {
+        let hint = issue.select_named("settings connection issue hint", move |issue| {
+            connection_issue_recovery_hint(&as_issue(issue)).to_string()
+        });
+        muted_text(shared, Label::new(hint.get()).text_from(hint), TextSize::Sm)
+    };
     let detail_label = {
         let s = shared.clone();
-        settings_label(shared, "Low-level detail", shared.theme().text.sm)
+        settings_label(shared, "Low-level detail", TextSize::Sm)
             .color_when(move || palette(&s).text_faint)
     };
     let detail_field = {
@@ -7023,104 +7180,127 @@ fn connection_issue_row(shared: &Shared, reader: &ThemeReader, issue: Connection
             Tab::Files => "connection-files-detail",
             _ => "connection-issue-detail",
         };
-        SizedBox::new()
-            .height(68.0)
-            .child(selectable_read_only_area(reader, name, detail))
+        let r = Rc::clone(reader);
+        // The selectable detail text; rebuilt only when the reported detail changes.
+        RebuildOnChange::key_from(
+            issue.select_named("settings connection issue detail", |issue| {
+                issue.detail.clone()
+            }),
+            move |detail| {
+                WidgetPod::new(
+                    SizedBox::new()
+                        .height(68.0)
+                        .child(selectable_read_only_area(&r, name, detail.clone())),
+                )
+            },
+        )
     };
     let button = {
         let s = shared.clone();
-        sui::Button::new(action)
+        sui::Button::new(current.action)
             .icon(tab_action_icon(tab))
             .theme_when(clone_reader(reader))
             .on_press(move || open_tab(&s, tab))
     };
-    let sifs_button = connection_issue_has_sifs_recovery(&issue).then(|| {
+    let sifs_button = {
         let s = shared.clone();
         sui::Button::new("Check SIFS")
             .icon(tab_action_icon(Tab::Files))
             .theme_when(clone_reader(reader))
             .on_press(move || open_tab(&s, Tab::Files))
-    });
+    };
     let detail_button = {
         let s = shared.clone();
-        sui::Button::new(if expanded {
-            "Hide detail"
-        } else {
-            "Show detail"
-        })
-        .icon(if expanded {
-            sui::IconGlyph::ChevronUp
-        } else {
-            sui::IconGlyph::ChevronDown
-        })
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press(move || s.settings_mut().toggle_connection_detail(tab))
+        disclosure_restyle(
+            sui::Button::new("Show detail")
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || s.settings_mut().toggle_connection_detail(tab)),
+            expanded.clone(),
+            "Show detail",
+            "Hide detail",
+        )
     };
     let header = Stack::vertical()
         .gap(3.0)
         .alignment(Alignment::Stretch)
         .with_child(status)
         .with_child(summary);
-    let mut controls = Flex::horizontal()
+    let controls = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(8.0)
         .align_items(Alignment::Start)
-        .with_child(button);
-    if let Some(sifs_button) = sifs_button {
-        controls = controls.with_child(sifs_button);
-    }
-    controls = controls.with_child(detail_button);
+        .with_child(button)
+        .with_child(
+            Presence::new(sifs_button)
+                .transition(crate::ui::widgets::reveal_transition())
+                .shown_from(
+                    issue.select_named("settings connection issue SIFS", move |issue| {
+                        connection_issue_has_sifs_recovery(&as_issue(issue))
+                    }),
+                )
+                .collapse(Axis::Horizontal),
+        )
+        .with_child(detail_button);
     let action_row = Stack::vertical()
         .gap(5.0)
         .alignment(Alignment::Start)
         .with_child(controls)
         .with_child(recovery);
-    let mut stack = Stack::vertical()
-        .gap(8.0)
-        .alignment(Alignment::Stretch)
+    let detail = Column::new(reader, |theme| theme.metrics.property_row_stacked_gap)
+        .with_child(detail_label)
+        .with_child(detail_field);
+    let stack = Column::new(reader, |_| 8.0)
         .with_child(header)
-        .with_child(action_row);
-    if expanded {
-        stack = stack.with_child(detail_label).with_child(detail_field);
-    }
+        .with_child(action_row)
+        .with_child(revealed(detail, expanded));
 
-    FormRow::new(issue.title, stack)
+    FormRow::new(current.title, stack)
         .stacked()
         .theme_when(clone_reader(reader))
 }
 
+/// The selected node and its configuration. Only the node card follows the node it describes;
+/// the configuration browser below stays mounted.
 fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source =
-        shared
-            .signals()
-            .settings_structure
-            .select_named("settings node structure", |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.node.clone(), snapshot.modules.clone()))
-            });
+    let node = settings_projection(shared, "settings selected node", |snapshot| {
+        snapshot.modules.selected_node.as_ref().map(|node| {
+            (
+                node.node_id.clone(),
+                node.display_name.clone(),
+                node.availability.clone(),
+            )
+        })
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_sig| {
-        WidgetPod::new(section_node_body(&s, &r))
-    })
+    let card = RebuildOnChange::key_from(node, move |node| {
+        WidgetPod::new(selected_node_card(&s, &r, node.clone()))
+    });
+    Stack::vertical()
+        .gap(16.0)
+        .alignment(Alignment::Stretch)
+        .with_child(card)
+        .with_child(section_configuration(shared, reader, true))
 }
 
-fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let node = shared.settings().module_snapshot.selected_node.clone();
+fn selected_node_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    node: Option<(String, String, String)>,
+) -> impl Widget + use<> {
     let mut card = SettingsCard::new("Selected node");
-    if let Some(node) = node {
+    if let Some((node_id, display_name, availability)) = node {
         card = card
             .row(
                 SettingRow::new("Name")
-                    .value(shared, node.summary.display_name)
+                    .value(shared, display_name)
                     .build(shared),
             )
             .row(
                 SettingRow::new("Availability")
-                    .value(shared, node.summary.availability)
+                    .value(shared, availability)
                     .build(shared),
             )
             .row(details(
@@ -7130,21 +7310,12 @@ fn section_node_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 "node ID",
                 vec![widgets::Boxed::new(
                     SettingRow::new("Node ID")
-                        .control(copy_control(
-                            reader,
-                            "settings-node-id",
-                            "Node ID",
-                            node.summary.node_id,
-                        ))
+                        .control(copy_control(reader, "settings-node-id", "Node ID", node_id))
                         .build(shared),
                 )],
             ));
     }
-    Stack::vertical()
-        .gap(16.0)
-        .alignment(Alignment::Stretch)
-        .with_child(card.build(shared, reader))
-        .with_child(section_configuration(shared, reader, true))
+    card.build(shared, reader)
 }
 
 /// The SIFS mount and the NFS mount, which both expose SIFS through the node's filesystem.
@@ -7159,100 +7330,42 @@ fn section_storage(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
 /// The modules behind the two mounts. The SIFS mount module shows only its lifecycle here, since
 /// the mount settings above edit its configuration; the NFS module brings its own settings.
 fn storage_modules_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings storage modules structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.modules.clone())
-        });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        let modules = storage_modules(&s.settings());
-        let mut stack = Stack::vertical().gap(16.0).alignment(Alignment::Stretch);
-        for (module_id, with_settings) in &modules {
-            if let Some(card) = module_card(&s, &r, module_id, *with_settings) {
-                stack = stack.with_child(PodHost::new(card));
-            }
-        }
-        if !modules.iter().any(|(_, with_settings)| *with_settings) {
-            stack = stack.with_child(
-                SettingsCard::new("NFS mount")
-                    .row(
-                        SettingRow::new("Status")
-                            .value(&s, "The NFS mount module is not available on this node.")
-                            .build(&s),
-                    )
-                    .build(&s, &r),
-            );
-        }
-        WidgetPod::new(stack)
-    })
+    let cards = settings_projection(shared, "settings storage module cards", storage_page_cards);
+    let nfs_missing = settings_projection(shared, "settings storage NFS missing", |snapshot| {
+        !storage_module_ids(&snapshot.configuration.items)
+            .iter()
+            .any(|(_, with_settings)| *with_settings)
+    });
+    Column::new(reader, |_| 16.0)
+        .with_child(module_card_stack(shared, reader, cards))
+        .with_child(revealed(
+            SettingsCard::new("NFS mount")
+                .row(
+                    SettingRow::new("Status")
+                        .value(
+                            shared,
+                            "The NFS mount module is not available on this node.",
+                        )
+                        .build(shared),
+                )
+                .build(shared, reader),
+            nfs_missing,
+        ))
 }
 
-/// Modules managed on the Storage page, each with whether Storage shows its settings: the owner
-/// of the SIFS mount setting (edited by the mount settings card) and the NFS mount module. They
-/// are found as the owners of their settings because the app reaches the runtime through the
-/// client facade, which does not export the storage crates.
+/// Modules managed on the Storage page, each with whether Storage shows its settings.
+#[cfg(test)]
 fn storage_modules(settings: &SettingsState) -> Vec<(String, bool)> {
-    let owner = |key: &str| {
-        settings
-            .config_items
-            .iter()
-            .find(|item| item.key == key)
-            .and_then(|item| item.module_id.clone())
-    };
-    let mut modules: Vec<(String, bool)> = Vec::new();
-    for (key, with_settings) in [(SIFS_MOUNT_CONFIG_KEY, false), (NFS_MOUNT_CONFIG_KEY, true)] {
-        if let Some(module_id) = owner(key)
-            && !modules
-                .iter()
-                .any(|(known, _)| module_ids_match(known, &module_id))
-        {
-            modules.push((module_id, with_settings));
-        }
-    }
-    modules
+    let items = settings
+        .config_items
+        .iter()
+        .map(ConfigItemStructure::from)
+        .collect::<Vec<_>>();
+    storage_module_ids(&items)
 }
 
 const SIFS_MOUNT_CONFIG_KEY: &str = "storage.sifs-mount";
 const NFS_MOUNT_CONFIG_KEY: &str = "storage.sifs-nfs-mount";
-
-/// The lifecycle and settings card for one module on the selected node, as Modules renders it.
-fn module_card(
-    shared: &Shared,
-    reader: &ThemeReader,
-    module_id: &str,
-    with_settings: bool,
-) -> Option<WidgetPod> {
-    let (module, associated) = {
-        let settings = shared.settings();
-        let module = settings
-            .module_snapshot
-            .modules
-            .iter()
-            .find(|module| module_ids_match(&module.module_id, module_id))?
-            .clone();
-        let associated = settings
-            .config_items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                with_settings
-                    && item.node_scoped
-                    && item
-                        .module_id
-                        .as_deref()
-                        .is_some_and(|id| module_ids_match(id, &module.module_id))
-            })
-            .map(|(index, item)| (index, item.clone()))
-            .collect::<Vec<_>>();
-        (module, associated)
-    };
-    Some(WidgetPod::new(module_config_section(
-        shared, reader, module, associated,
-    )))
-}
 
 /// One configuration browser with a scope switch, instead of separate node and cluster pages.
 fn section_configuration_page(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -7300,21 +7413,32 @@ fn section_configuration_page(shared: &Shared, reader: &ThemeReader) -> impl Wid
 
 const CONFIGURATION_SCOPES: [&str; 2] = ["Cluster", "This device"];
 
+/// The supervisor's status and the mount settings. The status refreshes beside the settings, so
+/// live updates never touch the form; the form is rebuilt only when the node's platform or the
+/// availability of its stored configuration changes, which changes which controls apply.
 fn section_sifs_mount(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source =
-        shared
-            .signals()
-            .settings_structure
-            .select_named("settings SIFS mount structure", |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| SettingsSifsMountEditorStructure::from(&snapshot.sifs_mount))
-            });
+    let shape = settings_projection(shared, "settings SIFS mount editor shape", |snapshot| {
+        Some(sifs_mount_editor_shape(&snapshot.sifs_mount))
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
+    let editor = RebuildOnChange::key_from(shape, move |_shape| {
         WidgetPod::new(section_sifs_mount_body(&s, &r))
-    })
+    });
+    Stack::vertical()
+        .gap(16.0)
+        .alignment(Alignment::Stretch)
+        .with_child(sifs_mount_runtime_status(shared, reader))
+        .with_child(editor)
+}
+
+/// What decides which mount controls apply: the node's platform, and whether its stored
+/// configuration could be read.
+fn sifs_mount_editor_shape(mount: &SettingsSifsMountStructure) -> (SifsMountPlatform, bool) {
+    (
+        mount.snapshot.platform,
+        mount.snapshot.config_error.is_some(),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7323,11 +7447,36 @@ struct SifsMountRuntimePresentationKey {
     presentation: SifsMountPresentation,
 }
 
+/// The status card stays mounted, with its Refresh button; only the reported rows follow each
+/// observation.
 fn sifs_mount_runtime_status(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let refresh = {
+        let s = shared.clone();
+        let idle = settings_projection(shared, "settings SIFS mount idle", |snapshot| {
+            !snapshot.sifs_mount.pending
+        });
+        sui::Button::new("Refresh status")
+            .icon(IconGlyph::Redo)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled_from(idle)
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::SifsMount,
+                    SettingsOperation::RefreshSifsMount {
+                        update_feedback: true,
+                    },
+                );
+            })
+    };
     let key_shared = shared.clone();
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
-    let status = RebuildOnChange::key_when(
+    // Read-only observation rows. The presentation depends on the clock as well as the snapshot,
+    // so the key is read on each pass rather than projected.
+    let rows = RebuildOnChange::key_when(
         move || {
             let snapshot = key_shared.settings().sifs_mount_snapshot.clone();
             let presentation =
@@ -7346,7 +7495,12 @@ fn sifs_mount_runtime_status(shared: &Shared, reader: &ThemeReader) -> impl Widg
             ))
         },
     );
-    SifsMountLiveRefresh::new(shared.clone(), status)
+    let card = SettingsCard::new("SIFS mount")
+        .description("What the mount supervisor on this node reports. A saved setting is not a mount until the supervisor confirms it.")
+        .header_action(refresh)
+        .row(rows)
+        .build(shared, reader);
+    SifsMountLiveRefresh::new(shared.clone(), card)
 }
 
 fn build_sifs_mount_runtime_status(
@@ -7356,48 +7510,25 @@ fn build_sifs_mount_runtime_status(
     presentation: &SifsMountPresentation,
 ) -> impl Widget + use<> {
     let status = &snapshot.status;
-    let refresh = {
-        let s = shared.clone();
-        sui::Button::new("Refresh status")
-            .icon(IconGlyph::Redo)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Tonal)
-            .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                move || !s.settings().sifs_mount_pending()
-            })
-            .on_press(move || {
-                queue_settings_operation(
-                    &s,
-                    SettingsOperationScope::SifsMount,
-                    SettingsOperation::RefreshSifsMount {
-                        update_feedback: true,
-                    },
-                );
-            })
-    };
     let value = |label: &str, value: String| {
         widgets::Boxed::new(SettingRow::new(label).value(shared, value).build(shared))
     };
 
-    let mut card = SettingsCard::new("SIFS mount")
-        .description("What the mount supervisor on this node reports. A saved setting is not a mount until the supervisor confirms it.")
-        .header_action(refresh)
-        .row(
+    let mut card = Column::new(reader, |theme| theme.metrics.form_section_body_gap)
+        .with_child(
             SettingRow::new("Status")
                 .help(presentation.detail.clone())
                 .status(reader, presentation.label.clone(), presentation.tone)
                 .build(shared),
         )
-        .row(value(
+        .with_child(value(
             "Location",
             status
                 .resolved_mount_point
                 .clone()
                 .unwrap_or_else(|| status.configured_mount_point.clone()),
         ))
-        .row(value(
+        .with_child(value(
             "Access",
             if status.read_only {
                 "Read only".to_string()
@@ -7407,11 +7538,11 @@ fn build_sifs_mount_runtime_status(
         ));
     if status.platform == SifsMountPlatform::ExternalProvider {
         card = card
-            .row(value(
+            .with_child(value(
                 "Writeback",
                 sifs_mount_writeback_mode_label(status.writeback_mode).to_string(),
             ))
-            .row(value(
+            .with_child(value(
                 "Pending changes",
                 format!(
                     "{} pending · {} retrying · {} failed · {} conflicts",
@@ -7427,7 +7558,7 @@ fn build_sifs_mount_runtime_status(
             .take(SIFS_MOUNT_ATTENTION_DISPLAY_LIMIT)
             .enumerate()
         {
-            card = card.row(copyable_area_row(
+            card = card.with_child(copyable_area_row(
                 reader,
                 &format!("sifs-mount-attention-{index}"),
                 &format!(
@@ -7445,7 +7576,7 @@ fn build_sifs_mount_runtime_status(
             as u64;
         let attention_overflow = status.attention_overflow.saturating_add(locally_omitted);
         if attention_overflow > 0 {
-            card = card.row(value(
+            card = card.with_child(value(
                 "Additional attention",
                 format!(
                     "{attention_overflow} additional issues omitted from this bounded live status; inspect daemon logs and refresh after addressing the shown issues"
@@ -7454,15 +7585,14 @@ fn build_sifs_mount_runtime_status(
         }
     }
     if let Some(last_error) = status.last_error.as_ref() {
-        card = card.row(value("Last error", last_error.clone()));
+        card = card.with_child(value("Last error", last_error.clone()));
     }
     if let Some(action) = presentation.operator_action.as_ref() {
-        card = card.row(value("Safe next action", action.clone()));
+        card = card.with_child(value("Safe next action", action.clone()));
     }
     if let Some(error) = snapshot.status_error.as_ref() {
-        card = card.row(value("Status unavailable", error.clone()));
+        card = card.with_child(value("Status unavailable", error.clone()));
     }
-
     // Supervisor internals for diagnosing a mount that does not come up.
     let mut technical = vec![
         value(
@@ -7533,14 +7663,13 @@ fn build_sifs_mount_runtime_status(
     if !status.updated_at.trim().is_empty() {
         technical.push(value("Last observation", status.updated_at.clone()));
     }
-    card.row(details(
+    card.with_child(details(
         shared,
         reader,
         "sifs-mount-runtime",
         "supervisor details",
         technical,
     ))
-    .build(shared, reader)
 }
 
 struct SifsMountLiveRefresh {
@@ -7650,39 +7779,56 @@ impl Widget for SifsMountLiveRefresh {
 }
 
 fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (snapshot, form) = {
+    let (platform, form) = {
         let settings = shared.settings();
         (
-            settings.sifs_mount_snapshot.clone(),
+            settings.sifs_mount_snapshot.platform,
             settings.sifs_mount_form.clone(),
         )
     };
-    let platform = snapshot.platform;
-    let runtime_status = sifs_mount_runtime_status(shared, reader);
-
     let external = platform == SifsMountPlatform::ExternalProvider;
-    let input =
-        |name: &str, value: String, placeholder: &str, edit: fn(&mut SifsMountForm, String)| {
-            let s = shared.clone();
-            TextInput::new(name)
-                .value(value)
-                .placeholder(placeholder)
-                .min_width(240.0)
-                .theme_when(clone_reader(reader))
-                .on_change(move |value| s.settings_mut().edit_sifs_mount(|form| edit(form, value)))
-        };
+    // Reset, reload, and save replace the draft and bump this revision; the retained fields and
+    // switches adopt the new values without being rebuilt.
+    let revision = settings_projection(shared, "settings SIFS mount revision", |snapshot| {
+        snapshot.sifs_mount.ui_revision
+    });
+    let form_flag = |name: &'static str, flag: fn(&SifsMountForm) -> bool| {
+        settings_projection(shared, name, move |snapshot| {
+            flag(&snapshot.sifs_mount.form)
+        })
+    };
+    let input = |name: &str,
+                 value: String,
+                 placeholder: &str,
+                 read: fn(&SifsMountForm) -> String,
+                 edit: fn(&mut SifsMountForm, String)| {
+        let s = shared.clone();
+        let field = TextInput::new(name)
+            .value(value)
+            .placeholder(placeholder)
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().edit_sifs_mount(|form| edit(form, value)));
+        let s = shared.clone();
+        SyncedTextInput::new(field, move || read(&s.settings().sifs_mount_form))
+            .observing(revision.clone())
+    };
     let mut card = SettingsCard::new("Mount settings")
         .description("Applies to the selected node. Sinomo picks the change up after you save.")
         .row(
             SettingRow::new("Enabled")
                 .help("Mount SIFS into this node's filesystem.")
-                .control(setting_switch(reader, "Enabled", form.enabled, {
-                    let s = shared.clone();
-                    move |enabled| {
-                        s.settings_mut()
-                            .edit_sifs_mount(|form| form.enabled = enabled);
-                    }
-                }))
+                .control(setting_switch_from(
+                    reader,
+                    "Enabled",
+                    form_flag("settings SIFS mount enabled", |form| form.enabled),
+                    {
+                        let s = shared.clone();
+                        move |enabled| {
+                            s.settings_mut()
+                                .edit_sifs_mount(|form| form.enabled = enabled);
+                        }
+                    },
+                ))
                 .build(shared),
         )
         .row(
@@ -7698,12 +7844,13 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             })
             .control(input(
                 "sifs-mount-location",
-                form.mount_point,
+                form.mount_point.clone(),
                 if external {
                     r"C:\Users\you\Sinomo"
                 } else {
                     "~/sinomo"
                 },
+                |form| form.mount_point.clone(),
                 |form, value| form.mount_point = value,
             ))
             .build(shared),
@@ -7713,8 +7860,9 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
                 .help("The SIFS folder to expose. / shows everything.")
                 .control(input(
                     "sifs-mount-root-path",
-                    form.root_path,
+                    form.root_path.clone(),
                     "/",
+                    |form| form.root_path.clone(),
                     |form, value| form.root_path = value,
                 ))
                 .build(shared),
@@ -7724,22 +7872,27 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             card = card
                 .row(
                     SettingRow::new("Read only")
-                        .control(setting_switch(reader, "Read only", form.read_only, {
-                            let s = shared.clone();
-                            move |read_only| {
-                                s.settings_mut()
-                                    .edit_sifs_mount(|form| form.read_only = read_only);
-                            }
-                        }))
+                        .control(setting_switch_from(
+                            reader,
+                            "Read only",
+                            form_flag("settings SIFS mount read only", |form| form.read_only),
+                            {
+                                let s = shared.clone();
+                                move |read_only| {
+                                    s.settings_mut()
+                                        .edit_sifs_mount(|form| form.read_only = read_only);
+                                }
+                            },
+                        ))
                         .build(shared),
                 )
                 .row(
                     SettingRow::new("Allow other local users")
                         .help("Owner-only by default; this also needs user_allow_other in /etc/fuse.conf.")
-                        .control(setting_switch(
+                        .control(setting_switch_from(
                             reader,
                             "Allow other local users",
-                            form.allow_other,
+                            form_flag("settings SIFS mount allow other", |form| form.allow_other),
                             {
                                 let s = shared.clone();
                                 move |allow_other| {
@@ -7752,14 +7905,15 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
                 );
         }
         SifsMountPlatform::ExternalProvider => {
-            let writeback_enabled = !form.read_only && form.sync_local_changes;
             card = card.row(
                 SettingRow::new("Durable writable cloud sync")
                     .help("Local changes are journaled and version-checked; conflicts stop for your review.")
-                    .control(setting_switch(
+                    .control(setting_switch_from(
                         reader,
                         "Durable writable cloud sync",
-                        writeback_enabled,
+                        form_flag("settings SIFS mount writeback", |form| {
+                            !form.read_only && form.sync_local_changes
+                        }),
                         {
                             let s = shared.clone();
                             move |enabled| {
@@ -7784,24 +7938,32 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             );
         }
     }
-    if let Some(error) = snapshot.config_error.as_ref() {
+    if shared.settings().sifs_mount_snapshot.config_error.is_some() {
+        let error = settings_projection(shared, "settings SIFS mount config error", |snapshot| {
+            snapshot
+                .sifs_mount
+                .snapshot
+                .config_error
+                .clone()
+                .unwrap_or_default()
+        });
         card = card.row(
             SettingRow::new("Configuration unavailable")
-                .value(shared, error.clone())
+                .value_from(shared, error)
                 .build(shared),
         );
     }
 
+    let can_save = settings_projection(shared, "settings SIFS mount can save", |snapshot| {
+        snapshot.sifs_mount.dirty && !snapshot.sifs_mount.pending
+    });
     let save = {
         let s = shared.clone();
         sui::Button::new("Save mount configuration")
             .icon(IconGlyph::Check)
             .primary_action()
             .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.settings().sifs_mount_dirty() && !s.settings().sifs_mount_pending()
-            })
+            .enabled_from(can_save.clone())
             .on_press(move || {
                 let config = s.settings().sifs_mount_save_config();
                 match config {
@@ -7827,50 +7989,37 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                move || s.settings().sifs_mount_dirty() && !s.settings().sifs_mount_pending()
-            })
+            .enabled_from(can_save)
             .on_press(move || s.settings_mut().reset_sifs_mount_form())
     };
-    let card = card
-        .row(Align::new(
-            Alignment::End,
-            Alignment::Center,
-            Flex::horizontal()
-                .gap(8.0)
-                .align_items(Alignment::Center)
-                .with_child(reset)
-                .with_child(save),
-        ))
-        .row(feedback_slot(
-            shared,
-            reader,
-            |settings| settings.sifs_mount_action_error.clone(),
-            |settings| settings.sifs_mount_action_status.clone(),
-        ))
-        .row(details(
-            shared,
-            reader,
-            "sifs-mount-settings",
-            "storage key",
-            vec![widgets::Boxed::new(
-                SettingRow::new("Stored in")
-                    .help(format!(
-                        "One node-local {} mount, applied by the main Sinomo process.",
-                        sifs_mount_platform_label(platform)
-                    ))
-                    .value(shared, "storage.sifs-mount")
-                    .build(shared),
-            )],
-        ))
-        .build(shared, reader);
-
-    Stack::vertical()
-        .gap(16.0)
-        .alignment(Alignment::Stretch)
-        .with_child(runtime_status)
-        .with_child(card)
+    card.row(Align::new(
+        Alignment::End,
+        Alignment::Center,
+        Flex::horizontal()
+            .gap(8.0)
+            .align_items(Alignment::Center)
+            .with_child(reset)
+            .with_child(save),
+    ))
+    .row(feedback_slot(shared, reader, |snapshot| {
+        snapshot.feedback.sifs_mount.clone()
+    }))
+    .row(details(
+        shared,
+        reader,
+        "sifs-mount-settings",
+        "storage key",
+        vec![widgets::Boxed::new(
+            SettingRow::new("Stored in")
+                .help(format!(
+                    "One node-local {} mount, applied by the main Sinomo process.",
+                    sifs_mount_platform_label(platform)
+                ))
+                .value(shared, "storage.sifs-mount")
+                .build(shared),
+        )],
+    ))
+    .build(shared, reader)
 }
 
 fn sifs_mount_platform_label(platform: SifsMountPlatform) -> &'static str {
@@ -8142,89 +8291,387 @@ fn sifs_mount_section_presentation_at(
     sifs_mount_presentation_at(snapshot, now)
 }
 
+/// Host access for the selected node: the local consent controls when it is this device, or the
+/// commands to run on it otherwise. Both stay mounted and update in place.
 fn section_remote_management(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared.signals().settings_structure.select_named(
-        "settings remote management structure",
-        |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| snapshot.remote_management.clone())
-        },
-    );
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        if !s.settings().selected_settings_node_is_local() {
-            return WidgetPod::new(remote_host_access_panel(&s, &r));
-        }
-        WidgetPod::new(section_remote_management_body(&s, &r))
-    })
+    let remote = settings_projection(shared, "settings remote management scope", |snapshot| {
+        usize::from(!snapshot.remote_management.local)
+    });
+    SwitchView::new()
+        .with_child(section_remote_management_body(shared, reader))
+        .with_child(remote_host_access_panel(shared, reader))
+        .selected_from(remote)
 }
 
-fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (
-        snapshot,
-        permission_action_error,
-        permission_action_status,
-        module_action_error,
-        module_action_status,
-        confirming,
-        permission_pending,
-        module_pending,
-    ) = {
-        let settings = shared.settings();
-        (
-            settings.remote_management.clone(),
-            settings.remote_management_permission_error.clone(),
-            settings.remote_management_permission_status.clone(),
-            settings.remote_management_module_error.clone(),
-            settings.remote_management_module_status.clone(),
-            settings.remote_management_enable_confirming,
-            settings.remote_management_permission_pending(),
-            settings.remote_management_module_pending(),
-        )
-    };
+/// The state of a node-local permission document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PermissionState {
+    #[default]
+    Loading,
+    Unavailable,
+    Allowed,
+    Denied,
+}
 
-    // ------------------------------------------------------------------ local permission
-    let (permission_label, permission_tone, permission_detail) = if snapshot.permission_loading {
-        (
-            "Loading",
-            SemanticTone::Neutral,
-            "Reading the node-local permission document.",
-        )
-    } else if snapshot.permission_error.is_some() {
-        (
-            "Unavailable",
-            SemanticTone::Danger,
-            "Permission state could not be read, so access stays blocked.",
-        )
-    } else if snapshot.permission_enabled {
-        (
-            "Allowed",
-            SemanticTone::Warning,
-            "Signed local or voter administrators may use unrestricted host-management routes.",
-        )
-    } else {
-        (
-            "Denied",
-            SemanticTone::Neutral,
-            "Remote host-management effects are blocked on this node.",
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PermissionView {
+    state: PermissionState,
+    enabled: bool,
+    pending: bool,
+    confirming: bool,
+    error: Option<String>,
+}
+
+impl PermissionView {
+    fn new(
+        loading: bool,
+        error: Option<String>,
+        enabled: bool,
+        pending: bool,
+        confirming: bool,
+    ) -> Self {
+        let state = if loading {
+            PermissionState::Loading
+        } else if error.is_some() {
+            PermissionState::Unavailable
+        } else if enabled {
+            PermissionState::Allowed
+        } else {
+            PermissionState::Denied
+        };
+        Self {
+            state,
+            enabled,
+            pending,
+            confirming,
+            error,
+        }
+    }
+
+    /// Which control the permission row shows: progress, a refresh, the switch, or the
+    /// confirmation entry point.
+    fn control(&self) -> usize {
+        if self.pending {
+            0
+        } else {
+            match self.state {
+                PermissionState::Loading | PermissionState::Unavailable => 1,
+                PermissionState::Allowed => 2,
+                PermissionState::Denied => 3,
+            }
+        }
+    }
+
+    fn label_and_tone(&self) -> (&'static str, SemanticTone) {
+        match self.state {
+            PermissionState::Loading => ("Loading", SemanticTone::Neutral),
+            PermissionState::Unavailable => ("Unavailable", SemanticTone::Danger),
+            PermissionState::Allowed => ("Allowed", SemanticTone::Warning),
+            PermissionState::Denied => ("Denied", SemanticTone::Neutral),
+        }
+    }
+}
+
+/// The wording and actions of one node-local permission card.
+struct PermissionCard {
+    title: &'static str,
+    description: &'static str,
+    /// Help for the loading, unavailable, allowed, and denied states.
+    details: [&'static str; 4],
+    switch_name: &'static str,
+    allow_label: &'static str,
+    pending_name: &'static str,
+    confirm_region: &'static str,
+    confirm_help: &'static str,
+    confirm_description: &'static str,
+    error_name: &'static str,
+    scope: fn() -> SettingsOperationScope,
+    set: fn(bool) -> SettingsOperation,
+    confirm: fn(&mut SettingsState),
+    cancel: fn(&mut SettingsState),
+    view: fn(&SettingsStructureSnapshot) -> PermissionView,
+    feedback: fn(&SettingsStructureSnapshot) -> SettingsFeedback,
+}
+
+/// A permission card whose badge, control, confirmation, and feedback follow the permission
+/// state in place. `extra` rows sit between the confirmation and the error details.
+fn permission_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    card: PermissionCard,
+    extra: Vec<widgets::Boxed>,
+) -> SettingsCard {
+    let view = settings_projection(shared, card.title, card.view);
+    let label = derived(
+        view.clone(),
+        "settings permission label",
+        |view: &PermissionView| view.label_and_tone().0.to_string(),
+    );
+    let tone = derived(
+        view.clone(),
+        "settings permission tone",
+        |view: &PermissionView| view.label_and_tone().1,
+    );
+    let details = card.details;
+    let detail = derived(
+        view.clone(),
+        "settings permission detail",
+        move |view: &PermissionView| {
+            let index = match view.state {
+                PermissionState::Loading => 0,
+                PermissionState::Unavailable => 1,
+                PermissionState::Allowed => 2,
+                PermissionState::Denied => 3,
+            };
+            details[index].to_string()
+        },
+    );
+    let scope = card.scope;
+    let set = card.set;
+    let refresh = {
+        let s = shared.clone();
+        sui::Button::new("Refresh")
+            .icon(IconGlyph::Redo)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::RemoteManagementRefresh,
+                    SettingsOperation::RefreshRemoteManagement,
+                );
+            })
+    };
+    let switch = {
+        let s = shared.clone();
+        synced_switch(
+            Switch::new("")
+                .semantic_name(card.switch_name)
+                .checked(true)
+                .theme_when(clone_reader(reader))
+                .on_change(move |enabled| {
+                    if !enabled {
+                        queue_settings_operation(&s, scope(), set(false));
+                    }
+                }),
+            derived(
+                view.clone(),
+                "settings permission enabled",
+                |view: &PermissionView| view.enabled,
+            ),
         )
     };
-    let permission_control = if permission_pending {
-        widgets::Boxed::new(
+    let allow = {
+        let s = shared.clone();
+        let confirm = card.confirm;
+        sui::Button::new(card.allow_label)
+            .icon(IconGlyph::Lock)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Warning)
+            .on_press(move || confirm(&mut s.settings_mut()))
+    };
+    let control = SwitchView::new()
+        .with_child(
             Flex::horizontal()
                 .gap(8.0)
                 .align_items(Alignment::Center)
-                .with_child(
-                    Spinner::new("remote-management-permission-pending")
-                        .theme_when(clone_reader(reader)),
-                )
+                .with_child(Spinner::new(card.pending_name).theme_when(clone_reader(reader)))
                 .with_child(muted_label(shared, "Applying local permission…")),
         )
-    } else if snapshot.permission_loading || snapshot.permission_error.is_some() {
+        .with_child(refresh)
+        .with_child(switch)
+        .with_child(allow)
+        .selected_from(derived(
+            view.clone(),
+            "settings permission control",
+            PermissionView::control,
+        ));
+
+    let confirm = {
         let s = shared.clone();
-        widgets::Boxed::new(
+        sui::Button::new("Confirm allow")
+            .icon(IconGlyph::Lock)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
+            .on_press(move || {
+                queue_settings_operation(&s, scope(), set(true));
+            })
+    };
+    let cancel = {
+        let s = shared.clone();
+        let cancel = card.cancel;
+        sui::Button::new("Cancel")
+            .icon(IconGlyph::Close)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || cancel(&mut s.settings_mut()))
+    };
+    let confirmation = SemanticRegion::new(
+        card.confirm_region,
+        SettingRow::new("Confirm access")
+            .help(card.confirm_help)
+            .control(
+                Flex::horizontal()
+                    .gap(8.0)
+                    .align_items(Alignment::Center)
+                    .with_child(cancel)
+                    .with_child(confirm),
+            )
+            .build(shared),
+    )
+    .description(card.confirm_description)
+    .role(SemanticsRole::Dialog);
+    let confirming = derived(
+        view.clone(),
+        "settings permission confirming",
+        |view: &PermissionView| view.confirming && !view.enabled && !view.pending,
+    );
+
+    let error = derived(
+        view.clone(),
+        "settings permission error",
+        |view: &PermissionView| view.error.clone(),
+    );
+    let has_error = derived(
+        error.clone(),
+        "settings permission has error",
+        Option::is_some,
+    );
+    let error_name = card.error_name;
+    // The selectable error text; rebuilt only when the error itself changes.
+    let error_row = {
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(error, move |error| match error.clone() {
+            Some(error) => {
+                WidgetPod::new(copyable_area_row(&r, error_name, "Permission error", error))
+            }
+            None => WidgetPod::new(SizedBox::new()),
+        })
+    };
+
+    let mut result = SettingsCard::new(card.title)
+        .description(card.description)
+        .header_action(status_badge_from(reader, label, tone))
+        .row(
+            SettingRow::new("Permission")
+                .help_from(detail)
+                .control(control)
+                .build(shared),
+        )
+        .row(revealed(confirmation, confirming));
+    for row in extra {
+        result = result.row(row);
+    }
+    let feedback = card.feedback;
+    result
+        .row(revealed(error_row, has_error))
+        .row(feedback_slot(shared, reader, feedback))
+}
+
+fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    // ------------------------------------------------------------------ local permission
+    let exposure = settings_projection(shared, "settings remote management exposure", |snapshot| {
+        let snapshot = &snapshot.remote_management.snapshot;
+        if snapshot.resource_exposure_count == 0 {
+            return String::new();
+        }
+        format!(
+            "{} operation{} across {} resource{}",
+            snapshot.resource_operation_count,
+            if snapshot.resource_operation_count == 1 {
+                ""
+            } else {
+                "s"
+            },
+            snapshot.resource_exposure_count,
+            if snapshot.resource_exposure_count == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    });
+    let has_exposure = derived(
+        exposure.clone(),
+        "settings remote management has exposure",
+        |exposure: &String| !exposure.is_empty(),
+    );
+    let permission = permission_card(
+        shared,
+        reader,
+        PermissionCard {
+            title: "Remote management",
+            description: "Stored only on this node and applied immediately. Module activation and remote requests can never change it.",
+            details: [
+                "Reading the node-local permission document.",
+                "Permission state could not be read, so access stays blocked.",
+                "Signed local or voter administrators may use unrestricted host-management routes.",
+                "Remote host-management effects are blocked on this node.",
+            ],
+            switch_name: "Allow remote management",
+            allow_label: "Allow remote management…",
+            pending_name: "remote-management-permission-pending",
+            confirm_region: "Allow remote management confirmation",
+            confirm_help: "This lets signed local or voter administrators run shell commands, transfer files, inspect the host, and change ordinary node configuration.",
+            confirm_description: "Confirmation is required before changing the local host permission",
+            error_name: "remote-management-permission-error",
+            scope: || SettingsOperationScope::RemoteManagementPermission,
+            set: |enabled| SettingsOperation::SetRemoteManagementPermission { enabled },
+            confirm: SettingsState::confirm_remote_management_enable,
+            cancel: SettingsState::cancel_remote_management_enable,
+            view: |snapshot| {
+                let remote = &snapshot.remote_management;
+                PermissionView::new(
+                    remote.snapshot.permission_loading,
+                    remote.snapshot.permission_error.clone(),
+                    remote.snapshot.permission_enabled,
+                    remote.permission_pending,
+                    remote.enable_confirming,
+                )
+            },
+            feedback: |snapshot| {
+                (
+                    snapshot.remote_management.permission_error.clone(),
+                    snapshot.remote_management.permission_status.clone(),
+                )
+            },
+        },
+        vec![widgets::Boxed::new(revealed(
+            SettingRow::new("Other device exposure")
+                .help("Managed separately from remote management.")
+                .value_from(shared, exposure)
+                .build(shared),
+            has_exposure,
+        ))],
+    );
+
+    // ------------------------------------------------------------------ module on this node
+    let module = settings_projection(shared, "settings remote management module", |snapshot| {
+        snapshot.remote_management.snapshot.clone()
+    });
+    let override_control = settings_projection(
+        shared,
+        "settings remote management override control",
+        |snapshot| {
+            let remote = &snapshot.remote_management;
+            if remote.module_pending {
+                0
+            } else if remote.snapshot.module_loading {
+                1
+            } else if remote.snapshot.module_node_id.is_none() {
+                2
+            } else {
+                3
+            }
+        },
+    );
+    let module_override = {
+        let refresh = {
+            let s = shared.clone();
             sui::Button::new("Refresh")
                 .icon(IconGlyph::Redo)
                 .theme_when(clone_reader(reader))
@@ -8236,213 +8683,59 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                         SettingsOperationScope::RemoteManagementRefresh,
                         SettingsOperation::RefreshRemoteManagement,
                     );
-                }),
-        )
-    } else if snapshot.permission_enabled {
-        let s = shared.clone();
-        widgets::Boxed::new(
-            Switch::new("")
-                .semantic_name("Allow remote management")
-                .checked(true)
-                .theme_when(clone_reader(reader))
-                .on_change(move |enabled| {
-                    if !enabled {
-                        queue_settings_operation(
-                            &s,
-                            SettingsOperationScope::RemoteManagementPermission,
-                            SettingsOperation::SetRemoteManagementPermission { enabled: false },
-                        );
-                    }
-                }),
-        )
-    } else {
-        let s = shared.clone();
-        widgets::Boxed::new(
-            sui::Button::new("Allow remote management…")
-                .icon(IconGlyph::Lock)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Warning)
-                .on_press(move || s.settings_mut().confirm_remote_management_enable()),
-        )
-    };
-    let mut permission = SettingsCard::new("Remote management")
-        .description("Stored only on this node and applied immediately. Module activation and remote requests can never change it.")
-        .header_action(
-            StatusBadge::new(permission_label)
-                .tone(permission_tone)
-                .theme_when(clone_reader(reader)),
-        )
-        .row(
-            SettingRow::new("Permission")
-                .help(permission_detail)
-                .control(permission_control)
-                .build(shared),
-        );
-
-    if confirming && !snapshot.permission_enabled && !permission_pending {
-        let confirm = {
-            let s = shared.clone();
-            sui::Button::new("Confirm allow")
-                .icon(IconGlyph::Lock)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .on_press(move || {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::RemoteManagementPermission,
-                        SettingsOperation::SetRemoteManagementPermission { enabled: true },
-                    );
                 })
         };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || s.settings_mut().cancel_remote_management_enable())
-        };
-        permission = permission.row(
-            SemanticRegion::new(
-                "Allow remote management confirmation",
-                SettingRow::new("Confirm access")
-                    .help("This lets signed local or voter administrators run shell commands, transfer files, inspect the host, and change ordinary node configuration.")
-                    .control(
-                        Flex::horizontal()
-                            .gap(8.0)
-                            .align_items(Alignment::Center)
-                            .with_child(cancel)
-                            .with_child(confirm),
-                    )
-                    .build(shared),
-            )
-            .description("Confirmation is required before changing the local host permission")
-            .role(SemanticsRole::Dialog),
-        );
-    }
-
-    if snapshot.resource_exposure_count > 0 {
-        permission = permission.row(
-            SettingRow::new("Other device exposure")
-                .help("Managed separately from remote management.")
-                .value(
-                    shared,
-                    format!(
-                        "{} operation{} across {} resource{}",
-                        snapshot.resource_operation_count,
-                        if snapshot.resource_operation_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        snapshot.resource_exposure_count,
-                        if snapshot.resource_exposure_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                    ),
-                )
-                .build(shared),
-        );
-    }
-    if let Some(error) = snapshot.permission_error.clone() {
-        permission = permission.row(copyable_area_row(
-            reader,
-            "remote-management-permission-error",
-            "Permission error",
-            error,
-        ));
-    }
-    if let Some(error) = permission_action_error.clone() {
-        permission = permission.row(SettingRow::new("Error").value(shared, error).build(shared));
-    } else if let Some(status) = permission_action_status.clone() {
-        permission = permission.row(
-            SettingRow::new("Status")
-                .value(shared, status)
-                .build(shared),
-        );
-    }
-
-    // ------------------------------------------------------------------ module on this node
-    let module_override = if module_pending {
-        widgets::Boxed::new(
+        let s = shared.clone();
+        let select = Select::new("Remote management node override")
+            .options(MODULE_OVERRIDE_OPTIONS.iter().copied())
+            .selected_when({
+                let s = s.clone();
+                move || {
+                    Some(match s.settings().remote_management.module_override {
+                        Some(true) => 1,
+                        Some(false) => 2,
+                        None => 0,
+                    })
+                }
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| {
+                let enabled = match index {
+                    1 => Some(true),
+                    2 => Some(false),
+                    _ => None,
+                };
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::RemoteManagementModule,
+                    SettingsOperation::SetRemoteManagementModuleOverride { enabled },
+                );
+            });
+        let busy = |name: &str, text: &str| {
             Flex::horizontal()
                 .gap(8.0)
                 .align_items(Alignment::Center)
-                .with_child(
-                    Spinner::new("remote-management-module-pending")
-                        .theme_when(clone_reader(reader)),
-                )
-                .with_child(muted_label(shared, "Saving desired state…")),
-        )
-    } else if snapshot.module_loading || snapshot.module_node_id.is_none() {
-        if snapshot.module_loading {
-            widgets::Boxed::new(
-                Flex::horizontal()
-                    .gap(8.0)
-                    .align_items(Alignment::Center)
-                    .with_child(
-                        Spinner::new("remote-management-module-loading")
-                            .theme_when(clone_reader(reader)),
-                    )
-                    .with_child(muted_label(shared, "Reading local module state…")),
-            )
-        } else {
-            let s = shared.clone();
-            widgets::Boxed::new(
+                .with_child(Spinner::new(name).theme_when(clone_reader(reader)))
+                .with_child(muted_label(shared, text))
+        };
+        SwitchView::new()
+            .with_child(busy(
+                "remote-management-module-pending",
+                "Saving desired state…",
+            ))
+            .with_child(busy(
+                "remote-management-module-loading",
+                "Reading local module state…",
+            ))
+            .with_child(
                 Flex::horizontal()
                     .gap(8.0)
                     .align_items(Alignment::Center)
                     .with_child(muted_label(shared, "Local node configuration unavailable"))
-                    .with_child(
-                        sui::Button::new("Refresh")
-                            .icon(IconGlyph::Redo)
-                            .theme_when(clone_reader(reader))
-                            .appearance(sui::ButtonAppearance::Tonal)
-                            .tone(SemanticTone::Neutral)
-                            .on_press(move || {
-                                queue_settings_operation(
-                                    &s,
-                                    SettingsOperationScope::RemoteManagementRefresh,
-                                    SettingsOperation::RefreshRemoteManagement,
-                                );
-                            }),
-                    ),
+                    .with_child(refresh),
             )
-        }
-    } else {
-        let s = shared.clone();
-        widgets::Boxed::new(
-            Select::new("Remote management node override")
-                .options(MODULE_OVERRIDE_OPTIONS.iter().copied())
-                .selected_when({
-                    let s = s.clone();
-                    move || {
-                        Some(match s.settings().remote_management.module_override {
-                            Some(true) => 1,
-                            Some(false) => 2,
-                            None => 0,
-                        })
-                    }
-                })
-                .theme_when(clone_reader(reader))
-                .on_change(move |index, _label| {
-                    let enabled = match index {
-                        1 => Some(true),
-                        2 => Some(false),
-                        _ => None,
-                    };
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::RemoteManagementModule,
-                        SettingsOperation::SetRemoteManagementModuleOverride { enabled },
-                    );
-                }),
-        )
+            .with_child(select)
+            .selected_from(override_control)
     };
     let open_modules = {
         let s = shared.clone();
@@ -8453,101 +8746,177 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().open(SettingsSection::Modules))
     };
-    let mut module = SettingsCard::new("Remote management module")
+    let loaded = derived(
+        module.clone(),
+        "settings remote management module loaded",
+        |module: &RemoteManagementSettingsSnapshot| !module.module_loading,
+    );
+    let desired = SettingRow::new("Desired state")
+        .help_from(derived(
+            module.clone(),
+            "settings remote management desired source",
+            |module: &RemoteManagementSettingsSnapshot| {
+                module_effective_source_label(module.module_effective_source).to_string()
+            },
+        ))
+        .control(status_badge_from(
+            reader,
+            derived(
+                module.clone(),
+                "settings remote management desired label",
+                |module: &RemoteManagementSettingsSnapshot| {
+                    if module.module_effective_enabled {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    }
+                    .to_string()
+                },
+            ),
+            derived(
+                module.clone(),
+                "settings remote management desired tone",
+                |module: &RemoteManagementSettingsSnapshot| {
+                    if module.module_effective_enabled {
+                        SemanticTone::Success
+                    } else {
+                        SemanticTone::Neutral
+                    }
+                },
+            ),
+        ))
+        .build(shared);
+    let running = SettingRow::new("Running")
+        .help_from(derived(
+            module.clone(),
+            "settings remote management observed detail",
+            |module: &RemoteManagementSettingsSnapshot| module.module_observed_detail.clone(),
+        ))
+        .control(status_badge_from(
+            reader,
+            derived(
+                module.clone(),
+                "settings remote management observed label",
+                |module: &RemoteManagementSettingsSnapshot| {
+                    remote_management_observed_label(module.module_observed).to_string()
+                },
+            ),
+            derived(
+                module.clone(),
+                "settings remote management observed tone",
+                |module: &RemoteManagementSettingsSnapshot| {
+                    module_observed_tone(module.module_observed)
+                },
+            ),
+        ))
+        .build(shared);
+    let attention = derived(
+        module.clone(),
+        "settings remote management attention",
+        |module: &RemoteManagementSettingsSnapshot| {
+            remote_management_module_attention(module)
+                .filter(|_| !module.module_loading)
+                .map(|(label, detail)| (label.to_string(), detail.to_string()))
+        },
+    );
+    let needs_attention = SettingRow::new("Needs attention")
+        .help_from(derived(
+            attention.clone(),
+            "settings remote management attention detail",
+            |attention: &Option<(String, String)>| {
+                attention
+                    .as_ref()
+                    .map(|(_, detail)| detail.clone())
+                    .unwrap_or_default()
+            },
+        ))
+        .control(status_badge_from(
+            reader,
+            derived(
+                attention.clone(),
+                "settings remote management attention label",
+                |attention: &Option<(String, String)>| {
+                    attention
+                        .as_ref()
+                        .map(|(label, _)| label.clone())
+                        .unwrap_or_default()
+                },
+            ),
+            derived(
+                attention.clone(),
+                "settings remote management attention tone",
+                |_: &Option<(String, String)>| SemanticTone::Warning,
+            ),
+        ))
+        .build(shared);
+    let module_error = derived(
+        module.clone(),
+        "settings remote management module error",
+        |module: &RemoteManagementSettingsSnapshot| module.module_error.clone().unwrap_or_default(),
+    );
+    let node_identity = derived(
+        module,
+        "settings remote management node identity",
+        |module: &RemoteManagementSettingsSnapshot| {
+            format!(
+                "{} · {}",
+                module.module_node_label,
+                module
+                    .module_node_id
+                    .as_deref()
+                    .map(|id| short(id, 18))
+                    .unwrap_or_else(|| "identity unavailable".to_string())
+            )
+        },
+    );
+    let module = SettingsCard::new("Remote management module")
         .description("Turns the module on or off for this node. It does not grant host permission or install a missing module.")
         .row(
             SettingRow::new("Node override")
                 .help("Inherit follows the cluster default.")
                 .control(module_override)
                 .build(shared),
-        );
-    if !snapshot.module_loading {
-        module = module
-            .row(
-                SettingRow::new("Desired state")
-                    .help(module_effective_source_label(
-                        snapshot.module_effective_source,
-                    ))
-                    .status(
-                        reader,
-                        if snapshot.module_effective_enabled {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        },
-                        if snapshot.module_effective_enabled {
-                            SemanticTone::Success
-                        } else {
-                            SemanticTone::Neutral
-                        },
-                    )
-                    .build(shared),
-            )
-            .row(
-                SettingRow::new("Running")
-                    .help(snapshot.module_observed_detail.clone())
-                    .status(
-                        reader,
-                        remote_management_observed_label(snapshot.module_observed),
-                        module_observed_tone(snapshot.module_observed),
-                    )
-                    .build(shared),
-            );
-        if let Some((label, detail)) = remote_management_module_attention(&snapshot) {
-            module = module.row(
-                SettingRow::new("Needs attention")
-                    .help(detail)
-                    .status(reader, label, SemanticTone::Warning)
-                    .build(shared),
-            );
-        }
-    }
-    if let Some(error) = snapshot.module_error.clone() {
-        module = module.row(
+        )
+        .row(revealed(desired, loaded.clone()))
+        .row(revealed(running, loaded.clone()))
+        .row(revealed(
+            needs_attention,
+            derived(attention, "settings remote management has attention", Option::is_some),
+        ))
+        .row(revealed(
             SettingRow::new("Module error")
-                .value(shared, error)
+                .value_from(shared, module_error.clone())
                 .build(shared),
-        );
-    }
-    if let Some(error) = module_action_error.clone() {
-        module = module.row(SettingRow::new("Error").value(shared, error).build(shared));
-    } else if let Some(status) = module_action_status.clone() {
-        module = module.row(
-            SettingRow::new("Status")
-                .value(shared, status)
+            derived(module_error, "settings remote management has module error", |error: &String| {
+                !error.is_empty()
+            }),
+        ))
+        .row(feedback_slot(shared, reader, |snapshot| {
+            (
+                snapshot.remote_management.module_error.clone(),
+                snapshot.remote_management.module_status.clone(),
+            )
+        }))
+        .row(
+            SettingRow::new("Module settings")
+                .help("Configure the module itself in Modules.")
+                .control(open_modules)
                 .build(shared),
-        );
-    }
-    module = module.row(
-        SettingRow::new("Module settings")
-            .help("Configure the module itself in Modules.")
-            .control(open_modules)
-            .build(shared),
-    );
-    if !snapshot.module_loading {
-        module = module.row(details(
-            shared,
-            reader,
-            "remote-management-module",
-            "node identity",
-            vec![widgets::Boxed::new(
-                SettingRow::new("Node")
-                    .value(
-                        shared,
-                        format!(
-                            "{} · {}",
-                            snapshot.module_node_label,
-                            snapshot
-                                .module_node_id
-                                .as_deref()
-                                .map(|id| short(id, 18))
-                                .unwrap_or_else(|| "identity unavailable".to_string())
-                        ),
-                    )
-                    .build(shared),
-            )],
+        )
+        .row(revealed(
+            details(
+                shared,
+                reader,
+                "remote-management-module",
+                "node identity",
+                vec![widgets::Boxed::new(
+                    SettingRow::new("Node")
+                        .value_from(shared, node_identity)
+                        .build(shared),
+                )],
+            ),
+            loaded,
         ));
-    }
 
     // ------------------------------------------------------------------ other nodes
     let commands = SettingsCard::new("Other nodes")
@@ -8583,10 +8952,63 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             )],
         ));
 
+    let mut devices = SettingsCard::new("Device sharing")
+        .description("Allow authenticated cluster peers to use this node's default devices. Android permissions and device availability still apply. Turn sharing off to revoke access.");
+    for (kind, label) in [
+        ("microphone", "Microphone"),
+        ("speaker", "Speaker"),
+        ("camera", "Camera"),
+        ("motion", "Motion and environment sensors"),
+    ] {
+        let s = shared.clone();
+        let checked = snapshot.shared_devices.iter().any(|value| value == kind);
+        devices = devices.row(
+            SettingRow::new(label)
+                .control(
+                    Switch::new("")
+                        .semantic_name(format!("Share {label}"))
+                        .checked(checked)
+                        .theme_when(clone_reader(reader))
+                        .on_change(move |enabled| {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::RemoteManagementPermission,
+                                SettingsOperation::SetDeviceExposure {
+                                    kind: kind.into(),
+                                    enabled,
+                                },
+                            );
+                        }),
+                )
+                .build(shared),
+        );
+    }
+    #[cfg(target_os = "android")]
+    {
+        let s = shared.clone();
+        devices = devices.row(
+            SettingRow::new("App Use")
+                .help("Share the display and enable accessibility for touch and text input.")
+                .control(
+                    sui::Button::new("Set up App Use")
+                        .theme_when(clone_reader(reader))
+                        .on_press(move || {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::RemoteManagementPermission,
+                                SettingsOperation::OpenAndroidMediaSettings,
+                            );
+                        }),
+                )
+                .build(shared),
+        );
+    }
+
     Stack::vertical()
         .gap(16.0)
         .alignment(Alignment::Stretch)
         .with_child(permission.build(shared, reader))
+        .with_child(devices.build(shared, reader))
         .with_child(module.build(shared, reader))
         .with_child(node_external_integrations_permission_section(
             shared, reader,
@@ -8620,37 +9042,37 @@ fn cluster_join_preview(raw: &str) -> Result<ClusterJoinPreview, String> {
     })
 }
 
+/// Membership. The page changes shape only when this device joins or leaves a cluster; the join
+/// field, review, confirmations, and invitations update in place.
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings cluster structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.cluster.clone())
-        });
+    let source = settings_projection(shared, "settings cluster membership", |snapshot| {
+        snapshot.cluster.clustered
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        WidgetPod::new(section_cluster_body(&s, &r))
+    RebuildOnChange::key_from(source, move |clustered| {
+        WidgetPod::new(section_cluster_body(&s, &r, *clustered))
     })
 }
 
-fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (clustered, cluster_summary, invite_result, leave_confirming) = {
-        let settings = shared.settings();
-        (
-            settings.clustered,
-            settings
-                .cluster_summary
-                .clone()
-                .unwrap_or_else(|| "connected".to_string()),
-            settings.invite_result.clone(),
-            settings.leave_confirming,
-        )
-    };
-
+fn section_cluster_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    clustered: bool,
+) -> impl Widget + use<> {
+    let idle = settings_projection(shared, "settings cluster idle", |snapshot| {
+        !snapshot.cluster.pending
+    });
     let mut this_cluster =
         SettingsCard::new("This cluster").header_action(cluster_dashboard_button(shared, reader));
     this_cluster = if clustered {
+        let summary = settings_projection(shared, "settings cluster summary", |snapshot| {
+            snapshot
+                .cluster
+                .cluster_summary
+                .clone()
+                .unwrap_or_else(|| "connected".to_string())
+        });
         this_cluster
             .row(
                 SettingRow::new("Status")
@@ -8659,7 +9081,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             )
             .row(
                 SettingRow::new("Cluster")
-                    .value(shared, cluster_summary)
+                    .value_from(shared, summary)
                     .build(shared),
             )
     } else {
@@ -8670,17 +9092,11 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 .build(shared),
         )
     };
-    this_cluster = this_cluster.row(feedback_slot(
-        shared,
-        reader,
-        |settings| settings.cluster_action_error.clone(),
-        |settings| settings.cluster_action_status.clone(),
-    ));
+    this_cluster = this_cluster.row(feedback_slot(shared, reader, |snapshot| {
+        snapshot.feedback.cluster.clone()
+    }));
 
-    let mut page = Stack::vertical()
-        .gap(16.0)
-        .alignment(Alignment::Stretch)
-        .with_child(this_cluster.build(shared, reader));
+    let mut page = Column::new(reader, |_| 16.0).with_child(this_cluster.build(shared, reader));
 
     if clustered {
         let generate = {
@@ -8688,13 +9104,7 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             sui::Button::new("Generate invitation")
                 .icon(sui::IconGlyph::Link)
                 .theme_when(clone_reader(reader))
-                .enabled_when({
-                    let s = s.clone();
-                    move || {
-                        !s.settings()
-                            .domain_pending(SettingsOperationDomain::Cluster)
-                    }
-                })
+                .enabled_from(idle.clone())
                 .on_press(move || {
                     queue_settings_operation(
                         &s,
@@ -8703,113 +9113,91 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                     );
                 })
         };
-        let mut invite = SettingsCard::new("Invite a device").row(
-            SettingRow::new("Invitation")
-                .help("Creates a one-time link another device uses to join. It expires.")
-                .control(generate)
-                .build(shared),
+        let invite = settings_projection(shared, "settings cluster invite", |snapshot| {
+            snapshot.cluster.invite.clone()
+        });
+        let has_invite = derived(
+            invite.clone(),
+            "settings cluster has invite",
+            Option::is_some,
         );
-        if let Some(result) = invite_result {
-            invite = invite
+        // The generated link and command; rebuilt only when a new invitation is issued.
+        let invite_rows = {
+            let s = shared.clone();
+            let r = Rc::clone(reader);
+            RebuildOnChange::key_from(invite, move |invite| match invite.clone() {
+                Some(invite) => WidgetPod::new(cluster_invite_rows(&s, &r, invite)),
+                None => WidgetPod::new(SizedBox::new()),
+            })
+        };
+        page = page.with_child(
+            SettingsCard::new("Invite a device")
                 .row(
-                    SettingRow::new("Join link")
-                        .help("Open it on the other device.")
-                        .control(copy_control(
-                            reader,
-                            "cluster-invite-link",
-                            "Join link",
-                            result.uri,
-                        ))
+                    SettingRow::new("Invitation")
+                        .help("Creates a one-time link another device uses to join. It expires.")
+                        .control(generate)
                         .build(shared),
                 )
-                .row(
-                    SettingRow::new("Join command")
-                        .help("Or run it in a terminal there.")
-                        .control(copy_control(
-                            reader,
-                            "cluster-invite-command",
-                            "Join command",
-                            result.join_command,
-                        ))
-                        .build(shared),
-                )
-                .row(
-                    SettingRow::new("Expires")
-                        .value(shared, result.expires_at)
-                        .build(shared),
-                )
-                .row(details(
-                    shared,
-                    reader,
-                    "cluster-invite",
-                    "saved key",
-                    vec![widgets::Boxed::new(
-                        SettingRow::new("Saved key")
-                            .value(shared, result.persisted_key)
-                            .build(shared),
-                    )],
-                ));
-        }
-        page = page.with_child(invite.build(shared, reader));
+                .row(revealed(invite_rows, has_invite))
+                .build(shared, reader),
+        );
     }
 
     page = page.with_child(cluster_join_card(shared, reader, clustered));
 
     if clustered {
-        let leave = if leave_confirming {
-            let confirm = {
-                let s = shared.clone();
-                sui::Button::new("Confirm leave")
-                    .icon(sui::IconGlyph::Trash)
-                    .theme_when(clone_reader(reader))
-                    .appearance(sui::ButtonAppearance::Filled)
-                    .tone(SemanticTone::Danger)
-                    .enabled_when({
-                        let s = s.clone();
-                        move || {
-                            !s.settings()
-                                .domain_pending(SettingsOperationDomain::Cluster)
-                        }
-                    })
-                    .on_press(move || {
-                        queue_settings_operation(
-                            &s,
-                            SettingsOperationScope::Cluster,
-                            SettingsOperation::LeaveCluster,
-                        );
-                    })
-            };
-            let cancel = {
-                let s = shared.clone();
-                sui::Button::new("Cancel")
-                    .icon(sui::IconGlyph::Close)
-                    .theme_when(clone_reader(reader))
-                    .appearance(sui::ButtonAppearance::Tonal)
-                    .tone(SemanticTone::Neutral)
-                    .on_press(move || {
-                        s.settings_mut().cancel_leave_cluster();
-                    })
-            };
-            widgets::Boxed::new(
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new("Confirm leave")
+                .icon(sui::IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
+                .enabled_from(idle)
+                .on_press(move || {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Cluster,
+                        SettingsOperation::LeaveCluster,
+                    );
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .icon(sui::IconGlyph::Close)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press(move || {
+                    s.settings_mut().cancel_leave_cluster();
+                })
+        };
+        let leave = {
+            let s = shared.clone();
+            sui::Button::new("Leave cluster")
+                .icon(sui::IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Danger)
+                .on_press(move || {
+                    s.settings_mut().confirm_leave_cluster();
+                })
+        };
+        let confirming =
+            settings_projection(shared, "settings cluster leave confirming", |snapshot| {
+                usize::from(snapshot.cluster.leave_confirming)
+            });
+        let leave = SwitchView::new()
+            .with_child(leave)
+            .with_child(
                 Flex::horizontal()
                     .gap(8.0)
                     .align_items(Alignment::Center)
                     .with_child(confirm)
                     .with_child(cancel),
             )
-        } else {
-            let s = shared.clone();
-            widgets::Boxed::new(
-                sui::Button::new("Leave cluster")
-                    .icon(sui::IconGlyph::Trash)
-                    .theme_when(clone_reader(reader))
-                    .appearance(sui::ButtonAppearance::Tonal)
-                    .tone(SemanticTone::Danger)
-                    .on_press(move || {
-                        s.settings_mut().confirm_leave_cluster();
-                    }),
-            )
-        };
+            .selected_from(confirming);
         page = page.with_child(
             SettingsCard::new("Leave cluster")
                 .row(
@@ -8824,33 +9212,101 @@ fn section_cluster_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
     page
 }
 
+fn cluster_invite_rows(
+    shared: &Shared,
+    reader: &ThemeReader,
+    (uri, join_command, expires_at, persisted_key): (String, String, String, String),
+) -> impl Widget + use<> {
+    Column::new(reader, |theme| theme.metrics.form_section_body_gap)
+        .with_child(
+            SettingRow::new("Join link")
+                .help("Open it on the other device.")
+                .control(copy_control(
+                    reader,
+                    "cluster-invite-link",
+                    "Join link",
+                    uri,
+                ))
+                .build(shared),
+        )
+        .with_child(
+            SettingRow::new("Join command")
+                .help("Or run it in a terminal there.")
+                .control(copy_control(
+                    reader,
+                    "cluster-invite-command",
+                    "Join command",
+                    join_command,
+                ))
+                .build(shared),
+        )
+        .with_child(
+            SettingRow::new("Expires")
+                .value(shared, expires_at)
+                .build(shared),
+        )
+        .with_child(details(
+            shared,
+            reader,
+            "cluster-invite",
+            "saved key",
+            vec![widgets::Boxed::new(
+                SettingRow::new("Saved key")
+                    .value(shared, persisted_key)
+                    .build(shared),
+            )],
+        ))
+}
+
 fn cluster_join_card(
     shared: &Shared,
     reader: &ThemeReader,
     clustered: bool,
 ) -> impl Widget + use<> {
-    let (join_value, confirming, source_cluster) = {
-        let settings = shared.settings();
-        (
-            settings.join_invite.clone(),
-            settings.join_confirming,
-            settings
-                .cluster_id
-                .as_deref()
-                .map(|id| short(id, 24))
-                .unwrap_or_else(|| "local bootstrap state".to_string()),
+    let join_value = shared.settings().join_invite.clone();
+    let idle = settings_projection(shared, "settings cluster join idle", |snapshot| {
+        !snapshot.cluster.pending
+    });
+    let confirming = settings_projection(shared, "settings cluster join confirming", |snapshot| {
+        snapshot.cluster.join_confirming
+    });
+    let reviewing = derived(
+        confirming.clone(),
+        "settings cluster join reviewing",
+        |confirming| !confirming,
+    );
+    let input = {
+        let s = shared.clone();
+        let field = TextInput::new("cluster-join-link")
+            .value(join_value)
+            .placeholder("sinomo://cluster/join/…")
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().set_join_invite(value));
+        let s = shared.clone();
+        SyncedTextInput::new(field, move || s.settings().join_invite.clone()).observing(
+            settings_projection(shared, "settings cluster join invite", |snapshot| {
+                snapshot.cluster.join_invite.clone()
+            }),
         )
     };
-    let input = TextInput::new("cluster-join-link")
-        .value(join_value.clone())
-        .placeholder("sinomo://cluster/join/…")
-        .min_width(240.0)
-        .theme_when(clone_reader(reader))
-        .on_change({
-            let s = shared.clone();
-            move |value| s.settings_mut().set_join_invite(value)
+    let review = {
+        let s = shared.clone();
+        let can_review = settings_projection(shared, "settings cluster can review", |snapshot| {
+            !snapshot.cluster.join_invite.trim().is_empty() && !snapshot.cluster.pending
         });
-    let mut card = SettingsCard::new(if clustered {
+        sui::Button::new(if clustered {
+            "Review migration"
+        } else {
+            "Review join"
+        })
+        .icon(sui::IconGlyph::ChevronRight)
+        .theme_when(clone_reader(reader))
+        .enabled_from(can_review)
+        .on_press(move || {
+            s.settings_mut().confirm_join_cluster();
+        })
+    };
+    let card = SettingsCard::new(if clustered {
         "Join another cluster"
     } else {
         "Join a cluster"
@@ -8859,135 +9315,135 @@ fn cluster_join_card(
         "Move this device to another cluster without leaving first. You review the target and impact before anything changes."
     } else {
         "Paste an invitation from a device in the cluster. You review the target and impact before joining."
-    });
+    })
+    .row(
+        SettingRow::new("Invitation link")
+            .control(
+                Flex::horizontal()
+                    .gap(8.0)
+                    .align_items(Alignment::Center)
+                    .with_item(input, FlexItem::new().shrink(1.0))
+                    .with_item(
+                        Presence::new(review)
+                            .transition(crate::ui::widgets::reveal_transition())
+                            .shown_from(reviewing)
+                            .collapse(Axis::Horizontal),
+                        FlexItem::new().no_shrink(),
+                    ),
+            )
+            .build(shared),
+    );
 
-    if confirming {
-        card = card.row(
-            SettingRow::new("Invitation link")
-                .control(input)
+    let preview = settings_projection(shared, "settings cluster join preview", |snapshot| {
+        cluster_join_preview(&snapshot.cluster.join_invite)
+            .ok()
+            .map(|preview| (preview.target, preview.expires_at, preview.issuer))
+    });
+    let has_preview = derived(
+        preview.clone(),
+        "settings cluster join has preview",
+        Option::is_some,
+    );
+    let preview_field = |name: &'static str, field: fn(&(String, String, String)) -> String| {
+        derived(preview.clone(), name, move |preview| {
+            preview.as_ref().map(field).unwrap_or_default()
+        })
+    };
+    let preview_rows = Column::new(reader, |theme| theme.metrics.form_section_body_gap)
+        .with_child(
+            SettingRow::new("Target cluster")
+                .value_from(
+                    shared,
+                    preview_field("settings cluster join target", |preview| preview.0.clone()),
+                )
+                .build(shared),
+        )
+        .with_child(
+            SettingRow::new("Invitation expires")
+                .value_from(
+                    shared,
+                    preview_field("settings cluster join expiry", |preview| preview.1.clone()),
+                )
+                .build(shared),
+        )
+        .with_child(
+            SettingRow::new("Issued by")
+                .value_from(
+                    shared,
+                    preview_field("settings cluster join issuer", |preview| preview.2.clone()),
+                )
                 .build(shared),
         );
-        if let Ok(preview) = cluster_join_preview(&join_value) {
-            card = card
-                .row(
-                    SettingRow::new("Target cluster")
-                        .value(shared, preview.target)
-                        .build(shared),
-                )
-                .row(
-                    SettingRow::new("Invitation expires")
-                        .value(shared, preview.expires_at)
-                        .build(shared),
-                )
-                .row(
-                    SettingRow::new("Issued by")
-                        .value(shared, preview.issuer)
-                        .build(shared),
-                );
-        }
-        let impact = if clustered {
+    let impact = settings_projection(shared, "settings cluster join impact", move |snapshot| {
+        if clustered {
+            let source_cluster = snapshot
+                .cluster
+                .cluster_id
+                .as_deref()
+                .map(|id| short(id, 24))
+                .unwrap_or_else(|| "local bootstrap state".to_string());
             format!(
                 "This device will leave {source_cluster}, retain its node identity, quarantine the source cluster state, join the target, and import node-local configuration. Cluster-scoped data and membership do not move."
             )
         } else {
             "This device will retain its node identity and join the target cluster. Local node configuration is preserved; cluster-scoped data remains owned by its current cluster."
                 .to_string()
-        };
-        let confirm = {
-            let s = shared.clone();
-            sui::Button::new(if clustered {
-                "Confirm migration"
-            } else {
-                "Confirm join"
-            })
-            .icon(sui::IconGlyph::Check)
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Filled)
-            .tone(SemanticTone::Danger)
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    !s.settings()
-                        .domain_pending(SettingsOperationDomain::Cluster)
-                }
-            })
-            .on_press(move || {
-                let invite = s.settings().join_invite.clone();
-                if cluster_join_preview(&invite).is_err() {
-                    s.settings_mut()
-                        .set_cluster_action_error("the invitation changed; review it again");
-                    return;
-                }
-                queue_settings_operation(
-                    &s,
-                    SettingsOperationScope::Cluster,
-                    SettingsOperation::JoinCluster { invite },
-                );
-            })
-        };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(sui::IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || s.settings_mut().cancel_join_cluster())
-        };
-        card = card
-            .row(SettingRow::new("What changes").help(impact).build(shared))
-            .row(
-                SettingRow::new("If it fails")
-                    .help("Sinomo restores the source cluster automatically. After an interrupted migration, restart the daemon and run `sinomo cluster status` before retrying.")
-                    .build(shared),
-            )
-            .row(
-                Align::new(
-                    Alignment::End,
-                    Alignment::Center,
-                    Flex::horizontal()
-                        .gap(8.0)
-                        .align_items(Alignment::Center)
-                        .with_child(cancel)
-                        .with_child(confirm),
-                ),
+        }
+    });
+    let confirm = {
+        let s = shared.clone();
+        sui::Button::new(if clustered {
+            "Confirm migration"
+        } else {
+            "Confirm join"
+        })
+        .icon(sui::IconGlyph::Check)
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Filled)
+        .tone(SemanticTone::Danger)
+        .enabled_from(idle)
+        .on_press(move || {
+            let invite = s.settings().join_invite.clone();
+            if cluster_join_preview(&invite).is_err() {
+                s.settings_mut()
+                    .set_cluster_action_error("the invitation changed; review it again");
+                return;
+            }
+            queue_settings_operation(
+                &s,
+                SettingsOperationScope::Cluster,
+                SettingsOperation::JoinCluster { invite },
             );
-    } else {
-        let review = {
-            let s = shared.clone();
-            sui::Button::new(if clustered {
-                "Review migration"
-            } else {
-                "Review join"
-            })
-            .icon(sui::IconGlyph::ChevronRight)
+        })
+    };
+    let cancel = {
+        let s = shared.clone();
+        sui::Button::new("Cancel")
+            .icon(sui::IconGlyph::Close)
             .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    !s.settings().join_invite.trim().is_empty()
-                        && !s
-                            .settings()
-                            .domain_pending(SettingsOperationDomain::Cluster)
-                }
-            })
-            .on_press(move || {
-                s.settings_mut().confirm_join_cluster();
-            })
-        };
-        card = card.row(
-            SettingRow::new("Invitation link")
-                .control(
-                    Flex::horizontal()
-                        .gap(8.0)
-                        .align_items(Alignment::Center)
-                        .with_item(input, FlexItem::new().shrink(1.0).min_width(160.0))
-                        .with_item(review, FlexItem::new().no_shrink()),
-                )
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || s.settings_mut().cancel_join_cluster())
+    };
+    let review_block = Column::new(reader, |theme| theme.metrics.form_section_body_gap)
+        .with_child(revealed(preview_rows, has_preview))
+        .with_child(SettingRow::new("What changes").help_from(impact).build(shared))
+        .with_child(
+            SettingRow::new("If it fails")
+                .help("Sinomo restores the source cluster automatically. After an interrupted migration, restart the daemon and run `sinomo cluster status` before retrying.")
                 .build(shared),
-        );
-    }
-    card.build(shared, reader)
+        )
+        .with_child(Align::new(
+            Alignment::End,
+            Alignment::Center,
+            Flex::horizontal()
+                .gap(8.0)
+                .align_items(Alignment::Center)
+                .with_child(cancel)
+                .with_child(confirm),
+        ));
+    card.row(revealed(review_block, confirming))
+        .build(shared, reader)
 }
 
 fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -9002,53 +9458,123 @@ fn cluster_dashboard_button(shared: &Shared, reader: &ThemeReader) -> impl Widge
 
 const COPY_DIAGNOSTIC_SUMMARY_LABEL: &str = "Copy summary";
 
+/// One provider account card's state. `index` addresses the account in the provider forms.
+#[derive(Clone, Debug, PartialEq)]
+struct ProviderCardStructure {
+    index: usize,
+    form: ProviderForm,
+    health: ProviderHealthState,
+    advanced: bool,
+    usage: bool,
+    status: Option<String>,
+    remove_confirming: bool,
+    action_error: Option<String>,
+}
+
+impl ProviderCardStructure {
+    /// Model choices: built-in and discovered models, plus the configured one.
+    fn model_options(&self) -> Vec<String> {
+        let mut options = self.form.known_models.clone();
+        options.extend(self.health.models.iter().cloned());
+        if !options.is_empty()
+            && !self.form.default_model.is_empty()
+            && !options.contains(&self.form.default_model)
+        {
+            options.push(self.form.default_model.clone());
+        }
+        options.sort();
+        options.dedup();
+        options
+    }
+}
+
+fn provider_cards(providers: &SettingsProviderStructure) -> Vec<ProviderCardStructure> {
+    providers
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(index, (form, health))| {
+            let key = provider_account_key(&form.provider, &form.account);
+            ProviderCardStructure {
+                index,
+                form: form.clone(),
+                health: health.clone(),
+                advanced: providers.expanded.contains(&key),
+                usage: providers.usage_expanded.contains(&key),
+                status: providers
+                    .action_status
+                    .as_ref()
+                    .filter(|status| {
+                        status.provider == form.provider && status.account == form.account
+                    })
+                    .map(|status| status.message.clone()),
+                remove_confirming: providers.remove_confirming.as_ref().is_some_and(
+                    |(provider, account)| provider == &form.provider && account == &form.account,
+                ),
+                action_error: providers.action_error.clone(),
+            }
+        })
+        .collect()
+}
+
 /// One provider account: operational state and chat routing stay visible; quota detail,
-/// credentials, tuning, and destructive actions are disclosed only when requested.
-fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widget + use<> {
+/// credentials, tuning, and destructive actions are disclosed only when requested. The card stays
+/// mounted while health checks, tests, and edits update it.
+fn provider_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    card: Signal<ProviderCardStructure>,
+) -> impl Widget + use<> {
     let form = shared.settings().provider_forms[index].clone();
-    let health = shared
-        .settings()
-        .provider_health(&form.provider, &form.account);
-    let advanced_expanded = shared
-        .settings()
-        .provider_detail_expanded(&form.provider, &form.account);
-    let usage_expanded = shared
-        .settings()
-        .provider_usage_expanded(&form.provider, &form.account);
+    let watch = |name: &'static str, select: fn(&ProviderCardStructure) -> bool| {
+        card.select_named(name, select)
+    };
+    let text = |name: &'static str, select: fn(&ProviderCardStructure) -> String| {
+        card.select_named(name, select)
+    };
 
     let enable_switch = {
         let s = shared.clone();
         let provider = form.provider.clone();
         let account = form.account.clone();
-        Switch::new("Enabled")
-            .checked(form.enabled)
-            .theme_when(clone_reader(reader))
-            .on_change(move |enabled| {
-                queue_settings_operation(
-                    &s,
-                    SettingsOperationScope::Providers,
-                    SettingsOperation::SetProviderEnabled {
-                        provider: provider.clone(),
-                        account: account.clone(),
-                        enabled,
-                    },
-                );
-            })
+        synced_switch(
+            Switch::new("Enabled")
+                .checked(form.enabled)
+                .theme_when(clone_reader(reader))
+                .on_change(move |enabled| {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Providers,
+                        SettingsOperation::SetProviderEnabled {
+                            provider: provider.clone(),
+                            account: account.clone(),
+                            enabled,
+                        },
+                    );
+                }),
+            watch("settings provider enabled", |card| card.form.enabled),
+        )
     };
-    let health_presentation = provider_health_presentation(&health);
-    let health_badge = StatusBadge::new(health_presentation.label)
-        .icon(health_presentation.icon)
-        .tone(health_presentation.tone)
-        .theme_when(clone_reader(reader));
+    let health = card.select_named("settings provider health", |card| {
+        provider_health_presentation(&card.health)
+    });
+    let health_label = derived(health.clone(), "settings provider health label", |health| {
+        health.label.to_string()
+    });
+    let health_badge = Restyle::new(
+        StatusBadge::new(health_label.get())
+            .label_from(health_label)
+            .theme_when(clone_reader(reader)),
+        health,
+        |badge, health| badge.tone(health.tone).icon(health.icon),
+    );
     let header_actions = Stack::horizontal()
         .gap(8.0)
         .alignment(Alignment::Center)
         .with_child(health_badge)
         .with_child(enable_switch);
 
-    let mut card = SettingsCard::new(form.display_name.clone())
-        .description(provider_card_description(&form))
-        .header_action(header_actions);
     let test_button = {
         let s = shared.clone();
         let provider = form.provider.clone();
@@ -9056,7 +9582,9 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         sui::Button::new("Test connection")
             .icon(IconGlyph::Check)
             .theme_when(clone_reader(reader))
-            .enabled(form.signed_in)
+            .enabled_from(watch("settings provider signed in", |card| {
+                card.form.signed_in
+            }))
             .on_press(move || {
                 queue_settings_operation(
                     &s,
@@ -9068,8 +9596,10 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
                 );
             })
     };
+    let checking = card.select_named("settings provider checking", |card| {
+        usize::from(card.health.checking)
+    });
     let test_control = SwitchView::new()
-        .selected(usize::from(health.checking))
         .with_child(test_button)
         .with_child(
             Spinner::new(format!(
@@ -9078,146 +9608,141 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             ))
             .label("Testing connection…")
             .theme_when(clone_reader(reader)),
-        );
-    card = card.row(
-        SettingRow::new("Connection")
-            .help(format!(
-                "{} · Last tested {}",
-                provider_auth_summary(&form),
-                provider_last_verified_label(&health).to_lowercase()
-            ))
-            .control(test_control)
-            .build(shared),
-    );
-    if let Some(error) = health.error.clone() {
-        card = card.row(
-            SettingRow::new("Last error")
-                .control(
-                    settings_label(shared, error, shared.theme().text.sm).color_when({
-                        let s = shared.clone();
-                        move || palette(&s).danger_text
-                    }),
-                )
-                .build(shared),
-        );
-    }
-    let chat_default_control = if form.is_default {
-        widgets::Boxed::new(
+        )
+        .selected_from(checking);
+    let connection_help = text("settings provider connection help", |card| {
+        format!(
+            "{} · Last tested {}",
+            provider_auth_summary(&card.form),
+            provider_last_verified_label(&card.health).to_lowercase()
+        )
+    });
+    let error = text("settings provider error", |card| {
+        card.health.error.clone().unwrap_or_default()
+    });
+    let error_row = SettingRow::new("Last error")
+        .control(
+            settings_label(shared, error.get(), TextSize::Sm)
+                .text_from(error)
+                .color_when({
+                    let s = shared.clone();
+                    move || palette(&s).bad_text
+                }),
+        )
+        .build(shared);
+
+    let set_default = {
+        let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        sui::Button::new("Set as chat default")
+            .icon(sui::IconGlyph::Chat)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled_from(watch("settings provider ready for chat", |card| {
+                card.form.enabled && card.form.signed_in
+            }))
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::SetProviderChatDefault {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                    },
+                );
+            })
+    };
+    let chat_default_control = SwitchView::new()
+        .with_child(set_default)
+        .with_child(
             StatusBadge::new("Default for chat")
                 .icon(IconGlyph::Chat)
                 .tone(SemanticTone::Accent)
                 .theme_when(clone_reader(reader)),
         )
-    } else {
+        .selected_from(card.select_named("settings provider chat default", |card| {
+            usize::from(card.form.is_default)
+        }));
+
+    // The model select's options have no reader form; only this row follows the option list.
+    let model_row = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(
+            card.select_named("settings provider model options", |card| {
+                card.model_options()
+            }),
+            move |options| WidgetPod::new(provider_model_row(&s, &r, index, options.clone())),
+        )
+    };
+    let discovery_error = text("settings provider model discovery", |card| {
+        if card.model_options().is_empty() {
+            card.health
+                .model_discovery_error
+                .clone()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        }
+    });
+    let has_discovery_error = derived(
+        discovery_error.clone(),
+        "settings provider has model discovery error",
+        |error: &String| !error.is_empty(),
+    );
+
+    let usage_toggle = {
         let s = shared.clone();
         let provider = form.provider.clone();
         let account = form.account.clone();
-        let ready_for_chat = form.enabled && form.signed_in;
-        widgets::Boxed::new(
-            sui::Button::new("Set as chat default")
-                .icon(sui::IconGlyph::Chat)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .enabled(ready_for_chat)
-                .on_press(move || {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Providers,
-                        SettingsOperation::SetProviderChatDefault {
-                            provider: provider.clone(),
-                            account: account.clone(),
-                        },
-                    );
-                }),
+        disclosure_restyle(
+            disclosure_button(reader, "View usage details", move || {
+                s.settings_mut().toggle_provider_usage(&provider, &account)
+            })
+            .enabled_from(watch("settings provider usage has detail", |card| {
+                card.health
+                    .usage
+                    .as_ref()
+                    .is_some_and(|usage| !usage.limits.is_empty() || usage.credits.is_some())
+            })),
+            watch("settings provider usage open", |card| card.usage),
+            "View usage details",
+            "Hide usage details",
         )
     };
-    card = card.row(
-        SettingRow::new("Chat routing")
-            .help("New chats use the default account unless you pick another.")
-            .control(chat_default_control)
-            .build(shared),
+    let usage_summary = SettingRow::new("Usage")
+        .help_from(text("settings provider usage summary", |card| {
+            provider_usage_summary(&card.health)
+        }))
+        .control(revealed(
+            usage_toggle,
+            watch("settings provider has usage", |card| {
+                card.health.usage.is_some()
+            }),
+        ))
+        .build(shared);
+    let usage_details = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        // Reported quotas, read-only; rebuilt when a test reports new usage.
+        RebuildOnChange::key_from(
+            card.select_named("settings provider usage", |card| card.health.usage.clone()),
+            move |usage| match usage {
+                Some(usage) => WidgetPod::new(provider_usage_row(&s, &r, usage)),
+                None => WidgetPod::new(SizedBox::new()),
+            },
+        )
+    };
+    let status = text("settings provider status", |card| {
+        card.status.clone().unwrap_or_default()
+    });
+    let has_status = derived(
+        status.clone(),
+        "settings provider has status",
+        |status: &String| !status.is_empty(),
     );
-
-    let mut model_options = form.known_models.clone();
-    model_options.extend(health.models.iter().cloned());
-    let has_model_options = !model_options.is_empty();
-    if has_model_options
-        && !form.default_model.is_empty()
-        && !model_options.contains(&form.default_model)
-    {
-        model_options.push(form.default_model.clone());
-    }
-    model_options.sort();
-    model_options.dedup();
-    if has_model_options {
-        let models = model_options;
-        let selected_model = form.default_model.clone();
-        let model_select = {
-            let s = shared.clone();
-            let provider = form.provider.clone();
-            let account = form.account.clone();
-            let options = models.clone();
-            Select::new(format!("provider-{index}-model-select"))
-                .options(options.clone())
-                .selected_when(move || {
-                    options
-                        .iter()
-                        .position(|model| model == &selected_model)
-                        .or((!options.is_empty()).then_some(0))
-                })
-                .theme_when(clone_reader(reader))
-                .on_change(move |_index, model| {
-                    let draft_key = provider_field_key(&provider, &account, ProviderField::Model);
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Providers,
-                        SettingsOperation::SetProviderField {
-                            provider: provider.clone(),
-                            account: account.clone(),
-                            field: ProviderField::Model,
-                            raw: model.clone(),
-                            draft_key,
-                        },
-                    );
-                })
-        };
-        card = card.row(
-            SettingRow::new("Model")
-                .help("Used when a chat or agent does not choose one.")
-                .control(model_select)
-                .build(shared),
-        );
-    } else {
-        card = card.row(provider_model_text_row(shared, reader, index, "Model"));
-        if let Some(error) = health.model_discovery_error.clone() {
-            card = card.row(SettingRow::new("Model discovery").help(error).build(shared));
-        }
-    }
-
-    card = card.row(provider_usage_summary_row(
-        shared,
-        reader,
-        &form,
-        &health,
-        usage_expanded,
-    ));
-    if usage_expanded && let Some(usage) = health.usage.as_ref() {
-        card = card.row(provider_usage_row(shared, reader, usage));
-    }
-    if let Some(status) = shared
-        .settings()
-        .provider_action_status
-        .as_ref()
-        .filter(|status| status.provider == form.provider && status.account == form.account)
-        .map(|status| status.message.clone())
-    {
-        card = card.row(
-            SettingRow::new("Status")
-                .value(shared, status)
-                .build(shared),
-        );
-    }
 
     let detail_button = {
         let s = shared.clone();
@@ -9225,448 +9750,563 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         let account = form.account.clone();
         disclosure_toggle(
             reader,
-            advanced_expanded,
+            watch("settings provider advanced open", |card| card.advanced),
             PROVIDER_ADVANCED_SHOW_LABEL,
             PROVIDER_ADVANCED_HIDE_LABEL,
             move || s.settings_mut().toggle_provider_detail(&provider, &account),
         )
     };
-    card = card.row(Align::new(
-        Alignment::Start,
-        Alignment::Center,
-        detail_button,
-    ));
+    let advanced = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let card = card.clone();
+        // The advanced controls change shape with the configured model (its context limits and
+        // whether a model list exists); edits and saves update them in place.
+        RebuildOnChange::key_from(
+            card.select_named("settings provider advanced shape", |card| {
+                (
+                    card.form.default_model.clone(),
+                    !card.model_options().is_empty(),
+                    card.form.uses_device_login,
+                    card.form.supports_reasoning,
+                )
+            }),
+            move |_| WidgetPod::new(provider_advanced_settings(&s, &r, index, card.clone())),
+        )
+    };
 
-    let mut body = FieldGroup::new().gap(10.0).fill_width(true);
-    if advanced_expanded {
-        body = body.with_child(
-            SettingRow::new("Capabilities")
-                .value(shared, provider_capabilities_summary(&form.provider))
+    SettingsCard::new(form.display_name.clone())
+        .description_from(text("settings provider description", |card| {
+            provider_card_description(&card.form)
+        }))
+        .header_action(header_actions)
+        .row(
+            SettingRow::new("Connection")
+                .help_from(connection_help)
+                .control(test_control)
                 .build(shared),
-        );
-        body = body.with_child(provider_subsection_heading(shared, reader, "Credentials"));
-        if form.uses_device_login {
-            let sign_in_label = if form.signed_in {
+        )
+        .row(revealed(
+            error_row,
+            watch("settings provider has error", |card| {
+                card.health.error.is_some()
+            }),
+        ))
+        .row(
+            SettingRow::new("Chat routing")
+                .help("New chats use the default account unless you pick another.")
+                .control(chat_default_control)
+                .build(shared),
+        )
+        .row(model_row)
+        .row(revealed(
+            SettingRow::new("Model discovery")
+                .help_from(discovery_error)
+                .build(shared),
+            has_discovery_error,
+        ))
+        .row(usage_summary)
+        .row(revealed(
+            usage_details,
+            watch("settings provider usage shown", |card| {
+                card.usage && card.health.usage.is_some()
+            }),
+        ))
+        .row(revealed(
+            SettingRow::new("Status")
+                .value_from(shared, status)
+                .build(shared),
+            has_status,
+        ))
+        .row(Align::new(
+            Alignment::Start,
+            Alignment::Center,
+            detail_button,
+        ))
+        .row(revealed(
+            advanced,
+            watch("settings provider advanced shown", |card| card.advanced),
+        ))
+        .build(shared, reader)
+}
+
+/// The default model: a select over the known and discovered models, or a text field.
+fn provider_model_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    options: Vec<String>,
+) -> widgets::Boxed {
+    if options.is_empty() {
+        return widgets::Boxed::new(provider_model_text_row(shared, reader, index, "Model"));
+    }
+    let form = shared.settings().provider_forms[index].clone();
+    let model_select = {
+        let s = shared.clone();
+        let selected = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        let choices = options.clone();
+        Select::new(format!("provider-{index}-model-select"))
+            .options(options)
+            .selected_when(move || {
+                let current = selected
+                    .settings()
+                    .provider_forms
+                    .get(index)
+                    .map(|form| form.default_model.clone())
+                    .unwrap_or_default();
+                choices
+                    .iter()
+                    .position(|model| model == &current)
+                    .or((!choices.is_empty()).then_some(0))
+            })
+            .theme_when(clone_reader(reader))
+            .on_change(move |_index, model| {
+                let draft_key = provider_field_key(&provider, &account, ProviderField::Model);
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::SetProviderField {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        field: ProviderField::Model,
+                        raw: model.clone(),
+                        draft_key,
+                    },
+                );
+            })
+    };
+    widgets::Boxed::new(
+        SettingRow::new("Model")
+            .help("Used when a chat or agent does not choose one.")
+            .control(model_select)
+            .build(shared),
+    )
+}
+
+/// Credentials, endpoint, context, response defaults, and account removal.
+fn provider_advanced_settings(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    card: Signal<ProviderCardStructure>,
+) -> impl Widget + use<> {
+    let form = shared.settings().provider_forms[index].clone();
+    let has_model_options = !card.get().model_options().is_empty();
+    let mut body = FieldGroup::new().gap(10.0).fill_width(true);
+    body = body.with_child(
+        SettingRow::new("Capabilities")
+            .value(shared, provider_capabilities_summary(&form.provider))
+            .build(shared),
+    );
+    body = body.with_child(provider_subsection_heading(shared, reader, "Credentials"));
+    if form.uses_device_login {
+        let button = {
+            let s = shared.clone();
+            let label = shared.clone();
+            sui::Button::new(if form.signed_in {
                 "Re-authenticate"
             } else {
                 "Sign in"
-            };
-            let button = {
-                let s = shared.clone();
-                sui::Button::new(sign_in_label)
-                    .theme_when(clone_reader(reader))
-                    .on_press(move || {
-                        let waker = s.borrow().waker.clone();
-                        s.settings_mut().begin_device_login(index, waker);
-                    })
-            };
-            let auth = Stack::vertical()
-                .gap(6.0)
-                .alignment(Alignment::Stretch)
-                .with_child(status_reflector(shared, index, reader))
-                .with_child(Stack::horizontal().with_child(button));
-            body = body.with_child(
-                FormRow::new("Sign-in", auth)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
-            );
-        } else if provider_requires_api_key(&form.provider) {
-            let placeholder = if form.has_api_key {
-                "Configured"
-            } else {
-                "Not set"
-            };
-            let api_key = provider_field_key(&form.provider, &form.account, ProviderField::ApiKey);
-            let api_value = shared.settings().field_draft_or(&api_key, String::new);
-            let on_change = {
-                let s = shared.clone();
-                move |value: String| {
-                    s.settings_mut()
-                        .set_provider_field_draft(index, ProviderField::ApiKey, value);
+            })
+            .label_when(move || {
+                let signed_in = label
+                    .settings()
+                    .provider_forms
+                    .get(index)
+                    .is_some_and(|form| form.signed_in);
+                if signed_in {
+                    "Re-authenticate"
+                } else {
+                    "Sign in"
                 }
-            };
-            body = body.with_child(password_save_inline_row(
-                shared,
-                reader,
-                &format!("provider-{index}-api-key"),
-                "API key",
-                api_key,
-                api_value,
-                placeholder,
-                on_change,
-                {
-                    let s = shared.clone();
-                    move || {
-                        let operation = s
-                            .settings()
-                            .provider_field_operation(index, ProviderField::ApiKey);
-                        if let Some(operation) = operation {
-                            queue_settings_operation(
-                                &s,
-                                SettingsOperationScope::Providers,
-                                operation,
-                            );
-                        }
-                    }
-                },
-            ));
-        } else {
-            body = body.with_child(value_row(
-                shared,
-                reader,
-                "Authentication",
-                "No credentials required; the app connects to the configured local service.",
-            ));
-        }
-
-        body = body.with_child(provider_subsection_heading(shared, reader, "Endpoint"));
-        if has_model_options {
-            body = body.with_child(provider_model_text_row(
-                shared,
-                reader,
-                index,
-                "Model ID override",
-            ));
-        }
-
-        let base_url_key =
-            provider_field_key(&form.provider, &form.account, ProviderField::BaseUrl);
-        let base_url_value = shared
-            .settings()
-            .field_draft_or(&base_url_key, || form.api_base_url.clone());
-        body = body.with_child(text_save_inline_row(
+                .to_string()
+            })
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                let waker = s.borrow().waker.clone();
+                s.settings_mut().begin_device_login(index, waker);
+            })
+        };
+        let auth = Stack::vertical()
+            .gap(6.0)
+            .alignment(Alignment::Stretch)
+            .with_child(status_reflector(shared, index, reader))
+            .with_child(Stack::horizontal().with_child(button));
+        body = body.with_child(
+            FormRow::new("Sign-in", auth)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        );
+    } else if provider_requires_api_key(&form.provider) {
+        let api_key = provider_field_key(&form.provider, &form.account, ProviderField::ApiKey);
+        let api_value = shared.settings().field_draft_or(&api_key, String::new);
+        let on_change = {
+            let s = shared.clone();
+            move |value: String| {
+                s.settings_mut()
+                    .set_provider_field_draft(index, ProviderField::ApiKey, value);
+            }
+        };
+        let has_key = card.select_named("settings provider has API key", |card| {
+            card.form.has_api_key
+        });
+        body = body.with_child(password_save_inline_row(
             shared,
             reader,
-            &format!("provider-{index}-base-url"),
-            "API base URL",
-            base_url_key,
-            base_url_value,
-            "Provider default",
-            {
-                let s = shared.clone();
-                move |value: String| {
-                    s.settings_mut()
-                        .set_provider_field_draft(index, ProviderField::BaseUrl, value);
-                }
-            },
+            &format!("provider-{index}-api-key"),
+            "API key",
+            api_key,
+            api_value,
+            has_key,
+            on_change,
             {
                 let s = shared.clone();
                 move || {
                     let operation = s
                         .settings()
-                        .provider_field_operation(index, ProviderField::BaseUrl);
+                        .provider_field_operation(index, ProviderField::ApiKey);
                     if let Some(operation) = operation {
                         queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
                     }
                 }
             },
         ));
-
-        if provider_supports_context_controls(&form.provider) {
-            body = body.with_child(provider_subsection_heading(
-                shared,
-                reader,
-                "Context and cost",
-            ));
-            let configured_model = if form.default_model.trim().is_empty() {
-                sinomo_runtime::api::lm::PROVIDER_DEFAULT_MODEL
-            } else {
-                form.default_model.as_str()
-            };
-            let automatic =
-                sinomo_lm::inferred_model_context_window_tokens(&form.provider, configured_model);
-            let supported = sinomo_lm::inferred_model_max_context_window_tokens(
-                &form.provider,
-                configured_model,
-            );
-            let effective_model =
-                sinomo_runtime::api::lm::effective_model_name(&form.provider, configured_model);
-            let context_hint = match (automatic, supported, effective_model.contains("gpt-5.6")) {
-                (Some(automatic), Some(supported), true) => format!(
-                    "Automatic cost-aware limit: {automatic} tokens. Known model window: {supported} tokens. OpenAI long-context requests above {} input tokens use higher rates and may consume subscription allowance faster.",
-                    sinomo_lm::OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS
-                ),
-                (Some(automatic), Some(supported), false) => format!(
-                    "Automatic inferred limit: {automatic} tokens. Known model window: {supported} tokens. Higher context limits can increase API cost or subscription usage."
-                ),
-                _ => "Leave blank to use Sinomo's inferred model limit. Higher context limits can increase API cost or subscription usage.".to_string(),
-            };
-            body = body.with_child(
-                SettingRow::new("Context policy")
-                    .help(context_hint)
-                    .build(shared),
-            );
-
-            let max_key = provider_field_key(
-                &form.provider,
-                &form.account,
-                ProviderField::MaxContextTokens,
-            );
-            let max_value = shared.settings().field_draft_or(&max_key, || {
-                form.max_context_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_default()
-            });
-            let max_placeholder = automatic
-                .map(|value| format!("Automatic ({value})"))
-                .unwrap_or_else(|| "Automatic".to_string());
-            body = body.with_child(text_save_inline_row(
-                shared,
-                reader,
-                &format!("provider-{index}-max-context-tokens"),
-                "Max context tokens",
-                max_key,
-                max_value,
-                &max_placeholder,
-                {
-                    let s = shared.clone();
-                    move |value| {
-                        s.settings_mut().set_provider_field_draft(
-                            index,
-                            ProviderField::MaxContextTokens,
-                            value,
-                        );
-                    }
-                },
-                {
-                    let s = shared.clone();
-                    move || {
-                        if let Some(operation) = s
-                            .settings()
-                            .provider_field_operation(index, ProviderField::MaxContextTokens)
-                        {
-                            queue_settings_operation(
-                                &s,
-                                SettingsOperationScope::Providers,
-                                operation,
-                            );
-                        }
-                    }
-                },
-            ));
-
-            let compact_key = provider_field_key(
-                &form.provider,
-                &form.account,
-                ProviderField::AutoCompactTokenLimit,
-            );
-            let compact_value = shared.settings().field_draft_or(&compact_key, || {
-                form.auto_compact_token_limit
-                    .map(|value| value.to_string())
-                    .unwrap_or_default()
-            });
-            body = body.with_child(text_save_inline_row(
-                shared,
-                reader,
-                &format!("provider-{index}-auto-compact-token-limit"),
-                "Compact history after",
-                compact_key,
-                compact_value,
-                "Automatic (80% of active limit)",
-                {
-                    let s = shared.clone();
-                    move |value| {
-                        s.settings_mut().set_provider_field_draft(
-                            index,
-                            ProviderField::AutoCompactTokenLimit,
-                            value,
-                        );
-                    }
-                },
-                {
-                    let s = shared.clone();
-                    move || {
-                        if let Some(operation) = s
-                            .settings()
-                            .provider_field_operation(index, ProviderField::AutoCompactTokenLimit)
-                        {
-                            queue_settings_operation(
-                                &s,
-                                SettingsOperationScope::Providers,
-                                operation,
-                            );
-                        }
-                    }
-                },
-            ));
-        }
-
-        let has_response_defaults = form.supports_reasoning
-            || provider_supports_reasoning_budget(&form.provider)
-            || provider_supports_text_verbosity(&form.provider)
-            || provider_supports_vendor_options(&form.provider);
-        if has_response_defaults {
-            body = body.with_child(provider_subsection_heading(
-                shared,
-                reader,
-                "Response defaults",
-            ));
-        }
-
-        if form.supports_reasoning {
-            let selected_when = {
-                let s = shared.clone();
-                move || {
-                    let settings = s.settings();
-                    settings
-                        .provider_forms
-                        .get(index)
-                        .map(|f| reasoning_effort_index(f.reasoning_effort.as_deref()))
-                }
-            };
-            let on_change = {
-                let s = shared.clone();
-                let provider = form.provider.clone();
-                let account = form.account.clone();
-                move |idx: usize, _label: String| {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Providers,
-                        SettingsOperation::SetProviderEffort {
-                            provider: provider.clone(),
-                            account: account.clone(),
-                            effort_index: idx,
-                        },
-                    );
-                }
-            };
-            body = body.with_child(select_row(
-                reader,
-                &format!("provider-{index}-effort"),
-                "Reasoning effort",
-                REASONING_EFFORT_OPTIONS,
-                selected_when,
-                on_change,
-            ));
-        }
-        if provider_supports_reasoning_budget(&form.provider) {
-            let budget_key = provider_field_key(
-                &form.provider,
-                &form.account,
-                ProviderField::ReasoningBudget,
-            );
-            let budget_value = shared.settings().field_draft_or(&budget_key, || {
-                form.reasoning_budget_tokens
-                    .map(|value| value.to_string())
-                    .unwrap_or_default()
-            });
-            body = body.with_child(text_save_inline_row(
-                shared,
-                reader,
-                &format!("provider-{index}-reasoning-budget"),
-                "Reasoning budget",
-                budget_key,
-                budget_value,
-                "Provider default",
-                {
-                    let s = shared.clone();
-                    move |value| {
-                        s.settings_mut().set_provider_field_draft(
-                            index,
-                            ProviderField::ReasoningBudget,
-                            value,
-                        );
-                    }
-                },
-                {
-                    let s = shared.clone();
-                    move || {
-                        if let Some(operation) = s
-                            .settings()
-                            .provider_field_operation(index, ProviderField::ReasoningBudget)
-                        {
-                            queue_settings_operation(
-                                &s,
-                                SettingsOperationScope::Providers,
-                                operation,
-                            );
-                        }
-                    }
-                },
-            ));
-        }
-        if provider_supports_text_verbosity(&form.provider) {
-            let selected_when = {
-                let s = shared.clone();
-                move || {
-                    s.settings()
-                        .provider_forms
-                        .get(index)
-                        .map(|form| text_verbosity_index(form.text_verbosity.as_deref()))
-                }
-            };
-            let on_change = {
-                let s = shared.clone();
-                let provider = form.provider.clone();
-                let account = form.account.clone();
-                move |verbosity_index, _label| {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Providers,
-                        SettingsOperation::SetProviderVerbosity {
-                            provider: provider.clone(),
-                            account: account.clone(),
-                            verbosity_index,
-                        },
-                    );
-                }
-            };
-            body = body.with_child(select_row(
-                reader,
-                &format!("provider-{index}-verbosity"),
-                "Text verbosity",
-                TEXT_VERBOSITY_OPTIONS,
-                selected_when,
-                on_change,
-            ));
-        }
-        if provider_supports_vendor_options(&form.provider) {
-            let options_key =
-                provider_field_key(&form.provider, &form.account, ProviderField::VendorOptions);
-            let options_value = shared
-                .settings()
-                .field_draft_or(&options_key, || form.vendor_options.clone());
-            body = body.with_child(text_save_inline_row(
-                shared,
-                reader,
-                &format!("provider-{index}-vendor-options"),
-                "Provider options",
-                options_key,
-                options_value,
-                "{}",
-                {
-                    let s = shared.clone();
-                    move |value| {
-                        s.settings_mut().set_provider_field_draft(
-                            index,
-                            ProviderField::VendorOptions,
-                            value,
-                        );
-                    }
-                },
-                {
-                    let s = shared.clone();
-                    move || {
-                        if let Some(operation) = s
-                            .settings()
-                            .provider_field_operation(index, ProviderField::VendorOptions)
-                        {
-                            queue_settings_operation(
-                                &s,
-                                SettingsOperationScope::Providers,
-                                operation,
-                            );
-                        }
-                    }
-                },
-            ));
-        }
-        body = body.with_child(provider_subsection_heading(shared, reader, "Account"));
-        body = body.with_child(provider_management_row(shared, reader, index, &form));
-        card = card.row(body);
+    } else {
+        body = body.with_child(value_row(
+            shared,
+            reader,
+            "Authentication",
+            "No credentials required; the app connects to the configured local service.",
+        ));
     }
 
-    card.build(shared, reader)
+    body = body.with_child(provider_subsection_heading(shared, reader, "Endpoint"));
+    if has_model_options {
+        body = body.with_child(provider_model_text_row(
+            shared,
+            reader,
+            index,
+            "Model ID override",
+        ));
+    }
+
+    let base_url_key = provider_field_key(&form.provider, &form.account, ProviderField::BaseUrl);
+    let base_url_value = shared
+        .settings()
+        .field_draft_or(&base_url_key, || form.api_base_url.clone());
+    body = body.with_child(text_save_inline_row(
+        shared,
+        reader,
+        &format!("provider-{index}-base-url"),
+        "API base URL",
+        base_url_key,
+        base_url_value,
+        "Provider default",
+        {
+            let s = shared.clone();
+            move |value: String| {
+                s.settings_mut()
+                    .set_provider_field_draft(index, ProviderField::BaseUrl, value);
+            }
+        },
+        {
+            let s = shared.clone();
+            move || {
+                let operation = s
+                    .settings()
+                    .provider_field_operation(index, ProviderField::BaseUrl);
+                if let Some(operation) = operation {
+                    queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                }
+            }
+        },
+    ));
+
+    if provider_supports_context_controls(&form.provider) {
+        body = body.with_child(provider_subsection_heading(
+            shared,
+            reader,
+            "Context and cost",
+        ));
+        let configured_model = if form.default_model.trim().is_empty() {
+            sinomo_runtime::api::lm::PROVIDER_DEFAULT_MODEL
+        } else {
+            form.default_model.as_str()
+        };
+        let automatic =
+            sinomo_lm::inferred_model_context_window_tokens(&form.provider, configured_model);
+        let supported =
+            sinomo_lm::inferred_model_max_context_window_tokens(&form.provider, configured_model);
+        let effective_model =
+            sinomo_runtime::api::lm::effective_model_name(&form.provider, configured_model);
+        let context_hint = match (automatic, supported, effective_model.contains("gpt-5.6")) {
+            (Some(automatic), Some(supported), true) => format!(
+                "Automatic cost-aware limit: {automatic} tokens. Known model window: {supported} tokens. OpenAI long-context requests above {} input tokens use higher rates and may consume subscription allowance faster.",
+                sinomo_lm::OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS
+            ),
+            (Some(automatic), Some(supported), false) => format!(
+                "Automatic inferred limit: {automatic} tokens. Known model window: {supported} tokens. Higher context limits can increase API cost or subscription usage."
+            ),
+            _ => "Leave blank to use Sinomo's inferred model limit. Higher context limits can increase API cost or subscription usage.".to_string(),
+        };
+        body = body.with_child(
+            SettingRow::new("Context policy")
+                .help(context_hint)
+                .build(shared),
+        );
+
+        let max_key = provider_field_key(
+            &form.provider,
+            &form.account,
+            ProviderField::MaxContextTokens,
+        );
+        let max_value = shared.settings().field_draft_or(&max_key, || {
+            form.max_context_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        });
+        let max_placeholder = automatic
+            .map(|value| format!("Automatic ({value})"))
+            .unwrap_or_else(|| "Automatic".to_string());
+        body = body.with_child(text_save_inline_row(
+            shared,
+            reader,
+            &format!("provider-{index}-max-context-tokens"),
+            "Max context tokens",
+            max_key,
+            max_value,
+            &max_placeholder,
+            {
+                let s = shared.clone();
+                move |value| {
+                    s.settings_mut().set_provider_field_draft(
+                        index,
+                        ProviderField::MaxContextTokens,
+                        value,
+                    );
+                }
+            },
+            {
+                let s = shared.clone();
+                move || {
+                    if let Some(operation) = s
+                        .settings()
+                        .provider_field_operation(index, ProviderField::MaxContextTokens)
+                    {
+                        queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                    }
+                }
+            },
+        ));
+
+        let compact_key = provider_field_key(
+            &form.provider,
+            &form.account,
+            ProviderField::AutoCompactTokenLimit,
+        );
+        let compact_value = shared.settings().field_draft_or(&compact_key, || {
+            form.auto_compact_token_limit
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        });
+        body = body.with_child(text_save_inline_row(
+            shared,
+            reader,
+            &format!("provider-{index}-auto-compact-token-limit"),
+            "Compact history after",
+            compact_key,
+            compact_value,
+            "Automatic (80% of active limit)",
+            {
+                let s = shared.clone();
+                move |value| {
+                    s.settings_mut().set_provider_field_draft(
+                        index,
+                        ProviderField::AutoCompactTokenLimit,
+                        value,
+                    );
+                }
+            },
+            {
+                let s = shared.clone();
+                move || {
+                    if let Some(operation) = s
+                        .settings()
+                        .provider_field_operation(index, ProviderField::AutoCompactTokenLimit)
+                    {
+                        queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                    }
+                }
+            },
+        ));
+    }
+
+    let has_response_defaults = form.supports_reasoning
+        || provider_supports_reasoning_budget(&form.provider)
+        || provider_supports_text_verbosity(&form.provider)
+        || provider_supports_vendor_options(&form.provider);
+    if has_response_defaults {
+        body = body.with_child(provider_subsection_heading(
+            shared,
+            reader,
+            "Response defaults",
+        ));
+    }
+
+    if form.supports_reasoning {
+        let selected_when = {
+            let s = shared.clone();
+            move || {
+                let settings = s.settings();
+                settings
+                    .provider_forms
+                    .get(index)
+                    .map(|f| reasoning_effort_index(f.reasoning_effort.as_deref()))
+            }
+        };
+        let on_change = {
+            let s = shared.clone();
+            let provider = form.provider.clone();
+            let account = form.account.clone();
+            move |idx: usize, _label: String| {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::SetProviderEffort {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        effort_index: idx,
+                    },
+                );
+            }
+        };
+        body = body.with_child(select_row(
+            reader,
+            &format!("provider-{index}-effort"),
+            "Reasoning effort",
+            REASONING_EFFORT_OPTIONS,
+            selected_when,
+            on_change,
+        ));
+    }
+    if provider_supports_reasoning_budget(&form.provider) {
+        let budget_key = provider_field_key(
+            &form.provider,
+            &form.account,
+            ProviderField::ReasoningBudget,
+        );
+        let budget_value = shared.settings().field_draft_or(&budget_key, || {
+            form.reasoning_budget_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        });
+        body = body.with_child(text_save_inline_row(
+            shared,
+            reader,
+            &format!("provider-{index}-reasoning-budget"),
+            "Reasoning budget",
+            budget_key,
+            budget_value,
+            "Provider default",
+            {
+                let s = shared.clone();
+                move |value| {
+                    s.settings_mut().set_provider_field_draft(
+                        index,
+                        ProviderField::ReasoningBudget,
+                        value,
+                    );
+                }
+            },
+            {
+                let s = shared.clone();
+                move || {
+                    if let Some(operation) = s
+                        .settings()
+                        .provider_field_operation(index, ProviderField::ReasoningBudget)
+                    {
+                        queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                    }
+                }
+            },
+        ));
+    }
+    if provider_supports_text_verbosity(&form.provider) {
+        let selected_when = {
+            let s = shared.clone();
+            move || {
+                s.settings()
+                    .provider_forms
+                    .get(index)
+                    .map(|form| text_verbosity_index(form.text_verbosity.as_deref()))
+            }
+        };
+        let on_change = {
+            let s = shared.clone();
+            let provider = form.provider.clone();
+            let account = form.account.clone();
+            move |verbosity_index, _label| {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::SetProviderVerbosity {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        verbosity_index,
+                    },
+                );
+            }
+        };
+        body = body.with_child(select_row(
+            reader,
+            &format!("provider-{index}-verbosity"),
+            "Text verbosity",
+            TEXT_VERBOSITY_OPTIONS,
+            selected_when,
+            on_change,
+        ));
+    }
+    if provider_supports_vendor_options(&form.provider) {
+        let options_key =
+            provider_field_key(&form.provider, &form.account, ProviderField::VendorOptions);
+        let options_value = shared
+            .settings()
+            .field_draft_or(&options_key, || form.vendor_options.clone());
+        body = body.with_child(text_save_inline_row(
+            shared,
+            reader,
+            &format!("provider-{index}-vendor-options"),
+            "Provider options",
+            options_key,
+            options_value,
+            "{}",
+            {
+                let s = shared.clone();
+                move |value| {
+                    s.settings_mut().set_provider_field_draft(
+                        index,
+                        ProviderField::VendorOptions,
+                        value,
+                    );
+                }
+            },
+            {
+                let s = shared.clone();
+                move || {
+                    if let Some(operation) = s
+                        .settings()
+                        .provider_field_operation(index, ProviderField::VendorOptions)
+                    {
+                        queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
+                    }
+                }
+            },
+        ));
+    }
+    body = body.with_child(provider_subsection_heading(shared, reader, "Account"));
+    body.with_child(provider_management_row(shared, reader, index, card))
 }
 
 const PROVIDER_ADVANCED_SHOW_LABEL: &str = "Advanced settings";
@@ -9679,34 +10319,6 @@ fn provider_card_description(form: &ProviderForm) -> String {
         form.default_model.as_str()
     };
     format!("{} account - {model}", form.account_label)
-}
-
-fn provider_usage_summary_row(
-    shared: &Shared,
-    reader: &ThemeReader,
-    form: &ProviderForm,
-    health: &ProviderHealthState,
-    expanded: bool,
-) -> impl Widget + use<> {
-    let summary = provider_usage_summary(health);
-    let row = SettingRow::new("Usage").help(summary);
-    let Some(usage) = health.usage.as_ref() else {
-        return row.build(shared);
-    };
-    let button = {
-        let s = shared.clone();
-        let provider = form.provider.clone();
-        let account = form.account.clone();
-        disclosure_toggle(
-            reader,
-            expanded,
-            "View usage details",
-            "Hide usage details",
-            move || s.settings_mut().toggle_provider_usage(&provider, &account),
-        )
-        .enabled(!usage.limits.is_empty() || usage.credits.is_some())
-    };
-    row.control(button).build(shared)
 }
 
 fn provider_usage_summary(health: &ProviderHealthState) -> String {
@@ -9742,15 +10354,18 @@ fn provider_usage_summary(health: &ProviderHealthState) -> String {
 }
 
 fn provider_subsection_heading(shared: &Shared, reader: &ThemeReader, title: &str) -> Stack {
-    let mut style = settings_text_style(shared, shared.theme().text.xs);
-    style.weight = FontWeight::SEMIBOLD;
+    let style = shared.clone();
     Stack::vertical()
         .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
         .with_child(
             Label::new(title.to_ascii_uppercase())
-                .text_style(style)
+                .text_style_when(move || {
+                    let mut style = settings_text_style(&style, TextSize::Xs);
+                    style.weight = FontWeight::SEMIBOLD;
+                    style
+                })
                 .color_when({
                     let s = shared.clone();
                     move || palette(&s).text_faint
@@ -9772,8 +10387,6 @@ where
     let enabled_key = draft_key;
     let button = IconButton::new(IconGlyph::Check, format!("Save {label}"))
         .description(format!("Save the edited {label}"))
-        .size(28.0)
-        .icon_size(14.0)
         .theme_when(clone_reader(reader))
         .enabled_when(move || {
             let settings = enabled_shared.settings();
@@ -9783,7 +10396,7 @@ where
         .on_press(on_save);
     Tooltip::new(format!("Save {label}"), button)
         .placement(TooltipPlacement::Above)
-        .theme(reader())
+        .theme_when(clone_reader(reader))
 }
 
 fn text_save_inline_row<C, S>(
@@ -9807,16 +10420,7 @@ where
         .theme_when(clone_reader(reader))
         .on_change(on_change);
     let save = provider_save_button(shared, reader, label, draft_key, on_save);
-    inline_row(
-        label,
-        SizedBox::new().height(28.0).child(
-            TrailingSlotRow::new(input, save)
-                .trailing_width(28.0)
-                .trailing_height(28.0)
-                .gap(6.0),
-        ),
-    )
-    .theme_when(clone_reader(reader))
+    inline_row(label, FieldWithAction::new(input, save).gap(6.0)).theme_when(clone_reader(reader))
 }
 
 fn password_save_inline_row<C, S>(
@@ -9826,7 +10430,7 @@ fn password_save_inline_row<C, S>(
     label: &str,
     draft_key: String,
     value: impl Into<String>,
-    placeholder: &str,
+    stored: impl Observable<bool> + 'static,
     on_change: C,
     on_save: S,
 ) -> FormRow
@@ -9834,22 +10438,17 @@ where
     C: FnMut(String) + 'static,
     S: FnMut() + 'static,
 {
-    let input = PasswordInput::new(name)
-        .value(value)
-        .placeholder(placeholder)
-        .theme_when(clone_reader(reader))
-        .on_change(on_change);
+    // The placeholder says whether a key is stored; a save updates it without replacing the field.
+    let input = Restyle::new(
+        PasswordInput::new(name)
+            .value(value)
+            .theme_when(clone_reader(reader))
+            .on_change(on_change),
+        stored,
+        |input, stored| input.placeholder(if *stored { "Configured" } else { "Not set" }),
+    );
     let save = provider_save_button(shared, reader, label, draft_key, on_save);
-    inline_row(
-        label,
-        SizedBox::new().height(28.0).child(
-            TrailingSlotRow::new(input, save)
-                .trailing_width(28.0)
-                .trailing_height(28.0)
-                .gap(6.0),
-        ),
-    )
-    .theme_when(clone_reader(reader))
+    inline_row(label, FieldWithAction::new(input, save).gap(6.0)).theme_when(clone_reader(reader))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10176,106 +10775,105 @@ fn provider_management_row(
     shared: &Shared,
     reader: &ThemeReader,
     index: usize,
-    form: &ProviderForm,
+    card: Signal<ProviderCardStructure>,
 ) -> FormRow {
-    let confirming = shared
-        .settings()
-        .provider_remove_confirming(&form.provider, &form.account);
-    let action_error = shared.settings().provider_action_error.clone();
-    if confirming {
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(sui::IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || s.settings_mut().cancel_provider_remove())
-        };
-        let remove = {
-            let s = shared.clone();
-            let provider = form.provider.clone();
-            let account = form.account.clone();
-            sui::Button::new("Remove account")
-                .icon(sui::IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .enabled_when({
-                    let s = s.clone();
-                    move || {
-                        !s.settings()
-                            .domain_pending(SettingsOperationDomain::Providers)
-                    }
-                })
-                .on_press(move || {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::Providers,
-                        SettingsOperation::RemoveProvider {
-                            provider: provider.clone(),
-                            account: account.clone(),
-                        },
-                    );
-                })
-        };
-        let controls = Stack::horizontal()
-            .gap(8.0)
-            .alignment(Alignment::Start)
-            .with_child(cancel)
-            .with_child(remove);
-        let mut stack = Stack::vertical()
-            .gap(6.0)
-            .alignment(Alignment::Start)
-            .with_child(muted_label(
+    let form = shared.settings().provider_forms[index].clone();
+    let cancel = {
+        let s = shared.clone();
+        sui::Button::new("Cancel")
+            .icon(sui::IconGlyph::Close)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || s.settings_mut().cancel_provider_remove())
+    };
+    let confirm = {
+        let s = shared.clone();
+        let provider = form.provider.clone();
+        let account = form.account.clone();
+        sui::Button::new("Remove account")
+            .icon(sui::IconGlyph::Trash)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
+            .enabled_from(settings_projection(
                 shared,
-                "This removes the provider account from lm.providers.",
+                "settings provider remove enabled",
+                |snapshot| !snapshot.providers.pending,
             ))
-            .with_child(controls);
-        if let Some(error) = action_error {
-            stack = stack.with_child(
-                settings_label(shared, error, shared.theme().text.sm).color_when({
+            .on_press(move || {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::Providers,
+                    SettingsOperation::RemoveProvider {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                    },
+                );
+            })
+    };
+    let error = card.select_named("settings provider remove error", |card| {
+        card.action_error.clone().unwrap_or_default()
+    });
+    let has_error = derived(
+        error.clone(),
+        "settings provider has remove error",
+        |error: &String| !error.is_empty(),
+    );
+    let confirmation = Column::new(reader, |theme| theme.metrics.property_row_stacked_gap)
+        .with_child(muted_label(
+            shared,
+            "This removes the provider account from lm.providers.",
+        ))
+        .with_child(
+            Stack::horizontal()
+                .gap(8.0)
+                .alignment(Alignment::Start)
+                .with_child(cancel)
+                .with_child(confirm),
+        )
+        .with_child(revealed(
+            settings_label(shared, error.get(), TextSize::Sm)
+                .text_from(error)
+                .color_when({
                     let s = shared.clone();
-                    move || palette(&s).danger_text
+                    move || palette(&s).bad_text
                 }),
-            );
-        }
-        FormRow::new("Remove", stack)
-            .stacked()
+            has_error,
+        ));
+    let remove = {
+        let s = shared.clone();
+        sui::Button::new("Remove account")
+            .icon(sui::IconGlyph::Trash)
             .theme_when(clone_reader(reader))
-    } else {
-        let remove = {
-            let s = shared.clone();
-            sui::Button::new("Remove account")
-                .icon(sui::IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .on_press(move || s.settings_mut().confirm_provider_remove(index))
-        };
-        inline_row("Remove", Stack::horizontal().with_child(remove))
-            .theme_when(clone_reader(reader))
-    }
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
+            .on_press(move || s.settings_mut().confirm_provider_remove(index))
+    };
+    let confirming = card.select_named("settings provider remove confirming", |card| {
+        usize::from(card.remove_confirming)
+    });
+    FormRow::new(
+        "Remove",
+        SwitchView::new()
+            .with_child(Align::new(Alignment::End, Alignment::Center, remove))
+            .with_child(confirmation)
+            .selected_from(confirming),
+    )
+    .stacked()
+    .theme_when(clone_reader(reader))
 }
 
+/// The account list and the add form stay mounted side by side; opening or closing the form
+/// only switches between them, so neither loses its scroll, fields, or focus.
 fn section_providers(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings providers structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.providers.clone())
-        });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_sig| provider_section_body(&s, &r))
-}
-
-fn provider_section_body(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    if shared.settings().provider_add_open {
-        WidgetPod::new(provider_add_view(shared, reader))
-    } else {
-        WidgetPod::new(provider_list_view(shared, reader))
-    }
+    let add_open = settings_projection(shared, "settings providers add open", |snapshot| {
+        usize::from(snapshot.providers.add_open)
+    });
+    SwitchView::new()
+        .with_child(provider_list_view(shared, reader))
+        .with_child(provider_add_view(shared, reader))
+        .selected_from(add_open)
 }
 
 #[cfg(test)]
@@ -10326,30 +10924,34 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
             button
         }
     };
-    let provider_forms = shared.settings().provider_forms.clone();
-    let action_error = shared.settings().provider_action_error.clone();
-    let error_row = |error: String| {
+    let error = settings_projection(shared, "settings providers error", |snapshot| {
+        snapshot.providers.action_error.clone().unwrap_or_default()
+    });
+    let has_error = derived(
+        error.clone(),
+        "settings providers has error",
+        |error: &String| !error.is_empty(),
+    );
+    let error_row = |error: SettingsProjection<String>| {
         SettingRow::new("Provider error")
             .control(
-                settings_label(shared, error, shared.theme().text.sm).color_when({
-                    let s = shared.clone();
-                    move || palette(&s).danger_text
-                }),
+                settings_label(shared, error.get(), TextSize::Sm)
+                    .text_from(error)
+                    .color_when({
+                        let s = shared.clone();
+                        move || palette(&s).bad_text
+                    }),
             )
             .build(shared)
     };
 
-    let mut stack = Stack::vertical().gap(16.0).alignment(Alignment::Stretch);
-    if provider_forms.is_empty() {
-        let mut empty = SettingsCard::new("No provider accounts yet")
-            .description(
-                "Add an account to start chatting. Providers sign in with an API key or a device login.",
-            )
-            .row(Align::new(Alignment::Start, Alignment::Center, add(true)));
-        if let Some(error) = action_error {
-            empty = empty.row(error_row(error));
-        }
-        empty = empty.row(details(
+    let empty = SettingsCard::new("No provider accounts yet")
+        .description(
+            "Add an account to start chatting. Providers sign in with an API key or a device login.",
+        )
+        .row(Align::new(Alignment::Start, Alignment::Center, add(true)))
+        .row(revealed(error_row(error.clone()), has_error.clone()))
+        .row(details(
             shared,
             reader,
             "providers-storage",
@@ -10360,48 +10962,86 @@ fn provider_list_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                     .value(shared, "lm.providers")
                     .build(shared),
             )],
-        ));
-        return stack.with_child(empty.build(shared, reader));
-    }
+        ))
+        .build(shared, reader);
 
-    let mut overview = SettingsCard::new("Overview")
+    let forms = |name: &'static str, summary: fn(&[ProviderForm]) -> String| {
+        settings_projection(shared, name, move |snapshot| {
+            let forms = snapshot
+                .providers
+                .providers
+                .iter()
+                .map(|(form, _)| form.clone())
+                .collect::<Vec<_>>();
+            summary(&forms)
+        })
+    };
+    let overview = SettingsCard::new("Overview")
         .header_action(add(false))
         .row(
             SettingRow::new("Accounts")
-                .value(shared, provider_accounts_summary(&provider_forms))
+                .value_from(
+                    shared,
+                    forms("settings providers accounts", provider_accounts_summary),
+                )
                 .build(shared),
         )
         .row(
             SettingRow::new("Ready for chat")
-                .value(shared, provider_ready_summary(&provider_forms))
+                .value_from(
+                    shared,
+                    forms("settings providers ready", provider_ready_summary),
+                )
                 .build(shared),
         )
         .row(
             SettingRow::new("Chat default")
-                .value(shared, provider_chat_default_summary(&provider_forms))
+                .value_from(
+                    shared,
+                    forms("settings providers default", provider_chat_default_summary),
+                )
                 .build(shared),
-        );
-    if let Some(error) = action_error {
-        overview = overview.row(error_row(error));
-    }
-    stack = stack.with_child(overview.build(shared, reader));
-    for index in 0..provider_forms.len() {
-        stack = stack.with_child(provider_card(shared, reader, index));
-    }
-    stack
+        )
+        .row(revealed(error_row(error), has_error))
+        .build(shared, reader);
+    // Accounts are keyed by position and identity, so a health check, test, or edit updates the
+    // matching card in place.
+    let cards = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        KeyedStack::vertical(
+            settings_projection(shared, "settings provider cards", |snapshot| {
+                provider_cards(&snapshot.providers)
+            }),
+            |card: &ProviderCardStructure| {
+                (
+                    card.index,
+                    card.form.provider.clone(),
+                    card.form.account.clone(),
+                )
+            },
+            move |(index, _, _), card| provider_card(&s, &r, *index, card),
+        )
+        .gap(16.0)
+    };
+    let list = Stack::vertical()
+        .gap(16.0)
+        .alignment(Alignment::Stretch)
+        .with_child(overview)
+        .with_child(cards);
+    SwitchView::new()
+        .with_child(empty)
+        .with_child(list)
+        .selected_from(settings_projection(
+            shared,
+            "settings providers present",
+            |snapshot| usize::from(!snapshot.providers.providers.is_empty()),
+        ))
 }
 
 const ADD_PROVIDER_LABEL: &str = "Add provider";
 
 fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (selected_index, uses_device_login, requires_api_key) = {
-        let settings = shared.settings();
-        (
-            settings.provider_add_provider_index,
-            settings.provider_add_uses_device_login(),
-            settings.provider_add_requires_api_key(),
-        )
-    };
     let provider_labels: Vec<String> = CONFIGURABLE_PROVIDERS
         .iter()
         .map(|provider| provider_display_name(provider))
@@ -10419,98 +11059,107 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 s.settings_mut().set_provider_add_provider(index);
             })
     };
-
-    let mut body = FieldGroup::new()
-        .fill_width(true)
-        .gap(8.0)
-        .with_child(inline_row("Provider", provider_select).theme_when(clone_reader(reader)))
-        .with_child(text_row(
-            reader,
-            "provider-add-account",
-            "Account",
-            shared.settings().provider_add_account.clone(),
-            "default",
-            {
-                let s = shared.clone();
-                move |value| s.settings_mut().set_provider_add_account(value)
-            },
-        ));
-
-    if uses_device_login {
-        body = body.with_child(value_row(
+    // Opening the form or picking another provider resets some fields in the model; the retained
+    // fields adopt those values without being rebuilt.
+    let resets = settings_projection(shared, "settings provider add resets", |snapshot| {
+        (
+            snapshot.providers.add_open,
+            snapshot.providers.add_provider_index,
+        )
+    });
+    let field = |name: &str,
+                 label: &str,
+                 placeholder: &str,
+                 read: fn(&SettingsState) -> String,
+                 write: fn(&mut SettingsState, String)| {
+        let s = shared.clone();
+        let input = TextInput::new(name)
+            .value(read(&shared.settings()))
+            .placeholder(placeholder)
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| write(&mut s.settings_mut(), value));
+        let s = shared.clone();
+        inline_row(
+            label,
+            SyncedTextInput::new(input, move || read(&s.settings())).observing(resets.clone()),
+        )
+        .theme_when(clone_reader(reader))
+    };
+    let api_key = {
+        let s = shared.clone();
+        let current = shared.clone();
+        let input = PasswordInput::new("provider-add-api-key")
+            .value(shared.settings().provider_add_api_key.clone())
+            .placeholder("Paste API key")
+            .theme_when(clone_reader(reader))
+            .on_change(move |value| s.settings_mut().set_provider_add_api_key(value));
+        let input = Restyle::new(input, resets.clone(), move |mut input, _| {
+            let value = current.settings().provider_add_api_key.clone();
+            if input.current_value() != value {
+                input.set_value(value);
+            }
+            input
+        });
+        inline_row("API key", input).theme_when(clone_reader(reader))
+    };
+    let auth = SwitchView::new()
+        .with_child(value_row(
             shared,
             reader,
             "Authentication",
             "Device login after add",
-        ));
-    } else if requires_api_key {
-        body = body
-            .with_child(password_row(
-                reader,
-                "provider-add-api-key",
-                "API key",
-                "",
-                "Paste API key",
-                {
-                    let s = shared.clone();
-                    move |value| s.settings_mut().set_provider_add_api_key(value)
-                },
-            ))
-            .with_child(value_row(
-                shared,
-                reader,
-                "Requirement",
-                "API key required before adding.",
-            ));
-    } else {
-        body = body.with_child(value_row(
+        ))
+        .with_child(
+            Column::new(reader, |_| 8.0)
+                .with_child(api_key)
+                .with_child(value_row(
+                    shared,
+                    reader,
+                    "Requirement",
+                    "API key required before adding.",
+                )),
+        )
+        .with_child(value_row(
             shared,
             reader,
             "Authentication",
             "No credentials required; make sure the local service is running.",
+        ))
+        .selected_from(settings_projection(
+            shared,
+            "settings provider add authentication",
+            |snapshot| snapshot.providers.add_auth.index(),
         ));
-    }
 
-    body = body
-        .with_child(text_row(
-            reader,
+    let body = FieldGroup::new()
+        .fill_width(true)
+        .gap(8.0)
+        .with_child(inline_row("Provider", provider_select).theme_when(clone_reader(reader)))
+        .with_child(field(
+            "provider-add-account",
+            "Account",
+            "default",
+            |settings| settings.provider_add_account.clone(),
+            |settings, value| settings.set_provider_add_account(value),
+        ))
+        .with_child(auth)
+        .with_child(field(
             "provider-add-model",
             "Default model",
-            shared.settings().provider_add_model.clone(),
             "Provider default",
-            {
-                let s = shared.clone();
-                move |value| s.settings_mut().set_provider_add_model(value)
-            },
+            |settings| settings.provider_add_model.clone(),
+            |settings, value| settings.set_provider_add_model(value),
         ))
-        .with_child(text_row(
-            reader,
+        .with_child(field(
             "provider-add-base-url",
             "API base URL",
-            shared.settings().provider_add_base_url.clone(),
             "Provider default",
-            {
-                let s = shared.clone();
-                move |value| s.settings_mut().set_provider_add_base_url(value)
-            },
-        ));
-
-    body = body.with_child(feedback_slot(
-        shared,
-        reader,
-        |settings| {
-            settings
-                .provider_add_error
-                .clone()
-                .or_else(|| settings.provider_action_error.clone())
-        },
-        |settings| {
-            settings
-                .provider_action_status
-                .as_ref()
-                .map(|status| status.message.clone())
-        },
-    ));
+            |settings| settings.provider_add_base_url.clone(),
+            |settings, value| settings.set_provider_add_base_url(value),
+        ))
+        .with_child(feedback_slot(shared, reader, |snapshot| {
+            snapshot.feedback.provider_add.clone()
+        }));
 
     let cancel = {
         let s = shared.clone();
@@ -10521,14 +11170,18 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
             .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().close_provider_add())
     };
-    let add_label = if uses_device_login {
-        "Add and sign in"
-    } else {
-        "Add provider"
-    };
     let add = {
         let s = shared.clone();
-        sui::Button::new(add_label)
+        let label = shared.clone();
+        sui::Button::new(ADD_PROVIDER_LABEL)
+            .label_when(move || {
+                if label.settings().provider_add_uses_device_login() {
+                    "Add and sign in"
+                } else {
+                    ADD_PROVIDER_LABEL
+                }
+                .to_string()
+            })
             .icon(sui::IconGlyph::Check)
             .theme_when(clone_reader(reader))
             .enabled_when({
@@ -10555,19 +11208,28 @@ fn provider_add_view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use
                 queue_settings_operation(&s, SettingsOperationScope::Providers, operation);
             })
     };
+    let add = follow(
+        add,
+        settings_projection(shared, "settings provider add state", |snapshot| {
+            (snapshot.providers.add_auth, snapshot.providers.pending)
+        }),
+    );
     let actions = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(8.0)
         .align_items(Alignment::Center)
         .with_child(cancel)
         .with_child(add);
-    body = body.with_child(inline_row("Actions", actions).theme_when(clone_reader(reader)));
+    let body = body.with_child(inline_row("Actions", actions).theme_when(clone_reader(reader)));
 
-    let title = CONFIGURABLE_PROVIDERS
-        .get(selected_index)
-        .map(|provider| format!("Add {}", provider_display_name(provider)))
-        .unwrap_or_else(|| "Add provider".to_string());
-    SettingsCard::new(title)
+    let title = settings_projection(shared, "settings provider add title", |snapshot| {
+        CONFIGURABLE_PROVIDERS
+            .get(snapshot.providers.add_provider_index)
+            .map(|provider| format!("Add {}", provider_display_name(provider)))
+            .unwrap_or_else(|| ADD_PROVIDER_LABEL.to_string())
+    });
+    SettingsCard::new(title.get())
+        .title_from(title)
         .description(
             "Add an account, then adjust low-level defaults from the provider card when needed.",
         )
@@ -10579,20 +11241,24 @@ fn section_agents(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
     section_agents_body(shared, reader)
 }
 
+/// The agent detail pane. It rebuilds only when another agent (or a new draft) is opened or the
+/// opened agent's kind of view changes; edits, tool and server lists, delete confirmation, and
+/// validation results update in place.
 fn agent_details_host(
     shared: &Shared,
     reader: &ThemeReader,
-) -> RebuildOnChange<Option<SettingsAgentsStructure>> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings agent details structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.agents.clone())
-        });
+) -> RebuildOnChange<(Option<String>, Option<String>, SettingsAgentDetail)> {
+    let source = settings_projection(shared, "settings agent detail", |snapshot| {
+        (
+            snapshot.agents.selected_id.clone(),
+            snapshot.agents.editor_previous_id.clone(),
+            snapshot.agents.detail.clone(),
+        )
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        WidgetPod::new(agent_detail_panel(&s, &r))
+    RebuildOnChange::key_from(source, move |(_, _, detail)| {
+        WidgetPod::new(agent_detail_body(&s, &r, detail.clone()))
     })
 }
 
@@ -10628,7 +11294,7 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     let wide = FixedPaneSplit::horizontal(
         agent_catalog_section(shared, reader),
         Separator::vertical().theme_when(clone_reader(reader)),
-        WidgetPadding::horizontal(18.0, agent_details_host(shared, reader)).fill_child(),
+        WidgetPadding::horizontal(18.0, agent_detail_panel(shared, reader)).fill_child(),
     )
     .fixed_first(AGENT_MENU_W)
     .divider_extent(1.0)
@@ -10647,14 +11313,14 @@ fn section_agents_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
         .gap(10.0)
         .alignment(Alignment::Stretch)
         .with_child(Stack::horizontal().with_child(back))
-        .with_child(agent_details_host(shared, reader));
+        .with_child(agent_detail_panel(shared, reader));
+    let open = settings_projection(shared, "settings agent detail open", |snapshot| {
+        usize::from(snapshot.agents.detail_open)
+    });
     let narrow = SwitchView::new()
         .with_child(agent_catalog_section(shared, reader))
         .with_child(detail)
-        .selected_when({
-            let shared = shared.clone();
-            move || usize::from(shared.settings().agent_detail_open)
-        });
+        .selected_from(open);
 
     ConstraintView::new(narrow).when(
         ConstraintQuery::new().min_width(AGENT_SPLIT_THRESHOLD),
@@ -10669,15 +11335,14 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             let Some(snapshot) = key.0.as_deref() else {
                 return widgets::VirtualCollectionSnapshot::new(Vec::new(), None);
             };
-            let agents = snapshot.agents.agents.clone();
-            let selected = snapshot.agents.selected_id.clone();
-            let theme = snapshot.agents.theme;
             widgets::VirtualCollectionSnapshot::new(
-                agents
-                    .into_iter()
-                    .map(|agent| (agent.id.clone(), SettingsAgentRow { theme, agent }))
+                snapshot
+                    .agents
+                    .agents
+                    .iter()
+                    .map(|agent| (agent.id.clone(), agent.clone()))
                     .collect(),
-                selected,
+                snapshot.agents.selected_id.clone(),
             )
         },
     );
@@ -10692,25 +11357,25 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             VirtualList::new("agent-config-list", model, move |_id, agent| {
                 let shared = row_shared.clone();
                 let reader = Rc::clone(&row_reader);
-                RebuildOnChange::key_from(agent, move |row| {
+                // One row's summary text; the list and its scroll position stay mounted.
+                RebuildOnChange::key_from(agent, move |agent| {
                     WidgetPod::new(padded_virtual_list_row(
                         &reader,
-                        agent_catalog_row(&shared, &row.agent),
+                        agent_catalog_row(&shared, agent),
                     ))
                 })
             })
             .state(state)
             .estimated_row_height(MENU_ROW_H)
             .theme_when(clone_reader(reader))
-            .row_name(|_id, row| {
-                let agent = &row.agent;
+            .row_name(|_id, agent| {
                 if agent.name.trim().is_empty() {
                     agent.id.clone()
                 } else {
                     agent.name.clone()
                 }
             })
-            .row_description(|_id, row| agent_summary_line(&row.agent))
+            .row_description(|_id, agent| agent_summary_line(agent))
             .on_change(move |selected_id| {
                 let index = {
                     let settings = action_shared.settings();
@@ -10757,7 +11422,7 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             });
         Tooltip::new("Refresh agents", button)
             .placement(TooltipPlacement::Above)
-            .theme(reader())
+            .theme_when(clone_reader(reader))
     };
 
     SettingsCard::new("Agents")
@@ -10768,88 +11433,94 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> impl Widget +
                 .with_child(new_agent)
                 .with_child(refresh),
         )
-        .row(agent_catalog_summary_host(shared))
+        .row(agent_catalog_summary(shared))
         .row(SizedBox::new().height(AGENT_LIST_ROW_H * 5.0).child(list))
         .build(shared, reader)
 }
 
-fn agent_catalog_summary_host(
-    shared: &Shared,
-) -> RebuildOnChange<Option<(Vec<AgentConfigSummary>, Option<String>)>> {
-    let source =
-        shared
-            .signals()
-            .settings_structure
-            .select_named("settings agent catalog summary", |key| {
-                key.0.as_deref().map(|snapshot| {
-                    (
-                        snapshot.agents.agents.clone(),
-                        snapshot.agents.error.clone(),
-                    )
-                })
-            });
-    let s = shared.clone();
-    RebuildOnChange::key_from(source, move |snapshot| {
-        let (agents, error) = snapshot.clone().unwrap_or_default();
+/// The catalog counts and any catalog error, updated in place.
+fn agent_catalog_summary(shared: &Shared) -> impl Widget + use<> {
+    let summary = settings_projection(shared, "settings agent catalog summary", |snapshot| {
         let catalog = AgentConfigSnapshot {
-            agents,
+            agents: snapshot.agents.agents.clone(),
             selected_agent: None,
             available_tools: Vec::new(),
-            error,
+            error: snapshot.agents.error.clone(),
         };
-        let summary = format!(
+        format!(
             "{} · {} custom",
             agent_sidebar_preview(&catalog),
             agent_custom_count(&catalog)
-        );
-        let mut rows = Stack::vertical()
-            .gap(6.0)
-            .alignment(Alignment::Stretch)
-            .with_child(muted_label_with_token(&s, summary, s.theme().text.sm));
-        if let Some(error) = catalog.error {
-            rows = rows.with_child(
-                settings_label(&s, format!("Catalog error: {error}"), s.theme().text.sm)
-                    .color_when({
-                        let s = s.clone();
-                        move || palette(&s).danger_text
-                    }),
-            );
-        }
-        WidgetPod::new(rows)
+        )
+    });
+    let error = settings_projection(shared, "settings agent catalog error", |snapshot| {
+        snapshot
+            .agents
+            .error
+            .as_ref()
+            .map(|error| format!("Catalog error: {error}"))
+            .unwrap_or_default()
+    });
+    let has_error = derived(error.clone(), "settings agent catalog has error", |error| {
+        !error.is_empty()
+    });
+    let error_label = settings_label(shared, error.get(), TextSize::Sm)
+        .text_from(error)
+        .color_when({
+            let s = shared.clone();
+            move || palette(&s).bad_text
+        });
+    Column::new(&shared_reader(shared), |theme| {
+        theme.metrics.property_row_stacked_gap
     })
+    .with_child(muted_text(
+        shared,
+        Label::new(summary.get()).text_from(summary),
+        TextSize::Sm,
+    ))
+    .with_child(revealed(error_label, has_error))
 }
 
+/// Feedback, the selected agent's view, package tools, and the latest validation report.
 fn agent_detail_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let mut stack = Stack::vertical()
-        .gap(14.0)
-        .alignment(Alignment::Stretch)
-        .with_child(feedback_slot(
-            shared,
-            reader,
-            |settings| settings.agent_action_error.clone(),
-            |settings| settings.agent_action_status.clone(),
-        ));
+    let report = settings_projection(shared, "settings agent validation report", |snapshot| {
+        snapshot.agents.validation_report.clone()
+    });
+    let has_report = derived(report.clone(), "settings agent has report", Option::is_some);
+    let report_card = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        // Read-only results; rebuilt only when a new report arrives.
+        RebuildOnChange::key_from(report, move |report| match report.clone() {
+            Some(report) => WidgetPod::new(agent_validation_report_section(&s, &r, report)),
+            None => WidgetPod::new(SizedBox::new()),
+        })
+    };
+    Column::new(reader, |_| 14.0)
+        .with_child(feedback_slot(shared, reader, |snapshot| {
+            snapshot.feedback.agent.clone()
+        }))
+        .with_child(agent_details_host(shared, reader))
+        .with_child(agent_package_management_section(shared, reader))
+        .with_child(revealed(report_card, has_report))
+}
 
-    let editing_unsaved = shared.settings().agent_form.previous_id.is_none();
-    let selected = shared.settings().agent_snapshot.selected_agent.clone();
-    let editor_visible =
-        editing_unsaved || selected.as_ref().is_some_and(agent_definition_is_editable);
-    if editor_visible {
-        stack = stack.with_child(agent_editor_section(shared, reader));
-    } else if let Some(definition) = selected {
-        stack = stack.with_child(agent_readonly_section(shared, reader, definition));
-    } else {
-        stack = stack.with_child(
+fn agent_detail_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    detail: SettingsAgentDetail,
+) -> widgets::Boxed {
+    match detail {
+        SettingsAgentDetail::Editor => widgets::Boxed::new(agent_editor_section(shared, reader)),
+        SettingsAgentDetail::ReadOnly(definition) => {
+            widgets::Boxed::new(agent_readonly_section(shared, reader, *definition))
+        }
+        SettingsAgentDetail::Empty => widgets::Boxed::new(
             SettingsCard::new("Select an agent")
                 .description("Choose an agent from the list, or create a custom agent.")
                 .build(shared, reader),
-        );
+        ),
     }
-    stack = stack.with_child(agent_package_management_section(shared, reader));
-    if let Some(report) = shared.settings().agent_validation_report.clone() {
-        stack = stack.with_child(agent_validation_report_section(shared, reader, report));
-    }
-    stack
 }
 
 fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -10939,10 +11610,7 @@ fn agent_package_management_section(shared: &Shared, reader: &ThemeReader) -> im
         Flex::horizontal()
             .gap(8.0)
             .align_items(Alignment::Center)
-            .with_item(
-                input.min_width(220.0),
-                FlexItem::new().shrink(1.0).min_width(160.0),
-            )
+            .with_item(input, FlexItem::new().shrink(1.0))
             .with_item(button, FlexItem::new().no_shrink())
     };
     SettingsCard::new("Package management")
@@ -11114,67 +11782,84 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
         ))
         .with_child(inline_row("Output", output_format_select).theme_when(clone_reader(reader)));
 
-    let mut tools = FieldGroup::new().fill_width(true).gap(8.0);
-    if form.definition.tools.is_empty() {
-        tools = tools.with_child(value_row(
-            shared,
-            reader,
-            "Packaged tools",
-            "No packaged tools enabled",
-        ));
-    } else {
-        for tool in form.definition.tools.iter().cloned() {
-            tools = tools.with_child(agent_tool_editor_row(shared, reader, tool));
-        }
-    }
-    let available_tools = available_agent_tool_specs(
-        &shared.settings().agent_snapshot.available_tools,
-        &form.definition.tools,
+    let tool_rows = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        KeyedStack::vertical(
+            settings_projection(shared, "settings agent editor tools", |snapshot| {
+                snapshot.agents.editor_tools.clone()
+            }),
+            |tool: &AgentToolSpec| tool.name.clone(),
+            move |_name, tool| agent_tool_editor_row(&s, &r, tool.get()),
+        )
+        .gap(8.0)
+    };
+    let no_tools = settings_projection(shared, "settings agent editor has no tools", |snapshot| {
+        snapshot.agents.editor_tools.is_empty()
+    });
+    let available_tools = settings_projection(shared, "settings agent addable tools", |snapshot| {
+        snapshot.agents.available_tools.clone()
+    });
+    let can_add_tool = derived(
+        available_tools.clone(),
+        "settings agent can add tool",
+        |tools: &Vec<String>| !tools.is_empty(),
     );
-    if !available_tools.is_empty() {
-        let names = available_tools
-            .iter()
-            .map(|tool| tool.name.clone())
-            .collect::<Vec<_>>();
-        let selected_names = names.clone();
-        let tool_select = {
-            let s = shared.clone();
-            Select::new("agent-add-tool-select")
-                .options(names)
-                .selected_when(move || {
-                    Some(
-                        s.settings()
-                            .agent_form
-                            .tool_add_index
-                            .min(selected_names.len().saturating_sub(1)),
-                    )
-                })
-                .theme_when(clone_reader(reader))
-                .on_change({
-                    let s = shared.clone();
-                    move |index, _| s.settings_mut().set_agent_tool_add_index(index)
-                })
-        };
-        let add_tool = {
-            let s = shared.clone();
-            sui::Button::new("Add tool")
-                .icon(IconGlyph::Add)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || s.settings_mut().add_selected_agent_tool())
-        };
-        tools = tools.with_child(
+    // The option list has no reader form, so only the select itself follows the addable tools.
+    let tool_select = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(available_tools, move |names| {
+            let selected = s.clone();
+            let count = names.len();
+            let change = s.clone();
+            WidgetPod::new(
+                Select::new("agent-add-tool-select")
+                    .options(names.clone())
+                    .selected_when(move || {
+                        Some(
+                            selected
+                                .settings()
+                                .agent_form
+                                .tool_add_index
+                                .min(count.saturating_sub(1)),
+                        )
+                    })
+                    .theme_when(clone_reader(&r))
+                    .on_change(move |index, _| {
+                        change.settings_mut().set_agent_tool_add_index(index)
+                    }),
+            )
+        })
+    };
+    let add_tool = {
+        let s = shared.clone();
+        sui::Button::new("Add tool")
+            .icon(IconGlyph::Add)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || s.settings_mut().add_selected_agent_tool())
+    };
+    let mut tools = Column::new(reader, |theme| theme.metrics.field_group_spacing)
+        .with_child(revealed(
+            value_row(
+                shared,
+                reader,
+                "Packaged tools",
+                "No packaged tools enabled",
+            ),
+            no_tools,
+        ))
+        .with_child(tool_rows)
+        .with_child(revealed(
             inline_row(
                 "Add packaged tool",
-                TrailingSlotRow::new(tool_select, add_tool)
-                    .trailing_width(108.0)
-                    .trailing_height(28.0)
-                    .gap(8.0),
+                FieldWithAction::new(tool_select, add_tool),
             )
             .theme_when(clone_reader(reader)),
-        );
-    }
+            can_add_tool,
+        ));
     tools = tools
         .with_child(agent_area_row(
             shared,
@@ -11278,31 +11963,23 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             form.previous_id.is_some(),
         ));
 
-    let mut package = FieldGroup::new().fill_width(true).gap(8.0);
-    if let Some(summary) = selected_agent_config_summary(shared) {
-        package = package
-            .with_child(agent_readiness_row(shared, reader, summary.readiness))
-            .with_child(value_row(
-                shared,
-                reader,
-                "Package",
-                format!("{} · version {}", summary.source, summary.package_version),
-            ));
-        if let Some(module_id) = summary
-            .module_id
-            .as_deref()
-            .filter(|module_id| !module_id.trim().is_empty())
-        {
-            let module = summary
-                .module_version
-                .as_deref()
-                .filter(|version| !version.trim().is_empty())
-                .map(|version| format!("{module_id} · version {version}"))
-                .unwrap_or_else(|| module_id.to_string());
-            package = package.with_child(value_row(shared, reader, "Module", module));
-        }
-        package = package.with_child(value_row(shared, reader, "Provenance", summary.provenance));
-    }
+    // Read-only package facts; rebuilt only when the saved summary changes.
+    let package = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(
+            settings_projection(shared, "settings agent package summary", |snapshot| {
+                let id = snapshot.agents.selected_id.as_deref()?;
+                snapshot
+                    .agents
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .cloned()
+            }),
+            move |summary| WidgetPod::new(agent_package_rows(&s, &r, summary.clone())),
+        )
+    };
     Stack::vertical()
         .gap(14.0)
         .alignment(Alignment::Stretch)
@@ -11328,9 +12005,7 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 .row(tools)
                 .build(shared, reader),
         )
-        .with_child(agent_external_integrations_sections(
-            shared, reader, &form,
-        ))
+        .with_child(agent_external_integrations_sections(shared, reader))
         .with_child(
             SettingsCard::new("Runtime")
                 .description("Default turn limits and preferred placement for sessions and sandboxed tools.")
@@ -11349,183 +12024,48 @@ fn node_external_integrations_permission_section(
     shared: &Shared,
     reader: &ThemeReader,
 ) -> impl Widget + use<> {
-    let (
-        permission_loading,
-        permission_enabled,
-        permission_error,
-        action_error,
-        action_status,
-        confirming,
-        pending,
-    ) = {
-        let settings = shared.settings();
-        (
-            settings.remote_management.permission_loading,
-            settings.remote_management.external_integrations_enabled,
-            settings.remote_management.permission_error.clone(),
-            settings.external_integrations_permission_error.clone(),
-            settings.external_integrations_permission_status.clone(),
-            settings.external_integrations_enable_confirming,
-            settings.external_integrations_permission_pending(),
-        )
-    };
-
-    let (label, tone, detail) = if permission_loading {
-        (
-            "Loading",
-            SemanticTone::Neutral,
-            "Reading the node-local permission document.",
-        )
-    } else if permission_error.is_some() {
-        (
-            "Unavailable",
-            SemanticTone::Danger,
-            "Permission state could not be read, so MCP calls stay blocked.",
-        )
-    } else if permission_enabled {
-        (
-            "Allowed",
-            SemanticTone::Warning,
-            "Configured MCP tools may send arguments to external servers.",
-        )
-    } else {
-        (
-            "Denied",
-            SemanticTone::Neutral,
-            "MCP tools stay visible in agent definitions but cannot run on this node.",
-        )
-    };
-
-    let permission_control = if pending {
-        widgets::Boxed::new(
-            Flex::horizontal()
-                .gap(8.0)
-                .align_items(Alignment::Center)
-                .with_child(
-                    Spinner::new("external-integrations-permission-pending")
-                        .theme_when(clone_reader(reader)),
+    permission_card(
+        shared,
+        reader,
+        PermissionCard {
+            title: "External integrations",
+            description: "Lets agents use MCP tools that reach external servers from this node. Applies immediately to chat and voice sessions.",
+            details: [
+                "Reading the node-local permission document.",
+                "Permission state could not be read, so MCP calls stay blocked.",
+                "Configured MCP tools may send arguments to external servers.",
+                "MCP tools stay visible in agent definitions but cannot run on this node.",
+            ],
+            switch_name: "Allow external integrations",
+            allow_label: "Allow external integrations…",
+            pending_name: "external-integrations-permission-pending",
+            confirm_region: "Allow external integrations confirmation",
+            confirm_help: "MCP servers receive model-generated tool arguments and may reach network services or take external actions. Each agent's tool rules and server allow-list still apply.",
+            confirm_description: "Confirmation is required before enabling MCP execution on this node",
+            error_name: "external-integrations-permission-error",
+            scope: || SettingsOperationScope::ExternalIntegrationsPermission,
+            set: |enabled| SettingsOperation::SetExternalIntegrationsPermission { enabled },
+            confirm: SettingsState::confirm_external_integrations_enable,
+            cancel: SettingsState::cancel_external_integrations_enable,
+            view: |snapshot| {
+                let remote = &snapshot.remote_management;
+                let (_, _, confirming, pending) = remote.external_integrations;
+                PermissionView::new(
+                    remote.snapshot.permission_loading,
+                    remote.snapshot.permission_error.clone(),
+                    remote.snapshot.external_integrations_enabled,
+                    pending,
+                    confirming,
                 )
-                .with_child(muted_label(shared, "Applying local permission…")),
-        )
-    } else if permission_loading || permission_error.is_some() {
-        let s = shared.clone();
-        widgets::Boxed::new(
-            sui::Button::new("Refresh")
-                .icon(IconGlyph::Redo)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::RemoteManagementRefresh,
-                        SettingsOperation::RefreshRemoteManagement,
-                    );
-                }),
-        )
-    } else if permission_enabled {
-        let s = shared.clone();
-        widgets::Boxed::new(
-            Switch::new("")
-                .semantic_name("Allow external integrations")
-                .checked(true)
-                .theme_when(clone_reader(reader))
-                .on_change(move |enabled| {
-                    if !enabled {
-                        queue_settings_operation(
-                            &s,
-                            SettingsOperationScope::ExternalIntegrationsPermission,
-                            SettingsOperation::SetExternalIntegrationsPermission { enabled: false },
-                        );
-                    }
-                }),
-        )
-    } else {
-        let s = shared.clone();
-        widgets::Boxed::new(
-            sui::Button::new("Allow external integrations…")
-                .icon(IconGlyph::Lock)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Warning)
-                .on_press(move || s.settings_mut().confirm_external_integrations_enable()),
-        )
-    };
-
-    let mut card = SettingsCard::new("External integrations")
-        .description("Lets agents use MCP tools that reach external servers from this node. Applies immediately to chat and voice sessions.")
-        .header_action(
-            StatusBadge::new(label)
-                .tone(tone)
-                .theme_when(clone_reader(reader)),
-        )
-        .row(
-            SettingRow::new("Permission")
-                .help(detail)
-                .control(permission_control)
-                .build(shared),
-        );
-    if confirming && !permission_enabled && !pending {
-        let confirm = {
-            let s = shared.clone();
-            sui::Button::new("Confirm allow")
-                .icon(IconGlyph::Lock)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .on_press(move || {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::ExternalIntegrationsPermission,
-                        SettingsOperation::SetExternalIntegrationsPermission { enabled: true },
-                    );
-                })
-        };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || s.settings_mut().cancel_external_integrations_enable())
-        };
-        card = card.row(
-            SemanticRegion::new(
-                "Allow external integrations confirmation",
-                SettingRow::new("Confirm access")
-                    .help("MCP servers receive model-generated tool arguments and may reach network services or take external actions. Each agent's tool rules and server allow-list still apply.")
-                    .control(
-                        Flex::horizontal()
-                            .gap(8.0)
-                            .align_items(Alignment::Center)
-                            .with_child(cancel)
-                            .with_child(confirm),
-                    )
-                    .build(shared),
-            )
-            .description("Confirmation is required before enabling MCP execution on this node")
-            .role(SemanticsRole::Dialog),
-        );
-    }
-    if let Some(error) = permission_error {
-        card = card.row(copyable_area_row(
-            reader,
-            "external-integrations-permission-error",
-            "Permission error",
-            error,
-        ));
-    }
-    if let Some(error) = action_error {
-        card = card.row(SettingRow::new("Error").value(shared, error).build(shared));
-    } else if let Some(status) = action_status {
-        card = card.row(
-            SettingRow::new("Status")
-                .value(shared, status)
-                .build(shared),
-        );
-    }
-    card.row(details(
+            },
+            feedback: |snapshot| {
+                let (error, status, _, _) = &snapshot.remote_management.external_integrations;
+                (error.clone(), status.clone())
+            },
+        },
+        Vec::new(),
+    )
+    .row(details(
         shared,
         reader,
         "external-integrations-commands",
@@ -11559,7 +12099,6 @@ fn node_external_integrations_permission_section(
 fn agent_external_integrations_sections(
     shared: &Shared,
     reader: &ThemeReader,
-    form: &AgentForm,
 ) -> impl Widget + use<> {
     let s = shared.clone();
     let permission_section = SettingsCard::new("Host authorization").row(FieldGroup::new().gap(8.0)
@@ -11576,19 +12115,24 @@ fn agent_external_integrations_sections(
             .tone(SemanticTone::Neutral)
             .on_press(move || s.settings_mut().add_agent_mcp_server())
     };
-    let server_summary = if form.mcp_servers.is_empty() {
-        "No MCP servers configured".to_string()
-    } else {
-        let enabled = form
-            .mcp_servers
-            .iter()
-            .filter(|server| server.enabled)
-            .count();
-        format!(
-            "{} configured · {enabled} enabled · tools are shared by chat and voice",
-            form.mcp_servers.len()
-        )
-    };
+    let servers = settings_projection(shared, "settings agent MCP servers", |snapshot| {
+        snapshot.agents.editor_mcp_servers.clone()
+    });
+    let server_summary = derived(
+        servers.clone(),
+        "settings agent MCP server summary",
+        |servers: &Vec<SettingsAgentMcpServerRow>| {
+            if servers.is_empty() {
+                "No MCP servers configured".to_string()
+            } else {
+                let enabled = servers.iter().filter(|server| server.enabled).count();
+                format!(
+                    "{} configured · {enabled} enabled · tools are shared by chat and voice",
+                    servers.len()
+                )
+            }
+        },
+    );
     let overview = SettingsCard::new("MCP servers").description("Each server is stored in this agent package. Secrets remain node-local environment variables beginning with SINOMO_MCP_. Leave the protocol on automatic unless an endpoint mishandles the stateless probe. Save the agent, then run its readiness test to connect and discover exposed tools.",).row(FieldGroup::new()
             .gap(8.0)
             .with_child(value_row(
@@ -11597,29 +12141,49 @@ fn agent_external_integrations_sections(
                 "Transport",
                 "Streamable HTTP · MCP 2026-07-28 with handshake fallback · Chat + voice",
             ))
-            .with_child(value_row(shared, reader, "Servers", server_summary))
+            .with_child(value_row_from(shared, reader, "Servers", server_summary))
             .with_child(
                 inline_row("Actions", Stack::horizontal().with_child(add_server))
                     .theme_when(clone_reader(reader)),
             )).build(shared, reader);
 
-    let mut sections = Stack::vertical()
+    // Servers are keyed by their draft id, so adding or removing one leaves the others' fields,
+    // focus, and caret in place.
+    let server_cards = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        KeyedStack::vertical(
+            servers,
+            |server: &SettingsAgentMcpServerRow| server.ui_id,
+            move |ui_id, server| agent_mcp_server_section(&s, &r, *ui_id, server),
+        )
         .gap(14.0)
-        .alignment(Alignment::Stretch)
+    };
+    Column::new(reader, |_| 14.0)
         .with_child(permission_section)
-        .with_child(overview);
-    for server in form.mcp_servers.iter().cloned() {
-        sections = sections.with_child(agent_mcp_server_section(shared, reader, server));
-    }
-    sections
+        .with_child(overview)
+        .with_child(server_cards)
 }
 
 fn agent_mcp_server_section(
     shared: &Shared,
     reader: &ThemeReader,
-    server: AgentMcpServerForm,
+    ui_id: u64,
+    row: Signal<SettingsAgentMcpServerRow>,
 ) -> impl Widget + use<> {
-    let ui_id = server.ui_id;
+    let server = shared
+        .settings()
+        .agent_form
+        .mcp_servers
+        .iter()
+        .find(|server| server.ui_id == ui_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            AgentMcpServerForm::from_definition(
+                ui_id,
+                &AgentMcpServerDefinition::streamable_http(String::new(), String::new()),
+            )
+        });
     let input_name = |field: &str| format!("agent-mcp-{ui_id}-{field}");
     let enabled = {
         let s = shared.clone();
@@ -11663,8 +12227,6 @@ fn agent_mcp_server_section(
                 settings.update_agent_mcp_server(ui_id, |server| server.name = value)
             },
         ));
-    let url_id = server.ui_id;
-    let protocol_id = server.ui_id;
     let protocol = {
         let selected = shared.clone();
         let s = shared.clone();
@@ -11680,16 +12242,15 @@ fn agent_mcp_server_section(
                         .agent_form
                         .mcp_servers
                         .iter()
-                        .find(|server| server.ui_id == protocol_id)
+                        .find(|server| server.ui_id == ui_id)
                         .map_or(0, |server| server.protocol_era_index),
                 )
             },
             move |index, _label| {
-                s.settings_mut()
-                    .update_agent_mcp_server(protocol_id, |server| {
-                        server.protocol_era_index =
-                            index.min(AGENT_MCP_PROTOCOL_ERA_OPTIONS.len().saturating_sub(1));
-                    });
+                s.settings_mut().update_agent_mcp_server(ui_id, |server| {
+                    server.protocol_era_index =
+                        index.min(AGENT_MCP_PROTOCOL_ERA_OPTIONS.len().saturating_sub(1));
+                });
             },
         )
     };
@@ -11702,13 +12263,12 @@ fn agent_mcp_server_section(
             server.url.clone(),
             "https://example.com/mcp",
             move |settings, value| {
-                settings.update_agent_mcp_server(url_id, |server| server.url = value)
+                settings.update_agent_mcp_server(ui_id, |server| server.url = value)
             },
         ))
         .with_child(protocol)
         .with_child(enabled)
         .with_child(required);
-    let allowed_id = server.ui_id;
     body = body.with_child(agent_area_row(
         shared,
         reader,
@@ -11718,10 +12278,9 @@ fn agent_mcp_server_section(
         "one original MCP tool name per line; empty exposes all",
         76.0,
         move |settings, value| {
-            settings.update_agent_mcp_server(allowed_id, |server| server.allowed_tools_text = value)
+            settings.update_agent_mcp_server(ui_id, |server| server.allowed_tools_text = value)
         },
     ));
-    let token_id = server.ui_id;
     body = body.with_child(agent_text_row(
         shared,
         reader,
@@ -11730,10 +12289,9 @@ fn agent_mcp_server_section(
         server.bearer_token_env.clone(),
         "SINOMO_MCP_FILES_TOKEN",
         move |settings, value| {
-            settings.update_agent_mcp_server(token_id, |server| server.bearer_token_env = value)
+            settings.update_agent_mcp_server(ui_id, |server| server.bearer_token_env = value)
         },
     ));
-    let headers_id = server.ui_id;
     body = body.with_child(agent_area_row(
         shared,
         reader,
@@ -11743,11 +12301,9 @@ fn agent_mcp_server_section(
         "X-Api-Key: SINOMO_MCP_FILES_KEY",
         76.0,
         move |settings, value| {
-            settings
-                .update_agent_mcp_server(headers_id, |server| server.headers_from_env_text = value)
+            settings.update_agent_mcp_server(ui_id, |server| server.headers_from_env_text = value)
         },
     ));
-    let startup_id = server.ui_id;
     body = body.with_child(agent_text_row(
         shared,
         reader,
@@ -11756,10 +12312,9 @@ fn agent_mcp_server_section(
         server.startup_timeout_ms.clone(),
         "10000",
         move |settings, value| {
-            settings.update_agent_mcp_server(startup_id, |server| server.startup_timeout_ms = value)
+            settings.update_agent_mcp_server(ui_id, |server| server.startup_timeout_ms = value)
         },
     ));
-    let timeout_id = server.ui_id;
     body = body
         .with_child(agent_text_row(
             shared,
@@ -11769,20 +12324,29 @@ fn agent_mcp_server_section(
             server.tool_timeout_ms.clone(),
             "60000",
             move |settings, value| {
-                settings
-                    .update_agent_mcp_server(timeout_id, |server| server.tool_timeout_ms = value)
+                settings.update_agent_mcp_server(ui_id, |server| server.tool_timeout_ms = value)
             },
         ))
         .with_child(
             inline_row("Actions", Stack::horizontal().with_child(remove))
                 .theme_when(clone_reader(reader)),
         );
-    let title = if server.name.trim().is_empty() {
+    let title = row.select_named("settings agent MCP server title", |row| {
+        mcp_server_card_title(&row.name)
+    });
+    SettingsCard::new(mcp_server_card_title(&server.name))
+        .title_from(title)
+        .description("The server's discovered tools use the same implementation in regular chat and realtime voice. Non-loopback endpoints must use HTTPS.",)
+        .row(body)
+        .build(shared, reader)
+}
+
+fn mcp_server_card_title(name: &str) -> String {
+    if name.trim().is_empty() {
         "MCP server".to_string()
     } else {
-        format!("MCP · {}", server.name)
-    };
-    SettingsCard::new(title).description("The server's discovered tools use the same implementation in regular chat and realtime voice. Non-loopback endpoints must use HTTPS.",).row(body).build(shared, reader)
+        format!("MCP · {name}")
+    }
 }
 
 fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolSpec) -> FormRow {
@@ -11805,14 +12369,11 @@ fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolS
             .on_press(move || s.settings_mut().remove_agent_tool(&name));
         Tooltip::new(label, button)
             .placement(TooltipPlacement::Above)
-            .theme(reader())
+            .theme_when(clone_reader(reader))
     };
     inline_row(
         tool.name,
-        TrailingSlotRow::new(muted_label(shared, description), remove)
-            .trailing_width(28.0)
-            .trailing_height(28.0)
-            .gap(8.0),
+        FieldWithAction::new(muted_label(shared, description), remove),
     )
     .theme_when(clone_reader(reader))
 }
@@ -11860,15 +12421,10 @@ fn agent_home_folder_row(
         Stack::vertical()
             .gap(6.0)
             .alignment(Alignment::Stretch)
-            .with_child(
-                TrailingSlotRow::new(
-                    selectable_read_only_input(reader, "agent-home-path", path),
-                    open,
-                )
-                .trailing_width(160.0)
-                .trailing_height(28.0)
-                .gap(8.0),
-            )
+            .with_child(FieldWithAction::new(
+                selectable_read_only_input(reader, "agent-home-path", path),
+                open,
+            ))
             .with_child(muted_label(shared, detail)),
     )
     .stacked()
@@ -11928,70 +12484,105 @@ fn agent_actions_row(shared: &Shared, reader: &ThemeReader) -> FormRow {
 }
 
 fn agent_delete_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (previous_id, confirming) = {
-        let settings = shared.settings();
-        let previous_id = settings.agent_form.previous_id.clone();
-        let confirming = previous_id
-            .as_ref()
-            .is_some_and(|id| settings.agent_delete_confirming.as_ref() == Some(id));
-        (previous_id, confirming)
+    let persisted = shared.settings().agent_form.previous_id.is_some();
+    let confirm = {
+        let s = shared.clone();
+        let pending = settings_projection(shared, "settings agent delete enabled", |snapshot| {
+            !snapshot.agents.pending
+        });
+        sui::Button::new("Confirm delete")
+            .icon(sui::IconGlyph::Trash)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
+            .enabled_from(pending)
+            .on_press(move || {
+                let id = s.settings().agent_selected_id.clone();
+                if let Some(id) = id {
+                    queue_settings_operation(
+                        &s,
+                        SettingsOperationScope::Agents,
+                        SettingsOperation::DeleteAgent { id },
+                    );
+                } else {
+                    s.settings_mut().agent_action_error =
+                        Some("select a custom agent first".to_string());
+                }
+            })
     };
-    if confirming {
-        let confirm = {
-            let s = shared.clone();
-            sui::Button::new("Confirm delete")
-                .icon(sui::IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .enabled_when({
-                    let s = s.clone();
-                    move || !s.settings().domain_pending(SettingsOperationDomain::Agents)
-                })
-                .on_press(move || {
-                    let id = s.settings().agent_selected_id.clone();
-                    if let Some(id) = id {
-                        queue_settings_operation(
-                            &s,
-                            SettingsOperationScope::Agents,
-                            SettingsOperation::DeleteAgent { id },
-                        );
-                    } else {
-                        s.settings_mut().agent_action_error =
-                            Some("select a custom agent first".to_string());
-                    }
-                })
-        };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .icon(sui::IconGlyph::Close)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press(move || s.settings_mut().cancel_agent_delete())
-        };
-        return Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(8.0)
-            .align_items(Alignment::Start)
-            .with_child(confirm)
-            .with_child(cancel);
-    }
-    let s = shared.clone();
-    Flex::horizontal()
-        .wrap(FlexWrap::Wrap)
-        .gap(8.0)
-        .align_items(Alignment::Start)
+    let cancel = {
+        let s = shared.clone();
+        sui::Button::new("Cancel")
+            .icon(sui::IconGlyph::Close)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || s.settings_mut().cancel_agent_delete())
+    };
+    let delete = {
+        let s = shared.clone();
+        sui::Button::new("Delete agent")
+            .icon(sui::IconGlyph::Trash)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Filled)
+            .tone(SemanticTone::Danger)
+            .enabled(persisted)
+            .on_press(move || s.settings_mut().confirm_agent_delete())
+    };
+    let confirming = settings_projection(shared, "settings agent delete confirming", |snapshot| {
+        usize::from(snapshot.agents.delete_confirming)
+    });
+    SwitchView::new()
         .with_child(
-            sui::Button::new("Delete agent")
-                .icon(sui::IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .enabled_when(move || previous_id.is_some())
-                .on_press(move || s.settings_mut().confirm_agent_delete()),
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
+                .with_child(delete),
         )
+        .with_child(
+            Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(8.0)
+                .align_items(Alignment::Start)
+                .with_child(confirm)
+                .with_child(cancel),
+        )
+        .selected_from(confirming)
+}
+
+/// The saved package's readiness, versions, and provenance, when the agent has been saved.
+fn agent_package_rows(
+    shared: &Shared,
+    reader: &ThemeReader,
+    summary: Option<AgentConfigSummary>,
+) -> impl Widget + use<> {
+    let mut package = FieldGroup::new().fill_width(true).gap(8.0);
+    let Some(summary) = summary else {
+        return package;
+    };
+    package = package
+        .with_child(agent_readiness_row(shared, reader, summary.readiness))
+        .with_child(value_row(
+            shared,
+            reader,
+            "Package",
+            format!("{} · version {}", summary.source, summary.package_version),
+        ));
+    if let Some(module_id) = summary
+        .module_id
+        .as_deref()
+        .filter(|module_id| !module_id.trim().is_empty())
+    {
+        let module = summary
+            .module_version
+            .as_deref()
+            .filter(|version| !version.trim().is_empty())
+            .map(|version| format!("{module_id} · version {version}"))
+            .unwrap_or_else(|| module_id.to_string());
+        package = package.with_child(value_row(shared, reader, "Module", module));
+    }
+    package.with_child(value_row(shared, reader, "Provenance", summary.provenance))
 }
 
 fn agent_readonly_section(
@@ -12007,12 +12598,39 @@ fn agent_readonly_section(
             .on_press(move || s.settings_mut().duplicate_selected_agent())
     };
     let summary = selected_agent_config_summary(shared);
-    let readiness = summary
-        .as_ref()
-        .map(|summary| summary.readiness)
-        .unwrap_or(AgentReadiness::NeedsAttention);
-    let (readiness_label, readiness_detail, readiness_tone, readiness_icon) =
-        agent_readiness_presentation(readiness);
+    // Readiness is reported with the catalog, which refreshes without reopening the agent.
+    let readiness = settings_projection(shared, "settings agent readiness", |snapshot| {
+        let id = snapshot.agents.selected_id.as_deref()?;
+        snapshot
+            .agents
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.readiness)
+    });
+    let presentation = |readiness: &Option<AgentReadiness>| {
+        agent_readiness_presentation(readiness.unwrap_or(AgentReadiness::NeedsAttention))
+    };
+    let readiness_label = derived(
+        readiness.clone(),
+        "settings agent readiness label",
+        move |r| presentation(r).0.to_string(),
+    );
+    let readiness_detail = derived(
+        readiness.clone(),
+        "settings agent readiness detail",
+        move |r| presentation(r).1.to_string(),
+    );
+    let readiness_badge = Restyle::new(
+        StatusBadge::new(readiness_label.get())
+            .label_from(readiness_label)
+            .theme_when(clone_reader(reader)),
+        readiness,
+        move |badge, readiness| {
+            let (_, _, tone, icon) = presentation(readiness);
+            badge.tone(tone).icon(icon)
+        },
+    );
     let prompt_copy = {
         let prompt = definition.system_prompt.clone();
         sui::Button::new("Copy")
@@ -12026,12 +12644,7 @@ fn agent_readonly_section(
 
     let mut card = SettingsCard::new(definition.name.clone())
         .description("Supplied by the runtime. Duplicate it to make an editable custom agent.")
-        .header_action(
-            StatusBadge::new(readiness_label)
-                .tone(readiness_tone)
-                .icon(readiness_icon)
-                .theme_when(clone_reader(reader)),
-        )
+        .header_action(readiness_badge)
         .row(
             SettingRow::new("Role")
                 .value(shared, agent_role_label(&definition.role))
@@ -12089,7 +12702,7 @@ fn agent_readonly_section(
     let mut technical = vec![
         widgets::Boxed::new(
             SettingRow::new("Readiness")
-                .value(shared, readiness_detail)
+                .value_from(shared, readiness_detail)
                 .build(shared),
         ),
         widgets::Boxed::new(
@@ -12312,7 +12925,6 @@ where
 {
     let s = shared.clone();
     let input = TextInput::new(name)
-        .min_width(FIELD_INPUT_MIN_W)
         .value(value)
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
@@ -12430,18 +13042,179 @@ fn agent_model_summary(definition: &AgentDefinition) -> String {
 
 const MODULE_OVERRIDE_OPTIONS: &[&str] = &["Inherit", "Enable", "Disable"];
 
-fn section_modules(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings modules structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.modules.clone())
-        });
+/// One module card on the Modules or Storage page. `settings` are the node-scoped catalog
+/// entries the card edits, by catalog index.
+#[derive(Clone, Debug, PartialEq)]
+struct ModuleCardStructure {
+    module: SettingsModuleSummaryStructure,
+    node_id: Option<String>,
+    node_label: String,
+    node_error: Option<String>,
+    managed_elsewhere: bool,
+    settings: Vec<(usize, ConfigItemStructure)>,
+    revision: u64,
+}
+
+impl ModuleCardStructure {
+    fn key(&self) -> (String, Option<String>, bool) {
+        (
+            self.module.module_id.clone(),
+            self.node_id.clone(),
+            self.managed_elsewhere,
+        )
+    }
+}
+
+/// The owners of the two mount settings, each with whether Storage shows its settings: the SIFS
+/// mount module (its settings are the mount card) and the NFS mount module. They are found as
+/// the owners of their settings because the app reaches the runtime through the client facade,
+/// which does not export the storage crates.
+fn storage_module_ids(items: &[ConfigItemStructure]) -> Vec<(String, bool)> {
+    let owner = |key: &str| {
+        items
+            .iter()
+            .find(|item| item.key == key)
+            .and_then(|item| item.module_id.clone())
+    };
+    let mut modules: Vec<(String, bool)> = Vec::new();
+    for (key, with_settings) in [(SIFS_MOUNT_CONFIG_KEY, false), (NFS_MOUNT_CONFIG_KEY, true)] {
+        if let Some(module_id) = owner(key)
+            && !modules
+                .iter()
+                .any(|(known, _)| module_ids_match(known, &module_id))
+        {
+            modules.push((module_id, with_settings));
+        }
+    }
+    modules
+}
+
+fn module_card_structure(
+    snapshot: &SettingsStructureSnapshot,
+    module: &SettingsModuleSummaryStructure,
+    managed_elsewhere: bool,
+    settings: Vec<(usize, ConfigItemStructure)>,
+) -> ModuleCardStructure {
+    let node = snapshot.modules.selected_node.as_ref();
+    ModuleCardStructure {
+        module: module.clone(),
+        node_id: node.map(|node| node.node_id.clone()),
+        node_label: node
+            .map(|node| node.display_name.clone())
+            .unwrap_or_else(|| "No node selected".to_string()),
+        node_error: node.and_then(|node| node.error.clone()),
+        managed_elsewhere,
+        settings,
+        revision: snapshot.configuration.ui_revision,
+    }
+}
+
+fn node_module_settings(snapshot: &SettingsStructureSnapshot) -> Vec<(usize, ConfigItemStructure)> {
+    snapshot
+        .configuration
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.module_id.is_some() && item.node_scoped)
+        .map(|(index, item)| (index, item.clone()))
+        .collect()
+}
+
+/// The Modules page cards, each with its settings, and the settings no installed module owns.
+fn modules_page_cards(
+    snapshot: &SettingsStructureSnapshot,
+) -> (Vec<ModuleCardStructure>, Vec<(usize, ConfigItemStructure)>) {
+    let catalog = node_module_settings(snapshot);
+    let storage = storage_module_ids(&snapshot.configuration.items);
+    let mut rendered = HashSet::new();
+    let mut cards = Vec::new();
+    for module in &snapshot.modules.modules {
+        let mut associated = Vec::new();
+        for (index, item) in &catalog {
+            if !rendered.contains(index)
+                && item.module_id.as_deref().is_some_and(|config_module_id| {
+                    module_ids_match(config_module_id, &module.module_id)
+                })
+            {
+                rendered.insert(*index);
+                associated.push((*index, item.clone()));
+            }
+        }
+        // The mount modules are managed in Storage, beside the mount settings.
+        let managed_elsewhere = storage
+            .iter()
+            .any(|(id, _)| module_ids_match(id, &module.module_id));
+        if managed_elsewhere {
+            associated.clear();
+        }
+        cards.push(module_card_structure(
+            snapshot,
+            module,
+            managed_elsewhere,
+            associated,
+        ));
+    }
+    let unmatched = catalog
+        .into_iter()
+        .filter(|(index, _)| !rendered.contains(index))
+        .collect();
+    (cards, unmatched)
+}
+
+/// The Storage page's module cards: lifecycle for the SIFS mount module, and lifecycle and
+/// settings for the NFS mount module.
+fn storage_page_cards(snapshot: &SettingsStructureSnapshot) -> Vec<ModuleCardStructure> {
+    let catalog = node_module_settings(snapshot);
+    storage_module_ids(&snapshot.configuration.items)
+        .into_iter()
+        .filter_map(|(module_id, with_settings)| {
+            let module = snapshot
+                .modules
+                .modules
+                .iter()
+                .find(|module| module_ids_match(&module.module_id, &module_id))?;
+            let settings = catalog
+                .iter()
+                .filter(|(_, item)| {
+                    with_settings
+                        && item
+                            .module_id
+                            .as_deref()
+                            .is_some_and(|id| module_ids_match(id, &module.module_id))
+                })
+                .cloned()
+                .collect();
+            Some(module_card_structure(snapshot, module, false, settings))
+        })
+        .collect()
+}
+
+/// Module cards keyed by module and node, so a status refresh or a settings edit updates the
+/// matching card in place.
+fn module_card_stack(
+    shared: &Shared,
+    reader: &ThemeReader,
+    cards: SettingsProjection<Vec<ModuleCardStructure>>,
+) -> KeyedStack<(String, Option<String>, bool), ModuleCardStructure> {
     let s = shared.clone();
     let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        WidgetPod::new(section_modules_body(&s, &r))
+    KeyedStack::vertical(cards, ModuleCardStructure::key, move |_, card| {
+        if card.get().managed_elsewhere {
+            widgets::Boxed::new(managed_elsewhere_card(
+                &s,
+                &r,
+                &card.get().module.label,
+                SettingsSection::Storage,
+            ))
+        } else {
+            widgets::Boxed::new(module_config_section(&s, &r, card))
+        }
     })
+    .gap(16.0)
+}
+
+fn section_modules(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    section_modules_body(shared, reader)
 }
 
 #[cfg(test)]
@@ -12460,55 +13233,8 @@ fn module_section_key(shared: &Shared) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let modules = snapshot
-        .modules
-        .iter()
-        .map(|module| {
-            format!(
-                "{}:{}:{}:{}:{:?}:{:?}:{}:{:?}:{}",
-                module.module_id,
-                module.label,
-                module.backend,
-                module.detail,
-                module.desired_enabled,
-                module.effective_source,
-                module.effective_enabled,
-                module.observed,
-                module.observed_detail
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let cluster = snapshot
-        .cluster_config
-        .modules
-        .iter()
-        .map(|(module_id, setting)| format!("{module_id}:{}", setting.enabled))
-        .collect::<Vec<_>>()
-        .join(",");
-    let selected = snapshot
-        .selected_node
-        .as_ref()
-        .map(|node| {
-            let config = node
-                .config
-                .modules
-                .iter()
-                .map(|(module_id, setting)| format!("{module_id}:{}", setting.enabled))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{}:{:?}:{}", node.summary.node_id, node.error, config)
-        })
-        .unwrap_or_default();
-    let module_settings = settings
-        .config_items
-        .iter()
-        .filter(|item| item.module_id.is_some())
-        .map(config_item_rebuild_signature)
-        .collect::<Vec<_>>()
-        .join("\n");
     format!(
-        "selected:{:?};error:{:?};status:{:?};warnings:{:?};config-revision:{}\n{nodes}\n{modules}\n{cluster}\n{selected}\n{module_settings}",
+        "selected:{:?};error:{:?};status:{:?};warnings:{:?};config-revision:{}\n{nodes}",
         settings.module_selected_node_id,
         settings.module_action_error,
         settings.module_action_status,
@@ -12517,16 +13243,9 @@ fn module_section_key(shared: &Shared) -> String {
     )
 }
 
+/// The Modules page: a summary that updates in place, one keyed card per module, and the
+/// settings of modules missing from the node.
 fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (snapshot, action_error, action_status) = {
-        let settings = shared.settings();
-        (
-            settings.module_snapshot.clone(),
-            settings.module_action_error.clone(),
-            settings.module_action_status.clone(),
-        )
-    };
-
     let refresh = {
         let s = shared.clone();
         sui::Button::new("Refresh")
@@ -12543,106 +13262,103 @@ fn section_modules_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 );
             })
     };
-
-    let mut summary = SettingsCard::new("Modules")
+    let cluster_defaults =
+        settings_projection(shared, "settings modules cluster defaults", |snapshot| {
+            let configured = snapshot.modules.cluster_config.len();
+            let enabled = snapshot
+                .modules
+                .cluster_config
+                .iter()
+                .filter(|(_, enabled)| *enabled)
+                .count();
+            if configured == 0 {
+                "No cluster defaults".to_string()
+            } else {
+                format!("{enabled} enabled · {configured} configured")
+            }
+        });
+    let node_error = settings_projection(shared, "settings modules node error", |snapshot| {
+        snapshot
+            .modules
+            .selected_node
+            .as_ref()
+            .and_then(|node| node.error.clone())
+            .unwrap_or_default()
+    });
+    let warnings = settings_projection(shared, "settings modules warnings", |snapshot| {
+        snapshot.modules.warnings.join("; ")
+    });
+    let not_empty = |text: &String| !text.is_empty();
+    let summary = SettingsCard::new("Modules")
         .description("Turn modules on or off for the selected node. Cluster-wide defaults are in Configuration.")
         .header_action(refresh)
         .row(
             SettingRow::new("Cluster defaults")
-                .value(shared, module_cluster_summary(&snapshot))
+                .value_from(shared, cluster_defaults)
                 .build(shared),
-        );
-    if let Some(node) = snapshot.selected_node.as_ref()
-        && let Some(error) = node.error.as_ref()
-    {
-        summary = summary.row(
+        )
+        .row(revealed(
             SettingRow::new("Node config")
-                .value(shared, error.clone())
+                .value_from(shared, node_error.clone())
                 .build(shared),
-        );
-    }
-    if !snapshot.warnings.is_empty() {
-        summary = summary.row(
+            derived(node_error, "settings modules has node error", not_empty),
+        ))
+        .row(revealed(
             SettingRow::new("Warnings")
-                .value(shared, snapshot.warnings.join("; "))
+                .value_from(shared, warnings.clone())
                 .build(shared),
-        );
-    }
-    if let Some(error) = action_error {
-        summary = summary.row(SettingRow::new("Error").value(shared, error).build(shared));
-    } else if let Some(status) = action_status {
-        summary = summary.row(
-            SettingRow::new("Status")
-                .value(shared, status)
-                .build(shared),
-        );
-    }
+            derived(warnings, "settings modules has warnings", not_empty),
+        ))
+        .row(feedback_slot(shared, reader, |snapshot| {
+            (
+                snapshot.modules.action_error.clone(),
+                snapshot.modules.action_status.clone(),
+            )
+        }));
 
-    let mut stack = Stack::vertical()
-        .gap(16.0)
-        .alignment(Alignment::Stretch)
-        .with_child(summary.build(shared, reader));
-    let module_config_catalog = {
-        let settings = shared.settings();
-        settings
-            .config_items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.module_id.is_some() && item.node_scoped)
-            .map(|(index, item)| (index, item.clone()))
-            .collect::<Vec<_>>()
+    let cards = settings_projection(shared, "settings module cards", |snapshot| {
+        modules_page_cards(snapshot).0
+    });
+    let unmatched = settings_projection(shared, "settings unmatched module settings", |snapshot| {
+        let (_, unmatched) = modules_page_cards(snapshot);
+        (unmatched, snapshot.configuration.ui_revision)
+    });
+    let has_unmatched = derived(
+        unmatched.clone(),
+        "settings has unmatched module settings",
+        |(unmatched, _): &(Vec<(usize, ConfigItemStructure)>, u64)| !unmatched.is_empty(),
+    );
+    // Editors for settings without an installed module; rebuilt for catalog or structural draft
+    // changes only.
+    let unmatched_card = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(unmatched, move |(unmatched, _)| {
+            let mut card = SettingsCard::new("Additional module settings")
+                .description("Settings declared by modules that are not installed on this node.");
+            for (index, _) in unmatched {
+                if let Some(item) = s.settings().config_items.get(*index).cloned() {
+                    card = card.row(PodHost::new(module_config_editor_row(
+                        &s, &r, *index, &item,
+                    )));
+                }
+            }
+            WidgetPod::new(card.build(&s, &r))
+        })
     };
-    let mut rendered_config_indices = HashSet::new();
-    if snapshot.modules.is_empty() {
-        stack = stack.with_child(
+    let no_modules = settings_projection(shared, "settings no modules", |snapshot| {
+        snapshot.modules.modules.is_empty()
+    });
+    Column::new(reader, |_| 16.0)
+        .with_child(summary.build(shared, reader))
+        .with_child(revealed(
             SettingsCard::new("No modules")
                 .description("No installed or configured modules were found on this node.")
                 .build(shared, reader),
-        );
-    }
-    let storage_modules = storage_modules(&shared.settings());
-    for module in snapshot.modules {
-        let mut associated = Vec::new();
-        for (index, item) in &module_config_catalog {
-            if !rendered_config_indices.contains(index)
-                && item.module_id.as_deref().is_some_and(|config_module_id| {
-                    module_ids_match(config_module_id, &module.module_id)
-                })
-            {
-                rendered_config_indices.insert(*index);
-                associated.push((*index, item.clone()));
-            }
-        }
-        // The mount modules are managed in Storage, beside the mount settings.
-        if storage_modules
-            .iter()
-            .any(|(id, _)| module_ids_match(id, &module.module_id))
-        {
-            stack = stack.with_child(managed_elsewhere_card(
-                shared,
-                reader,
-                &module.label,
-                SettingsSection::Storage,
-            ));
-            continue;
-        }
-        stack = stack.with_child(module_config_section(shared, reader, module, associated));
-    }
-    let unmatched = module_config_catalog
-        .into_iter()
-        .filter(|(index, _)| !rendered_config_indices.contains(index))
-        .collect::<Vec<_>>();
-    if !unmatched.is_empty() {
-        let mut card = SettingsCard::new("Additional module settings")
-            .description("Settings declared by modules that are not installed on this node.");
-        for (index, item) in unmatched {
-            card = card.row(PodHost::new(module_config_editor_row(
-                shared, reader, index, &item,
-            )));
-        }
-        stack = stack.with_child(card.build(shared, reader));
-    }
-    stack
+            no_modules,
+        ))
+        .with_child(module_card_stack(shared, reader, cards))
+        .with_child(revealed(unmatched_card, has_unmatched))
 }
 
 /// A module whose settings live on a dedicated page: name it here and link there.
@@ -12673,20 +13389,12 @@ fn managed_elsewhere_card(
 fn module_config_section(
     shared: &Shared,
     reader: &ThemeReader,
-    module: crate::backend::modules::ModuleConfigModuleSummary,
-    module_config_items: Vec<(usize, ConfigItem)>,
+    card: Signal<ModuleCardStructure>,
 ) -> impl Widget + use<> {
+    let current = card.get();
+    let module = current.module.clone();
     let module_id = module.module_id.clone();
     let native_rust = module.backend == "native-rust";
-    let selected_node_label = {
-        let settings = shared.settings();
-        settings
-            .module_snapshot
-            .selected_node
-            .as_ref()
-            .map(|node| node.summary.display_name.clone())
-            .unwrap_or_else(|| "No node selected".to_string())
-    };
     let node_override = {
         let s = shared.clone();
         let selected_module_id = module_id.clone();
@@ -12732,13 +13440,39 @@ fn module_config_section(
                 }
             })
     };
-    let (desired_label, desired_help) = match module.desired_enabled {
-        Some(true) => ("Enabled", "Every node runs it unless overridden."),
-        Some(false) => ("Disabled", "No node runs it unless overridden."),
-        None => ("Not configured", "No cluster default is set; it stays off."),
+    let summary = card.select_named("settings module summary", |card| card.module.clone());
+    let text = |name: &'static str, select: fn(&SettingsModuleSummaryStructure) -> String| {
+        derived(summary.clone(), name, select)
+    };
+    let tone = |name: &'static str, select: fn(&SettingsModuleSummaryStructure) -> SemanticTone| {
+        derived(summary.clone(), name, select)
+    };
+    let node_error = card.select_named("settings module node error", |card| {
+        card.node_error.clone().unwrap_or_default()
+    });
+    let settings = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        // Setting editors change shape only with the catalog or a structural draft change.
+        RebuildOnChange::key_from(
+            card.select_named("settings module settings", |card| {
+                (card.settings.clone(), card.revision)
+            }),
+            move |(settings, _)| {
+                let mut rows = Column::new(&r, |theme| theme.metrics.form_section_body_gap);
+                for (index, _) in settings {
+                    if let Some(item) = s.settings().config_items.get(*index).cloned() {
+                        rows.push(PodHost::new(module_config_editor_row(
+                            &s, &r, *index, &item,
+                        )));
+                    }
+                }
+                WidgetPod::new(rows)
+            },
+        )
     };
 
-    let mut card = SettingsCard::new(module.label.clone())
+    SettingsCard::new(module.label.clone())
         .description(module.detail.clone())
         .row(
             SettingRow::new("Node override")
@@ -12748,92 +13482,129 @@ fn module_config_section(
         )
         .row(
             SettingRow::new("Cluster default")
-                .help(desired_help)
-                .status(
+                .help_from(text("settings module desired help", |module| {
+                    module_desired_presentation(module.desired_enabled)
+                        .1
+                        .to_string()
+                }))
+                .control(status_badge_from(
                     reader,
-                    desired_label,
-                    if module.desired_enabled == Some(true) {
-                        SemanticTone::Success
-                    } else {
-                        SemanticTone::Neutral
-                    },
-                )
+                    text("settings module desired label", |module| {
+                        module_desired_presentation(module.desired_enabled)
+                            .0
+                            .to_string()
+                    }),
+                    tone("settings module desired tone", |module| {
+                        enabled_tone(module.desired_enabled == Some(true))
+                    }),
+                ))
                 .build(shared),
         )
         .row(
-            SettingRow::new(format!("On {selected_node_label}"))
-                .help(module_effective_source_label(module.effective_source))
-                .status(
+            SettingRow::new(format!("On {}", current.node_label))
+                .help_from(text("settings module effective source", |module| {
+                    module_effective_source_label(module.effective_source).to_string()
+                }))
+                .control(status_badge_from(
                     reader,
-                    if module.effective_enabled {
-                        "Enabled"
-                    } else {
-                        "Disabled"
-                    },
-                    if module.effective_enabled {
-                        SemanticTone::Success
-                    } else {
-                        SemanticTone::Neutral
-                    },
-                )
+                    text("settings module effective label", |module| {
+                        if module.effective_enabled {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        }
+                        .to_string()
+                    }),
+                    tone("settings module effective tone", |module| {
+                        enabled_tone(module.effective_enabled)
+                    }),
+                ))
                 .build(shared),
         )
         .row(
-            SettingRow::new(format!("Running on {selected_node_label}"))
-                .help(module.observed_detail.clone())
-                .status(
+            SettingRow::new(format!("Running on {}", current.node_label))
+                .help_from(text("settings module observed detail", |module| {
+                    module.observed_detail.clone()
+                }))
+                .control(status_badge_from(
                     reader,
-                    module_observed_label(module.observed),
-                    module_observed_tone(module.observed),
-                )
+                    text("settings module observed label", |module| {
+                        module_observed_label(module.observed).to_string()
+                    }),
+                    tone("settings module observed tone", |module| {
+                        module_observed_tone(module.observed)
+                    }),
+                ))
                 .build(shared),
-        );
-    if module_runtime_state_mismatch(&module) {
-        card = card.row(
+        )
+        .row(revealed(
             SettingRow::new("Reconciliation")
                 .help("The node has not caught up with its desired state yet.")
                 .status(reader, "Pending reconciliation", SemanticTone::Warning)
                 .build(shared),
-        );
-    }
-    if let Some(node) = shared.settings().module_snapshot.selected_node.as_ref()
-        && let Some(error) = node.error.as_ref()
-    {
-        card = card.row(
+            derived(
+                summary,
+                "settings module reconciling",
+                |module: &SettingsModuleSummaryStructure| {
+                    matches!(
+                        (module.effective_enabled, module.observed),
+                        (true, ModuleObservedState::Stopped)
+                            | (false, ModuleObservedState::Running)
+                    )
+                },
+            ),
+        ))
+        .row(revealed(
             SettingRow::new("Node error")
-                .value(shared, error.clone())
+                .value_from(shared, node_error.clone())
                 .build(shared),
-        );
-    }
-    for (index, item) in module_config_items {
-        card = card.row(PodHost::new(module_config_editor_row(
-            shared, reader, index, &item,
-        )));
-    }
-    card.row(details(
-        shared,
-        reader,
-        &format!("module-{module_id}"),
-        "module ID and backend",
-        vec![
-            widgets::Boxed::new(
-                SettingRow::new("Technical ID")
-                    .control(copy_control(
-                        reader,
-                        "module-technical-id",
-                        "Technical ID",
-                        module.module_id.clone(),
-                    ))
-                    .build(shared),
+            derived(
+                node_error,
+                "settings module has node error",
+                |error: &String| !error.is_empty(),
             ),
-            widgets::Boxed::new(
-                SettingRow::new("Backend")
-                    .value(shared, format!("{} · {}", module.backend, module.detail))
-                    .build(shared),
-            ),
-        ],
-    ))
-    .build(shared, reader)
+        ))
+        .row(settings)
+        .row(details(
+            shared,
+            reader,
+            &format!("module-{module_id}"),
+            "module ID and backend",
+            vec![
+                widgets::Boxed::new(
+                    SettingRow::new("Technical ID")
+                        .control(copy_control(
+                            reader,
+                            "module-technical-id",
+                            "Technical ID",
+                            module.module_id.clone(),
+                        ))
+                        .build(shared),
+                ),
+                widgets::Boxed::new(
+                    SettingRow::new("Backend")
+                        .value(shared, format!("{} · {}", module.backend, module.detail))
+                        .build(shared),
+                ),
+            ],
+        ))
+        .build(shared, reader)
+}
+
+fn module_desired_presentation(desired: Option<bool>) -> (&'static str, &'static str) {
+    match desired {
+        Some(true) => ("Enabled", "Every node runs it unless overridden."),
+        Some(false) => ("Disabled", "No node runs it unless overridden."),
+        None => ("Not configured", "No cluster default is set; it stays off."),
+    }
+}
+
+fn enabled_tone(enabled: bool) -> SemanticTone {
+    if enabled {
+        SemanticTone::Success
+    } else {
+        SemanticTone::Neutral
+    }
 }
 
 fn module_config_editor_row(
@@ -12855,7 +13626,7 @@ fn module_config_editor_row(
         body = body.with_child(muted_label_with_token(
             shared,
             short_one_line(&item.description, 160),
-            shared.theme().text.sm,
+            TextSize::Sm,
         ));
     }
     if let Some((error, resolution)) = module_operational_error(item) {
@@ -12928,21 +13699,6 @@ fn module_node_option(node: &crate::backend::modules::ModuleConfigNodeSummary) -
     )
 }
 
-fn module_cluster_summary(snapshot: &ModuleConfigSnapshot) -> String {
-    let enabled = snapshot
-        .cluster_config
-        .modules
-        .values()
-        .filter(|setting| setting.enabled)
-        .count();
-    let configured = snapshot.cluster_config.modules.len();
-    if configured == 0 {
-        "No cluster defaults".to_string()
-    } else {
-        format!("{enabled} enabled · {configured} configured")
-    }
-}
-
 fn module_effective_source_label(source: ModuleRuntimeConfigSource) -> &'static str {
     match source {
         ModuleRuntimeConfigSource::Node => "Resolved from this node's override",
@@ -13006,15 +13762,6 @@ fn module_observed_tone(state: ModuleObservedState) -> SemanticTone {
     }
 }
 
-fn module_runtime_state_mismatch(
-    module: &crate::backend::modules::ModuleConfigModuleSummary,
-) -> bool {
-    matches!(
-        (module.effective_enabled, module.observed),
-        (true, ModuleObservedState::Stopped) | (false, ModuleObservedState::Running)
-    )
-}
-
 fn module_display_id(module_id: &str) -> String {
     short_one_line(module_id, 72)
 }
@@ -13024,24 +13771,20 @@ fn section_skills(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         .gap(14.0)
         .alignment(Alignment::Stretch)
         .with_child(skills_summary_section(shared, reader))
-        .with_child(skills_catalog_host(shared, reader))
+        .with_child(skills_catalog(shared, reader))
         .with_child(skill_detail_host(shared, reader))
 }
 
 fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (include_all, import_path) = {
-        let settings = shared.settings();
-        (
-            settings.skills_include_all,
-            settings.skill_import_path.clone(),
-        )
-    };
+    let import_path = shared.settings().skill_import_path.clone();
+    let idle = settings_projection(shared, "settings skills idle", |snapshot| {
+        !snapshot.skills.pending
+    });
     let import_input = {
         let s = shared.clone();
         TextInput::new("skill-import-path")
             .value(import_path)
             .placeholder("/path/to/skill-name")
-            .min_width(220.0)
             .theme_when(clone_reader(reader))
             .on_change(move |value| s.settings_mut().set_skill_import_path(value))
     };
@@ -13051,10 +13794,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             .icon(sui::IconGlyph::Add)
             .primary_action()
             .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
-            })
+            .enabled_from(idle.clone())
             .on_press(move || {
                 let path = s.settings().skill_import_path.trim().to_string();
                 if path.is_empty() {
@@ -13078,10 +13818,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget 
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
-            })
+            .enabled_from(idle)
             .on_press(move || {
                 let (include_all, selected) = {
                     let settings = s.settings();
@@ -13099,11 +13836,13 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget 
     };
     let show_all = {
         let s = shared.clone();
-        Switch::new("")
-            .semantic_name("Show all versions")
-            .checked(include_all)
-            .theme_when(clone_reader(reader))
-            .on_change(move |on| {
+        setting_switch_from(
+            reader,
+            "Show all versions",
+            settings_projection(shared, "settings skills include all", |snapshot| {
+                snapshot.skills.include_all
+            }),
+            move |on| {
                 let selected = {
                     let mut settings = s.settings_mut();
                     settings.skills_include_all = on;
@@ -13118,15 +13857,24 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget 
                         selected,
                     },
                 );
-            })
+            },
+        )
     };
+    let catalog_summary =
+        settings_projection(shared, "settings skills catalog summary", |snapshot| {
+            skills_sidebar_preview(&snapshot.skills.skills)
+        });
 
     SettingsCard::new("Skills")
         .description(
             "Agent Skills packages that agents can load. Each package is a folder with a SKILL.md.",
         )
         .header_action(refresh)
-        .row(skills_summary_preview_host(shared))
+        .row(
+            SettingRow::new("Catalog")
+                .value_from(shared, catalog_summary)
+                .build(shared),
+        )
         .row(
             SettingRow::new("Import a skill")
                 .help("Copies the package folder into the skill catalog.")
@@ -13134,7 +13882,7 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget 
                     Flex::horizontal()
                         .gap(8.0)
                         .align_items(Alignment::Center)
-                        .with_item(import_input, FlexItem::new().shrink(1.0).min_width(160.0))
+                        .with_item(import_input, FlexItem::new().shrink(1.0))
                         .with_item(import, FlexItem::new().no_shrink()),
                 )
                 .build(shared),
@@ -13145,59 +13893,27 @@ fn skills_summary_section(shared: &Shared, reader: &ThemeReader) -> impl Widget 
                 .control(show_all)
                 .build(shared),
         )
-        .row(feedback_slot(
-            shared,
-            reader,
-            |settings| settings.skill_action_error.clone(),
-            |settings| settings.skill_action_status.clone(),
-        ))
+        .row(feedback_slot(shared, reader, |snapshot| {
+            snapshot.feedback.skill.clone()
+        }))
         .build(shared, reader)
 }
 
-fn skills_summary_preview_host(shared: &Shared) -> RebuildOnChange<Vec<SkillSummary>> {
-    let source = shared.signals().settings_structure.select_named(
-        "settings skills catalog summary",
-        |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| snapshot.skills.skills.clone())
-                .unwrap_or_default()
-        },
-    );
-    let s = shared.clone();
-    RebuildOnChange::key_from(source, move |skills| {
-        WidgetPod::new(
-            SettingRow::new("Catalog")
-                .value(&s, skills_sidebar_preview(skills))
-                .build(&s),
+/// The catalog list, or a prompt to import the first skill; both stay mounted.
+fn skills_catalog(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let present = settings_projection(shared, "settings skills catalog present", |snapshot| {
+        usize::from(!snapshot.skills.skills.is_empty())
+    });
+    SwitchView::new()
+        .with_child(
+            SettingsCard::new("No skills yet")
+                .description(
+                    "Import a folder containing SKILL.md above to make it available to agents.",
+                )
+                .build(shared, reader),
         )
-    })
-}
-
-fn skills_catalog_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<bool> {
-    let source = shared.signals().settings_structure.select_named(
-        "settings skills catalog availability",
-        |key| {
-            key.0
-                .as_deref()
-                .is_none_or(|snapshot| snapshot.skills.skills.is_empty())
-        },
-    );
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |empty| {
-        if *empty {
-            WidgetPod::new(
-                SettingsCard::new("No skills yet")
-                    .description(
-                        "Import a folder containing SKILL.md above to make it available to agents.",
-                    )
-                    .build(&s, &r),
-            )
-        } else {
-            WidgetPod::new(skill_virtual_catalog(&s, &r))
-        }
-    })
+        .with_child(skill_virtual_catalog(shared, reader))
+        .selected_from(present)
 }
 
 fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -13207,20 +13923,14 @@ fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             let Some(snapshot) = key.0.as_deref() else {
                 return widgets::VirtualCollectionSnapshot::new(Vec::new(), None);
             };
-            let skills = snapshot.skills.skills.clone();
-            let selected = snapshot.skills.selected.clone();
-            let theme = snapshot.skills.theme;
             widgets::VirtualCollectionSnapshot::new(
-                skills
-                    .into_iter()
-                    .map(|skill| {
-                        (
-                            (skill.id.clone(), skill.version.clone()),
-                            SettingsSkillRow { theme, skill },
-                        )
-                    })
+                snapshot
+                    .skills
+                    .skills
+                    .iter()
+                    .map(|skill| ((skill.id.clone(), skill.version.clone()), skill.clone()))
                     .collect(),
-                selected,
+                snapshot.skills.selected.clone(),
             )
         },
     );
@@ -13235,19 +13945,19 @@ fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> impl Widget +
             VirtualList::new("skill-catalog", model, move |_key, skill| {
                 let shared = row_shared.clone();
                 let reader = Rc::clone(&row_reader);
-                RebuildOnChange::key_from(skill, move |row| {
+                // One row's summary text; the list and its scroll position stay mounted.
+                RebuildOnChange::key_from(skill, move |skill| {
                     WidgetPod::new(padded_virtual_list_row(
                         &reader,
-                        skill_catalog_row(&shared, &row.skill),
+                        skill_catalog_row(&shared, skill),
                     ))
                 })
             })
             .state(state)
             .estimated_row_height(MENU_ROW_H)
             .theme_when(clone_reader(reader))
-            .row_name(|_key, row| skill_title(&row.skill))
-            .row_description(|_key, row| {
-                let skill = &row.skill;
+            .row_name(|_key, skill| skill_title(skill))
+            .row_description(|_key, skill| {
                 let state = if skill.active {
                     "active"
                 } else {
@@ -13281,37 +13991,31 @@ fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> impl Widget +
         .build(shared, reader)
 }
 
+/// The selected skill. It is rebuilt when another version is selected or its content changes;
+/// activation state, the SKILL.md disclosure, and the export field update in place.
 fn skill_detail_host(
     shared: &Shared,
     reader: &ThemeReader,
-) -> RebuildOnChange<Option<SettingsSkillsStructure>> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings skill details structure", |key| {
-            key.0.as_deref().map(|snapshot| snapshot.skills.clone())
-        });
+) -> RebuildOnChange<(Option<(String, String)>, Option<String>, bool)> {
+    let source = settings_projection(shared, "settings skill detail", |snapshot| {
+        (
+            snapshot.skills.selected.clone(),
+            snapshot.skills.detail_content_hash.clone(),
+            snapshot.skills.skills.is_empty(),
+        )
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
     RebuildOnChange::key_from(source, move |_key| {
-        let (detail, export_path, text_expanded) = {
+        let (detail, export_path) = {
             let settings = s.settings();
             (
                 settings.skill_detail.clone(),
                 settings.skill_export_path.clone(),
-                settings.skill_text_expanded,
             )
         };
         detail
-            .map(|detail| {
-                WidgetPod::new(skill_detail_section(
-                    &s,
-                    &r,
-                    detail,
-                    export_path,
-                    text_expanded,
-                ))
-            })
+            .map(|detail| WidgetPod::new(skill_detail_section(&s, &r, detail, export_path)))
             .unwrap_or_else(|| {
                 // With an empty catalog there is nothing to select; say so only once.
                 if s.settings().skills.is_empty() {
@@ -13332,21 +14036,54 @@ fn skill_detail_section(
     reader: &ThemeReader,
     detail: SkillDetail,
     export_path: String,
-    text_expanded: bool,
 ) -> impl Widget + use<> {
     let summary = detail.summary.clone();
-    let (state_label, state_tone) = if summary.active {
-        ("Active".to_string(), SemanticTone::Success)
-    } else {
-        (summary.status.clone(), SemanticTone::Neutral)
+    // Activation is reported with the catalog, which refreshes without reselecting the skill.
+    let state = {
+        let id = summary.id.clone();
+        let version = summary.version.clone();
+        let fallback = (summary.active, summary.status.clone());
+        settings_projection(shared, "settings skill state", move |snapshot| {
+            snapshot
+                .skills
+                .skills
+                .iter()
+                .find(|skill| skill.id == id && skill.version == version)
+                .map(|skill| (skill.active, skill.status.clone()))
+                .unwrap_or_else(|| fallback.clone())
+        })
     };
+    let state_label = derived(
+        state.clone(),
+        "settings skill state label",
+        |(active, status)| {
+            if *active {
+                "Active".to_string()
+            } else {
+                status.clone()
+            }
+        },
+    );
+    let state_tone = derived(state.clone(), "settings skill state tone", |(active, _)| {
+        if *active {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Neutral
+        }
+    });
+    let can_activate = sui::combine_named(
+        "settings skill can activate",
+        (
+            state,
+            settings_projection(shared, "settings skills busy", |snapshot| {
+                snapshot.skills.pending
+            }),
+        ),
+        |((active, _), pending)| !active && !pending,
+    );
     let mut card = SettingsCard::new(skill_title(&summary))
         .description(short_one_line(&summary.description, 160))
-        .header_action(
-            StatusBadge::new(state_label)
-                .tone(state_tone)
-                .theme_when(clone_reader(reader)),
-        )
+        .header_action(status_badge_from(reader, state_label, state_tone))
         .row(
             SettingRow::new("Source")
                 .value(shared, skill_source_label(&summary))
@@ -13406,23 +14143,16 @@ fn skill_detail_section(
         TextInput::new("skill-export-path")
             .value(export_path)
             .placeholder("/path/to/skill-name")
-            .min_width(220.0)
             .theme_when(clone_reader(reader))
             .on_change(move |value| s.settings_mut().set_skill_export_path(value))
     };
 
-    let already_active = summary.active;
     let activate = {
         let s = shared.clone();
         sui::Button::new("Activate")
             .icon(sui::IconGlyph::Check)
             .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || {
-                    !already_active && !s.settings().domain_pending(SettingsOperationDomain::Skills)
-                }
-            })
+            .enabled_from(can_activate)
             .on_press(move || {
                 let selected = s.settings().skill_selected.clone();
                 let include_all = s.settings().skills_include_all;
@@ -13446,10 +14176,11 @@ fn skill_detail_section(
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
-            .enabled_when({
-                let s = s.clone();
-                move || !s.settings().domain_pending(SettingsOperationDomain::Skills)
-            })
+            .enabled_from(settings_projection(
+                shared,
+                "settings skills export idle",
+                |snapshot| !snapshot.skills.pending,
+            ))
             .on_press(move || {
                 let (selected, output, include_all) = {
                     let settings = s.settings();
@@ -13480,11 +14211,14 @@ fn skill_detail_section(
                 );
             })
     };
+    let text_expanded = settings_projection(shared, "settings skill text expanded", |snapshot| {
+        snapshot.skills.text_expanded
+    });
     let text = {
         let s = shared.clone();
         disclosure_toggle(
             reader,
-            text_expanded,
+            text_expanded.clone(),
             "Show SKILL.md",
             "Hide SKILL.md",
             move || s.settings_mut().toggle_skill_text(),
@@ -13504,22 +14238,21 @@ fn skill_detail_section(
                     Flex::horizontal()
                         .gap(8.0)
                         .align_items(Alignment::Center)
-                        .with_item(export_input, FlexItem::new().shrink(1.0).min_width(160.0))
+                        .with_item(export_input, FlexItem::new().shrink(1.0))
                         .with_item(export, FlexItem::new().no_shrink()),
                 )
                 .build(shared),
         )
-        .row(Align::new(Alignment::Start, Alignment::Center, text));
-    if text_expanded {
-        card = card.row(
+        .row(Align::new(Alignment::Start, Alignment::Center, text))
+        .row(revealed(
             SizedBox::new().height(220.0).child(
                 TextArea::new("skill-markdown")
                     .value(detail.text)
                     .read_only(true)
                     .theme_when(clone_reader(reader)),
             ),
-        );
-    }
+            text_expanded,
+        ));
     card.row(details(
         shared,
         reader,
@@ -13530,7 +14263,14 @@ fn skill_detail_section(
     .build(shared, reader)
 }
 
-fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    // Clear filters resets both controls in place: they adopt the model when its controls
+    // revision changes, so the search field keeps focus while typing.
+    let revision = settings_projection(
+        shared,
+        "settings configuration controls revision",
+        |snapshot| snapshot.configuration.controls_revision,
+    );
     let search = {
         let query = shared.settings().advanced_query.clone();
         let s = shared.clone();
@@ -13542,6 +14282,7 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             .on_change(move |query| s.settings_mut().set_advanced_query(query));
         let s = shared.clone();
         SyncedTextInput::new(input, move || s.settings().advanced_query.clone())
+            .observing(revision.clone())
     };
     let overrides = {
         let on = shared.settings().advanced_overrides_only;
@@ -13552,19 +14293,18 @@ fn configuration_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             .on_change(move |on| s.settings_mut().set_advanced_overrides_only(on));
         let s = shared.clone();
         SyncedCheckbox::new(checkbox, move || s.settings().advanced_overrides_only)
+            .observing(revision)
     };
-    WidgetPod::new(
-        SettingsCard::new("Browse configuration").description("Search catalog metadata without exposing resolved values. Overrides are settings explicitly stored on this device or in the cluster.",).row(FieldGroup::new()
-                .gap(8.0)
-                .with_child(
-                    FormRow::new("Search", search)
-                        .stacked()
-                        .theme_when(clone_reader(reader)),
-                )
-                .with_child(
-                    FormRow::new("Filter", overrides).theme_when(clone_reader(reader)),
-                )).build(shared, reader),
-    )
+    SettingsCard::new("Browse configuration").description("Search catalog metadata without exposing resolved values. Overrides are settings explicitly stored on this device or in the cluster.",).row(FieldGroup::new()
+            .gap(8.0)
+            .with_child(
+                FormRow::new("Search", search)
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                FormRow::new("Filter", overrides).theme_when(clone_reader(reader)),
+            )).build(shared, reader)
 }
 
 fn section_configuration(
@@ -13572,142 +14312,410 @@ fn section_configuration(
     reader: &ThemeReader,
     node_scoped: bool,
 ) -> impl Widget + use<> {
-    // Typing changes only the results source; the controls rebuild solely for an explicit
-    // model-side reset. This preserves focus/caret state while making Clear filters authoritative.
-    let controls_source = shared.signals().settings_structure.select_named(
-        "settings configuration controls revision",
-        |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| snapshot.configuration.controls_revision)
-                .unwrap_or_default()
-        },
-    );
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let controls = RebuildOnChange::key_from(controls_source, move |_revision| {
-        configuration_controls(&s, &r)
-    });
-
-    let source = shared.signals().settings_structure.select_named(
-        "settings configuration results structure",
-        |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| snapshot.configuration.clone())
-        },
-    );
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let results = RebuildOnChange::key_from(source, move |_key| {
-        configuration_results(&s, &r, node_scoped)
-    });
     Stack::vertical()
         .gap(14.0)
         .alignment(Alignment::Stretch)
-        .with_child(controls)
-        .with_child(results)
+        .with_child(configuration_controls(shared, reader))
+        .with_child(configuration_results(shared, reader, node_scoped))
 }
 
-fn configuration_results(shared: &Shared, reader: &ThemeReader, node_scoped: bool) -> WidgetPod {
-    let (error, total, groups, query, overrides_only) = {
-        let settings = shared.settings();
-        (
-            settings.config_error.clone(),
-            settings
-                .config_items
-                .iter()
-                .filter(|item| item.node_scoped == node_scoped)
-                .count(),
-            visible_config_groups(&settings)
-                .into_iter()
-                .filter_map(|(owner, indices)| {
-                    let indices = indices
-                        .into_iter()
-                        .filter(|index| settings.config_items[*index].node_scoped == node_scoped)
-                        .collect::<Vec<_>>();
-                    (!indices.is_empty()).then_some((owner, indices))
-                })
-                .collect::<Vec<_>>(),
-            settings.advanced_query.trim().to_string(),
-            settings.advanced_overrides_only,
-        )
-    };
-    if let Some(error) = error {
-        return WidgetPod::new(
-            SettingsCard::new("Configuration unavailable")
-                .description("Sinomo could not load the resolved configuration catalog.")
-                .row(value_row(shared, reader, "Error", error))
-                .build(shared, reader),
-        );
-    }
-    if total == 0 {
-        return WidgetPod::new(
-            SettingsCard::new("Configuration values")
-                .description("The active runtime did not publish any configurable settings.")
-                .row(muted_label(shared, "No configuration keys are available."))
-                .build(shared, reader),
-        );
-    }
+/// One owner group of visible settings in a configuration browser.
+#[derive(Clone, Debug, PartialEq)]
+struct ConfigGroupStructure {
+    owner: String,
+    rows: Vec<ConfigRowStructure>,
+}
 
-    let visible = groups
+/// One visible setting. `index` addresses the catalog item that saves and toggles act on.
+#[derive(Clone, Debug, PartialEq)]
+struct ConfigRowStructure {
+    index: usize,
+    item: ConfigItemStructure,
+    expanded: bool,
+    revision: u64,
+}
+
+impl ConfigRowStructure {
+    /// Booleans that can be written directly are a switch; everything else has an editor.
+    fn is_toggle(&self) -> bool {
+        self.item.bool_value.is_some()
+            && self.item.edit_kind == ConfigEditKind::Bool
+            && !self.item.read_only
+    }
+}
+
+fn config_scope_groups(
+    configuration: &SettingsConfigurationStructure,
+    node_scoped: bool,
+) -> Vec<ConfigGroupStructure> {
+    configuration
+        .groups
         .iter()
-        .map(|(_, indices)| indices.len())
-        .sum::<usize>();
-    if visible == 0 {
-        let message = if overrides_only && query.is_empty() {
+        .filter_map(|(owner, indices)| {
+            let rows = indices
+                .iter()
+                .filter_map(|index| {
+                    let item = configuration.items.get(*index)?;
+                    (item.node_scoped == node_scoped).then(|| ConfigRowStructure {
+                        index: *index,
+                        item: item.clone(),
+                        expanded: configuration.expanded.contains(&item.key),
+                        revision: configuration.ui_revision,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!rows.is_empty()).then(|| ConfigGroupStructure {
+                owner: owner.clone(),
+                rows,
+            })
+        })
+        .collect()
+}
+
+/// The browser's results. Searching and filtering add and remove keyed rows; existing rows, their
+/// open editors, and the cards around them stay mounted.
+fn configuration_results(
+    shared: &Shared,
+    reader: &ThemeReader,
+    node_scoped: bool,
+) -> impl Widget + use<> {
+    let total = settings_projection(shared, "settings configuration total", move |snapshot| {
+        snapshot
+            .configuration
+            .items
+            .iter()
+            .filter(|item| item.node_scoped == node_scoped)
+            .count()
+    });
+    let groups = settings_projection(shared, "settings configuration groups", move |snapshot| {
+        config_scope_groups(&snapshot.configuration, node_scoped)
+    });
+    let visible = derived(
+        groups.clone(),
+        "settings configuration visible count",
+        |groups: &Vec<ConfigGroupStructure>| {
+            groups.iter().map(|group| group.rows.len()).sum::<usize>()
+        },
+    );
+    let state = settings_projection(shared, "settings configuration state", move |snapshot| {
+        let configuration = &snapshot.configuration;
+        if configuration.error.is_some() {
+            0
+        } else if !configuration
+            .items
+            .iter()
+            .any(|item| item.node_scoped == node_scoped)
+        {
+            1
+        } else if config_scope_groups(configuration, node_scoped).is_empty() {
+            2
+        } else {
+            3
+        }
+    });
+
+    let error = settings_projection(shared, "settings configuration error", |snapshot| {
+        snapshot.configuration.error.clone().unwrap_or_default()
+    });
+    let unavailable = SettingsCard::new("Configuration unavailable")
+        .description("Sinomo could not load the resolved configuration catalog.")
+        .row(value_row_from(shared, reader, "Error", error))
+        .build(shared, reader);
+    let empty = SettingsCard::new("Configuration values")
+        .description("The active runtime did not publish any configurable settings.")
+        .row(muted_label(shared, "No configuration keys are available."))
+        .build(shared, reader);
+
+    let message = settings_projection(shared, "settings configuration empty message", |snapshot| {
+        let configuration = &snapshot.configuration;
+        if configuration.overrides_only && configuration.query_empty {
             "No local or cluster overrides are currently stored."
-        } else if overrides_only {
+        } else if configuration.overrides_only {
             "No stored overrides match this search."
         } else {
             "No configuration metadata matches this search."
-        };
+        }
+        .to_string()
+    });
+    let none_shown = derived(
+        total.clone(),
+        "settings configuration none shown",
+        |total: &usize| format!("0 of {total} configuration values shown"),
+    );
+    let clear = {
         let s = shared.clone();
-        let clear = sui::Button::new("Clear filters")
+        sui::Button::new("Clear filters")
             .icon(IconGlyph::Close)
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
             .on_press(move || {
                 s.settings_mut().clear_advanced_filters();
-            });
-        let body = Stack::vertical()
-            .gap(8.0)
-            .alignment(Alignment::Stretch)
-            .with_child(muted_label(shared, message))
-            .with_child(Stack::horizontal().with_child(clear));
-        return WidgetPod::new(
-            SettingsCard::new("No matching settings")
-                .description(format!("0 of {total} configuration values shown"))
-                .row(body)
-                .build(shared, reader),
+            })
+    };
+    let no_matches = SettingsCard::new("No matching settings")
+        .description_from(none_shown)
+        .row(
+            Stack::vertical()
+                .gap(8.0)
+                .alignment(Alignment::Stretch)
+                .with_child(muted_text(
+                    shared,
+                    Label::new(message.get()).text_from(message),
+                    TextSize::Base,
+                ))
+                .with_child(Stack::horizontal().with_child(clear)),
+        )
+        .build(shared, reader);
+
+    let showing = sui::combine_named(
+        "settings configuration showing",
+        (visible, total),
+        |(visible, total)| format!("{visible} of {total}"),
+    );
+    let summary = SettingsCard::new("Configuration values")
+        .description(
+            "Resolved values and drafts remain redacted where the catalog marks data as sensitive.",
+        )
+        .row(value_row_from(shared, reader, "Showing", showing))
+        .build(shared, reader);
+    let group_cards = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        KeyedStack::vertical(
+            groups,
+            |group: &ConfigGroupStructure| group.owner.clone(),
+            move |owner, group| config_group_card(&s, &r, owner, group),
+        )
+        .gap(14.0)
+    };
+    let list = Stack::vertical()
+        .gap(14.0)
+        .alignment(Alignment::Stretch)
+        .with_child(summary)
+        .with_child(group_cards);
+
+    SwitchView::new()
+        .with_child(unavailable)
+        .with_child(empty)
+        .with_child(no_matches)
+        .with_child(list)
+        .selected_from(state)
+}
+
+fn config_group_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    owner: &str,
+    group: Signal<ConfigGroupStructure>,
+) -> impl Widget + use<> {
+    let count = group.select_named("settings configuration group count", |group| {
+        if group.rows.len() == 1 {
+            "1 setting".to_string()
+        } else {
+            format!("{} settings", group.rows.len())
+        }
+    });
+    let rows = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        KeyedStack::vertical(
+            group.select_named("settings configuration group rows", |group| {
+                group.rows.clone()
+            }),
+            |row: &ConfigRowStructure| (row.item.key.clone(), row.index, row.is_toggle()),
+            move |(_, index, _), row| config_row(&s, &r, *index, row),
+        )
+        .gap(8.0)
+    };
+    SettingsCard::new(owner)
+        .description_from(count)
+        .row(rows)
+        .build(shared, reader)
+}
+
+/// One Advanced config row: a toggle for booleans, otherwise a redacted summary with an explicit
+/// raw-value disclosure. Sensitive raw values remain read-only and redacted in Advanced.
+fn config_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    index: usize,
+    row: Signal<ConfigRowStructure>,
+) -> impl Widget + use<> {
+    let Some(item) = shared.settings().config_items.get(index).cloned() else {
+        return widgets::Boxed::new(SizedBox::new());
+    };
+    let key = item.key.clone();
+    let display_key = key.trim_start_matches('/').to_string();
+    let item_changes = row.select_named("settings configuration row item", |row| row.item.clone());
+
+    if row.get().is_toggle() {
+        let on_toggle = {
+            let s = shared.clone();
+            let key = key.clone();
+            move |next: bool| {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::ConfigField(config_field_key(&key)),
+                    SettingsOperation::SetConfigBool {
+                        key: key.clone(),
+                        value: next,
+                    },
+                );
+            }
+        };
+        let checked = row.select_named("settings configuration row value", |row| {
+            row.item.bool_value.unwrap_or(false)
+        });
+        let switch = synced_switch(
+            Switch::new("Applies immediately")
+                .checked(checked.get())
+                .theme_when(clone_reader(reader))
+                .on_change(on_toggle),
+            checked,
+        );
+        let metadata = row.select_named("settings configuration row metadata", |row| {
+            config_structure_metadata_line(&row.item)
+        });
+        let description = row.select_named("settings configuration row description", |row| {
+            short_one_line(&row.item.description, 128)
+        });
+        let has_description = derived(
+            description.clone(),
+            "settings configuration row has description",
+            |description: &String| !description.trim().is_empty(),
+        );
+        let details = Column::new(reader, |theme| theme.metrics.property_row_stacked_gap)
+            .with_child(switch)
+            .with_child(muted_text(
+                shared,
+                Label::new(metadata.get()).text_from(metadata),
+                TextSize::Xs,
+            ))
+            .with_child(revealed(
+                muted_text(
+                    shared,
+                    Label::new(description.get()).text_from(description),
+                    TextSize::Sm,
+                ),
+                has_description,
+            ));
+        return widgets::Boxed::new(
+            FormRow::new(display_key, details)
+                .stacked()
+                .theme_when(clone_reader(reader)),
         );
     }
 
-    let mut stack = Stack::vertical()
-        .gap(14.0)
-        .alignment(Alignment::Stretch)
-        .with_child(
-        SettingsCard::new("Configuration values").description("Resolved values and drafts remain redacted where the catalog marks data as sensitive.",).row(value_row(shared, reader, "Showing", format!("{visible} of {total}"))).build(shared, reader),
-    );
-    for (owner, indices) in groups {
-        let mut rows = FieldGroup::new().gap(8.0);
-        for index in &indices {
-            // Preserve the catalog index: all save/toggle operations address the original item.
-            rows = rows.with_child(config_row(shared, reader, *index));
-        }
-        stack = stack.with_child(
-            SettingsCard::new(owner)
-                .description(if indices.len() == 1 {
-                    "1 setting".to_string()
-                } else {
-                    format!("{} settings", indices.len())
+    let sensitive = config_item_has_sensitive_detail(&item);
+    let row_key = config_field_key(&key);
+    let summary_label = {
+        let s = shared.clone();
+        follow(
+            settings_label(shared, config_value_summary(&item), TextSize::Sm)
+                .text_when(move || {
+                    s.settings()
+                        .config_items
+                        .get(index)
+                        .map(config_value_summary)
+                        .unwrap_or_default()
                 })
-                .row(rows)
-                .build(shared, reader),
-        );
+                .color_when({
+                    let s = shared.clone();
+                    move || palette(&s).text_muted
+                }),
+            item_changes.clone(),
+        )
+    };
+    let meta_label = {
+        let s = shared.clone();
+        let metadata = row.select_named("settings configuration row metadata", |row| {
+            config_structure_metadata_line(&row.item)
+        });
+        let fallback = metadata.clone();
+        follow(
+            settings_label(shared, metadata.get(), TextSize::Xs)
+                .text_when({
+                    let s = s.clone();
+                    let row_key = row_key.clone();
+                    move || {
+                        s.settings()
+                            .field_errors
+                            .get(&row_key)
+                            .cloned()
+                            .unwrap_or_else(|| fallback.get())
+                    }
+                })
+                .color_when({
+                    let s = s.clone();
+                    let row_key = row_key.clone();
+                    move || {
+                        let pal = palette(&s);
+                        if s.settings().field_errors.contains_key(&row_key) {
+                            pal.accent
+                        } else {
+                            pal.text_faint
+                        }
+                    }
+                }),
+            metadata,
+        )
+    };
+    let description = short_one_line(&item.description, 128);
+    let expanded = row.select_named("settings configuration row expanded", |row| row.expanded);
+    let disclosure = {
+        let s = shared.clone();
+        let key = key.clone();
+        let closed_label = if sensitive {
+            "Show redacted detail"
+        } else if item.schema.is_some() {
+            "Edit fields"
+        } else {
+            "Edit raw value"
+        };
+        disclosure_toggle(
+            reader,
+            expanded.clone(),
+            closed_label,
+            "Hide value",
+            move || s.settings_mut().toggle_advanced_detail(&key),
+        )
+    };
+    // The editor is built while open and rebuilt only for structural draft changes (a list or map
+    // entry added or removed, an optional field unset, Reset) or a new saved value.
+    let editor = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let source = row.select_named("settings configuration row editor", |row| {
+            row.expanded.then(|| (row.revision, row.item.clone()))
+        });
+        RebuildOnChange::key_from(source, move |open| {
+            let item = s.settings().config_items.get(index).cloned();
+            match (open, item) {
+                (Some(_), Some(item)) => match &item.schema {
+                    Some(schema) => {
+                        WidgetPod::new(config_schema_editor(&s, &r, index, &item, schema))
+                    }
+                    None => WidgetPod::new(config_detail_editor(&s, &r, index, &item)),
+                },
+                _ => WidgetPod::new(SizedBox::new()),
+            }
+        })
+    };
+    let mut details = Column::new(reader, |theme| theme.metrics.property_row_stacked_gap)
+        .with_child(summary_label)
+        .with_child(meta_label);
+    if !description.is_empty() {
+        details = details.with_child(muted_meta_label(shared, description));
     }
-    WidgetPod::new(stack)
+    details = details
+        .with_child(Stack::horizontal().with_child(disclosure))
+        .with_child(revealed(editor, expanded));
+    widgets::Boxed::new(
+        FormRow::new(display_key, details)
+            .stacked()
+            .theme_when(clone_reader(reader)),
+    )
 }
 
 fn visible_config_groups(settings: &SettingsState) -> Vec<(String, Vec<usize>)> {
@@ -13832,147 +14840,6 @@ fn config_owner_label(owner: &str) -> String {
     }
 }
 
-/// One Advanced config row: a toggle for booleans, otherwise a redacted summary with an explicit
-/// raw-value disclosure. Sensitive raw values remain read-only and redacted in Advanced.
-fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widget + use<> {
-    let item = shared.settings().config_items[index].clone();
-    let key = item.key.clone();
-    let edit_kind = item.edit_kind;
-    let bool_value = item.bool_value;
-    let display_key = key.trim_start_matches('/').to_string();
-
-    if let Some(on) = bool_value
-        && edit_kind == ConfigEditKind::Bool
-        && !item.read_only
-    {
-        let on_toggle = {
-            let s = shared.clone();
-            let key = key.clone();
-            move |next: bool| {
-                queue_settings_operation(
-                    &s,
-                    SettingsOperationScope::ConfigField(config_field_key(&key)),
-                    SettingsOperation::SetConfigBool {
-                        key: key.clone(),
-                        value: next,
-                    },
-                );
-            }
-        };
-        let mut details = Stack::vertical()
-            .gap(5.0)
-            .alignment(Alignment::Stretch)
-            .with_child(
-                Switch::new("Applies immediately")
-                    .checked(on)
-                    .theme_when(clone_reader(reader))
-                    .on_change(on_toggle),
-            )
-            .with_child(muted_label_with_token(
-                shared,
-                config_metadata_line(&item),
-                shared.theme().text.xs,
-            ));
-        if !item.description.trim().is_empty() {
-            details = details.with_child(muted_meta_label(
-                shared,
-                short_one_line(&item.description, 128),
-            ));
-        }
-        return PodHost::new(WidgetPod::new(
-            FormRow::new(display_key, details)
-                .stacked()
-                .theme_when(clone_reader(reader)),
-        ));
-    }
-
-    let expanded = shared.settings().advanced_detail_expanded(&key);
-    let sensitive = config_item_has_sensitive_detail(&item);
-    let row_key = config_field_key(&key);
-    let metadata = config_metadata_line(&item);
-    let description = short_one_line(&item.description, 128);
-    let summary = config_value_summary(&item);
-    let summary_label = {
-        let s = shared.clone();
-        settings_label(shared, summary, shared.theme().text.sm)
-            .color_when(move || palette(&s).text_muted)
-    };
-    let meta_label = {
-        let s = shared.clone();
-        let metadata = metadata.clone();
-        settings_label(shared, metadata.clone(), shared.theme().text.xs)
-            .text_when({
-                let s = s.clone();
-                let row_key = row_key.clone();
-                let metadata = metadata.clone();
-                move || {
-                    s.settings()
-                        .field_errors
-                        .get(&row_key)
-                        .cloned()
-                        .unwrap_or_else(|| metadata.clone())
-                }
-            })
-            .color_when({
-                let s = s.clone();
-                let row_key = row_key.clone();
-                move || {
-                    let pal = palette(&s);
-                    if s.settings().field_errors.contains_key(&row_key) {
-                        pal.accent
-                    } else {
-                        pal.text_faint
-                    }
-                }
-            })
-    };
-    let disclosure = {
-        let s = shared.clone();
-        let key = key.clone();
-        let label = if expanded {
-            "Hide value"
-        } else if sensitive {
-            "Show redacted detail"
-        } else if item.schema.is_some() {
-            "Edit fields"
-        } else {
-            "Edit raw value"
-        };
-        sui::Button::new(label)
-            .icon(if expanded {
-                sui::IconGlyph::ChevronUp
-            } else {
-                sui::IconGlyph::ChevronDown
-            })
-            .theme_when(clone_reader(reader))
-            .appearance(sui::ButtonAppearance::Ghost)
-            .tone(SemanticTone::Neutral)
-            .on_press(move || s.settings_mut().toggle_advanced_detail(&key))
-    };
-    let mut details = Stack::vertical()
-        .gap(6.0)
-        .alignment(Alignment::Stretch)
-        .with_child(summary_label)
-        .with_child(meta_label);
-    if !description.is_empty() {
-        details = details.with_child(muted_meta_label(shared, description));
-    }
-    details = details.with_child(Stack::horizontal().with_child(disclosure));
-    if expanded {
-        if let Some(schema) = &item.schema {
-            details =
-                details.with_child(config_schema_editor(shared, reader, index, &item, schema));
-        } else {
-            details = details.with_child(config_detail_editor(shared, reader, index, &item));
-        }
-    }
-    PodHost::new(WidgetPod::new(
-        FormRow::new(display_key, details)
-            .stacked()
-            .theme_when(clone_reader(reader)),
-    ))
-}
-
 fn config_detail_editor(
     shared: &Shared,
     reader: &ThemeReader,
@@ -14067,9 +14934,7 @@ fn config_schema_editor(
             item.read_only,
         )
     };
-    let mut stack = Stack::vertical()
-        .gap(FIELD_ROW_GAP)
-        .alignment(Alignment::Stretch);
+    let mut stack = Column::new(reader, |theme| theme.metrics.field_group_spacing);
     if !schema.description.trim().is_empty() {
         stack = stack.with_child(muted_meta_label(shared, schema.description.clone()));
     }
@@ -14160,14 +15025,9 @@ fn config_schema_editor(
     stack
 }
 
-/// Minimum width of a text field in a setting row, so short values still read as editable.
-const FIELD_INPUT_MIN_W: f32 = 240.0;
-const FIELD_ROW_GAP: f32 = 12.0;
-
 fn config_schema_feedback_label(shared: &Shared, error_key: String, fallback: String) -> Label {
     let s = shared.clone();
-    let token = shared.theme().text.sm;
-    settings_label(shared, fallback.clone(), token)
+    settings_label(shared, fallback.clone(), TextSize::Sm)
         .text_when({
             let s = s.clone();
             let error_key = error_key.clone();
@@ -14182,7 +15042,7 @@ fn config_schema_feedback_label(shared: &Shared, error_key: String, fallback: St
         .color_when(move || {
             let palette = palette(&s);
             if s.settings().field_errors.contains_key(&error_key) {
-                palette.danger_text
+                palette.bad_text
             } else {
                 palette.text_muted
             }
@@ -14285,7 +15145,7 @@ fn config_schema_object_editor(
     description: &str,
     read_only: bool,
 ) -> WidgetPod {
-    let mut group = FieldGroup::new().gap(FIELD_ROW_GAP);
+    let mut group = FieldGroup::new().theme_when(clone_reader(reader));
     if !description.trim().is_empty() {
         group = group.with_child(SettingRow::new(label).help(description).build(shared));
     }
@@ -14720,14 +15580,12 @@ fn config_schema_primitive_row(
                 .and_then(|key| shared.settings().field_drafts.get(key).cloned())
                 .unwrap_or_default();
             let input = PasswordInput::new(schema_control_name(index, &path))
-                .min_width(FIELD_INPUT_MIN_W)
                 .value(replacement)
                 .placeholder(if configured {
                     "Enter a replacement"
                 } else {
                     "Enter a secret"
                 })
-                .min_width(FIELD_INPUT_MIN_W)
                 .theme_when(clone_reader(reader))
                 .on_change({
                     let s = shared.clone();
@@ -14778,7 +15636,6 @@ fn config_schema_primitive_row(
             let input = TextInput::new(schema_control_name(index, &path))
                 .value(value_text)
                 .placeholder(schema_placeholder(schema))
-                .min_width(FIELD_INPUT_MIN_W)
                 .theme_when(clone_reader(reader))
                 .on_change({
                     let s = shared.clone();
@@ -14861,7 +15718,6 @@ fn config_schema_primitive_row(
             let input = TextInput::new(schema_control_name(index, &path))
                 .value(value_text)
                 .placeholder(schema_placeholder(schema))
-                .min_width(FIELD_INPUT_MIN_W)
                 .theme_when(clone_reader(reader))
                 .on_change({
                     let s = shared.clone();
@@ -15086,22 +15942,44 @@ fn format_number_range(range: &sinomo_runtime::config::ConfigNumberRange) -> Opt
 }
 
 fn config_metadata_line(item: &ConfigItem) -> String {
-    let kind = match item.edit_kind {
+    config_metadata_text(
+        item.edit_kind,
+        &item.owner,
+        item.schema.as_ref(),
+        item.source,
+        item.scope,
+    )
+}
+
+fn config_structure_metadata_line(item: &ConfigItemStructure) -> String {
+    config_metadata_text(
+        item.edit_kind,
+        &item.owner,
+        item.schema.as_ref(),
+        item.source,
+        item.scope,
+    )
+}
+
+fn config_metadata_text(
+    edit_kind: ConfigEditKind,
+    owner: &str,
+    schema: Option<&ConfigSchema>,
+    source: &str,
+    scope: &str,
+) -> String {
+    let kind = match edit_kind {
         ConfigEditKind::Bool => "Boolean",
         ConfigEditKind::Text => "Text",
         ConfigEditKind::Number => "Number",
         ConfigEditKind::Json => "JSON",
     };
-    let owner = item.owner.trim();
-    let schema = item
-        .schema
-        .as_ref()
-        .map(|schema| schema.name.as_str())
-        .unwrap_or(kind);
+    let owner = owner.trim();
+    let schema = schema.map(|schema| schema.name.as_str()).unwrap_or(kind);
     if owner.is_empty() {
-        format!("{} · {} · {schema}", item.source, item.scope)
+        format!("{source} · {scope} · {schema}")
     } else {
-        format!("{} · {} · {owner} · {schema}", item.source, item.scope)
+        format!("{source} · {scope} · {owner} · {schema}")
     }
 }
 
@@ -15447,6 +16325,7 @@ fn section_body(
         };
         pages = pages.with_child(section_page(
             shared,
+            reader,
             section,
             body,
             &scroll_states[section.index()],
@@ -15457,6 +16336,7 @@ fn section_body(
 
 fn section_page<W>(
     shared: &Shared,
+    reader: &ThemeReader,
     section: SettingsSection,
     body: W,
     scroll_state: &ScrollState,
@@ -15474,7 +16354,7 @@ where
     let column = if section.uses_wide_page() {
         widgets::Boxed::new(column)
     } else {
-        widgets::Boxed::new(widgets::MaxWidth::new(PAGE_MAX_W, column))
+        widgets::Boxed::new(PageColumn::new(reader, column))
     };
     let inset = Stack::vertical()
         .gap(0.0)
@@ -15485,16 +16365,21 @@ where
     ScrollView::vertical(inset).state(scroll_state.clone())
 }
 
-/// Build one group's rows for the desktop sidebar or narrow drill-in menu.
+/// Build one group's rows for the desktop sidebar or narrow drill-in menu from the section
+/// previews.
 fn section_list_items(
-    shared: &Shared,
     sections: &'static [SettingsSection],
+    previews: &[(SettingsSection, String)],
     with_preview: bool,
 ) -> Vec<ListItem> {
     sections
         .iter()
         .map(|section| {
-            let preview = section_preview(shared, *section);
+            let preview = previews
+                .iter()
+                .find(|(candidate, _)| candidate == section)
+                .map(|(_, preview)| preview.as_str())
+                .unwrap_or_default();
             let mut item = ListItem::new(section.title())
                 .leading_icon(section.icon())
                 .semantic_name(section.title())
@@ -15507,6 +16392,8 @@ fn section_list_items(
         .collect()
 }
 
+/// One group's list. Previews reach the rows' descriptions in place, so the list keeps its
+/// selection, hover, and focus while settings load and change.
 fn section_group_list(
     shared: &Shared,
     reader: &ThemeReader,
@@ -15516,13 +16403,20 @@ fn section_group_list(
     show_selection: bool,
     row_height: f32,
 ) -> impl Widget + use<> {
-    let viewport_padding = reader().metrics.data_viewport_padding;
+    let previews = settings_projection(shared, name, move |snapshot| {
+        snapshot
+            .navigation_previews
+            .iter()
+            .filter(|(section, _)| sections.contains(section))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     let list = {
         let s = shared.clone();
         let selected_sections = sections;
         let action_sections = sections;
         ListView::new(name)
-            .items(section_list_items(shared, sections, with_preview))
+            .items(section_list_items(sections, &previews.get(), with_preview))
             .row_height(row_height)
             .theme_when(clone_reader(reader))
             .selected_when({
@@ -15543,9 +16437,18 @@ fn section_group_list(
                 }
             })
     };
-    SizedBox::new()
-        .height(row_height * sections.len() as f32 + viewport_padding.top + viewport_padding.bottom)
-        .child(list)
+    let list = Restyle::new(list, previews, move |list, previews| {
+        list.items(section_list_items(sections, previews, with_preview))
+    });
+    let rows = sections.len() as f32;
+    ThemedHeight::new(
+        reader,
+        move |theme| {
+            let padding = theme.metrics.data_viewport_padding;
+            row_height * rows + padding.top + padding.bottom
+        },
+        list,
+    )
 }
 
 fn section_group(
@@ -15576,63 +16479,18 @@ fn section_group(
         ))
 }
 
-fn section_group_host(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signal_name: String,
-    label: &'static str,
-    list_name: &'static str,
-    sections: &'static [SettingsSection],
-    with_preview: bool,
-    show_selection: bool,
-    row_height: f32,
-) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named(signal_name, move |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| {
-                    snapshot
-                        .navigation_previews
-                        .iter()
-                        .filter(|(section, _)| sections.contains(section))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_previews| {
-        WidgetPod::new(section_group(
-            &s,
-            &r,
-            label,
-            list_name,
-            sections,
-            with_preview,
-            show_selection,
-            row_height,
-        ))
-    })
-}
-
 fn primary_section_groups_host(
     shared: &Shared,
     reader: &ThemeReader,
-    signal_prefix: &'static str,
     with_preview: bool,
     show_selection: bool,
     row_height: f32,
 ) -> impl Widget + use<> {
     let mut groups = Stack::vertical().gap(12.0).alignment(Alignment::Stretch);
     for group in SETTINGS_GROUPS {
-        groups = groups.with_child(section_group_host(
+        groups = groups.with_child(section_group(
             shared,
             reader,
-            format!("{signal_prefix} {} previews", group.list_name),
             group.title,
             group.list_name,
             group.sections,
@@ -15650,14 +16508,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(14.0))
         .with_child(horizontal_inset(
-            primary_section_groups_host(
-                shared,
-                reader,
-                "settings wide",
-                false,
-                true,
-                SIDEBAR_ITEM_H,
-            ),
+            primary_section_groups_host(shared, reader, false, true, SIDEBAR_ITEM_H),
             8.0,
         ))
         .with_child(SizedBox::new().height(14.0))
@@ -15671,14 +16522,7 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .alignment(Alignment::Stretch)
         .with_child(SizedBox::new().height(CONTENT_PAD))
         .with_child(horizontal_inset(
-            primary_section_groups_host(
-                shared,
-                reader,
-                "settings narrow",
-                false,
-                false,
-                MENU_ROW_H,
-            ),
+            primary_section_groups_host(shared, reader, false, false, MENU_ROW_H),
             CONTENT_PAD,
         ))
         .with_child(SizedBox::new().height(14.0))
@@ -15731,7 +16575,10 @@ fn narrow_pod(
                     .title()
                     .to_string()
             })
-            .text_style(settings_text_style(shared, shared.theme().text.base))
+            .text_style_when({
+                let s = shared.clone();
+                move || settings_text_style(&s, TextSize::Base)
+            })
             .color_when(move || palette(&color).text)
     };
     let backbar = TrailingSlotRow::new(
@@ -15779,6 +16626,7 @@ fn narrow_pod(
 struct SyncedTextInput {
     inner: TextInput,
     value_reader: Box<dyn Fn() -> String>,
+    observe: Option<Box<dyn Fn(&MeasureCtx)>>,
 }
 
 impl SyncedTextInput {
@@ -15789,7 +16637,17 @@ impl SyncedTextInput {
         Self {
             inner,
             value_reader: Box::new(value_reader),
+            observe: None,
         }
+    }
+
+    /// Re-check the model whenever `source` changes, such as a reset revision, so an external
+    /// change reaches the retained editor without a rebuild.
+    fn observing<K: 'static>(mut self, source: impl Observable<K> + 'static) -> Self {
+        self.observe = Some(Box::new(move |ctx| {
+            let _: K = ctx.observe(&source);
+        }));
+        self
     }
 
     fn sync_value(&mut self) {
@@ -15810,6 +16668,9 @@ impl Widget for SyncedTextInput {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        if let Some(observe) = &self.observe {
+            observe(ctx);
+        }
         self.sync_value();
         self.inner.measure(ctx, constraints)
     }
@@ -15835,6 +16696,7 @@ impl Widget for SyncedTextInput {
 struct SyncedCheckbox {
     inner: Checkbox,
     checked_reader: Box<dyn Fn() -> bool>,
+    observe: Option<Box<dyn Fn(&MeasureCtx)>>,
 }
 
 impl SyncedCheckbox {
@@ -15845,7 +16707,16 @@ impl SyncedCheckbox {
         Self {
             inner,
             checked_reader: Box::new(checked_reader),
+            observe: None,
         }
+    }
+
+    /// See [`SyncedTextInput::observing`].
+    fn observing<K: 'static>(mut self, source: impl Observable<K> + 'static) -> Self {
+        self.observe = Some(Box::new(move |ctx| {
+            let _: K = ctx.observe(&source);
+        }));
+        self
     }
 
     fn sync_checked(&mut self) {
@@ -15862,6 +16733,9 @@ impl Widget for SyncedCheckbox {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        if let Some(observe) = &self.observe {
+            observe(ctx);
+        }
         self.sync_checked();
         self.inner.measure(ctx, constraints)
     }
@@ -15935,72 +16809,71 @@ where
 // ---------------------------------------------------------------------------
 
 fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared.signals().settings_structure.select_named(
-        "settings device login status",
-        move |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| (snapshot.theme, snapshot.device_logins.get(index).cloned()))
-        },
-    );
+    let source = settings_projection(shared, "settings device login status", move |snapshot| {
+        snapshot.device_logins.get(index).cloned()
+    });
     let build_shared = shared.clone();
     let build_reader = Rc::clone(reader);
+    // A small status block, rebuilt when the sign-in flow moves to its next step.
     RebuildOnChange::key_from(source, move |_| {
-        let theme = build_reader();
-        let pal = palette(&build_shared);
         let (primary, prompt_url) = device_login_lines(&build_shared, index);
         let prompt_code = device_login_code(&build_shared, index);
         let is_error = device_login_is_error(&build_shared, index);
-        let primary_style = sui::TextStyle {
-            font_size: theme.text.sm.size,
-            line_height: theme.text.sm.line_height,
-            weight: FontWeight::MEDIUM,
-            color: if is_error { pal.danger_text } else { pal.text },
-            ..theme.body_text_style()
-        };
+        let style = build_shared.clone();
         let mut body = Flex::vertical().align_items(Alignment::Start).with_child(
             sui::Label::new(if prompt_code.is_some() {
                 "Enter this code:"
             } else {
                 primary.as_str()
             })
-            .text_style(primary_style),
+            .text_style_when(move || {
+                let mut text = settings_text_style(&style, TextSize::Sm);
+                let pal = palette(&style);
+                text.weight = FontWeight::MEDIUM;
+                text.color = if is_error { pal.bad_text } else { pal.text };
+                text
+            }),
         );
         if let Some(code) = prompt_code {
-            body = body.with_child(device_login_code_control(&build_reader, &theme, &pal, code));
+            body = body.with_child(device_login_code_control(
+                &build_shared,
+                &build_reader,
+                code,
+            ));
         }
         if let Some(url) = prompt_url {
-            let link_style = sui::TextStyle {
-                font_size: theme.text.xs.size,
-                line_height: theme.text.xs.line_height,
-                ..theme.text_style(pal.accent_text)
-            };
-            body = body.with_child(
-                sui::Link::new(url.clone(), url)
-                    .semantic_name("Open login page")
-                    .text_style(link_style)
-                    .theme_when(clone_reader(&build_reader))
-                    .on_open(open_provider_login_url),
-            );
+            // Links have no style reader; the retained link is restyled when the theme changes.
+            let link = sui::Link::new(url.clone(), url)
+                .semantic_name("Open login page")
+                .theme_when(clone_reader(&build_reader))
+                .on_open(open_provider_login_url);
+            body = body.with_child(Restyle::new(
+                link,
+                build_shared.signals().theme.clone(),
+                |link, theme| {
+                    link.text_style(sui::TextStyle {
+                        font_size: theme.text.xs.size,
+                        line_height: theme.text.xs.line_height,
+                        ..theme.text_style(theme.surfaces.accent_text)
+                    })
+                },
+            ));
         }
         WidgetPod::new(body)
     })
 }
 
 fn device_login_code_control(
+    shared: &Shared,
     reader: &ThemeReader,
-    theme: &DefaultTheme,
-    pal: &Palette,
     code: String,
 ) -> impl Widget + use<> {
     let selection = SelectionScope::new();
-    let code_style = device_login_code_text_style(theme, pal);
     let field = TextInput::new("provider-device-login-code")
         .value(code.clone())
         .read_only(true)
         .selection_scope(selection.clone())
         .copy_to_clipboard(true)
-        .text_style(code_style)
         .padding(sui::Insets {
             left: 14.0,
             top: 6.0,
@@ -16010,6 +16883,10 @@ fn device_login_code_control(
         .min_width(240.0)
         .min_height(54.0)
         .theme_when(clone_reader(reader));
+    // Text inputs have no style reader; the retained field is restyled when the theme changes.
+    let field = Restyle::new(field, shared.signals().theme.clone(), |field, theme| {
+        field.text_style(device_login_code_text_style(theme, &theme.surfaces))
+    });
     let field = read_only_text_menu(reader, "provider-device-login-code", field, selection, true);
     let copy_code = code;
     let copy = sui::Button::new("Copy code")
@@ -16029,7 +16906,7 @@ fn device_login_code_control(
         .with_item(copy, FlexItem::new().no_shrink())
 }
 
-fn device_login_code_text_style(theme: &DefaultTheme, pal: &Palette) -> sui::TextStyle {
+fn device_login_code_text_style(theme: &DefaultTheme, pal: &SurfacePalette) -> sui::TextStyle {
     let mut style = theme.mono_text_style(pal.text);
     style.font_size = theme.text._3xl.size;
     style.line_height = theme.text._3xl.line_height;
@@ -16185,11 +17062,7 @@ fn responsive_settings_view(shared: Shared) -> impl Widget {
 }
 
 fn settings_control_theme(shared: &Shared, size: ControlSize) -> DefaultTheme {
-    let mut theme = shared.theme().with_size(size);
-    theme.metrics.form_row_label_width = 132.0;
-    theme.metrics.form_row_control_width = 520.0;
-    theme.metrics.form_section_max_width = 860.0;
-    theme
+    shared.theme_sized(size)
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -16371,24 +17244,40 @@ mod tests {
     fn sifs_mount_text_drafts_preserve_the_retained_form_structure() {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
-        let before = settings_structure_key(&shared);
+        let shape = |shared: &Shared| {
+            let key = settings_structure_key(shared);
+            sifs_mount_editor_shape(&key.0.as_deref().expect("settings snapshot").sifs_mount)
+        };
+        let before = shape(&shared);
 
         shared.settings_mut().edit_sifs_mount(|form| {
             form.mount_point = "/tmp/sinomo-live".to_string();
         });
         assert_eq!(
-            settings_structure_key(&shared),
+            shape(&shared),
             before,
-            "typing must not rebuild the section and discard TextInput focus or caret state"
+            "typing must not rebuild the form and discard TextInput focus or caret state"
         );
 
+        let read_only = !shared.settings().sifs_mount_form.read_only;
         shared.settings_mut().edit_sifs_mount(|form| {
-            form.read_only = !form.read_only;
+            form.read_only = read_only;
         });
-        assert_ne!(
-            settings_structure_key(&shared),
+        assert_eq!(
+            shape(&shared),
             before,
-            "structural switch changes must still refresh the retained section"
+            "switches update in place rather than rebuilding the form"
+        );
+        let key = settings_structure_key(&shared);
+        assert_eq!(
+            key.0
+                .as_deref()
+                .expect("settings snapshot")
+                .sifs_mount
+                .form
+                .read_only,
+            read_only,
+            "the retained switches follow the projected form"
         );
     }
 
@@ -16398,9 +17287,7 @@ mod tests {
         let shared = Shared::new(AppState::ready(backend));
         let before = {
             let key = settings_structure_key(&shared);
-            SettingsSifsMountEditorStructure::from(
-                &key.0.as_deref().expect("settings snapshot").sifs_mount,
-            )
+            sifs_mount_editor_shape(&key.0.as_deref().expect("settings snapshot").sifs_mount)
         };
 
         {
@@ -16414,9 +17301,7 @@ mod tests {
 
         let after = {
             let key = settings_structure_key(&shared);
-            SettingsSifsMountEditorStructure::from(
-                &key.0.as_deref().expect("settings snapshot").sifs_mount,
-            )
+            sifs_mount_editor_shape(&key.0.as_deref().expect("settings snapshot").sifs_mount)
         };
         assert_eq!(
             after, before,
@@ -16440,9 +17325,7 @@ mod tests {
         let before_status = shared.settings().sifs_mount_snapshot.status.clone();
         let before_editor = {
             let key = settings_structure_key(&shared);
-            SettingsSifsMountEditorStructure::from(
-                &key.0.as_deref().expect("settings snapshot").sifs_mount,
-            )
+            sifs_mount_editor_shape(&key.0.as_deref().expect("settings snapshot").sifs_mount)
         };
 
         let effects = {
@@ -16466,9 +17349,7 @@ mod tests {
         );
         let after_editor = {
             let key = settings_structure_key(&shared);
-            SettingsSifsMountEditorStructure::from(
-                &key.0.as_deref().expect("settings snapshot").sifs_mount,
-            )
+            sifs_mount_editor_shape(&key.0.as_deref().expect("settings snapshot").sifs_mount)
         };
         assert_eq!(
             after_editor, before_editor,
@@ -16816,7 +17697,8 @@ mod tests {
 
     #[test]
     fn settings_error_text_can_be_selected_and_copied() -> sui::Result<()> {
-        let fixture = sinomo_testdir::TestDir::new("app-ui-settings-error-text-can-be-selected-and-copied");
+        let fixture =
+            sinomo_testdir::TestDir::new("app-ui-settings-error-text-can-be-selected-and-copied");
         let backend = Backend::local_fallback_for_data_dir(
             sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
         );
@@ -16833,12 +17715,9 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Selectable settings error")
-                    .root(feedback_slot(
-                        &shared,
-                        &reader,
-                        |settings| settings.agent_action_error.clone(),
-                        |settings| settings.agent_action_status.clone(),
-                    )),
+                    .root(feedback_slot(&shared, &reader, |snapshot| {
+                        snapshot.feedback.agent.clone()
+                    })),
             )
             .build()?;
         let clipboard = runtime.clipboard();
@@ -18295,6 +19174,131 @@ mod tests {
         assert!(export_dir.join("settings-package-agent.json").is_file());
     }
 
+    /// Renders `section`, applies each edit to the model, and checks that the named controls
+    /// keep their widget identity: edits update retained widgets instead of remounting them.
+    fn assert_edits_keep_controls_mounted(
+        section: SettingsSection,
+        controls: &[&str],
+        prepare: impl FnOnce(&Shared),
+        edits: &[(&str, &dyn Fn(&Shared))],
+    ) -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut app = shared.borrow_mut();
+            app.active_tab = Tab::Settings;
+            app.ready
+                .as_mut()
+                .expect("ready state")
+                .settings
+                .open(section);
+        }
+        prepare(&shared);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Retained settings controls")
+                    .root(view(shared.clone())),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(sui::Event::Window(sui::WindowEvent::Resized(Size::new(
+                1440.0, 1600.0,
+            ))))?;
+        app.run_until_idle()?;
+        let ids = || -> sui::Result<Vec<_>> {
+            let snapshot = window.snapshot()?;
+            Ok(controls
+                .iter()
+                .map(|name| {
+                    snapshot
+                        .accessibility
+                        .nodes
+                        .iter()
+                        .find(|node| node.name.as_deref() == Some(*name))
+                        .unwrap_or_else(|| panic!("{name:?} should be present"))
+                        .id
+                })
+                .collect())
+        };
+        let before = ids()?;
+        for (label, edit) in edits {
+            edit(&shared);
+            app.run_until_idle()?;
+            window.advance_time(1.0)?;
+            assert_eq!(ids()?, before, "{label} must not remount {controls:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_editor_edits_keep_its_fields_mounted() -> sui::Result<()> {
+        assert_edits_keep_controls_mounted(
+            SettingsSection::Agents,
+            &["agent-name", "agent-system-prompt", "agent-import-path"],
+            |shared| shared.settings_mut().create_agent(),
+            &[
+                ("typing a name", &|shared: &Shared| {
+                    shared.settings_mut().set_agent_name("Renamed".to_string())
+                }),
+                ("adding an MCP server", &|shared: &Shared| {
+                    shared.settings_mut().add_agent_mcp_server()
+                }),
+                ("adding a packaged tool", &|shared: &Shared| {
+                    shared.settings_mut().add_selected_agent_tool()
+                }),
+                ("an action error", &|shared: &Shared| {
+                    shared.settings_mut().agent_action_error = Some("check failed".to_string())
+                }),
+            ],
+        )
+    }
+
+    #[test]
+    fn provider_add_form_stays_mounted_while_choosing_a_provider() -> sui::Result<()> {
+        assert_edits_keep_controls_mounted(
+            SettingsSection::Providers,
+            &[
+                "provider-add-account",
+                "provider-add-model",
+                "provider-add-provider",
+            ],
+            |shared| shared.settings_mut().open_provider_add(),
+            &[
+                ("picking another provider", &|shared: &Shared| {
+                    shared.settings_mut().set_provider_add_provider(1)
+                }),
+                ("typing an account", &|shared: &Shared| {
+                    shared
+                        .settings_mut()
+                        .set_provider_add_account("work".to_string())
+                }),
+            ],
+        )
+    }
+
+    #[test]
+    fn configuration_search_and_filters_keep_the_browser_mounted() -> sui::Result<()> {
+        assert_edits_keep_controls_mounted(
+            SettingsSection::Configuration,
+            &["advanced-config-search", "configuration-scope"],
+            |_| {},
+            &[
+                ("searching", &|shared: &Shared| {
+                    shared.settings_mut().set_advanced_query("lm".to_string())
+                }),
+                ("filtering overrides", &|shared: &Shared| {
+                    shared.settings_mut().set_advanced_overrides_only(true)
+                }),
+                ("clearing filters", &|shared: &Shared| {
+                    shared.settings_mut().clear_advanced_filters()
+                }),
+            ],
+        )
+    }
+
     #[test]
     fn settings_agents_section_renders_management_controls() -> sui::Result<()> {
         let backend = backend_with_mounted_agent_catalog();
@@ -19440,6 +20444,8 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Allow remote management…")
             .click()?;
+        // The confirmation grows into place; let the reveal finish before pressing its buttons.
+        window.advance_time(1.0)?;
         window
             .get_by_role(sui::SemanticsRole::Dialog)
             .with_name("Allow remote management confirmation")
@@ -20116,6 +21122,8 @@ mod tests {
             provider_section_signature(&shared),
             "usage disclosure state must invalidate the retained section"
         );
+        // The details grow into place; let the reveal finish before measuring them.
+        window.advance_time(1.0)?;
         assert!(window.get_by_text("Five-hour limit · 64% used").count()? >= 1);
         window
             .get_by_role(sui::SemanticsRole::ProgressBar)
@@ -20176,7 +21184,9 @@ mod tests {
 
     #[test]
     fn provider_card_uses_dropdown_for_known_catalog_before_connection_test() -> sui::Result<()> {
-        let fixture = sinomo_testdir::TestDir::new("app-ui-provider-card-uses-dropdown-for-known-catalog-before-connection-test");
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-provider-card-uses-dropdown-for-known-catalog-before-connection-test",
+        );
         let backend = Backend::local_fallback_for_data_dir(
             sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
         );
@@ -20919,7 +21929,7 @@ mod tests {
 
         let key = settings_structure_key(&shared);
         let configuration = &key.0.as_deref().expect("settings snapshot").configuration;
-        assert_eq!(configuration.query, "placement");
+        assert!(!configuration.query_empty);
         assert!(configuration.overrides_only);
         assert!(
             configuration

@@ -51,6 +51,19 @@ granting remote control of the host system. Host filesystem mount changes still
 require remote-management consent on the selected node. Grant or revoke host
 access locally on that node; selecting it in Settings does not grant permission.
 
+**Host access → Device sharing** controls access to this node's default
+microphone, speaker, camera, and motion/environment sensors. Change these switches on the
+device that owns the hardware. Sharing is separate from unrestricted remote
+management and is off by default. Other authenticated cluster nodes still need
+the matching media capability. Turning sharing off revokes access; it does not
+revoke Android's permission for local calls. Sensor capture depends on a platform
+adapter; Android supplies motion, rotation, magnetic field, light, and pressure
+readings where the hardware is available.
+
+On Android, **Set up App Use** opens the local display-sharing and accessibility
+controls. App Use also requires its packaged OS provider and exact-share consent;
+see [App Use setup](computer-and-app-use.md#installation-and-local-consent).
+
 ## Models and Providers
 
 Show the current default, list models, and change the selection:
@@ -338,6 +351,21 @@ preserves registration identity, pending local evidence, and the exact provider
 needed after restart. The
 [Cloud Files architecture](../cloud-files-architecture.md) describes the
 Windows data paths and recovery model.
+
+## Android attachments and media
+
+Use Chat's attachment chooser to select images or files in Android's document
+picker. The picker grants access to the selected documents; broad storage access
+is not required. Sinomo copies selections into private cache before validating
+and attaching them. Each selection is limited to 32 files and 128 MiB in total.
+Cancelling the picker leaves the draft unchanged.
+
+Enabling the microphone or camera for setup or a call requests the corresponding
+Android permission. A denial leaves that feature unavailable and shows an error;
+allow access in Android's app settings and retry. Local calls do not enable
+cluster device sharing. Camera capture uses the front camera when available and
+adjusts frames for display rotation. Android's foreground and privacy controls
+still govern capture, including capture requested by another node.
 
 ## Voice and Realtime Models
 

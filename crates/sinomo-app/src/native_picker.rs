@@ -15,9 +15,7 @@ pub(crate) enum NativePickerKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-// Non-desktop builds retain the cross-platform result contract even though
-// their local picker backend can only return `Failed`.
-#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "desktop", target_os = "android")), allow(dead_code))]
 pub(crate) enum NativePickerOutcome {
     Selected(Vec<PathBuf>),
     Cancelled,
@@ -143,7 +141,7 @@ fn run_picker(kind: NativePickerKind, title: &str) -> NativePickerOutcome {
     }
 }
 
-#[cfg(not(feature = "desktop"))]
+#[cfg(all(not(feature = "desktop"), not(target_os = "android")))]
 fn run_picker(_kind: NativePickerKind, _title: &str) -> NativePickerOutcome {
     NativePickerOutcome::Failed("native file pickers are unavailable on this platform".to_string())
 }
@@ -175,5 +173,29 @@ mod tests {
         assert_eq!(result.request_id, 7);
         assert_eq!(result.context_generation, 2);
         assert!(!lane.is_pending());
+    }
+}
+
+#[cfg(all(target_os = "android", not(feature = "desktop")))]
+fn run_picker(kind: NativePickerKind, _title: &str) -> NativePickerOutcome {
+    let operation = match kind {
+        NativePickerKind::OneFile => "file",
+        NativePickerKind::MultipleFiles => "files",
+        NativePickerKind::OneFolder => {
+            return NativePickerOutcome::Failed(
+                "Android document folders cannot be used as filesystem workspace paths".into(),
+            );
+        }
+    };
+    match crate::android_media::request(operation) {
+        Ok(result) if result == "cancelled" => NativePickerOutcome::Cancelled,
+        Ok(result) => match serde_json::from_str::<Vec<PathBuf>>(&result) {
+            Ok(paths) if !paths.is_empty() => NativePickerOutcome::Selected(paths),
+            Ok(_) => NativePickerOutcome::Cancelled,
+            Err(error) => {
+                NativePickerOutcome::Failed(format!("Invalid document picker result: {error}"))
+            }
+        },
+        Err(error) => NativePickerOutcome::Failed(error),
     }
 }
