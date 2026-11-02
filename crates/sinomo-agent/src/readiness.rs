@@ -3,15 +3,14 @@ use crate::AgentProcessLifecycleStatus;
 #[cfg(unix)]
 use crate::tools::local_workspace::provision_default_agent_session_sandbox;
 use crate::{
-    AGENT_DEFINITION_SIFS_ROOT, AGENT_OBJECT_RPC_ROUTES, AGENT_RPC_CATEGORY,
-    AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES, AGENT_SESSION_FOLLOW_UP_ROUTE,
-    AGENT_SESSION_INSPECT_ROUTE, AGENT_SESSION_INTERRUPT_ROUTE, AGENT_SESSION_PROGRESS_ROUTE,
-    AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE, AGENT_SESSION_TERMINAL_RESULTS_ROUTE,
-    Agent, AgentCancellationToken, AgentCatalog, AgentCompactor, AgentConfig,
-    AgentContextAttachment, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
-    AgentDefinitionValidationError, AgentItem, AgentLoopInput, AgentLoopResponseMode,
-    AgentModelDecisionSource, AgentModelEvent, AgentModuleToolProjection, AgentOp,
-    AgentOutputFormat, AgentPackageProvenance, AgentPackageSource, AgentPlacementMetadata,
+    AGENT_OBJECT_RPC_ROUTES, AGENT_RPC_CATEGORY, AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES,
+    AGENT_SESSION_FOLLOW_UP_ROUTE, AGENT_SESSION_INSPECT_ROUTE, AGENT_SESSION_INTERRUPT_ROUTE,
+    AGENT_SESSION_PROGRESS_ROUTE, AGENT_SESSION_RESUME_ROUTE, AGENT_SESSION_STEER_ROUTE,
+    AGENT_SESSION_TERMINAL_RESULTS_ROUTE, Agent, AgentCancellationToken, AgentCatalog,
+    AgentCompactor, AgentConfig, AgentContextAttachment, AgentDefinition, AgentDefinitionSifsStore,
+    AgentDefinitionStore, AgentDefinitionValidationError, AgentItem, AgentLoopInput,
+    AgentLoopResponseMode, AgentModelDecisionSource, AgentModelEvent, AgentModuleToolProjection,
+    AgentOp, AgentOutputFormat, AgentPackageProvenance, AgentPackageSource, AgentPlacementMetadata,
     AgentRemoteObjectRpcFuture, AgentRemoteObjectRpcTool, AgentRemoteObjectRpcTransport, AgentRole,
     AgentRun, AgentRunContext, AgentRuntimeControlError, AgentRuntimeControlHost,
     AgentRuntimeControlRegistry, AgentSession, AgentSessionControlEventCursor,
@@ -53,6 +52,7 @@ use sinomo_runtime::node::{LocalNodePermission, NodeId};
 use sinomo_runtime::service::{
     ResponseSink, ServiceContext, ServiceError, ServiceRegistry, ServiceSigner,
 };
+use sinomo_runtime::vfs::{VfsHandle, VfsRemoveOptions};
 use std::collections::VecDeque;
 use std::fs;
 use std::future::Future;
@@ -106,13 +106,18 @@ impl AgentReadinessReport {
 
 // Keeping each probe on its own line makes this long diagnostic catalog easier
 // to audit and extend than one very large `vec!` initializer.
+/// Run deterministic checks using DATA and SIFS selected for the same existing
+/// owner. Storage selection errors remain failed readiness checks.
 #[allow(clippy::vec_init_then_push)]
-pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> AgentReadinessReport {
+pub fn run_local_agent_readiness_gate(
+    workspace_root: impl Into<PathBuf>,
+    owner: Result<(SinomoDataDir, VfsHandle), String>,
+) -> AgentReadinessReport {
     let workspace_root = workspace_root.into();
     let mut checks = Vec::new();
     checks.push(check_built_in_package_validation());
     checks.push(check_package_json_round_trip());
-    checks.push(check_package_artifact_store_smoke());
+    checks.push(check_package_artifact_store_smoke(owner));
     checks.push(check_package_rejects_malformed_definitions());
     checks.push(check_reserved_identity_and_role_exposure_smoke());
     checks.push(check_model_derived_context_budget_smoke());
@@ -976,101 +981,139 @@ fn check_package_json_round_trip() -> AgentReadinessCheck {
     }
 }
 
-fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-agent-package-readiness-{}",
+fn check_package_artifact_store_smoke(
+    owner: Result<(SinomoDataDir, VfsHandle), String>,
+) -> AgentReadinessCheck {
+    let (data_dir, vfs) = match owner {
+        Ok(owner) => owner,
+        Err(error) => {
+            return failed(
+                "package_artifact_store_smoke",
+                "SIFS-backed agent package owner is unavailable",
+                serde_json::json!({ "phase": "select_owner", "error": error }),
+            );
+        }
+    };
+    let state = match sinomo_runtime::cluster::read_cluster_state_without_kv(
+        &sinomo_runtime::network::ClusterPaths::new(&data_dir),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            return failed(
+                "package_artifact_store_smoke",
+                "SIFS-backed agent package owner identity is unavailable",
+                serde_json::json!({ "phase": "owner_identity", "error": error.to_string() }),
+            );
+        }
+    };
+    let namespace = format!(
+        "/services/sinomo/readiness/{}/{}",
+        state.local_node_id,
         TaskId::generate()
-    ));
-    let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
-    let store = match AgentDefinitionSifsStore::open(Some(data_dir.root())) {
-        Ok(store) => store,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&root);
-            return failed(
-                "package_artifact_store_smoke",
-                "SIFS-backed agent package store failed to open",
-                serde_json::json!({ "error": error.to_string() }),
-            );
-        }
+    );
+    let failure = |phase: &str, error: String| {
+        failed(
+            "package_artifact_store_smoke",
+            "SIFS-backed agent package readiness probe failed",
+            serde_json::json!({
+                "phase": phase,
+                "error": error,
+                "cluster_id": state.cluster_id,
+                "node_id": state.local_node_id,
+                "namespace": namespace,
+                "cleanup_complete": false,
+            }),
+        )
     };
-    let source_path = "agent-packages/readiness-imported-agent.json";
-    let definition = AgentDefinition::custom(
-        "readiness-imported-agent",
-        AgentRole::Deliberation,
-        "Readiness package import/export smoke.",
-    )
-    .with_package_version("1.2.3")
-    .with_package_provenance(AgentPackageProvenance::imported(source_path))
-    .with_tool(AgentToolSpec::new(
-        AgentToolKind::ReadFile,
-        "read_file",
-        "Read a workspace file.",
-        false,
-    ))
-    .with_skill("readiness.skill")
-    .with_temperature(Some(0.3))
-    .with_max_output_tokens(Some(512));
-
-    let saved_path = match store.save_definition(&definition) {
-        Ok(path) => path,
-        Err(error) => {
-            return failed(
-                "package_artifact_store_smoke",
-                "SIFS-backed agent package save failed",
-                serde_json::json!({ "error": error.to_string() }),
+    let result = (|| {
+        let scoped = vfs
+            .scoped(&namespace)
+            .map_err(|error| failure("scope", error.to_string()))?;
+        scoped
+            .create_dir_all_beneath_no_links("agents")
+            .map_err(|error| failure("create_namespace", error.to_string()))?;
+        let directory = scoped
+            .scoped("agents")
+            .map_err(|error| failure("scope_store", error.to_string()))?;
+        let store = AgentDefinitionSifsStore::from_scoped_vfs(directory.clone());
+        let source_path = "agent-packages/readiness-imported-agent.json";
+        let definition = AgentDefinition::custom(
+            "readiness-imported-agent",
+            AgentRole::Deliberation,
+            "Readiness package import/export smoke.",
+        )
+        .with_package_version("1.2.3")
+        .with_package_provenance(AgentPackageProvenance::imported(source_path))
+        .with_tool(AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            "read_file",
+            "Read a workspace file.",
+            false,
+        ))
+        .with_skill("readiness.skill")
+        .with_temperature(Some(0.3))
+        .with_max_output_tokens(Some(512));
+        let saved_path = store
+            .save_definition(&definition)
+            .map_err(|error| failure("save", error.to_string()))?;
+        let loaded = store
+            .load_definitions()
+            .map_err(|error| failure("load", error.to_string()))?;
+        let loaded_definition = loaded
+            .iter()
+            .find(|candidate| candidate.key() == definition.key());
+        let reopened = AgentDefinitionSifsStore::from_scoped_vfs(directory);
+        let mut catalog = AgentCatalog::load_from_store(reopened)
+            .map_err(|error| failure("catalog_reopen", error.to_string()))?;
+        catalog
+            .merge_product_modules(&data_dir)
+            .map_err(|error| failure("catalog_modules", error.to_string()))?;
+        let catalog_definition = catalog.get(definition.key());
+        let saved_in_sifs = loaded_definition.is_some();
+        let expected_sifs_path = format!("{}/{}.json", store.root(), definition.key());
+        let saved_path_matches = saved_path == expected_sifs_path;
+        let loaded_matches = loaded_definition.is_some_and(|loaded| {
+            loaded.package.version == "1.2.3"
+                && loaded.package.provenance.source == AgentPackageSource::Imported
+                && loaded.package.provenance.path.as_deref() == Some(source_path)
+                && loaded.tools.iter().any(|tool| tool.name == "read_file")
+                && loaded.skills == vec!["readiness.skill".to_string()]
+                && loaded.model_policy.temperature == Some(0.3)
+                && loaded.model_policy.max_output_tokens == Some(512)
+        });
+        let catalog_matches = catalog_definition.is_some_and(|loaded| {
+            loaded.package.provenance.source == AgentPackageSource::Imported
+                && loaded.package.provenance.path.as_deref() == Some(source_path)
+        });
+        if !(saved_in_sifs && saved_path_matches && loaded_matches && catalog_matches) {
+            let mut check = failure(
+                "verify",
+                "agent package round-trip lost package data".to_string(),
             );
+            check.evidence["saved_path"] = serde_json::json!(saved_path);
+            check.evidence["saved_in_sifs"] = serde_json::json!(saved_in_sifs);
+            check.evidence["saved_path_matches"] = serde_json::json!(saved_path_matches);
+            check.evidence["loaded_matches"] = serde_json::json!(loaded_matches);
+            check.evidence["catalog_matches"] = serde_json::json!(catalog_matches);
+            check.evidence["loaded_count"] = serde_json::json!(loaded.len());
+            return Err(check);
         }
-    };
-    let loaded = match store.load_definitions() {
-        Ok(definitions) => definitions,
-        Err(error) => {
-            return failed(
-                "package_artifact_store_smoke",
-                "SIFS-backed agent package load failed",
-                serde_json::json!({
-                    "saved_path": saved_path,
-                    "error": error.to_string(),
-                }),
-            );
+        if !store
+            .delete_definition(definition.key())
+            .map_err(|error| failure("cleanup_definition", error.to_string()))?
+        {
+            return Err(failure(
+                "cleanup_definition",
+                "saved probe definition is absent".to_string(),
+            ));
         }
-    };
-    let loaded_definition = loaded
-        .iter()
-        .find(|candidate| candidate.key() == definition.key());
-    let catalog = match AgentCatalog::load_from_data_dir(&data_dir) {
-        Ok(catalog) => catalog,
-        Err(error) => {
-            return failed(
-                "package_artifact_store_smoke",
-                "agent catalog failed to load SIFS-backed package",
-                serde_json::json!({
-                    "saved_path": saved_path,
-                    "error": error.to_string(),
-                }),
-            );
-        }
-    };
-    let catalog_definition = catalog.get(definition.key());
-    let saved_in_sifs = loaded_definition.is_some();
-    let expected_sifs_path = format!("{}/{}.json", AGENT_DEFINITION_SIFS_ROOT, definition.key());
-    let saved_path_matches = saved_path == expected_sifs_path;
-    let loaded_matches = loaded_definition.is_some_and(|loaded| {
-        loaded.package.version == "1.2.3"
-            && loaded.package.provenance.source == AgentPackageSource::Imported
-            && loaded.package.provenance.path.as_deref() == Some(source_path)
-            && loaded.tools.iter().any(|tool| tool.name == "read_file")
-            && loaded.skills == vec!["readiness.skill".to_string()]
-            && loaded.model_policy.temperature == Some(0.3)
-            && loaded.model_policy.max_output_tokens == Some(512)
-    });
-    let catalog_matches = catalog_definition.is_some_and(|loaded| {
-        loaded.package.provenance.source == AgentPackageSource::Imported
-            && loaded.package.provenance.path.as_deref() == Some(source_path)
-    });
-    let _ = fs::remove_dir_all(&root);
-
-    if saved_in_sifs && saved_path_matches && loaded_matches && catalog_matches {
-        passed(
+        scoped
+            .remove_with_options("agents", VfsRemoveOptions::directory())
+            .map_err(|error| failure("cleanup_store", error.to_string()))?;
+        scoped
+            .remove_with_options("", VfsRemoveOptions::directory())
+            .map_err(|error| failure("cleanup_namespace", error.to_string()))?;
+        Ok(passed(
             "package_artifact_store_smoke",
             "SIFS-backed agent package artifacts save, load, and merge into the catalog with import provenance",
             serde_json::json!({
@@ -1079,23 +1122,14 @@ fn check_package_artifact_store_smoke() -> AgentReadinessCheck {
                 "package_version": "1.2.3",
                 "provenance": "imported",
                 "source_path": source_path,
+                "cluster_id": state.cluster_id,
+                "node_id": state.local_node_id,
+                "namespace": namespace,
+                "cleanup_complete": true,
             }),
-        )
-    } else {
-        failed(
-            "package_artifact_store_smoke",
-            "SIFS-backed agent package artifact round-trip lost package data",
-            serde_json::json!({
-                "agent": definition.key(),
-                "saved_path": saved_path,
-                "saved_in_sifs": saved_in_sifs,
-                "saved_path_matches": saved_path_matches,
-                "loaded_matches": loaded_matches,
-                "catalog_matches": catalog_matches,
-                "loaded_count": loaded.len(),
-            }),
-        )
-    }
+        ))
+    })();
+    result.unwrap_or_else(std::convert::identity)
 }
 
 fn check_package_rejects_malformed_definitions() -> AgentReadinessCheck {
@@ -4881,13 +4915,14 @@ fn check_compaction_eval_harness_smoke(workspace_root: &Path) -> AgentReadinessC
         }
     }
 
+    let docs = docs.split_whitespace().collect::<Vec<_>>().join(" ");
     let required_doc_markers = [
         "Model quality is eval work, not ordinary Rust unit testing",
         "run_compaction_eval.py --mode plan",
         "run_compaction_eval.py --mode fixture",
         "run_compaction_eval.py --mode run",
-        "Live/model results are research and eval evidence",
-        "local readiness remains responsible only for deterministic projection and persistence invariants",
+        "Live/model results are eval evidence",
+        "local readiness remains responsible for deterministic projection and persistence invariants",
     ];
     for marker in required_doc_markers {
         if !docs.contains(marker) {
@@ -7706,10 +7741,66 @@ mod tests {
     }
 
     #[test]
+    fn package_store_readiness_preserves_unavailable_owner_without_initializing_data() {
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-readiness-unavailable");
+        let data_dir = SinomoDataDir::new(root.join("uninitialized"));
+        let error = "selected SIFS provider is unavailable";
+
+        let check = check_package_artifact_store_smoke(Err(error.to_string()));
+
+        assert_eq!(check.status, AgentReadinessCheckStatus::Failed);
+        assert_eq!(check.evidence["phase"], "select_owner");
+        assert_eq!(check.evidence["error"], error);
+        assert!(
+            !data_dir.root().exists(),
+            "readiness must not bootstrap an owner"
+        );
+    }
+
+    #[test]
     fn local_agent_readiness_gate_passes_on_workspace_root() {
-        let report = run_local_agent_readiness_gate(env!("CARGO_MANIFEST_DIR"));
+        let native = Arc::new(
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start(
+                "sinomo-agent-readiness",
+            )
+            .expect("native SIFS owner"),
+        );
+        let vfs = native.mounted_vfs().expect("native SIFS VFS");
+        let canonical = AgentDefinitionSifsStore::from_vfs(vfs.clone()).expect("canonical store");
+        let sentinel = AgentDefinition::custom(
+            "readiness-sentinel",
+            AgentRole::Deliberation,
+            "Preserve the canonical catalog.",
+        );
+        let sentinel_path = canonical.save_definition(&sentinel).expect("save sentinel");
+        let sentinel_bytes = vfs.read(&sentinel_path).expect("read sentinel");
+        let report = run_local_agent_readiness_gate(
+            env!("CARGO_MANIFEST_DIR"),
+            Ok((native.data_dir().clone(), vfs.clone())),
+        );
 
         assert!(report.is_ready(), "{report:#?}");
+        assert_eq!(
+            vfs.read(&sentinel_path).expect("retained sentinel"),
+            sentinel_bytes
+        );
+        assert_eq!(
+            canonical.load_definitions().expect("canonical catalog"),
+            vec![sentinel]
+        );
+        let package_check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "package_artifact_store_smoke")
+            .expect("package check");
+        assert_eq!(package_check.evidence["cleanup_complete"], true);
+        let namespace = package_check.evidence["namespace"]
+            .as_str()
+            .expect("probe namespace");
+        assert!(matches!(
+            vfs.stat(namespace),
+            Err(sinomo_runtime::vfs::VfsError::NotFound { .. })
+        ));
         assert!(
             report
                 .checks

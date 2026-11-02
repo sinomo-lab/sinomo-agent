@@ -22296,12 +22296,17 @@ mod tests {
 
     #[test]
     fn channel_config_removes_agent_and_updates_sidebar_count() {
-        let (_backend, mut state) = isolated_chat_state("channel-remove-agent");
+        let (backend, mut state) = isolated_chat_state("channel-remove-agent");
         seed_test_agents(&mut state);
         state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
-            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
+            state.pending_session_reset.is_none()
+                && state.channel_create_rx.is_none()
+                && !state.session_list_loading
         });
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal completed channel creation observations");
         let channel_id = state.session_id.clone();
         state.set_channel_agent_idx(1);
         state.add_selected_agent_to_channel();
@@ -22316,6 +22321,9 @@ mod tests {
             .map(|participant| participant.participant_id)
             .expect("coding participant listed");
 
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal completed agent addition observations");
         state.remove_channel_agent(&channel_id, &coding_participant_id);
         assert!(state.pending_channel_config.is_some());
         wait_for(&mut state, Duration::from_secs(5), |state| {
@@ -23492,6 +23500,11 @@ mod tests {
             seed_test_agents(&mut chat);
             chat.sessions.clear();
             chat.session_id = SessionId::generate().to_string();
+            let session = chat.session_id.clone();
+            chat.apply_event(ChatEvent::ToolRuntime(workspace_management_selection(
+                &session,
+                &["/Workspace"],
+            )));
             chat.messages = vec![
                 ChatMessage::user("We already have history."),
                 ChatMessage::model("Ready for the next task."),
@@ -23590,7 +23603,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Choose folder")
+                .with_name("Add folder")
                 .count()?,
             1,
             "workspace control should expose the native folder picker"
@@ -23598,7 +23611,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Remove access")
+                .with_name("Remove all")
                 .count()?,
             1,
             "workspace control should expose explicit grant revocation"
@@ -24457,13 +24470,24 @@ mod tests {
             })
             .expect("main-pane New channel action")
             .bounds;
-        let empty_copy_bottom = after
+        let transcript = after
+            .snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List
+                    && node.name.as_deref() == Some("Conversation messages")
+            })
+            .expect("main-pane transcript semantics");
+        let empty_copy = after
             .snapshot
             .accessibility
             .nodes
             .iter()
             .filter(|node| {
-                node.role == SemanticsRole::Text
+                node.parent == Some(transcript.id)
+                    && node.role == SemanticsRole::Text
                     && matches!(
                         node.name.as_deref(),
                         Some("No channels yet")
@@ -24473,6 +24497,10 @@ mod tests {
                             | Some("Use New channel to choose agents and edit the title.")
                     )
             })
+            .collect::<Vec<_>>();
+        assert_eq!(empty_copy.len(), 3, "main-pane empty-state copy semantics");
+        let empty_copy_bottom = empty_copy
+            .iter()
             .map(|node| node.bounds.max_y())
             .fold(0.0, f32::max);
         assert!(
@@ -24490,7 +24518,7 @@ mod tests {
             let mut chat = shared.chat_mut();
             seed_default_provider(&mut chat);
             chat.models_loading = false;
-            chat.workspace_path_input = r"D:\Projects\sinomo".into();
+            chat.workspace_path_input = "/Projects/sinomo".into();
             chat.messages = vec![
                 ChatMessage::user("Keep the composer compact."),
                 ChatMessage::model("Ready."),
@@ -24553,7 +24581,7 @@ mod tests {
         {
             let mut chat = shared.chat_mut();
             chat.providers[0].models[0] = "gpt-5.6-sol".into();
-            chat.workspace_path_input = r"D:\Projects\active-workspace".into();
+            chat.workspace_path_input = "/Projects/active-workspace".into();
         }
         for width in [700.0, 360.0, 320.0] {
             window
@@ -25967,21 +25995,17 @@ mod tests {
 
     #[test]
     fn retry_chat_list_restarts_stuck_load_and_refreshes_history() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-app-chat-list-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let data_dir = SinomoDataDir::new(&root);
+        let backend = Backend::local_fallback();
         let channel_id = "01hxy6qa9k0t9vr4g9n8d3q6b1"
             .parse::<SessionId>()
             .expect("session id");
         seed_backend_chat(
-            &data_dir,
+            backend.data_dir.as_ref(),
             &channel_id,
             "Recovered by retry",
             &[ChatMessage::user("hello")],
         );
         let session_id = channel_id.to_string();
-        let backend = Backend::local_fallback_for_data_dir(data_dir);
         let mut state = ChatState::new(&backend);
         state.sessions.clear();
         let (_tx, rx) = mpsc::channel();
@@ -26012,8 +26036,6 @@ mod tests {
                 .any(|session| session.id == session_id && session.title == "Recovered by retry"),
             "retry should discard the stale worker and reload persisted sidebar history"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

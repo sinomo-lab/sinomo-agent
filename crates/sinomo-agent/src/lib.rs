@@ -2016,11 +2016,15 @@ impl AgentDefinitionSifsStore {
         let handle = handle
             .and_then(|handle| handle.scoped(AGENT_DEFINITION_SIFS_ROOT))
             .map_err(agent_definition_vfs_error)?;
-        let objects = sinomo_runtime::vfs::DirectoryObjectStore::json(handle, "json");
-        Ok(Self {
-            root: AGENT_DEFINITION_SIFS_ROOT.to_string(),
-            objects,
-        })
+        Ok(Self::from_scoped_vfs(handle))
+    }
+
+    /// Adopt an already confined definition directory on the selected owner.
+    pub(crate) fn from_scoped_vfs(handle: sinomo_runtime::vfs::VfsHandle) -> Self {
+        Self {
+            root: handle.root().to_string(),
+            objects: sinomo_runtime::vfs::DirectoryObjectStore::json(handle, "json"),
+        }
     }
 
     pub fn root(&self) -> &str {
@@ -3675,6 +3679,12 @@ mod tests {
     fn persistent_store_rejects_reserved_built_in_ids() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-reserved-definition-store");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-reserved-definition-store",
+                data_dir.clone(),
+            )
+            .expect("native SIFS owner");
         let store = AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open store");
 
         let save_error = store
@@ -4064,6 +4074,12 @@ mod tests {
     fn sifs_agent_definition_store_round_trips_custom_definition() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-definition-store",
+                data_dir.clone(),
+            )
+            .expect("native SIFS owner");
         let store = AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open store");
         let definition =
             AgentDefinition::custom("docs-agent", AgentRole::Deliberation, "Write docs.")
@@ -4107,6 +4123,12 @@ mod tests {
     fn agent_catalog_loads_definitions_from_mounted_sifs() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store-catalog");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-definition-store-catalog",
+                data_dir.clone(),
+            )
+            .expect("native SIFS owner");
         let writer = AgentDefinitionSifsStore::open(Some(data_dir.root())).expect("open writer");
         let definition =
             AgentDefinition::custom("catalog-agent", AgentRole::Deliberation, "Stay consistent.");

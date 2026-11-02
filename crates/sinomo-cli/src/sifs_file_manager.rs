@@ -499,6 +499,19 @@ impl SifsFileManagerObservation {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
+        #[cfg(all(feature = "dfs-test-support", not(test)))]
+        if let Some(opened) =
+            sinomo_runtime::vfs::native_test_support::open_registered(data_dir, None)
+        {
+            let opened = opened.map_err(|error| error.to_string())?;
+            let backend = Self::from_service(data_dir, rpc_runtime, opened.service, true, None)?;
+            // The registered native service already carries its authoritative
+            // control-plane client; retain that same owner for mutations.
+            backend
+                .local_catalog_authoritative
+                .store(true, Ordering::Release);
+            return Ok(backend);
+        }
         if let Some(backend) = Self::open_resident(data_dir, rpc_runtime.clone(), true, None)? {
             return Ok(backend);
         }
@@ -9549,7 +9562,6 @@ mod tests {
             } else {
                 "cli-real-w2-create"
             });
-            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
             let path = "/services/needs-two-receipts";
             let (configured, targets) = fixture.with_native(|native, _| {
                 let state =
@@ -9601,6 +9613,40 @@ mod tests {
                     .unwrap();
                 (job.accepted_config, targets)
             });
+            fixture.with_native(|native, _| {
+                let projection = native
+                    .control_plane_client()
+                    .unwrap()
+                    .write_configuration_projection()
+                    .unwrap()
+                    .expect("actual primary write configuration");
+                let key = sinomo_runtime::dfs::file_system_config_key(&sifs_file_system_id());
+                let entry = projection
+                    .entries(&key)
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .expect("actual accepted filesystem configuration");
+                let actual: DfsFileSystemConfig =
+                    sinomo_runtime::kv::decode_kv_value(&entry.value).unwrap();
+                assert_eq!(actual.file_system_id, configured.file_system_id);
+                assert_eq!(actual.owner_node_id, configured.owner_node_id);
+                let accepted_policy = configured
+                    .subtree_policies
+                    .iter()
+                    .find(|rule| rule.path_prefix == path)
+                    .expect("accepted policy for the tested path");
+                assert_eq!(
+                    actual
+                        .subtree_policies
+                        .iter()
+                        .filter(|rule| rule.path_prefix == path)
+                        .collect::<Vec<_>>(),
+                    vec![accepted_policy],
+                    "seed must use the exact committed managed policy for {path}"
+                );
+            });
+            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
             // Read actual ordinary options before faulting any carrier; never
             // force supplied candidates/options as an authority substitute.
             let options = backend

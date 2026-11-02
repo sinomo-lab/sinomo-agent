@@ -971,7 +971,11 @@ mod tests {
 
     #[test]
     fn missing_cluster_state_never_classifies_an_arbitrary_node_as_local() {
-        let backend = Backend::local_fallback();
+        let fixture = sinomo_testdir::TestDir::new("app-module-locality-without-cluster");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
+        );
+        assert!(!ClusterPaths::new(backend.data_dir.as_ref()).state.exists());
         assert!(backend.module_config_node_is_local(&backend.node.node_id.to_string()));
         assert!(!backend.module_config_node_is_local("remote-node"));
     }

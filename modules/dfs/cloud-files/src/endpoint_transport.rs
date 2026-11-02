@@ -199,6 +199,34 @@ impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
 }
 
 impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
+    fn send_local_metadata_query_to_main(
+        &mut self,
+        message: DfsRoutedMessage,
+    ) -> Result<(), NetworkError> {
+        if message.source_node_id != self.local_node_id
+            || message.target_node_id != self.local_node_id
+            || !matches!(&message.message,
+                dfs::DfsNetworkMessage::NamespaceRequest(command)
+                if command.requesting_node_id == self.local_node_id
+                    && !command.include_metadata_journal_batches
+                    && command.metadata_journal_after_sequences.is_empty()
+                    && matches!(command.operation, dfs::DfsNamespaceOperation::MetadataQuery { .. }))
+        {
+            return Err(NetworkError::Io {
+                operation: "local metadata query to Main".into(),
+                detail: "only an exact local read-only metadata query may use Main dispatch".into(),
+            });
+        }
+        if self.daemon_peer.is_none() {
+            return Err(NetworkError::Io {
+                operation: "local metadata query to Main".into(),
+                detail: "registered Main query has no authenticated sender".into(),
+            });
+        }
+        let local = self.local_node_id.clone();
+        self.send_routed_call_to_target(&local, DfsRoutedCall::value(message), true)
+    }
+
     fn take_namespace_response(
         &mut self,
         request_id: &str,
@@ -435,6 +463,11 @@ mod tests {
     #[test]
     fn local_primary_stat_reads_current_daemon_generation_over_private_metadata() {
         let mut fixture = primary_service("cloud-files-local-stat", true);
+        drop(fixture.reads);
+        fixture.reads = fixture
+            .runtime
+            .capture_namespace_requests(&fixture.local, 32)
+            .expect("actual metadata query observer");
         assert_eq!(
             fixture
                 .service
@@ -453,11 +486,167 @@ mod tests {
         assert_eq!(stat.size_bytes, Some(7));
         let requests = fixture.requests();
         assert!(!requests.is_empty());
-        assert!(requests.iter().all(|request| matches!(
-            &request.operation,
-            dfs::DfsNamespaceOperation::LookupPath { .. }
-        )));
+        let is_requested_stat = |request: &dfs::DfsNamespaceCommand| {
+            matches!(
+                &request.operation,
+                dfs::DfsNamespaceOperation::MetadataQuery { query }
+                    if query.file_system_id == fixture.shard.file_system_id
+                        && query.shard_id.0 == fixture.shard.shard_id
+                        && query.epoch == fixture.shard.epoch
+                        && matches!(&query.selection, dfs::DfsMetadataSelection::StatAtPathV1 { request }
+                            if request.path == DOCUMENT)
+            )
+        };
+        assert!(requests.iter().any(is_requested_stat), "{requests:?}");
+        assert!(
+            requests.iter().all(|request| {
+                matches!(
+                    &request.operation,
+                    dfs::DfsNamespaceOperation::LookupPath { .. }
+                ) || is_requested_stat(request)
+            }),
+            "{requests:?}"
+        );
         fixture.close();
+    }
+
+    #[test]
+    fn local_metadata_query_uses_native_main_and_rejects_wrong_identity_or_effects() {
+        let PrimaryFixture {
+            runtime,
+            service,
+            reads,
+            local,
+            shard,
+            current,
+            ..
+        } = primary_service("cloud-files-local-query-contract", false);
+        drop(reads);
+        let capture = runtime
+            .capture_namespace_requests(&local, 32)
+            .expect("actual native ingress observer");
+        let mut transport = service.into_transport();
+        let command = dfs::DfsNamespaceCommand {
+            request_id: "cloud-files-local-query-contract".into(),
+            file_system_id: shard.file_system_id.clone(),
+            requesting_node_id: local.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: vec![shard.clone()],
+            operation: dfs::DfsNamespaceOperation::MetadataQuery {
+                query: dfs::DfsMetadataShardQuery {
+                    file_system_id: shard.file_system_id.clone(),
+                    shard_id: dfs::DfsMetadataShardId::new(shard.shard_id.clone()),
+                    epoch: shard.epoch,
+                    selection: dfs::DfsMetadataSelection::CurrentObject {
+                        object_id: current.object_id.clone(),
+                    },
+                },
+            },
+        };
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: local.clone(),
+            frame_id: 70001,
+            message_id: 70001,
+            message: dfs::DfsNetworkMessage::NamespaceRequest(command.clone()),
+        };
+        let foreign = NodeId::from_legacy_named("cloud-files-foreign-query").unwrap();
+        for changed in [
+            "source",
+            "target",
+            "requester",
+            "journal",
+            "cursor",
+            "mutation",
+        ] {
+            let mut rejected = message.clone();
+            let dfs::DfsNetworkMessage::NamespaceRequest(request) = &mut rejected.message else {
+                unreachable!();
+            };
+            match changed {
+                "source" => rejected.source_node_id = foreign.clone(),
+                "target" => rejected.target_node_id = foreign.clone(),
+                "requester" => request.requesting_node_id = foreign.clone(),
+                "journal" => request.include_metadata_journal_batches = true,
+                "cursor" => {
+                    request
+                        .metadata_journal_after_sequences
+                        .push(dfs::DfsNamespaceShardCursor {
+                            shard_id: dfs::DfsMetadataShardId::new(shard.shard_id.clone()),
+                            after_sequence: 0,
+                        })
+                }
+                "mutation" => {
+                    request.operation = dfs::DfsNamespaceOperation::Mkdir {
+                        path: format!("{ROOT}/must-not-exist"),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                transport
+                    .send_local_metadata_query_to_main(rejected)
+                    .is_err(),
+                "{changed}"
+            );
+        }
+        let mut disconnected = DfsCloudFilesEndpointTransport::new(local.clone(), Vec::new(), None);
+        assert!(
+            disconnected
+                .send_local_metadata_query_to_main(message.clone())
+                .is_err()
+        );
+        assert!(disconnected.incoming_messages.is_empty());
+        transport.set_operation_deadline(Some(Instant::now()));
+        assert!(
+            transport
+                .send_local_metadata_query_to_main(message.clone())
+                .is_err()
+        );
+        assert!(
+            capture.records().is_empty(),
+            "rejections never dispatch to Main"
+        );
+        assert!(transport.incoming_messages.is_empty());
+        transport.set_operation_deadline(None);
+
+        transport
+            .send_local_metadata_query_to_main(message.clone())
+            .expect("actual native Main query");
+        assert_eq!(capture.records(), vec![message]);
+        let response = transport
+            .take_namespace_response(&command.request_id)
+            .unwrap()
+            .expect("native response");
+        assert_eq!(response.source_node_id, local);
+        assert_eq!(response.target_node_id, local);
+        let dfs::DfsNetworkMessage::NamespaceResponse(response) = response.message else {
+            panic!("native query returned a non-response");
+        };
+        assert_eq!(response.request_id, command.request_id);
+        assert_eq!(response.result, dfs::DfsNamespaceResult::Applied);
+        let Some(dfs::DfsPosixCoordinationResult::MetadataQuery(result)) =
+            response.posix_coordination_result
+        else {
+            panic!("native query omitted its typed response");
+        };
+        assert_eq!(result.file_system_id, shard.file_system_id);
+        assert_eq!(result.shard_id.0, shard.shard_id);
+        assert_eq!(result.epoch, shard.epoch);
+        let dfs::DfsMetadataQueryResult::CurrentObject {
+            object: Some(object),
+        } = result.result
+        else {
+            panic!("native query omitted its current object");
+        };
+        assert_eq!(object.object_id, current.object_id);
+        assert_eq!(object.version, current.version);
+        assert_eq!(object.content_hash, current.content_hash);
+        assert!(transport.incoming_messages.is_empty());
+        drop(capture);
+        drop(transport);
+        runtime.close().expect("normal native shutdown");
     }
 
     #[test]

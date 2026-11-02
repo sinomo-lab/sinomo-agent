@@ -7161,6 +7161,7 @@ mod tui_tests {
     fn tui_and_app_agent_switches_atomically_rebind_recall_tool_authority() {
         let root = temp_file_browser_root("agent-switch-recall-authority");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
             &data_dir,
             ModelRuntimeConfig::default(),
@@ -7226,6 +7227,7 @@ mod tui_tests {
     fn tui_agent_switch_persists_identity_and_generic_workspace_immediately() {
         let root = temp_file_browser_root("durable-agent-switch");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("plain-workspace");
         let stale_process_workspace = root.join("stale-process-workspace");
         fs::create_dir_all(&workspace).expect("create generic workspace");
@@ -7356,6 +7358,7 @@ mod tui_tests {
     fn tui_resume_prefers_canonical_agent_identity_and_conversation_workspaces() {
         let root = temp_file_browser_root("canonical-agent-resume");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let conversation_workspace = root.join("conversation-workspace");
         let stale_session_workspace = root.join("stale-session-workspace");
         fs::create_dir_all(&conversation_workspace).expect("create conversation workspace");
@@ -7473,6 +7476,7 @@ mod tui_tests {
     fn tui_resume_failure_restores_outer_session_recall_authority_and_route() {
         let root = temp_file_browser_root("resume-transaction-rollback");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session_store = TuiSessionStore::for_data_dir(&data_dir);
         let target_session = InteractionSession::new(
             SessionId::generate(),

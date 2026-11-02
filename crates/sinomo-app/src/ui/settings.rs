@@ -16226,6 +16226,60 @@ mod tests {
         backend
     }
 
+    fn scroll_agent_rows_into_view(
+        window: &sui_testing::TestWindow,
+        names: &[&str],
+    ) -> sui::Result<()> {
+        window
+            .get_by_role(sui::SemanticsRole::List)
+            .with_name("agent-config-list")
+            .scroll_pixels(sui::Vector::new(0.0, -2000.0))?;
+        window.run_until_idle()?;
+        let snapshot = window.snapshot()?;
+        let list = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::List
+                    && node.name.as_deref() == Some("agent-config-list")
+            })
+            .expect("agent list viewport");
+        let viewport = snapshot
+            .scene_summary
+            .as_ref()
+            .expect("rendered agent settings viewport")
+            .viewport;
+        for name in names {
+            let row = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.parent == Some(list.id)
+                        && node.role == sui::SemanticsRole::ListItem
+                        && node.name.as_deref() == Some(*name)
+                })
+                .unwrap_or_else(|| panic!("agent row {name:?} should be realized after scrolling"));
+            let center_x = row.bounds.x() + row.bounds.width() * 0.5;
+            let center_y = row.bounds.y() + row.bounds.height() * 0.5;
+            assert!(
+                center_x >= list.bounds.x()
+                    && center_x < list.bounds.max_x()
+                    && center_y >= list.bounds.y()
+                    && center_y < list.bounds.max_y()
+                    && center_x >= 0.0
+                    && center_x < viewport.width
+                    && center_y >= 0.0
+                    && center_y < viewport.height,
+                "agent row {name:?} center should lie inside the list and window viewports: row={:?}, list={:?}, viewport={viewport:?}",
+                row.bounds,
+                list.bounds,
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn agent_summary_identifies_the_providing_module() {
         let summary = AgentConfigSummary {
@@ -16913,20 +16967,9 @@ mod tests {
         parts.join("\u{1f}")
     }
 
-    fn temp_skill_backend(label: &str) -> (Backend, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-app-settings-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let mut backend = Backend::local_fallback_for_data_dir(SinomoDataDir::new(root.clone()));
-        backend
-            .use_mounted_catalog_reads_for_tests()
-            .expect("test catalog VFS");
+    fn temp_skill_backend(_label: &str) -> (Backend, PathBuf) {
+        let backend = Backend::local_fallback();
+        let root = backend.data_dir.root();
         (backend, root)
     }
 
@@ -17826,8 +17869,6 @@ mod tests {
                 .expect("exported reference"),
             "Beta lane reference."
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -17932,7 +17973,6 @@ mod tests {
             title.bounds
         );
 
-        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -17999,7 +18039,6 @@ mod tests {
         window.run_until_idle()?;
         assert_eq!(row_ids(&window.snapshot()?), before);
 
-        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -18287,6 +18326,7 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        scroll_agent_rows_into_view(&window, &["render-agent"])?;
 
         window.get_by_text("Agents").expect().to_be_visible()?;
         window
@@ -18583,6 +18623,7 @@ mod tests {
             .expect()
             .to_be_hidden()?;
 
+        scroll_agent_rows_into_view(&window, &["Zulu Agent"])?;
         window
             .get_by_role(sui::SemanticsRole::ListItem)
             .with_name("Zulu Agent")
@@ -18642,6 +18683,7 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
+        scroll_agent_rows_into_view(&window, &["Virtual agent alpha", "Virtual agent beta"])?;
         let row_ids = |snapshot: &sui_testing::WindowSnapshot| {
             ["Virtual agent alpha", "Virtual agent beta"]
                 .into_iter()
@@ -20293,8 +20335,8 @@ mod tests {
         let window = app.main_window()?;
 
         window
-            .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name("provider-0-model")
+            .get_by_role(sui::SemanticsRole::ComboBox)
+            .with_name("provider-0-model-select")
             .expect()
             .to_have_value("gpt-5")?;
         window
@@ -20326,6 +20368,11 @@ mod tests {
         assert!(window.get_by_text("CREDENTIALS").count()? >= 1);
         assert!(window.get_by_text("ENDPOINT").count()? >= 1);
         assert!(window.get_by_text("ACCOUNT").count()? >= 1);
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-model")
+            .expect()
+            .to_have_value("gpt-5")?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
             .with_name("provider-0-base-url")

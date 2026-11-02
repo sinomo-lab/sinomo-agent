@@ -30,3 +30,4 @@ tracing.workspace = true
 [dev-dependencies]
 nfs3_client = { workspace = true, features = ["tokio"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
+sinomo-vfs-sifs = { path = "../sinomo-vfs-sifs", features = ["test-support"] }

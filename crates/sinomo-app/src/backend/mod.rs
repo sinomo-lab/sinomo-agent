@@ -201,6 +201,10 @@ pub struct Backend {
     pub settings_node_id: Option<String>,
     /// Keeps the exact app-owned daemon alive; `None` when attached to an external one.
     _daemon: Option<Arc<OwnedDaemonHandle>>,
+    /// Drop catalog clients before draining their native owner, and drain before DATA cleanup.
+    #[cfg(test)]
+    _native_catalog_owner:
+        Option<Arc<sinomo_runtime::vfs::native_test_support::NativeMountedOwner>>,
     /// Keeps the isolated data directory used by [`Backend::local_fallback`] alive for exactly as
     /// long as the headless backend. Integration tests compile this crate without `cfg(test)`, so
     /// this cannot be test-only without silently falling back to the operator's real data dir.
@@ -307,6 +311,8 @@ impl Backend {
             config,
             settings_node_id: None,
             _daemon: daemon.map(Arc::new),
+            #[cfg(test)]
+            _native_catalog_owner: None,
             _local_fallback_data_dir_cleanup: None,
         }
     }
@@ -315,13 +321,31 @@ impl Backend {
     /// visual tests, which render the UI without the async connection (and without standing up a
     /// real daemon).
     pub fn local_fallback() -> Self {
+        #[cfg(test)]
+        let owner = {
+            let name = format!("app-native-{}", sinomo_runtime::core::Id::generate());
+            Arc::new(
+                sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start(&name)
+                    .expect("headless test native owner"),
+            )
+        };
+        #[cfg(test)]
+        let data_dir = owner.data_dir().clone();
+        #[cfg(not(test))]
         let (data_dir, cleanup) = local_fallback_data_dir();
         let mut backend = Self::local_fallback_for_data_dir(data_dir);
-        backend._local_fallback_data_dir_cleanup = Some(cleanup);
+        #[cfg(not(test))]
+        {
+            backend._local_fallback_data_dir_cleanup = Some(cleanup);
+        }
         #[cfg(test)]
-        backend
-            .use_mounted_catalog_reads_for_tests()
-            .expect("headless test catalog VFS");
+        {
+            backend.node.node_id = owner.node_id().clone();
+            backend._native_catalog_owner = Some(owner);
+            backend
+                .use_mounted_catalog_reads_for_tests()
+                .expect("headless test catalog VFS");
+        }
         backend
     }
 
@@ -351,6 +375,8 @@ impl Backend {
             config,
             settings_node_id: None,
             _daemon: None,
+            #[cfg(test)]
+            _native_catalog_owner: None,
             _local_fallback_data_dir_cleanup: None,
         }
     }
@@ -438,12 +464,34 @@ impl Backend {
 
     #[cfg(test)]
     pub(crate) fn use_mounted_catalog_reads_for_tests(&mut self) -> Result<(), String> {
-        self.catalog_read_vfs = sinomo_runtime::vfs::mounted_sifs(Some(self.data_dir.root()))
+        if self._native_catalog_owner.is_none() {
+            let name = format!("app-native-{}", sinomo_runtime::core::Id::generate());
+            let owner =
+                sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                    &name,
+                    self.data_dir.as_ref().clone(),
+                )?;
+            self.node.node_id = owner.node_id().clone();
+            self._native_catalog_owner = Some(Arc::new(owner));
+        }
+        self.catalog_read_vfs = self
+            ._native_catalog_owner
+            .as_ref()
+            .expect("native catalog owner initialized above")
+            .mounted_vfs()
             .map_err(|error| error.to_string());
         self.catalog_read_vfs
             .as_ref()
             .map(|_| ())
             .map_err(|error| error.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_native_fixture_observations(&self) -> Result<usize, String> {
+        self._native_catalog_owner
+            .as_ref()
+            .ok_or_else(|| "backend has no native catalog owner".to_string())?
+            .checkpoint_rpc_observation_window()
     }
 
     /// Apply a live daemon observation and rebuild connection-bound clients as one backend update.
@@ -1375,6 +1423,41 @@ mod tests {
 
     #[test]
     fn test_local_fallback_uses_temp_data_dir_and_cleans_up() {
+        // Exercise normal cleanup in one child without changing sibling tests' retention.
+        if std::env::var("SINOMO_TEST_KEEP_TMP")
+            .is_ok_and(|value| !value.is_empty() && value != "0")
+        {
+            let evidence = sinomo_testdir::TestDir::new("app-fallback-cleanup-child");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current app test executable"),
+            )
+            .args([
+                "--exact",
+                "backend::tests::test_local_fallback_uses_temp_data_dir_and_cleans_up",
+                "--nocapture",
+            ])
+            .env("SINOMO_TEST_KEEP_TMP", "0")
+            .output()
+            .expect("run cleanup oracle without retaining successful child fixtures");
+            std::fs::write(evidence.join("child.stdout"), &output.stdout)
+                .expect("retain cleanup child stdout");
+            std::fs::write(evidence.join("child.stderr"), &output.stderr)
+                .expect("retain cleanup child stderr");
+            assert!(
+                output.status.success(),
+                "cleanup child failed: {}; raw evidence: {}",
+                output.status,
+                evidence.display(),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")),
+                "cleanup child must run exactly one test; raw evidence: {}",
+                evidence.display(),
+            );
+            return;
+        }
         let default_root = app_config::default_data_dir().root();
         let backend = Backend::local_fallback();
         let root = backend.data_dir.root();
@@ -1391,10 +1474,8 @@ mod tests {
             "unit-test fallback backends must not touch the operator data dir"
         );
         assert!(
-            root.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("sinomo-app-local-fallback-test-")),
-            "unit-test fallback data dir should be visibly test-scoped: {root:?}"
+            root.starts_with(std::env::temp_dir()),
+            "unit-test fallback data dir should live under the test temporary root: {root:?}"
         );
         assert_ne!(
             root, second_root,

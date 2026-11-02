@@ -300,26 +300,48 @@ fn registered_native_control_read_keeps_local_provenance_and_remote_contention_f
     let member = state.members.iter().find(|m| m.node_id == node).unwrap();
     assert_eq!(signer_node, node.as_str());
     assert_eq!(signer_key, member.node_public_key);
+    owner.with_native(|native, _| native.checkpoint_rpc_observation_window().unwrap());
     // A raw protocol frame remains a remote/forwarded call even when its
     // source ID equals its destination. It cannot borrow local-origin policy.
     let held =
         sinomo_runtime::kv::lock_cluster_kv_raft_operation_for_paths(&paths.kv_paths()).unwrap();
+    let resident = paths.kv_paths().raft_store().open_node(&node).unwrap();
+    assert!(
+        sinomo_runtime::kv::with_cluster_kv_resident_read_projection(
+            &paths.kv_paths().raft_wal_paths(&node),
+            &node,
+            |_| (),
+        )
+        .is_none(),
+        "hold the actual resident read projection as well as mutation admission"
+    );
     let started = std::time::Instant::now();
     let (rejected, ended) = {
         let native = owner.native.as_ref().unwrap().lock().unwrap();
         let rejected = native
             .rpc_request(&node, &node, request(), budget)
             .unwrap_err();
-        let ended = native
-            .rpc_observations()
-            .into_iter()
-            .rev()
+        let observations = native.rpc_observations();
+        let constructed = observations
+            .iter()
             .find(|r| {
-                r.route == sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+                r.source == node
+                    && r.target == node
+                    && r.route == sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
+                    && r.origin
+                        == sinomo_runtime::dfs::test_support::DfsTestRpcOrigin::ExplicitFixtureRpc
+                    && r.phase == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::Constructed
+            })
+            .expect("actual explicit raw request");
+        let ended = observations
+            .iter()
+            .find(|r| {
+                r.call_id == constructed.call_id
                     && r.phase
                         == sinomo_runtime::dfs::test_support::DfsTestRpcPhase::EndedWithoutResponse
             })
-            .unwrap();
+            .expect("same explicit raw request ended without response")
+            .clone();
         (rejected, ended)
     };
     assert!(
@@ -328,6 +350,7 @@ fn registered_native_control_read_keeps_local_provenance_and_remote_contention_f
     );
     assert!(started.elapsed() < budget);
     assert!(!ended.signer.unwrap().is_local());
+    drop(resident);
     drop(held);
     owner
         .native

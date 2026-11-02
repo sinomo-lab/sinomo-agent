@@ -2202,6 +2202,12 @@ mod tests {
     fn guarded_task_activity_projection_does_not_skip_unavailable_content() {
         let data_root =
             sinomo_testdir::TestDir::new("sinomo-agent-task-activity-unavailable-content");
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-task-activity-unavailable-content",
+                sinomo_runtime::local::SinomoDataDir::new(&data_root),
+            )
+            .expect("native SIFS owner");
         let vfs = mounted_sifs(Some(data_root.path().to_path_buf())).expect("mounted SIFS VFS");
         let store = AgentTaskActivityProjectionStore::from_vfs(vfs.clone());
         let snapshot = AgentTaskSnapshot::new(
