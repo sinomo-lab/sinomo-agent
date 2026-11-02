@@ -11,7 +11,6 @@ use sui::{
 };
 
 use crate::state::Shared;
-use crate::theme::Palette;
 
 /// Typed application snapshot consumed by [`VirtualCollectionHost`].
 ///
@@ -107,6 +106,108 @@ where
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         visitor.visit(&mut self.child);
+    }
+}
+
+/// How revealed content comes and goes: it appears at once, so a control revealed by a click is
+/// immediately where it stays and can be used; leaving content fades while its space collapses.
+/// Apply before [`sui::Presence::collapse`], which this transition would otherwise reset.
+pub fn reveal_transition() -> sui::PresenceTransition {
+    sui::PresenceTransition::new().enter(sui::AnimationSpec::INSTANT)
+}
+
+/// Keeps one stock control mounted while an observed key restyles it.
+///
+/// Some stock builders (tone, icon, description) have no reader form. Instead of rebuilding the
+/// control when the key changes, the host takes the retained control, re-applies those consuming
+/// builders, and puts it back, so focus, hover, and press state survive the update.
+pub struct Restyle<W, K> {
+    source: Arc<dyn Observable<K>>,
+    key: Option<K>,
+    apply: Box<dyn Fn(W, &K) -> W>,
+    control: Option<W>,
+}
+
+impl<W, K> Restyle<W, K>
+where
+    W: Widget,
+    K: Clone + PartialEq + 'static,
+{
+    pub fn new<O>(control: W, source: O, apply: impl Fn(W, &K) -> W + 'static) -> Self
+    where
+        O: Observable<K> + 'static,
+    {
+        Self {
+            source: Arc::new(source),
+            key: None,
+            apply: Box::new(apply),
+            control: Some(control),
+        }
+    }
+
+    fn control(&self) -> &W {
+        self.control.as_ref().expect("restyled control")
+    }
+
+    fn control_mut(&mut self) -> &mut W {
+        self.control.as_mut().expect("restyled control")
+    }
+}
+
+impl<W, K> Widget for Restyle<W, K>
+where
+    W: Widget,
+    K: Clone + PartialEq + 'static,
+{
+    fn event(&mut self, ctx: &mut sui::EventCtx, event: &sui::Event) {
+        self.control_mut().event(ctx, event);
+    }
+
+    fn command(&mut self, ctx: &mut sui::EventCtx, command: &sui::Command<'_>) {
+        self.control_mut().command(ctx, command);
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let key = ctx.observe(self.source.as_ref());
+        if self.key.as_ref() != Some(&key) {
+            self.control = self
+                .control
+                .take()
+                .map(|control| (self.apply)(control, &key));
+            self.key = Some(key);
+        }
+        self.control_mut().measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.control_mut().arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        // A restyle can change tone or icon without changing size.
+        ctx.observe(self.source.as_ref());
+        self.control().paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        ctx.observe(self.source.as_ref());
+        self.control().semantics(ctx);
+    }
+
+    fn accepts_focus(&self) -> bool {
+        self.control().accepts_focus()
+    }
+
+    fn focus_changed(&mut self, ctx: &mut sui::EventCtx, focused: bool) {
+        self.control_mut().focus_changed(ctx, focused);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        self.control().visit_children(visitor);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        self.control_mut().visit_children_mut(visitor);
     }
 }
 
@@ -224,12 +325,7 @@ impl Widget for Fill {
 
 /// Whether the current theme mode resolves to dark.
 pub fn theme_is_dark(shared: &Shared) -> bool {
-    Palette::from_theme(&shared.theme(), is_dark_mode(shared)).dark
-}
-
-fn is_dark_mode(shared: &Shared) -> bool {
-    use crate::theme::AppThemeMode;
-    !matches!(shared.borrow().theme_mode, AppThemeMode::Light)
+    shared.theme().surfaces.dark
 }
 
 /// Draw text horizontally centered at `cx`, vertically centered at `cy`.

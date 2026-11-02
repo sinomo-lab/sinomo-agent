@@ -31,7 +31,7 @@ fn relayout(ctx: &mut EventCtx) {
 }
 
 impl TabStrip {
-    pub fn new(shared: Shared, compact: bool) -> Self {
+    pub fn new(shared: Shared, compact: Rc<Cell<bool>>) -> Self {
         let labels = shared.clone();
         let selected = shared.clone();
         let select = shared.clone();
@@ -53,9 +53,8 @@ impl TabStrip {
                     .position(|tab| *tab == id),
             })
             .theme_when(move || {
+                // Narrow viewports may not fit the stock minimum tab width.
                 let mut theme = theme.theme();
-                theme.metrics.tab_height = 32.0;
-                theme.metrics.tab_gap = 3.0;
                 theme.metrics.tab_min_width =
                     theme.metrics.tab_min_width.min(theme_width_limit.get());
                 theme
@@ -80,8 +79,6 @@ impl TabStrip {
         let add = ContextMenu::new(
             "New tab menu",
             IconButton::new(IconGlyph::Add, "New tab")
-                .size(32.0)
-                .icon_size(18.0)
                 .appearance(sui::ButtonAppearance::Ghost)
                 .enabled_when(move || !button_enabled.borrow().updates.view.busy)
                 .theme_when(move || button_theme.theme()),
@@ -122,62 +119,64 @@ impl TabStrip {
             .state(scroll_state.clone())
             .name("Primary navigation tabs")
             .scroll_bars(false);
+        // Both destination presentations stay mounted; the compact breakpoint only switches them.
+        let navigate = shared.clone();
+        let nav_theme = shared.clone();
+        let navigation = ContextMenu::new(
+            "Application navigation",
+            sui::Button::new("Navigate")
+                .icon(IconGlyph::MoreHorizontal)
+                .appearance(sui::ButtonAppearance::Ghost)
+                .enabled_when({
+                    let shared = shared.clone();
+                    move || !shared.borrow().updates.view.busy
+                })
+                .theme_when(move || nav_theme.theme()),
+        )
+        .items_when(|| {
+            Tab::ALL
+                .into_iter()
+                .map(|tab| MenuItem::new(tab.title()))
+                .collect()
+        })
+        .activation_button(PointerButton::Primary)
+        .anchor_to_pointer(false)
+        .theme_when({
+            let shared = shared.clone();
+            move || shared.theme()
+        })
+        .on_activate_path_with_ctx(move |ctx, path, _| {
+            if let [index] = path.as_slice()
+                && let Some(tab) = Tab::ALL.get(*index)
+            {
+                navigate.set_active_tab(*tab);
+            }
+            relayout(ctx);
+        });
         let mut pinned = sui::Flex::horizontal().gap(2.0);
-        if compact {
-            let destinations = shared.clone();
-            let nav_theme = shared.clone();
-            let navigation = ContextMenu::new(
-                "Application navigation",
-                sui::Button::new("Navigate")
-                    .icon(IconGlyph::MoreHorizontal)
-                    .appearance(sui::ButtonAppearance::Ghost)
-                    .enabled_when({
-                        let shared = shared.clone();
-                        move || !shared.borrow().updates.view.busy
-                    })
-                    .theme_when(move || nav_theme.theme()),
-            )
-            .items_when(|| {
-                Tab::ALL
-                    .into_iter()
-                    .map(|tab| MenuItem::new(tab.title()))
-                    .collect()
-            })
-            .activation_button(PointerButton::Primary)
-            .anchor_to_pointer(false)
-            .theme_when({
-                let shared = shared.clone();
-                move || shared.theme()
-            })
-            .on_activate_path_with_ctx(move |ctx, path, _| {
-                if let [index] = path.as_slice()
-                    && let Some(tab) = Tab::ALL.get(*index)
-                {
-                    destinations.set_active_tab(*tab);
-                }
-                relayout(ctx);
-            });
-            pinned = pinned.with_child(navigation);
-        } else {
-            for tab in Tab::ALL {
-                let control = super::pinned_tab::PinnedTab::new(shared.clone(), tab, compact);
-                #[cfg(target_os = "android")]
-                {
-                    pinned = pinned.with_child(control);
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    pinned = pinned.with_child(
-                        sui::Tooltip::new(tab.title(), control)
-                            .placement(sui::TooltipPlacement::Below)
-                            .theme(shared.theme()),
-                    );
-                }
+        for tab in Tab::ALL {
+            let control = super::pinned_tab::PinnedTab::new(shared.clone(), tab);
+            #[cfg(target_os = "android")]
+            {
+                pinned = pinned.with_child(control);
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let tooltip_theme = shared.clone();
+                pinned = pinned.with_child(
+                    sui::Tooltip::new(tab.title(), control)
+                        .placement(sui::TooltipPlacement::Below)
+                        .theme_when(move || tooltip_theme.theme()),
+                );
             }
         }
+        let destinations = sui::SwitchView::new()
+            .selected_when(move || usize::from(compact.get()))
+            .with_child(pinned)
+            .with_child(navigation);
         let content = sui::Flex::horizontal()
             .align_items(sui::Alignment::Center)
-            .with_child(Padding::symmetric(4.0, 4.0, pinned))
+            .with_child(Padding::symmetric(4.0, 4.0, destinations))
             .with_item(scroll, sui::FlexItem::flex(1.0).min_width(0.0));
         let child = WidgetPod::new(
             TrailingSlotRow::new(content, Padding::symmetric(2.0, 4.0, add))
@@ -517,6 +516,8 @@ mod tests {
                 .root()
                 .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 720.0))))?;
             let snapshot = window.snapshot()?;
+            // Compact chrome replaces the pinned destinations with one navigation menu.
+            let compact = width <= 620.0;
             let controls: Vec<_> = snapshot
                 .accessibility
                 .nodes
@@ -525,11 +526,15 @@ mod tests {
                     node.description
                         .as_deref()
                         .is_some_and(|description| description.starts_with("Pinned "))
-                        || node.name.as_deref() == Some("New tab")
+                        || matches!(node.name.as_deref(), Some("New tab" | "Navigate"))
                 })
                 .map(|node| (node.name.clone(), node.bounds))
                 .collect();
-            assert_eq!(controls.len(), 6);
+            assert_eq!(
+                controls.len(),
+                if compact { 2 } else { 6 },
+                "fixed destinations and New tab at {width}"
+            );
             for (_, bounds) in &controls {
                 assert!(bounds.x() >= 0.0 && bounds.max_x() <= width);
             }
@@ -574,23 +579,30 @@ mod tests {
                         .any(|node| node.name == name && node.bounds == bounds)
                 );
             }
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Settings")
-                .click()?;
+            if compact {
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Navigate")
+                    .click()?;
+                window
+                    .get_by_role(SemanticsRole::MenuItem)
+                    .with_name("Settings")
+                    .click()?;
+            } else {
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Settings")
+                    .click()?;
+            }
             assert_eq!(shared.borrow().active_workspace_tab, None);
             assert_eq!(shared.active_tab(), Tab::Settings);
-            let selected = window.snapshot()?;
-            assert!(
-                selected
-                    .accessibility
-                    .nodes
-                    .iter()
-                    .any(
-                        |node| node.description.as_deref() == Some("Pinned Settings tab")
-                            && node.state.selected
-                    )
-            );
+            if !compact {
+                let selected = window.snapshot()?;
+                assert!(selected.accessibility.nodes.iter().any(
+                    |node| node.description.as_deref() == Some("Pinned Settings tab")
+                        && node.state.selected
+                ));
+            }
         }
         Ok(())
     }

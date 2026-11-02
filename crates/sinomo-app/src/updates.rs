@@ -473,78 +473,121 @@ fn background<T: Send + 'static>(
     rx
 }
 
+/// What the update banner shows beside any error.
+fn banner_state(view: &UpdateView) -> usize {
+    if view.busy {
+        1
+    } else if view.status.phase == AppUpdatePhase::RestartRequested {
+        2
+    } else if view.status.phase == AppUpdatePhase::Ready && view.dismissed {
+        3
+    } else if view.status.phase == AppUpdatePhase::Ready {
+        4
+    } else if view.status.phase == AppUpdatePhase::RolledBack {
+        5
+    } else {
+        0
+    }
+}
+
+/// The banner stays mounted; the update phase switches its prebuilt rows in place.
 pub(crate) fn banner(shared: Shared) -> impl sui::Widget {
-    use sui::{Button, Flex, Label, RebuildOnChange, WidgetPod};
-    RebuildOnChange::key_from(shared.signals().theme.clone(), move |theme| {
+    use sui::{Button, Flex, Insets, Label, Padding, Presence, SizedBox, SwitchView};
+    let update = shared.signals().app_update.clone();
+    let theme = {
         let shared = shared.clone();
-        let theme = *theme;
-        WidgetPod::new(RebuildOnChange::key_from(
-            shared.signals().app_update.clone(),
-            move |view| {
-                let label = |text: &str| {
-                    Label::new(text.to_owned()).text_style(theme.text_style(theme.palette.text))
-                };
-                let mut row = Flex::horizontal()
-                    .main_gap(8.0)
-                    .align_items(sui::Alignment::Center)
-                    .wrap(sui::FlexWrap::Wrap);
-                if let Some(error) = &view.error {
-                    row = row.with_child(label(error));
-                }
-                if view.busy {
-                    row = row.with_child(label("Saving your workspace and restarting…"));
-                } else if view.status.phase == AppUpdatePhase::RestartRequested {
-                    let shared = shared.clone();
-                    row = row
-                        .with_child(label("Finishing the requested app update…"))
-                        .with_child(
-                            Button::new("Retry restart")
-                                .theme(theme)
-                                .on_press(move || request_restart(&shared, false)),
-                        );
-                } else if view.status.phase == AppUpdatePhase::Ready {
-                    if view.dismissed {
-                        let shared = shared.clone();
-                        row =
-                            row.with_child(Button::new("Update available").theme(theme).on_press(
-                                move || {
-                                    shared.borrow_mut().updates.view.dismissed = false;
-                                },
-                            ));
+        move || {
+            let shared = shared.clone();
+            move || shared.theme()
+        }
+    };
+    let label = |text: &str| Label::new(text.to_owned()).theme_when(theme());
+    let row = || {
+        Flex::horizontal()
+            .main_gap(8.0)
+            .align_items(sui::Alignment::Center)
+            .wrap(sui::FlexWrap::Wrap)
+    };
+
+    let retry = shared.clone();
+    let restart_requested = row()
+        .with_child(label("Finishing the requested app update…"))
+        .with_child(
+            Button::new("Retry restart")
+                .theme_when(theme())
+                .on_press(move || request_restart(&retry, false)),
+        );
+    let reopen = shared.clone();
+    let dismissed = Button::new("Update available")
+        .theme_when(theme())
+        .on_press(move || {
+            reopen.borrow_mut().updates.view.dismissed = false;
+        });
+    let (now, idle, later) = (shared.clone(), shared.clone(), shared.clone());
+    let ready = row()
+        .with_child(
+            Label::new("App update ready")
+                .text_from(update.select_named("app update ready label", |view| {
+                    if view.when_idle {
+                        "Update ready — waiting for idle"
                     } else {
-                        let now = shared.clone();
-                        let idle = shared.clone();
-                        let later = shared.clone();
-                        row = row
-                            .with_child(label(if view.when_idle {
-                                "Update ready — waiting for idle"
-                            } else {
-                                "App update ready"
-                            }))
-                            .with_child(
-                                Button::new("Restart and restore")
-                                    .theme(theme)
-                                    .on_press(move || request_restart(&now, false)),
-                            )
-                            .with_child(
-                                Button::new("When idle")
-                                    .theme(theme)
-                                    .on_press(move || request_restart(&idle, true)),
-                            )
-                            .with_child(Button::new("Later").theme(theme).on_press(move || {
-                                let mut app = later.borrow_mut();
-                                app.updates.view.dismissed = true;
-                                app.updates.view.when_idle = false;
-                                app.updates.restart_intent = None;
-                            }));
+                        "App update ready"
                     }
-                } else if view.status.phase == AppUpdatePhase::RolledBack {
-                    row = row.with_child(label(&view.status.detail));
-                }
-                WidgetPod::new(row)
-            },
-        ))
-    })
+                    .to_string()
+                }))
+                .theme_when(theme()),
+        )
+        .with_child(
+            Button::new("Restart and restore")
+                .theme_when(theme())
+                .on_press(move || request_restart(&now, false)),
+        )
+        .with_child(
+            Button::new("When idle")
+                .theme_when(theme())
+                .on_press(move || request_restart(&idle, true)),
+        )
+        .with_child(Button::new("Later").theme_when(theme()).on_press(move || {
+            let mut app = later.borrow_mut();
+            app.updates.view.dismissed = true;
+            app.updates.view.when_idle = false;
+            app.updates.restart_intent = None;
+        }));
+    let rolled_back = Label::new("")
+        .text_from(update.select_named("app update rollback detail", |view| {
+            view.status.detail.clone()
+        }))
+        .theme_when(theme());
+
+    let error = Presence::new(Padding::new(
+        Insets {
+            left: 0.0,
+            top: 0.0,
+            right: 8.0,
+            bottom: 0.0,
+        },
+        Label::new("")
+            .text_from(update.select_named("app update error", |view| {
+                view.error.clone().unwrap_or_default()
+            }))
+            .theme_when(theme()),
+    ))
+    .transition(crate::ui::widgets::reveal_transition())
+    .shown_from(update.select_named("app update error shown", |view| view.error.is_some()));
+    Flex::horizontal()
+        .align_items(sui::Alignment::Center)
+        .wrap(sui::FlexWrap::Wrap)
+        .with_child(error)
+        .with_child(
+            SwitchView::new()
+                .selected_from(update.select_named("app update banner", banner_state))
+                .with_child(SizedBox::new())
+                .with_child(label("Saving your workspace and restarting…"))
+                .with_child(restart_requested)
+                .with_child(dismissed)
+                .with_child(ready)
+                .with_child(rolled_back),
+        )
 }
 
 #[cfg(test)]

@@ -136,20 +136,14 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
     reader: &ThemeReader,
     body: W,
 ) -> impl Widget + use<W> {
-    let source = shared
-        .signals()
-        .settings_structure
-        .select_named("settings node picker", |key| {
-            key.0.as_deref().map(|snapshot| {
-                (
-                    snapshot.modules.nodes.clone(),
-                    snapshot.modules.selected_node_id.clone(),
-                )
-            })
-        });
+    // The option list has no reader form, so the picker follows the node list; picking a node
+    // only moves its selection.
+    let nodes = settings_projection(shared, "settings node picker", |snapshot| {
+        snapshot.modules.nodes.clone()
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let picker = RebuildOnChange::key_from(source, move |_| {
+    let picker = RebuildOnChange::key_from(nodes, move |_| {
         let nodes = s.settings().module_snapshot.nodes.clone();
         let s_change = s.clone();
         let select = Select::new("settings-node-selector")
@@ -171,55 +165,32 @@ pub(super) fn node_settings_page<W: Widget + 'static>(
                 .build(&s),
         )
     });
-    let state_source = shared.signals().settings_structure.select_named(
-        "settings selected node availability",
-        |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| snapshot.node_target.clone())
-        },
-    );
-    let gate =
-        shared
-            .signals()
-            .settings_structure
-            .select_named("settings node loading gate", |key| {
-                usize::from(key.0.as_deref().is_some_and(|snapshot| {
-                    snapshot.node_target.1 || snapshot.node_target.2.is_some()
-                }))
-            });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let unavailable = RebuildOnChange::key_from(state_source, move |_| {
-        let (loading, error, node_id) = {
-            let settings = s.settings();
-            (
-                settings.node_settings_loading,
-                settings.node_settings_error.clone(),
-                settings.module_selected_node_id.clone(),
-            )
-        };
-        let message = if loading {
+    let gate = settings_projection(shared, "settings node loading gate", |snapshot| {
+        usize::from(snapshot.node_target.1 || snapshot.node_target.2.is_some())
+    });
+    let message = settings_projection(shared, "settings selected node availability", |snapshot| {
+        let (_, loading, error) = &snapshot.node_target;
+        if *loading {
             "Loading the selected node…".to_string()
         } else {
-            error.unwrap_or_default()
-        };
-        let s_retry = s.clone();
-        WidgetPod::new(
-            SettingsCard::new("Node settings")
-                .description(message)
-                .header_action(
-                    sui::Button::new("Refresh node")
-                        .theme_when(clone_reader(&r))
-                        .on_press(move || {
-                            if let Some(node) = node_id.clone() {
-                                reload_node(&s_retry, node);
-                            }
-                        }),
-                )
-                .build(&s, &r),
-        )
+            error.clone().unwrap_or_default()
+        }
     });
+    let refresh = {
+        let s = shared.clone();
+        sui::Button::new("Refresh node")
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                let node = s.settings().module_selected_node_id.clone();
+                if let Some(node) = node {
+                    reload_node(&s, node);
+                }
+            })
+    };
+    let unavailable = SettingsCard::new("Node settings")
+        .description_from(message)
+        .header_action(refresh)
+        .build(shared, reader);
     Stack::vertical()
         .gap(14.0)
         .alignment(Alignment::Stretch)
@@ -236,7 +207,6 @@ pub(super) fn remote_host_access_panel(
     shared: &Shared,
     reader: &ThemeReader,
 ) -> impl Widget + use<> {
-    let snapshot = shared.settings().remote_management.clone();
     let s = shared.clone();
     let module_override = Select::new("selected-node-remote-management-module")
         .options(MODULE_OVERRIDE_OPTIONS.iter().copied())
@@ -264,7 +234,7 @@ pub(super) fn remote_host_access_panel(
                 },
             );
         });
-    let mut card = SettingsCard::new("Host access on the selected node")
+    let card = SettingsCard::new("Host access on the selected node")
         .description("Host-access consent can only be changed on that node itself. Ordinary Sinomo settings do not need it.")
         .row(
             SettingRow::new("Allow host access there")
@@ -289,25 +259,40 @@ pub(super) fn remote_host_access_panel(
         )
         .row(
             SettingRow::new("Module override")
-                .help(snapshot.module_observed_detail)
+                .help_from(settings_projection(
+                    shared,
+                    "settings remote node module detail",
+                    |snapshot| {
+                        snapshot
+                            .remote_management
+                            .snapshot
+                            .module_observed_detail
+                            .clone()
+                    },
+                ))
                 .control(module_override)
                 .build(shared),
         );
-    let feedback = {
-        let settings = shared.settings();
-        settings
-            .remote_management_module_error
+    let feedback = settings_projection(shared, "settings remote node module status", |snapshot| {
+        let remote = &snapshot.remote_management;
+        remote
+            .module_error
             .clone()
-            .or(settings.remote_management_module_status.clone())
-            .or(snapshot.module_error)
-    };
-    if let Some(feedback) = feedback {
-        card = card.row(
-            SettingRow::new("Status")
-                .value(shared, feedback)
-                .build(shared),
-        );
-    }
+            .or(remote.module_status.clone())
+            .or(remote.snapshot.module_error.clone())
+            .unwrap_or_default()
+    });
+    let has_feedback = derived(
+        feedback.clone(),
+        "settings remote node has status",
+        |feedback: &String| !feedback.is_empty(),
+    );
+    let card = card.row(revealed(
+        SettingRow::new("Status")
+            .value_from(shared, feedback)
+            .build(shared),
+        has_feedback,
+    ));
     card.build(shared, reader)
 }
 
@@ -469,9 +454,7 @@ mod tests {
                 sui::WindowBuilder::new()
                     .title("Agent configuration scope")
                     .root(ScrollView::vertical(agent_external_integrations_sections(
-                        &shared,
-                        &reader,
-                        &shared.settings().agent_form,
+                        &shared, &reader,
                     ))),
             )
             .build()?;

@@ -21,7 +21,7 @@ use sui::{
     Align, Alignment, ArrangeCtx, Button, ButtonAppearance, Command, CommandController, CommandCtx,
     Constraints, Event, EventCtx, EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton,
     IconGlyph, Image, ImageFit, ImageHandle, Insets, KeyState, Label, MeasureCtx, PaintCtx,
-    PanelSection, Popover, PopoverAlignment, RebuildOnChange, Rect, RichText, ScrollView,
+    PanelSection, Popover, PopoverAlignment, Presence, RebuildOnChange, Rect, ScrollView,
     SemanticRegion, SemanticTone, SemanticsAction, SemanticsActionRequest, SemanticsCtx,
     SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, SizedBox, Spinner,
     StatusBadge, Surface, SurfaceAppearance, SwitchView, TimerToken, Widget, WidgetPod,
@@ -32,7 +32,6 @@ use sui_lucide::LucideIcon;
 #[cfg(test)]
 use crate::state::ShellStatus;
 use crate::state::{ConnectionPhase, HealthIssue, HealthStructureKey, HealthSurface, Shared, Tab};
-use crate::theme::Palette;
 use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
 pub const TOPBAR_HEIGHT: f32 = if cfg!(target_os = "android") {
@@ -275,7 +274,13 @@ pub struct Shell {
     health_center: WidgetPod,
     /// Reactive loading boundary and retained tab bodies keyed by stable workspace identities.
     body: WidgetPod,
-    compact_tabs: Cell<bool>,
+    /// Compact title-bar breakpoint, read by the retained tab strip and health trigger.
+    compact_tabs: Rc<Cell<bool>>,
+    /// Theme the window was last laid out with. Widgets read the theme live, so a theme change
+    /// refreshes the window once instead of rebuilding any subtree.
+    applied_theme: Cell<sui::DefaultTheme>,
+    /// The cluster state that starts or stops live observation.
+    cluster_schedule: std::sync::Arc<dyn sui::Observable<(bool, bool, bool)>>,
     last_render_options: Cell<Option<WindowRenderOptions>>,
     tab_strip_rect: Rect,
     /// Repaint driver for the loading screen: keeps the per-step elapsed time live
@@ -303,8 +308,10 @@ impl Shell {
         );
         let wordmark = WidgetPod::new(build_wordmark(&shared));
 
-        let tabs = WidgetPod::new(build_tab_bar(&shared, false));
-        let health_center = WidgetPod::new(HealthCenter::new(shared.clone(), false));
+        let compact_tabs = Rc::new(Cell::new(false));
+        let tabs = WidgetPod::new(build_tab_bar(&shared, Rc::clone(&compact_tabs)));
+        let health_center =
+            WidgetPod::new(HealthCenter::new(shared.clone(), Rc::clone(&compact_tabs)));
         let body = {
             let ready = shared.signals().ready.clone();
             let body_shared = shared.clone();
@@ -313,6 +320,12 @@ impl Shell {
             }))
         };
 
+        let applied_theme = Cell::new(shared.signals().theme.get());
+        let cluster_schedule =
+            std::sync::Arc::new(shared.signals().cluster_structure.select_named(
+                "shell cluster observation schedule",
+                cluster::ClusterStructureKey::observation_schedule,
+            ));
         let shell = Self {
             shared,
             titlebar,
@@ -321,7 +334,9 @@ impl Shell {
             tabs,
             health_center,
             body,
-            compact_tabs: Cell::new(false),
+            compact_tabs,
+            applied_theme,
+            cluster_schedule,
             last_render_options: Cell::new(None),
             tab_strip_rect: Rect::ZERO,
             connect_status_timer: Cell::new(None),
@@ -406,13 +421,22 @@ impl Shell {
         ctx.request_paint();
     }
 
-    fn sync_tab_bar_density(&mut self, compact: bool) {
-        if self.compact_tabs.get() == compact {
+    /// Re-read every live theme binding after an appearance change. Retained widgets, their
+    /// focus, scroll positions and drafts all survive; only measure, paint and semantics rerun.
+    fn refresh_for_theme(&self, ctx: &mut EventCtx) {
+        let theme = self.shared.signals().theme.get();
+        if self.applied_theme.replace(theme) == theme {
             return;
         }
-        self.compact_tabs.set(compact);
-        self.tabs = WidgetPod::new(build_tab_bar(&self.shared, compact));
-        self.health_center = WidgetPod::new(HealthCenter::new(self.shared.clone(), compact));
+        let window = sui::InvalidationTarget::Window(ctx.window_id());
+        for kind in [
+            sui::InvalidationKind::Measure,
+            sui::InvalidationKind::Paint,
+            sui::InvalidationKind::HitTest,
+            sui::InvalidationKind::Semantics,
+        ] {
+            ctx.request(sui::InvalidationRequest::new(window, kind));
+        }
     }
 
     /// Route operating-system file drags delivered at the window root to the
@@ -625,29 +649,23 @@ fn build_titlebar_surface(shared: &Shared) -> Surface {
         .fill()
 }
 
-fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
-    RebuildOnChange::key_from(
-        shared
-            .signals()
-            .theme
-            .select_named("shell wordmark theme", |theme| *theme),
-        move |theme| {
-            let mut style = theme.body_text_style();
-            style.font_size = theme.text.base.size;
-            style.line_height = theme.text.base.line_height;
-            style.weight = FontWeight::SEMIBOLD;
-            style.color = theme.surfaces.text;
-            WidgetPod::new(
-                Label::new("Sinomo")
-                    .semantic_name("Sinomo wordmark")
-                    .text_style(style),
+fn build_wordmark(shared: &Shared) -> Label {
+    let shared = shared.clone();
+    Label::new("Sinomo")
+        .semantic_name("Sinomo wordmark")
+        .text_style_when(move || {
+            let theme = shared.theme();
+            crate::theme::token_text_style(
+                &theme,
+                theme.text.base,
+                FontWeight::SEMIBOLD,
+                theme.surfaces.text,
             )
-        },
-    )
+        })
 }
 
 /// Build fixed application destinations and the independently scrolling workspace tab bar.
-fn build_tab_bar(shared: &Shared, compact: bool) -> impl Widget + use<> {
+fn build_tab_bar(shared: &Shared, compact: Rc<Cell<bool>>) -> impl Widget + use<> {
     super::workspace::TabStrip::new(shared.clone(), compact)
 }
 
@@ -690,54 +708,69 @@ fn build_shell_body(shared: Shared, ready: bool) -> WidgetPod {
 }
 
 fn build_loading_view(shared: Shared) -> Surface {
-    let theme = shared.theme();
-    let mut status_style = theme.text_style(theme.palette.text_muted);
-    status_style.font_size = theme.text.base.size;
-    status_style.line_height = theme.text.base.line_height;
-    status_style.weight = FontWeight::MEDIUM;
-
-    let hint_theme = theme;
-    let hints =
-        RebuildOnChange::key_from(shared.signals().loading_stall_lines.clone(), move |lines| {
-            let mut hint_style = hint_theme.text_style(hint_theme.palette.text_muted);
-            hint_style.font_size = hint_theme.text.xs.size;
-            hint_style.line_height = hint_theme.text.xs.line_height;
-            let mut content = Flex::vertical()
-                .main_gap(4.0)
-                .align_items(Alignment::Center);
-            for line in lines.iter().flatten() {
-                content = content.with_child(
-                    SizedBox::new().width(560.0).child(
-                        RichText::from_plain_text(line.clone(), hint_style.clone())
-                            .semantic_name(line.clone()),
-                    ),
-                );
-            }
-            WidgetPod::new(content)
-        });
-
-    let content = Flex::vertical()
+    let status_shared = shared.clone();
+    let mut content = Flex::vertical()
         .main_gap(10.0)
         .align_items(Alignment::Center)
         .with_child(
             Spinner::new("shell-connecting")
                 .size(LOADING_SPINNER_SIZE)
-                .theme(theme),
+                .theme_when(theme_reader(&shared)),
         )
         .with_child(
             Label::new(shared.status_text())
                 .text_from(shared.signals().status_text.clone())
                 .semantic_name("Connection status")
-                .text_style(status_style),
-        )
-        .with_child(hints);
+                .text_style_when(move || {
+                    let theme = status_shared.theme();
+                    crate::theme::token_text_style(
+                        &theme,
+                        theme.text.base,
+                        FontWeight::MEDIUM,
+                        theme.palette.text_muted,
+                    )
+                }),
+        );
+    // Each stall line keeps its own retained label; the elapsed time updates its text in place.
+    for index in 0..2 {
+        let lines = shared.signals().loading_stall_lines.clone();
+        let text = lines.select_named("loading stall line", move |lines| {
+            lines[index].clone().unwrap_or_default()
+        });
+        let shown = lines.select_named("loading stall line shown", move |lines| {
+            lines[index].is_some()
+        });
+        let hint_shared = shared.clone();
+        content = content.with_child(
+            Presence::new(SizedBox::new().width(560.0).child(
+                Label::new("").text_from(text).text_style_when(move || {
+                    let theme = hint_shared.theme();
+                    crate::theme::token_text_style(
+                        &theme,
+                        theme.text.xs,
+                        FontWeight::NORMAL,
+                        theme.palette.text_muted,
+                    )
+                }),
+            ))
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_from(shown)
+            .collapse(sui::Axis::Vertical),
+        );
+    }
 
     Surface::window(Align::center(
         SemanticRegion::new("Sinomo launch progress", content)
             .role(SemanticsRole::GenericContainer),
     ))
-    .theme(theme)
+    .theme_when(theme_reader(&shared))
     .fill()
+}
+
+/// Live theme reader for `theme_when` builders.
+fn theme_reader(shared: &Shared) -> impl Fn() -> sui::DefaultTheme + 'static {
+    let shared = shared.clone();
+    move || shared.theme()
 }
 
 impl Widget for Shell {
@@ -752,6 +785,7 @@ impl Widget for Shell {
 
     fn command(&mut self, ctx: &mut EventCtx, command: &Command<'_>) {
         if command.is(sui::REACTIVE_CHANGED) {
+            self.refresh_for_theme(ctx);
             if cluster::observation_visible(&self.shared) {
                 self.schedule_cluster_observe_timer(ctx);
             } else if let Some(token) = self.cluster_observe_timer.take() {
@@ -763,13 +797,14 @@ impl Widget for Shell {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         // Starting/resuming observation must not depend on a platform redraw event.
         ctx.observe(&self.shared.signals().active_tab);
-        ctx.observe(&self.shared.signals().cluster_structure);
+        ctx.observe(self.cluster_schedule.as_ref());
+        ctx.observe(&self.shared.signals().theme);
         let size = constraints.max;
         #[cfg(all(target_os = "android", feature = "mobile"))]
         crate::sync_android_system_bars(self.shared.borrow().theme_mode);
         let safe_size = crate::platform_safe_area_insets().inset(size);
         let compact = compact_chrome(safe_size.width);
-        self.sync_tab_bar_density(compact);
+        self.compact_tabs.set(compact);
 
         self.titlebar.measure(
             ctx,
@@ -876,11 +911,13 @@ impl Widget for Shell {
             bounds.max_x() - EDGE_PAD - health_measured.width
         };
         let available_w = (bounds.max_x() - EDGE_PAD - health_x).max(0.0);
+        // The stock trigger sizes itself from the health theme; center whatever it measured.
+        let health_y = bounds.y() + ((TOPBAR_HEIGHT - health_measured.height) / 2.0).max(0.0);
         self.health_center.arrange(
             ctx,
             Rect::new(
                 health_x,
-                status_rect.y(),
+                health_y,
                 health_measured.width.min(available_w),
                 health_measured.height,
             ),
@@ -1157,28 +1194,58 @@ struct HealthCenter {
 }
 
 impl HealthCenter {
-    fn new(shared: Shared, compact: bool) -> Self {
+    /// The popover, its trigger, and its content host stay mounted for the life of the shell.
+    /// Status updates restyle the trigger in place and rebuild only the popover's inner content.
+    fn new(shared: Shared, compact: Rc<Cell<bool>>) -> Self {
         let open = Rc::new(Cell::new(false));
         let focused_action = Rc::new(Cell::new(0));
         let action_error = Rc::new(RefCell::new(None));
-        let source = shared
-            .signals()
+        let signals = shared.signals();
+        let ready = signals
             .health_structure
-            .select_named("shell health center structure", Clone::clone);
+            .select_named("shell health ready", |key| usize::from(key.ready));
+        let content_source = signals
+            .health_structure
+            .select_named("shell health content", Clone::clone);
         let build_shared = shared.clone();
         let build_open = Rc::clone(&open);
         let build_focus = Rc::clone(&focused_action);
         let build_error = Rc::clone(&action_error);
-        let child = RebuildOnChange::key_from(source, move |key| {
-            build_health_center_tree(
+        let content = RebuildOnChange::key_from(content_source, move |key| {
+            WidgetPod::new(build_health_content(
                 build_shared.clone(),
                 key,
-                compact,
                 Rc::clone(&build_open),
                 Rc::clone(&build_focus),
                 Rc::clone(&build_error),
-            )
+            ))
         });
+        let open_reader = Rc::clone(&open);
+        let changed_open = Rc::clone(&open);
+        let changed_focus = Rc::clone(&focused_action);
+        let changed_error = Rc::clone(&action_error);
+        let popover = Popover::new(
+            "Health and recovery",
+            health_trigger(&shared, &compact),
+            content,
+        )
+        .theme_when(health_theme_reader(&shared))
+        .open_when(move || open_reader.get())
+        .on_open_change(move |value| {
+            changed_open.set(value);
+            changed_focus.set(0);
+            if !value {
+                changed_error.borrow_mut().take();
+            }
+        })
+        .alignment(PopoverAlignment::End);
+        let child = SwitchView::new()
+            .selected_from(ready)
+            .with_child(HealthReadOnlyStatus::new(
+                shared.clone(),
+                health_trigger(&shared, &compact),
+            ))
+            .with_child(popover);
         Self {
             shared,
             open,
@@ -1262,80 +1329,87 @@ impl Widget for HealthCenter {
     }
 }
 
-fn build_health_center_tree(
-    shared: Shared,
-    key: &HealthCenterKey,
-    compact: bool,
-    open: Rc<Cell<bool>>,
-    focused: Rc<Cell<usize>>,
-    error: Rc<RefCell<Option<String>>>,
-) -> WidgetPod {
-    let theme = key.theme;
-    let tone = health_status_tone(key);
-    let icon = health_status_icon(key);
-    let trigger = SwitchView::new()
-        .selected(usize::from(compact))
-        .with_child(
-            Button::new(compact_health_line(&key.status.label, 22))
-                .semantic_name(key.status.label.clone())
-                .description(format!("Open Health and recovery. {}", key.status.detail))
-                .icon(icon)
-                .appearance(ButtonAppearance::Tonal)
-                .tone(tone)
-                .theme(theme)
-                .min_width(STATUS_PILL_W)
-                .min_height(STATUS_PILL_H)
-                .padding(Insets {
-                    left: 10.0,
-                    top: 2.0,
-                    right: 10.0,
-                    bottom: 2.0,
-                })
-                .enabled(key.ready),
-        )
-        .with_child(
-            IconButton::new(icon, key.status.label.clone())
-                .description(format!("Open Health and recovery. {}", key.status.detail))
-                .appearance(ButtonAppearance::Tonal)
-                .tone(tone)
-                .theme(theme)
-                .size(COMPACT_STATUS_PILL_W)
-                .icon_size(13.0)
-                .selected(key.status.degraded)
-                .enabled(key.ready),
-        );
-    if !key.ready {
-        return WidgetPod::new(HealthReadOnlyStatus::new(
-            trigger,
-            key.status.label.clone(),
-            key.status.detail.clone(),
-        ));
-    }
+/// What the title-bar status trigger shows.
+#[derive(Clone, Debug, PartialEq)]
+struct HealthTriggerKey {
+    label: String,
+    description: String,
+    tone: SemanticTone,
+    icon: IconGlyph,
+    degraded: bool,
+    ready: bool,
+}
 
-    let content = build_health_content(
-        shared,
-        key,
-        Rc::clone(&open),
-        Rc::clone(&focused),
-        Rc::clone(&error),
-    );
-    let open_reader = Rc::clone(&open);
-    let changed_open = Rc::clone(&open);
-    let changed_focus = Rc::clone(&focused);
-    let changed_error = Rc::clone(&error);
-    WidgetPod::new(
-        Popover::new("Health and recovery", trigger, content)
-            .theme(theme)
-            .open_when(move || open_reader.get())
-            .on_open_change(move |value| {
-                changed_open.set(value);
-                changed_focus.set(0);
-                if !value {
-                    changed_error.borrow_mut().take();
+impl HealthTriggerKey {
+    fn from_key(key: &HealthCenterKey) -> Self {
+        Self {
+            label: key.status.label.clone(),
+            description: format!("Open Health and recovery. {}", key.status.detail),
+            tone: health_status_tone(key),
+            icon: health_status_icon(key),
+            degraded: key.status.degraded,
+            ready: key.ready,
+        }
+    }
+}
+
+/// Compact chrome uses the health theme's control size for its trigger and popover.
+fn health_theme_reader(shared: &Shared) -> impl Fn() -> sui::DefaultTheme + 'static {
+    let shared = shared.clone();
+    move || shared.theme_sized(sui::ControlSize::Small)
+}
+
+/// Full status pill and compact icon trigger, switched in place at the compact breakpoint.
+fn health_trigger(shared: &Shared, compact: &Rc<Cell<bool>>) -> SwitchView {
+    let source = || {
+        shared
+            .signals()
+            .health_structure
+            .select_named("shell health trigger", HealthTriggerKey::from_key)
+    };
+    let pill = Button::new("")
+        .appearance(ButtonAppearance::Tonal)
+        .theme_when(health_theme_reader(shared))
+        .min_width(STATUS_PILL_W);
+    let icon = IconButton::new(IconGlyph::Storage, "")
+        .appearance(ButtonAppearance::Tonal)
+        .theme_when(health_theme_reader(shared));
+    let compact = Rc::clone(compact);
+    let icon_shared = shared.clone();
+    SwitchView::new()
+        .selected_when(move || usize::from(compact.get()))
+        .with_child(widgets::Restyle::new(
+            pill,
+            source(),
+            |mut pill: Button, key: &HealthTriggerKey| {
+                pill.set_label(compact_health_line(&key.label, 22));
+                pill.semantic_name(key.label.clone())
+                    .description(key.description.clone())
+                    .icon(key.icon)
+                    .tone(key.tone)
+                    .enabled(key.ready)
+            },
+        ))
+        .with_child(widgets::Restyle::new(
+            icon,
+            source(),
+            // IconButton takes its glyph and name only at construction.
+            move |_: IconButton, key: &HealthTriggerKey| {
+                let icon = IconButton::new(key.icon, key.label.clone())
+                    .description(key.description.clone())
+                    .appearance(ButtonAppearance::Tonal)
+                    .tone(key.tone)
+                    .theme_when(health_theme_reader(&icon_shared))
+                    .selected(key.degraded)
+                    .enabled(key.ready);
+                // Touch platforms keep the compact trigger at the touch target.
+                if cfg!(target_os = "android") {
+                    icon.size(icon_shared.theme().metrics.touch_target_size)
+                } else {
+                    icon
                 }
-            })
-            .alignment(PopoverAlignment::End),
-    )
+            },
+        ))
 }
 
 fn build_health_content(
@@ -1345,8 +1419,8 @@ fn build_health_content(
     focused: Rc<Cell<usize>>,
     error: Rc<RefCell<Option<String>>>,
 ) -> impl Widget + use<> {
-    let theme = key.theme;
-    let palette = Palette::from_theme(&theme, widgets::theme_is_dark(&shared));
+    let theme = shared.theme_sized(sui::ControlSize::Small);
+    let scroll_theme = health_theme_reader(&shared);
     let summary = if key.issues.is_empty() {
         key.status.detail.clone()
     } else {
@@ -1369,28 +1443,28 @@ fn build_health_content(
                     .align_items(Alignment::Center)
                     .gap(8.0)
                     .with_item(
-                        Label::new("Health and recovery").text_style(health_text_style(
-                            &theme,
-                            theme.text.base,
+                        health_label(
+                            &shared,
+                            "Health and recovery",
+                            |theme| theme.text.base,
                             FontWeight::SEMIBOLD,
-                            palette.text,
-                        )),
+                            |palette| palette.text,
+                        ),
                         FlexItem::flex(1.0),
                     )
                     .with_child(
                         StatusBadge::new(key.connection_label.clone())
                             .icon(health_status_icon(key))
                             .tone(health_status_tone(key))
-                            .theme(theme),
+                            .theme_when(health_theme_reader(&shared)),
                     ),
             )
-            .with_child(Label::new(compact_health_line(&summary, 72)).text_style(
-                health_text_style(
-                    &theme,
-                    theme.text.sm,
-                    FontWeight::NORMAL,
-                    palette.text_muted,
-                ),
+            .with_child(health_label(
+                &shared,
+                compact_health_line(&summary, 72),
+                |theme| theme.text.sm,
+                FontWeight::NORMAL,
+                |palette| palette.text_muted,
             )),
         key.connection_label.clone(),
         key.connection_detail.clone(),
@@ -1404,32 +1478,26 @@ fn build_health_content(
             Flex::vertical()
                 .align_items(Alignment::Stretch)
                 .gap(3.0)
-                .with_child(
-                    Label::new("All monitored surfaces are operational.").text_style(
-                        health_text_style(
-                            &theme,
-                            theme.text.sm,
-                            FontWeight::SEMIBOLD,
-                            palette.ok_text,
-                        ),
-                    ),
-                )
-                .with_child(
-                    Label::new(compact_health_line(&key.status.detail, 76)).text_style(
-                        health_text_style(
-                            &theme,
-                            theme.text.sm,
-                            FontWeight::NORMAL,
-                            palette.text_muted,
-                        ),
-                    ),
-                ),
+                .with_child(health_label(
+                    &shared,
+                    "All monitored surfaces are operational.",
+                    |theme| theme.text.sm,
+                    FontWeight::SEMIBOLD,
+                    |palette| palette.good_text,
+                ))
+                .with_child(health_label(
+                    &shared,
+                    compact_health_line(&key.status.detail, 76),
+                    |theme| theme.text.sm,
+                    FontWeight::NORMAL,
+                    |palette| palette.text_muted,
+                )),
         )
         .appearance(SurfaceAppearance::Soft)
         .tone(SemanticTone::Success)
         .padding(Insets::all(10.0))
         .fill_width(true)
-        .theme(theme);
+        .theme_when(health_theme_reader(&shared));
         list.push(
             SemanticRegion::new("All systems operational", empty)
                 .description(key.status.detail.clone())
@@ -1449,7 +1517,6 @@ fn build_health_content(
                             shared.clone(),
                             action,
                             action_index,
-                            theme,
                             Rc::clone(&open),
                             Rc::clone(&focused),
                             Rc::clone(&error),
@@ -1469,7 +1536,7 @@ fn build_health_content(
                 IconGlyph::Alert
             })
             .tone(SemanticTone::Warning)
-            .theme(theme);
+            .theme_when(health_theme_reader(&shared));
             let card = Surface::panel(
                 Flex::vertical()
                     .align_items(Alignment::Stretch)
@@ -1479,33 +1546,31 @@ fn build_health_content(
                             .align_items(Alignment::Center)
                             .gap(8.0)
                             .with_item(
-                                Label::new(issue.title.clone()).text_style(health_text_style(
-                                    &theme,
-                                    theme.text.sm,
+                                health_label(
+                                    &shared,
+                                    issue.title.clone(),
+                                    |theme| theme.text.sm,
                                     FontWeight::SEMIBOLD,
-                                    palette.text,
-                                )),
+                                    |palette| palette.text,
+                                ),
                                 FlexItem::flex(1.0),
                             )
                             .with_child(badge),
                     )
-                    .with_child(
-                        Label::new(compact_health_line(&issue.detail, 88)).text_style(
-                            health_text_style(
-                                &theme,
-                                theme.text.sm,
-                                FontWeight::NORMAL,
-                                palette.text_muted,
-                            ),
-                        ),
-                    )
+                    .with_child(health_label(
+                        &shared,
+                        compact_health_line(&issue.detail, 88),
+                        |theme| theme.text.sm,
+                        FontWeight::NORMAL,
+                        |palette| palette.text_muted,
+                    ))
                     .with_child(buttons),
             )
             .appearance(SurfaceAppearance::Soft)
             .tone(SemanticTone::Warning)
             .padding(Insets::all(10.0))
             .fill_width(true)
-            .theme(theme);
+            .theme_when(health_theme_reader(&shared));
             list.push(
                 SemanticRegion::new(issue.title.clone(), card)
                     .description(issue.detail.clone())
@@ -1522,41 +1587,33 @@ fn build_health_content(
         .with_child(
             PanelSection::new("Affected surfaces", issues)
                 .gap(8.0)
-                .title_style(health_text_style(
-                    &theme,
-                    theme.text.sm,
-                    FontWeight::SEMIBOLD,
-                    palette.text_muted,
-                ))
-                .theme(theme),
+                .theme_when(health_theme_reader(&shared)),
         );
     if let Some(message) = key.action_error.clone() {
         let callout = Surface::panel(
             Flex::vertical()
                 .align_items(Alignment::Stretch)
                 .gap(2.0)
-                .with_child(
-                    Label::new("Recovery action failed").text_style(health_text_style(
-                        &theme,
-                        theme.text.sm,
-                        FontWeight::SEMIBOLD,
-                        palette.danger_text,
-                    )),
-                )
-                .with_child(Label::new(compact_health_line(&message, 76)).text_style(
-                    health_text_style(
-                        &theme,
-                        theme.text.sm,
-                        FontWeight::NORMAL,
-                        palette.danger_text,
-                    ),
+                .with_child(health_label(
+                    &shared,
+                    "Recovery action failed",
+                    |theme| theme.text.sm,
+                    FontWeight::SEMIBOLD,
+                    |palette| palette.bad_text,
+                ))
+                .with_child(health_label(
+                    &shared,
+                    compact_health_line(&message, 76),
+                    |theme| theme.text.sm,
+                    FontWeight::NORMAL,
+                    |palette| palette.bad_text,
                 )),
         )
         .appearance(SurfaceAppearance::Soft)
         .tone(SemanticTone::Danger)
         .padding(Insets::all(9.0))
         .fill_width(true)
-        .theme(theme);
+        .theme_when(health_theme_reader(&shared));
         body.push(
             SemanticRegion::new("Recovery action failed", callout)
                 .description(message)
@@ -1572,7 +1629,6 @@ fn build_health_content(
                 enabled: true,
             },
             action_index,
-            theme,
             open,
             focused,
             error,
@@ -1599,7 +1655,7 @@ fn build_health_content(
         width,
         ScrollView::vertical(body)
             .name("Health and recovery details")
-            .theme(theme)
+            .theme_when(scroll_theme)
             .viewport_width_hint(true),
     ))
 }
@@ -1624,6 +1680,21 @@ fn health_status_icon(key: &HealthCenterKey) -> IconGlyph {
     } else {
         IconGlyph::Storage
     }
+}
+
+/// A health-popover label whose type and color follow the live theme.
+fn health_label(
+    shared: &Shared,
+    text: impl Into<String>,
+    token: fn(&sui::DefaultTheme) -> sui::ThemeTextToken,
+    weight: FontWeight,
+    color: fn(&sui::SurfacePalette) -> sui::Color,
+) -> Label {
+    let shared = shared.clone();
+    Label::new(text).text_style_when(move || {
+        let theme = shared.theme_sized(sui::ControlSize::Small);
+        health_text_style(&theme, token(&theme), weight, color(&theme.surfaces))
+    })
 }
 
 fn health_text_style(
@@ -1727,7 +1798,6 @@ fn build_health_action_control(
     shared: Shared,
     action: HealthActionItem,
     index: usize,
-    theme: sui::DefaultTheme,
     open: Rc<Cell<bool>>,
     focused: Rc<Cell<usize>>,
     error: Rc<RefCell<Option<String>>>,
@@ -1737,7 +1807,6 @@ fn build_health_action_control(
         action.clone(),
         index,
         false,
-        theme,
         Rc::clone(&open),
         Rc::clone(&focused),
         Rc::clone(&error),
@@ -1747,7 +1816,6 @@ fn build_health_action_control(
         action.clone(),
         index,
         true,
-        theme,
         Rc::clone(&open),
         Rc::clone(&focused),
         Rc::clone(&error),
@@ -1786,7 +1854,6 @@ fn stock_health_action_button(
     action: HealthActionItem,
     index: usize,
     selected: bool,
-    theme: sui::DefaultTheme,
     open: Rc<Cell<bool>>,
     focused: Rc<Cell<usize>>,
     error: Rc<RefCell<Option<String>>>,
@@ -1803,7 +1870,7 @@ fn stock_health_action_button(
         .icon(icon)
         .appearance(appearance)
         .tone(tone)
-        .theme(theme)
+        .theme_when(health_theme_reader(&shared))
         .min_width(0.0)
         .enabled(action.enabled)
         .on_press_with_ctx(move |ctx| {
@@ -2137,19 +2204,17 @@ impl Widget for HealthConnectionStatus {
 }
 
 struct HealthReadOnlyStatus {
-    label: String,
-    detail: String,
+    shared: Shared,
     child: SingleChild,
 }
 
 impl HealthReadOnlyStatus {
-    fn new<W>(child: W, label: String, detail: String) -> Self
+    fn new<W>(shared: Shared, child: W) -> Self
     where
         W: Widget + 'static,
     {
         Self {
-            label,
-            detail,
+            shared,
             child: SingleChild::new(child),
         }
     }
@@ -2169,9 +2234,10 @@ impl Widget for HealthReadOnlyStatus {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let key = ctx.observe(&self.shared.signals().health_structure);
         let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
-        node.name = Some(self.label.clone());
-        node.description = Some(self.detail.clone());
+        node.name = Some(key.status.label);
+        node.description = Some(key.status.detail);
         node.value = Some(SemanticsValue::Text("connecting".to_string()));
         node.state.busy = true;
         ctx.push(node);
@@ -2909,8 +2975,10 @@ mod tests {
             status.bounds
         );
 
-        // Pinned destinations stay fixed while closable tabs overflow on a phone.
+        // Pinned destinations stay fixed while closable tabs overflow on a phone. A single
+        // selected tab is capped to the viewport, so open two to overflow it.
         shared.new_workspace_tab(crate::state::WorkspaceTabKind::Chat);
+        shared.new_workspace_tab(crate::state::WorkspaceTabKind::Files);
         root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(320.0, 720.0))))?;
         app.run_until_idle()?;
         let narrow = window.snapshot()?;
@@ -3007,6 +3075,133 @@ mod tests {
             "ArrowDown should move the recovery action cursor"
         );
 
+        Ok(())
+    }
+
+    /// Appearance changes restyle the retained tree in place: every surface keeps its widget
+    /// identities (and with them focus, scroll and drafts) across a theme or text-size switch.
+    #[test]
+    fn theme_changes_keep_retained_widgets_mounted() -> sui::Result<()> {
+        use crate::theme::{AppTextScale, AppThemeMode};
+
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared.set_theme_mode(AppThemeMode::Dark);
+        // Chat's daemonless session load never settles headlessly; a quiet surface keeps the
+        // harness idle-able.
+        shared.set_active_tab(Tab::Evolution);
+        let app = sui_testing::TestApp::from_runtime(crate::build_runtime(shared.clone())?)?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                1280.0, 800.0,
+            ))))?;
+        app.run_until_idle()?;
+
+        let identities = || -> sui::Result<Vec<(String, sui::WidgetId)>> {
+            let snapshot = window.snapshot()?;
+            let mut ids: Vec<_> = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .filter_map(|node| {
+                    let name = node.name.as_deref()?;
+                    let tracked = matches!(
+                        (&node.role, name),
+                        (SemanticsRole::ScrollView, "Primary navigation tabs")
+                            | (SemanticsRole::TabBar, "shell-tabs")
+                            | (SemanticsRole::Text, "Sinomo wordmark")
+                    ) || node.description.as_deref().is_some_and(|description| {
+                        description.starts_with("Open Health and recovery.")
+                            || description.starts_with("Pinned ")
+                    });
+                    tracked.then(|| (format!("{:?} {name}", node.role), node.id))
+                })
+                .collect();
+            ids.sort();
+            Ok(ids)
+        };
+        let before = identities()?;
+        assert!(before.len() >= 9, "tracked chrome present: {before:?}");
+
+        shared.set_theme_mode(AppThemeMode::Light);
+        app.run_until_idle()?;
+        assert_eq!(
+            identities()?,
+            before,
+            "a theme switch must not remount chrome"
+        );
+        assert_eq!(
+            shared.signals().theme.get(),
+            crate::theme::resolve_theme(AppThemeMode::Light)
+        );
+
+        shared.set_text_scale(AppTextScale::Large);
+        app.run_until_idle()?;
+        assert_eq!(
+            identities()?,
+            before,
+            "a text-size switch must not remount chrome"
+        );
+        Ok(())
+    }
+
+    /// A theme switch rebuilds nothing on any surface: every accessible widget keeps its identity.
+    #[test]
+    fn theme_changes_keep_surface_widgets_mounted() -> sui::Result<()> {
+        use crate::theme::AppThemeMode;
+
+        for tab in [
+            Tab::Sinomo,
+            Tab::Files,
+            Tab::Cluster,
+            Tab::Evolution,
+            Tab::Settings,
+        ] {
+            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            shared.set_theme_mode(AppThemeMode::Dark);
+            shared.set_active_tab(tab);
+            let app = sui_testing::TestApp::from_runtime(crate::build_runtime(shared.clone())?)?;
+            let window = app.main_window()?;
+            // Pump a few frames rather than waiting for idle: chat's daemonless session load
+            // never settles headlessly.
+            let identities = || -> sui::Result<Vec<(String, sui::WidgetId)>> {
+                window.pump_frames(3)?;
+                let snapshot = window.snapshot_now()?;
+                let mut ids: Vec<_> = snapshot
+                    .accessibility
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            format!("{:?} {}", node.role, node.name.clone().unwrap_or_default()),
+                            node.id,
+                        )
+                    })
+                    .collect();
+                ids.sort();
+                Ok(ids)
+            };
+            window.pump_frames(30)?;
+            let before = identities()?;
+            assert!(
+                before
+                    .iter()
+                    .any(|(name, _)| name.starts_with("ScrollView")),
+                "{tab:?} surface is mounted: {before:?}"
+            );
+            assert_eq!(
+                identities()?,
+                before,
+                "{tab:?} layout settles before the switch"
+            );
+            shared.set_theme_mode(AppThemeMode::Light);
+            assert_eq!(
+                identities()?,
+                before,
+                "{tab:?} must not remount on a theme switch"
+            );
+        }
         Ok(())
     }
 

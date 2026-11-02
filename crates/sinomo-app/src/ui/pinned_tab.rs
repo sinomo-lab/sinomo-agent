@@ -10,33 +10,30 @@ pub(super) struct PinnedTab {
 }
 
 impl PinnedTab {
-    pub fn new(shared: Shared, destination: Tab, compact: bool) -> Self {
+    pub fn new(shared: Shared, destination: Tab) -> Self {
         let selected = shared.clone();
         let activate = shared.clone();
         let theme = shared.clone();
-        let size = if cfg!(target_os = "android") {
-            44.0
-        } else if compact {
-            24.0
-        } else {
-            32.0
-        };
         let control = IconButton::from_image(
             super::shell::tab_icons()[destination.index()].handle(),
             destination.title(),
         )
         .description(format!("Pinned {} tab", destination.title()))
-        .size(size)
-        .icon_size(18.0)
         .appearance(sui::ButtonAppearance::Ghost)
         .tone(sui::SemanticTone::Neutral)
         .selected_when(move || {
             selected.signals().workspace_selection.get() == WorkspaceSelection::Pinned(destination)
         })
         .theme_when(move || {
-            let mut theme = theme.theme();
-            theme.metrics.min_height = size;
-            theme
+            let theme = theme.theme();
+            // Touch platforms size destinations to the touch target.
+            if cfg!(target_os = "android") {
+                let mut touch = theme;
+                touch.metrics.icon_button_size = theme.metrics.touch_target_size;
+                touch
+            } else {
+                theme
+            }
         })
         .on_press_with_ctx(move |ctx| {
             activate.set_active_tab(destination);

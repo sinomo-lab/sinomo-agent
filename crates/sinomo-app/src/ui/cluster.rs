@@ -10,14 +10,15 @@ use std::thread;
 use time::OffsetDateTime;
 
 use sui::{
-    Alignment, ArrangeCtx, Button, ButtonAppearance, Color, Command, ConstraintQuery,
+    Alignment, ArrangeCtx, Axis, Button, ButtonAppearance, Color, Command, ConstraintQuery,
     ConstraintView, Constraints, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx, Flex,
-    FlexItem, FlexWrap, FontWeight, IconGlyph, Insets, KeyState, Label, MasterDetail,
-    MasterDetailState, MeasureCtx, PaintCtx, PanelSection, Path, PathBuilder, Point, PointerButton,
-    PointerEventKind, RebuildOnChange, Rect, ScrollView, SegmentedControl, Select, SemanticTone,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Size, SizedBox, SplitState,
-    StatusBadge, StrokeStyle, Surface, SurfaceAppearance, SurfaceBorder, SurfaceElevation,
-    SwitchView, TabBar, TextInput, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
+    FlexItem, FlexWrap, FontWeight, IconGlyph, Insets, KeyState, KeyedStack, Label, MasterDetail,
+    MasterDetailState, MeasureCtx, Observable, Observer, PaintCtx, PanelSection, Path, PathBuilder,
+    Point, PointerButton, PointerEventKind, Presence, RebuildOnChange, Rect, ScrollView,
+    SegmentedControl, Select, Selector, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode,
+    SemanticsRole, Signal, Size, SizedBox, SourceId, SplitState, StatusBadge, StrokeStyle,
+    Subscription, Surface, SurfaceAppearance, SurfaceBorder, SurfaceElevation, SwitchView, TabBar,
+    TextInput, TextStyle, ThemeTextToken, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
     WidgetPodVisitor,
 };
 
@@ -29,10 +30,10 @@ use crate::metrics::{
     MetricStore, MetricTransform, metric_process_identity_matches, strict_metrics_interval_delta,
 };
 use crate::state::{Shared, Tab};
-use crate::theme::Palette;
 use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets;
+use sui::SurfacePalette;
 
 const HEADER_H: f32 = 78.0;
 const PAD: f32 = 22.0;
@@ -41,7 +42,6 @@ const LAN_R: f32 = 18.0;
 const PANEL_W: f32 = 360.0;
 const PANEL_PAD: f32 = 16.0;
 const DETAIL_PANEL_H: f32 = 620.0;
-const DETAIL_BUTTON_H: f32 = 30.0;
 const LEGEND_H: f32 = 32.0;
 const VERTEX_TEXT_TOP_GAP: f32 = 6.0;
 const VERTEX_TEXT_LINE_GAP: f32 = 2.0;
@@ -330,9 +330,10 @@ pub struct ClusterState {
 }
 
 /// Cloneable UI projection shared by the Cluster tab's structural selectors.
+///
+/// The theme is not part of it: a theme change restyles the retained tab in place.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClusterStructureKey {
-    theme: DefaultTheme,
     snapshot: ClusterSnapshot,
     subview: ClusterSubview,
     selected: Option<ClusterSelection>,
@@ -340,6 +341,8 @@ pub struct ClusterStructureKey {
     refreshing: bool,
     observation_revision: u64,
     observation_live: bool,
+    /// A collection request is running.
+    observation_in_flight: bool,
     dashboard_diagnostics: bool,
     explorer: MetricExplorerState,
     explorer_entry: Option<Arc<MetricCatalogEntry>>,
@@ -353,10 +356,22 @@ pub struct ClusterStructureKey {
 }
 
 impl ClusterStructureKey {
-    pub(crate) fn new(theme: DefaultTheme, cluster: Option<&ClusterState>) -> Self {
+    /// What starts or stops live observation besides the active tab: an observing subview,
+    /// the overview's live state, and live logs.
+    pub(crate) fn observation_schedule(&self) -> (bool, bool, bool) {
+        (
+            matches!(
+                self.subview,
+                ClusterSubview::Overview | ClusterSubview::Explore
+            ),
+            self.observation_live,
+            self.subview == ClusterSubview::Logs && self.logs.is_live(),
+        )
+    }
+
+    pub(crate) fn new(_theme: DefaultTheme, cluster: Option<&ClusterState>) -> Self {
         let Some(cluster) = cluster else {
             return Self {
-                theme,
                 snapshot: ClusterSnapshot::default(),
                 subview: ClusterSubview::Overview,
                 selected: None,
@@ -364,6 +379,7 @@ impl ClusterStructureKey {
                 refreshing: false,
                 observation_revision: 0,
                 observation_live: true,
+                observation_in_flight: false,
                 dashboard_diagnostics: false,
                 explorer: MetricExplorerState::default(),
                 explorer_entry: None,
@@ -376,7 +392,6 @@ impl ClusterStructureKey {
             };
         };
         Self {
-            theme,
             snapshot: cluster.snapshot.clone(),
             logs: cluster.logs.key.clone(),
             subview: cluster.subview,
@@ -385,6 +400,7 @@ impl ClusterStructureKey {
             refreshing: cluster.refreshing,
             observation_revision: cluster.observation.revision,
             observation_live: cluster.observation.paused_at.is_none(),
+            observation_in_flight: cluster.observation.in_flight,
             dashboard_diagnostics: cluster.observation.dashboard_diagnostics,
             explorer: cluster.explorer.clone(),
             explorer_entry: cluster
@@ -1137,7 +1153,7 @@ pub fn view(shared: Shared) -> impl Widget {
         .with_child(logs::view(&shared, &reader));
     let sections = build_cluster_section_bar(&shared, &reader, tab_section_source);
     let cluster = Dock::new(Dock::new(body).top(CLUSTER_SECTION_H, sections))
-        .top(HEADER_H, cluster_header_host(&shared, &reader));
+        .top(HEADER_H, cluster_header(&shared, &reader));
     let offline =
         DaemonOfflinePanel::new(&shared, &reader, "Cluster offline", CLUSTER_OFFLINE_SUMMARY)
             .build();
@@ -1260,220 +1276,320 @@ fn cluster_metric_catalog_host(shared: &Shared, reader: &ThemeReader) -> impl Wi
     catalog::view(shared, reader)
 }
 
+/// What the explorer detail page describes. Choosing another metric in the catalog replaces the
+/// page's content; samples, query controls, and theme changes update the mounted content.
 #[derive(Clone, Debug, PartialEq)]
-struct MetricDetailStructureKey {
-    theme: DefaultTheme,
-    entry: Option<Arc<MetricCatalogEntry>>,
+struct MetricIdentity {
+    name: String,
+    help: String,
+    kind: ObserveMetricKind,
+    unit: Option<ObserveMetricUnit>,
+}
+
+fn cluster_metric_detail_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let identity = cluster_select(shared, "metric detail identity", |key| {
+        key.explorer_entry.as_ref().map(|entry| MetricIdentity {
+            name: entry.descriptor.name.clone(),
+            help: entry.descriptor.help.clone(),
+            kind: entry.descriptor.kind,
+            unit: entry.descriptor.unit,
+        })
+    });
+    let content_shared = shared.clone();
+    let content_reader = Rc::clone(reader);
+    // The scroll view stays mounted; only the metric's own content is replaced.
+    let content = RebuildOnChange::key_from(identity, move |identity| match identity {
+        Some(identity) => WidgetPod::new(build_metric_detail(
+            &content_shared,
+            &content_reader,
+            identity,
+        )),
+        None => WidgetPod::new(SizedBox::new()),
+    });
+    let page = Surface::window(
+        ScrollView::vertical(content)
+            .name("Metric explorer detail")
+            .viewport_width_hint(true)
+            .theme_when(clone_reader(reader)),
+    )
+    .padding(Insets::all(PAD))
+    .fill()
+    .theme_when(clone_reader(reader));
+    let empty = EmptyState::new(
+        "Select a metric",
+        "Search the registered catalog to inspect its live history",
+    )
+    .name("Metric explorer detail")
+    .transparent()
+    .theme_when(clone_reader(reader));
+    SwitchView::new()
+        .selected_from(cluster_select(shared, "metric detail selected", |key| {
+            usize::from(key.explorer_entry.is_some())
+        }))
+        .with_child(empty)
+        .with_child(page)
+}
+
+fn build_metric_detail(shared: &Shared, reader: &ThemeReader, identity: &MetricIdentity) -> Flex {
+    let title = ConstraintView::new(build_metric_detail_header(shared, reader, identity, true))
+        .when(
+            ConstraintQuery::new().min_width(600.0),
+            build_metric_detail_header(shared, reader, identity, false),
+        );
+    Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(14.0)
+        .with_child(title)
+        .with_child(metric_query_controls(shared, reader, identity))
+        .with_child(build_metric_live_details(shared, reader, identity))
+}
+
+/// The selected metric's live query, keyed by everything it reads: retained samples, the
+/// observation clock, and the explorer's scope and transform. Catalog search and kind filters
+/// are not part of it.
+#[derive(Clone, Debug, PartialEq)]
+struct MetricQueryKey {
+    metrics_revision: u64,
+    observation_time: Option<OffsetDateTime>,
+    observation_live: bool,
+    metric: Option<String>,
     node: Option<String>,
     labels: BTreeMap<String, String>,
     transform: ExplorerTransform,
 }
 
-fn cluster_metric_detail_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .cluster_structure
-        .select_named("metric detail controls", |key| MetricDetailStructureKey {
-            theme: key.theme,
-            entry: key.explorer_entry.clone(),
-            node: key.explorer.selected_node.clone(),
-            labels: key.explorer.label_filters.clone(),
-            transform: key.explorer.transform,
-        });
-    let shared = shared.clone();
-    let reader = reader.clone();
-    RebuildOnChange::key_from(source, move |_| {
-        build_cluster_metric_detail(&shared, &reader)
-    })
+/// One evaluation of the selected metric's query, shared by the retained summary, chart,
+/// legend, and series table.
+struct MetricLive {
+    value: String,
+    coverage: String,
+    subtitle: String,
+    legend: Vec<String>,
+    chart_series: Vec<MetricSeries>,
+    chart_state: usize,
+    capped: Option<String>,
+    rows: Vec<MetricSeriesRow>,
+    table_state: usize,
+    transform: ExplorerTransform,
+    window: ExplorerWindow,
+    end_at: OffsetDateTime,
+    paused: bool,
 }
 
-fn build_cluster_metric_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (entry, mut explorer) = {
-        let cluster = shared.cluster();
-        (
-            cluster
-                .explorer
-                .selected_metric
-                .as_deref()
-                .and_then(|name| cluster.observation.metrics.catalog_entry(name).cloned()),
-            cluster.explorer.clone(),
-        )
-    };
-    let Some(entry) = entry else {
-        return WidgetPod::new(
-            EmptyState::new(
-                "Select a metric",
-                "Search the registered catalog to inspect its live history",
-            )
-            .name("Metric explorer detail")
-            .transparent()
-            .theme_when(clone_reader(reader)),
-        );
-    };
-    explorer.window = dashboard::metric_window(&entry.descriptor.name, entry.descriptor.kind);
-    let title = ConstraintView::new(build_metric_detail_header(
-        shared, reader, &entry, false, true,
-    ))
-    .when(
-        ConstraintQuery::new().min_width(600.0),
-        build_metric_detail_header(shared, reader, &entry, false, false),
-    );
-    let controls = build_metric_query_controls(shared, reader, &entry, &explorer);
-    let source = shared
-        .signals()
-        .cluster_structure
-        .select_named("metric live samples", |key| {
-            (
-                key.metrics_revision,
-                key.observation_time,
-                key.observation_live,
-            )
-        });
-    let live_shared = shared.clone();
-    let live_reader = reader.clone();
-    let hover = Rc::new(Cell::new(None));
-    let live = RebuildOnChange::key_from(source, move |_| {
-        build_metric_live_details(&live_shared, &live_reader, hover.clone())
+type MetricLiveSource = Projection<MetricQueryKey, Option<Rc<MetricLive>>>;
+
+fn metric_live_source(shared: &Shared) -> MetricLiveSource {
+    let trigger = cluster_select(shared, "metric live query", |key| MetricQueryKey {
+        metrics_revision: key.metrics_revision,
+        observation_time: key.observation_time,
+        observation_live: key.observation_live,
+        metric: key.explorer.selected_metric.clone(),
+        node: key.explorer.selected_node.clone(),
+        labels: key.explorer.label_filters.clone(),
+        transform: key.explorer.transform,
     });
-    WidgetPod::new(
-        Surface::window(
-            ScrollView::vertical(
-                Flex::vertical()
-                    .align_items(Alignment::Stretch)
-                    .gap(14.0)
-                    .with_child(title)
-                    .with_child(controls)
-                    .with_child(live),
-            )
-            .name("Metric explorer detail")
-            .viewport_width_hint(true)
-            .theme_when(clone_reader(reader)),
-        )
-        .padding(Insets::all(PAD))
-        .fill()
-        .theme_when(clone_reader(reader)),
-    )
+    let shared = shared.clone();
+    Projection::new(trigger, move || metric_live(&shared.cluster()).map(Rc::new))
 }
 
-fn build_metric_live_details(
-    shared: &Shared,
-    reader: &ThemeReader,
-    hover: Rc<Cell<Option<f32>>>,
-) -> WidgetPod {
-    let (entry, explorer, query, _in_flight) = {
-        let cluster = shared.cluster();
-        let mut explorer = cluster.explorer.clone();
-        let entry = explorer
-            .selected_metric
-            .as_deref()
-            .and_then(|name| cluster.observation.metrics.catalog_entry(name).cloned());
-        if let Some(entry) = &entry {
-            explorer.window =
-                dashboard::metric_window(&entry.descriptor.name, entry.descriptor.kind);
-        }
-        let query = entry.as_ref().map(|entry| {
-            let transform = metric_query_transform(explorer.transform, entry.descriptor.kind);
-            cluster.observation.metrics.query_window(
-                &MetricSelection {
-                    metric_name: entry.descriptor.name.clone(),
-                    node_id: explorer.selected_node.clone(),
-                    labels: explorer.label_filters.clone(),
-                    transform,
-                },
-                explorer.window.sample_limit(),
-                Some(cluster.observation_time() - explorer.window.duration()),
-            )
-        });
-        (entry, explorer, query, cluster.observation.in_flight)
-    };
-    let Some(entry) = entry else {
-        return WidgetPod::new(
-            EmptyState::new(
-                "Select a metric",
-                "Search the registered catalog to inspect current values and short live history",
-            )
-            .name("Metric explorer detail")
-            .icon(IconGlyph::Search)
-            .transparent()
-            .theme_when(clone_reader(reader)),
-        );
-    };
-    let query = query.expect("catalog entry builds a query");
+fn metric_live(cluster: &ClusterState) -> Option<MetricLive> {
+    let mut explorer = cluster.explorer.clone();
+    let entry = explorer
+        .selected_metric
+        .as_deref()
+        .and_then(|name| cluster.observation.metrics.catalog_entry(name).cloned())?;
+    explorer.window = dashboard::metric_window(&entry.descriptor.name, entry.descriptor.kind);
+    let query = cluster.observation.metrics.query_window(
+        &MetricSelection {
+            metric_name: entry.descriptor.name.clone(),
+            node_id: explorer.selected_node.clone(),
+            labels: explorer.label_filters.clone(),
+            transform: metric_query_transform(explorer.transform, entry.descriptor.kind),
+        },
+        explorer.window.sample_limit(),
+        Some(cluster.observation_time() - explorer.window.duration()),
+    );
     let effective_transform =
         if ExplorerTransform::available(entry.descriptor.kind).contains(&explorer.transform) {
             explorer.transform
         } else {
             ExplorerTransform::Auto
         };
+    let (value, coverage) =
+        metric_current_summary(cluster, &entry, effective_transform, &explorer, &query);
 
-    let mut badges = Flex::horizontal()
+    let mut chart_series = query.series.clone();
+    sort_metric_series(&mut chart_series);
+    chart_series.truncate(EXPLORER_CHART_SERIES_LIMIT);
+    let sample_count = query
+        .series
+        .iter()
+        .map(|series| series.points.len())
+        .max()
+        .unwrap_or_default();
+    let observed_span = query
+        .oldest_at()
+        .zip(query.newest_at())
+        .map(|(oldest, newest)| format_metric_span(newest - oldest))
+        .unwrap_or_else(|| "no span yet".to_string());
+    let subtitle = format!(
+        "{} · {} · {} window · {} retained sample{} over {}",
+        explorer_transform_summary(explorer.transform, entry.descriptor.kind),
+        metric_unit_label(entry.descriptor.unit),
+        explorer.window.label(),
+        sample_count,
+        if sample_count == 1 { "" } else { "s" },
+        observed_span,
+    );
+    let legend = chart_series
+        .iter()
+        .enumerate()
+        .map(|(index, series)| {
+            format!(
+                "S{} {} · {}",
+                index + 1,
+                short(&series.key.display_name(), 30),
+                format_metric_value(
+                    series.latest(),
+                    entry.descriptor.unit,
+                    explorer.transform,
+                    entry.descriptor.kind,
+                )
+            )
+        })
+        .collect();
+    let chart_state = if query.value_conflict {
+        1
+    } else if chart_series.is_empty() {
+        2
+    } else {
+        0
+    };
+    let capped = (!query.value_conflict
+        && (query.history_truncated || query.matching_series > EXPLORER_CHART_SERIES_LIMIT))
+        .then(|| {
+            format!(
+                "Showing up to {} of {} matching series; filter by node or labels for a precise comparison",
+                EXPLORER_CHART_SERIES_LIMIT,
+                query.matching_series.max(query.series.len())
+            )
+        });
+    let (rows, table_state) = if query.value_conflict {
+        (Vec::new(), 1)
+    } else if query.series.is_empty() {
+        (Vec::new(), 2)
+    } else {
+        (metric_series_rows(&entry, effective_transform, &query), 0)
+    };
+    Some(MetricLive {
+        value,
+        coverage,
+        subtitle,
+        legend,
+        chart_series,
+        chart_state,
+        capped,
+        rows,
+        table_state,
+        transform: explorer.transform,
+        window: explorer.window,
+        end_at: cluster.observation_time(),
+        paused: cluster.observation.paused_at.is_some(),
+    })
+}
+
+fn build_metric_live_details(
+    shared: &Shared,
+    reader: &ThemeReader,
+    identity: &MetricIdentity,
+) -> Flex {
+    let live = metric_live_source(shared);
+    let series_count = cluster_select(shared, "metric series count", |key| {
+        key.explorer_entry
+            .as_ref()
+            .map_or(0, |entry| entry.current_series)
+    });
+    let series = widgets::Restyle::new(
+        StatusBadge::new(String::new())
+            .label_from(cluster_select(shared, "metric series badge", |key| {
+                format!(
+                    "{} series",
+                    key.explorer_entry
+                        .as_ref()
+                        .map_or(0, |entry| entry.current_series)
+                )
+            }))
+            .theme_when(clone_reader(reader)),
+        series_count,
+        |badge, count| {
+            badge.tone(if *count > EXPLORER_CHART_SERIES_LIMIT {
+                SemanticTone::Warning
+            } else {
+                SemanticTone::Neutral
+            })
+        },
+    );
+    let badges = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .align_items(Alignment::Center)
         .gap(6.0)
         .with_child(
-            StatusBadge::new(metric_kind_label(entry.descriptor.kind))
+            StatusBadge::new(metric_kind_label(identity.kind))
                 .tone(SemanticTone::Neutral)
                 .theme_when(clone_reader(reader)),
         )
         .with_child(
-            StatusBadge::new(metric_unit_label(entry.descriptor.unit))
+            StatusBadge::new(metric_unit_label(identity.unit))
                 .tone(SemanticTone::Neutral)
                 .theme_when(clone_reader(reader)),
         )
+        .with_child(series)
         .with_child(
-            StatusBadge::new(format!("{} series", entry.current_series))
-                .tone(if entry.current_series > EXPLORER_CHART_SERIES_LIMIT {
-                    SemanticTone::Warning
-                } else {
-                    SemanticTone::Neutral
+            Presence::new(
+                StatusBadge::new("Descriptor conflict")
+                    .tone(SemanticTone::Danger)
+                    .theme_when(clone_reader(reader)),
+            )
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_from(cluster_select(
+                shared,
+                "metric descriptor conflict",
+                |key| {
+                    key.explorer_entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.descriptor_conflict)
+                },
+            )),
+        )
+        .with_child(
+            Presence::new(
+                StatusBadge::new("Dimensions capped")
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+            )
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_from(cluster_select(shared, "metric dimensions capped", |key| {
+                key.explorer_entry.as_ref().is_some_and(|entry| {
+                    entry.label_keys_truncated || !entry.label_values_truncated.is_empty()
                 })
-                .theme_when(clone_reader(reader)),
+            })),
         );
-    if entry.descriptor_conflict {
-        badges.push(
-            StatusBadge::new("Descriptor conflict")
-                .tone(SemanticTone::Danger)
-                .theme_when(clone_reader(reader)),
-        );
-    }
-    if entry.label_keys_truncated || !entry.label_values_truncated.is_empty() {
-        badges.push(
-            StatusBadge::new("Dimensions capped")
-                .tone(SemanticTone::Warning)
-                .theme_when(clone_reader(reader)),
-        );
-    }
 
-    let current = build_metric_current_summary(
-        shared,
-        reader,
-        &entry,
-        effective_transform,
-        &explorer,
-        &query,
-    );
-    let chart = build_metric_chart_panel(shared, reader, &entry, &explorer, &query, hover);
-    let series = build_metric_series_table(reader, &entry, effective_transform, &query);
-    WidgetPod::new(
-        Flex::vertical()
-            .align_items(Alignment::Stretch)
-            .gap(14.0)
-            .with_child(badges)
-            .with_child(current)
-            .with_child(chart)
-            .with_child(series),
-    )
+    Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(14.0)
+        .with_child(badges)
+        .with_child(build_metric_current_summary(reader, &live))
+        .with_child(build_metric_chart_panel(reader, identity, &live))
+        .with_child(build_metric_series_table(reader, &live))
 }
 
 fn build_metric_detail_header(
     shared: &Shared,
     reader: &ThemeReader,
-    entry: &MetricCatalogEntry,
-    _in_flight: bool,
+    identity: &MetricIdentity,
     compact: bool,
 ) -> impl Widget + use<> {
-    let theme = shared.theme();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
     let back_navigation = shared.cluster().explorer_navigation.clone();
     let back = Button::new("All metrics")
         .icon(IconGlyph::ChevronLeft)
@@ -1485,41 +1601,38 @@ fn build_metric_detail_header(
             request_metric_explorer_relayout(ctx);
         });
     let refresh_shared = shared.clone();
-    let refresh_enabled = shared.clone();
     let refresh = Button::new("Refresh")
         .icon(IconGlyph::Redo)
         .appearance(ButtonAppearance::Tonal)
         .tone(SemanticTone::Accent)
-        .enabled_when(move || {
-            !refresh_enabled.cluster().observation.in_flight
-                && refresh_enabled.cluster().observation.paused_at.is_none()
-        })
+        .enabled_from(collection_idle(shared))
         .theme_when(clone_reader(reader))
         .on_press_with_ctx(move |ctx| {
             request_observation(&refresh_shared);
             request_metric_explorer_relayout(ctx);
         });
+    let name_token: fn(&DefaultTheme) -> ThemeTextToken = if compact {
+        |theme| theme.text.base
+    } else {
+        |theme| theme.text.lg
+    };
     let title = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(3.0)
         .with_child(
-            Label::new(entry.descriptor.name.clone()).text_style(pal.text_style(
-                &theme,
-                if compact {
-                    theme.text.base.size
-                } else {
-                    theme.text.lg.size
-                },
+            Label::new(identity.name.clone()).text_style_when(themed_style(
+                reader,
+                name_token,
                 FontWeight::SEMIBOLD,
-                pal.text,
+                |theme| theme.surfaces.text,
             )),
         )
         .with_child(
-            Label::new(entry.descriptor.help.clone()).text_style(pal.text_style(
-                &theme,
-                theme.text.sm.size,
+            Label::new(identity.help.clone()).text_style_when(themed_style(
+                reader,
+                |theme| theme.text.sm,
                 FontWeight::NORMAL,
-                pal.text_muted,
+                |theme| theme.surfaces.text_muted,
             )),
         );
     let mut actions = Flex::horizontal().wrap(FlexWrap::Wrap).gap(6.0);
@@ -1539,16 +1652,60 @@ fn build_metric_detail_header(
     .theme_when(clone_reader(reader))
 }
 
-fn build_metric_current_summary(
-    shared: &Shared,
-    reader: &ThemeReader,
+fn build_metric_current_summary(reader: &ThemeReader, live: &MetricLiveSource) -> Surface {
+    Surface::panel(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(2.0)
+            .with_child(
+                Label::new(String::new())
+                    .text_from(live.map(|live| {
+                        live.as_ref()
+                            .map(|live| live.value.clone())
+                            .unwrap_or_default()
+                    }))
+                    .text_style_when(themed_style(
+                        reader,
+                        |theme| theme.text.lg,
+                        FontWeight::SEMIBOLD,
+                        |theme| theme.surfaces.text,
+                    )),
+            )
+            .with_child(
+                Label::new(String::new())
+                    .text_from(live.map(|live| {
+                        live.as_ref()
+                            .map(|live| live.coverage.clone())
+                            .unwrap_or_default()
+                    }))
+                    .text_style_when(themed_style(
+                        reader,
+                        |theme| theme.text.sm,
+                        FontWeight::NORMAL,
+                        |theme| theme.surfaces.text_muted,
+                    )),
+            ),
+    )
+    .name("Metric current values")
+    .appearance(SurfaceAppearance::Soft)
+    .padding(Insets {
+        left: 12.0,
+        right: 12.0,
+        top: 10.0,
+        bottom: 10.0,
+    })
+    .fill_width(true)
+    .theme_when(clone_reader(reader))
+}
+
+/// The current value and node coverage lines of the explorer summary.
+fn metric_current_summary(
+    cluster: &ClusterState,
     entry: &MetricCatalogEntry,
     transform: ExplorerTransform,
     explorer: &MetricExplorerState,
     query: &MetricQueryResult,
-) -> Surface {
-    let theme = shared.theme();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
+) -> (String, String) {
     let current_values = query
         .series
         .iter()
@@ -1597,79 +1754,49 @@ fn build_metric_current_summary(
     } else {
         "Awaiting a current sample".to_string()
     };
-    let (reporting, total, partial, unavailable) = {
-        let cluster = shared.cluster();
-        let targets = explorer
-            .selected_node
-            .as_ref()
-            .map(|node| vec![node.clone()])
-            .unwrap_or_else(|| {
-                let mut nodes = cluster
-                    .observation
-                    .targets
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if nodes.is_empty() {
-                    nodes.extend(entry.node_ids.iter().cloned());
-                }
-                nodes
-            });
-        let reporting = targets
-            .iter()
-            .filter(|node| entry.node_ids.contains(*node))
-            .count();
-        let partial = targets
-            .iter()
-            .filter(|node| {
-                cluster
-                    .observation
-                    .targets
-                    .get(*node)
-                    .is_some_and(|target| target.partial && target.error.is_none())
-            })
-            .count();
-        let unavailable = targets.len().saturating_sub(reporting);
-        (reporting, targets.len(), partial, unavailable)
-    };
+    let targets = explorer
+        .selected_node
+        .as_ref()
+        .map(|node| vec![node.clone()])
+        .unwrap_or_else(|| {
+            let mut nodes = cluster
+                .observation
+                .targets
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            if nodes.is_empty() {
+                nodes.extend(entry.node_ids.iter().cloned());
+            }
+            nodes
+        });
+    let reporting = targets
+        .iter()
+        .filter(|node| entry.node_ids.contains(*node))
+        .count();
+    let partial = targets
+        .iter()
+        .filter(|node| {
+            cluster
+                .observation
+                .targets
+                .get(*node)
+                .is_some_and(|target| target.partial && target.error.is_none())
+        })
+        .count();
+    let unavailable = targets.len().saturating_sub(reporting);
     let updated = query
         .newest_at()
         .map(format_metric_sample_age)
         .unwrap_or_else(|| "No matching sample yet".to_string());
-    let mut coverage = format!("{updated} · {reporting}/{total} nodes reporting");
+    let mut coverage = format!("{updated} · {reporting}/{} nodes reporting", targets.len());
     if partial > 0 {
         coverage.push_str(&format!(" · {partial} partial"));
     }
     if unavailable > 0 {
         coverage.push_str(&format!(" · {unavailable} unavailable"));
     }
-    Surface::panel(
-        Flex::vertical()
-            .align_items(Alignment::Stretch)
-            .gap(2.0)
-            .with_child(Label::new(value).text_style(pal.text_style(
-                &theme,
-                theme.text.lg.size,
-                FontWeight::SEMIBOLD,
-                pal.text,
-            )))
-            .with_child(Label::new(coverage).text_style(pal.text_style(
-                &theme,
-                theme.text.sm.size,
-                FontWeight::NORMAL,
-                pal.text_muted,
-            ))),
-    )
-    .name("Metric current values")
-    .appearance(SurfaceAppearance::Soft)
-    .padding(Insets {
-        left: 12.0,
-        right: 12.0,
-        top: 10.0,
-        bottom: 10.0,
-    })
-    .fill_width(true)
-    .theme_when(clone_reader(reader))
+    (value, coverage)
 }
 
 fn format_metric_sample_age(at: OffsetDateTime) -> String {
@@ -1698,54 +1825,146 @@ fn format_metric_span(span: time::Duration) -> String {
     }
 }
 
-fn build_metric_query_controls(
-    shared: &Shared,
-    reader: &ThemeReader,
-    entry: &MetricCatalogEntry,
-    explorer: &MetricExplorerState,
-) -> Flex {
+/// Label filters shown for the selected metric: keys with observed values plus any key the
+/// explorer already filters on.
+fn metric_filter_keys(key: &ClusterStructureKey) -> Vec<String> {
+    let Some(entry) = key.explorer_entry.as_ref() else {
+        return Vec::new();
+    };
+    let mut keys = entry.label_keys.clone();
+    keys.extend(key.explorer.label_filters.keys().cloned());
+    keys.into_iter()
+        .filter(|label| {
+            entry
+                .label_values
+                .get(label)
+                .is_some_and(|values| !values.is_empty())
+                || key.explorer.label_filters.contains_key(label)
+        })
+        .collect()
+}
+
+fn metric_node_options(key: &ClusterStructureKey) -> Vec<String> {
     let mut nodes = std::iter::once("All nodes".to_string())
-        .chain(entry.node_ids.iter().cloned())
+        .chain(
+            key.explorer_entry
+                .iter()
+                .flat_map(|entry| entry.node_ids.iter().cloned()),
+        )
         .collect::<Vec<_>>();
-    if let Some(selected) = explorer.selected_node.as_ref()
+    if let Some(selected) = key.explorer.selected_node.as_ref()
         && !nodes.contains(selected)
     {
         nodes.push(selected.clone());
     }
-    let selected_node = explorer
-        .selected_node
-        .as_ref()
-        .and_then(|node| nodes.iter().position(|candidate| candidate == node))
-        .unwrap_or(0);
-    let node_shared = shared.clone();
-    let node_options = nodes.clone();
-    let node = Select::new("Metric node scope")
-        .options(nodes)
-        .selected(selected_node)
-        .theme_when(clone_reader(reader))
-        .on_change_with_ctx(move |ctx, index, _label| {
-            let node_id = if index == 0 {
-                None
-            } else {
-                node_options.get(index).cloned()
-            };
-            node_shared.cluster_mut().set_explorer_node(node_id);
-            request_metric_explorer_relayout(ctx);
-        });
+    nodes
+}
 
-    let transforms = ExplorerTransform::available(entry.descriptor.kind);
-    let selected_transform = transforms
-        .iter()
-        .position(|transform| *transform == explorer.transform)
-        .unwrap_or(0);
+fn metric_label_options(key: &ClusterStructureKey, label: &str) -> Vec<String> {
+    let mut options = std::iter::once(format!("All {label}"))
+        .chain(
+            key.explorer_entry
+                .iter()
+                .filter_map(|entry| entry.label_values.get(label))
+                .flat_map(|values| values.iter().cloned()),
+        )
+        .collect::<Vec<_>>();
+    if let Some(selected) = key.explorer.label_filters.get(label)
+        && !options.contains(selected)
+    {
+        options.push(selected.clone());
+    }
+    options
+}
+
+/// Query controls for one metric. Every select reads its value from the explorer state, so
+/// choosing an option never replaces it; a select is rebuilt only when its option list changes,
+/// and the row only when the set of label filters does.
+fn metric_query_controls(
+    shared: &Shared,
+    reader: &ThemeReader,
+    identity: &MetricIdentity,
+) -> impl Widget + use<> {
+    let shared = shared.clone();
+    let reader = Rc::clone(reader);
+    let identity = identity.clone();
+    RebuildOnChange::key_from(
+        cluster_select(&shared, "metric label filter keys", metric_filter_keys),
+        move |filter_keys| {
+            WidgetPod::new(build_metric_query_controls(
+                &shared,
+                &reader,
+                &identity,
+                filter_keys,
+            ))
+        },
+    )
+}
+
+fn build_metric_query_controls(
+    shared: &Shared,
+    reader: &ThemeReader,
+    identity: &MetricIdentity,
+    filter_keys: &[String],
+) -> Flex {
+    let node_shared = shared.clone();
+    let node_reader = Rc::clone(reader);
+    let node = RebuildOnChange::key_from(
+        cluster_select(shared, "metric node options", metric_node_options),
+        move |options| {
+            let selected_shared = node_shared.clone();
+            let selected_options = options.clone();
+            let change_shared = node_shared.clone();
+            let change_options = options.clone();
+            WidgetPod::new(
+                Select::new("Metric node scope")
+                    .options(options.iter().cloned())
+                    .selected_when(move || {
+                        Some(
+                            selected_shared
+                                .cluster()
+                                .explorer
+                                .selected_node
+                                .as_ref()
+                                .and_then(|node| {
+                                    selected_options
+                                        .iter()
+                                        .position(|candidate| candidate == node)
+                                })
+                                .unwrap_or(0),
+                        )
+                    })
+                    .theme_when(clone_reader(&node_reader))
+                    .on_change_with_ctx(move |ctx, index, _label| {
+                        let node_id = if index == 0 {
+                            None
+                        } else {
+                            change_options.get(index).cloned()
+                        };
+                        change_shared.cluster_mut().set_explorer_node(node_id);
+                        request_metric_explorer_relayout(ctx);
+                    }),
+            )
+        },
+    );
+
+    let transforms = ExplorerTransform::available(identity.kind);
+    let selected_shared = shared.clone();
     let transform_shared = shared.clone();
-    let transform_options = transforms.to_vec();
     let transform = Select::new("Metric transform")
         .options(transforms.iter().map(|transform| transform.label()))
-        .selected(selected_transform)
+        .selected_when(move || {
+            let current = selected_shared.cluster().explorer.transform;
+            Some(
+                transforms
+                    .iter()
+                    .position(|transform| *transform == current)
+                    .unwrap_or(0),
+            )
+        })
         .theme_when(clone_reader(reader))
         .on_change_with_ctx(move |ctx, index, _label| {
-            if let Some(transform) = transform_options.get(index).copied() {
+            if let Some(transform) = transforms.get(index).copied() {
                 transform_shared
                     .cluster_mut()
                     .set_explorer_transform(transform);
@@ -1753,9 +1972,12 @@ fn build_metric_query_controls(
             }
         });
 
-    let window = StatusBadge::new(format!("Fixed · {}", explorer.window.label()))
-        .tone(SemanticTone::Neutral)
-        .theme_when(clone_reader(reader));
+    let window = StatusBadge::new(format!(
+        "Fixed · {}",
+        dashboard::metric_window(&identity.name, identity.kind).label()
+    ))
+    .tone(SemanticTone::Neutral)
+    .theme_when(clone_reader(reader));
 
     let mut controls = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
@@ -1764,44 +1986,57 @@ fn build_metric_query_controls(
     controls.push_item(node, metric_query_control_item());
     controls.push_item(transform, metric_query_control_item());
     controls.push_item(window, metric_query_control_item());
-    let mut filter_keys = entry.label_keys.clone();
-    filter_keys.extend(explorer.label_filters.keys().cloned());
-    for key in &filter_keys {
-        let values = entry.label_values.get(key);
-        if values.is_none_or(BTreeSet::is_empty) && !explorer.label_filters.contains_key(key) {
-            continue;
-        }
-        let mut options = std::iter::once(format!("All {key}"))
-            .chain(values.into_iter().flat_map(|values| values.iter().cloned()))
-            .collect::<Vec<_>>();
-        if let Some(selected) = explorer.label_filters.get(key)
-            && !options.contains(selected)
-        {
-            options.push(selected.clone());
-        }
-        let selected = explorer
-            .label_filters
-            .get(key)
-            .and_then(|value| options.iter().position(|candidate| candidate == value))
-            .unwrap_or(0);
+    for key in filter_keys {
+        let options_key = key.clone();
         let filter_shared = shared.clone();
+        let filter_reader = Rc::clone(reader);
         let filter_key = key.clone();
-        let filter_options = options.clone();
-        let select = Select::new(format!("Metric label {key}"))
-            .options(options)
-            .selected(selected)
-            .theme_when(clone_reader(reader))
-            .on_change_with_ctx(move |ctx, index, _label| {
-                let value = if index == 0 {
-                    None
-                } else {
-                    filter_options.get(index).cloned()
-                };
-                filter_shared
-                    .cluster_mut()
-                    .set_explorer_label(filter_key.clone(), value);
-                request_metric_explorer_relayout(ctx);
-            });
+        let select = RebuildOnChange::key_from(
+            cluster_select(
+                shared,
+                format!("metric label {key} options"),
+                move |state| metric_label_options(state, &options_key),
+            ),
+            move |options| {
+                let selected_shared = filter_shared.clone();
+                let selected_key = filter_key.clone();
+                let selected_options = options.clone();
+                let change_shared = filter_shared.clone();
+                let change_key = filter_key.clone();
+                let change_options = options.clone();
+                WidgetPod::new(
+                    Select::new(format!("Metric label {filter_key}"))
+                        .options(options.iter().cloned())
+                        .selected_when(move || {
+                            Some(
+                                selected_shared
+                                    .cluster()
+                                    .explorer
+                                    .label_filters
+                                    .get(&selected_key)
+                                    .and_then(|value| {
+                                        selected_options
+                                            .iter()
+                                            .position(|candidate| candidate == value)
+                                    })
+                                    .unwrap_or(0),
+                            )
+                        })
+                        .theme_when(clone_reader(&filter_reader))
+                        .on_change_with_ctx(move |ctx, index, _label| {
+                            let value = if index == 0 {
+                                None
+                            } else {
+                                change_options.get(index).cloned()
+                            };
+                            change_shared
+                                .cluster_mut()
+                                .set_explorer_label(change_key.clone(), value);
+                            request_metric_explorer_relayout(ctx);
+                        }),
+                )
+            },
+        );
         controls.push_item(select, metric_query_control_item());
     }
     controls
@@ -1821,81 +2056,48 @@ fn sort_metric_series(series: &mut [MetricSeries]) {
 }
 
 fn build_metric_chart_panel(
-    shared: &Shared,
     reader: &ThemeReader,
-    entry: &MetricCatalogEntry,
-    explorer: &MetricExplorerState,
-    query: &MetricQueryResult,
-    hover: Rc<Cell<Option<f32>>>,
+    identity: &MetricIdentity,
+    live: &MetricLiveSource,
 ) -> Surface {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, theme.surfaces.dark);
-    let mut chart_series = query.series.clone();
-    sort_metric_series(&mut chart_series);
-    chart_series.truncate(EXPLORER_CHART_SERIES_LIMIT);
-    let sample_count = query
-        .series
-        .iter()
-        .map(|series| series.points.len())
-        .max()
-        .unwrap_or_default();
-    let observed_span = query
-        .oldest_at()
-        .zip(query.newest_at())
-        .map(|(oldest, newest)| format_metric_span(newest - oldest))
-        .unwrap_or_else(|| "no span yet".to_string());
-    let subtitle = format!(
-        "{} · {} · {} window · {} retained sample{} over {}",
-        explorer_transform_summary(explorer.transform, entry.descriptor.kind),
-        metric_unit_label(entry.descriptor.unit),
-        explorer.window.label(),
-        sample_count,
-        if sample_count == 1 { "" } else { "s" },
-        observed_span,
-    );
-    let mut body = Flex::vertical()
-        .align_items(Alignment::Stretch)
-        .gap(6.0)
-        .with_child(Label::new("Live history").text_style(pal.text_style(
-            &theme,
-            theme.text.base.size,
-            FontWeight::SEMIBOLD,
-            pal.text,
-        )))
-        .with_child(Label::new(subtitle).text_style(pal.text_style(
-            &theme,
-            theme.text.sm.size,
-            FontWeight::NORMAL,
-            pal.text_muted,
-        )));
-    if !chart_series.is_empty() {
-        let mut legend = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .align_items(Alignment::Center)
-            .gap(8.0);
-        for (index, series) in chart_series.iter().enumerate() {
-            let label = format!(
-                "S{} {} · {}",
-                index + 1,
-                short(&series.key.display_name(), 30),
-                format_metric_value(
-                    series.latest(),
-                    entry.descriptor.unit,
-                    explorer.transform,
-                    entry.descriptor.kind,
-                )
-            );
-            legend.push(Label::new(label).text_style(pal.text_style(
-                &theme,
-                theme.text.xs.size,
-                FontWeight::MEDIUM,
-                pal.agent[index % pal.agent.len()],
-            )));
-        }
-        body.push(legend);
+    let mut legend = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .align_items(Alignment::Center)
+        .gap(8.0);
+    for index in 0..EXPLORER_CHART_SERIES_LIMIT {
+        let hue_reader = Rc::clone(reader);
+        legend.push(
+            Presence::new(
+                Label::new(String::new())
+                    .text_from(live.map(move |live| {
+                        live.as_ref()
+                            .and_then(|live| live.legend.get(index).cloned())
+                            .unwrap_or_default()
+                    }))
+                    .text_style_when(move || {
+                        let theme = hue_reader();
+                        crate::theme::token_text_style(
+                            &theme,
+                            theme.text.xs,
+                            FontWeight::MEDIUM,
+                            crate::theme::agent_hues(&theme)[index % 6],
+                        )
+                    }),
+            )
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_from(
+                live.map(move |live| live.as_ref().is_some_and(|live| live.legend.len() > index)),
+            ),
+        );
     }
-    if query.value_conflict {
-        body.push(
+    let plot = SwitchView::new()
+        .selected_from(live.map(|live| live.as_ref().map_or(2, |live| live.chart_state)))
+        .with_child(
+            SizedBox::new()
+                .height(EXPLORER_CHART_H)
+                .child(ExplorerChart::new(live.clone(), reader, identity)),
+        )
+        .with_child(
             SizedBox::new().height(EXPLORER_CHART_H).child(
                 EmptyState::new(
                     "Conflicting metric descriptors",
@@ -1906,9 +2108,8 @@ fn build_metric_chart_panel(
                 .transparent()
                 .theme_when(clone_reader(reader)),
             ),
-        );
-    } else if chart_series.is_empty() {
-        body.push(
+        )
+        .with_child(
             SizedBox::new().height(EXPLORER_CHART_H).child(
                 EmptyState::new(
                     "Collecting live history",
@@ -1920,40 +2121,44 @@ fn build_metric_chart_panel(
                 .theme_when(clone_reader(reader)),
             ),
         );
-    } else {
-        body.push(
-            SizedBox::new().height(EXPLORER_CHART_H).child(
-                MetricChart::new(
-                    entry.descriptor.name.clone(),
-                    chart_series,
-                    theme,
-                    pal.agent,
-                    entry.descriptor.unit,
-                    explorer.transform,
-                    entry.descriptor.kind,
-                )
-                .hover_state(hover)
-                .time_range(
-                    shared.cluster().observation_time(),
-                    explorer.window,
-                    shared.cluster().observation.paused_at.is_some(),
-                ),
-            ),
-        );
-    }
-    if !query.value_conflict
-        && (query.history_truncated || query.matching_series > EXPLORER_CHART_SERIES_LIMIT)
-    {
-        body.push(
-            StatusBadge::new(format!(
-                "Showing up to {} of {} matching series; filter by node or labels for a precise comparison",
-                EXPLORER_CHART_SERIES_LIMIT,
-                query.matching_series.max(query.series.len())
-            ))
+    let capped = Presence::new(
+        StatusBadge::new(String::new())
+            .label_from(live.map(|live| {
+                live.as_ref()
+                    .and_then(|live| live.capped.clone())
+                    .unwrap_or_default()
+            }))
             .tone(SemanticTone::Warning)
             .theme_when(clone_reader(reader)),
-        );
-    }
+    )
+    .transition(crate::ui::widgets::reveal_transition())
+    .shown_from(live.map(|live| live.as_ref().is_some_and(|live| live.capped.is_some())));
+    let body = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(6.0)
+        .with_child(Label::new("Live history").text_style_when(themed_style(
+            reader,
+            |theme| theme.text.base,
+            FontWeight::SEMIBOLD,
+            |theme| theme.surfaces.text,
+        )))
+        .with_child(
+            Label::new(String::new())
+                .text_from(live.map(|live| {
+                    live.as_ref()
+                        .map(|live| live.subtitle.clone())
+                        .unwrap_or_default()
+                }))
+                .text_style_when(themed_style(
+                    reader,
+                    |theme| theme.text.sm,
+                    FontWeight::NORMAL,
+                    |theme| theme.surfaces.text_muted,
+                )),
+        )
+        .with_child(legend)
+        .with_child(plot)
+        .with_child(capped);
     Surface::panel(body)
         .appearance(SurfaceAppearance::Raised)
         .elevation(SurfaceElevation::Small)
@@ -1962,90 +2167,193 @@ fn build_metric_chart_panel(
         .theme_when(clone_reader(reader))
 }
 
-fn build_metric_series_table(
-    reader: &ThemeReader,
+/// The explorer's plot. It stays mounted while samples arrive, so pointer hover and the
+/// accessibility node survive; each sample refreshes its series from the shared query.
+struct ExplorerChart {
+    live: MetricLiveSource,
+    chart: MetricChart,
+}
+
+impl ExplorerChart {
+    fn new(live: MetricLiveSource, reader: &ThemeReader, identity: &MetricIdentity) -> Self {
+        Self {
+            live,
+            chart: MetricChart::new(
+                identity.name.clone(),
+                Vec::new(),
+                Rc::clone(reader),
+                identity.unit,
+                ExplorerTransform::Auto,
+                identity.kind,
+            ),
+        }
+    }
+}
+
+impl Widget for ExplorerChart {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        if let Some(live) = ctx.observe(&self.live) {
+            self.chart.series = live.chart_series.clone();
+            self.chart.transform = live.transform;
+            self.chart
+                .set_time_range(live.end_at, live.window, live.paused);
+        }
+        self.chart.measure(ctx, constraints)
+    }
+
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        self.chart.event(ctx, event);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.chart.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.chart.semantics(ctx);
+    }
+}
+
+/// One row of the explorer's series table; `hue` is the chart color of a plotted series.
+#[derive(Clone, Debug, PartialEq)]
+struct MetricSeriesRow {
+    node: String,
+    labels: BTreeMap<String, String>,
+    identity: String,
+    value: String,
+    hue: Option<usize>,
+}
+
+fn metric_series_rows(
     entry: &MetricCatalogEntry,
     transform: ExplorerTransform,
     query: &MetricQueryResult,
-) -> PanelSection {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, theme.surfaces.dark);
-    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(6.0);
-    if query.value_conflict {
-        rows.push(
+) -> Vec<MetricSeriesRow> {
+    let mut series = query.series.clone();
+    sort_metric_series(&mut series);
+    series
+        .iter()
+        .take(16)
+        .enumerate()
+        .map(|(index, series)| {
+            let values = series.finite_values().collect::<Vec<_>>();
+            let min = values.iter().copied().reduce(f64::min);
+            let max = values.iter().copied().reduce(f64::max);
+            let plotted = index < EXPLORER_CHART_SERIES_LIMIT;
+            MetricSeriesRow {
+                node: series.key.node_id.clone(),
+                labels: series.key.labels.clone(),
+                identity: if plotted {
+                    format!("S{} · {}", index + 1, series.key.display_name())
+                } else {
+                    series.key.display_name()
+                },
+                value: format!(
+                    "now {} · min {} · max {} · {} sample{}",
+                    format_metric_value(
+                        series.latest(),
+                        entry.descriptor.unit,
+                        transform,
+                        entry.descriptor.kind,
+                    ),
+                    format_metric_value(
+                        min,
+                        entry.descriptor.unit,
+                        transform,
+                        entry.descriptor.kind
+                    ),
+                    format_metric_value(
+                        max,
+                        entry.descriptor.unit,
+                        transform,
+                        entry.descriptor.kind
+                    ),
+                    values.len(),
+                    if values.len() == 1 { "" } else { "s" }
+                ),
+                hue: plotted.then_some(index),
+            }
+        })
+        .collect()
+}
+
+fn build_metric_series_table(reader: &ThemeReader, live: &MetricLiveSource) -> PanelSection {
+    let row_reader = Rc::clone(reader);
+    let rows = KeyedStack::vertical(
+        live.map(|live| {
+            live.as_ref()
+                .map(|live| live.rows.clone())
+                .unwrap_or_default()
+        }),
+        |row: &MetricSeriesRow| (row.node.clone(), row.labels.clone()),
+        move |_, row| metric_series_row(&row_reader, row),
+    )
+    .gap(6.0);
+    let table = SwitchView::new()
+        .selected_from(live.map(|live| live.as_ref().map_or(2, |live| live.table_state)))
+        .with_child(rows)
+        .with_child(
             DetailRow::new(
                 "Series",
                 "Unavailable until every sampled node reports the same metric kind and unit",
             )
             .theme_when(clone_reader(reader)),
-        );
-    } else if query.series.is_empty() {
-        rows.push(
+        )
+        .with_child(
             DetailRow::new("Series", "No matching retained series yet")
                 .theme_when(clone_reader(reader)),
         );
-    } else {
-        let mut series = query.series.clone();
-        sort_metric_series(&mut series);
-        for (index, series) in series.iter().take(16).enumerate() {
-            let values = series.finite_values().collect::<Vec<_>>();
-            let latest = series.latest();
-            let min = values.iter().copied().reduce(f64::min);
-            let max = values.iter().copied().reduce(f64::max);
-            let identity = if index < EXPLORER_CHART_SERIES_LIMIT {
-                format!("S{} · {}", index + 1, series.key.display_name())
-            } else {
-                series.key.display_name()
-            };
-            let identity_color = if index < EXPLORER_CHART_SERIES_LIMIT {
-                pal.agent[index % pal.agent.len()]
-            } else {
-                pal.text
-            };
-            let value = format!(
-                "now {} · min {} · max {} · {} sample{}",
-                format_metric_value(
-                    latest,
-                    entry.descriptor.unit,
-                    transform,
-                    entry.descriptor.kind,
-                ),
-                format_metric_value(min, entry.descriptor.unit, transform, entry.descriptor.kind,),
-                format_metric_value(max, entry.descriptor.unit, transform, entry.descriptor.kind,),
-                values.len(),
-                if values.len() == 1 { "" } else { "s" }
-            );
-            rows.push(
-                Surface::window(
-                    Flex::vertical()
-                        .align_items(Alignment::Stretch)
-                        .gap(2.0)
-                        .with_child(Label::new(identity).text_style(pal.text_style(
+    PanelSection::new("Matching series", table).theme_when(clone_reader(reader))
+}
+
+fn metric_series_row(reader: &ThemeReader, row: Signal<MetricSeriesRow>) -> Surface {
+    let ink_reader = Rc::clone(reader);
+    let ink = row.clone();
+    let initial = row.get();
+    Surface::window(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(2.0)
+            .with_child(
+                Label::new(initial.identity)
+                    .text_from(
+                        row.select_named("metric series identity", |row| row.identity.clone()),
+                    )
+                    // A plotted series keeps its chart color; the identity text names the slot,
+                    // so a slot change re-measures the label and re-reads this style.
+                    .text_style_when(move || {
+                        let theme = ink_reader();
+                        let color = ink.get().hue.map_or(theme.surfaces.text, |hue| {
+                            crate::theme::agent_hues(&theme)[hue % 6]
+                        });
+                        crate::theme::token_text_style(
                             &theme,
-                            theme.text.sm.size,
+                            theme.text.sm,
                             FontWeight::SEMIBOLD,
-                            identity_color,
-                        )))
-                        .with_child(Label::new(value).text_style(pal.text_style(
-                            &theme,
-                            theme.text.sm.size,
-                            FontWeight::NORMAL,
-                            pal.text_muted,
-                        ))),
-                )
-                .border(SurfaceBorder::Bottom)
-                .padding(Insets {
-                    left: 0.0,
-                    right: 0.0,
-                    top: 4.0,
-                    bottom: 6.0,
-                })
-                .fill_width(true)
-                .theme_when(clone_reader(reader)),
-            );
-        }
-    }
-    PanelSection::new("Matching series", rows).theme_when(clone_reader(reader))
+                            color,
+                        )
+                    }),
+            )
+            .with_child(
+                Label::new(initial.value)
+                    .text_from(row.select_named("metric series values", |row| row.value.clone()))
+                    .text_style_when(themed_style(
+                        reader,
+                        |theme| theme.text.sm,
+                        FontWeight::NORMAL,
+                        |theme| theme.surfaces.text_muted,
+                    )),
+            ),
+    )
+    .border(SurfaceBorder::Bottom)
+    .padding(Insets {
+        left: 0.0,
+        right: 0.0,
+        top: 4.0,
+        bottom: 6.0,
+    })
+    .fill_width(true)
+    .theme_when(clone_reader(reader))
 }
 
 fn request_metric_explorer_relayout(ctx: &mut EventCtx) {
@@ -2122,6 +2430,8 @@ fn short_metric_name(name: &str, domain: &str) -> String {
 
 struct ClusterView {
     shared: Shared,
+    /// The nodes, links, and selection the graph draws.
+    topology: ClusterSelector<(ClusterSnapshot, Option<ClusterSelection>)>,
     keyboard_focus: RefCell<Option<ClusterSelection>>,
     empty: WidgetPod,
     legend: WidgetPod,
@@ -2133,18 +2443,21 @@ impl ClusterView {
     fn new(shared: Shared) -> Self {
         let reader = cluster_theme_reader(&shared);
         Self {
-            empty: WidgetPod::new(cluster_empty_host(&shared, &reader)),
+            topology: cluster_select(&shared, "cluster topology graph", |key| {
+                (key.snapshot.clone(), key.selected.clone())
+            }),
+            empty: WidgetPod::new(cluster_empty_view(&shared, &reader)),
             legend: WidgetPod::new(cluster_legend(&reader)),
-            detail: WidgetPod::new(cluster_detail_host(&shared, &reader)),
+            detail: WidgetPod::new(cluster_inspector(&shared, &reader)),
             show_detail: Cell::new(false),
             shared,
             keyboard_focus: RefCell::new(None),
         }
     }
 
-    fn palette(&self) -> (sui::DefaultTheme, Palette) {
+    fn palette(&self) -> (sui::DefaultTheme, SurfacePalette) {
         let theme = self.shared.theme();
-        let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&self.shared));
+        let pal = theme.surfaces;
         (theme, pal)
     }
 
@@ -2266,8 +2579,7 @@ impl Widget for ClusterView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let structure = self.shared.signals().cluster_structure.clone();
-        let _ = ctx.observe(&structure);
+        let _ = ctx.observe(&self.topology);
         let size = constraints.max;
         let bounds = Rect::new(0.0, 0.0, size.width.max(0.0), size.height.max(0.0));
         let graph = graph_rect(bounds);
@@ -2447,119 +2759,220 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct ClusterObservationViewKey {
-    theme: DefaultTheme,
-    snapshot: ClusterSnapshot,
-    observation_revision: u64,
+/// A text style read from the live theme at a type-ramp step, weight, and ink.
+fn themed_style(
+    reader: &ThemeReader,
+    token: fn(&DefaultTheme) -> ThemeTextToken,
+    weight: FontWeight,
+    ink: fn(&DefaultTheme) -> Color,
+) -> impl Fn() -> TextStyle + 'static {
+    let reader = Rc::clone(reader);
+    move || {
+        let theme = reader();
+        crate::theme::token_text_style(&theme, token(&theme), weight, ink(&theme))
+    }
+}
+
+type ClusterSelector<U> = Selector<Signal<ClusterStructureKey>, ClusterStructureKey, U>;
+
+/// The Cluster tab's structure, narrowed to what one binding reads.
+fn cluster_select<U>(
+    shared: &Shared,
+    name: impl Into<Arc<str>>,
+    select: impl Fn(&ClusterStructureKey) -> U + Send + Sync + 'static,
+) -> ClusterSelector<U>
+where
+    U: Clone + PartialEq + Send + Sync + 'static,
+{
+    shared
+        .signals()
+        .cluster_structure
+        .select_named(name, select)
+}
+
+/// Live collection is on and no request is running, so a manual collection can start.
+fn collection_idle(shared: &Shared) -> ClusterSelector<bool> {
+    cluster_select(shared, "cluster collection idle", |key| {
+        key.observation_live && !key.observation_in_flight
+    })
+}
+
+/// Keeps `control` mounted and re-runs its readers whenever `trigger` changes.
+fn live<W, K>(control: W, trigger: impl Observable<K> + 'static) -> widgets::Restyle<W, K>
+where
+    W: Widget,
+    K: Clone + PartialEq + 'static,
+{
+    widgets::Restyle::new(control, trigger, |control, _| control)
+}
+
+/// Cluster state that the structure key does not carry, such as sample history, activity, and
+/// metric query results.
+///
+/// The value is read from [`Shared`] once per change of `trigger`, a narrow projection of the
+/// structure key that changes whenever the state read here does. Clones and [`Self::map`]
+/// projections share that subscription, so retained widgets bind to it like any observable.
+struct Projection<K, T> {
+    trigger: ClusterSelector<K>,
+    read: Rc<dyn Fn() -> T>,
+    cache: Rc<RefCell<Option<(K, T)>>>,
+}
+
+impl<K, T> Clone for Projection<K, T> {
+    fn clone(&self) -> Self {
+        Self {
+            trigger: self.trigger.clone(),
+            read: Rc::clone(&self.read),
+            cache: Rc::clone(&self.cache),
+        }
+    }
+}
+
+impl<K, T> Projection<K, T>
+where
+    K: Clone + PartialEq + Send + Sync + 'static,
+    T: Clone + 'static,
+{
+    fn new(trigger: ClusterSelector<K>, read: impl Fn() -> T + 'static) -> Self {
+        Self {
+            trigger,
+            read: Rc::new(read),
+            cache: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn map<U>(&self, map: impl Fn(&T) -> U + 'static) -> Projection<K, U>
+    where
+        U: Clone + 'static,
+    {
+        let source = self.clone();
+        Projection::new(self.trigger.clone(), move || map(&source.get()))
+    }
+}
+
+impl<K, T> Observable<T> for Projection<K, T>
+where
+    K: Clone + PartialEq + Send + Sync + 'static,
+    T: Clone + 'static,
+{
+    fn source_id(&self) -> SourceId {
+        self.trigger.source_id()
+    }
+
+    fn source_name(&self) -> Arc<str> {
+        self.trigger.source_name()
+    }
+
+    fn get(&self) -> T {
+        let key = self.trigger.get();
+        if let Some((cached, value)) = self.cache.borrow().as_ref()
+            && *cached == key
+        {
+            return value.clone();
+        }
+        let value = (self.read)();
+        *self.cache.borrow_mut() = Some((key, value.clone()));
+        value
+    }
+
+    fn subscribe(&self, observer: Observer) -> Subscription {
+        self.trigger.subscribe(observer)
+    }
 }
 
 /// The performance dashboard, or the cluster empty state while there are no nodes and no
 /// metrics, instead of a grid of blank cards and charts.
 fn cluster_overview_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let structure = &shared.signals().cluster_structure;
-    let selected = structure.select_named("cluster overview empty", |key| {
-        usize::from(key.overview_empty())
-    });
-    let empty_source = structure.select_named("cluster overview empty state", |key| {
-        (key.theme, key.snapshot.warnings.clone(), key.refreshing)
-    });
-    let empty_shared = shared.clone();
-    let empty_reader = Rc::clone(reader);
     SwitchView::new()
-        .selected_from(selected)
-        .with_child(dashboard::view(shared.clone()))
-        .with_child(RebuildOnChange::key_from(empty_source, move |_key| {
-            build_cluster_empty(&empty_shared, &empty_reader)
+        .selected_from(cluster_select(shared, "cluster overview empty", |key| {
+            usize::from(key.overview_empty())
         }))
+        .with_child(dashboard::view(shared.clone()))
+        .with_child(cluster_empty_view(shared, reader))
 }
 
-fn cluster_activity_host(
-    shared: &Shared,
-    reader: &ThemeReader,
-) -> RebuildOnChange<ClusterObservationViewKey> {
-    let source =
-        shared
-            .signals()
-            .cluster_structure
-            .select_named("cluster activity structure", |key| {
-                ClusterObservationViewKey {
-                    theme: key.theme,
-                    snapshot: key.snapshot.clone(),
-                    observation_revision: key.observation_revision,
-                }
-            });
-    let build_shared = shared.clone();
-    let reader = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        build_cluster_activity(&build_shared, &reader)
-    })
+/// One retained row of the activity list. The key carries the full content plus an occurrence
+/// count for repeated entries, so rows never need to update in place.
+#[derive(Clone, Debug, PartialEq)]
+struct ActivityRow {
+    key: (String, String, usize),
+    lines: usize,
 }
 
-fn build_cluster_activity(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let theme = shared.theme();
-    let (warnings, activity) = {
-        let cluster = shared.cluster();
-        (
-            cluster.snapshot.warnings.clone(),
-            cluster
-                .observation
-                .activity
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
+fn activity_rows(cluster: &ClusterState) -> Vec<ActivityRow> {
+    let mut seen = BTreeMap::<(String, String), usize>::new();
+    let mut row = |label: String, value: String, lines: usize| {
+        let occurrence = seen.entry((label.clone(), value.clone())).or_default();
+        let key = (label, value, *occurrence);
+        *occurrence += 1;
+        ActivityRow { key, lines }
     };
-    if warnings.is_empty() && activity.is_empty() {
-        return WidgetPod::new(
-            EmptyState::new(
-                "No recent cluster activity",
-                "Collection failures and topology warnings appear here",
-            )
-            .name("Cluster activity")
-            .icon(IconGlyph::Check)
-            .detail("This view updates while Cluster is open.")
-            .transparent()
-            .theme_when(clone_reader(reader)),
-        );
-    }
-    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
-    for warning in warnings {
-        rows.push(
-            DetailRow::new("Topology warning", warning)
-                .max_value_lines(3)
-                .theme_when(clone_reader(reader)),
-        );
-    }
-    for entry in activity.into_iter().rev() {
+    let mut rows = cluster
+        .snapshot
+        .warnings
+        .iter()
+        .map(|warning| row("Topology warning".to_string(), warning.clone(), 3))
+        .collect::<Vec<_>>();
+    for entry in cluster.observation.activity.iter().rev() {
         let time = format!(
             "{:02}:{:02}:{:02}",
             entry.at.hour(),
             entry.at.minute(),
             entry.at.second()
         );
-        rows.push(
-            DetailRow::new(
-                format!("{time} · {}", short(&entry.node_id, 18)),
-                entry.detail,
-            )
-            .max_value_lines(if entry.warning { 3 } else { 2 })
-            .theme_when(clone_reader(reader)),
-        );
+        rows.push(row(
+            format!("{time} · {}", short(&entry.node_id, 18)),
+            entry.detail.clone(),
+            if entry.warning { 3 } else { 2 },
+        ));
     }
-    WidgetPod::new(
-        Surface::window(
-            ScrollView::vertical(
-                PanelSection::new("Operational activity", rows).theme_when(clone_reader(reader)),
-            )
-            .name("Cluster operational activity")
-            .theme(theme)
-            .viewport_width_hint(true),
-        )
-        .padding(Insets::all(PAD))
-        .fill()
-        .theme_when(clone_reader(reader)),
+    rows
+}
+
+/// Collection failures and topology warnings. The scroll view stays mounted; rows enter and
+/// leave by key as activity arrives.
+fn cluster_activity_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let trigger = cluster_select(shared, "cluster activity", |key| {
+        (key.snapshot.warnings.clone(), key.observation_revision)
+    });
+    let rows_shared = shared.clone();
+    let rows = Projection::new(trigger, move || activity_rows(&rows_shared.cluster()));
+    let row_reader = Rc::clone(reader);
+    let list = KeyedStack::vertical(
+        rows.clone(),
+        |row: &ActivityRow| row.key.clone(),
+        move |_, row| {
+            let row = row.get();
+            DetailRow::new(row.key.0, row.key.1)
+                .max_value_lines(row.lines)
+                .theme_when(clone_reader(&row_reader))
+        },
     )
+    .gap(8.0);
+    let page = Surface::window(
+        ScrollView::vertical(
+            PanelSection::new("Operational activity", list).theme_when(clone_reader(reader)),
+        )
+        .name("Cluster operational activity")
+        .theme_when(clone_reader(reader))
+        .viewport_width_hint(true),
+    )
+    .padding(Insets::all(PAD))
+    .fill()
+    .theme_when(clone_reader(reader));
+    let empty = EmptyState::new(
+        "No recent cluster activity",
+        "Collection failures and topology warnings appear here",
+    )
+    .name("Cluster activity")
+    .icon(IconGlyph::Check)
+    .detail("This view updates while Cluster is open.")
+    .transparent()
+    .theme_when(clone_reader(reader));
+    SwitchView::new()
+        .selected_from(rows.map(|rows| usize::from(!rows.is_empty())))
+        .with_child(empty)
+        .with_child(page)
 }
 
 fn sort_target_summaries(targets: &mut [TargetObservationSummary], local_node_id: Option<&str>) {
@@ -2702,147 +3115,124 @@ impl Widget for SyncedMetricSearch {
 mod chart;
 use chart::MetricChart;
 
-#[derive(Clone, Debug, PartialEq)]
-struct ClusterHeaderKey {
-    theme: DefaultTheme,
-    snapshot: ClusterSnapshot,
-    refreshing: bool,
-}
-
-fn cluster_header_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<ClusterHeaderKey> {
-    let source =
-        shared
-            .signals()
-            .cluster_structure
-            .select_named("cluster header structure", |key| ClusterHeaderKey {
-                theme: key.theme,
-                snapshot: key.snapshot.clone(),
-                refreshing: key.refreshing,
-            });
-    let build_shared = shared.clone();
-    let reader = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        build_cluster_header(&build_shared, &reader)
-    })
-}
-
-fn build_cluster_header(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (snapshot, refreshing) = {
-        let cluster = shared.cluster();
-        (cluster.snapshot.clone(), cluster.refreshing)
-    };
-    let topology = build_topology(&snapshot);
-    let theme = shared.theme();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let summary = Flex::vertical()
-        .align_items(Alignment::Stretch)
-        .gap(2.0)
-        .with_child(Label::new("Cluster").text_style(pal.text_style(
-            &theme,
-            theme.text.xl.size,
-            FontWeight::SEMIBOLD,
-            pal.text,
-        )))
-        .with_child(
-            Label::new(cluster_header_summary(&snapshot, &topology)).text_style(pal.text_style(
-                &theme,
-                theme.text.sm.size,
-                FontWeight::NORMAL,
-                pal.text_muted,
-            )),
-        );
-    let (status, tone) = if refreshing {
+/// Badge text and tone for the header: health, or the refresh in progress.
+fn cluster_header_status(key: &ClusterStructureKey) -> (String, SemanticTone) {
+    if key.refreshing {
         ("Refreshing".to_string(), SemanticTone::Accent)
     } else {
         (
-            cluster_health_badge_summary(&snapshot),
-            cluster_health_tone(&snapshot),
+            cluster_health_badge_summary(&key.snapshot),
+            cluster_health_tone(&key.snapshot),
         )
-    };
-    let row = TrailingSlotRow::new(
-        summary,
-        StatusBadge::new(status)
-            .tone(tone)
-            .theme_when(clone_reader(reader)),
-    )
-    .trailing_width(142.0)
-    .trailing_height(30.0)
-    .gap(12.0);
-    WidgetPod::new(
-        Surface::window(row)
-            .border(SurfaceBorder::Bottom)
-            .padding(Insets {
-                left: PAD,
-                right: PAD,
-                top: 10.0,
-                bottom: 10.0,
-            })
-            .fill()
-            .theme_when(clone_reader(reader)),
-    )
+    }
 }
 
-fn cluster_empty_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<ClusterHeaderKey> {
-    let source =
-        shared
-            .signals()
-            .cluster_structure
-            .select_named("cluster empty structure", |key| ClusterHeaderKey {
-                theme: key.theme,
-                snapshot: key.snapshot.clone(),
-                refreshing: key.refreshing,
-            });
-    let build_shared = shared.clone();
-    let reader = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        build_cluster_empty(&build_shared, &reader)
-    })
-}
-
-fn build_cluster_empty(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (snapshot, refreshing) = {
-        let cluster = shared.cluster();
-        (cluster.snapshot.clone(), cluster.refreshing)
-    };
-    let title = if snapshot.warnings.is_empty() {
-        "No cluster nodes"
-    } else {
-        "Cluster metadata unavailable"
-    };
-    let description = if refreshing {
-        "Refreshing cluster membership and health in the background"
-    } else {
-        "Initialize or join a cluster to populate this view"
-    };
-    let detail = snapshot
-        .warnings
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "Cluster nodes appear here after discovery completes.".to_string());
-    let refresh_shared = shared.clone();
-    let refresh = Button::new(if refreshing { "Refreshing" } else { "Refresh" })
-        .icon(IconGlyph::Redo)
-        .description("Refresh cluster health and topology")
-        .appearance(ButtonAppearance::Tonal)
-        .tone(SemanticTone::Accent)
-        .enabled(!refreshing)
+fn cluster_header(shared: &Shared, reader: &ThemeReader) -> Surface {
+    let summary = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(2.0)
+        .with_child(Label::new("Cluster").text_style_when(themed_style(
+            reader,
+            |theme| theme.text.xl,
+            FontWeight::SEMIBOLD,
+            |theme| theme.surfaces.text,
+        )))
+        .with_child(
+            Label::new(String::new())
+                .text_from(cluster_select(shared, "cluster header summary", |key| {
+                    cluster_header_summary(&key.snapshot, &build_topology(&key.snapshot))
+                }))
+                .text_style_when(themed_style(
+                    reader,
+                    |theme| theme.text.sm,
+                    FontWeight::NORMAL,
+                    |theme| theme.surfaces.text_muted,
+                )),
+        );
+    let status = widgets::Restyle::new(
+        StatusBadge::new(String::new())
+            .label_from(cluster_select(shared, "cluster header status", |key| {
+                cluster_header_status(key).0
+            }))
+            .theme_when(clone_reader(reader)),
+        cluster_select(shared, "cluster header tone", |key| {
+            cluster_header_status(key).1
+        }),
+        |badge, tone| badge.tone(*tone),
+    );
+    let row = TrailingSlotRow::new(summary, status)
+        .trailing_width(142.0)
+        .trailing_height(30.0)
+        .gap(12.0);
+    Surface::window(row)
+        .border(SurfaceBorder::Bottom)
+        .padding(Insets {
+            left: PAD,
+            right: PAD,
+            top: 10.0,
+            bottom: 10.0,
+        })
+        .fill()
         .theme_when(clone_reader(reader))
-        .on_press_with_ctx(move |ctx| {
-            request_refresh(&refresh_shared);
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
+}
+
+/// The cluster empty state, shared by the overview and the topology view.
+///
+/// Its title and description follow whether warnings exist and whether a refresh is running.
+/// Each combination is a prebuilt variant, so a refresh switches variants rather than
+/// rebuilding one; the detail line follows the first warning in place.
+fn cluster_empty_view(shared: &Shared, reader: &ThemeReader) -> SwitchView {
+    let detail =
+        cluster_select(shared, "cluster empty detail", |key| {
+            key.snapshot.warnings.first().cloned().unwrap_or_else(|| {
+                "Cluster nodes appear here after discovery completes.".to_string()
+            })
         });
-    WidgetPod::new(
-        EmptyState::new(title, description)
-            .name("Cluster empty state")
-            .icon(IconGlyph::Link)
-            .detail(detail)
-            .action(refresh)
-            .action_max_width(160.0)
-            .transparent()
-            .theme_when(clone_reader(reader)),
-    )
+    let mut view =
+        SwitchView::new().selected_from(cluster_select(shared, "cluster empty variant", |key| {
+            usize::from(!key.snapshot.warnings.is_empty()) * 2 + usize::from(key.refreshing)
+        }));
+    for warned in [false, true] {
+        for refreshing in [false, true] {
+            let title = if warned {
+                "Cluster metadata unavailable"
+            } else {
+                "No cluster nodes"
+            };
+            let description = if refreshing {
+                "Refreshing cluster membership and health in the background"
+            } else {
+                "Initialize or join a cluster to populate this view"
+            };
+            let refresh_shared = shared.clone();
+            let refresh = Button::new(if refreshing { "Refreshing" } else { "Refresh" })
+                .icon(IconGlyph::Redo)
+                .description("Refresh cluster health and topology")
+                .appearance(ButtonAppearance::Tonal)
+                .tone(SemanticTone::Accent)
+                .enabled(!refreshing)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    request_refresh(&refresh_shared);
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_paint();
+                });
+            let state = EmptyState::new(title, description)
+                .name("Cluster empty state")
+                .icon(IconGlyph::Link)
+                .action(refresh)
+                .action_max_width(160.0)
+                .transparent()
+                .theme_when(clone_reader(reader));
+            view = view.with_child(widgets::Restyle::new(
+                state,
+                detail.clone(),
+                |state, detail| state.detail(detail.clone()),
+            ));
+        }
+    }
+    view
 }
 
 fn cluster_legend(reader: &ThemeReader) -> Surface {
@@ -2882,7 +3272,12 @@ fn cluster_legend(reader: &ThemeReader) -> Surface {
         .theme_when(clone_reader(reader))
 }
 
-fn paint_edges(ctx: &mut PaintCtx, pal: &Palette, topology: &Topology, layout: &[LayoutVertex]) {
+fn paint_edges(
+    ctx: &mut PaintCtx,
+    pal: &SurfacePalette,
+    topology: &Topology,
+    layout: &[LayoutVertex],
+) {
     let centers = layout
         .iter()
         .map(|vertex| (vertex.vertex.id.as_str(), vertex.center))
@@ -2909,7 +3304,7 @@ fn paint_edges(ctx: &mut PaintCtx, pal: &Palette, topology: &Topology, layout: &
 fn paint_vertices(
     ctx: &mut PaintCtx,
     theme: &sui::DefaultTheme,
-    pal: &Palette,
+    pal: &SurfacePalette,
     layout: &[LayoutVertex],
     selected: &Option<ClusterSelection>,
 ) {
@@ -2922,7 +3317,7 @@ fn paint_vertices(
             (Some(ClusterSelection::LanSegment(id)), GraphVertexKind::LanSegment)
                 if id == &vertex.vertex.id
         );
-        let fill = vertex_fill(pal, &vertex.vertex);
+        let fill = vertex_fill(theme, &vertex.vertex);
         let border = if selected_here {
             pal.accent
         } else if vertex.vertex.kind == GraphVertexKind::LanSegment {
@@ -2942,9 +3337,8 @@ fn paint_vertices(
             StrokeStyle::new(if selected_here { 2.0 } else { 1.25 }),
         );
         if selected_here {
-            // Selected nodes glow like the Mesh cluster map's self node — a
-            // soft accent halo outside the ring (empty in Light, damped in Void).
-            if let Some(glow) = pal.glow_accent.first {
+            // A soft accent halo outside the ring, where the theme defines an accent glow.
+            if let Some(glow) = theme.glows.accent.first {
                 ctx.stroke(
                     Path::circle(vertex.center, vertex.radius + 6.0),
                     glow.color,
@@ -2956,8 +3350,14 @@ fn paint_vertices(
             paint_public_reachability_badge(ctx, pal, vertex.center, vertex.radius);
         }
 
-        let label_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
-        let detail_style = pal.text_style(theme, 11.0, FontWeight::NORMAL, pal.text_faint);
+        let label_style =
+            crate::theme::token_text_style(theme, theme.text.xs, FontWeight::MEDIUM, pal.text);
+        let detail_style = crate::theme::token_text_style(
+            theme,
+            theme.text.xs,
+            FontWeight::NORMAL,
+            pal.text_faint,
+        );
         let text_layout = vertex_text_layout(
             vertex.center,
             vertex.radius,
@@ -3004,9 +3404,10 @@ fn vertex_text_layout(
     }
 }
 
-fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
+fn vertex_fill(theme: &sui::DefaultTheme, vertex: &GraphVertex) -> Color {
+    let pal = &theme.surfaces;
     match vertex.kind {
-        GraphVertexKind::LanSegment => lan_segment_color(pal),
+        GraphVertexKind::LanSegment => lan_segment_color(theme),
         GraphVertexKind::Node => match vertex.availability.as_str() {
             "online" => pal.good,
             "offline" => pal.bad,
@@ -3016,7 +3417,12 @@ fn vertex_fill(pal: &Palette, vertex: &GraphVertex) -> Color {
     }
 }
 
-fn paint_public_reachability_badge(ctx: &mut PaintCtx, pal: &Palette, center: Point, radius: f32) {
+fn paint_public_reachability_badge(
+    ctx: &mut PaintCtx,
+    pal: &SurfacePalette,
+    center: Point,
+    radius: f32,
+) {
     let badge_center = Point::new(center.x + radius * 0.58, center.y - radius * 0.58);
     ctx.fill(Path::circle(badge_center, 5.5), public_node_color(pal));
     ctx.stroke(
@@ -3027,190 +3433,326 @@ fn paint_public_reachability_badge(ctx: &mut PaintCtx, pal: &Palette, center: Po
 }
 
 /// Public/internet reachability rides the informational hue.
-fn public_node_color(pal: &Palette) -> Color {
+fn public_node_color(pal: &SurfacePalette) -> Color {
     pal.info
 }
 
-/// LAN segment hubs use the amber agent hue — a topology identity, not a
+/// LAN segment hubs use the decorative amber hue — a topology identity, not a
 /// warning (labels next to them stay on ink tokens).
-fn lan_segment_color(pal: &Palette) -> Color {
-    pal.agent[3]
+fn lan_segment_color(theme: &sui::DefaultTheme) -> Color {
+    theme.decorative.get(sui::DecorativeHue::Amber).solid
 }
 
 /// Unknown availability reads as disabled, not as a status.
-fn unknown_node_color(pal: &Palette) -> Color {
+fn unknown_node_color(pal: &SurfacePalette) -> Color {
     pal.text_disabled
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct ClusterDetailKey {
-    theme: DefaultTheme,
-    snapshot: ClusterSnapshot,
-    selected: Option<ClusterSelection>,
-    diagnostics_open: bool,
-    refreshing: bool,
-}
-
-fn cluster_detail_host(shared: &Shared, reader: &ThemeReader) -> RebuildOnChange<ClusterDetailKey> {
-    let source =
-        shared
-            .signals()
-            .cluster_structure
-            .select_named("cluster detail structure", |key| ClusterDetailKey {
-                theme: key.theme,
-                snapshot: key.snapshot.clone(),
-                selected: key.selected.clone(),
-                diagnostics_open: key.diagnostics_open,
-                refreshing: key.refreshing,
-            });
-    let build_shared = shared.clone();
-    let reader = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_key| {
-        build_cluster_detail(&build_shared, &reader)
-    })
-}
-
-fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (snapshot, selection, diagnostics_open, refreshing) = {
-        let cluster = shared.cluster();
-        (
-            cluster.snapshot.clone(),
-            cluster.selected.clone(),
-            cluster.diagnostics_open,
-            cluster.refreshing,
-        )
-    };
-    let topology = build_topology(&snapshot);
-    let lines = selection
+/// The inspector's lines for the current selection, snapshot, and diagnostics toggle; the first
+/// line is the section title.
+fn inspector_lines(key: &ClusterStructureKey) -> Vec<String> {
+    let topology = build_topology(&key.snapshot);
+    key.selected
         .as_ref()
-        .map(|selection| detail_lines(&snapshot, &topology, selection, diagnostics_open))
-        .unwrap_or_else(|| overview_lines(&snapshot, &topology, diagnostics_open, refreshing));
-    let title = lines
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "Cluster overview".to_string());
-    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
-    for line in lines.iter().skip(1).filter(|line| !line.trim().is_empty()) {
-        let (label, value, max_lines) = if let Some(hint) = line.strip_prefix("hint:") {
-            ("Guidance", hint.trim(), 3)
-        } else if let Some((label, value)) = line.split_once(':') {
-            (
-                label.trim(),
-                value.trim(),
-                if diagnostics_open { 3 } else { 2 },
+        .map(|selection| detail_lines(&key.snapshot, &topology, selection, key.diagnostics_open))
+        .unwrap_or_else(|| {
+            overview_lines(
+                &key.snapshot,
+                &topology,
+                key.diagnostics_open,
+                key.refreshing,
             )
-        } else {
-            ("Detail", line.trim(), 2)
-        };
-        rows.push(
-            DetailRow::new(label, value)
-                .max_value_lines(max_lines)
-                .theme_when(clone_reader(reader)),
-        );
-    }
-    let (status, tone) = cluster_detail_status(&snapshot, &topology, selection.as_ref());
-    let details = PanelSection::new(
-        title,
-        ScrollView::vertical(rows)
-            .name("Cluster detail fields")
-            .theme(shared.theme())
-            .viewport_width_hint(true),
-    )
-    .header_action(
-        StatusBadge::new(status)
-            .tone(tone)
-            .theme_when(clone_reader(reader)),
-    )
-    .theme_when(clone_reader(reader));
+        })
+}
+
+/// One inspector field. The key is the label plus its occurrence, so a field keeps its row
+/// while its value changes and new diagnostics fields enter around it.
+#[derive(Clone, Debug, PartialEq)]
+struct InspectorRow {
+    key: (String, usize),
+    value: String,
+    max_lines: usize,
+}
+
+fn inspector_rows(key: &ClusterStructureKey) -> Vec<InspectorRow> {
+    let mut seen = BTreeMap::<String, usize>::new();
+    inspector_lines(key)
+        .iter()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (label, value, max_lines) = if let Some(hint) = line.strip_prefix("hint:") {
+                ("Guidance", hint.trim(), 3)
+            } else if let Some((label, value)) = line.split_once(':') {
+                (
+                    label.trim(),
+                    value.trim(),
+                    if key.diagnostics_open { 3 } else { 2 },
+                )
+            } else {
+                ("Detail", line.trim(), 2)
+            };
+            let occurrence = seen.entry(label.to_string()).or_default();
+            let row = InspectorRow {
+                key: (label.to_string(), *occurrence),
+                value: value.to_string(),
+                max_lines,
+            };
+            *occurrence += 1;
+            row
+        })
+        .collect()
+}
+
+/// Show `child` while `shown` holds. The leading `gap` belongs to the child, so a hidden child
+/// leaves no spacing behind in a gap-free parent stack.
+fn revealed<W>(gap: f32, child: W, shown: impl Observable<bool> + 'static) -> Presence
+where
+    W: Widget + 'static,
+{
+    Presence::new(sui::prelude::Padding::new(
+        Insets {
+            left: 0.0,
+            top: gap,
+            right: 0.0,
+            bottom: 0.0,
+        },
+        child,
+    ))
+    .transition(crate::ui::widgets::reveal_transition())
+    .shown_from(shown)
+    .collapse(Axis::Vertical)
+}
+
+/// The topology inspector. The panel, its actions, and their focus stay mounted: buttons follow
+/// the selection, refresh, and diagnostics state through bindings. Only the field section is
+/// replaced, when another node or segment gives it a new title; its rows follow refreshes and
+/// the diagnostics toggle by key inside the retained scroll view.
+fn cluster_inspector(shared: &Shared, reader: &ThemeReader) -> Surface {
+    let title = cluster_select(shared, "cluster inspector title", |key| {
+        inspector_lines(key)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "Cluster overview".to_string())
+    });
+    let details_shared = shared.clone();
+    let details_reader = Rc::clone(reader);
+    let details = RebuildOnChange::key_from(title, move |title| {
+        WidgetPod::new(inspector_details(&details_shared, &details_reader, title))
+    });
 
     let refresh_shared = shared.clone();
-    let refresh = Button::new(if refreshing { "Refreshing" } else { "Refresh" })
-        .icon(IconGlyph::Redo)
-        .description("Refresh cluster health and topology")
-        .appearance(ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .min_height(DETAIL_BUTTON_H)
-        .enabled(!refreshing)
+    let refresh = widgets::Restyle::new(
+        Button::new("Refresh")
+            .icon(IconGlyph::Redo)
+            .description("Refresh cluster health and topology")
+            .appearance(ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                request_refresh(&refresh_shared);
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_paint();
+            }),
+        cluster_select(shared, "cluster inspector refreshing", |key| key.refreshing),
+        |mut button, refreshing| {
+            button.set_label(if *refreshing { "Refreshing" } else { "Refresh" });
+            button.enabled(!refreshing)
+        },
+    );
+    let back_shared = shared.clone();
+    let back = Button::new("Back to topology")
         .theme_when(clone_reader(reader))
         .on_press_with_ctx(move |ctx| {
-            request_refresh(&refresh_shared);
+            let mut cluster = back_shared.cluster_mut();
+            cluster.selected = None;
+            cluster.diagnostics_open = false;
+            drop(cluster);
             ctx.request_measure();
             ctx.request_arrange();
             ctx.request_paint();
         });
-    let warning_visible = if selection.is_some() {
-        selected_node_needs_connection_settings(&snapshot, selection.as_ref())
-    } else {
-        !refreshing && cluster_actionable_warning(&snapshot).is_some()
-    };
-    let primary_count = 1 + usize::from(selection.is_some()) + usize::from(warning_visible);
-    let primary_height =
-        DETAIL_BUTTON_H * primary_count as f32 + 8.0 * primary_count.saturating_sub(1) as f32;
-    let mut primary_actions = Flex::vertical()
+    let settings_shared = shared.clone();
+    let settings = widgets::Restyle::new(
+        Button::new("Connection settings")
+            .icon(IconGlyph::Alert)
+            .appearance(ButtonAppearance::Filled)
+            .tone(SemanticTone::Accent)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                open_connection_settings(&settings_shared);
+                ctx.request_measure();
+                ctx.request_arrange();
+                ctx.request_paint();
+            }),
+        cluster_select(shared, "cluster inspector settings description", |key| {
+            if key.selected.is_some() {
+                "Open connection settings for selected cluster node"
+            } else {
+                "Open connection settings for cluster warning"
+            }
+        }),
+        |button, description| button.description(*description),
+    );
+    let primary = Flex::vertical()
         .align_items(Alignment::Stretch)
-        .gap(8.0)
-        .with_item(refresh, FlexItem::fixed(DETAIL_BUTTON_H));
-    if selection.is_some() {
-        let back = shared.clone();
-        primary_actions.push_item(
-            Button::new("Back to topology")
-                .min_height(DETAIL_BUTTON_H)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    let mut cluster = back.cluster_mut();
-                    cluster.selected = None;
-                    cluster.diagnostics_open = false;
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_paint();
-                }),
-            FlexItem::fixed(DETAIL_BUTTON_H),
-        );
-    }
-    if warning_visible {
-        let settings_shared = shared.clone();
-        let description = if selection.is_some() {
-            "Open connection settings for selected cluster node"
-        } else {
-            "Open connection settings for cluster warning"
-        };
-        primary_actions.push_item(
-            Button::new("Connection settings")
-                .icon(IconGlyph::Alert)
-                .description(description)
-                .appearance(ButtonAppearance::Filled)
-                .tone(SemanticTone::Accent)
-                .min_height(DETAIL_BUTTON_H)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    open_connection_settings(&settings_shared);
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_paint();
-                }),
-            FlexItem::fixed(DETAIL_BUTTON_H),
-        );
-    }
+        .with_child(refresh)
+        .with_child(revealed(
+            8.0,
+            back,
+            cluster_select(shared, "cluster inspector back", |key| {
+                key.selected.is_some()
+            }),
+        ))
+        .with_child(revealed(
+            8.0,
+            settings,
+            cluster_select(shared, "cluster inspector settings", |key| {
+                if key.selected.is_some() {
+                    selected_node_needs_connection_settings(&key.snapshot, key.selected.as_ref())
+                } else {
+                    !key.refreshing && cluster_actionable_warning(&key.snapshot).is_some()
+                }
+            }),
+        ));
 
-    let toggle_shared = shared.clone();
-    let mut secondary_actions = Flex::horizontal()
+    // Node details can be copied; LAN segments and the overview cannot.
+    let copy_details = cluster_select(shared, "cluster inspector copy details", |key| {
+        key.selected
+            .as_ref()
+            .and_then(|selection| selected_copy_details(&key.snapshot, selection))
+    });
+    let copy_shared = shared.clone();
+    let copy = widgets::Restyle::new(
+        Button::new("Copy details")
+            .semantic_name("Copy node details")
+            .icon(IconGlyph::Restore)
+            .appearance(ButtonAppearance::Outline)
+            .tone(SemanticTone::Neutral)
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                let cluster = copy_shared.cluster();
+                if let Some(value) = cluster
+                    .selected
+                    .as_ref()
+                    .and_then(|selection| selected_copy_details(&cluster.snapshot, selection))
+                {
+                    ctx.set_clipboard_text(value);
+                }
+                ctx.request_semantics();
+            }),
+        copy_details,
+        |button, value| {
+            button.description(format!(
+                "Copy the full node ID, address, and endpoints: {}",
+                value.as_deref().unwrap_or_default()
+            ))
+        },
+    );
+    let secondary = SwitchView::new()
+        .selected_from(cluster_select(
+            shared,
+            "cluster inspector copyable",
+            |key| {
+                usize::from(key.selected.as_ref().is_some_and(|selection| {
+                    selected_copy_details(&key.snapshot, selection).is_some()
+                }))
+            },
+        ))
+        .with_child(
+            Flex::horizontal()
+                .align_items(Alignment::Stretch)
+                .gap(8.0)
+                .with_item(
+                    diagnostics_toggle(shared, reader),
+                    FlexItem::fill().min_width(0.0),
+                ),
+        )
+        .with_child(
+            Flex::horizontal()
+                .align_items(Alignment::Stretch)
+                .gap(8.0)
+                .with_item(
+                    diagnostics_toggle(shared, reader),
+                    FlexItem::fill().min_width(0.0),
+                )
+                .with_item(copy, FlexItem::fill().min_width(0.0)),
+        );
+    let actions = Flex::vertical()
         .align_items(Alignment::Stretch)
         .gap(8.0)
-        .with_item(
-            Button::new(if diagnostics_open {
-                "Hide diagnostics"
-            } else {
-                "Show diagnostics"
-            })
-            .icon(if diagnostics_open {
-                IconGlyph::ChevronUp
-            } else {
-                IconGlyph::ChevronDown
-            })
+        .with_child(primary)
+        .with_child(secondary);
+    Surface::panel(
+        Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .gap(8.0)
+            .with_item(details, FlexItem::fill())
+            .with_child(actions),
+    )
+    .name("Cluster inspector")
+    .appearance(SurfaceAppearance::Raised)
+    .elevation(SurfaceElevation::Medium)
+    .padding(Insets::all(PANEL_PAD))
+    .fill()
+    .theme_when(clone_reader(reader))
+}
+
+fn inspector_details(shared: &Shared, reader: &ThemeReader, title: &str) -> PanelSection {
+    let row_reader = Rc::clone(reader);
+    let rows = KeyedStack::vertical(
+        cluster_select(shared, "cluster inspector rows", inspector_rows),
+        |row: &InspectorRow| row.key.clone(),
+        move |_, row| {
+            let initial = row.get();
+            let label = row.clone();
+            let value = row.clone();
+            widgets::Restyle::new(
+                DetailRow::new(initial.key.0, initial.value)
+                    .label_when(move || label.get().key.0)
+                    .value_when(move || value.get().value)
+                    .theme_when(clone_reader(&row_reader)),
+                row,
+                |detail, row| detail.max_value_lines(row.max_lines),
+            )
+        },
+    )
+    .gap(8.0);
+    let status = cluster_select(shared, "cluster inspector status", |key| {
+        cluster_detail_status(
+            &key.snapshot,
+            &build_topology(&key.snapshot),
+            key.selected.as_ref(),
+        )
+    });
+    let status_label = status.clone();
+    let badge = widgets::Restyle::new(
+        StatusBadge::new(status.get().0)
+            .label_when(move || status_label.get().0)
+            .theme_when(clone_reader(reader)),
+        status,
+        |badge, (_, tone)| badge.tone(*tone),
+    );
+    PanelSection::new(
+        title,
+        ScrollView::vertical(rows)
+            .name("Cluster detail fields")
+            .theme_when(clone_reader(reader))
+            .viewport_width_hint(true),
+    )
+    .header_action(badge)
+    .theme_when(clone_reader(reader))
+}
+
+fn diagnostics_toggle(shared: &Shared, reader: &ThemeReader) -> widgets::Restyle<Button, bool> {
+    let toggle_shared = shared.clone();
+    widgets::Restyle::new(
+        Button::new("Show diagnostics")
+            .icon(IconGlyph::ChevronDown)
             .description("Show technical cluster source and identifier details")
             .appearance(ButtonAppearance::Outline)
             .tone(SemanticTone::Neutral)
-            .min_height(DETAIL_BUTTON_H)
             .theme_when(clone_reader(reader))
             .on_press_with_ctx(move |ctx| {
                 let open = toggle_shared.cluster().diagnostics_open;
@@ -3220,52 +3762,21 @@ fn build_cluster_detail(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 ctx.request_paint();
                 ctx.request_semantics();
             }),
-            FlexItem::fill().min_width(0.0),
-        );
-    if selection
-        .as_ref()
-        .is_some_and(|selection| selected_copy_details(&snapshot, selection).is_some())
-    {
-        let copy_shared = shared.clone();
-        let copy_selection = selection.clone().expect("selection checked above");
-        let copy_value = selected_copy_details(&snapshot, &copy_selection).unwrap_or_default();
-        secondary_actions.push_item(
-            Button::new("Copy details")
-                .semantic_name("Copy node details")
-                .icon(IconGlyph::Restore)
-                .description(format!(
-                    "Copy the full node ID, address, and endpoints: {copy_value}"
-                ))
-                .appearance(ButtonAppearance::Outline)
-                .tone(SemanticTone::Neutral)
-                .min_height(DETAIL_BUTTON_H)
-                .theme_when(clone_reader(reader))
-                .on_press_with_ctx(move |ctx| {
-                    if let Some(value) =
-                        selected_copy_details(&copy_shared.cluster().snapshot, &copy_selection)
-                    {
-                        ctx.set_clipboard_text(value);
-                    }
-                    ctx.request_semantics();
-                }),
-            FlexItem::fill().min_width(0.0),
-        );
-    }
-
-    let actions = Flex::vertical()
-        .align_items(Alignment::Stretch)
-        .gap(8.0)
-        .with_item(primary_actions, FlexItem::fixed(primary_height))
-        .with_item(secondary_actions, FlexItem::fixed(DETAIL_BUTTON_H));
-    let content = Dock::new(details).bottom(primary_height + DETAIL_BUTTON_H + 8.0, actions);
-    WidgetPod::new(
-        Surface::panel(content)
-            .name("Cluster inspector")
-            .appearance(SurfaceAppearance::Raised)
-            .elevation(SurfaceElevation::Medium)
-            .padding(Insets::all(PANEL_PAD))
-            .fill()
-            .theme_when(clone_reader(reader)),
+        cluster_select(shared, "cluster inspector diagnostics", |key| {
+            key.diagnostics_open
+        }),
+        |mut button, open| {
+            button.set_label(if *open {
+                "Hide diagnostics"
+            } else {
+                "Show diagnostics"
+            });
+            button.icon(if *open {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            })
+        },
     )
 }
 
@@ -4202,9 +4713,15 @@ mod tests {
     #[test]
     fn vertex_text_lines_follow_extra_large_theme_metrics_without_overlap() {
         let theme = resolve_theme_with_preferences(AppThemeMode::Dark, AppTextScale::ExtraLarge);
-        let pal = Palette::from_theme(&theme, true);
-        let label = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.text);
-        let detail = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
+        let pal = theme.surfaces;
+        let label =
+            crate::theme::token_text_style(&theme, theme.text.xs, FontWeight::MEDIUM, pal.text);
+        let detail = crate::theme::token_text_style(
+            &theme,
+            theme.text.xs,
+            FontWeight::NORMAL,
+            pal.text_faint,
+        );
         let center = Point::new(120.0, 90.0);
         let layout = vertex_text_layout(center, NODE_R, label.line_height, detail.line_height);
         let label_top = layout.label_center_y - label.line_height * 0.5;
@@ -5098,17 +5615,15 @@ mod tests {
     #[test]
     fn dashboard_time_windows_are_fixed_and_missing_gauges_stay_unknown() {
         let end = test_time(1000);
-        let theme = resolve_theme(AppThemeMode::Dark);
-        let chart = MetricChart::new(
+        let mut chart = MetricChart::new(
             "sinomo.daemon.service.requests".into(),
             vec![],
-            theme,
-            Palette::from_theme(&theme, true).agent,
+            Rc::new(|| resolve_theme(AppThemeMode::Dark)),
             Some(ObserveMetricUnit::Count),
             ExplorerTransform::Rate,
             ObserveMetricKind::Counter,
-        )
-        .time_range(end, ExplorerWindow::FiveMinutes, false);
+        );
+        chart.set_time_range(end, ExplorerWindow::FiveMinutes, false);
         assert_eq!(chart.x_fraction(end - time::Duration::minutes(5)), 0.0);
         assert_eq!(chart.x_fraction(end - time::Duration::seconds(150)), 0.5);
         assert!((chart.x_fraction(end - time::Duration::seconds(5)) - 59.0 / 60.0).abs() < 0.0001);
@@ -6299,7 +6814,7 @@ mod tests {
                 .with_name("Show diagnostics")
                 .count()?,
             1,
-            "keyboard selection should rebuild the stock inspector actions"
+            "keyboard selection should show the stock inspector actions"
         );
         Ok(())
     }
@@ -6864,8 +7379,8 @@ mod tests {
         };
         let topology = build_topology(&snapshot);
         let theme = resolve_theme(AppThemeMode::Light);
-        let pal = Palette::from_theme(&theme, false);
-        let fill = vertex_fill(&pal, &topology.vertices[0]);
+        let pal = theme.surfaces;
+        let fill = vertex_fill(&theme, &topology.vertices[0]);
 
         assert_eq!(fill, unknown_node_color(&pal));
         assert_ne!(fill, pal.field);
@@ -6882,8 +7397,8 @@ mod tests {
         };
         let topology = build_topology(&snapshot);
         let theme = resolve_theme(AppThemeMode::Light);
-        let pal = Palette::from_theme(&theme, false);
-        let fill = vertex_fill(&pal, &topology.vertices[0]);
+        let pal = theme.surfaces;
+        let fill = vertex_fill(&theme, &topology.vertices[0]);
 
         assert_eq!(fill, pal.bad);
         assert_ne!(fill, public_node_color(&pal));

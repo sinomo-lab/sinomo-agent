@@ -6,18 +6,19 @@
 //! reconnect button reports an in-flight reconnect and the detail line tracks the latest failure.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use sui::{
-    Align, Alignment, Button, ButtonAppearance, Constraints, DefaultTheme, Flex, FlexWrap,
-    FontWeight, IconGlyph, MeasureCtx, PaintCtx, Paragraph, RebuildOnChange, SemanticTone,
+    Align, Alignment, Axis, Button, ButtonAppearance, Constraints, DefaultTheme, Flex, FlexWrap,
+    FontWeight, IconGlyph, MeasureCtx, Observable, PaintCtx, Paragraph, Presence, SemanticTone,
     SemanticsCtx, SemanticsNode, SemanticsRole, Size, Stack, TextAlign, TextStyle, VerticalAlign,
-    Widget, WidgetPod,
+    Widget,
 };
 use sui_lucide::LucideIcon;
 
 use crate::state::{DaemonAvailability, Shared, Tab};
 use crate::ui::settings::SettingsSection;
-use crate::ui::widgets::MaxWidth;
+use crate::ui::widgets::{MaxWidth, Restyle};
 
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 type ActionFactory = Rc<dyn Fn() -> Button>;
@@ -28,7 +29,6 @@ pub(crate) const RECONNECT_LABEL: &str = "Reconnect";
 pub(crate) const RECONNECTING_LABEL: &str = "Reconnecting…";
 pub(crate) const CONNECTION_SETTINGS_LABEL: &str = "Connection settings";
 
-const PANEL_MAX_WIDTH: f32 = 460.0;
 const ICON_SIZE: f32 = 40.0;
 
 /// Builder for a surface's offline panel. `summary` says what the surface needs the daemon for.
@@ -70,17 +70,7 @@ impl DaemonOfflinePanel {
             summary,
             extra_actions,
         } = self;
-        let source = shared.signals().daemon.clone();
-        RebuildOnChange::key_from(source, move |daemon| {
-            WidgetPod::new(panel_content(
-                &shared,
-                &reader,
-                &name,
-                &summary,
-                &extra_actions,
-                daemon,
-            ))
-        })
+        panel_content(&shared, &reader, &name, &summary, &extra_actions)
     }
 }
 
@@ -101,48 +91,43 @@ pub(crate) fn daemon_gate(
         .with_child(offline)
 }
 
+/// The panel is built once; reconnect progress and the latest failure update it in place.
 fn panel_content(
     shared: &Shared,
     reader: &ThemeReader,
     name: &str,
     summary: &str,
     extra_actions: &[ActionFactory],
-    daemon: &DaemonAvailability,
 ) -> impl Widget + use<> {
-    let (detail, reconnecting) = match daemon {
-        DaemonAvailability::Available => (None, false),
-        DaemonAvailability::Unavailable {
-            detail,
-            reconnecting,
-        } => (detail.clone(), *reconnecting),
-    };
-    let theme = reader();
-
-    let mut title_style = theme.text_style(theme.palette.text);
-    title_style.font_size = theme.text.lg.size;
-    title_style.line_height = theme.text.lg.line_height;
-    title_style.weight = FontWeight::SEMIBOLD;
-    let mut summary_style = theme.text_style(theme.palette.text_muted);
-    summary_style.font_size = theme.text.sm.size;
-    summary_style.line_height = theme.text.sm.line_height;
-    let mut detail_style = summary_style.clone();
-    detail_style.font_size = theme.text.xs.size;
-    detail_style.line_height = theme.text.xs.line_height;
-
+    let daemon = shared.signals().daemon.clone();
     let reconnect = {
         let shared = shared.clone();
-        Button::new(if reconnecting {
-            RECONNECTING_LABEL
-        } else {
-            RECONNECT_LABEL
-        })
-        .icon(IconGlyph::Redo)
-        .primary_action()
-        .enabled(!reconnecting)
-        .theme_when(clone_reader(reader))
-        .on_press(move || {
-            shared.request_connection_probe(true);
-        })
+        Restyle::new(
+            Button::new(RECONNECT_LABEL)
+                .icon(IconGlyph::Redo)
+                .primary_action()
+                .theme_when(clone_reader(reader))
+                .on_press(move || {
+                    shared.request_connection_probe(true);
+                }),
+            daemon.select_named("daemon reconnecting", |daemon| {
+                matches!(
+                    daemon,
+                    DaemonAvailability::Unavailable {
+                        reconnecting: true,
+                        ..
+                    }
+                )
+            }),
+            |mut button: Button, reconnecting: &bool| {
+                button.set_label(if *reconnecting {
+                    RECONNECTING_LABEL
+                } else {
+                    RECONNECT_LABEL
+                });
+                button.enabled(!reconnecting)
+            },
+        )
     };
     let settings = {
         let shared = shared.clone();
@@ -163,18 +148,60 @@ fn panel_content(
         actions = actions.with_child(action().theme_when(clone_reader(reader)));
     }
 
-    let mut column = Stack::vertical()
+    let detail = daemon.select_named("daemon failure detail", |daemon| match daemon {
+        DaemonAvailability::Unavailable {
+            detail: Some(detail),
+            ..
+        } if !detail.trim().is_empty() => detail.clone(),
+        _ => String::new(),
+    });
+    let detail_shown = daemon.select_named("daemon failure detail shown", |daemon| {
+        matches!(
+            daemon,
+            DaemonAvailability::Unavailable { detail: Some(detail), .. } if !detail.trim().is_empty()
+        )
+    });
+    let column = Stack::vertical()
         .gap(8.0)
         .alignment(Alignment::Stretch)
         .with_child(Align::center(OfflineIcon {
-            color: theme.palette.text_muted,
+            reader: Rc::clone(reader),
         }))
-        .with_child(CenteredText::new(DAEMON_OFFLINE_TITLE, title_style))
-        .with_child(CenteredText::new(summary, summary_style));
-    if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
-        column = column.with_child(CenteredText::new(detail, detail_style));
-    }
-    column = column
+        .with_child(CenteredText::new(
+            DAEMON_OFFLINE_TITLE,
+            text_style(
+                reader,
+                |theme| theme.text.lg,
+                FontWeight::SEMIBOLD,
+                |theme| theme.palette.text,
+            ),
+        ))
+        .with_child(CenteredText::new(
+            summary,
+            text_style(
+                reader,
+                |theme| theme.text.sm,
+                FontWeight::NORMAL,
+                |theme| theme.palette.text_muted,
+            ),
+        ))
+        .with_child(
+            Presence::new(
+                CenteredText::new(
+                    "",
+                    text_style(
+                        reader,
+                        |theme| theme.text.xs,
+                        FontWeight::NORMAL,
+                        |theme| theme.palette.text_muted,
+                    ),
+                )
+                .text_from(detail),
+            )
+            .transition(crate::ui::widgets::reveal_transition())
+            .shown_from(detail_shown)
+            .collapse(Axis::Vertical),
+        )
         .with_child(sui::SizedBox::new().height(4.0))
         .with_child(actions);
 
@@ -182,11 +209,25 @@ fn panel_content(
         name,
         sui::Padding::all(
             16.0,
-            sui::ScrollView::vertical(Align::center(MaxWidth::new(PANEL_MAX_WIDTH, column)))
+            sui::ScrollView::vertical(Align::center(MaxWidth::new(reader().containers.md, column)))
                 .content_height(sui::ContentExtent::AtLeastViewport)
-                .theme(theme),
+                .theme_when(clone_reader(reader)),
         ),
     )
+}
+
+/// A live text style at a type-ramp token.
+fn text_style(
+    reader: &ThemeReader,
+    token: fn(&DefaultTheme) -> sui::ThemeTextToken,
+    weight: FontWeight,
+    color: fn(&DefaultTheme) -> sui::Color,
+) -> Rc<dyn Fn() -> TextStyle> {
+    let reader = Rc::clone(reader);
+    Rc::new(move || {
+        let theme = reader();
+        crate::theme::token_text_style(&theme, token(&theme), weight, color(&theme))
+    })
 }
 
 fn open_connection_settings(shared: &Shared) {
@@ -203,7 +244,7 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
 
 /// The cloud-off glyph, painted as vector paths so the panel needs no registered image resource.
 struct OfflineIcon {
-    color: sui::Color,
+    reader: ThemeReader,
 }
 
 impl Widget for OfflineIcon {
@@ -212,33 +253,45 @@ impl Widget for OfflineIcon {
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
-        LucideIcon::CloudOff.paint(ctx, ctx.bounds(), self.color);
+        let color = (self.reader)().palette.text_muted;
+        LucideIcon::CloudOff.paint(ctx, ctx.bounds(), color);
     }
 }
 
-/// Wrapped text with every line centered, as one accessible text node.
+/// Wrapped text with every line centered, as one accessible text node. The style is read live
+/// so appearance changes restyle the text in place.
 struct CenteredText {
     text: String,
-    style: TextStyle,
+    source: Option<Arc<dyn Observable<String>>>,
+    style: Rc<dyn Fn() -> TextStyle>,
     paragraph: Option<Paragraph>,
 }
 
 impl CenteredText {
-    fn new(text: impl Into<String>, style: TextStyle) -> Self {
+    fn new(text: impl Into<String>, style: Rc<dyn Fn() -> TextStyle>) -> Self {
         Self {
             text: text.into(),
+            source: None,
             style,
             paragraph: None,
         }
+    }
+
+    fn text_from(mut self, source: impl Observable<String> + 'static) -> Self {
+        self.source = Some(Arc::new(source));
+        self
     }
 }
 
 impl Widget for CenteredText {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        if let Some(source) = &self.source {
+            self.text = ctx.observe(source.as_ref());
+        }
         let paragraph = Paragraph::new(
             ctx,
             self.text.clone(),
-            &self.style,
+            &(self.style)(),
             TextAlign::Center,
             constraints.max.width,
         );
@@ -254,6 +307,9 @@ impl Widget for CenteredText {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if let Some(source) = &self.source {
+            ctx.observe(source.as_ref());
+        }
         let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Text, ctx.bounds());
         node.name = Some(self.text.clone());
         ctx.push(node);
@@ -292,16 +348,19 @@ mod tests {
             Size::new(869.0, 300.0),
         ] {
             let shared = Shared::new(AppState::connecting());
+            shared
+                .signals()
+                .daemon
+                .set(DaemonAvailability::Unavailable {
+                    detail: Some(detail.clone()),
+                    reconnecting: false,
+                });
             let panel = panel_content(
                 &shared,
                 &reader,
                 "Mobile offline",
                 "Chat runs through the daemon; reconnect to load conversations.",
                 &[],
-                &DaemonAvailability::Unavailable {
-                    detail: Some(detail.clone()),
-                    reconnecting: false,
-                },
             );
             let mut runtime = sui::Application::new()
                 .window(sui::WindowBuilder::new().root(panel))

@@ -1,26 +1,27 @@
 //! Goal, revision-DAG, metric, agent, and resource monitoring surface.
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
 use sinomo_client::evolution_contract as contract;
 use sui::{
-    Alignment, Button, ButtonAppearance, Flex, FlexItem, FontWeight, Insets, Label,
-    RebuildOnChange, ScrollView, SemanticTone, StatusBadge, Surface, SurfaceAppearance, Widget,
-    WidgetPod,
+    Alignment, Axis, Button, ButtonAppearance, Flex, FlexItem, FontWeight, Insets, KeyedStack,
+    Label, Presence, RebuildOnChange, ScrollState, ScrollView, SemanticTone, StatusBadge, Surface,
+    SurfaceAppearance, SwitchView, Widget, WidgetPod,
 };
 
 use crate::backend::Backend;
 use crate::state::{Shared, Tab};
 use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
+use crate::ui::widgets;
 
 #[derive(Debug)]
 pub struct EvolutionState {
     pub dashboard: contract::EvolutionDashboard,
     pub refreshing: bool,
-    pub revision: u64,
     refresh_rx: Option<Receiver<Result<contract::EvolutionDashboard, String>>>,
     details_open: sui::Signal<bool>,
 }
@@ -30,10 +31,13 @@ impl EvolutionState {
         Self {
             dashboard: contract::EvolutionDashboard::default(),
             refreshing: false,
-            revision: 1,
             refresh_rx: None,
             details_open: sui::Signal::new(false),
         }
+    }
+
+    pub fn details_open(&self) -> sui::Signal<bool> {
+        self.details_open.clone()
     }
 
     fn begin_refresh(&mut self, address: Option<String>, waker: Option<sui::UiHandle>) {
@@ -45,13 +49,11 @@ impl EvolutionState {
                 "Evolution monitoring requires a daemon connection and active evolution module"
                     .to_string(),
             );
-            self.revision = self.revision.saturating_add(1);
             return;
         };
         let (tx, rx) = mpsc::channel();
         self.refresh_rx = Some(rx);
         self.refreshing = true;
-        self.revision = self.revision.saturating_add(1);
         thread::spawn(move || {
             let result = sinomo_client::EvolutionClient::at_address(address)
                 .with_timeout(Duration::from_secs(10))
@@ -78,13 +80,11 @@ impl EvolutionState {
                 "Evolution controls require a daemon connection and active evolution module"
                     .to_string(),
             );
-            self.revision = self.revision.saturating_add(1);
             return;
         };
         let (tx, rx) = mpsc::channel();
         self.refresh_rx = Some(rx);
         self.refreshing = true;
-        self.revision = self.revision.saturating_add(1);
         thread::spawn(move || {
             let client = sinomo_client::EvolutionClient::at_address(address)
                 .with_timeout(Duration::from_secs(10));
@@ -114,7 +114,6 @@ impl EvolutionState {
             Ok(dashboard) => self.dashboard = dashboard,
             Err(error) => self.dashboard.error = Some(error),
         }
-        self.revision = self.revision.saturating_add(1);
         true
     }
 }
@@ -180,23 +179,73 @@ pub(crate) const EVOLUTION_OFFLINE_SUMMARY: &str =
 /// The command that proposes a goal; goals are proposed from a terminal for now.
 pub(crate) const PROPOSE_GOAL_COMMAND: &str = "sinomo evolve propose \"<goal>\"";
 
+/// The dashboard projection the retained page binds to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EvolutionView {
+    pub dashboard: Arc<contract::EvolutionDashboard>,
+    pub refreshing: bool,
+}
+
+impl EvolutionView {
+    pub(crate) fn from_state(state: &EvolutionState) -> Self {
+        Self {
+            dashboard: Arc::new(state.dashboard.clone()),
+            refreshing: state.refreshing,
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.dashboard
+            .error
+            .as_deref()
+            .filter(|error| !error.trim().is_empty())
+    }
+
+    fn summary(&self) -> String {
+        if self.error().is_some() {
+            return "Status unavailable".into();
+        }
+        let dashboard = &self.dashboard;
+        format!(
+            "{} goals · {} revisions · {} active goals",
+            dashboard.goals.len(),
+            dashboard
+                .goals
+                .iter()
+                .map(|goal| goal.revisions.len())
+                .sum::<usize>(),
+            dashboard.active_goal_count()
+        )
+    }
+
+    /// Which goals body shows: loading, the empty card, the goal list, or nothing beside an
+    /// error.
+    fn body(&self) -> usize {
+        if !self.dashboard.goals.is_empty() {
+            2
+        } else if self.error().is_some() {
+            3
+        } else if self.refreshing {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+type ThemeReader = Rc<dyn Fn() -> sui::DefaultTheme>;
+
+fn clone_reader(reader: &ThemeReader) -> impl Fn() -> sui::DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || reader()
+}
+
 pub fn view(shared: Shared) -> impl Widget {
-    let key_shared = shared.clone();
-    let build_shared = shared.clone();
-    let dashboard = RebuildOnChange::key_when(
-        move || {
-            (
-                key_shared.signals().evolution_revision.get(),
-                key_shared.theme(),
-                key_shared.evolution().details_open.get(),
-            )
-        },
-        move |_| build_dashboard(&build_shared),
-    );
-    let reader: Rc<dyn Fn() -> sui::DefaultTheme> = {
+    let reader: ThemeReader = {
         let shared = shared.clone();
         Rc::new(move || shared.theme())
     };
+    let dashboard = build_dashboard(&shared, &reader);
     let offline = DaemonOfflinePanel::new(
         &shared,
         &reader,
@@ -207,15 +256,27 @@ pub fn view(shared: Shared) -> impl Widget {
     daemon_gate(&shared, dashboard, offline)
 }
 
-fn build_dashboard(shared: &Shared) -> WidgetPod {
-    let theme = shared.theme();
-    let dashboard = shared.evolution().dashboard.clone();
-    let unavailable = dashboard
-        .error
-        .as_ref()
-        .is_some_and(|error| !error.trim().is_empty());
-    let refreshing = shared.evolution().refreshing;
+/// The page stays mounted: refreshes update its bindings, and only a goal whose own summary
+/// changed rebuilds its card.
+fn build_dashboard(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let view = shared.signals().evolution.clone();
+    let details = shared.evolution().details_open();
     let refresh_shared = shared.clone();
+    let refresh = widgets::Restyle::new(
+        Button::new("Refresh")
+            .theme_when(clone_reader(reader))
+            .appearance(ButtonAppearance::Tonal)
+            .on_press(move || request_refresh(&refresh_shared)),
+        view.select_named("evolution refreshing", |view| view.refreshing),
+        |mut button: Button, refreshing: &bool| {
+            button.set_label(if *refreshing {
+                "Refreshing…"
+            } else {
+                "Refresh"
+            });
+            button.enabled(!refreshing)
+        },
+    );
     let header = Flex::horizontal()
         .align_items(Alignment::Center)
         .gap(10.0)
@@ -223,102 +284,131 @@ fn build_dashboard(shared: &Shared) -> WidgetPod {
             Flex::vertical()
                 .gap(2.0)
                 .with_child(
-                    weighted_label("Evolution", theme, FontWeight::SEMIBOLD)
+                    weighted_label("Evolution", reader, FontWeight::SEMIBOLD)
                         .semantic_name("Evolution goals"),
                 )
                 .with_child(
-                    Label::new(if unavailable {
-                        "Status unavailable".into()
-                    } else {
-                        format!(
-                            "{} goals · {} revisions · {} active goals",
-                            dashboard.goals.len(),
-                            dashboard
-                                .goals
-                                .iter()
-                                .map(|goal| goal.revisions.len())
-                                .sum::<usize>(),
-                            dashboard.active_goal_count()
-                        )
-                    })
-                    .theme(theme),
+                    Label::new(view.get().summary())
+                        .text_from(view.select_named("evolution summary", EvolutionView::summary))
+                        .theme_when(clone_reader(reader)),
                 ),
             FlexItem::new().grow(1.0),
         )
-        .with_child(
-            Button::new(if refreshing {
-                "Refreshing…"
-            } else {
-                "Refresh"
-            })
-            .theme(theme)
-            .appearance(ButtonAppearance::Tonal)
-            .enabled(!refreshing)
-            .on_press(move || request_refresh(&refresh_shared)),
-        );
+        .with_child(refresh);
 
-    let mut content = Flex::vertical().align_items(Alignment::Stretch).gap(12.0);
-    content.push(
-        Surface::window(header)
-            .padding(Insets::all(14.0))
-            .fill()
-            .theme(theme),
+    let toggle_details = details.clone();
+    let details_button = widgets::Restyle::new(
+        Button::new("Technical details")
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                toggle_details.set(!toggle_details.get());
+            }),
+        details.clone(),
+        |mut button: Button, open: &bool| {
+            button.set_label(if *open {
+                "Hide details"
+            } else {
+                "Technical details"
+            });
+            button
+        },
     );
-    if let Some(error) = dashboard.error.filter(|error| !error.trim().is_empty()) {
-        let details = shared.evolution().details_open.clone();
-        let open = details.get();
-        let mut body = Flex::vertical().gap(10.0)
-            .with_child(weighted_label("Evolution unavailable", theme, FontWeight::SEMIBOLD))
-            .with_child(Label::new("Evolution could not be loaded from this node. Check that a capable node is connected, then refresh.").theme(theme))
-            .with_child(Button::new(if open { "Hide details" } else { "Technical details" })
-                .theme(theme).on_press(move || { details.set(!details.get()); }));
-        if open {
-            body = body.with_child(Label::new(error).theme(theme));
-        }
-        content.push(
-            Surface::panel(body)
-                .appearance(SurfaceAppearance::Raised)
-                .padding(Insets::all(12.0))
-                .theme(theme),
-        );
-    }
-    if dashboard.goals.is_empty() && !unavailable {
-        if refreshing {
-            content.push(
-                Surface::panel(Label::new("Loading Evolution…").theme(theme))
-                    .padding(Insets::all(16.0))
-                    .theme(theme),
-            );
-        } else {
-            content.push(empty_goals_card(theme));
-        }
-    } else {
-        for goal in dashboard.goals {
-            content.push(goal_card(goal, theme, shared));
-        }
-    }
-    WidgetPod::new(
-        ScrollView::vertical(
-            Surface::window(content)
-                .padding(Insets::all(16.0))
-                .fill()
-                .theme(theme),
-        )
-        .name("Evolution goal dashboard")
-        .theme(theme)
-        .viewport_width_hint(true),
+    let unavailable = Surface::panel(
+        Flex::vertical()
+            .gap(10.0)
+            .with_child(weighted_label("Evolution unavailable", reader, FontWeight::SEMIBOLD))
+            .with_child(
+                Label::new(
+                    "Evolution could not be loaded from this node. Check that a capable node is connected, then refresh.",
+                )
+                .theme_when(clone_reader(reader)),
+            )
+            .with_child(details_button)
+            .with_child(
+                Presence::new(
+                    Label::new("")
+                        .text_from(view.select_named("evolution error", |view| {
+                            view.error().unwrap_or_default().to_string()
+                        }))
+                        .theme_when(clone_reader(reader)),
+                )
+                .transition(crate::ui::widgets::reveal_transition())
+                .shown_from(details)
+                .collapse(Axis::Vertical),
+            ),
     )
+    .appearance(SurfaceAppearance::Raised)
+    .padding(Insets::all(12.0))
+    .theme_when(clone_reader(reader));
+
+    let goals_shared = shared.clone();
+    let goals_reader = Rc::clone(reader);
+    let goals = KeyedStack::vertical(
+        view.select_named("evolution goals", |view| view.dashboard.goals.clone()),
+        |goal: &contract::EvolutionGoalSummary| goal.id.clone(),
+        move |_, goal| {
+            let shared = goals_shared.clone();
+            let reader = Rc::clone(&goals_reader);
+            RebuildOnChange::key_from(goal, move |goal| {
+                WidgetPod::new(goal_card(goal.clone(), &reader, &shared))
+            })
+        },
+    )
+    .gap(12.0);
+    let body = SwitchView::new()
+        .selected_from(view.select_named("evolution body", EvolutionView::body))
+        .with_child(
+            Surface::panel(Label::new("Loading Evolution…").theme_when(clone_reader(reader)))
+                .padding(Insets::all(16.0))
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(empty_goals_card(reader))
+        .with_child(goals)
+        .with_child(sui::SizedBox::new());
+
+    let content = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(12.0)
+        .with_child(
+            Surface::window(header)
+                .padding(Insets::all(14.0))
+                .fill()
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(
+            Presence::new(unavailable)
+                .transition(crate::ui::widgets::reveal_transition())
+                .shown_from(
+                    view.select_named("evolution unavailable", |view| view.error().is_some()),
+                )
+                .collapse(Axis::Vertical),
+        )
+        .with_child(body);
+    ScrollView::vertical(
+        Surface::window(content)
+            .padding(Insets::all(16.0))
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+    .state(ScrollState::new())
+    .name("Evolution goal dashboard")
+    .theme_when(clone_reader(reader))
+    .viewport_width_hint(true)
 }
 
-fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
-    let mut command_style = theme.mono_text_style(theme.palette.text);
-    command_style.font_size = theme.text.sm.size;
-    command_style.line_height = theme.text.sm.line_height;
+fn empty_goals_card(reader: &ThemeReader) -> Surface {
+    let style_reader = Rc::clone(reader);
     let command = Surface::panel(
         Label::new(PROPOSE_GOAL_COMMAND)
-            .theme(theme)
+            .theme_when(clone_reader(reader))
             .single_line(true)
-            .text_style(command_style),
+            .text_style_when(move || {
+                let theme = style_reader();
+                let mut style = theme.mono_text_style(theme.palette.text);
+                style.font_size = theme.text.sm.size;
+                style.line_height = theme.text.sm.line_height;
+                style
+            }),
     )
     .appearance(SurfaceAppearance::Soft)
     .padding(Insets {
@@ -327,9 +417,9 @@ fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
         right: 10.0,
         bottom: 6.0,
     })
-    .theme(theme);
+    .theme_when(clone_reader(reader));
     let copy = Button::new("Copy command")
-        .theme(theme)
+        .theme_when(clone_reader(reader))
         .appearance(ButtonAppearance::Tonal)
         .on_press_with_ctx(|ctx| ctx.set_clipboard_text(PROPOSE_GOAL_COMMAND));
     Surface::panel(
@@ -337,14 +427,14 @@ fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
             .gap(8.0)
             .with_child(weighted_label(
                 "No evolution goals yet",
-                theme,
+                reader,
                 FontWeight::SEMIBOLD,
             ))
             .with_child(
                 Label::new(
                     "Propose a goal from a terminal. Its revisions and metrics appear here.",
                 )
-                .theme(theme),
+                .theme_when(clone_reader(reader)),
             )
             .with_child(
                 Flex::horizontal()
@@ -356,12 +446,12 @@ fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
     )
     .appearance(SurfaceAppearance::Raised)
     .padding(Insets::all(16.0))
-    .theme(theme)
+    .theme_when(clone_reader(reader))
 }
 
 fn goal_card(
     goal: contract::EvolutionGoalSummary,
-    theme: sui::DefaultTheme,
+    reader: &ThemeReader,
     shared: &Shared,
 ) -> Surface {
     let mut body = Flex::vertical().align_items(Alignment::Stretch).gap(8.0);
@@ -374,7 +464,7 @@ fn goal_card(
                     .gap(2.0)
                     .with_child(weighted_label(
                         goal.objective.clone(),
-                        theme,
+                        reader,
                         FontWeight::SEMIBOLD,
                     ))
                     .with_child(
@@ -382,19 +472,19 @@ fn goal_card(
                             "{} · governor {} · {} events",
                             goal.id, goal.evolution_agent_id, goal.event_count
                         ))
-                        .theme(theme),
+                        .theme_when(clone_reader(reader)),
                     ),
                 FlexItem::new().grow(1.0),
             )
             .with_child(
                 StatusBadge::new(goal.status.clone())
                     .tone(status_tone(&goal.status))
-                    .theme(theme),
+                    .theme_when(clone_reader(reader)),
             ),
     );
 
     let mut revision_rows = Flex::vertical().align_items(Alignment::Stretch).gap(5.0);
-    revision_rows.push(weighted_label("Revision DAG", theme, FontWeight::SEMIBOLD));
+    revision_rows.push(weighted_label("Revision DAG", reader, FontWeight::SEMIBOLD));
     for revision in &goal.revisions {
         let parents = if revision.parent_ids.is_empty() {
             "root".to_string()
@@ -413,7 +503,7 @@ fn goal_card(
                 .with_child(
                     StatusBadge::new(revision.status.clone())
                         .tone(status_tone(&revision.status))
-                        .theme(theme),
+                        .theme_when(clone_reader(reader)),
                 )
                 .with_item(
                     Label::new(format!(
@@ -425,7 +515,7 @@ fn goal_card(
                         revision.artifacts.len(),
                         revision.metrics.len()
                     ))
-                    .theme(theme),
+                    .theme_when(clone_reader(reader)),
                     FlexItem::new().grow(1.0),
                 ),
         );
@@ -440,14 +530,14 @@ fn goal_card(
                         .map(|count| format!(" (n={count})"))
                         .unwrap_or_default()
                 ))
-                .theme(theme),
+                .theme_when(clone_reader(reader)),
             );
         }
     }
     body.push(
         Surface::panel(revision_rows)
             .padding(Insets::all(10.0))
-            .theme(theme),
+            .theme_when(clone_reader(reader)),
     );
 
     if !goal.tasks.is_empty() || !goal.agent_runs.is_empty() {
@@ -456,7 +546,7 @@ fn goal_card(
             .gap(5.0)
             .with_child(weighted_label(
                 "Workflow and agents",
-                theme,
+                reader,
                 FontWeight::SEMIBOLD,
             ));
         for task in &goal.tasks {
@@ -467,7 +557,7 @@ fn goal_card(
                     .with_child(
                         StatusBadge::new(task.status.clone())
                             .tone(status_tone(&task.status))
-                            .theme(theme),
+                            .theme_when(clone_reader(reader)),
                     )
                     .with_item(
                         Label::new(format!(
@@ -478,7 +568,7 @@ fn goal_card(
                                 .as_deref()
                                 .unwrap_or("unassigned")
                         ))
-                        .theme(theme),
+                        .theme_when(clone_reader(reader)),
                         FlexItem::new().grow(1.0),
                     ),
             );
@@ -491,7 +581,7 @@ fn goal_card(
                     .with_child(
                         StatusBadge::new(run.status.clone())
                             .tone(status_tone(&run.status))
-                            .theme(theme),
+                            .theme_when(clone_reader(reader)),
                     )
                     .with_item(
                         Label::new(format!(
@@ -504,7 +594,7 @@ fn goal_card(
                                 .map(|session| format!(" · {session}"))
                                 .unwrap_or_default()
                         ))
-                        .theme(theme),
+                        .theme_when(clone_reader(reader)),
                         FlexItem::new().grow(1.0),
                     ),
             );
@@ -512,7 +602,7 @@ fn goal_card(
         body.push(
             Surface::panel(workflow)
                 .padding(Insets::all(10.0))
-                .theme(theme),
+                .theme_when(clone_reader(reader)),
         );
     }
 
@@ -533,7 +623,7 @@ fn goal_card(
                 &cost
             }
         ))
-        .theme(theme),
+        .theme_when(clone_reader(reader)),
     );
     if let Some(event) = goal.recent_events.last() {
         body.push(
@@ -541,7 +631,7 @@ fn goal_card(
                 "Latest activity: {} · {} · {}",
                 event.kind, event.actor, event.occurred_at
             ))
-            .theme(theme),
+            .theme_when(clone_reader(reader)),
         );
     }
     let pause_action = if goal.status == "paused" {
@@ -567,7 +657,7 @@ fn goal_card(
             .gap(8.0)
             .with_child(
                 Button::new("Open governor chat")
-                    .theme(theme)
+                    .theme_when(clone_reader(reader))
                     .appearance(ButtonAppearance::Ghost)
                     .on_press(move || {
                         chat_shared.chat_mut().start_agent_chat("evolution-agent");
@@ -576,7 +666,7 @@ fn goal_card(
             )
             .with_child(
                 Button::new(pause_label)
-                    .theme(theme)
+                    .theme_when(clone_reader(reader))
                     .appearance(ButtonAppearance::Tonal)
                     .enabled(!terminal)
                     .on_press(move || {
@@ -585,7 +675,7 @@ fn goal_card(
             )
             .with_child(
                 Button::new("Complete")
-                    .theme(theme)
+                    .theme_when(clone_reader(reader))
                     .appearance(ButtonAppearance::Tonal)
                     .tone(SemanticTone::Success)
                     .enabled(!terminal)
@@ -599,7 +689,7 @@ fn goal_card(
             )
             .with_child(
                 Button::new("Cancel")
-                    .theme(theme)
+                    .theme_when(clone_reader(reader))
                     .appearance(ButtonAppearance::Outline)
                     .tone(SemanticTone::Danger)
                     .enabled(!terminal)
@@ -616,7 +706,7 @@ fn goal_card(
         .name(format!("Evolution goal {}", goal.id))
         .appearance(SurfaceAppearance::Raised)
         .padding(Insets::all(14.0))
-        .theme(theme)
+        .theme_when(clone_reader(reader))
 }
 
 fn status_tone(status: &str) -> SemanticTone {
@@ -629,10 +719,15 @@ fn status_tone(status: &str) -> SemanticTone {
     }
 }
 
-fn weighted_label(text: impl Into<String>, theme: sui::DefaultTheme, weight: FontWeight) -> Label {
-    let mut style = theme.body_text_style();
-    style.weight = weight;
-    Label::new(text).theme(theme).text_style(style)
+fn weighted_label(text: impl Into<String>, reader: &ThemeReader, weight: FontWeight) -> Label {
+    let style_reader = Rc::clone(reader);
+    Label::new(text)
+        .theme_when(clone_reader(reader))
+        .text_style_when(move || {
+            let mut style = style_reader().body_text_style();
+            style.weight = weight;
+            style
+        })
 }
 
 #[cfg(test)]
