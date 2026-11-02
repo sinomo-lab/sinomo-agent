@@ -681,6 +681,59 @@ class ActivationResources(unittest.TestCase):
             self.assertEqual(sent.call_count, int(result != 0))
         return result
 
+    def run_plain_watcher(self, root, delivered):
+        # A watcher without an activation candidate, fed fixed Docker events.
+        now, handler = [0.0], {}
+        pending = queue.Queue()
+        for event in delivered:
+            pending.put(event)
+        process = SimpleNamespace(ended=False)
+        process.poll = lambda: 0 if process.ended else None
+        process.terminate = lambda: setattr(process, "ended", True)
+        process.wait = lambda **_: 0
+        reader = SimpleNamespace(start=lambda: None, join=lambda **_: None, is_alive=lambda: False)
+        class Delivery:
+            def get(self, timeout):
+                now[0] += 0.2
+                if pending.empty():
+                    handler[resources.signal.SIGTERM]()
+                    raise queue.Empty
+                return pending.get_nowait()
+            def get_nowait(self):
+                return pending.get_nowait()
+            def empty(self):
+                return pending.empty()
+        def checked(row, activation=None, now=None):
+            return {"node": row["Config"]["Labels"]["com.docker.compose.service"], "running": True}
+        with patch.object(resources, "inspect_nodes", return_value=copy.deepcopy(self.rows)), \
+                patch.object(resources, "check_node", side_effect=checked), \
+                patch.object(resources.subprocess, "Popen", return_value=process), \
+                patch.object(resources.threading, "Thread", return_value=reader), \
+                patch.object(resources.queue, "Queue", return_value=Delivery()), \
+                patch.object(resources.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(resources.time, "time_ns", side_effect=lambda: 100 + int(now[0] * 10**9)), \
+                patch.object(resources.signal, "signal", side_effect=lambda sig, fn: handler.update({sig: fn})), \
+                patch.object(resources.signal, "pidfd_send_signal"), \
+                patch.object(resources.os, "pidfd_open", return_value=123), \
+                patch.object(resources.os, "close"), \
+                patch.dict(os.environ, SINOMO_TEST_RESOURCE_INTENTS=str(root / "intents.jsonl")):
+            return resources.watch("owned", root / "watch", 456)
+
+    def test_watcher_ignores_events_replayed_from_before_it_started(self):
+        # The reset of a previous project incarnation can die in the same whole
+        # second the next watch starts; Docker replays it under --since.
+        replayed = self.event("die")
+        replayed["Actor"]["Attributes"]["exitCode"] = "137"
+        replayed["timeNano"] = 99
+        unexpected = copy.deepcopy(replayed)
+        unexpected["timeNano"] = 100
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(self.run_plain_watcher(root, [replayed]), 0)
+            self.assertEqual(len((root / "watch/events.jsonl").read_text().splitlines()), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.run_plain_watcher(Path(tmp), [unexpected]), 1)
+
     def test_watcher_retains_pending_raw_sample_then_reconciles_before_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

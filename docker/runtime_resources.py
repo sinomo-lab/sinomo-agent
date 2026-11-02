@@ -512,9 +512,14 @@ def watch(project, artifacts, parent_pid, activation_candidate=None):
                     events.write(json.dumps(event) + "\n")
                     events.flush()
                     intents = read_intents()
-                    if event["Action"] == "oom":
+                    if event["timeNano"] < started_ns:
+                        # Docker's whole-second --since replays this second's
+                        # earlier events, such as the reset of a previous project
+                        # incarnation. They precede this watch and stay evidence.
+                        pass
+                    elif event["Action"] == "oom":
                         raise RuntimeError(f"hard container resource/exit failure: {event}")
-                    if activation is not None:
+                    elif activation is not None:
                         activation.refresh(intents)
                         activation.event(event, time.monotonic())
                     elif event["Action"] == "die" and not expected_die(event, intents, consumed):
