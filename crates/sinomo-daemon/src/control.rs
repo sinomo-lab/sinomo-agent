@@ -1855,19 +1855,35 @@ async fn daemon_control_stream_uses_authenticated_transport_prelude(
     }
 }
 
+/// Membership for authorizing an inbound peer, no older than this node's
+/// applied cluster state. A member admitted a moment ago must be recognized on
+/// its first contact, so an in-flight KV mutation is waited out on the
+/// blocking lane instead of answered from an earlier observation.
+async fn read_authorization_directory_records(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> Result<sinomo_core::network::DirectoryRecordsSnapshot, DaemonError> {
+    let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+        sinomo_core::network::cluster_directory_for(cluster_paths),
+        state,
+    );
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let records = tokio::task::spawn_blocking(move || directory.current_records_snapshot(deadline))
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: cluster_paths.root.display().to_string(),
+            detail: format!("authorization directory read task failed: {source}"),
+        })??;
+    Ok(records)
+}
+
 fn resolve_authenticated_transport_peer(
-    paths: &DaemonPaths,
+    records: sinomo_core::network::DirectoryRecordsSnapshot,
     state: &sinomo_core::ClusterBootstrapState,
     metadata: &sinomo_core::network::AuthenticatedTransportMetadata,
     local_node_id: &NodeId,
     identity: &dyn sinomo_core::network::RoutedSessionIdentity,
 ) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot, [String; 2]), DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let records = sinomo_core::network::cluster_directory_with_bootstrap_state(
-        sinomo_core::network::cluster_directory_for(&cluster_paths),
-        state,
-    )
-    .records_snapshot()?;
     let (version, members, endpoints) = records.into_parts();
     let directory = sinomo_core::network::DirectorySnapshot::try_from_records(
         version,
@@ -1993,8 +2009,9 @@ async fn handle_daemon_authenticated_transport_stream_async(
         local_node_id.clone(),
         data_dir,
     )?);
+    let records = read_authorization_directory_records(&cluster_paths, &state).await?;
     let (peer_node_id, directory, admitted_pool_scopes) = resolve_authenticated_transport_peer(
-        &paths,
+        records,
         &state,
         &metadata,
         &local_node_id,

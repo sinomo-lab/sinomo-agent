@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 use time::OffsetDateTime;
 
 const MAX_CLUSTER_DIRECTORY_PROJECTION_CACHE_ENTRIES: usize = 128;
@@ -136,14 +137,25 @@ impl ClusterDirectoryKvInput {
 fn read_cluster_directory_input(
     paths: &ClusterPaths,
 ) -> Result<Option<Arc<ClusterDirectoryKvInput>>, NetworkError> {
-    let prefixes = CLUSTER_DIRECTORY_PREFIXES
-        .map(|prefix| (prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES));
-    read_cluster_directory_input_for_prefixes(paths, &prefixes)
+    read_cluster_directory_input_until(paths, None)
 }
 
+fn read_cluster_directory_input_until(
+    paths: &ClusterPaths,
+    wait_until: Option<Instant>,
+) -> Result<Option<Arc<ClusterDirectoryKvInput>>, NetworkError> {
+    let prefixes = CLUSTER_DIRECTORY_PREFIXES
+        .map(|prefix| (prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES));
+    read_cluster_directory_input_for_prefixes(paths, &prefixes, wait_until)
+}
+
+/// While a mutation holds the resident writer, the fallback serves the
+/// materialized checkpoint, which can predate members this process already
+/// admitted. `wait_until` waits for the mutation instead.
 fn read_cluster_directory_input_for_prefixes(
     paths: &ClusterPaths,
     prefixes: &[(&str, usize)],
+    wait_until: Option<Instant>,
 ) -> Result<Option<Arc<ClusterDirectoryKvInput>>, NetworkError> {
     let fallback = || {
         read_cluster_kv_latest_observed_snapshot_arc_if_present(paths)?
@@ -159,30 +171,33 @@ fn read_cluster_directory_input_for_prefixes(
         Err(NetworkError::ClusterOrphan) => return fallback(),
         Err(error) => return Err(error),
     };
-    let current = sinomo_kv::with_cluster_kv_resident_read_projection(
-        &paths.kv_paths().raft_wal_paths(&node_id),
-        &node_id,
-        |projection| {
-            let mut entries = Vec::new();
-            for &(prefix, max_entries) in prefixes {
-                // Preserve the directory's existing per-prefix cardinality
-                // contract. No smaller new payload cap rejects old inputs.
-                let selected = projection.read_index_prefix_limited_by_payload_bytes(
-                    prefix,
-                    max_entries,
-                    usize::MAX,
-                )?;
-                entries.try_reserve(selected.len()).map_err(|_| {
-                    sinomo_kv::KvError::ResourceExhausted {
-                        operation: "capture existing directory prefix input".into(),
-                        requested_bytes: usize::MAX,
-                    }
-                })?;
-                entries.extend(selected);
-            }
-            Ok::<_, sinomo_kv::KvError>(entries)
-        },
-    )
+    let wal_paths = paths.kv_paths().raft_wal_paths(&node_id);
+    let project = |projection: &mut sinomo_kv::ClusterKvRaftResidentReadProjection<'_>| {
+        let mut entries = Vec::new();
+        for &(prefix, max_entries) in prefixes {
+            // Preserve the directory's existing per-prefix cardinality
+            // contract. No smaller new payload cap rejects old inputs.
+            let selected = projection.read_index_prefix_limited_by_payload_bytes(
+                prefix,
+                max_entries,
+                usize::MAX,
+            )?;
+            entries.try_reserve(selected.len()).map_err(|_| {
+                sinomo_kv::KvError::ResourceExhausted {
+                    operation: "capture existing directory prefix input".into(),
+                    requested_bytes: usize::MAX,
+                }
+            })?;
+            entries.extend(selected);
+        }
+        Ok::<_, sinomo_kv::KvError>(entries)
+    };
+    let current = match wait_until {
+        Some(deadline) => sinomo_kv::with_cluster_kv_resident_read_projection_before(
+            &wal_paths, &node_id, deadline, project,
+        ),
+        None => sinomo_kv::with_cluster_kv_resident_read_projection(&wal_paths, &node_id, project),
+    }
     .transpose()
     .map_err(kv_err)?;
     let Some(current) = current else {
@@ -583,7 +598,7 @@ pub(crate) fn read_cluster_members_for_state(
         (CLUSTER_MEMBER_PREFIXES[1], usize::MAX),
         (CLUSTER_MEMBER_PREFIXES[2], CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES),
     ];
-    let Some(input) = read_cluster_directory_input_for_prefixes(paths, &prefixes)? else {
+    let Some(input) = read_cluster_directory_input_for_prefixes(paths, &prefixes, None)? else {
         return Ok(Vec::new());
     };
     read_cluster_members_from_directory_entries(input.as_ref())
@@ -885,6 +900,29 @@ impl KvClusterDirectory {
     pub fn new(paths: ClusterPaths) -> Self {
         Self { paths }
     }
+
+    fn records_snapshot_until(
+        &self,
+        wait_until: Option<Instant>,
+    ) -> Result<sinomo_network::DirectoryRecordsSnapshot, NetworkError> {
+        let Some(snapshot) = read_cluster_directory_input_until(&self.paths, wait_until)? else {
+            return Ok(sinomo_network::DirectoryRecordsSnapshot::new(
+                sinomo_network::DirectoryVersion(0),
+                Vec::new(),
+                Vec::new(),
+            ));
+        };
+        let version = sinomo_network::DirectoryVersion(snapshot.revision.0);
+        let projection = read_cluster_directory_projection_from_input_at_module_generation(
+            &self.paths,
+            snapshot,
+            sinomo_network::network_module_routing_generation(),
+        )?;
+        let (members, endpoints) = projection.current_routing_records();
+        Ok(sinomo_network::DirectoryRecordsSnapshot::new(
+            version, members, endpoints,
+        ))
+    }
 }
 
 impl sinomo_network::ClusterDirectory for KvClusterDirectory {
@@ -921,23 +959,14 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
     }
 
     fn records_snapshot(&self) -> Result<sinomo_network::DirectoryRecordsSnapshot, NetworkError> {
-        let Some(snapshot) = read_cluster_directory_input(&self.paths)? else {
-            return Ok(sinomo_network::DirectoryRecordsSnapshot::new(
-                sinomo_network::DirectoryVersion(0),
-                Vec::new(),
-                Vec::new(),
-            ));
-        };
-        let version = sinomo_network::DirectoryVersion(snapshot.revision.0);
-        let projection = read_cluster_directory_projection_from_input_at_module_generation(
-            &self.paths,
-            snapshot,
-            sinomo_network::network_module_routing_generation(),
-        )?;
-        let (members, endpoints) = projection.current_routing_records();
-        Ok(sinomo_network::DirectoryRecordsSnapshot::new(
-            version, members, endpoints,
-        ))
+        self.records_snapshot_until(None)
+    }
+
+    fn current_records_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<sinomo_network::DirectoryRecordsSnapshot, NetworkError> {
+        self.records_snapshot_until(Some(deadline))
     }
 
     fn routing_records_snapshot(

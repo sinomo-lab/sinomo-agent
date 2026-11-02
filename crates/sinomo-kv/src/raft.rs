@@ -1099,6 +1099,46 @@ pub fn pin_resident_raft_node_registry_for_test(
     resident_raft_node_slot(&paths.root).map(|slot| ResidentRaftNodeRegistryPin { _slot: slot })
 }
 
+/// Keeps the loaded resident writer checked out, as an in-flight mutation
+/// does, and checks the unchanged node back in when dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ResidentRaftCheckoutHold {
+    slot: Arc<ResidentRaftNodeSlot>,
+    resident: Option<ResidentRaftNode>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ResidentRaftCheckoutHold {
+    fn drop(&mut self) {
+        if let Some(resident) = self.resident.take() {
+            self.slot.checkin(resident);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_resident_raft_checkout_for_test(
+    paths: &KvWalPaths,
+) -> Result<ResidentRaftCheckoutHold, KvError> {
+    let slot = resident_raft_node_slot(&paths.root)?;
+    let resident = slot
+        .checkout(&paths.root, Duration::from_secs(5))?
+        .ok_or_else(|| KvError::Io {
+            path: paths.root.display().to_string(),
+            detail: "resident cluster KV Raft node is not loaded".to_string(),
+        });
+    match resident {
+        Ok(resident) => Ok(ResidentRaftCheckoutHold {
+            slot,
+            resident: Some(resident),
+        }),
+        Err(error) => {
+            slot.release_without_cache();
+            Err(error)
+        }
+    }
+}
+
 /// Returns true only when the canonical resident writer for this exact durable
 /// root is currently checked out. This is an observational scheduling probe,
 /// not a freshness claim: callers may use it to avoid a doomed nonresident

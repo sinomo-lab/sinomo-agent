@@ -22,6 +22,7 @@ use sinomo_base::{
 use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 /// Version stamp for cached routing state. Monotonic for a given backing
 /// store; the KV-backed implementation uses the local KV snapshot revision.
@@ -303,6 +304,20 @@ pub trait ClusterDirectory: Send + Sync {
         Ok(DirectoryRecordsSnapshot::new(after, members, endpoints))
     }
 
+    /// Captures membership and endpoint records no older than the local
+    /// owner's applied state, for authorizing peers.
+    ///
+    /// [`Self::records_snapshot`] may serve an earlier observation while a
+    /// local mutation is in flight. Providers with such a fallback wait for
+    /// the mutation until `deadline` instead.
+    fn current_records_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<DirectoryRecordsSnapshot, NetworkError> {
+        let _ = deadline;
+        self.records_snapshot()
+    }
+
     /// Captures every raw input needed to build one route-planning generation.
     ///
     /// Providers backed by a transactional store should override this method.
@@ -480,6 +495,16 @@ impl ClusterDirectory for BootstrapAwareClusterDirectory {
 
     fn records_snapshot(&self) -> Result<DirectoryRecordsSnapshot, NetworkError> {
         let (version, members, endpoints) = self.records()?;
+        Ok(DirectoryRecordsSnapshot::new(version, members, endpoints))
+    }
+
+    fn current_records_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<DirectoryRecordsSnapshot, NetworkError> {
+        let (version, members, endpoints) =
+            self.inner.current_records_snapshot(deadline)?.into_parts();
+        let (version, members, endpoints) = self.merge_records(version, members, endpoints);
         Ok(DirectoryRecordsSnapshot::new(version, members, endpoints))
     }
 

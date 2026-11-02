@@ -15387,6 +15387,57 @@ fn cluster_join_registration_leaves_current_acceptor_endpoints_unwritten() {
 }
 
 #[test]
+fn current_directory_records_include_a_member_admitted_while_a_mutation_is_in_flight() {
+    let fixture = join_authority_fixture("join_current_directory_records");
+    let before = read_cluster_kv_current_snapshot(&fixture.paths).expect("pre-join snapshot");
+    let mut host = RecordingJoinRegistrationHost::default();
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle join registration");
+    assert!(response.accepted, "{}", response.detail);
+
+    // The materialized checkpoint trails the applied state, and another
+    // mutation holds the resident writer when the new member first calls.
+    fixture
+        .paths
+        .kv_paths()
+        .local_cache()
+        .write_snapshot(&before)
+        .expect("checkpoint written before the admission");
+    let wal_paths = cluster_raft_wal_paths(&fixture.paths, &fixture.state.local_node_id);
+    let in_flight =
+        sinomo_kv::hold_resident_raft_checkout_for_test(&wal_paths).expect("hold resident writer");
+    let directory = KvClusterDirectory::new(fixture.paths.clone());
+    let includes_joined = |records: DirectoryRecordsSnapshot| {
+        let (_, members, _) = records.into_parts();
+        members
+            .iter()
+            .any(|member| member.node_id == fixture.joined_node_id)
+    };
+    assert!(
+        !includes_joined(directory.records_snapshot().expect("observed records")),
+        "the observed directory serves the checkpoint while the writer is busy"
+    );
+
+    let finish = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(in_flight);
+    });
+    let current = directory
+        .current_records_snapshot(std::time::Instant::now() + std::time::Duration::from_secs(5))
+        .expect("current records");
+    finish.join().expect("finish in-flight mutation");
+    assert!(
+        includes_joined(current),
+        "authorization must recognize the member its admission committed"
+    );
+}
+
+#[test]
 fn cluster_join_registration_rejects_revoked_invite_and_removed_issuer() {
     let revoked = join_authority_fixture("join_revoked_invite");
     let state_key = sinomo_node::cluster_invitation_state_key(&revoked.invite.invite_id);
