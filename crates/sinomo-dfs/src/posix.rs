@@ -600,19 +600,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(plan.desired_replica_nodes)
     }
 
-    fn sync_blocking_routed_write_namespace(
-        &mut self,
-        path: &str,
-        wait_for_commit: bool,
-        foreground_replica_repair: bool,
-        replay_response_journal: bool,
-    ) -> Result<()> {
-        if !wait_for_commit || !foreground_replica_repair || !replay_response_journal {
-            return Ok(());
-        }
-        self.sync_remote_namespace_path_until_quiet(path)
-    }
-
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let fallback_file_system = crate::namespace::distributed_sifs(self.node_id.clone());
@@ -3858,12 +3845,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.touch_parent_directory_modified(&path)?;
                 }
-                self.sync_blocking_routed_write_namespace(
-                    &path,
-                    options.wait_for_commit,
-                    options.foreground_replica_repair,
-                    replay_response_journal,
-                )?;
                 if !options.foreground_replica_repair {
                     if transient_create && remote_metadata_primary {
                         let authoritative = self.stat_target_for_path(&path)?;
@@ -3871,23 +3852,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     return self.stat_object_for_path(&committed_object, &path);
                 }
-                let object = match self.stat_target_for_path(&path) {
-                    Err(DfsPosixError::NotFound { .. }) => {
-                        let mut refreshed = None;
-                        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-                            self.sync_remote_namespace_path(&path)?;
-                            match self.stat_target_for_path(&path) {
-                                Err(DfsPosixError::NotFound { .. }) => continue,
-                                result => {
-                                    refreshed = Some(result);
-                                    break;
-                                }
-                            }
-                        }
-                        refreshed.unwrap_or_else(|| self.stat_target_for_path(&path))?
-                    }
-                    result => result?,
-                };
+                let object = self.committed_write_stat_target(&path)?;
                 self.stat_object_for_path(&object, &path)
             }
             NetworkedDfsWriteOutcome::Pending {
@@ -4663,12 +4628,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 {
                     self.touch_parent_directory_modified(&path)?;
                 }
-                self.sync_blocking_routed_write_namespace(
-                    &path,
-                    options.wait_for_commit,
-                    options.foreground_replica_repair,
-                    true,
-                )?;
                 if !options.foreground_replica_repair {
                     if transient_create {
                         let authoritative = self.stat_target_for_path(&path)?;
@@ -4676,26 +4635,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     return self.stat_object_for_path(&committed_object, &path);
                 }
-                // Bounded response replay may not have covered a deep
-                // catch-up; pull further batches before surfacing NotFound
-                // for a write that committed.
-                let object = match self.stat_target_for_path(&path) {
-                    Err(DfsPosixError::NotFound { .. }) => {
-                        let mut refreshed = None;
-                        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
-                            self.sync_remote_namespace_path(&path)?;
-                            match self.stat_target_for_path(&path) {
-                                Err(DfsPosixError::NotFound { .. }) => continue,
-                                result => {
-                                    refreshed = Some(result);
-                                    break;
-                                }
-                            }
-                        }
-                        refreshed.unwrap_or_else(|| self.stat_target_for_path(&path))?
-                    }
-                    result => result?,
-                };
+                // The local view may not show the committed object; its
+                // metadata authority does.
+                let object = self.committed_write_stat_target(&path)?;
                 self.stat_object_for_path(&object, &path)
             }
             NetworkedDfsWriteOutcome::Pending {

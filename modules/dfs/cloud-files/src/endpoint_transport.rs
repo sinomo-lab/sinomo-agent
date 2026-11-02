@@ -375,7 +375,6 @@ mod tests {
                 .bootstrap_distributed_sifs()
                 .expect("delegated configuration bootstrap");
         }
-        crate::windows_sync::configure_cloud_files_mounted_read_policy(&mut service);
         let options = dfs::DfsWriteOptions::replicated_eventual(vec![local.clone()]);
         let old_stat = if with_private_backend {
             service
