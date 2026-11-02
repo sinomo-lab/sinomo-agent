@@ -482,9 +482,12 @@ kill -TERM "$pid"
                     "shadow_before": shadow_before, "shadow_after": shadow_after,
                     "public_start_attempted": start_attempted,
                     "scope": "exact Main-only controlled stop and supported public start; PID1 Shadow, container, probe CLI and DATA retained"})
-                # The container entrypoint profiles its initial Main. A public
-                # Main-only restart has its own profiler, so establish the same
-                # bounded capture for this actual replacement generation.
+                # When CPU profiling is requested, the container entrypoint
+                # profiles its initial Main. A public Main-only restart has its
+                # own profiler, so establish the same bounded capture for this
+                # actual replacement generation.
+                if os.environ.get("SINOMO_TEST_CPU_PROFILE") != "1":
+                    return
                 config = json.loads((self.artifacts / "compose-effective.json").read_text())
                 environment = config["services"][node]["environment"]
                 duration = int(environment["SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS"])

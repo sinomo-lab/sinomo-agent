@@ -126,8 +126,9 @@ not build the native module itself.
 
 ## Docker and Android
 
-The disposable development cluster uses the host-built debug binary. Its nodes
-start bounded CPU profiles by default, so build with profiler support:
+The disposable development cluster uses the host-built debug binary. Build it
+with profiler support so its nodes can start bounded CPU profiles when profiling
+is requested with `SINOMO_TEST_CPU_PROFILE=1`:
 
 ```sh
 cargo build -p sinomo -p sinomo-observe --features sinomo-observe/cpu-profiler

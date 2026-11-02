@@ -232,8 +232,8 @@ full test-client proxy round trip is reported separately. Neither interval
 subtracts tracing or profiling overhead, and active diagnostics must capture the
 processes selected by the workload's affinity.
 
-Docker gates run the `debug+cpu-profiler` build with debugging, tracing, and CPU
-profiling enabled at unchanged thresholds, as required by the
+Docker gates run the `debug+cpu-profiler` build with debugging and tracing
+enabled at unchanged thresholds, and CPU profiling when requested, as required by the
 [performance analysis skill](../../skills/sinomo-performance-analysis/SKILL.md).
 The workspace dev profile builds the network, DFS, daemon, SOBJ codec, Observe,
 `tracing`, `tracing-core`, and `tracing-subscriber` packages at optimization

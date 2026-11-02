@@ -687,7 +687,8 @@ NODES=node1
         for supported, active_filter, debug in [(False, "debug,sinomo.perf=trace", b"1"),
                                                  (True, "info", b"1"),
                                                  (True, "debug,sinomo.perf=trace", b"0")]:
-            with tempfile.TemporaryDirectory() as directory:
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch.dict(os.environ, SINOMO_TEST_CPU_PROFILE="1"):
                 runner = self.runner()
                 runner.artifacts = Path(directory)
                 runner.compose = ["docker", "compose"]
@@ -696,6 +697,28 @@ NODES=node1
                     {"active_filter": active_filter}, {"supported": supported}, {"capacity": 32768})])
                 with self.assertRaisesRegex(RuntimeError, "require DFS debug"):
                     runner.verify_observe()
+
+    def test_observe_configuration_needs_no_profiler_unless_cpu_profiling_is_requested(self):
+        node = ({"active_filter": "debug,sinomo.perf=trace"}, {"supported": False, "state": "idle"},
+                {"capacity": 32768})
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"SINOMO_TEST_CPU_PROFILE": "0"}):
+            runner = self.runner()
+            runner.artifacts = Path(directory)
+            runner.compose = ["docker", "compose"]
+            runner.run = Mock(return_value=b"1")
+            runner.cli = Mock(side_effect=[json.dumps(item).encode() for item in node * 6])
+            runner.verify_observe(require_cpu_capture=True)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"SINOMO_TEST_CPU_PROFILE": "0"}):
+            runner = self.runner()
+            runner.artifacts = Path(directory)
+            runner.compose = ["docker", "compose"]
+            runner.run = Mock(return_value=b"1")
+            runner.cli = Mock(side_effect=[json.dumps(item).encode() for item in (
+                {"active_filter": "info"}, node[1], node[2])])
+            with self.assertRaisesRegex(RuntimeError, "require DFS debug"):
+                runner.verify_observe()
 
     def test_formation_capture_handles_retained_pid_markers_once_per_generation(self):
         source = Path(__file__).with_name("entrypoint.sh").read_text()

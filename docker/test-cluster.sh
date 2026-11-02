@@ -162,12 +162,14 @@
 #   SINOMO_TEST_ARTIFACTS       artifact dir (default target/cluster-test-artifacts/<run>)
 #   SINOMO_TEST_ALLOW_OTHER_COMPOSE=1       allow running while unrelated compose projects are up
 #   SINOMO_TEST_COMPOSE_OVERRIDE optional second compose file (for measurement-only overrides)
-#   SINOMO_TEST_FORMATION_OBSERVE=1 start bounded trace, RPC-timeline, and CPU
-#                                  captures before Docker formation work; diagnostic only
+#   SINOMO_TEST_CPU_PROFILE=1   opt in to CPU profiling in every lane: capture,
+#                               collect and require profiles (default 0)
+#   SINOMO_TEST_FORMATION_OBSERVE=1 start bounded trace and RPC-timeline captures, plus
+#                                  CPU captures when profiling, before Docker formation work
 #   SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS capture watchdog seconds (default 12)
 #   SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ CPU samples/second (default 49)
-#   SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES comma-separated nodes profiled in-process
-#                                           (default node1; use all explicitly)
+#   SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES comma-separated nodes profiled in-process when
+#                                           SINOMO_TEST_CPU_PROFILE=1 (default all)
 #   SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS bounded RPC-timeline records/node (default 32768)
 #
 # Exits non-zero if any scenario fails; failure evidence (probe JSON, compose ps,
@@ -220,9 +222,16 @@ PJDFSTEST_PATCHSET="sinomo-linux-portability-v1"
 PJDFSTEST_MOUNT_POINT="/mnt/sinomo-pjdfstest"
 FORMATION_OBSERVE_DURATION_SECONDS="${SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS:-12}"
 FORMATION_OBSERVE_FREQUENCY_HZ="${SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ:-49}"
-FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-all}"
+CPU_PROFILE="${SINOMO_TEST_CPU_PROFILE:-0}"
+FORMATION_OBSERVE_CPU_NODES=""
+RUN_PROFILE="${SINOMO_TEST_PROFILE:-debug}"
+if [ "$CPU_PROFILE" = 1 ]; then
+  FORMATION_OBSERVE_CPU_NODES="${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-all}"
+  RUN_PROFILE="${SINOMO_TEST_PROFILE:-debug+cpu-profiler}"
+fi
 FORMATION_OBSERVE_MAX_EVENTS="${SINOMO_TEST_FORMATION_OBSERVE_MAX_EVENTS:-32768}"
 FORMATION_OBSERVE_FILTER="${SINOMO_TEST_FORMATION_OBSERVE_FILTER:-debug,sinomo.perf=trace,sinomo.cluster.formation=trace,sinomo.cluster.health=trace,sinomo.daemon.cluster_network_maintenance=trace,sinomo.daemon.cluster_member_publish=trace,sinomo.daemon.node_status_publish=trace,sinomo.cluster.raft_fanout=trace}"
+export SINOMO_TEST_CPU_PROFILE="$CPU_PROFILE"
 export SINOMO_TEST_FORMATION_OBSERVE="$FORMATION_OBSERVE"
 export SINOMO_TEST_FORMATION_OBSERVE_DURATION_SECONDS="$FORMATION_OBSERVE_DURATION_SECONDS"
 export SINOMO_TEST_FORMATION_OBSERVE_FREQUENCY_HZ="$FORMATION_OBSERVE_FREQUENCY_HZ"
@@ -541,6 +550,17 @@ validate_formation_observation_config() {
       return 1
       ;;
   esac
+  case "$CPU_PROFILE" in
+    0|1) ;;
+    *)
+      log "SINOMO_TEST_CPU_PROFILE must be 0 or 1, got: $CPU_PROFILE"
+      return 1
+      ;;
+  esac
+  if [ "$CPU_PROFILE" != 1 ] && [ -n "${SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES:-}" ]; then
+    log "SINOMO_TEST_FORMATION_OBSERVE_CPU_NODES requires SINOMO_TEST_CPU_PROFILE=1"
+    return 1
+  fi
   case "$DFS_READY_ONLY" in
     0|1) ;;
     *)
@@ -1488,10 +1508,14 @@ wait_for_network_quiet() {
   local label="$1" label_slug diagnostic_pid="" gate_rc=0
   label_slug="${label//[^a-zA-Z0-9._-]/_}"
   if [ "${SINOMO_TEST_TIMING_HELPERS_SELF_TEST:-0}" != 1 ]; then
+    local cpu_profile_args=()
+    if [ "$CPU_PROFILE" = 1 ]; then
+      cpu_profile_args=(--cpu-profile)
+    fi
     python3 "$SINOMO_DOCKER_DIR/profile-idle.py" \
       --project "$PROJECT" --binary "$BINARY" \
       --source-revision "$(git -C "$SINOMO_ROOT" rev-parse HEAD)-working-tree" \
-      --profile "${SINOMO_TEST_PROFILE:-debug+cpu-profiler}" \
+      --profile "$RUN_PROFILE" "${cpu_profile_args[@]}" \
       --artifacts "$ARTIFACTS/idle-$label_slug" \
       > "$ARTIFACTS/idle-$label_slug.log" 2>&1 &
     diagnostic_pid=$!
@@ -3957,7 +3981,7 @@ CASE_RESULT
 
 dfs_baseline_correctness() {
   python3 - "$ARTIFACTS/dfs-baseline-scope.json" <<'BASELINE_SCOPE'
-import json, sys
+import json, os, sys
 from pathlib import Path
 functional = [
     'invariants-baseline', 'read-your-write', 'cross-node', 'rename-across-prefixes',
@@ -3979,7 +4003,9 @@ Path(sys.argv[1]).write_text(json.dumps({
     'required_cases': [{'name': name, 'status': 'not_run'} for name in functional],
     'performance_cases': [{'name': name, 'status': 'not_run',
         'reason': 'separate performance distributions deferred by this explicit baseline selector'} for name in performance],
-    'observation': 'debug/tracing/CPU-profiler support remains required and charged',
+    'observation': ('debug/tracing and CPU profiling remain required and charged'
+                    if os.environ.get('SINOMO_TEST_CPU_PROFILE') == '1'
+                    else 'debug/tracing remain required and charged; CPU profiling was not requested'),
     'quiet_gate': {'cpu_percent_of_one_core': 10, 'combined_network_bytes_per_second_per_container': 65536,
                    'all_interfaces_including_loopback': True, 'continuous_seconds': 30, 'absolute_search_seconds': 120},
     'topology_evidence': 'dfs-requested-topology*.json, dfs-converged probe artifacts, dfs-handoff/handoff.json',
@@ -4600,15 +4626,20 @@ freeze_formation_observation_node() {
     observe timeline network stop --capture "$capture" --json \
     > "$node_dir/network-timeline.json" 2> "$node_dir/network-timeline.stderr.log" &
   timeline_pid=$!
-  compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
-    observe profile cpu stop --capture "$capture" --json \
-    > "$node_dir/cpu-profile-stop.json" 2> "$node_dir/cpu-profile-stop.stderr.log" &
-  profile_pid=$!
+  if [ "$CPU_PROFILE" = 1 ]; then
+    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+      observe profile cpu stop --capture "$capture" --json \
+      > "$node_dir/cpu-profile-stop.json" 2> "$node_dir/cpu-profile-stop.stderr.log" &
+    profile_pid=$!
+  fi
   compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
     observe control --clear-capture --expected-capture "$capture" --json \
     > "$node_dir/trace-control-stop.json" 2> "$node_dir/trace-control-stop.stderr.log" &
   trace_pid=$!
-  wait "$timeline_pid" "$profile_pid" "$trace_pid" 2>/dev/null || true
+  wait "$timeline_pid" "$trace_pid" 2>/dev/null || true
+  if [ -n "${profile_pid:-}" ]; then
+    wait "$profile_pid" 2>/dev/null || true
+  fi
 
   # Trace records are process-local. Read both the capture-tagged subset and
   # the full ring immediately after clearing the tag, while the daemon
@@ -4633,29 +4664,30 @@ collect_formation_observation_node() {
     return 0
   fi
 
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
-      observe profile cpu status --json \
-      > "$node_dir/cpu-profile-status.json" 2> "$node_dir/cpu-profile-status.stderr.log" || true
-    if grep -Eq '"state": "(complete|failed|unsupported)"' \
-      "$node_dir/cpu-profile-status.json"; then
-      break
-    fi
-    sleep 0.1
-  done
+  if [ "$CPU_PROFILE" = 1 ]; then
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
+        observe profile cpu status --json \
+        > "$node_dir/cpu-profile-status.json" 2> "$node_dir/cpu-profile-status.stderr.log" || true
+      if grep -Eq '"state": "(complete|failed|unsupported)"' \
+        "$node_dir/cpu-profile-status.json"; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
   compose_exec_timeout "$ARTIFACT_COMMAND_TIMEOUT" "$node" sinomo \
     observe metrics --limit 4096 --json \
     > "$node_dir/metrics.json" 2> "$node_dir/metrics.stderr.log" || true
 
   container="$(compose ps -q "$node")"
   if [ -n "$container" ]; then
-    mkdir -p \
-      "$node_dir/profile-artifact" \
-      "$node_dir/profile-artifacts" \
-      "$node_dir/startup" \
-      "$node_dir/network-timeline-artifacts"
-    docker cp "$container:/data/observe/profiles/$capture/." \
-      "$node_dir/profile-artifact/" >/dev/null 2>&1 || true
+    mkdir -p "$node_dir/startup" "$node_dir/network-timeline-artifacts"
+    if [ "$CPU_PROFILE" = 1 ]; then
+      mkdir -p "$node_dir/profile-artifact" "$node_dir/profile-artifacts"
+      docker cp "$container:/data/observe/profiles/$capture/." \
+        "$node_dir/profile-artifact/" >/dev/null 2>&1 || true
+    fi
     # Preserve recorded identity-changing formation generations, including
     # joins which restarted the container. Do not re-export/re-render unrelated
     # historical write/idle profiles from retained volumes.
@@ -4668,10 +4700,12 @@ collect_formation_observation_node() {
     printf '%s\n' "$capture" >> "$node_dir/formation-captures.txt"
     while IFS= read -r generation_capture; do
       [[ "$generation_capture" =~ ^formation-[a-zA-Z0-9-]+$ ]] || continue
-      mkdir -p "$node_dir/profile-artifacts/$generation_capture" \
-        "$node_dir/network-timeline-artifacts/$generation_capture"
-      docker cp "$container:/data/observe/profiles/$generation_capture/." \
-        "$node_dir/profile-artifacts/$generation_capture/" >/dev/null 2>&1 || true
+      mkdir -p "$node_dir/network-timeline-artifacts/$generation_capture"
+      if [ "$CPU_PROFILE" = 1 ]; then
+        mkdir -p "$node_dir/profile-artifacts/$generation_capture"
+        docker cp "$container:/data/observe/profiles/$generation_capture/." \
+          "$node_dir/profile-artifacts/$generation_capture/" >/dev/null 2>&1 || true
+      fi
       docker cp "$container:/data/observe/timelines/$generation_capture/." \
         "$node_dir/network-timeline-artifacts/$generation_capture/" >/dev/null 2>&1 || true
     done < <(sort -u "$node_dir/formation-captures.txt")
@@ -4723,6 +4757,8 @@ render_formation_observation_artifacts() {
     done < <(find "$node_dir/network-timeline-artifacts" -type f -name timeline.json -print0)
   done
 
+  # Without SINOMO_TEST_CPU_PROFILE=1 no profile was captured or expected.
+  [ "$CPU_PROFILE" = 1 ] || return 0
   if [ "${SINOMO_TEST_DEFER_PPROF_PRESENTATION:-0}" = 1 ]; then
     # Raw captures/CPU manifests and all collection above stay in this phase.
     # Nested restart harnesses inherit the same explicit per-run setting.
@@ -4766,7 +4802,7 @@ capture_formation_observation() {
   local node node_dir capture worker_pid
   local -a freeze_workers=() collect_workers=()
   mkdir -p "$observe_dir"
-  log "freezing bounded formation traces, RPC timelines, and CPU profiles"
+  log "freezing bounded formation traces and RPC timelines$([ "$CPU_PROFILE" = 1 ] && printf ', and CPU profiles')"
 
   # Freeze every node at the same gate edge. A sequential stop allowed later
   # joining daemons to replace themselves before their capture was addressed.
@@ -4794,7 +4830,7 @@ capture_formation_observation() {
   for worker_pid in "${collect_workers[@]}"; do
     wait "$worker_pid" 2>/dev/null || true
   done
-  log "rendering formation timelines and flamegraphs"
+  log "rendering formation timelines$([ "$CPU_PROFILE" = 1 ] && printf ' and flamegraphs')"
   render_formation_observation_artifacts "$observe_dir"
 }
 
@@ -4894,7 +4930,7 @@ teardown() {
   teardown_cluster "$original_exit" || log "cluster teardown did not complete"
   python3 "$SINOMO_DOCKER_DIR/verification_report.py" "$ARTIFACTS" \
     --project "$PROJECT" --binary "$BINARY" --exit-code "$original_exit" \
-    --profile "${SINOMO_TEST_PROFILE:-debug+cpu-profiler}" \
+    --profile "$RUN_PROFILE" \
     --lane "formation=$FORMATION_ONLY dfs-ready=$DFS_READY_ONLY quiet=$QUIET_ONLY dfs=$DFS_ONLY dfs-baseline=${DFS_BASELINE_ONLY:-0} network=${NETWORK_CASES:-${SINOMO_TEST_NETWORK_ONLY:-0}} kv=$CLUSTER_KV_ONLY pjdfstest=$PJDFSTEST_ONLY" \
     --failed-scenarios "$FAILED_SCENARIOS" || report_exit=$?
   trap - EXIT
@@ -4954,7 +4990,7 @@ if [ "${SINOMO_TEST_BUILD:-1}" = 1 ]; then
     exit 1
   fi
   if [ "${SINOMO_TEST_REUSE:-0}" = 1 ]; then
-    log "reuse requires SINOMO_TEST_BUILD=0 and a verified profiler-enabled binary"; exit 1
+    log "reuse requires SINOMO_TEST_BUILD=0 and the verified binary the running project mounts"; exit 1
   fi
   log "stopping this task's cluster before compiling"
   compose stop -t 10 || { log "cluster stop failed"; exit 1; }

@@ -571,7 +571,7 @@ def markdown(report):
              "| Acceptance lane | Samples | p50 / p95 / p99 / max | Throughput | Target | Result |",
              "|---|---:|---|---|---|---|",
              "| Verification gate results | unavailable | unavailable | unavailable | unchanged configured targets | see the generated verification report |", "",
-             "Debugging, tracing and profiling remain enabled for Docker acceptance. Use observed timings directly; no overhead is subtracted or used to relax gates. This stage capture alone does not establish all gate results. Stage latencies measure captured span lifetimes, including unknown outcomes (which may be cancellations). Stage rows are inclusive and overlap; do not sum them. Percentiles use nearest-rank samples on each node. n/o means not observed, n/a unavailable.", "",
+             "Debugging and tracing remain enabled for Docker acceptance; CPU profiling is opt-in. Use observed timings directly; no overhead is subtracted or used to relax gates. This stage capture alone does not establish all gate results. Stage latencies measure captured span lifetimes, including unknown outcomes (which may be cancellations). Stage rows are inclusive and overlap; do not sum them. Percentiles use nearest-rank samples on each node. n/o means not observed, n/a unavailable.", "",
              "| Node / process | Stage | N | p50 ms | p95 ms | p99 ms | Max ms | Outcomes ok/error/unknown | TX / RX B (ops) | Read / write B (ops) | Sync ops / ms | Peers |",
              "|---|---|---:|---:|---:|---:|---:|---|---|---|---|---|"]
     for row in report["stages"]:

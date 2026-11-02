@@ -53,7 +53,7 @@ These are narrower evidence, not substitutes for the full harness:
 | Goal | Selection |
 |---|---|
 | Formation only | `SINOMO_TEST_FORMATION_ONLY=1` with `docker/test-cluster.sh` |
-| Formation diagnostics | Enabled by default (`SINOMO_TEST_FORMATION_OBSERVE=1`); CPU capture defaults to all nodes |
+| Formation diagnostics | Enabled by default (`SINOMO_TEST_FORMATION_OBSERVE=1`); CPU capture is opt-in with `SINOMO_TEST_CPU_PROFILE=1` |
 | DFS readiness/mutation/convergence | `SINOMO_TEST_DFS_READY_ONLY=1` |
 | Readiness plus the standard quiet gate, no mutation workloads | `SINOMO_TEST_QUIET_ONLY=1`, normally with reuse and build disabled |
 | Normal/history/restart/handoff/core-only correctness and history benchmarks | `SINOMO_TEST_DFS_ONLY=1`; standalone cases via [test-file-history.py](../../../../docker/test-file-history.py) `--case` |
@@ -127,8 +127,8 @@ before interpreting a result. Do not replace it with a daemon-only CPU sample.
 Default artifacts are under `target/cluster-test-artifacts/<run>/`; use
 `SINOMO_TEST_ARTIFACTS` to choose a run directory. Preserve raw probe results and
 the first failing gate. Formation observation includes capture-tagged and
-all-process traces, startup generations, CPU captures, network timelines and
-Perfetto output. Rendering helpers live in [scripts/debug](../../../../scripts/debug).
+all-process traces, startup generations, network timelines and Perfetto output,
+plus CPU captures when profiling is requested. Rendering helpers live in [scripts/debug](../../../../scripts/debug).
 
 Read and share the automatically generated `REPORT.md` and `report.json` first.
 The main harness report links generated child reports; the write matrix report
@@ -141,6 +141,6 @@ Do not replace generated results with ad hoc measurement or summary scripts.
 For a retained or interrupted run, record project/context, Compose files, binary
 identity, artifact path, completed/failed phase, live process/container state and
 the exact resume command. A CLI timeout or a successful reduced lane is not a
-full acceptance result. All gates retain their thresholds with debugging, tracing and profiling enabled,
-including formation-observed processes and shadows. Do not switch instrumentation
+full acceptance result. All gates retain their thresholds with debugging and tracing enabled, and
+with CPU profiling when requested, including formation-observed processes and shadows. Do not switch instrumentation
 off to make an acceptance gate pass.

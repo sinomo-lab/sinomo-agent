@@ -30,8 +30,8 @@ sha256sum target/debug/sinomo
 Use the release profile for performance claims and state the profile
 explicitly. Do not compare a debug binary with a release baseline. Docker
 acceptance gates default to the host-built `target/debug/sinomo` described in
-the [Docker guide](../../docker/README.md) and keep debugging, tracing, and
-profiling enabled at unchanged thresholds. Record the profile with their results
+the [Docker guide](../../docker/README.md) and keep debugging and tracing
+enabled at unchanged thresholds; CPU profiling is opt-in. Record the profile with their results
 and do not present debug-profile timings as release performance. DFS and
 cluster performance reports follow the
 [performance analysis skill](../../skills/sinomo-performance-analysis/SKILL.md).

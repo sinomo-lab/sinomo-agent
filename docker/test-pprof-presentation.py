@@ -126,12 +126,9 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("render-pprof-flamegraph.py", invoked.call_args_list[1].args[0][1])
         self.assertNotIn("presentation_status", rows[0])
 
-    def test_formation_nested_environment_preserves_raw_and_missing_status(self):
-        observe = self.root / "formation"
-        profile, manifest, _ = self.raw(observe / "node1/profile-artifact")
-        original = profile.read_bytes(), manifest.read_bytes()
+    def render_formation(self, observe, cpu_profile):
         for node in ("node1", "node2"):
-            (observe / node / "network-timeline-artifacts").mkdir(parents=True)
+            (observe / node / "network-timeline-artifacts").mkdir(parents=True, exist_ok=True)
         source = (ROOT / "docker/test-cluster.sh").read_text()
         function = source.split("render_formation_observation_artifacts() {", 1)[1].split(
             "\ncapture_formation_observation() {", 1)[0]
@@ -140,15 +137,30 @@ class PresentationTests(unittest.TestCase):
                          '\nrender_formation_observation_artifacts "$1"\n')
         sentinel = self.root / "go-was-invoked"
         bin_dir = self.root / "bin"
-        bin_dir.mkdir()
+        bin_dir.mkdir(exist_ok=True)
         go = bin_dir / "go"
         go.write_text('#!/bin/sh\ntouch "$GO_SENTINEL"\nexit 77\n')
         go.chmod(0o700)
         environment = dict(os.environ, **{ENV: "1", "SINOMO_ROOT": str(ROOT), "NODES": "node1 node2",
-                           "GO_SENTINEL": str(sentinel), "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]})
+                           "CPU_PROFILE": cpu_profile, "GO_SENTINEL": str(sentinel),
+                           "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]})
         # Two real shell levels exercise ordinary inherited restart environment.
         subprocess.run(["bash", "-c", 'exec bash "$1" "$2"', "nested-restart", str(shell), str(observe)],
                        env=environment, check=True, timeout=10)
+        return sentinel
+
+    def test_formation_without_cpu_profiling_writes_no_presentation(self):
+        observe = self.root / "formation"
+        sentinel = self.render_formation(observe, "0")
+        self.assertFalse(list(observe.rglob("pprof-presentation.json")))
+        self.assertFalse(list(observe.rglob("flamegraph.html")))
+        self.assertFalse(sentinel.exists())
+
+    def test_formation_nested_environment_preserves_raw_and_missing_status(self):
+        observe = self.root / "formation"
+        profile, manifest, _ = self.raw(observe / "node1/profile-artifact")
+        original = profile.read_bytes(), manifest.read_bytes()
+        sentinel = self.render_formation(observe, "1")
         good = json.loads((profile.parent / "pprof-presentation.json").read_text())
         missing = json.loads((observe / "node2/profile-artifact/pprof-presentation.json").read_text())
         self.assertEqual(good["status"], "deferred")
@@ -179,7 +191,7 @@ class PresentationTests(unittest.TestCase):
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(PresentationTests)
     count = suite.countTestCases()
-    assert count == 8, count
+    assert count == 9, count
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     evidence = os.environ.get("SINOMO_PPROF_TEST_EVIDENCE")
     if evidence:

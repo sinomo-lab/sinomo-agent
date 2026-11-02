@@ -72,17 +72,19 @@ any deliberately changed workload/profile as a different experiment.
 Use a separate fresh project for clean-formation evidence; reused volumes
 exercise a warm or recovery path and cannot establish clean bootstrap behavior.
 
-Debugging, tracing and profiler support are the standard Docker configuration.
-The harness builds with `sinomo-observe/cpu-profiler`, starts bounded formation
-profiles on all nodes and verifies debug/tracing/profile availability. Every gate,
-including formation, quietness and performance, must pass with observation enabled
-at its unchanged threshold. Use observed timings directly without subtracting
+Debugging and tracing are the standard Docker configuration. The harness builds
+with `sinomo-observe/cpu-profiler` and verifies debug/tracing availability. CPU
+profiling is opt-in: `SINOMO_TEST_CPU_PROFILE=1` starts bounded formation profiles
+on all nodes, adds CPU profiles to the idle and write stage reports, and requires
+profiler support and the formation capture. Every gate, including formation,
+quietness and performance, must pass with observation enabled at its unchanged
+threshold. Use observed timings directly without subtracting
 overhead or treating instrumentation as a reason to waive a failure. The quiet
 gate measures entire containers, including samplers, shadows and helpers.
 Every quiet gate collects `idle-<leg>/REPORT.md` with the standard Observe idle
 profiler and includes per-node CPU stream summaries in the generated verification
-report. Diagnose its background counters, stages and CPU profiles before changing
-scheduling. A partial profile does not change the gate verdict; missing metrics
+report. Diagnose its background counters and stages, and CPU profiles when
+profiling was requested, before changing scheduling. A partial profile does not change the gate verdict; missing metrics
 and trace coverage must remain visible.
 For a follow-up idle check, select `SINOMO_TEST_QUIET_ONLY=1` with reuse and build
 disabled. This retains readiness, observation and the unchanged quiet gate while
@@ -106,8 +108,9 @@ measurement is missing instead of creating a different benchmark for each task.
 Ordinary Docker write performance uses both **W=1/N=2 and W=2/N=3** through
 `docker/measure-dfs-write-latency.py`, for both callers and all three shards.
 Require recorded effective-policy checks and keep policy/create/overwrite
-distributions separate. The write driver generates detailed stage/I/O/CPU reports
-by default via `profile-dfs-writes.py`; skipping that stage is diagnostic only.
+distributions separate. The write driver generates detailed stage/I/O reports by
+default via `profile-dfs-writes.py`, with CPU profiles when profiling is requested;
+skipping that stage is diagnostic only.
 Apply the repository
 [performance analysis skill](../../../skills/sinomo-performance-analysis/SKILL.md)
 for the full matrix, standard tables and separate traced diagnostics.

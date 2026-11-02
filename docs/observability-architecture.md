@@ -28,9 +28,10 @@ counter snapshots beside trace/process windows. Its reporter requires complete
 snapshots from the same process before computing deltas. Missing, newly
 registered or reset counters retain raw endpoints and an unavailable delta.
 Docker quietness runs `docker/profile-idle.py` alongside its continuous CPU gate,
-producing the standard stage/I/O, node-window, activity and coverage report plus
-CPU profiles. Main-process profiles diagnose work; whole-container CPU remains
-the gate authority and includes shadows, helpers and collection overhead.
+producing the standard stage/I/O, node-window, activity and coverage report, plus
+CPU profiles when profiling is requested. Main-process profiles diagnose work;
+whole-container CPU remains the gate authority and includes shadows, helpers and
+collection overhead.
 DFS metric export reads only the bounded resident status projection. A missing
 or busy projection remains an explicit partial-export error; observation never
 falls back to opening and decoding the metadata store. Requests for metric
@@ -815,9 +816,10 @@ silently changes it or restarts nodes. The record, field-size and scope-depth
 bounds remain in force, and a full ring still reports loss. Buffered export
 cannot recover records evicted before the capture stopped.
 
-Docker verification enables debug logging, DFS/generic tracing, a 32,768-record
-ring and CPU profiler support by default. Gates retain their thresholds with
-observation enabled; timings are not adjusted for estimated overhead. The write
+Docker verification enables debug logging, DFS/generic tracing and a
+32,768-record ring by default; CPU profiling is opt-in with
+`SINOMO_TEST_CPU_PROFILE=1`. Gates retain their thresholds with observation
+enabled; timings are not adjusted for estimated overhead. The write
 matrix automatically generates detailed stage reports with
 `docker/profile-dfs-writes.py`. Its prepared-fixture mode uses the same daemon
 write probe and verifies W/N before writing. The reporter can select one root by

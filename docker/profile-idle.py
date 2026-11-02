@@ -108,6 +108,8 @@ def main():
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=15)
+    parser.add_argument("--cpu-profile", action="store_true",
+                        help="also collect a bounded CPU profile from every main daemon")
     args = parser.parse_args()
     if not 1 <= args.seconds <= 20:
         parser.error("seconds must be between 1 and 20 for the bounded CPU capture")
@@ -116,7 +118,8 @@ def main():
     run = profiles.latency.acceptance.Acceptance(args)
     result = {"schema": "sinomo.idle-diagnostics.v1", "project": args.project,
               "binary_sha256": run.binary_hash, "source_revision": args.source_revision,
-              "profile": args.profile, "seconds": args.seconds, "complete": False,
+              "profile": args.profile, "seconds": args.seconds, "cpu_profile": args.cpu_profile,
+              "complete": False,
               "classification": "diagnostic", "errors": [], "nodes": {}, "cpu_profiles": []}
     capture = run.artifacts / "idle"
     try:
@@ -137,7 +140,8 @@ def main():
                    for alias, node in nodes.items()}
         profiles.save(run.artifacts / "clients.json", clients)
         command = ["python3", str(ROOT / "scripts/debug/capture-performance.py"), "--buffered",
-                   "--cpu-profile", "--workload-kind", "idle", "--metrics-prefix", "sinomo.dfs.background", "--nodes", *nodes.values(),
+                   *(["--cpu-profile"] if args.cpu_profile else []),
+                   "--workload-kind", "idle", "--metrics-prefix", "sinomo.dfs.background", "--nodes", *nodes.values(),
                    "--clients-file", str(run.artifacts / "clients.json"), "--output", str(capture),
                    "--source-revision", args.source_revision, "--binary-sha256", run.binary_hash,
                    "--profile", args.profile, "--duration-seconds", str(args.seconds + 10),
@@ -154,7 +158,8 @@ def main():
                 result["errors"].append(issue)
         profiles.save(capture / "performance.json", report)
         (capture / "PERFORMANCE.md").write_text(profiles.reporter.markdown(report))
-        result["cpu_profiles"] = profiles.collect_cpu_profiles(run, capture, "idle", nodes)
+        if args.cpu_profile:
+            result["cpu_profiles"] = profiles.collect_cpu_profiles(run, capture, "idle", nodes)
         result["process_windows"] = []
         for alias, node in nodes.items():
             endpoints = [run.artifacts / f"{node}-process-{index}.json" for index in (0, 1)]
@@ -162,7 +167,7 @@ def main():
             result["process_windows"].extend(dict(row, node=alias) for row in process_deltas(before, after))
         result["trace_complete"] = report["complete"]
         result["complete"] = (result["capture_exit"] == 0 and report["complete"]
-                              and len(result["cpu_profiles"]) == 6
+                              and (not args.cpu_profile or len(result["cpu_profiles"]) == 6)
                               and all(row[field] is not None for row in result['process_windows']
                                       for field in ['cpu_percent', 'read_bytes', 'write_bytes', 'read_syscalls', 'write_syscalls']))
     except Exception as error:
@@ -172,11 +177,15 @@ def main():
                  f"Project: `{args.project}`. Source: `{args.source_revision}`. Binary: `{run.binary_hash}`. Profile: `{args.profile}`.", "",
                  "This bounded idle capture is diagnostic and does not establish quietness acceptance. "
                  "The verification harness runs it alongside the unchanged whole-container quietness gate. "
-                 "CPU profiles cover main daemons; gate CPU also includes shadows and helpers. All observation "
-                 "overhead remains charged to the gate. CPU sampling excludes the system-library ranges listed in each manifest.", "",
+                 + ("CPU profiles cover main daemons; gate CPU also includes shadows and helpers. All observation "
+                    "overhead remains charged to the gate. CPU sampling excludes the system-library ranges listed in each manifest."
+                    if args.cpu_profile else
+                    "CPU profiling was not requested; SINOMO_TEST_CPU_PROFILE=1 enables it. All observation "
+                    "overhead remains charged to the gate."), "",
                  f"Capture coverage: **{'complete' if result['complete'] else 'partial / unavailable'}**. "
-                 "[Standard stage/I/O, node-window, activity and coverage tables](idle/PERFORMANCE.md).", "",
-                 "| Node | CPU samples | Profile |", "|---|---:|---|"]
+                 "[Standard stage/I/O, node-window, activity and coverage tables](idle/PERFORMANCE.md).", ""]
+        if args.cpu_profile:
+            lines += ["| Node | CPU samples | Profile |", "|---|---:|---|"]
         for row in result["cpu_profiles"]:
             links = f"[pprof]({row['artifact']})"
             if row.get("flamegraph"):
