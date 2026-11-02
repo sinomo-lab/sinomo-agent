@@ -24,7 +24,6 @@ fn cloud_files_root_stat_queries_its_resident_main() {
             .control_plane_client()
             .expect("native control plane"),
     );
-    crate::windows_sync::configure_cloud_files_mounted_read_policy(&mut service);
 
     // This is the first authoritative read in the Cloud Files full scan. The
     // mounted adapter must not treat its private projection as resident Main.

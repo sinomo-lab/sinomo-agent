@@ -354,7 +354,6 @@ pub(crate) fn open_hosted_browser_sifs_service(
                 message: other.to_string(),
             },
         })?;
-    service.disable_implicit_read_replica_ingest();
     Ok(OpenedMountedSifsService {
         service,
         replica_candidates,
@@ -444,11 +443,6 @@ fn open_mounted_sifs_service_from_context(
                 },
             })?;
     }
-    // LookupPath is already a read-only authoritative query. Do not let an
-    // eligible transient failure silently escalate a mounted stat/read into a
-    // durable SyncPath apply outside the adapter's handoff. Directory listing
-    // remains the explicit replaying read surface and is bracketed by adapters.
-    service.disable_implicit_read_replica_ingest();
     Ok(OpenedMountedSifsService {
         service,
         replica_candidates,

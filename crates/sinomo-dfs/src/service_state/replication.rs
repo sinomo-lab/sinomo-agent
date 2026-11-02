@@ -15,8 +15,6 @@ pub(crate) struct DfsReplicationState {
     pub(crate) local_metadata_journal_cursors: BTreeMap<DfsMetadataShardId, u64>,
     pub(crate) routed_replica_projections: BTreeMap<DfsMetadataShardId, RoutedReplicaProjection>,
     pub(crate) metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
-    pub(crate) recent_namespace_freshness_syncs:
-        BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,
     pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pub(crate) pending_metadata_authority_probes: BTreeMap<String, PendingMetadataAuthorityProbe>,
     pub(crate) metadata_authority_probe_results: BTreeMap<String, bool>,

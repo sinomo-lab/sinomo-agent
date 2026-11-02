@@ -321,9 +321,8 @@ declared policy.
 ## Namespace Operations
 
 Path mutations execute at the primary responsible for the affected namespace.
-The primary validates every object and parent involved, commits the namespace
-transaction, and returns bounded journal progress so the requester can read its
-own change.
+The primary validates every object and parent involved and commits the namespace
+transaction; the requester reads its own change from that primary.
 
 Operations contained within one authority are atomic. Recursive work is split
 into bounded durable jobs that resume after restart.
@@ -368,6 +367,9 @@ exists elsewhere. The branch never becomes a second canonical history.
 Distributed POSIX stat derives current inode fields through bounded authenticated
 metadata projections; see [the authoritative stat contract](dfs-authoritative-stat.md)
 for generation, cross-shard completeness, compatibility and outage behavior.
+Path metadata is answered by the shard's primary or one of its replicas. A node
+outside the replica set reads through the primary and surfaces the primary's
+error rather than a local copy.
 
 Reads prefer the closest valid copy:
 

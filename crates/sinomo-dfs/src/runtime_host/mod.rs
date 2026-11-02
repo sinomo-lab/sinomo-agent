@@ -2381,9 +2381,7 @@ fn open_dfs_runtime_service_for_use(
         .with_boxed_metadata_backend_lazy(metadata)
         .map_err(DfsRuntimeError::from)?;
     if read_only {
-        // Keep the catalog used by outgoing POSIX reads, but never turn their
-        // responses into an implicit durable replica update.
-        service.disable_implicit_read_replica_ingest();
+        // Keep the catalog used by outgoing POSIX reads.
         return Ok(service);
     }
     if let Some(expected) = effect {

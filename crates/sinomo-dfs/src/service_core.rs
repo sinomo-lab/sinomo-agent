@@ -61,9 +61,9 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             metadata_backend: None,
             metadata_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
             metadata_lookup_cache_depth: std::sync::Mutex::new(0),
+            read_shard_snapshot: None,
             passive_fetch_started_at: BTreeMap::new(),
             repair_attempt_records: BTreeMap::new(),
-            implicit_read_replica_ingest_enabled: true,
             pending_routed_namespace_ops: BTreeMap::new(),
             stable_namespace_reconciliation_results: BTreeMap::new(),
             stable_namespace_reconciliation_targets: BTreeMap::new(),
@@ -203,14 +203,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn set_cancellation(&mut self, cancellation: Option<DfsCancellationFlag>) {
         self.cancellation = cancellation;
-    }
-
-    /// Keep ordinary mounted reads non-mutating. Explicit directory refreshes
-    /// may still replay replica journals, but their adapters must own the
-    /// crash-safe mounted-mutation handoff around that call.
-    pub fn disable_implicit_read_replica_ingest(&mut self) {
-        self.implicit_read_replica_ingest_enabled = false;
-        self.replication.recent_namespace_freshness_syncs.clear();
     }
 
     /// Add a cancellation source without replacing one already installed by
@@ -494,7 +486,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             placement_snapshot_cache,
             content_pin_node_ids,
             replication,
-            implicit_read_replica_ingest_enabled,
             pending_namespace_request_recovery_cursor,
             write_intent_maintenance_scan,
             maintenance_progress,
@@ -519,7 +510,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         service.placement_snapshot_cache = placement_snapshot_cache;
         service.content_pin_node_ids = content_pin_node_ids;
         service.replication = replication.into_lazy();
-        service.implicit_read_replica_ingest_enabled = implicit_read_replica_ingest_enabled;
         // This cursor is tiny but provides bounded-scan fairness across routine
         // maintenance ticks. Restarting at the first durable page after every
         // lazy rebuild could starve later locally authoritative requests behind
@@ -600,7 +590,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.repair_attempt_records.clear();
         self.reads.transient_remote_read_pruned_locations.clear();
         self.replication.local_metadata_journal_cursors.clear();
-        self.replication.recent_namespace_freshness_syncs.clear();
         self.last_events.clear();
         self.message_committed_work = DfsMessageCommittedWork::default();
         // Re-seed the exact durable cursor after clearing a possibly stale
@@ -944,10 +933,6 @@ mod projection_release_tests {
             .replication
             .local_metadata_journal_cursors
             .insert(shard_id.clone(), 91);
-        service.replication.recent_namespace_freshness_syncs.insert(
-            (file_system_id.clone(), shard_id.clone(), replica.clone()),
-            Instant::now(),
-        );
         service.pending_namespace_request_recovery_cursor =
             Some(crate::DfsPendingNamespaceRequestPageCursor {
                 updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -992,12 +977,6 @@ mod projection_release_tests {
                 .local_metadata_journal_cursors
                 .get(&shard_id),
             Some(&native_head)
-        );
-        assert!(
-            service
-                .replication
-                .recent_namespace_freshness_syncs
-                .is_empty()
         );
         assert_eq!(
             service
