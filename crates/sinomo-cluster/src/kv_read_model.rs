@@ -25,9 +25,6 @@ use time::OffsetDateTime;
 const MAX_CLUSTER_DIRECTORY_PROJECTION_CACHE_ENTRIES: usize = 128;
 
 static CLUSTER_DIRECTORY_PROJECTION_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
-// Local route recovery changes routing without advancing KV authority. These
-// process-local cache generations fence cold captures and prepared connectors;
-// they are never exposed as KvRevision or used for membership authorization.
 static CLUSTER_DIRECTORY_PROJECTIONS: LazyLock<
     Mutex<HashMap<PathBuf, ClusterDirectoryProjectionCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
