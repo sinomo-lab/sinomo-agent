@@ -106,6 +106,9 @@ A joining installation presents its identity and capabilities to an
 introducer. The existing cluster validates the invite and commits the new
 member. The same commit includes the accepting member's current listener
 advertisements, so the joiner's first committed view can route back to it.
+The joiner starts its replicated KV state from that committed view, anchored
+at the authority's log position, so its first reads already include its own
+admission and replication continues from there.
 Normal invitations use learner or non-voting roles. Authority promotion
 is a separate committed membership change. The current lifecycle records learner
 admission, requires proof that the learner reached the required committed log

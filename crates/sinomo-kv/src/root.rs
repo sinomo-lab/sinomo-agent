@@ -423,6 +423,7 @@ pub use raft::{
     prepare_cluster_kv_raft_proposals, process_local_raft_access_is_denied,
     read_cluster_kv_authoritative_snapshot_async_with_host,
     read_cluster_kv_authoritative_snapshot_with_host,
+    read_cluster_kv_raft_anchored_snapshot_before,
     replicate_cluster_kv_raft_to_target_async_with_host,
     replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
     with_cluster_kv_resident_read_projection, with_cluster_kv_resident_read_projection_before,

@@ -1858,10 +1858,15 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         &mut host,
     )
     .map_err(CliError::from)?;
-    if let Some(snapshot) = reconciliation.kv_snapshot
+    if let Some(snapshot) = reconciliation.kv_snapshot.as_ref()
         && let Some(paths) = paths
     {
-        write_cluster_kv_snapshot(paths, &snapshot)?;
+        cluster::persist_accepted_cluster_join_snapshot(
+            paths,
+            &state.local_node_id,
+            snapshot,
+            reconciliation.raft_anchor,
+        )?;
     }
     if let Some(endpoint) = reconciliation.accepted_endpoint {
         println!("introducer accepted join: {}", endpoint.address);
@@ -3212,16 +3217,6 @@ pub(crate) fn read_cluster_kv_local_snapshot_for_test(
                 })
         }
     }
-}
-
-pub(crate) fn write_cluster_kv_snapshot(
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> Result<(), CliError> {
-    sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot)
-        .map(|_| ())
-        .map_err(sinomo_runtime::network::NetworkError::directory)
-        .map_err(Into::into)
 }
 
 #[cfg(test)]

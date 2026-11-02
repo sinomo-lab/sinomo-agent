@@ -15387,6 +15387,65 @@ fn cluster_join_registration_leaves_current_acceptor_endpoints_unwritten() {
 }
 
 #[test]
+fn accepted_join_starts_the_joiner_raft_state_at_the_anchored_admission() {
+    let fixture = join_authority_fixture("join_anchored_raft_state");
+    let mut host = RecordingJoinRegistrationHost::default();
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        join_authority_fixture_request(&fixture),
+        fixture.now,
+        &mut host,
+    )
+    .expect("handle join registration");
+    assert!(response.accepted, "{}", response.detail);
+    let anchor = response
+        .raft_anchor
+        .expect("the authority anchors its admission snapshot");
+    let snapshot = response.kv_snapshot.expect("admission snapshot");
+    let authority = open_cluster_raft_kv_node(&fixture.paths, &fixture.state.local_node_id)
+        .expect("authority Raft state");
+    assert_eq!(
+        (anchor.last_included_index, snapshot.revision),
+        (authority.applied_index(), authority.store().revision()),
+        "the snapshot is the authority's exact applied state at the anchor"
+    );
+    drop(authority);
+
+    let joiner_root = sinomo_testdir::TestDir::new("join_anchored_raft_state_joiner");
+    let joiner_paths = ClusterPaths::new(&SinomoDataDir::new(&joiner_root));
+    joiner_paths.ensure().expect("joiner cluster paths");
+    persist_accepted_cluster_join_snapshot(
+        &joiner_paths,
+        &fixture.joined_node_id,
+        &snapshot,
+        Some(anchor),
+    )
+    .expect("persist accepted join snapshot");
+
+    // Before any replication, the joiner's own Raft view already holds its
+    // admission and the invitation an introducer checks.
+    let joined = sinomo_kv::DurableRaftKvNode::open(
+        fixture.joined_node_id.clone(),
+        cluster_raft_wal_paths(&joiner_paths, &fixture.joined_node_id),
+    )
+    .expect("joined Raft state");
+    assert_eq!(joined.applied_index(), anchor.last_included_index);
+    assert_eq!(joined.store().revision(), snapshot.revision);
+    assert!(
+        joined
+            .store()
+            .get(&cluster_member_key(&fixture.joined_node_id))
+            .is_some()
+    );
+    assert!(
+        joined
+            .store()
+            .get(&cluster_invitation_key(&fixture.invite.invite_id))
+            .is_some()
+    );
+}
+
+#[test]
 fn current_directory_records_include_a_member_admitted_while_a_mutation_is_in_flight() {
     let fixture = join_authority_fixture("join_current_directory_records");
     let before = read_cluster_kv_current_snapshot(&fixture.paths).expect("pre-join snapshot");
@@ -16775,6 +16834,7 @@ fn identityless_invite_requires_snapshot_for_accepted_join_response() {
         state: accepted_state,
         kv_snapshot: None,
         responder_node_id: None,
+        raft_anchor: None,
     };
     let endpoint = daemon_lan_endpoint(&voter, "node1:21353".to_string(), 0);
     let mut reconciled = pending.clone();
@@ -16855,6 +16915,7 @@ fn accepted_join_response_uses_authorized_responder_as_endpoint_owner() {
         state: accepted_state,
         kv_snapshot: None,
         responder_node_id: Some(bridge.clone()),
+        raft_anchor: None,
     };
 
     let reconciliation =
@@ -17008,6 +17069,7 @@ fn cluster_join_reconciliation_driver_merges_acceptance_through_host() {
             state: accepted,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         }),
         ..Default::default()
     };
@@ -17123,6 +17185,7 @@ fn cluster_join_reconciliation_fetches_snapshot_after_unverified_acceptance() {
             state: stale_response_state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         }),
         snapshot: Some(snapshot),
         ..Default::default()
@@ -17358,6 +17421,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
                             state: self.accepted_state.clone(),
                             kv_snapshot: None,
                             responder_node_id: None,
+                            raft_anchor: None,
                         },
                     )
                 }

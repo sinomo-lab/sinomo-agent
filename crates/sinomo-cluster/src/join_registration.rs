@@ -23,7 +23,9 @@ use crate::membership_forward::{
     ClusterMembershipRpcForwardHost, forward_cluster_membership_rpc_to_state_authority_with_host,
     forward_cluster_membership_value_to_state_authority_async_with_host,
 };
-use crate::membership_rpc::{ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse};
+use crate::membership_rpc::{
+    ClusterJoinRaftAnchor, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
+};
 use crate::prelude::*;
 #[allow(unused_imports)]
 use sinomo_kv::KvSnapshot;
@@ -282,6 +284,7 @@ fn requested_join_learner_node_id(request: &ClusterJoinRegistrationRequest) -> O
 pub struct ClusterJoinReconciliation {
     pub accepted_endpoint: Option<ClusterEndpointRecord>,
     pub kv_snapshot: Option<KvSnapshot>,
+    pub raft_anchor: Option<ClusterJoinRaftAnchor>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -303,6 +306,7 @@ pub fn prepare_cluster_join_registration_response(
             state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         });
     }
     if let Err(error) = crate::verify_cluster_join_invite_signature(&persisted_invite) {
@@ -312,6 +316,7 @@ pub fn prepare_cluster_join_registration_response(
             state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         });
     }
     if !state.members.iter().any(|member| {
@@ -328,6 +333,7 @@ pub fn prepare_cluster_join_registration_response(
             state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         });
     }
     if persisted_invite.cluster_id != state.cluster_id {
@@ -340,6 +346,7 @@ pub fn prepare_cluster_join_registration_response(
             state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         });
     }
     if persisted_invite.expires_at <= now {
@@ -355,6 +362,7 @@ pub fn prepare_cluster_join_registration_response(
             state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         });
     }
     if request
@@ -368,6 +376,7 @@ pub fn prepare_cluster_join_registration_response(
             state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         });
     }
 
@@ -392,6 +401,7 @@ pub fn prepare_cluster_join_registration_response(
         state: accepted_state,
         kv_snapshot: None,
         responder_node_id: None,
+        raft_anchor: None,
     })
 }
 
@@ -416,6 +426,7 @@ fn rejected_cluster_join_registration(
         state,
         kv_snapshot: None,
         responder_node_id: None,
+        raft_anchor: None,
     })
 }
 
@@ -1117,6 +1128,44 @@ fn cluster_join_learner_admission_lifecycle_is_committed(
         && change.phase == ClusterKvRaftConfigChangePhase::Committed)
 }
 
+/// The authority's applied state anchored at its Raft position, which a
+/// joiner can install as its initial Raft state.
+fn cluster_join_response_raft_snapshot(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Option<sinomo_kv::RaftSnapshot> {
+    let wal_paths = crate::ClusterKvPathsExt::kv_paths(paths).raft_wal_paths(node_id);
+    let deadline = Instant::now() + sinomo_network::DEFAULT_NETWORK_TIMEOUT;
+    match sinomo_kv::read_cluster_kv_raft_anchored_snapshot_before(&wal_paths, node_id, deadline)? {
+        Ok(snapshot) => Some(snapshot),
+        Err(error) => {
+            join_registration_trace(format_args!(
+                "join response Raft anchor unavailable: {error}"
+            ));
+            None
+        }
+    }
+}
+
+/// Answers with the anchored snapshot when it covers the admission. A voter
+/// that has not applied the admission yet answers with the admitted snapshot
+/// alone, and the joiner's Raft state then starts empty.
+fn anchored_cluster_join_response_snapshot(
+    admitted: KvSnapshot,
+    anchored: Option<sinomo_kv::RaftSnapshot>,
+) -> (KvSnapshot, Option<ClusterJoinRaftAnchor>) {
+    match anchored {
+        Some(anchored) if anchored.kv.revision >= admitted.revision => {
+            let anchor = ClusterJoinRaftAnchor {
+                last_included_index: anchored.last_included_index,
+                last_included_term: anchored.last_included_term,
+            };
+            (Arc::unwrap_or_clone(anchored.kv), Some(anchor))
+        }
+        _ => (admitted, None),
+    }
+}
+
 fn finish_cluster_join_learner_admission_with_host(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -1474,6 +1523,7 @@ pub fn handle_cluster_join_registration_request_with_host(
                 state: prepared.state,
                 kv_snapshot: None,
                 responder_node_id: None,
+                raft_anchor: None,
             });
         }
         // A replay proves this exact failed compare, not authority for a new
@@ -1522,7 +1572,10 @@ pub fn handle_cluster_join_registration_request_with_host(
         "join learner lifecycle completion node={learner_node_id} change={lifecycle_change_id:?} completed in {:?}",
         lifecycle_started.elapsed()
     ));
-    let snapshot = admitted.snapshot;
+    let (snapshot, raft_anchor) = anchored_cluster_join_response_snapshot(
+        admitted.snapshot,
+        cluster_join_response_raft_snapshot(paths, &commit_state.local_node_id),
+    );
     let response_revision = snapshot.revision.0;
     let response_term = admitted.authority.term;
     let projection_started = Instant::now();
@@ -1679,6 +1732,7 @@ pub fn handle_cluster_join_registration_request_with_host(
         state: response_state,
         kv_snapshot: Some(snapshot),
         responder_node_id: None,
+        raft_anchor,
     })
 }
 
@@ -2014,6 +2068,7 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
                 state: prepared.state,
                 kv_snapshot: None,
                 responder_node_id: None,
+                raft_anchor: None,
             });
         }
         // A replay proves this exact failed compare, not authority for a new
@@ -2070,7 +2125,15 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         authority: admitted.authority,
     });
     drop(admission_turn);
-    let snapshot = admitted.snapshot;
+    let anchor_paths = paths.clone();
+    let anchor_node_id = commit_state.local_node_id.clone();
+    let anchored = runtime
+        .spawn_blocking(move || cluster_join_response_raft_snapshot(&anchor_paths, &anchor_node_id))
+        .await
+        .ok()
+        .flatten();
+    let (snapshot, raft_anchor) =
+        anchored_cluster_join_response_snapshot(admitted.snapshot, anchored);
     let response_revision = snapshot.revision.0;
     let response_term = admitted.authority.term;
     let response_state_input = prepared.state;
@@ -2251,6 +2314,7 @@ pub async fn handle_cluster_join_registration_request_async_with_host(
         state: response_state,
         kv_snapshot: Some(snapshot),
         responder_node_id: None,
+        raft_anchor,
     })
 }
 
@@ -2534,6 +2598,7 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
         return Ok(ClusterJoinReconciliation {
             accepted_endpoint: None,
             kv_snapshot: None,
+            raft_anchor: None,
         });
     }
     let request = ClusterJoinRegistrationRequest {
@@ -2647,6 +2712,7 @@ pub fn reconcile_cluster_join_with_introducers_with_host(
     Ok(ClusterJoinReconciliation {
         accepted_endpoint: None,
         kv_snapshot: None,
+        raft_anchor: None,
     })
 }
 
@@ -2857,13 +2923,15 @@ pub fn reconcile_accepted_cluster_join_response(
             endpoint,
             responder_node_id.as_ref(),
         );
-        return Ok(Some(apply_accepted_cluster_join_state(
+        let mut reconciliation = apply_accepted_cluster_join_state(
             state,
             invite,
             &endpoint,
             accepted_state,
             Some(snapshot),
-        )));
+        );
+        reconciliation.raft_anchor = response.raft_anchor;
+        return Ok(Some(reconciliation));
     }
 
     if !crate::invite_has_embedded_cluster_identity(invite)
@@ -2920,7 +2988,41 @@ pub fn apply_accepted_cluster_join_state(
     ClusterJoinReconciliation {
         accepted_endpoint: Some(accepted_endpoint),
         kv_snapshot,
+        raft_anchor: None,
     }
+}
+
+/// Persists an accepted join's snapshot as the materialized checkpoint and,
+/// when the authority anchored it at its Raft position, as this node's initial
+/// Raft state, so its first reads already include the admission. Without an
+/// anchor the Raft state starts empty and replication fills it.
+pub fn persist_accepted_cluster_join_snapshot(
+    paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    snapshot: &KvSnapshot,
+    raft_anchor: Option<ClusterJoinRaftAnchor>,
+) -> Result<(), NetworkError> {
+    let kv_paths = crate::ClusterKvPathsExt::kv_paths(paths);
+    sinomo_kv::write_cluster_kv_snapshot_if_changed(&kv_paths, snapshot).map_err(kv_err)?;
+    let Some(anchor) = raft_anchor else {
+        return Ok(());
+    };
+    let installed = kv_paths.raft_store().install_anchored_snapshot(
+        local_node_id,
+        sinomo_kv::RaftSnapshot {
+            last_included_index: anchor.last_included_index,
+            last_included_term: anchor.last_included_term,
+            kv: Arc::new(snapshot.clone()),
+        },
+    );
+    if let Err(error) = installed {
+        // The admission is already committed; replication still catches up.
+        tracing::warn!(
+            %error,
+            "joined node could not start its Raft state at the admission snapshot"
+        );
+    }
+    Ok(())
 }
 
 pub fn join_channel_endpoint_for_accepted_state(

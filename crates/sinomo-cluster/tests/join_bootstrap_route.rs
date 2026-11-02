@@ -108,6 +108,7 @@ impl Fixture {
             state: self.accepted.clone(),
             kv_snapshot: None,
             responder_node_id: Some(self.seed.clone()),
+            raft_anchor: None,
         }
     }
     fn reconcile(

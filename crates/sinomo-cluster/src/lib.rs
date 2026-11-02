@@ -186,7 +186,8 @@ pub use join_registration::{
     accepted_cluster_join_state_from_kv_snapshot, cluster_join_challenge_rpc_request,
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_join_registration_request_with_host, join_channel_endpoint_for_accepted_state,
-    reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
+    persist_accepted_cluster_join_snapshot, reconcile_accepted_cluster_join_response,
+    reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host,
     send_cluster_join_registration_over_membership_rpc,
 };
@@ -276,8 +277,9 @@ pub use member_publish::{
 };
 pub use membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
-    ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
-    ClusterMemberPublishResponse, handle_cluster_membership_rpc_request_with_hosts,
+    ClusterJoinRaftAnchor, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
+    ClusterMemberPublishRequest, ClusterMemberPublishResponse,
+    handle_cluster_membership_rpc_request_with_hosts,
 };
 pub use membership_service::{
     ClusterMembershipServiceFuture, ClusterMembershipServiceHost, HostedClusterMembershipService,

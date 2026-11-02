@@ -5546,9 +5546,13 @@ fn daemon_cluster_control_join_fresh_on_runtime(
         Some(paths),
         &mut host,
     )?;
-    if let Some(snapshot) = reconciliation.kv_snapshot {
-        sinomo_core::kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), &snapshot)
-            .map_err(DaemonError::from)?;
+    if let Some(snapshot) = reconciliation.kv_snapshot.as_ref() {
+        sinomo_core::cluster::persist_accepted_cluster_join_snapshot(
+            paths,
+            &state.local_node_id,
+            snapshot,
+            reconciliation.raft_anchor,
+        )?;
     }
     if sinomo_core::network::cluster_state_needs_join_registration(&state) {
         return Err(DaemonError::ClusterReadOnly {
@@ -11153,6 +11157,7 @@ mod tests {
             state: accepted_state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         };
 
         sinomo_core::cluster::record_forwarded_join_registration_acceptance_with_host(
@@ -11377,6 +11382,7 @@ mod tests {
             state: accepted_state,
             kv_snapshot: None,
             responder_node_id: None,
+            raft_anchor: None,
         };
         let endpoint =
             sinomo_core::network::daemon_lan_endpoint(&voter, "node1:21353".to_string(), 0);

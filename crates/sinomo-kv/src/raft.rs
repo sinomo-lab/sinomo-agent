@@ -1670,6 +1670,35 @@ where
     })
 }
 
+/// Captures the idle resident node's applied state, anchored at its applied
+/// index and that entry's term, as replication would send it to a lagging
+/// peer. `None` means the resident node is cold, invalid, still owned by a
+/// mutation at `deadline`, or cannot name the applied entry's term.
+pub fn read_cluster_kv_raft_anchored_snapshot_before(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+    deadline: Instant,
+) -> Option<Result<RaftSnapshot, KvError>> {
+    let read = with_idle_resident_raft_node_before(paths, node_id, deadline, |node| {
+        let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
+            &paths.root,
+            Some(node.hard_state.current_term),
+            "capture an anchored resident Raft snapshot",
+        )?;
+        let Some(last_included_term) = node.term_at(node.applied_index) else {
+            return Ok(None);
+        };
+        let mut kv = node.store.try_snapshot()?;
+        compact_kv_snapshot_event_history(&mut kv, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
+        Ok(Some(RaftSnapshot {
+            last_included_index: node.applied_index,
+            last_included_term,
+            kv: kv.into(),
+        }))
+    })?;
+    read.map(|read| read.value).transpose()
+}
+
 fn read_index_probe_metadata_from_node(
     node: &ReplicatedKvNode,
 ) -> Result<ClusterKvRaftReadIndexProbeMetadata, KvError> {
@@ -8627,6 +8656,25 @@ impl ClusterKvRaftStore {
             state: state.clone(),
             vote,
         })
+    }
+
+    /// Installs a snapshot a leader anchored at its applied position, under the
+    /// rule for a snapshot carried by AppendEntries: only one past the local
+    /// applied index replaces local state. Returns whether it was installed.
+    ///
+    /// The node is not kept resident, so the process that next owns this Raft
+    /// root, such as a joined daemon's replacement, opens it from disk.
+    pub fn install_anchored_snapshot(
+        &self,
+        node_id: &NodeId,
+        snapshot: RaftSnapshot,
+    ) -> Result<bool, KvError> {
+        let mut node = DurableRaftKvNode::open(node_id.clone(), self.wal_paths(node_id))?;
+        if snapshot.last_included_index <= node.applied_index() {
+            return Ok(false);
+        }
+        node.restore_snapshot(snapshot)?;
+        Ok(true)
     }
 
     pub fn apply_append_entries_with_optional_snapshot(
