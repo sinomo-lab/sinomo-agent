@@ -14,7 +14,8 @@ fn accept_empty_native_repair_policy(
         .unwrap();
     let control = runtime.shared_control_plane().unwrap();
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    for _ in 0..2 {
+    let placement_owner = runtime.root_shard().unwrap().primary_node_id;
+    loop {
         let job = control
             .with_client(|kv| {
                 DfsControlPlaneStore::new(kv.as_mut())
@@ -31,7 +32,9 @@ fn accept_empty_native_repair_policy(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero());
-        let tick = runtime.maintenance_tick(owner, remaining).unwrap();
+        let tick = runtime
+            .maintenance_tick(&placement_owner, remaining)
+            .unwrap();
         assert!(
             tick.outcome.is_ok(),
             "empty native policy job: {:?}",

@@ -230,6 +230,7 @@ metrics = "0.24.6"
 nfs3_server = "0.11.0"
 nfs3_client = "0.9.0"
 pprof = { version = "0.15.0", default-features = false, features = ["framehop-unwinder", "prost-codec"] }
+backtrace = "0.3.76"
 netwatcher = { version = "0.7.1", features = ["tokio"] }
 notify = "8.2.0"
 ulid = "3.0.0"

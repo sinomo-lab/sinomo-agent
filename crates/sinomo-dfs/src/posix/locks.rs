@@ -131,7 +131,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceResult::Rejected {
                     current_primary_node_id: Some(current),
                     ..
-                } if current == self.node_id => {
+                } if current == self.node_id
+                    && !self.transport.delegates_local_namespace_authority() =>
+                {
                     return self.posix_apply_advisory_lock_local(
                         &authority_path,
                         object_id,

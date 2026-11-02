@@ -33077,9 +33077,8 @@ mod tests {
     #[test]
     fn sifs_thumbnail_persists_across_browser_reopen_and_hits_before_source_decode() {
         use sinomo_runtime::dfs::*;
-        let root = sinomo_testdir::TestDir::new("persistent-thumbnail");
-        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
-        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(backend.data_dir.as_ref()).unwrap();
         let path = "/users/photo.png";
         let fixture = ThumbnailBitmap {
             width: 16,
@@ -33117,7 +33116,7 @@ mod tests {
             matches!(&stored, DfsAttachmentResponse::Descriptor { attachment: Some(a) } if a.current)
         );
         drop(browser);
-        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let browser = SifsBrowser::open(backend.data_dir.as_ref()).unwrap();
         assert_eq!(
             load_persistent_sifs_thumbnail(&browser, &request).unwrap(),
             first
@@ -33166,9 +33165,8 @@ mod tests {
     fn dfs_thumbnail_browsing_fetches_and_paints_stored_previews_in_every_view() -> sui::Result<()>
     {
         use sinomo_runtime::dfs::*;
-        let root = sinomo_testdir::TestDir::new("dfs-thumbnail-browsing");
-        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
-        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(backend.data_dir.as_ref()).unwrap();
         // This source cannot be decoded by the app's raster generator. A module
         // has supplied only the 128px attachment, also used in the larger views.
         let path = "/users/report.pdf";
@@ -33221,7 +33219,7 @@ mod tests {
             FilesViewMode::LargeIcons,
             FilesViewMode::Flow,
         ] {
-            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            let shared = Shared::new(AppState::ready(backend.clone()));
             let (tx, rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
             {

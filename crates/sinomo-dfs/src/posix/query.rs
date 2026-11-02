@@ -132,6 +132,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let object = final_object.expect("a normalized absolute path has a final object");
+        if self.transport.delegates_local_namespace_authority() && self.control_plane.is_some() {
+            // Preserve the no-link walk's exact identity and routing cut while
+            // deriving counts through the existing native authority queries.
+            // A private replica aggregate would decode every shard again.
+            return self.with_stat_deadline(|service| {
+                service.with_stat_read_rounds(|service| {
+                    service.stat_object_from_authorities(&object, &path, shard_snapshot.as_deref())
+                })
+            });
+        }
         self.namespace_lstat_object_for_path(&object, &path)
     }
 
@@ -208,14 +218,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_readlink_distributed(&mut self, path: &str) -> Result<String> {
         let _namespace_plan = self.namespace_execution.begin_planning();
-        let path = self.resolve_existing_posix_path_distributed(path, false)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        let (path, object) = if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some()
+        {
+            self.lookup_sifs_path_distributed_synced(path, false)?
+        } else {
+            let path = self.resolve_existing_posix_path_distributed(path, false)?;
+            let object = self.lookup_sifs_path(&path)?;
+            (path, object)
+        };
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
-        let object = self.resolve_hardlink_target(&object)?;
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         if object.kind != DfsObjectKind::Symlink {
             return Err(DfsPosixError::NotSymlink { path });
         }
@@ -319,7 +336,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         shard_snapshot,
                     )?
                     .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                let object = service.resolve_hardlink_target(&object)?;
+                let object =
+                    service.resolve_hardlink_target_distributed(&object, shard_snapshot)?;
                 if object.kind == DfsObjectKind::Tombstone {
                     return Err(DfsPosixError::NotFound { path });
                 }
@@ -392,6 +410,53 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_namespace_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
+        if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some()
+        {
+            return self.with_stat_deadline(|service| {
+                let _namespace_plan = service.namespace_execution.begin_planning();
+                let requested = service.resolve_posix_dot_components_distributed(path)?;
+                service.ensure_distributed_read_path_not_in_cross_shard_flight(
+                    &sifs_file_system_id(),
+                    &requested,
+                )?;
+                let snapshot = service.refresh_sifs_metadata_shards()?;
+                let (path, object) = service.lookup_sifs_path_distributed_synced_from_snapshot(
+                    path,
+                    false,
+                    snapshot.as_deref(),
+                )?;
+                service.ensure_distributed_read_path_not_in_cross_shard_flight(
+                    &sifs_file_system_id(),
+                    &path,
+                )?;
+                let object =
+                    object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                if object.kind == DfsObjectKind::Tombstone {
+                    return Err(DfsPosixError::NotFound { path });
+                }
+                service.with_stat_read_rounds(|service| {
+                    let stat = service.stat_object_from_authorities(
+                        &object,
+                        &path,
+                        snapshot.as_deref(),
+                    )?;
+                    if object.kind == DfsObjectKind::Hardlink {
+                        // Count at the canonical inode, but keep the captured
+                        // dentry identity so namespace callers still see a link.
+                        super::stat::stat_from_projection(
+                            service,
+                            object.clone(),
+                            &path,
+                            stat.link_count,
+                        )
+                    } else {
+                        Ok(stat)
+                    }
+                })
+            });
+        }
         let _namespace_plan = self.namespace_execution.begin_planning();
         let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_distributed_read_path_not_in_cross_shard_flight(
@@ -640,7 +705,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (objects, next_cursor) = crate::metadata_pages::finish_cursor_page(pairs, max_entries);
         let mut entries = Vec::with_capacity(objects.len());
         for object in objects {
-            let target = if project_hardlinks {
+            let target = if project_hardlinks
+                && self.metadata_backend.is_none()
+                && self.transport.delegates_local_namespace_authority()
+                && self.control_plane.is_some()
+            {
+                self.resolve_hardlink_target_distributed(&object, Some(&configs))?
+            } else if project_hardlinks {
                 super::metadata::resolve_hardlink_target_with(&object, |id| {
                     self.current_object_from_authority(&fs, id)
                         .map_err(Into::into)

@@ -3793,6 +3793,170 @@ fn file_history_restore_rejects_wrong_input_before_publishing_a_destination() {
 }
 
 #[test]
+fn file_history_backendless_same_primary_restore_and_resume_use_main_job() {
+    let node = NodeId::from_legacy_named("backendless-history-primary").unwrap();
+    let (runtime, mut writer) = native_history_core_service(
+        "file_history_backendless_same_primary_restore_and_resume_use_main_job",
+        node.clone(),
+    );
+    let options = DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+    let source = writer
+        .posix_write_file(
+            "/services/backendless-history-source",
+            b"saved native history",
+            options.clone(),
+        )
+        .unwrap();
+    capture_history(&mut writer, &source);
+    writer
+        .posix_write_file(&source.path, b"later native bytes", options.clone())
+        .unwrap();
+    let destination = writer
+        .posix_write_file(
+            "/services/backendless-history-destination",
+            b"before",
+            options.clone(),
+        )
+        .unwrap();
+    drop(writer);
+
+    let (sync, asynchronous) = runtime.peer_transports(&node).unwrap();
+    let transport = sinomo_dfs::DfsNodeTransport::with_peer_transports_for_nodes(
+        node.clone(),
+        vec![node.clone()],
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        sync,
+        asynchronous,
+    )
+    .with_registered_main_namespace_dispatch();
+    let mut client = NetworkedDfsService::new(
+        transport,
+        sinomo_dfs::LocalContentStore::new(runtime.data_dir(&node).dfs_dir().join("content"))
+            .unwrap(),
+    )
+    .with_boxed_control_plane(runtime.control_plane_client().unwrap());
+    client.bootstrap_distributed_sifs().unwrap();
+    assert!(client.metadata_backend().is_none());
+    let list = DfsFileHistoryListRequest {
+        file_system_id: source.file_system_id.clone(),
+        path: Some(source.path.clone()),
+        object_id: Some(source.object_id.clone()),
+        after: None,
+        limit: 128,
+    };
+    let page = next_history_entries_page(&mut client, list.clone()).unwrap();
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.identity == history_identity(&source))
+    );
+    let history_read = DfsFileHistoryReadRequest {
+        identity: history_identity(&source),
+        offset: 0,
+        max_bytes: 64,
+    };
+    assert!(
+        matches!(client.read_file_history(history_read.clone()).unwrap(),
+        DfsFileHistoryReadOutcome::Found { data } if data.bytes == b"saved native history")
+    );
+
+    let request = DfsFileHistoryRestoreRequest {
+        source: history_identity(&source),
+        destination_path: destination.path.clone(),
+        expected_destination: Some(history_identity(&destination)),
+        operation_id: "backendless-same-primary-restore".into(),
+    };
+    let captured = runtime.capture_namespace_requests(&node, 32).unwrap();
+    let response = client
+        .restore_file_history(request.clone(), options.clone())
+        .unwrap();
+    assert!(client.metadata_backend().is_none());
+    let job_id = core_test::content_copy_job_id(&node, &request.operation_id);
+    let author = runtime.metadata_primary_service(&destination.path).unwrap();
+    assert_eq!(author.node_id(), &node);
+    let before = author
+        .metadata_backend()
+        .unwrap()
+        .get_namespace_job(&job_id)
+        .unwrap()
+        .unwrap();
+    let before_state = core_test::content_copy_job_state(&before).unwrap();
+    assert_eq!(before_state.request, request);
+    assert_eq!(before_state.requester_node_id, node);
+    assert_eq!(before_state.planned, response.committed);
+    let original_origin = before.origin.clone();
+    let original_source = before_state.source_reference.clone();
+    let original_release = before_state.source_release.clone();
+    drop(author);
+
+    let complete = client
+        .posix_resume_namespace_job_bounded(&job_id, 4)
+        .unwrap();
+    assert_eq!(complete.job_id, job_id);
+    assert_eq!(complete.origin, original_origin);
+    assert_eq!(complete.status, DfsNamespaceJobStatus::Completed);
+    let complete_state = core_test::content_copy_job_state(&complete).unwrap();
+    assert_eq!(complete_state.request, request);
+    assert_eq!(complete_state.requester_node_id, node);
+    assert_eq!(complete_state.source_reference, original_source);
+    assert_eq!(complete_state.source_release, original_release);
+    assert!(complete_state.cleanup_complete);
+    assert_eq!(
+        client
+            .restore_file_history(request.clone(), options)
+            .unwrap(),
+        response
+    );
+    let heads = captured.records();
+    let begins = heads.iter().enumerate().filter_map(|(index, frame)| {
+        let sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command) = &frame.message else { return None };
+        matches!(&command.operation, sinomo_dfs::DfsNamespaceOperation::BeginContentCopy { request: actual, .. }
+            if actual == &request).then_some(index)
+    }).collect::<Vec<_>>();
+    assert_eq!(
+        begins.len(),
+        1,
+        "same-operation replay must not issue another begin"
+    );
+    assert!(heads[begins[0] + 1..].iter().any(|frame| {
+        let sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command) = &frame.message else { return false };
+        frame.source_node_id == node && frame.target_node_id == node
+            && matches!(&command.operation, sinomo_dfs::DfsNamespaceOperation::MetadataQuery { query }
+                if matches!(&query.selection, sinomo_dfs::DfsMetadataSelection::NamespaceJob { job_id: actual }
+                    if actual == &job_id))
+    }), "the backendless requester must discover the actual Main job after begin");
+    drop(captured);
+    assert_eq!(
+        client
+            .posix_read_file_distributed(&destination.path)
+            .unwrap(),
+        b"saved native history"
+    );
+    assert!(matches!(client.read_file_history(history_read).unwrap(),
+        DfsFileHistoryReadOutcome::Found { data } if data.bytes == b"saved native history"));
+    assert!(
+        next_history_entries_page(&mut client, list)
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.identity == history_identity(&source))
+    );
+    assert!(client.metadata_backend().is_none());
+    let author = runtime.metadata_primary_service(&destination.path).unwrap();
+    assert_eq!(
+        author
+            .metadata_backend()
+            .unwrap()
+            .get_namespace_job(&job_id)
+            .unwrap(),
+        Some(complete)
+    );
+    drop(author);
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn file_history_restore_runs_on_the_primary_with_the_original_requester_identity() {
     let (mut runtime, owner, requester, mut primary, mut client) = native_history_remote_services(
         "file_history_restore_runs_on_the_primary_with_the_original_requester_identity",

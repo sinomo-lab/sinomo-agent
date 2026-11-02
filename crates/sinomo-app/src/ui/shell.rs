@@ -2372,16 +2372,12 @@ mod tests {
 
     #[test]
     fn already_ready_shell_starts_chat_history_load() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-app-ready-shell-history-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let data_dir = SinomoDataDir::new(&root);
+        let backend = Backend::local_fallback();
         let channel_id = "01hxy6qa9k0t9vr4g9n8d3q6a0"
             .parse::<SessionId>()
             .expect("session id");
-        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let store =
+            SifsAgentChannelStore::open(backend.data_dir.as_ref()).expect("open channel store");
         let mut channel = AgentChannel::new(channel_id.clone(), "Ready shell history");
         let message = channel.append_user_message(
             AGENT_CHANNEL_APP_USER_ID,
@@ -2393,9 +2389,9 @@ mod tests {
             .append_message(&channel.channel_id, &message)
             .expect("append backend message");
         store.save_channel(&channel).expect("save backend chat");
+        drop(store);
         let session_id = channel_id.to_string();
 
-        let backend = Backend::local_fallback_for_data_dir(data_dir);
         let state = AppState::ready(backend);
         let shared = Shared::new(state);
         shared.chat_mut().sessions.clear();
@@ -2422,8 +2418,6 @@ mod tests {
                 .any(|session| session.id == session_id && session.title == "Ready shell history"),
             "already-ready shells should kick the chat history loader"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

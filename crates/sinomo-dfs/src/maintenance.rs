@@ -590,8 +590,6 @@ pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
     })
 }
 
-#[cfg(test)]
-use crate::DfsMetadataBackend;
 use crate::{
     AsyncDfsMessageTransport, AsyncDfsMetadataJournalReplicationTransport,
     AsyncDfsMetadataNodeTransport, AsyncDfsPeerTransport, ContentStoreGcOptions,

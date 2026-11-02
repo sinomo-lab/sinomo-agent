@@ -2807,7 +2807,6 @@ fn original_filesystem_preparation_for_request(
 #[cfg(test)]
 mod filesystem_preparation_recovery_tests {
     use super::*;
-    use crate::DfsMetadataBackend;
 
     #[test]
     fn native_placement_intent_retry_recovers_the_original_prepared_body() {

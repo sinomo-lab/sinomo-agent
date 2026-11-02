@@ -13,8 +13,6 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
-#[cfg(test)]
-use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsNamespaceObjectPrecondition, DfsNamespaceOperation,

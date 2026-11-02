@@ -5338,8 +5338,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        DfsFileSystem, DfsMetadataBackend, LocalContentStore, SharedDfsControlPlaneKvClient,
-        sifs_file_system_id,
+        DfsFileSystem, LocalContentStore, SharedDfsControlPlaneKvClient, sifs_file_system_id,
     };
     use sinomo_core::kv::InProcessKvStore;
 

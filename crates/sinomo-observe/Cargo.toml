@@ -13,7 +13,7 @@ ring = "r1"
 
 [features]
 default = []
-cpu-profiler = ["dep:pprof"]
+cpu-profiler = ["dep:backtrace", "dep:pprof"]
 
 [dependencies]
 fs2.workspace = true
@@ -34,6 +34,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+backtrace = { workspace = true, optional = true }
 pprof = { workspace = true, optional = true }
 
 [dev-dependencies]

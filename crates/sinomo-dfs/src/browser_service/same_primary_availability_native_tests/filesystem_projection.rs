@@ -409,11 +409,9 @@ fn explicit_filesystem_producer_still_publishes_the_exact_requested_definition()
         2,
         3,
     ));
-    let outcome = fixture.backend.with_mutation_service(|service| {
-        service
-            .add_file_system(desired.clone())
-            .map_err(dfs_browser_service_error)
-    });
+    let mut owner = fixture.native.metadata_primary_service(PARENT).unwrap();
+    let outcome = owner.add_file_system(desired.clone());
+    drop(owner);
     let after = fixture.cut();
     fixture.checkpoint("filesystem-explicit-result",serde_json::json!({"before":before,"desired":desired,"after":after,"outcome":format!("{outcome:?}")}));
     outcome.unwrap();
@@ -455,14 +453,9 @@ fn recorded_original_after_configuration_update_and_restart_does_not_replan_file
         2,
         3,
     ));
-    fixture
-        .backend
-        .with_mutation_service(|service| {
-            service
-                .add_file_system(desired.clone())
-                .map_err(dfs_browser_service_error)
-        })
-        .unwrap();
+    let mut owner = fixture.native.metadata_primary_service(PARENT).unwrap();
+    owner.add_file_system(desired.clone()).unwrap();
+    drop(owner);
     let before_restart = fixture.cut();
     assert_eq!(fixture.fs(), desired);
     drop(fixture.backend);

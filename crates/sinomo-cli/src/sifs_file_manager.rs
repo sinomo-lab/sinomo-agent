@@ -12,9 +12,9 @@ use sinomo_runtime::dfs::DfsPosixCreateAttrs;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError, DfsFileSystemConfig,
-    DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement, DfsNodeTransport,
-    DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView, DfsOperatorStatus,
-    DfsPeerTransport, DfsPeerTransportError, DfsPinAddRequest, DfsPinMode,
+    DfsMessageTransport, DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement,
+    DfsNodeTransport, DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView,
+    DfsOperatorStatus, DfsPeerTransport, DfsPeerTransportError, DfsPinAddRequest, DfsPinMode,
     DfsPlacementBlockingDiagnostic, DfsPlacementImpact, DfsPlacementNodePreview,
     DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
     DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
@@ -499,6 +499,19 @@ impl SifsFileManagerObservation {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
+        #[cfg(all(feature = "dfs-test-support", not(test)))]
+        if let Some(opened) =
+            sinomo_runtime::vfs::native_test_support::open_registered(data_dir, None)
+        {
+            let opened = opened.map_err(|error| error.to_string())?;
+            let backend = Self::from_service(data_dir, rpc_runtime, opened.service, true, None)?;
+            // The registered native service already carries its authoritative
+            // control-plane client; retain that same owner for mutations.
+            backend
+                .local_catalog_authoritative
+                .store(true, Ordering::Release);
+            return Ok(backend);
+        }
         if let Some(backend) = Self::open_resident(data_dir, rpc_runtime.clone(), true, None)? {
             return Ok(backend);
         }
@@ -3425,6 +3438,7 @@ fn open_sifs_service_with_catalog_until(
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
     // The caller uses Main's normal typed call/result and attachment contract.
     let transport = sifs_main_caller_transport(data_dir, local_node_id.clone(), peer_node_ids)?;
+    let registered_main_namespace_dispatch = transport.delegates_local_namespace_authority();
     let mut service = NetworkedDfsService::new(transport, content);
     let metadata_shards = if let Some((client, shards)) = authoritative_catalog {
         service = service.with_control_plane(client);
@@ -3437,10 +3451,17 @@ fn open_sifs_service_with_catalog_until(
         read_sifs_metadata_shard_configs(&cluster_paths)?
     };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let service = if let Some(metadata) =
-        open_sifs_sharded_metadata_backend(data_dir, metadata_shards, &local_node_id)?
-    {
-        if hydrate_metadata {
+    let service = if let Some(metadata) = open_sifs_sharded_metadata_backend(
+        data_dir,
+        metadata_shards,
+        &local_node_id,
+        registered_main_namespace_dispatch,
+    )? {
+        if registered_main_namespace_dispatch {
+            service
+                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
+                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
+        } else if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
@@ -3455,7 +3476,11 @@ fn open_sifs_service_with_catalog_until(
             default_dfs_metadata_root(data_dir),
         )
         .map_err(|error| format!("cannot inspect local SIFS metadata: {error}"))?;
-        if hydrate_metadata {
+        if registered_main_namespace_dispatch {
+            service
+                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
+                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
+        } else if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
@@ -5076,17 +5101,28 @@ fn open_sifs_sharded_metadata_backend(
     data_dir: &SinomoDataDir,
     shards: Vec<DfsMetadataShardConfig>,
     local_node_id: &NodeId,
+    registered_main_namespace_dispatch: bool,
 ) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, String> {
     if shards.is_empty() {
         return Ok(None);
     }
-    sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
-        default_dfs_metadata_shards_root(data_dir),
-        shards,
-        local_node_id,
-    )
-    .map(Some)
-    .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
+    let metadata_root = default_dfs_metadata_shards_root(data_dir);
+    let backend = if registered_main_namespace_dispatch {
+        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node_deferred(
+            metadata_root,
+            shards,
+            local_node_id,
+        )
+    } else {
+        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
+            metadata_root,
+            shards,
+            local_node_id,
+        )
+    };
+    backend
+        .map(Some)
+        .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
 }
 
 fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> Vec<NodeId> {
@@ -9526,7 +9562,6 @@ mod tests {
             } else {
                 "cli-real-w2-create"
             });
-            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
             let path = "/services/needs-two-receipts";
             let (configured, targets) = fixture.with_native(|native, _| {
                 let state =
@@ -9578,6 +9613,40 @@ mod tests {
                     .unwrap();
                 (job.accepted_config, targets)
             });
+            fixture.with_native(|native, _| {
+                let projection = native
+                    .control_plane_client()
+                    .unwrap()
+                    .write_configuration_projection()
+                    .unwrap()
+                    .expect("actual primary write configuration");
+                let key = sinomo_runtime::dfs::file_system_config_key(&sifs_file_system_id());
+                let entry = projection
+                    .entries(&key)
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .expect("actual accepted filesystem configuration");
+                let actual: DfsFileSystemConfig =
+                    sinomo_runtime::kv::decode_kv_value(&entry.value).unwrap();
+                assert_eq!(actual.file_system_id, configured.file_system_id);
+                assert_eq!(actual.owner_node_id, configured.owner_node_id);
+                let accepted_policy = configured
+                    .subtree_policies
+                    .iter()
+                    .find(|rule| rule.path_prefix == path)
+                    .expect("accepted policy for the tested path");
+                assert_eq!(
+                    actual
+                        .subtree_policies
+                        .iter()
+                        .filter(|rule| rule.path_prefix == path)
+                        .collect::<Vec<_>>(),
+                    vec![accepted_policy],
+                    "seed must use the exact committed managed policy for {path}"
+                );
+            });
+            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
             // Read actual ordinary options before faulting any carrier; never
             // force supplied candidates/options as an authority substitute.
             let options = backend

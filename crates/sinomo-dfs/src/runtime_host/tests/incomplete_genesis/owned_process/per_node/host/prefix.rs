@@ -310,7 +310,6 @@ pub(super) fn probe(
     source: &NodeId,
     cluster: &sinomo_core::Id,
     peers: &BTreeSet<NodeId>,
-    contacts: &OwnedContacts,
 ) -> Result<ProbeReply, NetworkError> {
     if request.target != *source {
         return Err(refuse(
@@ -324,20 +323,17 @@ pub(super) fn probe(
     }
     let data = SinomoDataDir::new(root);
     let selected = select(&data, source, cluster, peers, deadline)?;
-    let hints = request.prefix_contact_hints.as_ref()
-        .ok_or_else(|| refuse("native PREFIX lacks observed owned route hints"))?;
-    let mut expected_contacts = contacts.clone();
-    if matches!(request.kind, ProbeKind::PrefixRoundWrongKey) {
-        // Negative fixture input only: use another ACTUAL held member's public
-        // key as the wrong expected key. No membership or authority is changed.
-        let peer = selected.target.replica_node_ids.first().ok_or_else(|| refuse("key control lacks peer"))?;
-        let wrong_key = contacts.get(source).ok_or_else(|| refuse("key control lacks source"))?.1.clone();
-        if expected_contacts[peer].1 == wrong_key { return Err(refuse("key control has no distinct key")); }
-        expected_contacts.get_mut(peer).unwrap().1 = wrong_key;
-    }
-    let mut transport = crate::runtime_host::data_plane::daemon_dfs_native_prefix_contact_scoped_transport_for_test(
-        source.clone(), selected.target.replica_node_ids.clone(), &data, runtime, expected_contacts, hints.clone(),
-    ).map_err(refuse)?;
+    let host = crate::runtime_host::registered_dfs_runtime_host(&data)
+        .map_err(refuse)?
+        .ok_or_else(|| refuse("actual registered native host is unavailable"))?;
+    // The registered host's normal transport: peers are reached by node.
+    let mut transport = crate::runtime_host::data_plane::daemon_dfs_client_node_transport(
+        source.clone(),
+        selected.target.replica_node_ids.clone(),
+        host,
+        &data,
+        runtime,
+    );
     check_deadline(deadline)?;
     transport.set_operation_deadline(Some(deadline));
     // Synchronous owned bridge: the actual registered adapter owns its

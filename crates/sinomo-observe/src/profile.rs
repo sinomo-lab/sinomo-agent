@@ -422,12 +422,16 @@ fn run_cpu_profile_capture(
     let guard = pprof::ProfilerGuardBuilder::default()
         .frequency(config.frequency_hz as i32)
         .blocklist(CPU_PROFILE_EXCLUDED_LIBRARIES)
-        .build()
-        .map_err(|source| ObserveError::Runtime {
-            detail: format!("failed to start CPU profiler: {source}"),
-        })?;
+        .build();
+    let deadline = Instant::now() + Duration::from_secs(config.duration_seconds);
+    // pprof warms up a resolved backtrace before starting its timer. Sampling
+    // uses raw framehop addresses, so it need not retain that DWARF/image cache.
+    backtrace::clear_symbol_cache();
+    let guard = guard.map_err(|source| ObserveError::Runtime {
+        detail: format!("failed to start CPU profiler: {source}"),
+    })?;
     mark_profile_running(generation)?;
-    wait_for_capture_expiry(generation, Duration::from_secs(config.duration_seconds))?;
+    wait_for_capture_expiry(generation, deadline)?;
     let unresolved = stop_cpu_profile_sampling(guard)?;
     mark_profile_finalizing(generation)?;
 
@@ -438,6 +442,9 @@ fn run_cpu_profile_capture(
     for (frames, count) in unresolved.data {
         *report.data.entry(pprof::Frames::from(frames)).or_default() += count;
     }
+    // Frames own their resolved names and locations. Release symbolization's
+    // image mappings and DWARF data before encoding, including later failures.
+    backtrace::clear_symbol_cache();
     let profile = report.pprof().map_err(|source| ObserveError::Runtime {
         detail: format!("failed to encode CPU profile report: {source}"),
     })?;
@@ -545,9 +552,8 @@ fn mark_profile_running(generation: u64) -> Result<(), ObserveError> {
     Ok(())
 }
 
-fn wait_for_capture_expiry(generation: u64, duration: Duration) -> Result<(), ObserveError> {
+fn wait_for_capture_expiry(generation: u64, deadline: Instant) -> Result<(), ObserveError> {
     let manager = cpu_profile_manager();
-    let deadline = Instant::now() + duration;
     let mut inner = manager.lock()?;
     loop {
         ensure_generation(&inner, generation)?;
@@ -790,6 +796,29 @@ mod tests {
         assert_eq!(
             manifest["sampling_excluded_libraries"],
             serde_json::json!(CPU_PROFILE_EXCLUDED_LIBRARIES)
+        );
+        use pprof::protos::Message;
+        let bytes = fs::read(
+            root.join(OBSERVE_CPU_PROFILE_ARTIFACT_ROOT)
+                .join("allocation-stress")
+                .join(CPU_PROFILE_FILE_NAME),
+        )
+        .unwrap();
+        let profile = pprof::protos::Profile::decode(bytes.as_slice()).unwrap();
+        assert!(
+            profile
+                .sample
+                .iter()
+                .any(|sample| { sample.value.first().is_some_and(|count| *count > 0) })
+        );
+        assert!(
+            profile.function.iter().any(|function| {
+                usize::try_from(function.name)
+                    .ok()
+                    .and_then(|index| profile.string_table.get(index))
+                    .is_some_and(|name| name.contains("cpu_profile_allocation_stress"))
+            }),
+            "profile must retain resolved application symbols after releasing the cache"
         );
     }
 

@@ -131,6 +131,17 @@ impl SifsNfsFileSystem {
             None => SinomoDataDir::from_env_or_home()
                 .map_err(|source| DfsNfsError::Dfs(source.to_string()))?,
         };
+        #[cfg(test)]
+        if let Some(opened) = sinomo_vfs_sifs::test_support::open_registered(&data_dir, None) {
+            // Adapter tests borrow the real component owner in this process;
+            // the external daemon handoff remains a separate host boundary.
+            let mut opened = opened.map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
+            let root_stat = opened
+                .service
+                .posix_lstat_distributed(&root_path)
+                .map_err(|source| DfsNfsError::Dfs(source.to_string()))?;
+            return Self::from_opened(opened, root_stat, root_path, read_only, None);
+        }
         let clustered = sinomo_core::network::ClusterPaths::new(&data_dir)
             .state
             .exists();
@@ -174,6 +185,16 @@ impl SifsNfsFileSystem {
             open_service()?
         };
         let (opened, root_stat) = opened;
+        Self::from_opened(opened, root_stat, root_path, read_only, handoff)
+    }
+
+    fn from_opened(
+        opened: dfs::OpenedMountedSifsService,
+        root_stat: DfsStat,
+        root_path: String,
+        read_only: bool,
+        handoff: Option<Arc<NfsMountedMutationHandoff>>,
+    ) -> Result<Self> {
         let dfs::OpenedMountedSifsService {
             service,
             replica_candidates,
@@ -959,9 +980,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nfs_adapter_roundtrips_without_a_projection_tree() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-nfs-roundtrip");
+        let owner =
+            sinomo_vfs_sifs::test_support::NativeMountedOwner::start("sinomo-dfs-nfs-roundtrip")
+                .expect("start native SIFS owner");
         let filesystem =
-            SifsNfsFileSystem::open(Some(root.path().to_path_buf()), "/".to_string(), false)
+            SifsNfsFileSystem::open(Some(owner.data_dir().root()), "/".to_string(), false)
                 .expect("open NFS adapter");
         let root_handle = filesystem.root_dir();
         let attrs = sattr3 {
@@ -1023,8 +1046,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn object_handles_are_self_contained_and_cannot_escape_export_root() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-nfs-handle-boundary");
-        let mut bootstrap = dfs::open_mounted_sifs_service(Some(root.path().to_path_buf()))
+        let owner = sinomo_vfs_sifs::test_support::NativeMountedOwner::start(
+            "sinomo-dfs-nfs-handle-boundary",
+        )
+        .expect("start native SIFS owner");
+        let mut bootstrap = sinomo_vfs_sifs::test_support::open_registered(owner.data_dir(), None)
+            .expect("registered native SIFS owner")
             .expect("open bootstrap service")
             .service;
         bootstrap
@@ -1041,12 +1068,9 @@ mod tests {
             .expect("create outside directory");
         drop(bootstrap);
 
-        let filesystem = SifsNfsFileSystem::open(
-            Some(root.path().to_path_buf()),
-            "/export".to_string(),
-            false,
-        )
-        .expect("open bounded export");
+        let filesystem =
+            SifsNfsFileSystem::open(Some(owner.data_dir().root()), "/export".to_string(), false)
+                .expect("open bounded export");
         let root_handle = filesystem.root_dir();
         let (file, _) = filesystem
             .create(&root_handle, &filename("inside.txt"), sattr3::default())
@@ -1070,9 +1094,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_only_and_exclusive_create_capabilities_fail_closed() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-nfs-capabilities");
+        let owner =
+            sinomo_vfs_sifs::test_support::NativeMountedOwner::start("sinomo-dfs-nfs-capabilities")
+                .expect("start native SIFS owner");
         let writable =
-            SifsNfsFileSystem::open(Some(root.path().to_path_buf()), "/".to_string(), false)
+            SifsNfsFileSystem::open(Some(owner.data_dir().root()), "/".to_string(), false)
                 .expect("open writable adapter");
         assert!(matches!(
             writable
@@ -1087,7 +1113,7 @@ mod tests {
         drop(writable);
 
         let read_only =
-            SifsNfsFileSystem::open(Some(root.path().to_path_buf()), "/".to_string(), true)
+            SifsNfsFileSystem::open(Some(owner.data_dir().root()), "/".to_string(), true)
                 .expect("open read-only adapter");
         assert_eq!(read_only.capabilities(), VFSCapabilities::ReadOnly);
         assert!(matches!(

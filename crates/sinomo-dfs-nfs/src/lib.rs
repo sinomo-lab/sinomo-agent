@@ -223,9 +223,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn server_speaks_mount_and_nfs_over_tcp() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-nfs-wire");
+        let owner = sinomo_vfs_sifs::test_support::NativeMountedOwner::start("sinomo-dfs-nfs-wire")
+            .expect("start native SIFS owner");
         let server = DfsNfsServer::bind(DfsNfsServerOptions {
-            data_dir: Some(root.path().to_path_buf()),
+            data_dir: Some(owner.data_dir().root()),
             bind: "127.0.0.1:0".to_string(),
             export_name: "wire-test".to_string(),
             root_path: "/".to_string(),

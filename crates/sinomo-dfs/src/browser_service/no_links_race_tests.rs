@@ -460,3 +460,294 @@ fn no_links_remote_parent_linked_after_validation_conflicts_without_outside_effe
 fn no_links_remote_cas_changed_after_open_conflicts_without_overwrite() {
     run_native_race("native-no-links-cas-dispatch-race", Race::ConcurrentCas);
 }
+
+#[test]
+fn no_links_same_main_committed_reply_does_not_follow_a_replacement_symlink() {
+    use crate::DaemonDfsBrowserNoLinksOperation as O;
+    use crate::DaemonDfsBrowserNoLinksResponse as R;
+    const RETIRED: &str = "/no-links-race/parent/committed.md";
+    const OTHER: &str = "/postcommit-outside.md";
+    const OTHER_BYTES: &[u8] = b"outside-root content must never become the original receipt";
+    let (native, nodes) = native_browser_runtime("native-no-links-postcommit-symlink", 1);
+    let primary = native
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "root")
+        .unwrap()
+        .primary_node_id;
+    native_browser_policy(
+        &native.shared_control_plane().unwrap(),
+        ROOT,
+        crate::DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 1, 1)
+            .unwrap(),
+    );
+    let data = Arc::new(native.data_dir(&primary).clone());
+    let backend =
+        DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &native.runtime_handle())
+            .unwrap();
+    let host = dfs_browser_component_host(&data).unwrap();
+    native.runtime_handle().block_on(async {
+        tokio::time::timeout(
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            host.ensure_write_configuration_ready(&data, &native.runtime_handle()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    backend
+        .no_links(crate::DaemonDfsBrowserNoLinksRequest {
+            expected_cluster_id: None,
+            root: "/".into(),
+            path: PARENT.into(),
+            operation: O::CreateDirAll,
+        })
+        .unwrap();
+    let outside_reply = backend
+        .no_links(crate::DaemonDfsBrowserNoLinksRequest {
+            expected_cluster_id: None,
+            root: "/".into(),
+            path: OTHER.into(),
+            operation: O::CreateNew {
+                bytes: OTHER_BYTES.to_vec(),
+            },
+        })
+        .unwrap();
+    let R::Metadata { metadata: other } = outside_reply else {
+        panic!("outside setup: {outside_reply:?}")
+    };
+    let gate = Arc::new(Semaphore::new(0));
+    native.install_fault(FaultRule {
+        source: Some(primary.clone()),
+        target: Some(primary.clone()),
+        route: Some(crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE.into()),
+        call_id: None,
+        origin: Some(RpcOrigin::RegisteredHost),
+        remaining_hits: 1,
+        action: FaultAction::PauseAfterDispatch(Arc::clone(&gate)),
+    });
+    let capture = native.capture_served_work(&primary, 32).unwrap();
+    let start = native.rpc_observations().len();
+    let started = Instant::now();
+    let deadline = started + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    backend
+        .lock_service()
+        .unwrap()
+        .set_transport_operation_deadline(Some(deadline));
+    let worker_backend = Arc::clone(&backend);
+    let selected = |event: &crate::test_runtime::RpcObservation| {
+        event.source == primary
+            && event.target == primary
+            && event.route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+            && event.origin == RpcOrigin::RegisteredHost
+    };
+    let (preparation, result, completed_at) = std::thread::scope(|scope| {
+        let _cleanup = DispatchGateCleanup(Arc::clone(&gate));
+        let gate_owner_baseline = Arc::strong_count(&gate);
+        let (send, receive) = mpsc::channel();
+        let worker = scope.spawn(move || {
+            let result = worker_backend.no_links(request(O::CreateNew {
+                bytes: ORIGINAL.to_vec(),
+            }));
+            let _ = send.send((Instant::now(), result));
+        });
+        let preparation = (|| -> Result<_, String> {
+            let call_id = loop {
+                if let Some(call) = native
+                    .rpc_observations()
+                    .iter()
+                    .skip(start)
+                    .find(|event| selected(event) && event.phase == RpcPhase::AfterDispatch)
+                {
+                    break call.call_id;
+                }
+                if Instant::now() >= deadline {
+                    return Err("original never completed native dispatch".into());
+                }
+                std::thread::yield_now();
+            };
+            native.assert_fault_budgets()?;
+            assert!(
+                Arc::strong_count(&gate) > gate_owner_baseline,
+                "the actual carrier must retain its selected response gate"
+            );
+            assert!(
+                matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "the real completed response must remain held"
+            );
+            assert!(
+                !native
+                    .rpc_observations()
+                    .iter()
+                    .skip(start)
+                    .any(|event| selected(event)
+                        && event.call_id == call_id
+                        && event.phase == RpcPhase::Completed)
+            );
+            let mut owner = native
+                .metadata_primary_service(CHILD)
+                .map_err(|e| e.to_string())?;
+            owner.set_transport_operation_deadline(Some(deadline));
+            let original = owner
+                .posix_namespace_lstat_distributed(CHILD)
+                .map_err(|e| e.to_string())?;
+            assert_eq!(original.content_hash, Some(crate::content_hash(ORIGINAL)));
+            let intents = owner
+                .metadata_backend()
+                .unwrap()
+                .intents_for_object(&original.object_id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|intent| {
+                    intent.status == DfsWriteIntentStatus::Committed
+                        && intent.target_version == original.version
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                intents.len(),
+                1,
+                "genuine committed original before the competing effect"
+            );
+            assert_eq!(
+                (
+                    intents[0].policy.min_commit_replicas,
+                    intents[0].policy.desired_replicas
+                ),
+                (1, 1)
+            );
+            let prepared = owner
+                .metadata_backend()
+                .unwrap()
+                .prepared_operation_record(&format!("write:{}", intents[0].intent_id))
+                .map_err(|e| e.to_string())?
+                .ok_or("committed original omitted its native body")?;
+            prepared.validate().map_err(|e| e.to_string())?;
+            assert_eq!(prepared.status, DfsPreparedOperationStatus::Committed);
+            owner
+                .posix_rename(CHILD, RETIRED)
+                .map_err(|e| e.to_string())?;
+            let retired = owner
+                .posix_namespace_lstat_distributed(RETIRED)
+                .map_err(|e| e.to_string())?;
+            owner
+                .posix_symlink(
+                    OTHER,
+                    CHILD,
+                    crate::DfsWriteOptions::replicated_eventual(nodes.clone()),
+                )
+                .map_err(|e| e.to_string())?;
+            let link = owner
+                .posix_namespace_lstat_distributed(CHILD)
+                .map_err(|e| e.to_string())?;
+            assert_eq!(link.kind, DfsObjectKind::Symlink);
+            assert_ne!(link.object_id, original.object_id);
+            assert_eq!(
+                owner
+                    .posix_read_file_distributed(OTHER)
+                    .map_err(|e| e.to_string())?,
+                OTHER_BYTES
+            );
+            assert!(
+                Instant::now() < deadline,
+                "competing native effects retain the original five-second budget"
+            );
+            assert!(
+                !native
+                    .rpc_observations()
+                    .iter()
+                    .skip(start)
+                    .any(|event| selected(event)
+                        && event.call_id == call_id
+                        && event.phase == RpcPhase::Completed),
+                "the original reply stays held through both genuine competing effects"
+            );
+            Ok((call_id, original, prepared, retired, link))
+        })();
+        gate.add_permits(1);
+        let (completed_at, result) = match receive
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                gate.close();
+                if let Err(panic) = worker.join() {
+                    std::panic::resume_unwind(panic);
+                }
+                panic!("original bounded caller failed to return: {error}; setup={preparation:?}");
+            }
+        };
+        if let Err(panic) = worker.join() {
+            std::panic::resume_unwind(panic);
+        }
+        (preparation, result, completed_at)
+    });
+    native.clear_faults();
+    let (call_id, original, prepared, retired, link) =
+        preparation.expect("actual committed original and replacement symlink");
+    let calls = native
+        .rpc_observations()
+        .into_iter()
+        .skip(start)
+        .filter(selected)
+        .collect::<Vec<_>>();
+    let reports = capture.records();
+    drop(capture);
+    let original_reports = reports.iter().filter(|work| {
+        work.succeeded && matches!(&work.command.routed_message.message,
+            DfsNetworkMessage::ExclusiveCreateRequest(command)
+                if command.request.object_id == original.object_id && command.request.target_version == original.version)
+    }).collect::<Vec<_>>();
+    let facts = serde_json::json!({"original":format!("{original:?}"),"prepared":prepared,"retired":format!("{retired:?}"),"replacement_link":format!("{link:?}"),
+        "outside":other,"result":format!("{result:?}"),"calls":format!("{calls:?}"),
+        "original_work":original_reports.iter().map(|work| &work.command).collect::<Vec<_>>(),
+        "elapsed_us":completed_at.saturating_duration_since(started).as_micros(),
+        "qualification":"actual committed Main reply held by existing carrier gate; no replay, synthetic reply or authority; source-only helper author made no runtime claim"});
+    let export = std::fs::write(
+        data.root().join("no-links-postcommit-symlink.json"),
+        serde_json::to_vec_pretty(&facts).unwrap(),
+    );
+    if let Err(error) = &export {
+        eprintln!("postcommit race evidence export failed: {error}");
+    }
+    assert_eq!(original_reports.len(), 1);
+    let frame = &original_reports[0].command.routed_message;
+    let DfsNetworkMessage::ExclusiveCreateRequest(command) = &frame.message else {
+        unreachable!("the successful original report was matched above")
+    };
+    assert!(calls.iter().any(|call| {
+        call.call_id == call_id
+            && call.phase == RpcPhase::Decoded
+            && call.dfs_frame_id == Some(frame.frame_id)
+            && call.dfs_request_id.as_ref() == Some(&command.request_id)
+    }));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.phase == RpcPhase::BeforeDispatch)
+            .count(),
+        1,
+        "a postcommit observation must not reauthor the original"
+    );
+    assert!(calls.iter().any(|call| call.call_id == call_id
+        && call.phase == RpcPhase::Completed
+        && call.outcome_error.is_none()));
+    assert!(completed_at < deadline);
+    let R::Metadata { metadata } = result.unwrap() else {
+        panic!("committed original must retain its current object receipt: {facts}")
+    };
+    assert_eq!(metadata.object_id, original.object_id.as_str());
+    assert_ne!(metadata.object_id, other.object_id);
+    assert_eq!(metadata.content_hash, Some(crate::content_hash(ORIGINAL)));
+    assert_ne!(metadata.content_hash, other.content_hash);
+    let mut expected = daemon_dfs_browser_stat_response(retired, Vec::new(), None, None, None);
+    expected.path = CHILD.into();
+    assert_eq!(
+        serde_json::to_value(&metadata).unwrap(),
+        serde_json::to_value(&expected).unwrap()
+    );
+    export.expect("postcommit race evidence retained after business assertions");
+    drop(backend);
+    drop(host);
+    native.close().unwrap();
+}

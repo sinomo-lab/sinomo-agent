@@ -24,10 +24,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "test-support")]
-pub mod test_support;
 #[cfg(all(test, feature = "test-support"))]
 mod provider_discovery_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub fn mounted_sifs(data_dir: Option<PathBuf>) -> Result<VfsHandle> {
     VfsHandle::new(Arc::new(MountedSifsVfsBackend::open(data_dir)?), "/")
@@ -115,6 +115,9 @@ pub struct MountedSifsOpenOptions {
 #[derive(Debug)]
 pub struct MountedSifsVfsBackend {
     opened: Mutex<OpenedMountedSifsService>,
+    // Field order releases the client before the final test owner is drained.
+    #[cfg(any(test, feature = "test-support"))]
+    native_owner: Option<Arc<test_support::NativeMountedOwner>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -142,9 +145,13 @@ impl MountedSifsVfsBackend {
             })?,
         };
         let cluster_paths = ClusterPaths::new(&data_dir);
-        #[cfg(feature = "test-support")]
-        if let Some(opened) = test_support::open_registered(&data_dir, options.cancellation.clone()) {
-            return opened.map(|opened| Self { opened: Mutex::new(opened) });
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(opened) = test_support::open_registered(&data_dir, options.cancellation.clone())
+        {
+            return opened.map(|opened| Self {
+                opened: Mutex::new(opened),
+                native_owner: None,
+            });
         }
         let opened = if cluster_paths.state.exists() {
             let peer_transport = Arc::new(
@@ -178,6 +185,8 @@ impl MountedSifsVfsBackend {
                 })?;
         Ok(Self {
             opened: Mutex::new(opened),
+            #[cfg(any(test, feature = "test-support"))]
+            native_owner: None,
         })
     }
 
@@ -2010,8 +2019,43 @@ mod tests {
     }
 
     #[test]
+    fn mounted_sifs_requires_an_initialized_node() {
+        let root = temp_data_dir("uninitialized-node");
+        let error = mounted_sifs(Some(root.clone())).expect_err("uninitialized SIFS must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("SIFS requires an initialized node"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_fixture_owner_lives_until_the_last_scoped_client_drops() {
+        let owner = Arc::new(
+            test_support::NativeMountedOwner::start("sinomo-vfs-sifs-owner-lifetime")
+                .expect("start native SIFS owner"),
+        );
+        let lifetime = Arc::downgrade(&owner);
+        let handle = owner.mounted_vfs().expect("open owned mounted VFS");
+        handle.create_dir_all("catalog").expect("create catalog");
+        let scoped = handle.scoped("/catalog").expect("scope client");
+        drop(handle);
+        drop(owner);
+
+        assert!(lifetime.upgrade().is_some(), "scoped client retains owner");
+        scoped.write("entry.txt", b"retained").expect("write");
+        assert_eq!(scoped.read("entry.txt").expect("read"), b"retained");
+        drop(scoped);
+        assert!(lifetime.upgrade().is_none(), "final client drains owner");
+    }
+
+    #[test]
     fn mounted_sifs_reopened_handle_serves_same_node_writes() {
-        let root = temp_data_dir("reopened-handle");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-reopened-handle")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let writer = mounted_sifs(Some(root.clone())).expect("open writer");
         writer
             .create_dir_all("catalog")
@@ -2039,13 +2083,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"entry.json".to_string()), "{names:?}");
         assert!(reader.stat("catalog/entry.json").is_ok());
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn mounted_sifs_does_not_treat_missing_content_as_namespace_absence() {
-        let root = temp_data_dir("missing-content-is-not-absence");
+        let owner = test_support::NativeMountedOwner::start(
+            "sinomo-vfs-sifs-missing-content-is-not-absence",
+        )
+        .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let backend = MountedSifsVfsBackend::open(Some(root.clone())).expect("open mounted SIFS");
         let path = "/catalog/present.sobj";
         backend
@@ -2104,13 +2150,13 @@ mod tests {
             matches!(append_error, VfsError::Backend { .. }),
             "append must retain content unavailability: {append_error}"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn mounted_sifs_directory_pages_use_bounded_dfs_continuations() {
-        let root = temp_data_dir("directory-pages");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-directory-pages")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let setup = mounted_sifs(Some(root.clone())).expect("open setup handle");
         setup.create_dir_all("catalog").expect("create catalog");
         for name in ["echo.md", "alpha.md", "delta.md", "bravo.md", "charlie.md"] {
@@ -2149,12 +2195,13 @@ mod tests {
             names,
             vec!["alpha.md", "bravo.md", "charlie.md", "delta.md", "echo.md"]
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn create_new_is_exclusive_across_mounted_sifs_handles() {
-        let root = temp_data_dir("exclusive-create");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-exclusive-create")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let setup = mounted_sifs(Some(root.clone())).expect("open setup handle");
         setup
             .create_dir_all("notes")
@@ -2204,12 +2251,13 @@ mod tests {
         let reader = mounted_sifs(Some(root.clone())).expect("open reader");
         let contents = reader.read("notes/shared.md").expect("read winner");
         assert!(contents == b"left" || contents == b"right", "{contents:?}");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn confined_operations_stay_beneath_a_scoped_workspace() {
-        let root = temp_data_dir("confined-workspace");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-confined-workspace")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let setup = mounted_sifs(Some(root.clone())).expect("open setup handle");
         setup
             .create_dir_all("workspaces/project")
@@ -2286,12 +2334,13 @@ mod tests {
                 .expect("sibling intact"),
             b"secret"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn conditional_replace_rejects_a_stale_vfs_version() {
-        let root = temp_data_dir("conditional-replace");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-conditional-replace")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let handle = mounted_sifs(Some(root.clone())).expect("open handle");
         handle
             .create_dir_all("notes")
@@ -2330,12 +2379,14 @@ mod tests {
             handle.read("notes/versioned.md").expect("read saved note"),
             b"second"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn conditional_replace_rejects_an_old_identity_after_recreate() {
-        let root = temp_data_dir("conditional-replace-recreate");
+        let owner =
+            test_support::NativeMountedOwner::start("sinomo-vfs-sifs-conditional-replace-recreate")
+                .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let handle = mounted_sifs(Some(root.clone())).expect("open handle");
         handle
             .create_dir_all("notes")
@@ -2380,12 +2431,13 @@ mod tests {
                 .expect("read recreated note"),
             b"replacement object"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn no_link_beneath_operations_reject_link_components() {
-        let root = temp_data_dir("beneath-no-links");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-beneath-no-links")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let backend = Arc::new(
             MountedSifsVfsBackend::open(Some(root.clone())).expect("open mounted backend"),
         );
@@ -2556,12 +2608,13 @@ mod tests {
         drop(opened);
         drop(scoped);
         drop(backend);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn opened_no_link_mutations_cannot_follow_a_later_link_swap() {
-        let root = temp_data_dir("beneath-link-swap");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-beneath-link-swap")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let backend = MountedSifsVfsBackend::open(Some(root.clone())).expect("open backend");
         let mut opened = backend.opened.lock().expect("lock service");
         let options = DfsWriteOptions::replicated_eventual(vec![opened.service.node_id().clone()]);
@@ -2659,12 +2712,13 @@ mod tests {
         );
         drop(opened);
         drop(backend);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn cancellation_flag_fails_distributed_reads_fast() {
-        let root = temp_data_dir("cancel");
+        let owner = test_support::NativeMountedOwner::start("sinomo-vfs-sifs-cancel")
+            .expect("start native SIFS owner");
+        let root = owner.data_dir().root();
         let cancellation = DfsCancellationFlag::new();
         let handle = mounted_sifs_with_cancellation(Some(root.clone()), cancellation.clone())
             .expect("open cancellable handle");
@@ -2678,7 +2732,5 @@ mod tests {
             error.to_string().to_ascii_lowercase().contains("cancelled"),
             "unexpected error: {error}"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 }

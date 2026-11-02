@@ -10190,6 +10190,7 @@ dependencies = [
  "sinomo-dfs",
  "sinomo-module",
  "sinomo-testdir",
+ "sinomo-vfs-sifs",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -10477,6 +10478,7 @@ dependencies = [
 name = "sinomo-observe"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "fs2",
  "metrics",
  "pprof",

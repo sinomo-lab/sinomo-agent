@@ -611,23 +611,6 @@ impl ComponentObjectRpcTransport for DaemonComponentObjectRpcTransport {
         )
     }
 
-    fn call_endpoint(
-        &self,
-        endpoint: &sinomo_core::ClusterEndpointRecord,
-        call: ObjectRpcCall,
-        options: sinomo_core::network::ClusterObjectRpcOptions,
-        observe_connectivity: bool,
-    ) -> Result<ObjectRpcResult, NetworkError> {
-        crate::client::send_object_rpc_call_to_exact_endpoint_on_runtime(
-            &self.paths,
-            endpoint,
-            call,
-            options,
-            &self.runtime,
-            observe_connectivity,
-        )
-    }
-
     fn call_async<'a>(
         &'a self,
         target_node_id: &'a sinomo_core::node::NodeId,

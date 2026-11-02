@@ -2514,7 +2514,12 @@ fn local_workspace_apply_patch_rejects_symlink_path_components() {
 
     assert_eq!(outcome.status, AgentToolStatus::Failed);
     assert!(!root.join("real/new.txt").exists());
-    assert!(outcome.summary.contains("symlink component"));
+    assert_eq!(outcome.output["error"], "apply_patch_verification_failed");
+    assert_eq!(
+        outcome.output["detail"],
+        "inspect `link/new.txt`: VFS path /link/new.txt is outside scoped root /",
+        "actual symlink rejection: {outcome:?}"
+    );
 }
 
 #[test]

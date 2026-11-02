@@ -249,6 +249,25 @@ pub(crate) fn observe_decoded_namespace_call(command: &crate::DfsMessageCommand)
         };
         let mut observation = context.observation.clone();
         match &head.message {
+            crate::DfsNetworkMessage::WriteRequest(request)
+                if observation.route == crate::DFS_DATA_WRITE_ROUTE
+                    && context.write_reply_capture.is_none() =>
+            {
+                observation.dfs_request_id = Some(request.request_id.clone());
+                observation.dfs_file_system_id = Some(request.request.file_system_id.clone());
+                observation.dfs_object_id = Some(request.request.object_id.clone());
+                observation.dfs_version = Some(request.request.target_version.clone());
+            }
+            crate::DfsNetworkMessage::DistributedWriteRequest(request)
+            | crate::DfsNetworkMessage::ExclusiveCreateRequest(request)
+                if observation.route == crate::DFS_DATA_DISTRIBUTED_WRITE_ROUTE
+                    && context.write_reply_capture.is_none() =>
+            {
+                observation.dfs_request_id = Some(request.request_id.clone());
+                observation.dfs_file_system_id = Some(request.request.file_system_id.clone());
+                observation.dfs_object_id = Some(request.request.object_id.clone());
+                observation.dfs_version = Some(request.request.target_version.clone());
+            }
             crate::DfsNetworkMessage::FetchBlob(request)
                 if observation.route == crate::DFS_DATA_FETCH_BLOB_ROUTE =>
             {

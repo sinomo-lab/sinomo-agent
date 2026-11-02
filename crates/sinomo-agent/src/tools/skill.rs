@@ -364,6 +364,12 @@ Run the shortcut command.
     fn skill_update_cannot_replace_an_existing_version_from_another_source() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-collision");
         let data_dir = SinomoDataDir::new(&root);
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-skill-update-collision",
+                data_dir.clone(),
+            )
+            .expect("native SIFS owner");
         let (store, original_entry) = seed_active_user_skill(&data_dir);
         let registry = registry(SkillAgentToolConfig::new(data_dir.clone()));
 
@@ -389,6 +395,12 @@ Run the shortcut command.
     fn skill_catalog_activation_rejects_changed_active_version() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-cas");
         let data_dir = SinomoDataDir::new(&root);
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-skill-update-cas",
+                data_dir.clone(),
+            )
+            .expect("native SIFS owner");
         let (store, original_entry) = seed_active_user_skill(&data_dir);
         let stale = SkillCatalogWrite::from_markdown_skill(
             Some("shortcut".to_string()),
@@ -422,6 +434,12 @@ Run the shortcut command.
     fn skill_update_tool_writes_evolution_version_and_activates() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-tool");
         let data_dir = SinomoDataDir::new(&root);
+        let _native =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-agent-skill-update-tool",
+                data_dir.clone(),
+            )
+            .expect("native SIFS owner");
         let store = SkillCatalogSifsStore::open(Some(data_dir.root())).expect("store");
         let original_text = "---\nname: shortcut\ndescription: Use slow setup.\n---\n\n# Shortcut\nRun the slow setup.\n";
         let original_write = SkillCatalogWrite::from_markdown_skill(

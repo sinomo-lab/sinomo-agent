@@ -2903,6 +2903,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         authority_shard: &DfsMetadataShardConfig,
     ) -> Result<(), DfsError> {
         self.remove_transient_object_metadata(&publication.object_id);
+        if self.metadata_backend.is_none() && self.transport.delegates_local_namespace_authority() {
+            // The requester owns no durable image. Its result boundary reads
+            // the current head through Main after response processing ends.
+            self.clear_metadata_lookup_cache();
+            return Ok(());
+        }
         let backend = self
             .metadata_backend
             .as_ref()

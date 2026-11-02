@@ -74,6 +74,112 @@ fn delegated_bootstrap_seeds_only_configuration_without_a_client_metadata_backen
     drop(private_backend);
     runtime.close().unwrap();
 }
+
+#[test]
+fn main_sifs_client_attachment_uses_configuration_without_native_table_snapshots() {
+    let node =
+        crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-client-lazy-projection", 1)
+            .remove(0);
+    let (runtime, mut client) = native_sifs_service("native-client-lazy-projection", node.clone());
+    assert!(client.transport.delegates_local_namespace_authority());
+    let paths = [
+        "/lazy-root.bin",
+        "/services/lazy-services.bin",
+        "/users/lazy-users.bin",
+    ];
+    for path in paths {
+        client
+            .posix_write_file(
+                path,
+                b"actual native metadata",
+                DfsWriteOptions::replicated_eventual(vec![node.clone()]),
+            )
+            .unwrap();
+    }
+    let expected = client.metadata.filesystems[&sifs_file_system_id()].clone();
+    let configs = runtime.metadata_shards().unwrap();
+    let owner = client.metadata_backend.take().unwrap();
+    let crate::service_state::DfsMetadataBackendOwner::Owned(backend) = owner else {
+        panic!("ordinary client owns its private metadata backend");
+    };
+    let before = configs
+        .iter()
+        .map(|config| {
+            backend
+                .export_shard_table_snapshot(&DfsMetadataShardId::new(config.shard_id.clone()))
+                .unwrap()
+                .unwrap()
+                .prefix_proof
+        })
+        .collect::<Vec<_>>();
+    // The producer already hydrated replay cursors. Exercise attachment on a
+    // fresh requester while retaining its actual transport, content and control plane.
+    let transport = client.transport.clone();
+    let content = client.content.clone();
+    let control_plane = client.control_plane.take().unwrap();
+    drop(client);
+    let mut client =
+        NetworkedDfsService::new(transport, content).with_boxed_control_plane(control_plane);
+    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+    client = client
+        .with_boxed_metadata_backend_for_main_sifs_client(backend)
+        .unwrap();
+    assert_eq!(
+        crate::metadata_backend::metadata_current_tables_snapshot_calls(),
+        0,
+        "delegated attachment must not query the author tables for bootstrap projections"
+    );
+    assert!(crate::placement::dfs_file_system_semantically_eq(
+        &client.metadata.filesystems[&sifs_file_system_id()],
+        &expected,
+    ));
+    assert!(client.replication.local_metadata_journal_cursors.is_empty());
+    let after = configs
+        .iter()
+        .map(|config| {
+            client
+                .metadata_backend()
+                .unwrap()
+                .export_shard_table_snapshot(&DfsMetadataShardId::new(config.shard_id.clone()))
+                .unwrap()
+                .unwrap()
+                .prefix_proof
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "client attachment grants no native publication"
+    );
+    for path in paths {
+        assert_eq!(
+            client.posix_read_file(path).unwrap(),
+            b"actual native metadata"
+        );
+    }
+    // The generic delegated constructor still has its complete native
+    // catalogue, floor, job-guard and replay-cursor contract.
+    let owner = client.metadata_backend.take().unwrap();
+    let crate::service_state::DfsMetadataBackendOwner::Owned(backend) = owner else {
+        panic!("ordinary client owns its private metadata backend");
+    };
+    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+    client = client.with_boxed_metadata_backend_lazy(backend).unwrap();
+    assert!(crate::metadata_backend::metadata_current_tables_snapshot_calls() > 0);
+    assert!(!client.replication.local_metadata_journal_cursors.is_empty());
+    drop(client);
+    let mut author = runtime.metadata_primary_service("/services").unwrap();
+    assert!(!author.transport.delegates_local_namespace_authority());
+    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+    author.hydrate_file_systems_from_metadata_backend().unwrap();
+    assert!(
+        crate::metadata_backend::metadata_current_tables_snapshot_calls() > 0,
+        "the actual author retains ordinary native bootstrap hydration"
+    );
+    assert!(!author.replication.local_metadata_journal_cursors.is_empty());
+    drop(author);
+    runtime.close().unwrap();
+}
+
 #[test]
 fn clustered_service_rejects_public_local_metadata_publication_apis() {
     let root = temp_root("clustered-local-publication-rejected");

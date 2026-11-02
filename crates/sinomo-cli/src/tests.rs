@@ -6489,7 +6489,13 @@ fn agent_mcp_registry_requires_explicit_local_authority_before_network_discovery
 
 #[test]
 fn agent_readiness_text_renders_gate_results() {
-    let report = sinomo_agent::run_local_agent_readiness_gate(env!("CARGO_MANIFEST_DIR"));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-readiness");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let sifs = sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root()))
+        .map(|vfs| (data_dir.clone(), vfs))
+        .map_err(|error| error.to_string());
+    let report = sinomo_agent::run_local_agent_readiness_gate(env!("CARGO_MANIFEST_DIR"), sifs);
     let text = super::agent_readiness_text(&report);
 
     assert!(report.is_ready(), "{report:#?}");
@@ -8637,7 +8643,6 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
         1,
     )
     .expect("normal current DFS startup");
-    let data_dir = runtime.data_dir(&nodes[0]).clone();
     let shards = runtime
         .metadata_shards()
         .expect("actual native metadata assignments");
@@ -8663,16 +8668,31 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
         )
         .expect("real content persistence and guarded metadata publication");
     drop(writer);
-    let metadata = open_dfs_metadata_for_inspection_with_data_dir(None, &data_dir)
-        .expect("open inspection metadata");
-    let inspector = metadata.inspector();
-    let inspected = inspector
-        .object_by_path(&runtime.file_system().file_system_id, path)
-        .expect("inspect path")
-        .expect("object by path");
+    let request = sinomo_runtime::dfs::dfs_inspection_rpc_request(
+        &sinomo_runtime::dfs::DaemonDfsInspectionRequest::Path {
+            file_system_id: runtime.file_system().file_system_id,
+            path: path.to_string(),
+        },
+    )
+    .expect("encode actual owner inspection");
+    let response = runtime
+        .rpc_request(
+            &nodes[0],
+            &nodes[0],
+            request,
+            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+        )
+        .expect("inspect path through actual native owner");
+    let inspected = match sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
+        .expect("decode actual owner inspection")
+    {
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Path {
+            object: Some(object),
+        } => object,
+        other => panic!("object by path: {other:?}"),
+    };
     assert_eq!(inspected.object.object_id, object.object_id);
     assert_eq!(inspected.object.path, path);
-    drop(metadata);
     runtime.close().expect("normal current runtime closes");
 }
 
@@ -10852,18 +10872,10 @@ fn daemon_sandbox_http_fetch_uses_cluster_policy_and_returns_body() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_http_file").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_http_file").expect("node")),
-            name: "sandbox http file cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let mut policy_config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
     policy_config
@@ -11001,18 +11013,10 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file-quota");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_http_file_quota").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_http_file_quota").expect("node")),
-            name: "sandbox http file quota cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let mut policy_config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
     policy_config
@@ -11120,20 +11124,10 @@ fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file-denied");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_http_file_denied").expect("cluster"),
-            ),
-            node_id: Some(
-                NodeId::from_legacy_named("node_sandbox_http_file_denied").expect("node"),
-            ),
-            name: "sandbox http file denied cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
 
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
@@ -11212,21 +11206,10 @@ fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() 
 fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
     let root =
         sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file-transport-failure");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_http_file_transport")
-                    .expect("cluster"),
-            ),
-            node_id: Some(
-                NodeId::from_legacy_named("node_sandbox_http_file_transport").expect("node"),
-            ),
-            name: "sandbox http file transport cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let mut policy_config = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
     policy_config
@@ -11338,18 +11321,10 @@ fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-busybox-policy");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_busybox_policy").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_busybox_policy").expect("node")),
-            name: "sandbox busybox policy cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let mut restrictive_policy = sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default();
     restrictive_policy
@@ -11400,18 +11375,10 @@ fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-toolchain-add");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_toolchain_add").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_toolchain_add").expect("node")),
-            name: "sandbox toolchain add cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
 
@@ -11528,21 +11495,10 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-toolchain-artifact");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_toolchain_artifact")
-                    .expect("cluster"),
-            ),
-            node_id: Some(
-                NodeId::from_legacy_named("node_sandbox_toolchain_artifact").expect("node"),
-            ),
-            name: "sandbox toolchain artifact cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
 
@@ -11632,20 +11588,10 @@ fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-toolchain-package");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_toolchain_package").expect("cluster"),
-            ),
-            node_id: Some(
-                NodeId::from_legacy_named("node_sandbox_toolchain_package").expect("node"),
-            ),
-            name: "sandbox toolchain package cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
     daemon_handle_daemon_sandbox_toolchain_add_command(
@@ -11867,18 +11813,10 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-write-ro-mount");
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    cluster_init_with_paths(
-        ClusterInitOptions {
-            cluster_id: Some(
-                ClusterId::from_legacy_named("cluster_sandbox_write_ro_mount").expect("cluster"),
-            ),
-            node_id: Some(NodeId::from_legacy_named("node_sandbox_write_ro_mount").expect("node")),
-            name: "sandbox write read-only mount cluster".to_string(),
-        },
-        &paths,
-    )
-    .expect("cluster init");
+    let data_dir = SinomoDataDir::new(&root);
+    let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
+    let runtime = _native.with_native(|native, _node| native.runtime_handle());
+    let _entered = runtime.enter();
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -14657,6 +14595,34 @@ fn dfs_cluster_status_probes_members_despite_degraded_or_unreachable_builtin_con
             .expect("sync state");
 
         let now = OffsetDateTime::now_utc();
+        let mut provider =
+            sinomo_runtime::service::ServiceInstanceRecord::new("dfs", remote_node_id.clone());
+        provider.routes = vec![sinomo_runtime::dfs::DFS_STATUS_ROUTE.to_string()];
+        provider.provider_capabilities = vec!["dfs.object.transfer".to_string()];
+        provider.interface_id = format!(
+            "sinomo.object-rpc/{}",
+            sinomo_runtime::dfs::DFS_RPC_CATEGORY
+        );
+        provider.interface_version = sinomo_runtime::dfs::DFS_PROTOCOL.into();
+        provider.updated_at = now;
+        append_cluster_raft_command(
+            &paths,
+            &local_node_id,
+            KvCommand::Op(KvOp::Put {
+                key: sinomo_runtime::service::cluster_service_instance_key(
+                    &provider.service_id,
+                    &provider.node_id,
+                ),
+                value: sinomo_runtime::kv::encode_kv_value(&provider).expect("encode DFS provider"),
+                lease_id: None,
+            }),
+        )
+        .expect("advertise the remote DFS provider");
+        assert_eq!(
+            sinomo_runtime::dfs::discovered_cluster_dfs_provider_node_ids(&paths, &state)
+                .expect("project actual DFS providers"),
+            vec![remote_node_id.clone()]
+        );
         let consecutive_failures = if connectivity_state
             == sinomo_runtime::network::ClusterConnectivityState::Unreachable
         {
