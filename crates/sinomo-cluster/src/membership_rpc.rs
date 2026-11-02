@@ -35,6 +35,16 @@ pub struct ClusterJoinRegistrationResponse {
     pub kv_snapshot: Option<KvSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responder_node_id: Option<NodeId>,
+    /// The authority's Raft log position at which `kv_snapshot` is its exact
+    /// applied state. The joiner starts its Raft state there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raft_anchor: Option<ClusterJoinRaftAnchor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterJoinRaftAnchor {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

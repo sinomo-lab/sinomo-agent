@@ -7,10 +7,7 @@
 
 #[cfg(test)]
 use crate::DfsReplicationPolicy;
-use crate::advisory_lock::{
-    DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord, DfsAdvisoryLockTransitionContext,
-    transition_advisory_lock_state,
-};
+use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::content_root_catalog::{
     DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_BYTES, DFS_CONTENT_ROOT_CATALOG_TARGET_PAGE_BYTES,
     DfsContentRootCatalogCoverage, DfsContentRootCatalogCursor, DfsContentRootCatalogEntry,
@@ -29,13 +26,7 @@ use crate::metadata_history_gc::{
     DfsMetadataContentProtection, DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport,
     DfsMetadataHistoryRemoval, metadata_content_protection_from_tables, plan_metadata_history_gc,
 };
-use crate::metadata_io::{
-    create_dir_all, read_sobj_optional, remove_file_if_exists, write_sobj_atomic,
-};
-#[cfg(test)]
-use crate::metadata_io::{read_dir, read_sobj, sync_dir};
-#[cfg(test)]
-use crate::metadata_journal::DfsMetadataJournalHead;
+use crate::metadata_io::create_dir_all;
 use crate::metadata_journal::{
     DfsMetadataReplayCursor, bounded_metadata_journal_batch,
     journal_entries_since_limited_with_next_sequence, metadata_prefix_proof_after_exact_frame,
@@ -51,10 +42,7 @@ use crate::metadata_limits::{
     OBJECT_LOCAL_METADATA_PAGE_SIZE,
 };
 use crate::metadata_lock::{MetadataWriteLock, metadata_write_lock};
-use crate::metadata_namespace_transaction::{
-    plan_namespace_transaction_table_ops as namespace_transaction_table_ops,
-    validate_namespace_transaction_preconditions,
-};
+use crate::metadata_namespace_transaction::validate_namespace_transaction_preconditions;
 use crate::metadata_object_index::path_record_for_new_dentry;
 use crate::metadata_pages::object_by_path_from_tables;
 use crate::metadata_pages::{
@@ -81,17 +69,14 @@ use crate::metadata_summary::{
 };
 use crate::metadata_table_apply::{self, TableMaterializationState};
 #[cfg(test)]
-use crate::metadata_table_store::truncate_metadata_table_log;
+use crate::metadata_table_store::metadata_table_path;
 use crate::metadata_table_store::{
     METADATA_TABLE_SNAPSHOT_FORMAT_VERSION, MetadataTableStorageGeneration,
-    archive_metadata_backend_state, load_metadata_tables, metadata_table_checkpoint_log_path,
-    metadata_table_path, metadata_table_snapshot_fingerprint, metadata_table_snapshot_path,
-    metadata_table_storage_generation, metadata_tables_from_table_snapshot,
-    metadata_tables_snapshot, persist_metadata_table_snapshot,
-    read_metadata_table_snapshot_for_replica_repair, read_metadata_table_state_lenient,
+    archive_metadata_backend_state, load_metadata_tables, metadata_table_snapshot_fingerprint,
+    metadata_table_snapshot_path, metadata_table_storage_generation, metadata_tables_snapshot,
+    persist_metadata_table_snapshot, read_metadata_table_snapshot_for_replica_repair,
+    read_metadata_table_state_lenient,
 };
-#[cfg(test)]
-use crate::metadata_tables::namespace_prepare_footprint;
 use crate::metadata_tables::{
     DfsMetadataTableRollback, DfsMetadataTables, DfsMetadataTablesSnapshot,
     DfsNamespacePrepareFootprint, MetadataTableReadSnapshotCache, MetadataTableSnapshotFingerprint,
@@ -99,32 +84,21 @@ use crate::metadata_tables::{
     namespace_transaction_receipt_eviction_delta,
 };
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
-use crate::{
-    ContentStoreGcOptions, ContentStoreVersionGcOptions, DfsError, DfsFileSystem, DfsObjectKind,
-    DfsObjectMetadata, LocalContentStore, namespace_transaction_id_for_batch,
-};
+use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use crate::{DfsNamespaceOperation, DfsNamespaceResult};
+#[cfg(test)]
 use sinomo_core::DfsObjectPolicy;
-#[cfg(test)]
-use sinomo_core::DfsWriteReceipt;
-#[cfg(test)]
-use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
-#[cfg(test)]
-use sinomo_core::object::serde_ext as sinomo_object_serde;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-#[cfg(test)]
-use std::io;
 #[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::Instant;
 use time::OffsetDateTime;
 
 // Table-log replay is paid by every full SIFS service open. Keep the active
@@ -176,16 +150,6 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn reset_metadata_begin_write_calls() {
-    METADATA_BEGIN_WRITE_CALLS.set(0);
-}
-
-#[cfg(test)]
-fn metadata_begin_write_calls() -> usize {
-    METADATA_BEGIN_WRITE_CALLS.get()
-}
-
-#[cfg(test)]
 fn reset_metadata_durable_table_reloads() {
     METADATA_DURABLE_TABLE_RELOADS.set(0);
 }
@@ -218,62 +182,6 @@ pub(crate) fn metadata_backend_open_calls() -> usize {
 #[cfg(test)]
 pub(crate) fn record_metadata_backend_open_calls_from_workers(count: usize) {
     METADATA_BACKEND_OPEN_CALLS.set(METADATA_BACKEND_OPEN_CALLS.get().saturating_add(count));
-}
-
-#[cfg(test)]
-pub(crate) fn reset_metadata_export_table_snapshot_calls() {
-    METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn metadata_export_table_snapshot_calls() -> usize {
-    METADATA_EXPORT_TABLE_SNAPSHOT_CALLS.get()
-}
-
-#[cfg(test)]
-pub(crate) fn reset_metadata_journal_write_count() {
-    METADATA_JOURNAL_WRITE_COUNT.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn metadata_journal_write_count() -> usize {
-    METADATA_JOURNAL_WRITE_COUNT.get()
-}
-
-#[cfg(test)]
-fn reset_namespace_recovery_planner_calls() {
-    NAMESPACE_RECOVERY_PLANNER_CALLS.set(0);
-}
-
-#[cfg(test)]
-fn namespace_recovery_planner_calls() -> usize {
-    NAMESPACE_RECOVERY_PLANNER_CALLS.get()
-}
-
-#[cfg(test)]
-fn reset_metadata_recovery_scan_calls() {
-    METADATA_NAMESPACE_RECOVERY_SCAN_CALLS.set(0);
-    METADATA_VISIBLE_RECOVERY_SCAN_CALLS.set(0);
-    METADATA_LOCATION_RECOVERY_SCAN_CALLS.set(0);
-}
-
-#[cfg(test)]
-fn metadata_recovery_scan_calls() -> (usize, usize, usize) {
-    (
-        METADATA_NAMESPACE_RECOVERY_SCAN_CALLS.get(),
-        METADATA_VISIBLE_RECOVERY_SCAN_CALLS.get(),
-        METADATA_LOCATION_RECOVERY_SCAN_CALLS.get(),
-    )
-}
-
-#[cfg(test)]
-fn reset_namespace_prepared_commit_reference_planner_calls() {
-    NAMESPACE_PREPARED_COMMIT_REFERENCE_PLANNER_CALLS.set(0);
-}
-
-#[cfg(test)]
-fn reset_namespace_prepare_history_scan_calls() {
-    NAMESPACE_PREPARE_HISTORY_SCAN_CALLS.set(0);
 }
 
 struct ValidatedNamespacePreparePlan {
@@ -1757,16 +1665,6 @@ impl LocalSobjMetadataBackend {
         )
     }
 
-    #[cfg(test)]
-    fn advance_local_materialization_cursor(&self, sequence: u64) -> Result<()> {
-        metadata_cursor::advance_local_materialization_cursor(
-            &self.root,
-            &self.shard_id,
-            self.next_sequence,
-            sequence,
-        )
-    }
-
     fn reconcile_local_materialization_cursor(&self, materialized_sequence: u64) -> Result<()> {
         metadata_cursor::reconcile_local_materialization_cursor(
             &self.root,
@@ -1934,20 +1832,6 @@ impl LocalSobjMetadataBackend {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn local_materialization_cursor_path(&self) -> PathBuf {
-        metadata_cursor::local_materialization_cursor_path(&self.root)
-    }
-
-    #[cfg(test)]
-    fn metadata_replication_cursor_path(
-        &self,
-        target_node_id: &NodeId,
-        shard_id: &DfsMetadataShardId,
-    ) -> PathBuf {
-        metadata_cursor::metadata_replication_cursor_path(&self.root, target_node_id, shard_id)
-    }
-
     fn journal_write_lock_path(&self) -> PathBuf {
         metadata_cursor::journal_write_lock_path(&self.root)
     }
@@ -1976,9 +1860,23 @@ impl LocalSobjMetadataBackend {
         if self.consistent_read_snapshot_depth == 0
             && self.try_materialize_resident_journal()?.is_none()
         {
+            tracing::trace!(target: "sinomo.dfs.perf",
+                stage = "dfs.repair.receipt_projection.native_cut", outcome = "source_fence_busy",
+                backend = %format_args!("{:p}", self), root = %self.root.display(),
+                shard_id = ?self.shard_id, actual_prefix = ?self.prefix_proof,
+                actual_materialized_sequence = self.materialized_through_sequence,
+                actual_snapshot_depth = self.consistent_read_snapshot_depth,
+                "existing resident snapshot opener did not acquire a coherent cut");
             return Ok(false);
         }
         self.consistent_read_snapshot_depth = self.consistent_read_snapshot_depth.saturating_add(1);
+        tracing::trace!(target: "sinomo.dfs.perf",
+            stage = "dfs.repair.receipt_projection.native_cut", outcome = "ready",
+            backend = %format_args!("{:p}", self), root = %self.root.display(),
+            shard_id = ?self.shard_id, actual_prefix = ?self.prefix_proof,
+            actual_materialized_sequence = self.materialized_through_sequence,
+            actual_snapshot_depth = self.consistent_read_snapshot_depth,
+            "borrowed native prefix after existing resident snapshot admission");
         Ok(true)
     }
 
@@ -3305,7 +3203,6 @@ pub use source_adoption::{
 
 mod namespace_prepare;
 pub(crate) mod prepared_operation;
-use namespace_prepare::*;
 
 mod pin_validation;
 use pin_validation::*;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::{DfsMessageResponse, DfsNetworkMessage, DfsRoutedMessage};
+use sinomo_core::network::NetworkError;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonDfsDataPlaneHost {
@@ -1652,6 +1653,7 @@ pub(crate) fn daemon_dfs_control_plane_client_on_runtime(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn daemon_dfs_node_transport(
     local_node_id: sinomo_core::node::NodeId,
     peer_node_ids: impl IntoIterator<Item = NodeId>,
@@ -1705,56 +1707,6 @@ pub(crate) fn daemon_dfs_client_node_transport(
         async_peer,
     )
     .with_registered_main_namespace_dispatch()
-}
-
-/// Test-only contact restriction on the SAME actual registered native host.
-/// Not a replacement carrier, fresh owner, source authority or decoded return.
-#[cfg(test)]
-pub(crate) fn daemon_dfs_native_prefix_contact_scoped_transport_for_test(
-    local_node_id: NodeId,
-    peer_node_ids: Vec<NodeId>,
-    data_dir: &SinomoDataDir,
-    runtime: &tokio::runtime::Handle,
-    contacts: std::collections::BTreeMap<NodeId, (String, String)>,
-    hints: std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>,
-) -> Result<DfsNodeTransport, DfsRuntimeError> {
-    let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
-        detail: "native scoped PREFIX has no existing registered host".into(),
-    })?;
-    if contacts.len() != 3
-        || hints.len() != contacts.len()
-        || hints.iter().any(|(node, endpoint)| {
-            endpoint.node_id != *node
-                || contacts.get(node).is_none_or(|(address, _)| *address != endpoint.address)
-                || !matches!(endpoint.transport, sinomo_core::ClusterTransportKind::Loopback
-                    | sinomo_core::ClusterTransportKind::LanTcp)
-        })
-        || !contacts.contains_key(&local_node_id)
-        || peer_node_ids
-            .iter()
-            .any(|peer| !contacts.contains_key(peer))
-    {
-        return Err(DfsRuntimeError::Parse {
-            detail: "native scoped PREFIX contact set differs".into(),
-        });
-    }
-    let mut context = super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime);
-    context.contact_scope = Some(super::native_prefix_return::NativePrefixContactScope {
-        owned: contacts, hints,
-    });
-    let peer = Arc::new(DaemonDfsPeerTransport {
-        host,
-        native_prefix: Some(context),
-    });
-    let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
-    let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
-    Ok(DfsNodeTransport::with_peer_transports_for_nodes(
-        local_node_id,
-        peer_node_ids,
-        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-        sync_peer,
-        async_peer,
-    ))
 }
 
 #[derive(Clone)]
@@ -1986,16 +1938,64 @@ pub(crate) fn select_native_original_repair_custody(
 
 /// Created only by the admitted normal producer. The actual body remains in
 /// that producer's DfsRoutedSend; this carries no live mutation admission.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct PreparedNativeRepairCustody {
     attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
     data_dir: SinomoDataDir,
     owner: Arc<DfsDataOwnerLock>,
     host: Weak<DfsRuntimeHost>,
-    scope: Arc<NativeRepairCustodyScope>,
+    #[cfg(any(test, feature = "test-support"))]
+scope: Option<Arc<NativeRepairCustodyScope>>,
     admission: crate::publication_guard::NativeRepairProducerAdmission,
 }
-#[cfg(any(test, feature = "test-support"))]
+impl PreparedNativeRepairCustody {
+    pub(crate) fn validate_original_dispatch(
+        &self,
+        queue: &crate::LocalDfsRepairQueueStore,
+        carrier: &crate::DfsRoutedMessage,
+    ) -> Result<(), crate::DfsError> {
+        self.admission
+            .validate_original_dispatch(&self.data_dir, queue, &self.attempt, carrier)
+            .map(|_| ())
+    }
+
+    pub(crate) fn before_dispatch(
+        &self,
+    ) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
+        let layout = self
+            .owner
+            .selected_original_data_layout()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?;
+        let inspection = self
+            .owner
+            .repair_payload_inspection_context()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?;
+        #[cfg(any(test, feature = "test-support"))]
+if self.scope.is_some() {
+            return crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
+                &self.data_dir,
+                crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
+                    message: self.attempt.carrier().clone(),
+                },
+                layout.as_deref(),
+                Some(&inspection),
+            );
+        }
+        crate::runtime_message::checkpoint_detached_native_original_delivery(
+            &self.data_dir,
+            crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
+                message: self.attempt.carrier().clone(),
+            },
+            layout.as_deref(),
+            Some(&inspection),
+            &self.admission,
+            &self.attempt,
+        )
+    }
+}
 impl std::fmt::Debug for PreparedNativeRepairCustody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedNativeRepairCustody")
@@ -2004,7 +2004,6 @@ impl std::fmt::Debug for PreparedNativeRepairCustody {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn prepare_native_repair_custody(
     data_dir: &SinomoDataDir,
     owner: Arc<DfsDataOwnerLock>,
@@ -2023,23 +2022,33 @@ pub(crate) fn prepare_native_repair_custody(
     let host = registered_dfs_runtime_host(data_dir)
         .map_err(|e| error(e.to_string()))?
         .ok_or_else(|| error("native Repair custody preparation has no registered host".into()))?;
-    let scope = owner
+    #[cfg(any(test, feature = "test-support"))]
+let scope = owner
         .native_repair_custody
         .lock()
         .map_err(|_| error("native Repair custody selection poisoned".into()))?
         .as_ref()
         .filter(|scope| scope.material == *material)
-        .cloned()
-        .ok_or_else(|| {
-            error("native Repair custody selection changed during preparation".into())
-        })?;
+        .cloned();
     let layout = owner
         .selected_original_data_layout()
-        .map_err(|e| error(e.to_string()))?
-        .ok_or_else(|| error("native Repair custody preparation lost selected owner".into()))?;
-    let attempt = layout
-        .queue()?
-        .capture_original_repair_attempt_witness(carrier, material)?;
+        .map_err(|e| error(e.to_string()))?;
+    let queue = if let Some(layout) = &layout {
+        layout.queue()?
+    } else {
+        crate::LocalDfsRepairQueueStore::new(
+            owner
+                .checked_default_repair_queue_path()
+                .map_err(|e| error(e.to_string()))?,
+        )
+    };
+    let attempt = if layout.is_some() {
+        queue.capture_original_repair_attempt_witness(carrier, material)?
+    } else {
+        queue.capture_default_original_repair_attempt_witness(
+            &owner, &admission, carrier, material,
+        )?
+    };
     owner
         .repair_payload_inspection_context()
         .map_err(|e| error(e.to_string()))?
@@ -2050,6 +2059,7 @@ pub(crate) fn prepare_native_repair_custody(
         data_dir: data_dir.clone(),
         owner,
         host: Arc::downgrade(&host),
+        #[cfg(any(test, feature = "test-support"))]
         scope,
         admission,
     })
@@ -2058,17 +2068,16 @@ pub(crate) fn prepare_native_repair_custody(
 /// Ephemeral DATA from one actual target-bound native RPC. Private fields and
 /// no serialization or raw-frame constructor keep this distinct from a saved
 /// unverified completion candidate. It grants no application or custody effect.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct OwnedOriginalRepairCompletion {
     attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
     returned: DfsRoutedMessage,
     rpc_request_id: String,
     owner: Arc<DfsDataOwnerLock>,
+    #[cfg(any(test, feature = "test-support"))]
     scope: Option<Arc<NativeRepairCustodyScope>>,
     producer_admission: Option<crate::publication_guard::HistoricalNativeRepairProducerAdmission>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Debug for OwnedOriginalRepairCompletion {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2081,7 +2090,6 @@ impl std::fmt::Debug for OwnedOriginalRepairCompletion {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl OwnedOriginalRepairCompletion {
     pub(crate) fn carrier(&self) -> &DfsRoutedMessage {
         self.attempt.carrier()
@@ -2104,6 +2112,7 @@ impl OwnedOriginalRepairCompletion {
     pub(crate) fn payload_root(&self) -> &crate::content_store::RepairPayloadRoot {
         self.attempt.payload_root()
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn revalidate_custody_owner(
         &self,
         queue: &crate::repair_queue_store::LocalDfsRepairQueueStore,
@@ -2132,6 +2141,7 @@ impl OwnedOriginalRepairCompletion {
             .inspect(self.attempt.payload_root())?;
         Ok(())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn custody_queue(
         &self,
     ) -> Result<crate::repair_queue_store::LocalDfsRepairQueueStore, crate::DfsError> {
@@ -2145,6 +2155,7 @@ impl OwnedOriginalRepairCompletion {
             })?
             .queue()?)
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn before_custody_intake(self: &Arc<Self>) -> Result<(), crate::DfsError> {
         let scope = self
             .scope
@@ -2182,6 +2193,7 @@ impl OwnedOriginalRepairCompletion {
         }
         Ok(())
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn record_custody_deferred(
         &self,
         deferred: &crate::repair_queue_store::DeferredNativeRepairCompletion,
@@ -2201,6 +2213,7 @@ impl OwnedOriginalRepairCompletion {
             selected.take();
         }
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn record_custody_error(&self, error: &crate::DfsError) {
         if let Some(scope) = &self.scope
             && let Ok(mut last) = scope.last_error.lock()
@@ -2213,6 +2226,73 @@ impl OwnedOriginalRepairCompletion {
         self.scope
             .as_ref()
             .is_some_and(|scope| scope.fail_namespace_once.swap(false, Ordering::AcqRel))
+    }
+}
+
+/// A one-use immediate-return typestate. The contained completion remains
+/// DATA; only the matched concrete native future below can construct this thin
+/// wrapper. Old Owned/Arc/serialized return DATA has no conversion into it.
+#[derive(Debug)]
+pub(crate) struct FreshOriginalRepairReturn {
+    completion: OwnedOriginalRepairCompletion,
+}
+impl FreshOriginalRepairReturn {
+    pub(crate) fn rpc_request_id(&self) -> &str {
+        self.completion.rpc_request_id()
+    }
+    pub(crate) fn carrier(&self) -> &DfsRoutedMessage {
+        self.completion.carrier()
+    }
+    pub(crate) fn returned_frame(&self) -> &DfsRoutedMessage {
+        self.completion.returned_frame()
+    }
+    pub(crate) fn material(&self) -> &crate::DfsOriginalRepairMaterial {
+        self.completion.material()
+    }
+    pub(crate) fn revalidate_serving_owner(
+        &self,
+        owner: &Arc<DfsDataOwnerLock>,
+        queue: &crate::LocalDfsRepairQueueStore,
+    ) -> Result<(), crate::DfsError> {
+        if !Arc::ptr_eq(owner, &self.completion.owner) {
+            return Err(crate::DfsError::Metadata {
+                message: "fresh native Repair return changed current DATA owner".into(),
+            });
+        }
+        queue.revalidate_original_repair_attempt_witness(&self.completion.attempt)?;
+        owner
+            .repair_payload_inspection_context()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?
+            .inspect(self.completion.payload_root())?;
+        Ok(())
+    }
+}
+
+pub(crate) enum NativeOriginalRepairReturn {
+    Fresh(FreshOriginalRepairReturn),
+    Data(OwnedOriginalRepairCompletion),
+}
+
+// Private only: no caller can upgrade an already constructed DATA completion.
+// The Serving arm carries the actual producer admission into the SAME native
+// RPC, then is consumed at the actual matched return, not reconstructed later.
+enum NativeRepairReturnRoute {
+    DataOnly(Option<crate::publication_guard::NativeRepairProducerAdmission>),
+    Serving(crate::publication_guard::NativeRepairProducerAdmission),
+}
+impl NativeRepairReturnRoute {
+    fn into_admission(
+        self,
+    ) -> (
+        bool,
+        Option<crate::publication_guard::HistoricalNativeRepairProducerAdmission>,
+    ) {
+        match self {
+            Self::DataOnly(value) => (false, value.map(|proof| proof.into_historical())),
+            Self::Serving(value) => (true, Some(value.into_historical())),
+        }
     }
 }
 
@@ -2299,19 +2379,105 @@ pub(crate) fn call_native_original_repair_owned(
     {
         call = call.with_original_repair(material.clone())?;
     }
-    call_native_original_repair_owned_with_call(
-        data_dir, owner, host, attempt, call, options, deadline, None, None,
-    )
+    let mut rpc = NativeRepairRpc::prepare(
+        data_dir.clone(), owner, host, attempt, call, options, deadline, None, NativeRepairReturnRoute::DataOnly(None),
+    )?;
+    let outgoing = rpc.call.take().expect("one selected DATA native call");
+    let mut observation = crate::native_shard_trace::begin_rpc_attempt(&rpc.target, &rpc.expected);
+    let raw = rpc.host.object_rpc.call(
+        &rpc.target,
+        outgoing,
+        rpc.options.cluster_rpc_options(),
+        rpc.options.observe_connectivity,
+    );
+    if let (Some(observation), Err(error)) = (observation.as_mut(), &raw) {
+        observation.returned(&Err(DfsPeerTransportError::from_network(error.clone())));
+    }
+    match rpc.complete(raw, |decoded| {
+        if let Some(observation) = observation.as_mut() {
+            observation.returned(decoded);
+        }
+    })? {
+        NativeOriginalRepairReturn::Data(data) => Ok(data),
+        NativeOriginalRepairReturn::Fresh(_) => Err(invalid(
+            "DATA-only call unexpectedly acquired serving typestate",
+        )),
+    }
 }
 
-/// Only the normal admitted producer can create the private preparation. Its
-/// already-owned body is consumed here without substitution or reopening.
-#[cfg(any(test, feature = "test-support"))]
+/// Only the normal admitted producer creates this preparation. The same body
+/// is consumed exactly once; the actual native return decides its delivery.
 pub(crate) fn send_prepared_native_repair_custody(
     prepared: PreparedNativeRepairCustody,
     call: crate::DfsRoutedCall,
     options: DfsObjectRpcSendOptions,
-) -> Result<OwnedOriginalRepairCompletion, crate::DfsError> {
+    deadline: Option<Instant>,
+) -> Result<NativeOriginalRepairReturn, crate::DfsError> {
+    let mut rpc = prepare_native_repair_rpc(prepared, call, options, deadline)?;
+    #[cfg(any(test, feature = "test-support"))]
+let mut observation = crate::native_shard_trace::begin_rpc_attempt(&rpc.target, &rpc.expected);
+    let outgoing = rpc.call.take().expect("one owned native call");
+    let raw = rpc.host.object_rpc.call(
+        &rpc.target,
+        outgoing,
+        rpc.options.cluster_rpc_options(),
+        rpc.options
+        .observe_connectivity,
+    );
+    #[cfg(any(test, feature = "test-support"))]
+if let (Some(observation), Err(error)) = (observation.as_mut(), &raw) {
+        observation.returned(&Err(DfsPeerTransportError::from_network(error.clone())));
+    }
+    rpc.complete(raw, |decoded| {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(observation) = observation.as_mut() {
+            observation.returned(decoded);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = decoded;
+    })
+}
+
+pub(crate) async fn send_prepared_native_repair_custody_async(
+    prepared: PreparedNativeRepairCustody,
+    call: crate::DfsRoutedCall,
+    options: DfsObjectRpcSendOptions,
+    deadline: Option<Instant>,
+) -> Result<NativeOriginalRepairReturn, crate::DfsError> {
+    let mut rpc = prepare_native_repair_rpc(prepared, call, options, deadline)?;
+    #[cfg(any(test, feature = "test-support"))]
+    let mut observation = crate::native_shard_trace::begin_rpc_attempt(&rpc.target, &rpc.expected);
+    let outgoing = rpc.call.take().expect("one owned native call");
+    let raw = rpc
+        .host
+        .object_rpc
+        .call_async(
+            &rpc.target,
+            outgoing,
+            rpc.options.cluster_rpc_options(),
+            rpc.options.observe_connectivity,
+        )
+        .await;
+    #[cfg(any(test, feature = "test-support"))]
+    if let (Some(observation), Err(error)) = (observation.as_mut(), &raw) {
+        observation.returned(&Err(DfsPeerTransportError::from_network(error.clone())));
+    }
+    rpc.complete_async(raw, |decoded| {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(observation) = observation.as_mut() {
+            observation.returned(decoded);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = decoded;
+    }).await
+}
+
+fn prepare_native_repair_rpc(
+    prepared: PreparedNativeRepairCustody,
+    call: crate::DfsRoutedCall,
+    options: DfsObjectRpcSendOptions,
+    deadline: Option<Instant>,
+) -> Result<NativeRepairRpc, crate::DfsError> {
     let invalid = || crate::DfsError::Metadata {
         message: "native custody send changed its admitted original/body".into(),
     };
@@ -2325,55 +2491,76 @@ pub(crate) fn send_prepared_native_repair_custody(
     {
         return Err(invalid());
     }
-    let deadline = options
-        .overall_timeout
-        .map(|budget| Instant::now().checked_add(budget).ok_or_else(invalid))
-        .transpose()?;
     prepared.admission.revalidate_before_dispatch()?;
-    let host = prepared
-        .host
-        .upgrade()
-        .ok_or_else(|| crate::DfsError::Metadata {
-            message: "native custody prepared host is no longer registered".into(),
-        })?;
-    call_native_original_repair_owned_with_call(
-        &prepared.data_dir,
+    let host = prepared.host.upgrade().ok_or_else(invalid)?;
+    #[cfg(any(test, feature = "test-support"))]
+    let route = if prepared.scope.is_some() {
+        NativeRepairReturnRoute::DataOnly(Some(prepared.admission))
+    } else {
+        NativeRepairReturnRoute::Serving(prepared.admission)
+    };
+    #[cfg(not(any(test, feature = "test-support")))]
+    let route = NativeRepairReturnRoute::Serving(prepared.admission);
+    NativeRepairRpc::prepare(
+        prepared.data_dir,
         prepared.owner,
         host,
         prepared.attempt,
         call,
         options,
         deadline,
-        Some(prepared.scope),
-        Some(prepared.admission),
+        #[cfg(any(test, feature = "test-support"))]
+        prepared.scope,
+        route,
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn call_native_original_repair_owned_with_call(
-    data_dir: &SinomoDataDir,
+/// Per-call ownership only, not a retry machine or stored serving permission.
+/// Its two callers poll the concrete native host future, then immediately call
+/// complete; no raw inbox, arbitrary peer or saved DATA can enter that route.
+struct NativeRepairRpc {
+    data_dir: SinomoDataDir,
     owner: Arc<DfsDataOwnerLock>,
     host: Arc<DfsRuntimeHost>,
+    queue: crate::LocalDfsRepairQueueStore,
     attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
-    call: crate::DfsRoutedCall,
-    mut options: DfsObjectRpcSendOptions,
+    expected: DfsMessageCommand,
+    target: NodeId,
+    call: Option<ObjectRpcCall>,
+    options: DfsObjectRpcSendOptions,
     deadline: Option<Instant>,
+    #[cfg(any(test, feature = "test-support"))]
     scope: Option<Arc<NativeRepairCustodyScope>>,
-    producer_admission: Option<crate::publication_guard::NativeRepairProducerAdmission>,
-) -> Result<OwnedOriginalRepairCompletion, crate::DfsError> {
+    route: NativeRepairReturnRoute,
+}
+impl NativeRepairRpc {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        data_dir: SinomoDataDir,
+        owner: Arc<DfsDataOwnerLock>,
+        host: Arc<DfsRuntimeHost>,
+        attempt: crate::repair_queue_store::RepairOriginalAttemptWitness,
+        call: crate::DfsRoutedCall,
+        mut options: DfsObjectRpcSendOptions,
+        deadline: Option<Instant>,
+        #[cfg(any(test, feature = "test-support"))] scope: Option<Arc<NativeRepairCustodyScope>>,
+        route: NativeRepairReturnRoute,
+) -> Result<Self, crate::DfsError> {
     let invalid = |detail: &str| crate::DfsError::Metadata {
         message: format!("native original Repair completion {detail}"),
     };
-    let possibly_applied = |detail: String| crate::DfsError::NetworkDelivery {
-        message: format!("native original Repair completion {detail}"),
-        delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-    };
-    let paths = DaemonPaths::new(data_dir);
-    let current_host = registered_dfs_runtime_host(data_dir)
-        .map_err(|e| invalid(&e.to_string()))?
-        .ok_or_else(|| invalid("has no registered native host"))?;
-    let current_owner =
-        require_daemon_dfs_data_owner_lock(&paths).map_err(|e| invalid(&e.to_string()))?;
+    // Relative options are never restarted after local preparation. The
+        // transport supplies its original absolute deadline alongside options.
+        if options.overall_timeout.is_some() && deadline.is_none() {
+            return Err(invalid(
+                "has a relative budget without its original absolute deadline",
+            ));
+        }
+        let current_host = registered_dfs_runtime_host(&data_dir)
+            .map_err(|error| invalid(&error.to_string()))?
+            .ok_or_else(|| invalid("has no registered host"))?;
+        let current_owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(&data_dir))
+        .map_err(|error| invalid(&error.to_string()))?;
     if !Arc::ptr_eq(&host, &current_host)
         || !Arc::ptr_eq(&owner, &current_owner)
         || host.shutting_down.is_cancelled()
@@ -2382,101 +2569,192 @@ fn call_native_original_repair_owned_with_call(
     }
     let layout = owner
         .selected_original_data_layout()
-        .map_err(|e| invalid(&e.to_string()))?
-        .ok_or_else(|| invalid("requires its actual selected queue owner"))?;
-    let queue = layout.queue()?;
-    queue.revalidate_original_repair_attempt_witness(&attempt)?;
-    let inspection = owner
-        .repair_payload_inspection_context()
-        .map_err(|e| invalid(&e.to_string()))?;
-    inspection.inspect(attempt.payload_root())?;
-    let target = attempt.carrier().target_node_id.clone();
-    let (expected, call) = crate::node_transport::dfs_routed_call_rpc_call(call)
-        .map_err(crate::DfsError::from_network)?;
-    // Reuse the last gate of the existing detached sender: a closed/observed
-    // birth or a frozen source cannot send merely because historical Attempt
-    // DATA remains. This branch neither records a delivery nor renews admission.
-    let dispatch = crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
-        data_dir,
-        crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
-            message: expected.routed_message.clone(),
-        },
-        Some(&layout),
-        Some(&inspection),
-    )?;
-    if matches!(
-        dispatch,
-        crate::node_transport::DfsBackgroundReplicaDispatch::Fenced
-    ) {
-        return Err(invalid("source dispatch is fenced"));
-    }
-    if let Some(deadline) = deadline {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| invalid("caller deadline expired before dispatch"))?;
-        options.overall_timeout = Some(remaining);
-    }
-    // Concrete native owner only: neither DfsMessageSender, arbitrary peer
-    // traits nor the generic decoded inbox can enter the constructor below.
-    let peer = DaemonDfsPeerTransport {
-        host: Arc::clone(&host),
-        native_prefix: None, // Repair keeps its separate owned-return family.
-    };
-    #[cfg(any(test, feature = "test-support"))]
-    let mut native_attempt = crate::native_shard_trace::begin_rpc_attempt(&target, &expected);
-    let raw_return = peer.host.object_rpc.call(
-        &target,
-        call,
-        options.cluster_rpc_options(),
-        options.observe_connectivity,
-    );
-    #[cfg(any(test, feature = "test-support"))]
-    if let (Some(observation), Err(error)) = (native_attempt.as_mut(), &raw_return) {
-        observation.returned(&Err(DfsPeerTransportError::from_network(error.clone())));
-    }
-    let raw_return = raw_return.map_err(crate::DfsError::from_network)?;
-    let decoded = crate::node_transport::dfs_message_response_from_rpc_result_sync(raw_return);
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(observation) = native_attempt.as_mut() {
-        observation.returned(&decoded);
-    }
-    let decoded = decoded.map_err(|error| possibly_applied(error.to_string()))?;
-    let returned =
-        crate::node_transport::validate_original_repair_owned_rpc_return(&expected, decoded)
-            .map_err(|error| possibly_applied(error.to_string()))?;
-    let revalidate = || -> Result<(), crate::DfsError> {
-        let current_host = registered_dfs_runtime_host(data_dir)
-            .map_err(|error| invalid(&error.to_string()))?
-            .ok_or_else(|| invalid("registered native host disappeared during RPC"))?;
-        let current_owner = require_daemon_dfs_data_owner_lock(&paths)
+        .map_err(|error| invalid(&error.to_string()))?
+        ;
+        let queue = if let Some(layout) = &layout {
+            layout.queue()?
+        } else {
+            if !matches!(&route, NativeRepairReturnRoute::Serving(_)) {
+                return Err(invalid("DATA-only primitive requires its actual selected physical owner",
+                ));
+            }
+            crate::LocalDfsRepairQueueStore::new(
+                owner
+                    .checked_default_repair_queue_path()
+                    .map_err(|error| invalid(&error.to_string()))?,
+            )
+        };
+        queue .revalidate_original_repair_attempt_witness(&attempt)?;
+        let inspection = owner
+            .repair_payload_inspection_context()
             .map_err(|error| invalid(&error.to_string()))?;
-        if !Arc::ptr_eq(&host, &current_host)
-            || !Arc::ptr_eq(&owner, &current_owner)
+        inspection.inspect(attempt.payload_root())?;
+        let target = attempt.carrier().target_node_id.clone();
+        let (expected, call) = crate::node_transport::dfs_routed_call_rpc_call(call)
+            .map_err(crate::DfsError::from_network)?;
+        let event = crate::node_transport::DfsBackgroundReplicaDeliveryEvent::BeforeDispatch {
+            message: expected.routed_message.clone(),
+        };
+        let dispatch = if let NativeRepairReturnRoute::Serving(admission) = &route {
+            crate::runtime_message::checkpoint_detached_native_original_delivery(
+                &data_dir,
+                event,
+                layout.as_deref(),
+                Some(&inspection),
+                admission,
+                &attempt,
+            )?} else {
+            crate::runtime_message::checkpoint_detached_replica_delivery_with_layout(
+                &data_dir,
+                event,
+                layout.as_deref(),
+                Some(&inspection),
+            )?};
+    match dispatch {
+        crate::node_transport::DfsBackgroundReplicaDispatch::Observed(_) => {}
+        crate::node_transport::DfsBackgroundReplicaDispatch::Fenced => {
+            return Err(invalid("source dispatch is fenced"));
+        }
+        crate::node_transport::DfsBackgroundReplicaDispatch::Settled { original_validation_error, .. } => return Err(original_validation_error),
+        }
+    if let Some(deadline) = deadline {
+        options.overall_timeout = Some(
+                deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| invalid("caller deadline expired before actual RPC"))?,
+            );
+        }
+        Ok(Self {
+            data_dir,
+            owner,
+            host,
+            queue,
+            attempt,
+            expected,
+            target,
+            call: Some(call),
+            options,
+            deadline,
+            #[cfg(any(test, feature = "test-support"))]
+            scope,
+            route,
+        })
+    }
+
+    // Module-private and reached only from the concrete native call/call_async
+    // returns above (plus the existing selected DATA-only primitive below).
+    fn complete(
+        self,
+        raw: Result<ObjectRpcResult, NetworkError>,
+        observed: impl FnMut(&Result<DfsMessageResponse, DfsPeerTransportError>),
+    ) -> Result<NativeOriginalRepairReturn, crate::DfsError> {
+        let decoded = crate::node_transport::dfs_message_response_from_rpc_result_sync(
+            raw.map_err(crate::DfsError::from_network)?,
+        );
+        self.finish_matched_return(decoded, observed)
+    }
+
+    async fn complete_async(
+        self,
+        raw: Result<ObjectRpcResult, NetworkError>,
+        observed: impl FnMut(&Result<DfsMessageResponse, DfsPeerTransportError>),
+    ) -> Result<NativeOriginalRepairReturn, crate::DfsError> {
+        let decoded = crate::node_transport::dfs_message_response_from_rpc_result(
+            raw.map_err(crate::DfsError::from_network)?,
+        ).await;
+        self.finish_matched_return(decoded, observed)
+    }
+
+    fn finish_matched_return(
+        self,
+        decoded: Result<DfsMessageResponse, DfsPeerTransportError>,
+        mut observed: impl FnMut(&Result<DfsMessageResponse, DfsPeerTransportError>),
+    ) -> Result<NativeOriginalRepairReturn, crate::DfsError> {
+        let uncertain = |detail: String| crate::DfsError::NetworkDelivery {
+            message: format!("native original Repair completion {detail}"),
+            delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        };
+        observed(&decoded);
+        let returned = crate::node_transport::validate_original_repair_owned_rpc_return(
+            &self.expected,
+            decoded.map_err(|error| uncertain(error.to_string()))?,
+        )
+        .map_err(|error| uncertain(error.to_string()))?;
+        let current_host = registered_dfs_runtime_host(&self.data_dir)
+            .map_err(|error| uncertain(error.to_string()))?
+            .ok_or_else(|| uncertain("registered native host disappeared during RPC".into()))?;
+        let current_owner = require_daemon_dfs_data_owner_lock(&DaemonPaths::new(&self.data_dir))
+            .map_err(|error| uncertain(error.to_string()))?;
+        if !Arc::ptr_eq(&self.host, &current_host)
+            || !Arc::ptr_eq(&self.owner, &current_owner)
             || current_host.shutting_down.is_cancelled()
         {
-            return Err(invalid("native host or DATA owner changed during RPC"));
+            return Err(uncertain(
+                "native host or DATA owner changed during RPC".into(),
+            ));
         }
-        current_owner
-            .selected_original_data_layout()
-            .map_err(|error| invalid(&error.to_string()))?
-            .ok_or_else(|| invalid("selected owner disappeared during RPC"))?;
-        queue.revalidate_original_repair_attempt_witness(&attempt)?;
-        inspection.inspect(attempt.payload_root())?;
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(invalid("caller deadline expired before completion capture"));
+        self.queue
+            .revalidate_original_repair_attempt_witness(&self.attempt)
+            .map_err(|error| uncertain(error.to_string()))?;
+        self.owner
+            .repair_payload_inspection_context()
+            .map_err(|error| uncertain(error.to_string()))?
+            .inspect(self.attempt.payload_root())
+            .map_err(|error| uncertain(error.to_string()))?;
+        if matches!(&self.route, NativeRepairReturnRoute::Serving(_)) {
+            // Preserve this actual matched response as DATA before any later
+            // serving admission or publication can fail. This is not an ACK or
+            // current-holder witness and never grants the fresh typestate.
+            let crate::DfsNetworkMessage::RepairReplicaResponse(response) = &returned.message
+            else {
+                return Err(uncertain(
+                    "matched native return is not RepairReplicaResponse".into(),
+                ));
+            };
+            self.queue
+                .observe_original_repair_result(
+                    &self.expected.routed_message.source_node_id,
+                    response,
+                )
+                .map_err(|error| uncertain(error.to_string()))?
+                .ok_or_else(|| {
+                    uncertain("actual matched native return lost complete Original custody".into())
+                })?;
         }
-        Ok(())
-    };
-    revalidate().map_err(|error| possibly_applied(error.to_string()))?;
-    Ok(OwnedOriginalRepairCompletion {
-        attempt,
-        returned,
-        rpc_request_id: expected.request_id,
-        owner,
-        scope,
-        producer_admission: producer_admission.map(|proof| proof.into_historical()),
-    })
+        if let NativeRepairReturnRoute::Serving(admission) = &self.route {
+            admission
+                .revalidate_before_dispatch()
+                .map_err(|error| uncertain(error.to_string()))?;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(uncertain(
+                "original caller deadline expired before completion capture".into(),
+            ));
+        }
+        let (fresh, producer_admission) = self.route.into_admission();
+        let completion = OwnedOriginalRepairCompletion {
+            attempt: self.attempt,
+            returned,
+            rpc_request_id: self.expected.request_id,
+            owner: self.owner,
+            #[cfg(any(test, feature = "test-support"))]
+    scope: self.scope,
+            producer_admission,
+        };
+        if fresh {
+            // The SOLE constructor: the SAME concrete native RPC just returned,
+            // decoded and passed all original/outer-request/physical checks.
+            Ok(NativeOriginalRepairReturn::Fresh(
+                FreshOriginalRepairReturn { completion },
+            ))
+        } else {
+            Ok(NativeOriginalRepairReturn::Data(completion))
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2581,15 +2859,6 @@ pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)
-}
-
-#[cfg(test)]
-pub(super) fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
-    Arc::new(|_endpoint, _command, _timeout| {
-        Err(DfsMetadataPeerTransportError::new(
-            "test DFS metadata snapshot sender has no daemon runtime",
-        ))
-    })
 }
 
 // DFS inspection request/response types live in `sinomo-dfs`; this module only

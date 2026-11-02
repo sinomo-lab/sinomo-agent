@@ -20,9 +20,18 @@ selected a different directory, not that state was deleted.
 
 ## Process Lifecycle
 
-`sinomo install` performs initial setup, registers per-user startup and starts
-main and shadow daemons by default. It does not invoke the graphical installer
-or replace an evolved release. `--no-start` stages registration without launching
+`sinomo install` and graphical setup verify and reconcile the same installation.
+Fresh setup registers per-user startup and starts main and shadow by default;
+repeat setup preserves existing versions and omitted settings without restarting
+healthy daemons. Use `--add-to-path`/`--no-add-to-path`,
+`--startup`/`--no-startup`, `--menu-shortcut`/`--no-menu-shortcut`, and
+`--desktop-shortcut`/`--no-desktop-shortcut` to change integrations. It does not invoke the graphical installer
+or replace an evolved release by default. Explicit `sinomo install --repair`, or
+graphical **Repair binaries**, replaces the packaged runtime even when the daemon
+cannot start, retaining application data and settings. Downgrades are unsupported;
+repair does not migrate retained data or revert repaired binaries after a startup
+failure. See [installation](getting-started.md) for package requirements.
+`--no-start` stages registration or repair without launching
 new processes. The CLI and graphical uninstaller both stop the deployment and
 remove its recorded startup integration, retaining data unless deletion is
 explicitly requested.

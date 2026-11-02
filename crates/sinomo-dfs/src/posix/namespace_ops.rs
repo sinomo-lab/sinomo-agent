@@ -1128,16 +1128,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 #[cfg(test)]
 mod atomic_namespace_tests {
     use super::*;
-    use crate::{
-        DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataMutation, DfsMetadataShardAssignment,
-        DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceCommand, DfsNamespacePosixError,
-        DfsNamespaceResult, DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity,
-        LocalContentStore, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
-        SharedDfsControlPlaneKvClient, distributed_sifs, open_local_sharded_metadata_backend,
-    };
     use crate::{DfsMessageCommand, DfsMessageResponse, DfsNetworkMessage};
-    use sinomo_core::DfsObjectPolicy;
-    use sinomo_core::node::NodeId;
+    use crate::{
+        DfsMetadataMutation, DfsNamespaceCommand, DfsNamespacePosixError, DfsNamespaceResult,
+        DfsRoutedMessage,
+    };
+
     use std::time::{Duration, Instant};
 
     #[test]

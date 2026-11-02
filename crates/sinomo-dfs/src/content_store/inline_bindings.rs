@@ -48,6 +48,7 @@ const INLINE_FRAME_HEADER_LIMIT: u32 = 64 * 1024;
 const INLINE_OWNER_LOCK: &str = "content-owner.lock";
 const INLINE_CURRENT: &str = "current.sobj";
 const INLINE_CATALOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const INLINE_CATALOG_REPLAY_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 type VersionKey = (String, String);
 
@@ -536,6 +537,7 @@ fn encode_inline<T: Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|error| ContentStoreError::Serde(error.to_string()))
 }
 
+#[cfg(test)]
 fn read_catalog(root: &Path, incarnation: &str) -> Result<InlineCatalog> {
     read_catalog_for_format(root, incarnation, INLINE_FORMAT_VERSION)
 }
@@ -1319,10 +1321,15 @@ fn replay_catalog(root: &Path, catalog: &InlineCatalog) -> Result<(InlineBinding
     let mut active_end = 0;
     for (index, segment) in catalog.segments.iter().enumerate() {
         let path = segment_path(root, catalog.generation, segment.id);
-        let mut file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
+        let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
             path: path.clone(),
             source,
         })?;
+        // Each pass still reads and verifies every frame; batch only kernel reads.
+        let mut file = std::io::BufReader::with_capacity(
+            INLINE_CATALOG_REPLAY_READ_BUFFER_BYTES,
+            file,
+        );
         let sealed = index + 1 != catalog.segments.len();
         loop {
             match read_frame(&mut file, &path, frame_limits()).map_err(inline_error)? {

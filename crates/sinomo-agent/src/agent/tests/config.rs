@@ -790,6 +790,11 @@ fn skill_activation_loads_bundled_resources_on_demand() {
 fn agent_can_persist_learned_shortcut_as_skill_update() {
     let root = sinomo_testdir::TestDir::new("sinomo-agent-skill-update-task");
     let data_dir = SinomoDataDir::new(&root);
+    let _native = sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+        "sinomo-agent-skill-update-task",
+        data_dir.clone(),
+    )
+    .expect("native SIFS owner");
     let store = crate::SkillCatalogSifsStore::open(Some(data_dir.root())).expect("store");
     let original_text = "---\nname: shortcut-runner\ndescription: Run the long path.\n---\n\n# Shortcut Runner\nUse the long path.\n";
     let original_write = crate::SkillCatalogWrite::from_markdown_skill(

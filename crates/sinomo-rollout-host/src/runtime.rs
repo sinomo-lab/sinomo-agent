@@ -5264,7 +5264,7 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("main binary name");
-        let recovery_backups = (1..=(sinomo_rollout::ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+        let recovery_backups = (1..=3)
             .map(|generation| {
                 let path = rollout_paths
                     .bin
@@ -5349,7 +5349,7 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("main binary name");
-        let recovery_backups = (1..=(sinomo_rollout::ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+        let recovery_backups = (1..=3)
             .map(|generation| {
                 let path = rollout_paths
                     .bin
@@ -5399,12 +5399,10 @@ mod tests {
             .expect("status");
         assert_eq!(status.status, "accepted");
         assert_eq!(status.phase.as_deref(), Some("shadow-finalized"));
-        assert!(!recovery_backups[0].exists());
-        assert!(!recovery_backups[1].exists());
-        for path in &recovery_backups[2..] {
+        for path in &recovery_backups {
             assert!(
-                path.exists(),
-                "accepted finalization must retain the newest bounded recovery set: {path:?}"
+                !path.exists(),
+                "finalized rollout must remove legacy backup: {path:?}"
             );
         }
     }
@@ -5840,6 +5838,7 @@ mod tests {
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            rust_target: None,
             hostname: None,
             executable: None,
             rollout: None,

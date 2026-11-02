@@ -11,7 +11,6 @@ use sinomo_dfs::{
     LocalSobjMetadataBackend, NetworkedDfsRangeReadOutcome, NetworkedDfsService,
     NetworkedDfsServiceEvent,
 };
-use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Result as IoResult};

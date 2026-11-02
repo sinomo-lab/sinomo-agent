@@ -399,3 +399,65 @@ fn partial_append_acknowledges_only_entries_present_in_the_request() {
     assert_eq!(node.applied_index(), 2);
     assert!(node.store().get("uncommitted").is_none());
 }
+
+#[test]
+fn anchored_snapshot_starts_a_fresh_node_where_replication_continues() {
+    let root = sinomo_testdir::TestDir::new("sinomo-kv-anchored-snapshot");
+    let leader_paths = ClusterKvPaths::new(root.path().join("leader"));
+    let leader = id("anchor_leader");
+    let mut node = leader_paths.open_raft_node(&leader).unwrap();
+    node.become_leader(3).unwrap();
+    for key in ["/a", "/b"] {
+        let appended = node.append_local_command(3, put(key)).unwrap();
+        node.commit_to(appended.index).unwrap();
+    }
+    let applied_index = node.applied_index();
+    drop(node);
+    let anchored = read_cluster_kv_raft_anchored_snapshot_before(
+        &leader_paths.raft_wal_paths(&leader),
+        &leader,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .expect("resident leader")
+    .unwrap();
+    assert_eq!(
+        (anchored.last_included_index, anchored.last_included_term),
+        (applied_index, 3)
+    );
+
+    let joiner_paths = ClusterKvPaths::new(root.path().join("joiner"));
+    let joiner = id("anchor_joiner");
+    let store = joiner_paths.raft_store();
+    assert!(
+        store
+            .install_anchored_snapshot(&joiner, anchored.clone())
+            .unwrap()
+    );
+    assert!(
+        !store
+            .install_anchored_snapshot(&joiner, anchored.clone())
+            .unwrap(),
+        "a node already at the anchor keeps its state"
+    );
+
+    let mut node = leader_paths.open_raft_node(&leader).unwrap();
+    let appended = node.append_local_command(3, put("/c")).unwrap();
+    node.commit_to(appended.index).unwrap();
+    let entries = node.log().to_vec();
+    let leader_revision = node.store().revision();
+    drop(node);
+
+    let mut joined =
+        DurableRaftKvNode::open(joiner.clone(), joiner_paths.raft_wal_paths(&joiner)).unwrap();
+    assert_eq!(joined.applied_index(), anchored.last_included_index);
+    assert!(joined.store().get("/b").is_some());
+    // Replication resumes after the anchor. Resending the covered prefix does
+    // not apply it twice.
+    let response = joined
+        .append_entries(append(3, "anchor_leader", 0, 0, entries, appended.index))
+        .unwrap();
+    assert!(response.success);
+    assert_eq!(joined.applied_index(), appended.index);
+    assert_eq!(joined.store().revision(), leader_revision);
+    assert!(joined.store().get("/c").is_some());
+}

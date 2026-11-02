@@ -12,7 +12,6 @@ const DRIVER_CATEGORY: &str = "dfs.test.native.peer";
 const DRIVER_OPERATION: &str = "dfs.test.native.peer.query";
 const OP_CAP: Duration = sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
 const MAX_REPLY: usize = 1024 * 1024;
-type PrefixRouteHints = std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,21 +72,14 @@ enum ProbeKind {
     EndpointPing,
     EndpointDfsStatus,
     EndpointWrongPeer,
-    RegisteredEndpointPing,
-    FormationEndpointPing,
-    RegisteredEndpointWrongPeer,
-    RegisteredEndpointWrongId,
     RequestMetadataMembers,
     PreparePrefixBaseline,
-    ObserveOwnedEndpoint,
     PrefixRound,
-    PrefixRoundWrongKey,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProbePath {
     NodeRouting,
     AuthenticatedEndpoint,
-    RegisteredNativeEndpoint,
     NativePrefixOwner,
     NativeMetadataConfiguration,
 }
@@ -95,12 +87,10 @@ impl ProbeKind {
     fn path(self) -> ProbePath {
         match self {
             Self::Ping | Self::DfsStatus => ProbePath::NodeRouting,
-            Self::RegisteredEndpointPing
-            | Self::FormationEndpointPing
-            | Self::RegisteredEndpointWrongPeer
-            | Self::RegisteredEndpointWrongId => ProbePath::RegisteredNativeEndpoint,
-            Self::PrefixRound | Self::PrefixRoundWrongKey => ProbePath::NativePrefixOwner,
-            Self::RequestMetadataMembers | Self::PreparePrefixBaseline | Self::ObserveOwnedEndpoint => ProbePath::NativeMetadataConfiguration,
+            Self::PrefixRound => ProbePath::NativePrefixOwner,
+            Self::RequestMetadataMembers | Self::PreparePrefixBaseline => {
+                ProbePath::NativeMetadataConfiguration
+            }
             _ => ProbePath::AuthenticatedEndpoint,
         }
     }
@@ -111,8 +101,6 @@ struct DriverRequest {
     target: NodeId,
     nonce: String,
     kind: ProbeKind,
-    owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
-    prefix_contact_hints: Option<PrefixRouteHints>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -578,34 +566,11 @@ fn probe(
     nonce: String,
     budget: Duration,
 ) -> TestResult<DriverResponse> {
-    probe_with_contact(node, target, kind, nonce, budget, None)
-}
-fn probe_with_contact(
-    node: &mut NativeNode,
-    target: &NodeId,
-    kind: ProbeKind,
-    nonce: String,
-    budget: Duration,
-    owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
-) -> TestResult<DriverResponse> {
-    probe_with_routes(node, target, kind, nonce, budget, owned_contact_hint, None)
-}
-fn probe_with_routes(
-    node: &mut NativeNode,
-    target: &NodeId,
-    kind: ProbeKind,
-    nonce: String,
-    budget: Duration,
-    owned_contact_hint: Option<sinomo_core::ClusterEndpointRecord>,
-    prefix_contact_hints: Option<PrefixRouteHints>,
-) -> TestResult<DriverResponse> {
     let identity = node.alive_identity()?;
     let request = DriverRequest {
         target: target.clone(),
         nonce: nonce.clone(),
         kind,
-        owned_contact_hint,
-        prefix_contact_hints,
     };
     let response = local_rpc(
         node,
@@ -631,10 +596,7 @@ fn probe_with_routes(
             contact.transport,
             sinomo_core::ClusterTransportKind::Loopback | sinomo_core::ClusterTransportKind::LanTcp
         ));
-        let selected = if matches!(
-            kind,
-            ProbeKind::EndpointWrongPeer | ProbeKind::RegisteredEndpointWrongPeer
-        ) {
+        let selected = if matches!(kind, ProbeKind::EndpointWrongPeer) {
             node.contacts
                 .keys()
                 .find(|id| *id != &node.input.node_id && *id != target)
@@ -648,11 +610,7 @@ fn probe_with_routes(
             "diagnostic contact may name only its actual owned listener"
         );
     }
-    if matches!(
-        kind.path(),
-        ProbePath::AuthenticatedEndpoint | ProbePath::RegisteredNativeEndpoint
-    ) && result.result.is_ok()
-    {
+    if kind.path() == ProbePath::AuthenticatedEndpoint && result.result.is_ok() {
         assert!(
             result.contact.is_some(),
             "successful endpoint result lacks its selected owned contact"
@@ -662,13 +620,7 @@ fn probe_with_routes(
     if let Ok(reply) = &result.result {
         assert!(reply.body.len() <= MAX_REPLY);
         match kind {
-            ProbeKind::Ping
-            | ProbeKind::EndpointPing
-            | ProbeKind::EndpointWrongPeer
-            | ProbeKind::RegisteredEndpointPing
-            | ProbeKind::FormationEndpointPing
-            | ProbeKind::RegisteredEndpointWrongPeer
-            | ProbeKind::RegisteredEndpointWrongId => {
+            ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
                 assert_eq!(
                     reply.route,
                     sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE
@@ -679,7 +631,7 @@ fn probe_with_routes(
                 assert_eq!(&ping.responder_node_id, target);
                 assert_eq!(reply.responder_node_id.as_deref(), Some(target.as_str()));
             }
-            ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey => {
+            ProbeKind::PrefixRound => {
                 assert_eq!(reply.route, DRIVER_ROUTE);
                 assert_eq!(target, &node.input.node_id);
                 let data: serde_json::Value =
@@ -688,13 +640,6 @@ fn probe_with_routes(
                 assert_eq!(data["family"], "native-prefix-full-assignment");
                 // This is DATA describing checks inside the actual owner. No
                 // private round/capability can be reconstructed in the parent.
-            }
-            ProbeKind::ObserveOwnedEndpoint => {
-                assert_eq!(reply.route, DRIVER_ROUTE);
-                assert_eq!(target, &node.input.node_id);
-                let endpoint: sinomo_core::ClusterEndpointRecord = sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
-                assert_eq!(endpoint.node_id, node.input.node_id);
-                assert_eq!(endpoint.address, node.hello.as_ref().unwrap().address);
             }
             ProbeKind::PreparePrefixBaseline => {
                 assert_eq!(reply.route, DRIVER_ROUTE);
@@ -751,45 +696,6 @@ fn record_probe(
     report["probes"].as_array_mut().unwrap().push(summary);
     Ok(())
 }
-fn observed_owned_contact(
-    node: &mut NativeNode,
-    report: &serde_json::Value,
-) -> TestResult<sinomo_core::ClusterEndpointRecord> {
-    let identity = node.alive_identity()?;
-    let entry = report["probes"].as_array().unwrap().iter().rev().find(|entry| {
-        entry["source"] == node.input.node_id.as_str()
-            && entry["source_pid"] == identity.pid
-            && entry["phase"] == "target-owned-native-directory-observation"
-            && !entry["source_contact"].is_null()
-    }).ok_or("same owned process has no actual observed local endpoint; no synthesis")?;
-    let endpoint: sinomo_core::ClusterEndpointRecord =
-        serde_json::from_value(entry["source_contact"].clone())?;
-    assert_eq!(endpoint.node_id, node.input.node_id);
-    assert_eq!(endpoint.address, node.hello.as_ref().unwrap().address);
-    Ok(endpoint) // Route DATA only; the native carrier still checks current identity.
-}
-// Query the SAME directory composition used by this actual native receiver's
-// authenticated routed handshake. A bootstrap file alone is not that view.
-fn current_owned_contact(
-    node: &mut NativeNode, deadline: Instant, root: &Path, report: &mut serde_json::Value,
-) -> TestResult<sinomo_core::ClusterEndpointRecord> {
-    let target = node.input.node_id.clone();
-    let result = probe(node, &target, ProbeKind::ObserveOwnedEndpoint,
-        format!("owned-endpoint-{}", sinomo_core::Id::generate()),
-        OP_CAP.min(deadline.saturating_duration_since(Instant::now())));
-    record_probe(root, report, "target-owned-native-directory-observation", &result)?;
-    let reply = result?.result.map_err(|e| e.error)?;
-    Ok(sinomo_core::object::serde_ext::from_bytes(&reply.body)?)
-}
-
-fn owned_prefix_route_hints(nodes: &mut [NativeNode], report: &serde_json::Value)
-    -> TestResult<PrefixRouteHints>
-{
-    nodes.iter_mut().map(|node| {
-        let endpoint = observed_owned_contact(node, report)?;
-        Ok((node.input.node_id.clone(), endpoint))
-    }).collect()
-}
 fn wait_for_native_ping(
     nodes: &mut [NativeNode],
     source: usize,
@@ -807,13 +713,13 @@ fn wait_for_native_ping(
         }
         let target_id = nodes[target].input.node_id.clone();
         let nonce = format!("baseline-{source}-{target}-{}", sinomo_core::Id::generate());
-        let result = (|| {
-            let hint = if matches!(kind, ProbeKind::RegisteredEndpointPing | ProbeKind::FormationEndpointPing) {
-                Some(current_owned_contact(&mut nodes[target], deadline, root, report)?)
-            } else { None };
-            probe_with_contact(&mut nodes[source], &target_id, kind, nonce,
-                OP_CAP.min(deadline.saturating_duration_since(Instant::now())), hint)
-        })();
+        let result = probe(
+            &mut nodes[source],
+            &target_id,
+            kind,
+            nonce,
+            OP_CAP.min(deadline.saturating_duration_since(Instant::now())),
+        );
         record_probe(root, report, "baseline-native-ping", &result)?;
         if matches!(&result,Ok(value) if value.result.is_ok()) {
             if Instant::now() >= deadline {
@@ -971,23 +877,18 @@ fn observe_native_prefix(
     report: &mut serde_json::Value,
     phase: &str,
     budget: Duration,
-    hints: &PrefixRouteHints,
 ) -> TestResult<Option<serde_json::Value>> {
     let local = node.input.node_id.clone();
     let nonce = format!("owned-prefix-{}", sinomo_core::Id::generate());
-    write_data(&root.join(format!("prefix-request-{}.sobj", nonce)), &DriverRequest {
-        target: local.clone(), nonce: nonce.clone(), kind: ProbeKind::PrefixRound,
-        owned_contact_hint: None, prefix_contact_hints: Some(hints.clone()),
-    })?;
-    let result = probe_with_routes(
-        node,
-        &local,
-        ProbeKind::PrefixRound,
-        nonce,
-        budget,
-        None,
-        Some(hints.clone()),
-    );
+    write_data(
+        &root.join(format!("prefix-request-{}.sobj", nonce)),
+        &DriverRequest {
+            target: local.clone(),
+            nonce: nonce.clone(),
+            kind: ProbeKind::PrefixRound,
+        },
+    )?;
+    let result = probe(node, &local, ProbeKind::PrefixRound, nonce, budget);
     record_probe(root, report, phase, &result)?;
     let Ok(response) = result else {
         return Ok(None);
@@ -1021,15 +922,12 @@ fn observe_native_prefix(
 fn run_native_process_case(
     endpoint_mode: bool,
     retained_wrong_owner: Option<bool>,
-    registered_endpoint: bool,
     prefix_round: bool,
 ) {
     let fixture = sinomo_testdir::TestDir::new("dfs-per-node-native-process-control");
     let root = fixture.path().to_path_buf();
     let mut nodes = Vec::new();
-    let ping_kind = if registered_endpoint {
-        ProbeKind::RegisteredEndpointPing
-    } else if endpoint_mode {
+    let ping_kind = if endpoint_mode {
         ProbeKind::EndpointPing
     } else {
         ProbeKind::Ping
@@ -1066,8 +964,10 @@ fn run_native_process_case(
                 &mut nodes,
                 source,
                 target,
+                // Node-routed pings record the connectivity that the
+                // PREFIX round's node-targeted calls route over.
                 if prefix_round {
-                    ProbeKind::FormationEndpointPing
+                    ProbeKind::Ping
                 } else {
                     ping_kind
                 },
@@ -1100,11 +1000,7 @@ fn run_native_process_case(
             let wrong = probe(
                 &mut nodes[0],
                 &intended,
-                if registered_endpoint {
-                    ProbeKind::RegisteredEndpointWrongPeer
-                } else {
-                    ProbeKind::EndpointWrongPeer
-                },
+                ProbeKind::EndpointWrongPeer,
                 format!("wrong-contact-{}", sinomo_core::Id::generate()),
                 OP_CAP,
             );
@@ -1121,44 +1017,6 @@ fn run_native_process_case(
             nodes[1].alive_identity()?;
             nodes[2].alive_identity()?;
         }
-        if registered_endpoint {
-            let intended = nodes[2].input.node_id.clone();
-            let bad = probe(
-                &mut nodes[0],
-                &intended,
-                ProbeKind::RegisteredEndpointWrongId,
-                format!("unknown-endpoint-{}", sinomo_core::Id::generate()),
-                OP_CAP,
-            );
-            record_probe(
-                &root,
-                &mut report,
-                "native-unknown-endpoint-id-refusal",
-                &bad,
-            )?;
-            assert!(
-                matches!(&bad, Ok(value) if value.result.is_err() && value.contact.is_some()),
-                "unknown endpoint must reach actual registered native refusal: {bad:?}"
-            );
-            nodes[2].alive_identity()?;
-            let good = probe(
-                &mut nodes[0],
-                &intended,
-                ProbeKind::RegisteredEndpointPing,
-                format!("after-unknown-endpoint-{}", sinomo_core::Id::generate()),
-                OP_CAP,
-            );
-            record_probe(
-                &root,
-                &mut report,
-                "actual-valid-endpoint-after-refusal",
-                &good,
-            )?;
-            assert!(
-                matches!(&good, Ok(value) if value.result.is_ok()),
-                "same live peer must still answer its genuine endpoint: {good:?}"
-            );
-        }
         if prefix_round {
             let mut complete = 0;
             let mut observations = Vec::new();
@@ -1173,11 +1031,17 @@ fn run_native_process_case(
                 if !membership_request_done {
                     let source = nodes[0].input.node_id.clone();
                     let nonce = format!("fixture-members-{}", sinomo_core::Id::generate());
-                    write_data(&root.join(format!("membership-request-{rounds:03}.sobj")),
-                        &DriverRequest { target: source.clone(), nonce: nonce.clone(),
-                            kind: ProbeKind::RequestMetadataMembers, owned_contact_hint: None,
-                            prefix_contact_hints: None })?;
-                    let result = probe(&mut nodes[0], &source,
+                    write_data(
+                        &root.join(format!("membership-request-{rounds:03}.sobj")),
+                        &DriverRequest {
+                            target: source.clone(),
+                            nonce: nonce.clone(),
+                            kind: ProbeKind::RequestMetadataMembers,
+                        },
+                    )?;
+                    let result = probe(
+                        &mut nodes[0],
+                        &source,
                         ProbeKind::RequestMetadataMembers,
                         nonce,
                         OP_CAP.min(deadline.saturating_duration_since(Instant::now())));
@@ -1225,7 +1089,6 @@ fn run_native_process_case(
                     report["prefix_startup_sync"] = setup;
                     prefix_setup_done = true;
                 }
-                let hints = owned_prefix_route_hints(&mut nodes, &report)?;
                 for node in &mut nodes {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
@@ -1237,7 +1100,6 @@ fn run_native_process_case(
                         &mut report,
                         "baseline-owned-native-prefix",
                         OP_CAP.min(left),
-                        &hints,
                     )?;
                     complete += usize::from(data.as_ref().is_some_and(|v| v["complete"] == true));
                     observations.push(data);
@@ -1263,50 +1125,7 @@ fn run_native_process_case(
                 "native positive prerequisite has no actual complete full3 PREFIX round within original startup60s"
             );
         }
-        let prefix_hints = if prefix_round {
-            Some(owned_prefix_route_hints(&mut nodes, &report)?)
-        } else { None };
-        if let Some(hints) = &prefix_hints {
-            let source = nodes[0].input.node_id.clone();
-            let key_control = probe_with_routes(&mut nodes[0], &source, ProbeKind::PrefixRoundWrongKey,
-                format!("prefix-wrong-held-key-{}", sinomo_core::Id::generate()), OP_CAP, None, Some(hints.clone()));
-            record_probe(&root, &mut report, "PREFIX-current-member-key-refusal", &key_control)?;
-            let reply = key_control?.result.map_err(|e| e.error)?;
-            let key_control: serde_json::Value = sinomo_core::object::serde_ext::from_bytes(&reply.body)?;
-            assert_eq!(key_control["complete"], false);
-            assert!(key_control["peers"].as_array().unwrap().iter().any(|p|
-                p["native_present"] == false && p["error"].as_str().is_some_and(|e|
-                    e.contains("no matching current member/key"))));
-            assert!(key_control["peers"].as_array().unwrap().iter().any(|p|
-                p["native_present"] == true && p["binding_valid"] == true));
-            let wrong_peer = nodes[2].input.node_id.clone();
-            let other_peer = nodes[1].input.node_id.clone();
-            let mut foreign = hints.clone();
-            foreign.insert(wrong_peer.clone(), hints[&other_peer].clone());
-            let rejected = observe_native_prefix(&mut nodes[0], &root, &mut report,
-                "PREFIX-foreign-owned-route-refusal", OP_CAP, &foreign)?;
-            assert!(rejected.is_none());
-            assert!(report["probes"].as_array().unwrap().last().unwrap()
-                ["actual_result"]["error"]["error"].as_str().is_some_and(|e|
-                    e.contains("native scoped PREFIX contact set differs")));
-            let mut changed = hints.clone();
-            changed.get_mut(&wrong_peer).unwrap().endpoint_id = sinomo_core::Id::derived(
-                "dfs.test.prefix.unknown-endpoint", &sinomo_core::Id::generate().to_string());
-            let partial = observe_native_prefix(&mut nodes[0], &root, &mut report,
-                "PREFIX-changed-endpoint-native-refusal", OP_CAP, &changed)?
-                .ok_or("changed endpoint must return actual partial round DATA")?;
-            assert_eq!(partial["complete"], false);
-            let outcomes = partial["peers"].as_array().unwrap();
-            assert!(outcomes.iter().any(|p| p["peer"] == wrong_peer.as_str()
-                && p["native_present"] == false && !p["error"].is_null()));
-            assert!(outcomes.iter().any(|p| p["peer"] == other_peer.as_str()
-                && p["native_present"] == true && p["binding_valid"] == true));
-            let restored = observe_native_prefix(&mut nodes[0], &root, &mut report,
-                "PREFIX-valid-owned-routes-after-refusal", OP_CAP, hints)?
-                .ok_or("restored native route round absent")?;
-            assert_eq!(restored["complete"], true);
-        }
-        let survivor_contacts = if prefix_round {
+        if prefix_round {
             let nonprimary = nodes[1].input.node_id.clone();
             let denied = probe(&mut nodes[1], &nonprimary, ProbeKind::RequestMetadataMembers,
                 format!("nonprimary-members-{}", sinomo_core::Id::generate()), OP_CAP);
@@ -1315,27 +1134,7 @@ fn run_native_process_case(
             let denied: serde_json::Value = sinomo_core::object::serde_ext::from_bytes(&denied.body)?;
             assert_eq!(denied["state"], "NotPrimary");
             assert_eq!(denied["mutation_attempted"], false);
-            let b_contact = observed_owned_contact(&mut nodes[1], &report)?;
-            let c_contact = observed_owned_contact(&mut nodes[2], &report)?;
-            let intended = nodes[2].input.node_id.clone();
-            let foreign = probe_with_contact(&mut nodes[1], &intended,
-                ProbeKind::RegisteredEndpointPing,
-                format!("foreign-owned-hint-{}", sinomo_core::Id::generate()),
-                OP_CAP, Some(b_contact.clone()));
-            record_probe(&root, &mut report, "foreign-owned-hint-refusal", &foreign)?;
-            assert!(matches!(&foreign, Ok(value) if value.contact.is_none()
-                && value.result.as_ref().is_err_and(|error|
-                    error.error.contains("owned hint differs from intended held listener"))),
-                "foreign hint must refuse before dispatch: {foreign:?}");
-            let changed = probe_with_contact(&mut nodes[1], &intended,
-                ProbeKind::RegisteredEndpointWrongId,
-                format!("changed-owned-hint-{}", sinomo_core::Id::generate()),
-                OP_CAP, Some(c_contact.clone()));
-            record_probe(&root, &mut report, "changed-owned-hint-native-refusal", &changed)?;
-            assert!(matches!(&changed, Ok(value) if value.contact.is_some() && value.result.is_err()),
-                "changed ID must reach actual registered refusal: {changed:?}");
-            Some([b_contact, c_contact])
-        } else { None };
+        }
         let b = nodes[1].alive_identity()?;
         let c = nodes[2].alive_identity()?;
         let a_id = nodes[0].input.node_id.clone();
@@ -1362,13 +1161,12 @@ fn run_native_process_case(
         report["a_raw"] = serde_json::json!({"files":raw.files.len(),"entries":entries,"bytes":bytes,"blake3":blake3::hash(&encoded).to_hex().to_string(),"before_any_reopen":true});
         for (source, target) in [(1, 2), (2, 1)] {
             let peer = nodes[target].input.node_id.clone();
-            let result = probe_with_contact(
+            let result = probe(
                 &mut nodes[source],
                 &peer,
                 ping_kind,
                 format!("survivor-{}", sinomo_core::Id::generate()),
                 OP_CAP,
-                survivor_contacts.as_ref().map(|contacts| contacts[target - 1].clone()),
             );
             record_probe(
                 &root,
@@ -1428,7 +1226,6 @@ fn run_native_process_case(
                     &mut report,
                     "after-A-death-owned-native-prefix",
                     OP_CAP,
-                    prefix_hints.as_ref().unwrap(),
                 )?;
                 assert!(
                     !data.as_ref().is_some_and(|value| value["complete"] == true),
@@ -1575,87 +1372,25 @@ fn run_native_process_case(
 
 #[test]
 fn native_per_node_tcp_survivors_keep_authenticated_calls_after_a_sigkill() {
-    run_native_process_case(false, None, false, false);
+    run_native_process_case(false, None, false);
 }
 
 #[test]
 fn native_authenticated_endpoint_processes_survive_a_loss_without_routing_authority() {
-    run_native_process_case(true, None, false, false);
+    run_native_process_case(true, None, false);
 }
 
 #[test]
 fn native_retained_a_reconnects_same_identity_while_b_c_stay_alive() {
-    run_native_process_case(true, Some(false), false, false);
+    run_native_process_case(true, Some(false), false);
 }
 
 #[test]
 fn native_retained_a_wrong_physical_owner_refuses_without_data_mutation() {
-    run_native_process_case(true, Some(true), false, false);
-}
-
-#[test]
-fn native_registered_endpoint_calls_survive_a_loss_without_route_fallback() {
-    run_native_process_case(true, None, true, false);
+    run_native_process_case(true, Some(true), false);
 }
 
 #[test]
 fn native_owned_prefix_full_set_observation_refuses_after_a_process_loss() {
-    run_native_process_case(true, None, true, true);
-}
-
-#[test]
-fn generic_component_carrier_cannot_fallback_for_explicit_endpoint() {
-    use sinomo_core::network::{
-        ClusterObjectRpcOptions, NetworkDeliveryState, NetworkError, ObjectRpcCall, ObjectRpcResult,
-    };
-    use sinomo_module::ComponentObjectRpcTransport;
-    struct Generic(std::sync::atomic::AtomicUsize);
-    impl ComponentObjectRpcTransport for Generic {
-        fn call(
-            &self,
-            _: &NodeId,
-            _: ObjectRpcCall,
-            _: ClusterObjectRpcOptions,
-            _: bool,
-        ) -> Result<ObjectRpcResult, NetworkError> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            panic!("explicit endpoint may not fall back to generic call");
-        }
-        fn call_async<'a>(
-            &'a self,
-            _: &'a NodeId,
-            _: ObjectRpcCall,
-            _: ClusterObjectRpcOptions,
-            _: bool,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<ObjectRpcResult, NetworkError>> + Send + 'a,
-            >,
-        > {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async { panic!("explicit endpoint may not fall back to generic async call") })
-        }
-    }
-    let carrier = Generic(std::sync::atomic::AtomicUsize::new(0));
-    let target = NodeId::generate();
-    let endpoint = sinomo_core::network::daemon_lan_endpoint(&target, "127.0.0.1:1".to_string(), 0);
-    let call = ObjectRpcCall::value(
-        sinomo_core::cluster::cluster_network_ping_rpc_request("unsupported-native-endpoint", 0)
-            .unwrap(),
-    );
-    let result = carrier.call_endpoint(
-        &endpoint,
-        call,
-        ClusterObjectRpcOptions::default().with_overall_timeout(OP_CAP),
-        false,
-    );
-    let error = match result {
-        Err(error) => error,
-        Ok(_) => panic!("generic carrier manufactured endpoint result"),
-    };
-    assert_eq!(
-        error.delivery_state(),
-        Some(NetworkDeliveryState::DefinitelyNotSent)
-    );
-    assert_eq!(carrier.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    run_native_process_case(true, None, true);
 }

@@ -19,6 +19,386 @@ fn native_browser_service(
 }
 
 #[test]
+fn hosted_browser_routes_file_work_without_a_private_native_metadata_image() {
+    use crate::DaemonDfsBrowserNoLinksOperation as O;
+    use crate::DaemonDfsBrowserNoLinksResponse as R;
+    use crate::test_runtime::{CapturedServedMessageWork, RpcObservation};
+    use crate::test_support::DfsTestRpcPhase as Phase;
+    use crate::{DfsNamespaceOperation, DfsNetworkMessage};
+
+    fn observed<T>(
+        runtime: &crate::test_support::DfsTestRuntime,
+        node: &sinomo_core::node::NodeId,
+        action: impl FnOnce() -> T,
+    ) -> (T, Vec<CapturedServedMessageWork>) {
+        let capture = runtime.capture_served_work(node, 32).unwrap();
+        let result = action();
+        let records = capture.records();
+        drop(capture);
+        (result, records)
+    }
+
+    fn completed(work: &CapturedServedMessageWork, calls: &[RpcObservation]) -> bool {
+        let frame = &work.command.routed_message;
+        let request = match &frame.message {
+            DfsNetworkMessage::ExclusiveCreateRequest(command)
+            | DfsNetworkMessage::DistributedWriteRequest(command) => &command.request_id,
+            DfsNetworkMessage::NamespaceRequest(command) => &command.request_id,
+            _ => return false,
+        };
+        work.succeeded
+            && calls.iter().any(|decoded| {
+                decoded.source == frame.source_node_id
+                    && decoded.target == frame.target_node_id
+                    && decoded.phase == Phase::Decoded
+                    && decoded.dfs_frame_id == Some(frame.frame_id)
+                    && decoded.dfs_request_id.as_ref() == Some(request)
+                    && calls.iter().any(|returned| {
+                        returned.call_id == decoded.call_id
+                            && returned.phase == Phase::Completed
+                            && returned.outcome_error.is_none()
+                    })
+            })
+    }
+
+    const ROOT: &str = "/services/browser-no-private-native";
+    const PATH: &str = "/services/browser-no-private-native/value.bin";
+    const FIRST: &[u8] = b"actual browser original bytes";
+    const SECOND: &[u8] = b"actual browser replacement bytes";
+    let (runtime, _) = native_browser_runtime("native-browser-no-private-native-image", 3);
+    let services = runtime
+        .metadata_shards()
+        .unwrap()
+        .into_iter()
+        .find(|shard| shard.shard_id == "services")
+        .unwrap();
+    let primary = services.primary_node_id.clone();
+    native_browser_policy(
+        &runtime.shared_control_plane().unwrap(),
+        ROOT,
+        DfsPlacementPolicy::new(sinomo_core::DfsObjectPolicy::ReplicatedEventual, 2, 2).unwrap(),
+    );
+    let data = Arc::new(runtime.data_dir(&primary).clone());
+    let handle = runtime.runtime_handle();
+    let host = dfs_browser_component_host(&data).unwrap();
+    handle.block_on(async {
+        tokio::time::timeout(
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            host.ensure_write_configuration_ready(&data, &handle),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    });
+    // Acquire native evidence before measuring the requester. Main's actual
+    // executor and this observer remain separate from the synchronous browser.
+    let native_observer = runtime.metadata_primary_service(PATH).unwrap();
+    let rpc_begin = runtime.rpc_observations().len();
+    crate::metadata_backend::reset_metadata_backend_open_calls();
+    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
+    let backend = DfsBrowserBackend::for_component_data_dir(Arc::clone(&data), &handle).unwrap();
+    let state = |phase: &'static str| {
+        let service = backend.lock_service().unwrap();
+        (
+            phase,
+            service.metadata_backend().is_none(),
+            service.transport.delegates_local_namespace_authority(),
+            crate::metadata_backend::metadata_backend_open_calls(),
+            crate::metadata_backend::metadata_current_tables_snapshot_calls(),
+        )
+    };
+    let mut states = vec![state("opened")];
+    let request = |path: &str, operation| crate::DaemonDfsBrowserNoLinksRequest {
+        expected_cluster_id: None,
+        root: "/services".into(),
+        path: path.into(),
+        operation,
+    };
+    assert_eq!(
+        backend.no_links(request(ROOT, O::CreateDirAll)).unwrap(),
+        R::DirectoryCreated
+    );
+    backend
+        .no_links(request(
+            "/services/browser-no-private-native/child",
+            O::CreateDirAll,
+        ))
+        .unwrap();
+    let directory = backend
+        .namespace_lstat(crate::DaemonDfsBrowserStatRequest {
+            path: ROOT.into(),
+            max_staleness_millis: 0,
+        })
+        .unwrap()
+        .into_result()
+        .unwrap();
+    assert_eq!(directory.kind, DfsObjectKind::Directory);
+    assert_eq!(directory.link_count, 3);
+    states.push(state("directory"));
+    let (created, create_work) = observed(&runtime, &primary, || {
+        backend
+            .no_links(request(
+                PATH,
+                O::CreateNew {
+                    bytes: FIRST.to_vec(),
+                },
+            ))
+            .unwrap()
+    });
+    let R::Metadata { metadata: created } = created else {
+        panic!("actual native create receipt, received {created:?}");
+    };
+    states.push(state("created"));
+    let (replaced, replace_work) = observed(&runtime, &primary, || {
+        backend
+            .no_links(request(
+                PATH,
+                O::ReplaceIfVersion {
+                    expected_object_id: created.object_id.clone(),
+                    expected_version: created.version.clone(),
+                    bytes: SECOND.to_vec(),
+                },
+            ))
+            .unwrap()
+    });
+    let R::Metadata { metadata: replaced } = replaced else {
+        panic!("actual native replacement receipt, received {replaced:?}");
+    };
+    assert_eq!(created.object_id, replaced.object_id);
+    assert_ne!(created.version, replaced.version);
+    states.push(state("replaced"));
+    let (stale, _) = observed(&runtime, &primary, || {
+        backend
+            .no_links(request(
+                PATH,
+                O::ReplaceIfVersion {
+                    expected_object_id: created.object_id.clone(),
+                    expected_version: created.version.clone(),
+                    bytes: b"must not replace current bytes".to_vec(),
+                },
+            ))
+            .unwrap()
+    });
+    assert!(matches!(
+        stale,
+        R::Failed {
+            failure: crate::DaemonDfsBrowserNoLinksFailure::Conflict { .. }
+        }
+    ));
+    states.push(state("stale-cas-rejected"));
+    let (read, read_work) = observed(&runtime, &primary, || {
+        backend
+            .no_links(request(
+                PATH,
+                O::ReadRange {
+                    offset: 0,
+                    max_bytes: 4096,
+                },
+            ))
+            .unwrap()
+    });
+    let R::Read {
+        metadata: read_stat,
+        bytes,
+        truncated,
+    } = read
+    else {
+        panic!("actual browser bytes");
+    };
+    assert_eq!(bytes, SECOND);
+    assert!(!truncated);
+    assert_eq!(
+        (read_stat.object_id, read_stat.version),
+        (replaced.object_id.clone(), replaced.version.clone())
+    );
+    states.push(state("read"));
+    let (stat, stat_work) = observed(&runtime, &primary, || {
+        backend
+            .stat(crate::DaemonDfsBrowserStatRequest {
+                path: PATH.into(),
+                max_staleness_millis: 0,
+            })
+            .unwrap()
+            .into_result()
+            .unwrap()
+    });
+    assert_eq!(
+        (stat.object_id.clone(), stat.version.clone()),
+        (replaced.object_id.clone(), replaced.version.clone())
+    );
+    assert_eq!(
+        stat.content_hash,
+        Some(crate::content_store::content_hash(SECOND))
+    );
+    assert_eq!(stat.size_bytes, Some(SECOND.len() as u64));
+    let object_health = stat.health.as_ref().expect("shared Main object inspection");
+    assert!(object_health.version_count >= 1);
+    assert!(object_health.receipt_count >= 2);
+    assert!(object_health.intent_count >= 1);
+    states.push(state("stat"));
+    let health = backend.health_summary().unwrap();
+    assert!(health.file_system_count >= 1);
+    assert!(health.object_count >= 1);
+    assert!(health.metadata_shard_count >= 1);
+    states.push(state("health-summary"));
+    let (list, list_work) = observed(&runtime, &primary, || {
+        backend
+            .no_links(request(
+                ROOT,
+                O::ListPage {
+                    cursor: None,
+                    max_entries: 16,
+                },
+            ))
+            .unwrap()
+    });
+    let R::DirectoryPage {
+        entries,
+        next_cursor,
+        ..
+    } = list
+    else {
+        panic!("actual browser directory page");
+    };
+    assert!(entries.iter().any(|entry| entry.name == "value.bin"));
+    assert!(next_cursor.is_none());
+    states.push(state("list"));
+    let ((target, certificate), sync_work) = observed(&runtime, &primary, || {
+        backend
+            .with_mutation_service(|service| {
+                let target = service
+                    .posix_capture_file_sync_target(PATH, crate::DfsPosixSyncKind::File)
+                    .map_err(dfs_browser_service_error)?;
+                let certificate = service
+                    .posix_sync_file_target(&target)
+                    .map_err(dfs_browser_service_error)?;
+                Ok((target, certificate))
+            })
+            .unwrap()
+    });
+    states.push(state("synced"));
+    assert_eq!(certificate.target, target);
+    assert_eq!(target.object_id.as_str(), replaced.object_id);
+    assert_eq!(target.version.as_str(), replaced.version);
+    assert_eq!(certificate.content_evidence.required_receipts, 2);
+    assert!(certificate.content_evidence.receipt_node_ids.len() >= 2);
+    assert_eq!(
+        certificate.metadata_certificate.target.primary_node_id,
+        primary
+    );
+    assert_eq!(
+        certificate.metadata_certificate.target.authority_epoch,
+        Some(services.epoch)
+    );
+
+    // These native inspections are outside the recorded requester TLS window.
+    let calls = runtime.rpc_observations();
+    let calls = &calls[rpc_begin..];
+    let writes = |records: &[CapturedServedMessageWork],
+                  receipt: &crate::DaemonDfsBrowserStatResponse| {
+        records
+            .iter()
+            .filter(|work| {
+                let frame = &work.command.routed_message;
+                frame.source_node_id == primary
+                    && frame.target_node_id == primary
+                    && matches!(&frame.message,
+                    DfsNetworkMessage::ExclusiveCreateRequest(command)
+                    | DfsNetworkMessage::DistributedWriteRequest(command)
+                    if command.request.object_id.as_str() == receipt.object_id
+                        && command.request.target_version.as_str() == receipt.version)
+                    && completed(work, calls)
+            })
+            .count()
+    };
+    assert_eq!(writes(&create_work, &created), 1);
+    assert_eq!(writes(&replace_work, &replaced), 1);
+    for records in [&read_work, &stat_work, &list_work] {
+        assert!(
+            records.iter().any(|work| {
+                let frame = &work.command.routed_message;
+                frame.source_node_id == primary
+                    && frame.target_node_id == primary
+                    && matches!(&frame.message, DfsNetworkMessage::NamespaceRequest(command)
+                    if command.file_system_id == target.file_system_id
+                        && !command.include_metadata_journal_batches)
+                    && completed(work, calls)
+            }),
+            "browser metadata reads must reach actual registered Main"
+        );
+    }
+    assert!(sync_work.iter().any(|work| {
+        let frame = &work.command.routed_message;
+        frame.source_node_id == primary && frame.target_node_id == primary
+            && matches!(&frame.message, DfsNetworkMessage::NamespaceRequest(command)
+                if matches!(&command.operation, DfsNamespaceOperation::FileSync { path, target: actual }
+                    if path == PATH && actual == &target))
+            && completed(work, calls)
+    }));
+    let object = crate::DfsObjectId::new(&replaced.object_id).unwrap();
+    let native_intents = native_observer
+        .metadata_backend()
+        .unwrap()
+        .intents_for_object(&object)
+        .unwrap();
+    for receipt in [&created, &replaced] {
+        assert_eq!(
+            native_intents
+                .iter()
+                .filter(|intent| {
+                    intent.status == DfsWriteIntentStatus::Committed
+                        && intent.target_version.as_str() == receipt.version
+                        && intent.content_hash == receipt.content_hash
+                })
+                .count(),
+            1,
+            "actual native original for each browser write"
+        );
+    }
+    let facts = serde_json::json!({
+        "services":services,"directory":directory,"created":created,"replaced":replaced,
+        "target":target,"certificate":certificate,"requester_states":states,
+        "object_health":object_health,"health_summary":health,
+        "create_work":create_work.iter().map(|work| &work.command).collect::<Vec<_>>(),
+        "replace_work":replace_work.iter().map(|work| &work.command).collect::<Vec<_>>(),
+        "sync_work":sync_work.iter().map(|work| &work.command).collect::<Vec<_>>(),
+        "qualification":"actual registered self Main with normal native writes; TLS counts cover synchronous requester only, not Main executor or direct native evidence; no memory/RSS or broad acceptance claim"
+    });
+    let export = std::fs::write(
+        data.root().join("browser-no-private-native-image.json"),
+        serde_json::to_vec_pretty(&facts).unwrap(),
+    );
+    if let Err(error) = &export {
+        eprintln!("browser no-private-native evidence export failed: {error}");
+    }
+    for &(phase, _, delegated, opens, snapshots) in &states {
+        assert!(
+            delegated,
+            "{phase}: requester must retain registered Main routing"
+        );
+        assert_eq!(
+            opens, 0,
+            "{phase}: requester opened a native metadata image"
+        );
+        assert_eq!(
+            snapshots, 0,
+            "{phase}: requester materialized native table snapshots"
+        );
+    }
+    for (phase, absent, _, _, _) in states {
+        assert!(
+            absent,
+            "{phase}: browser must not retain a private native metadata owner"
+        );
+    }
+    export.expect("native no-private-image evidence retained after semantic assertions");
+    drop(native_observer);
+    drop(backend);
+    drop(host);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn browser_parent_exact_hint_does_not_recreate_a_confirmed_deleted_parent() {
     browser_parent_hint_deletion_control(false);
 }
@@ -288,7 +668,7 @@ fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
     runtime.close().unwrap();
 }
 
-fn native_browser_runtime(
+pub(super) fn native_browser_runtime(
     name: &str,
     count: usize,
 ) -> (
@@ -304,7 +684,7 @@ fn native_browser_runtime(
     (runtime, nodes)
 }
 
-fn native_browser_policy(
+pub(super) fn native_browser_policy(
     control: &crate::SharedDfsControlPlaneKvClient<Box<dyn crate::DfsControlPlaneKvClient>>,
     path: &str,
     policy: crate::DfsPlacementPolicy,
@@ -631,6 +1011,7 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
             &runtime.runtime_handle(),
         )
         .unwrap();
+        let native_observer = runtime.metadata_primary_service(path).unwrap();
         let (mut service, probe) = runtime.client_with_control_plane_probe(&owner).unwrap();
         let implicit = service
             .control_plane
@@ -680,7 +1061,7 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
                 stored.posix_read_file_distributed(path).unwrap(),
                 initial_bytes
             );
-            let intents = stored
+            let intents = native_observer
                 .metadata_backend()
                 .unwrap()
                 .intents_for_object_version_page(&stat.object_id, &stat.version, None, 16)
@@ -782,7 +1163,7 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
             let mut stored = backend.lock_service().unwrap();
             let stat = stored.posix_stat_distributed(path).unwrap();
             assert_eq!(stored.posix_read_file_distributed(path).unwrap(), bytes);
-            let intents = stored
+            let intents = native_observer
                 .metadata_backend()
                 .unwrap()
                 .intents_for_object_version_page(&stat.object_id, &stat.version, None, 16)
@@ -797,6 +1178,7 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
         }
         assert_ne!(versions[0], versions[1]);
         drop(service);
+        drop(native_observer);
         drop(backend);
         runtime.close().unwrap();
     }
@@ -891,6 +1273,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         &runtime.runtime_handle(),
     )
     .unwrap();
+    let native_observer = runtime.metadata_primary_service("/documents").unwrap();
     let key = crate::file_system_config_key(&sifs_file_system_id());
     let context = runtime.component_context(&nodes[0]).unwrap();
     let owner = crate::runtime_host::retain_component_data_owner(&context).unwrap();
@@ -947,9 +1330,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         bytes: bytes.clone(),
     };
     let allocation = request.bytes.as_ptr();
-    let before = backend
-        .lock_service()
-        .unwrap()
+    let before = native_observer
         .metadata_backend()
         .unwrap()
         .journal_last_sequence()
@@ -964,8 +1345,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         assert_eq!(request.bytes.as_ptr(), allocation);
         assert_eq!(request.path, path);
         assert_eq!(request.bytes, bytes);
-        let service = backend.lock_service().unwrap();
-        let metadata = service.metadata_backend().unwrap();
+        let metadata = native_observer.metadata_backend().unwrap();
         assert_eq!(metadata.journal_last_sequence().unwrap(), before);
         for absent in ["/documents/configuration-handoff", parent, path.as_str()] {
             assert!(
@@ -1001,10 +1381,10 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         backend.try_write_file(request).unwrap(),
         DfsBrowserWriteAttempt::Complete(_)
     ));
-    let service = backend.lock_service().unwrap();
-    assert_eq!(service.posix_read_file(&path).unwrap(), bytes);
-    let stat = service.posix_stat(&path).unwrap();
-    let intents = service
+    let mut service = backend.lock_service().unwrap();
+    assert_eq!(service.posix_read_file_distributed(&path).unwrap(), bytes);
+    let stat = service.posix_stat_distributed(&path).unwrap();
+    let intents = native_observer
         .metadata_backend()
         .unwrap()
         .intents_for_object_version_page(&stat.object_id, &stat.version, None, 16)
@@ -1018,6 +1398,7 @@ fn write_configuration_browser_pending_preserves_payload_without_parent_intent_o
         1
     );
     drop(service);
+    drop(native_observer);
     drop(authority);
     drop(gap);
     drop(backend);
@@ -1035,9 +1416,8 @@ fn write_configuration_browser_unavailable_native_floor_fails_before_parent_or_f
         &runtime.runtime_handle(),
     )
     .unwrap();
-    let before = backend
-        .lock_service()
-        .unwrap()
+    let native_observer = runtime.metadata_primary_service("/documents").unwrap();
+    let before = native_observer
         .metadata_backend()
         .unwrap()
         .journal_last_sequence()
@@ -1056,8 +1436,7 @@ fn write_configuration_browser_unavailable_native_floor_fails_before_parent_or_f
             .to_string()
             .contains("native configuration floor is unavailable")
     );
-    let service = backend.lock_service().unwrap();
-    let metadata = service.metadata_backend().unwrap();
+    let metadata = native_observer.metadata_backend().unwrap();
     assert_eq!(metadata.journal_last_sequence().unwrap(), before);
     for absent in ["/documents/native-floor-absent", parent, path.as_str()] {
         assert!(
@@ -1067,7 +1446,6 @@ fn write_configuration_browser_unavailable_native_floor_fails_before_parent_or_f
                 .is_none()
         );
     }
-    drop(service);
     drop(fault);
     backend
         .write_file(DaemonDfsBrowserWriteFileRequest {
@@ -1079,10 +1457,11 @@ fn write_configuration_browser_unavailable_native_floor_fails_before_parent_or_f
         backend
             .lock_service()
             .unwrap()
-            .posix_read_file(&path)
+            .posix_read_file_distributed(&path)
             .unwrap(),
         b"real normal recovery"
     );
+    drop(native_observer);
     drop(backend);
     runtime.close().unwrap();
 }

@@ -21,8 +21,6 @@ use crate::metadata_records::DfsMetadataPrefixProof;
 
 #[cfg(test)]
 mod recovery_fence;
-#[cfg(test)]
-pub(crate) use recovery_fence::DfsSelectedLocalRecoveryFenceResult;
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
@@ -1816,6 +1814,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Gather fresh full-assignment proof for exactly this locally captured
     /// target. Refuse source advancement/history loss instead of upgrading it.
     /// The returned existing certificate is DATA, never new serving authority.
+    #[cfg(test)]
     pub(crate) fn sync_metadata_shard_exact_prefix_full_assignment(
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,

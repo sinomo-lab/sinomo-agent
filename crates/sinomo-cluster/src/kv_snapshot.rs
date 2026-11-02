@@ -1,9 +1,6 @@
 #[allow(unused_imports)]
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::{
-    locked_cache_cluster_kv_snapshot_if_newer_than_raft, locked_kv_state_authority_id,
-    read_cluster_kv_snapshot, write_imported_cluster_kv_snapshot_if_changed,
-};
+use crate::kv_local_store::{locked_kv_state_authority_id, read_cluster_kv_snapshot};
 use sinomo_base::ClusterBootstrapState;
 use sinomo_kv::{InProcessKvStore, KvAuthoritativeRead, KvSnapshot};
 use sinomo_network::ClusterPaths;
@@ -52,13 +49,6 @@ pub trait ClusterKvSnapshotRefreshHost {
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError>;
 
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError>;
-
     fn call_node_object_rpc(
         &mut self,
         state: &ClusterBootstrapState,
@@ -82,15 +72,6 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         locked_kv_state_authority_id(paths, state)
-    }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError> {
-        locked_cache_cluster_kv_snapshot_if_newer_than_raft(paths, local_node_id, snapshot)
     }
 
     fn call_node_object_rpc(
@@ -123,7 +104,6 @@ where
 pub struct ClusterKvSnapshotRefreshOutcome {
     pub store: InProcessKvStore,
     pub fetched_remote: bool,
-    pub materialized_cache_changed: bool,
 }
 
 pub fn refresh_current_cluster_kv_store_with_host(
@@ -205,21 +185,12 @@ pub fn refresh_current_cluster_kv_store_with_outcome(
                     "no local KV projection or reachable authoritative KV snapshot is available"
                         .to_string(),
             })?;
-    let materialized_cache_changed = if fetched_remote {
-        write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-        host.cache_cluster_kv_snapshot_if_newer_than_raft(
-            paths,
-            &state.local_node_id,
-            snapshot.clone(),
-        )?
-    } else {
-        false
-    };
+    // The refreshed store is this caller's authoritative read. The local
+    // view converges through Raft, not by importing the remote snapshot.
     let store = InProcessKvStore::restore(snapshot).map_err(kv_err)?;
     Ok(ClusterKvSnapshotRefreshOutcome {
         store,
         fetched_remote,
-        materialized_cache_changed,
     })
 }
 
@@ -324,7 +295,6 @@ mod tests {
         snapshots: BTreeMap<NodeId, KvSnapshot>,
         stalled_target: Option<NodeId>,
         calls: Vec<(NodeId, Duration)>,
-        cached_snapshot: Option<KvSnapshot>,
     }
 
     impl ClusterKvSnapshotRefreshHost for RecordingSnapshotRefreshHost {
@@ -334,16 +304,6 @@ mod tests {
             _state: &ClusterBootstrapState,
         ) -> Result<Option<NodeId>, NetworkError> {
             Ok(Some(self.known_authority.clone()))
-        }
-
-        fn cache_cluster_kv_snapshot_if_newer_than_raft(
-            &mut self,
-            _paths: &ClusterPaths,
-            _local_node_id: &NodeId,
-            snapshot: KvSnapshot,
-        ) -> Result<bool, NetworkError> {
-            self.cached_snapshot = Some(snapshot);
-            Ok(true)
         }
 
         fn call_node_object_rpc(
@@ -489,7 +449,6 @@ mod tests {
             snapshots: BTreeMap::from([(fallback.clone(), snapshot(2))]),
             stalled_target: Some(preferred.clone()),
             calls: Vec::new(),
-            cached_snapshot: None,
         };
 
         let outcome = refresh_current_cluster_kv_store_with_outcome(
@@ -527,7 +486,6 @@ mod tests {
             snapshots: BTreeMap::from([(preferred.clone(), snapshot(4))]),
             stalled_target: None,
             calls: Vec::new(),
-            cached_snapshot: None,
         };
 
         let error = refresh_current_cluster_kv_store_with_outcome(
@@ -544,6 +502,5 @@ mod tests {
             error.to_string().contains("refusing snapshot arbitration"),
             "error should require Raft/state reconciliation: {error}"
         );
-        assert!(host.cached_snapshot.is_none());
     }
 }

@@ -11,6 +11,9 @@ pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";
 /// Strict namespace-entry metadata without following the final link. Older
 /// servers must reject this route, rather than interpret a stat flag as absent.
 pub const DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE: &str = "/daemon/dfs/browser/namespace-lstat-v1";
+/// Exact scoped operations. A dedicated route makes an older provider reject
+/// the no-link contract rather than silently ignore a safety option.
+pub const DAEMON_DFS_BROWSER_NO_LINKS_ROUTE: &str = "/daemon/dfs/browser/no-links-v1";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file-v7";
 pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
@@ -64,6 +67,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_STAT_ROUTE,
     DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE,
+    DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
@@ -90,6 +94,87 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
 ];
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonDfsBrowserNoLinksRequest {
+    /// Bind retained source references to their authenticated cluster namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_cluster_id: Option<sinomo_core::Id>,
+    pub root: String,
+    pub path: String,
+    pub operation: DaemonDfsBrowserNoLinksOperation,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DaemonDfsBrowserNoLinksOperation {
+    Stat,
+    ListPage {
+        cursor: Option<Vec<u8>>,
+        max_entries: usize,
+    },
+    ReadRange {
+        offset: u64,
+        max_bytes: u64,
+    },
+    CreateDirAll,
+    CreateNew {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    ReplaceIfVersion {
+        expected_object_id: String,
+        expected_version: String,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+}
+
+impl DaemonDfsBrowserNoLinksOperation {
+    pub fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateDirAll | Self::CreateNew { .. } | Self::ReplaceIfVersion { .. }
+        )
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DaemonDfsBrowserNoLinksResponse {
+    Metadata {
+        metadata: DaemonDfsBrowserStatResponse,
+    },
+    DirectoryPage {
+        directory: DaemonDfsBrowserStatResponse,
+        entries: Vec<DaemonDfsBrowserEntry>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    Read {
+        metadata: DaemonDfsBrowserStatResponse,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+        truncated: bool,
+    },
+    DirectoryCreated,
+    Failed {
+        failure: DaemonDfsBrowserNoLinksFailure,
+    },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DaemonDfsBrowserNoLinksFailure {
+    NotFound { path: String },
+    AlreadyExists { path: String },
+    NotDirectory { path: String },
+    IsDirectory { path: String },
+    InvalidPath { path: String, detail: String },
+    Conflict { path: String, detail: String },
+    Unavailable { path: String, detail: String },
+    Unsupported { path: String, detail: String },
+}
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonDfsBrowserStatusRequest {
@@ -811,6 +896,49 @@ mod versioned_bulk_read_wire_tests {
                 serde_json::json!({"bytes": []})
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_link_contract_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_operation_route_round_trips_exact_mutation_and_typed_absence() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+            DAEMON_DFS_BROWSER_STAT_ROUTE
+        );
+        let payload = DaemonDfsBrowserNoLinksRequest {
+            expected_cluster_id: Some(sinomo_core::Id::generate()),
+            root: "/users/agent/home/memory".into(),
+            path: "/users/agent/home/memory/note.md".into(),
+            operation: DaemonDfsBrowserNoLinksOperation::CreateNew {
+                bytes: vec![0, 1, 255],
+            },
+        };
+        let rpc = sinomo_core::network::ObjectRpcRequest::encode_body(
+            DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+            crate::DAEMON_RPC_CATEGORY,
+            &payload,
+        )
+        .unwrap();
+        let decoded: DaemonDfsBrowserNoLinksRequest = rpc.decode_body().unwrap();
+        assert_eq!(decoded, payload);
+        assert!(decoded.operation.is_mutation());
+        let absent = DaemonDfsBrowserNoLinksResponse::Failed {
+            failure: DaemonDfsBrowserNoLinksFailure::NotFound { path: payload.path },
+        };
+        let rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+            &absent,
+        )
+        .unwrap();
+        assert_eq!(
+            rpc.decode_body::<DaemonDfsBrowserNoLinksResponse>()
+                .unwrap(),
+            absent
         );
     }
 }

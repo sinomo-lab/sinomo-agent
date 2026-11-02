@@ -88,6 +88,7 @@ Run the smallest relevant checks while iterating, then broaden validation in pro
 For DFS or cluster performance work, read and apply
 [sinomo-performance-analysis](skills/sinomo-performance-analysis/SKILL.md).
 Use its standard acceptance, per-node stage/I/O, node-window and coverage tables
-for every DFS performance report. Docker gates run with debugging, tracing and
-profiling enabled at unchanged thresholds. Use measured timings directly without
+for every DFS performance report. Docker gates run with debugging and tracing
+enabled at unchanged thresholds; CPU profiling is opt-in with
+`SINOMO_TEST_CPU_PROFILE=1`. Use measured timings directly without
 subtracting observation overhead, and report unavailable measurements explicitly.

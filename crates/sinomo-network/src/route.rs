@@ -1,7 +1,5 @@
 //! Object RPC over the stream-native node-routing executor.
 
-mod freshness;
-
 use crate::prelude::*;
 use crate::{
     ClusterConnectivityGraph, ClusterPaths, DaemonRpcTimeouts, NetworkCallPolicy,
@@ -1281,7 +1279,7 @@ fn prepare_cluster_object_rpc_connector(
         let records = crate::route_graph_read_model::read_cluster_connectivity_graph_for_routing_snapshot(
             paths, state, &directory_snapshot, directory_connectivity,
         )?;
-        let connector = connector_from_observed_records(paths, state, directory_snapshot, records, health, None)?;
+        let connector = connector_from_observed_records(paths, state, directory_snapshot, records, health)?;
         if crate::network_module_routing_generation() != module_generation {
             continue;
         }
@@ -1306,22 +1304,10 @@ fn connector_from_observed_records(
     directory: crate::DirectorySnapshot,
     records: Vec<crate::ClusterConnectivityRecord>,
     health: NetworkHealthPolicy,
-    authenticated: Option<&std::collections::BTreeSet<(NodeId, NodeId, crate::ClusterEndpointId)>>,
 ) -> Result<Arc<crate::MultiHopRoutedConnector>, NetworkError> {
     let snapshot = crate::connectivity_snapshot_from_directory_records(
         &directory, records, OffsetDateTime::now_utc(),
     )?;
-    let snapshot = if let Some(authenticated) = authenticated {
-        let mut observations = snapshot.edges().to_vec();
-        for observation in &mut observations {
-            if authenticated.contains(&(observation.source_node_id.clone(), observation.target_node_id.clone(), observation.endpoint.endpoint_id.clone())) {
-                observation.provenance = if observation.source_node_id == state.local_node_id {
-                    "authenticated-direct-source-read"
-                } else { "authenticated-source-live-read" }.into();
-            }
-        }
-        crate::ConnectivitySnapshot::try_new(snapshot.generation(), snapshot.directory_generation(), snapshot.published_at(), observations)?
-    } else { snapshot };
     let connectivity = Arc::new(crate::ConnectivityTracker::new(snapshot));
     let identity: Arc<dyn crate::RoutedSessionIdentity> = Arc::new(
         crate::DaemonRoutedSessionIdentity::new(state.local_node_id.clone(), cluster_paths_data_dir(Some(paths))?)?,
@@ -1857,30 +1843,15 @@ where
             target_node_id.clone(),
             options.protection,
             connect_timeout,
-            async {
-                // The pool polls this only when a real carrier must be
-                // established. Live carriers do not trigger freshness reads.
-                let establishment_deadline = tokio::time::Instant::now() + connect_timeout;
-                let connector = if connector.has_live_observed_route(target_node_id, destination_process_affinity) {
-                    connector
-                } else {
-                    freshness::refresh_connector(
-                        paths, &directory, state, target_node_id, options, establishment_deadline,
-                        (directory_identity, module_generation, directory_generation),
-                    ).await?.unwrap_or(connector)
-                };
-                let remaining = establishment_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    return Err(NetworkError::timeout("establish routed service RPC stream", NetworkTimeoutPhase::Connect,
-                        connect_timeout, NetworkDeliveryState::DefinitelyNotSent));
-                }
-                connector.connect_with_destination_process_affinity(
-                    target_node_id.clone(),
-                    crate::ConnectOptions { constraints, timeout: remaining, protection: options.protection },
-                    destination_process_affinity,
-                ).await
-            },
-            None,
+            connector.connect_with_destination_process_affinity(
+                target_node_id.clone(),
+                crate::ConnectOptions {
+                    constraints,
+                    timeout: connect_timeout,
+                    protection: options.protection,
+                },
+                destination_process_affinity,
+            ),
         )
         .await;
         record_routed_rpc_timeline_stage(

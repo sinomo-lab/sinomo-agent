@@ -22,6 +22,7 @@ use sinomo_base::{
 use sinomo_node::NodeId;
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 /// Version stamp for cached routing state. Monotonic for a given backing
 /// store; the KV-backed implementation uses the local KV snapshot revision.
@@ -249,15 +250,6 @@ impl DirectorySnapshot {
 ///
 /// Implementations wrap whatever store owns cluster state; errors are
 /// reported as [`NetworkError::Directory`].
-/// Raw semantic baselines for authenticated source freshness reads. Expired
-/// values here are never routable by themselves. This is an observational
-/// directory cut, not a new effect-authority certificate.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DirectoryConnectivityBaseline {
-    pub version: DirectoryVersion,
-    pub records: Vec<ClusterConnectivityRecord>,
-}
-
 pub trait ClusterDirectory: Send + Sync {
     /// Authorized cluster member records, including endpoint/capability
     /// overlays from the backing store.
@@ -278,19 +270,6 @@ pub trait ClusterDirectory: Send + Sync {
     /// may complete a sparse graph with imported relay edges; afterwards only
     /// the current node's own newer observations are overlaid.
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError>;
-
-    /// Capture raw confirmed semantic rows separately from the TTL-filtered
-    /// routing view. Providers without retained expired rows safely offer only
-    /// their ordinary evidence. No caller may extend a row without a fresh,
-    /// authenticated statement from that row's actual source.
-    fn connectivity_freshness_baseline(&self) -> Result<DirectoryConnectivityBaseline, NetworkError> {
-        let before = self.routing_version()?;
-        let records = self.connectivity_records()?;
-        if self.routing_version()? != before {
-            return Err(NetworkError::Directory { detail: "directory changed during connectivity baseline capture".into() });
-        }
-        Ok(DirectoryConnectivityBaseline { version: before, records })
-    }
 
     /// Monotonic stamp of the backing store used for routing-cache
     /// invalidation.
@@ -323,6 +302,20 @@ pub trait ClusterDirectory: Send + Sync {
             });
         }
         Ok(DirectoryRecordsSnapshot::new(after, members, endpoints))
+    }
+
+    /// Captures membership and endpoint records no older than the local
+    /// owner's applied state, for authorizing peers.
+    ///
+    /// [`Self::records_snapshot`] may serve an earlier observation while a
+    /// local mutation is in flight. Providers with such a fallback wait for
+    /// the mutation until `deadline` instead.
+    fn current_records_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<DirectoryRecordsSnapshot, NetworkError> {
+        let _ = deadline;
+        self.records_snapshot()
     }
 
     /// Captures every raw input needed to build one route-planning generation.
@@ -492,11 +485,6 @@ impl ClusterDirectory for BootstrapAwareClusterDirectory {
         self.inner.connectivity_records()
     }
 
-    fn connectivity_freshness_baseline(&self) -> Result<DirectoryConnectivityBaseline, NetworkError> {
-        self.inner.connectivity_freshness_baseline()
-    }
-
-
     fn version(&self) -> Result<DirectoryVersion, NetworkError> {
         Ok(self.inner.version()?.max(self.bootstrap_version))
     }
@@ -507,6 +495,16 @@ impl ClusterDirectory for BootstrapAwareClusterDirectory {
 
     fn records_snapshot(&self) -> Result<DirectoryRecordsSnapshot, NetworkError> {
         let (version, members, endpoints) = self.records()?;
+        Ok(DirectoryRecordsSnapshot::new(version, members, endpoints))
+    }
+
+    fn current_records_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<DirectoryRecordsSnapshot, NetworkError> {
+        let (version, members, endpoints) =
+            self.inner.current_records_snapshot(deadline)?.into_parts();
+        let (version, members, endpoints) = self.merge_records(version, members, endpoints);
         Ok(DirectoryRecordsSnapshot::new(version, members, endpoints))
     }
 
@@ -597,11 +595,6 @@ impl ClusterDirectory for FencedBootstrapConnectivityDirectory {
     fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
         Ok(self.observed_connectivity_records())
     }
-
-    fn connectivity_freshness_baseline(&self) -> Result<DirectoryConnectivityBaseline, NetworkError> {
-        self.connectivity.connectivity_freshness_baseline()
-    }
-
 
     fn version(&self) -> Result<DirectoryVersion, NetworkError> {
         self.exact.version()

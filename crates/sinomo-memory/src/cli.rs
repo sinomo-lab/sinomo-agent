@@ -9,10 +9,20 @@ const MAX_MEMORY_ROOT_LIST_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MemoryCliCommand {
-    RootAdd { path: PathBuf },
+    RootAdd {
+        path: PathBuf,
+        filesystem: MemoryRootFilesystem,
+    },
     RootList(MemoryRootListOptions),
     Index { root_id: IndexRootId },
     Query(MemoryQueryOptions),
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum MemoryRootFilesystem {
+    #[default]
+    Local,
+    Sifs,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -47,25 +57,28 @@ fn memory_cli_spec() -> CliCommandSpec {
             CliCommandSpec::new("root", "manage indexed memory roots")
                 .help_on_empty()
                 .with_children([
-                    CliCommandSpec::new("add", "register a local memory source root")
+                    CliCommandSpec::new("add", "register a memory source root")
+                        .with_options([CliOptionSpec::value(
+                            "--filesystem",
+                            "filesystem containing the source (local or sifs)",
+                            CliValueSpec::new("filesystem", "local or sifs"),
+                        )])
                         .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
                             "path",
                             "source root path",
                         ))]),
-                    CliCommandSpec::new("list", "list registered local memory roots").with_options(
-                        [
-                            CliOptionSpec::value(
-                                "--limit",
-                                "maximum roots to return",
-                                CliValueSpec::new("count", "positive result limit"),
-                            ),
-                            CliOptionSpec::value(
-                                "--after",
-                                "continue after a root id",
-                                CliValueSpec::new("root-id", "memory root id"),
-                            ),
-                        ],
-                    ),
+                    CliCommandSpec::new("list", "list registered memory roots").with_options([
+                        CliOptionSpec::value(
+                            "--limit",
+                            "maximum roots to return",
+                            CliValueSpec::new("count", "positive result limit"),
+                        ),
+                        CliOptionSpec::value(
+                            "--after",
+                            "continue after a root id",
+                            CliValueSpec::new("root-id", "memory root id"),
+                        ),
+                    ]),
                 ]),
             CliCommandSpec::new("index", "index a registered memory root").with_positionals([
                 CliPositionalSpec::required(CliValueSpec::new("root-id", "memory root id")),
@@ -100,6 +113,15 @@ fn parse_memory_matches(matches: &CliCommandMatches) -> Result<MemoryCliCommand,
     match path.as_slice() {
         ["memory", "root", "add"] => Ok(MemoryCliCommand::RootAdd {
             path: PathBuf::from(required_positional(matches, 0)?),
+            filesystem: match matches.value("--filesystem").unwrap_or("local") {
+                "local" => MemoryRootFilesystem::Local,
+                "sifs" => MemoryRootFilesystem::Sifs,
+                value => {
+                    return Err(CliParseError::Parse {
+                        detail: format!("--filesystem must be local or sifs, got `{value}`"),
+                    });
+                }
+            },
         }),
         ["memory", "root", "list"] => {
             let limit = matches

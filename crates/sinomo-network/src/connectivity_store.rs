@@ -3,7 +3,8 @@ use crate::connectivity::{
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, cluster_connectivity_record_for_command_auth_denied,
     cluster_connectivity_record_for_hard_failure,
     cluster_connectivity_record_for_identity_mismatch,
-    cluster_connectivity_record_for_probe_outcome, cluster_connectivity_record_should_refresh,
+    cluster_connectivity_record_for_failed_attempt, cluster_connectivity_record_for_success,
+    cluster_connectivity_record_for_unverified_route, cluster_connectivity_record_should_refresh,
     cluster_connectivity_stable_eq, cluster_network_record_live,
     validate_cluster_connectivity_records_for_source,
 };
@@ -348,16 +349,21 @@ fn record_local_cluster_endpoint_command_connectivity_inner(
     let timestamp = now
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
-    let is_healthy = matches!(&connectivity_state, ClusterConnectivityState::Healthy);
-    let observed_latency_ms = latency_ms.unwrap_or_else(|| {
-        previous
-            .as_ref()
-            .and_then(|record| record.latency_ms)
-            .unwrap_or(0)
-    });
     let record = if matches!(&connectivity_state, ClusterConnectivityState::Unreachable) {
         cluster_connectivity_record_for_identity_mismatch(state, endpoint, &timestamp, now)
-    } else if !is_healthy && !allow_failure_grace {
+    } else if matches!(&connectivity_state, ClusterConnectivityState::Healthy) {
+        // A command that did not time the edge keeps its last measurement.
+        let latency_ms =
+            latency_ms.or_else(|| previous.as_ref().and_then(|record| record.latency_ms));
+        cluster_connectivity_record_for_success(
+            state,
+            endpoint,
+            previous.as_ref(),
+            latency_ms,
+            &timestamp,
+            now,
+        )
+    } else if !allow_failure_grace {
         cluster_connectivity_record_for_hard_failure(
             state,
             endpoint,
@@ -366,12 +372,10 @@ fn record_local_cluster_endpoint_command_connectivity_inner(
             now,
         )
     } else {
-        cluster_connectivity_record_for_probe_outcome(
+        cluster_connectivity_record_for_failed_attempt(
             state,
             endpoint,
             previous.as_ref(),
-            is_healthy,
-            observed_latency_ms,
             &timestamp,
             now,
         )
@@ -380,10 +384,32 @@ fn record_local_cluster_endpoint_command_connectivity_inner(
         paths,
         &state.local_node_id,
         std::slice::from_ref(&record),
-        false,
+        LocalConnectivityMerge::Observe,
         persist_observation_details,
     )?;
     Ok(record)
+}
+
+/// Makes an endpoint executable without claiming reachability, unless this
+/// node already holds an observation for it. See
+/// [`cluster_connectivity_record_for_unverified_route`].
+pub fn record_local_cluster_endpoint_unverified_route(
+    paths: &ClusterPaths,
+    state: &sinomo_base::ClusterBootstrapState,
+    endpoint: &sinomo_base::ClusterEndpointRecord,
+) -> Result<(), NetworkError> {
+    let record = cluster_connectivity_record_for_unverified_route(
+        state,
+        endpoint,
+        OffsetDateTime::now_utc(),
+    );
+    write_local_cluster_connectivity_records_inner(
+        paths,
+        &state.local_node_id,
+        std::slice::from_ref(&record),
+        LocalConnectivityMerge::AbsentOnly,
+        false,
+    )
 }
 
 pub fn record_local_cluster_endpoint_command_auth_denied(
@@ -410,27 +436,13 @@ pub fn write_local_cluster_connectivity_records(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<(), NetworkError> {
-    write_local_cluster_connectivity_records_inner(paths, source_node_id, records, false, false)
-}
-
-pub async fn write_local_cluster_connectivity_records_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    source_node_id: &NodeId,
-    records: &[ClusterConnectivityRecord],
-) -> Result<(), NetworkError> {
-    let paths = paths.clone();
-    let source_node_id = source_node_id.clone();
-    let records = records.to_vec();
-    runtime
-        .spawn_blocking(move || {
-            write_local_cluster_connectivity_records(&paths, &source_node_id, &records)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "write local cluster connectivity records".to_string(),
-            detail: format!("local cluster connectivity write task failed: {source}"),
-        })?
+    write_local_cluster_connectivity_records_inner(
+        paths,
+        source_node_id,
+        records,
+        LocalConnectivityMerge::Observe,
+        false,
+    )
 }
 
 /// Replaces the complete set owned by `source_node_id`.
@@ -448,7 +460,13 @@ pub fn write_local_cluster_connectivity_record_set(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<(), NetworkError> {
-    write_local_cluster_connectivity_records_inner(paths, source_node_id, records, true, false)
+    write_local_cluster_connectivity_records_inner(
+        paths,
+        source_node_id,
+        records,
+        LocalConnectivityMerge::ReplaceSource,
+        false,
+    )
 }
 
 /// Blocking-pool adapter for an already authoritative current source set.
@@ -1896,13 +1914,24 @@ fn cluster_connectivity_record_key(
     )
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LocalConnectivityMerge {
+    /// Merge newer observations over existing ones.
+    Observe,
+    /// Replace the complete set owned by the source.
+    ReplaceSource,
+    /// Insert only keys without a current record; evidence is never replaced.
+    AbsentOnly,
+}
+
 fn write_local_cluster_connectivity_records_inner(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
-    replace_source_records: bool,
+    merge: LocalConnectivityMerge,
     persist_observation_details: bool,
 ) -> Result<(), NetworkError> {
+    let replace_source_records = merge == LocalConnectivityMerge::ReplaceSource;
     validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let _mutation_lock = acquire_local_cluster_connectivity_mutation_lock(paths)?;
     let now = OffsetDateTime::now_utc();
@@ -1963,6 +1992,9 @@ fn write_local_cluster_connectivity_records_inner(
             && cluster_network_record_live(record.expires_at, now)
         {
             let key = cluster_connectivity_record_key(record);
+            if merge == LocalConnectivityMerge::AbsentOnly && merged.contains_key(&key) {
+                continue;
+            }
             if merged.get(&key).is_some_and(|existing| {
                 local_cluster_connectivity_latest_observed_at(
                     existing,
@@ -2170,6 +2202,86 @@ mod tests {
         remote_member.endpoints = vec![endpoint.clone()];
         state.members.push(remote_member);
         (root, paths, state, local, endpoint, now)
+    }
+
+    #[test]
+    fn untimed_command_success_keeps_unknown_latency_instead_of_zero() {
+        let (_root, paths, state, _local, endpoint, _now) =
+            connectivity_generation_fixture("untimed_command_success_latency");
+        let untimed = |paths: &ClusterPaths| {
+            record_local_cluster_endpoint_command_connectivity(
+                paths,
+                &state,
+                &endpoint,
+                ClusterConnectivityState::Healthy,
+                None,
+                true,
+            )
+            .expect("untimed success")
+        };
+
+        assert_eq!(
+            untimed(&paths).latency_ms,
+            None,
+            "a success that did not time the edge must not claim a 0 ms edge"
+        );
+        record_local_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(7),
+            true,
+        )
+        .expect("timed success");
+        assert_eq!(untimed(&paths).latency_ms, Some(7));
+    }
+
+    #[test]
+    fn unverified_route_never_replaces_an_observation_or_earns_failure_grace() {
+        let (_root, paths, state, local, endpoint, now) =
+            connectivity_generation_fixture("unverified_route_absent_only");
+        let read = |paths: &ClusterPaths| {
+            let records = read_local_cluster_connectivity_records_for_source(paths, &local)
+                .expect("read local connectivity");
+            assert_eq!(records.len(), 1);
+            records.into_iter().next().expect("one record")
+        };
+
+        record_local_cluster_endpoint_unverified_route(&paths, &state, &endpoint)
+            .expect("record unverified route");
+        let seeded = read(&paths);
+        assert_eq!(seeded.state, ClusterConnectivityState::Degraded);
+        assert_eq!(seeded.latency_ms, None);
+        assert_eq!(seeded.consecutive_failures, 0);
+        assert_eq!(seeded.last_success_at, None);
+        let failed_probe = cluster_connectivity_record_for_failed_attempt(
+            &state,
+            &endpoint,
+            Some(&seeded),
+            "probe failed",
+            now,
+        );
+        assert_eq!(
+            failed_probe.state,
+            ClusterConnectivityState::Degraded,
+            "a never-confirmed route gets no single-failure grace"
+        );
+
+        record_local_cluster_endpoint_command_connectivity(
+            &paths,
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(3),
+            true,
+        )
+        .expect("measured success");
+        record_local_cluster_endpoint_unverified_route(&paths, &state, &endpoint)
+            .expect("repeat unverified route");
+        let observed = read(&paths);
+        assert_eq!(observed.state, ClusterConnectivityState::Healthy);
+        assert_eq!(observed.latency_ms, Some(3));
     }
 
     #[test]

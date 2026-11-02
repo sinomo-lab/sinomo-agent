@@ -5,32 +5,32 @@ use crate::file_manager::{
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
+#[cfg(test)]
+use sinomo_runtime::dfs::DfsPeerTransportFuture;
 #[cfg(any(unix, test))]
 use sinomo_runtime::dfs::DfsPosixCreateAttrs;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError, DfsFileSystemConfig,
-    DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement, DfsNodeTransport,
-    DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView, DfsOperatorStatus,
-    DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode,
+    DfsMessageTransport, DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement,
+    DfsNodeTransport, DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView,
+    DfsOperatorStatus, DfsPeerTransport, DfsPeerTransportError, DfsPinAddRequest, DfsPinMode,
     DfsPlacementBlockingDiagnostic, DfsPlacementImpact, DfsPlacementNodePreview,
     DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
     DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
     DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
-    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
-    DfsPosixDistributedFilePrefixReadOutcome, DfsPosixDistributedFileReadOutcome, DfsPosixError,
-    DfsResolvedPlacementPolicy, DfsStableNamespaceOperationReconciliation, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    discovered_cluster_dfs_peer_node_ids, metadata_shards_prefix,
-    open_cluster_aware_dfs_metadata_backend_for_inspection,
+    DfsPlacementReconciliationJob, DfsPlacementScope, DfsPosixDistributedFilePrefixReadOutcome,
+    DfsPosixDistributedFileReadOutcome, DfsPosixError, DfsResolvedPlacementPolicy,
+    DfsStableNamespaceOperationReconciliation, DfsStat, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, default_dfs_pin_root, discovered_cluster_dfs_peer_node_ids,
+    metadata_shards_prefix, open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     preview_placement_with_unavailable_nodes,
     select_metadata_shard_config_for_path_strict_default_sifs_split, sifs_file_system_id,
     with_cached_cluster_aware_dfs_metadata_inspection,
 };
 use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
-use sinomo_runtime::dfs_history::DfsHistoryExt;
 use sinomo_runtime::kv::{
     KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnRequest, KvTxnResponse,
 };
@@ -231,6 +231,53 @@ fn sifs_object_by_path_from_current_owner(
             .map_err(Into::into)
     })
     .map_err(|error| format!("cannot inspect standalone SIFS path {path}: {error}"))
+}
+
+/// Closed test-fault restriction DATA, never holder or publication authority.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DfsLocalBlobDamageExpectation {
+    pub file_system_id: String,
+    pub object_id: String,
+    pub version: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub node_id: String,
+    pub path: String,
+}
+
+fn validate_local_blob_damage_expectation(
+    stat: &DfsStat,
+    local_node_id: &str,
+    expected: Option<&DfsLocalBlobDamageExpectation>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = DfsLocalBlobDamageExpectation {
+        file_system_id: stat.file_system_id.to_string(),
+        object_id: stat.object_id.to_string(),
+        version: stat.version.to_string(),
+        content_hash: stat.content_hash.clone().unwrap_or_default(),
+        size_bytes: stat
+            .size_bytes
+            .ok_or_else(|| "damage identity has no native size".to_owned())?,
+        node_id: local_node_id.to_owned(),
+        path: stat.path.clone(),
+    };
+    if actual != *expected {
+        return Err(format!(
+            "damage expected identity differs from actual native tuple: expected={expected:?} actual={actual:?}"
+        ));
+    }
+    if !stat
+        .current_locations
+        .iter()
+        .any(|node| node.as_str() != local_node_id)
+    {
+        return Err("damage refuses the last known current location".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -452,6 +499,19 @@ impl SifsFileManagerObservation {
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let rpc_runtime = SifsRpcRuntime::new()?;
+        #[cfg(all(feature = "dfs-test-support", not(test)))]
+        if let Some(opened) =
+            sinomo_runtime::vfs::native_test_support::open_registered(data_dir, None)
+        {
+            let opened = opened.map_err(|error| error.to_string())?;
+            let backend = Self::from_service(data_dir, rpc_runtime, opened.service, true, None)?;
+            // The registered native service already carries its authoritative
+            // control-plane client; retain that same owner for mutations.
+            backend
+                .local_catalog_authoritative
+                .store(true, Ordering::Release);
+            return Ok(backend);
+        }
         if let Some(backend) = Self::open_resident(data_dir, rpc_runtime.clone(), true, None)? {
             return Ok(backend);
         }
@@ -594,6 +654,7 @@ impl SifsFileManagerBackend {
         }))
     }
 
+    #[cfg(test)]
     fn from_resident_owner(
         data_dir: &SinomoDataDir,
         rpc_runtime: SifsRpcRuntime,
@@ -1443,10 +1504,11 @@ impl SifsFileManagerBackend {
             .map_err(|error| format!("cannot list {path}: {error}"))
     }
 
-    pub(crate) fn debug_remove_local_loose_blob_for_path(
+    pub(crate) fn debug_remove_local_loose_blob_for_path_with_expectation(
         &self,
         path: &str,
-    ) -> Result<DfsStat, String> {
+        expected: Option<&DfsLocalBlobDamageExpectation>,
+    ) -> Result<(DfsStat, Option<sinomo_runtime::dfs::ContentManifest>), String> {
         let stat = self.dfs_stat(path)?;
         let local_node_id = self.node_label();
         if !stat
@@ -1459,15 +1521,56 @@ impl SifsFileManagerBackend {
                 stat.current_locations
             ));
         }
+        // This optional harness input restricts the existing fault. It never
+        // grants holder permission, selects a different object, or bypasses the
+        // fresh native stat above. Legacy path-only callers retain their path.
+        validate_local_blob_damage_expectation(&stat, &local_node_id, expected)?;
         let Some(content_hash) = stat.content_hash.as_deref() else {
             return Err(format!("{path} has no content hash to damage"));
         };
         let store = LocalContentStore::new(self.data_dir.dfs_dir().join("content"))
             .map_err(|error| format!("cannot open DFS content store: {error}"))?;
+        let manifest = if expected.is_some() {
+            let size = stat
+                .size_bytes
+                .ok_or_else(|| format!("{path} has no exact size to damage"))?;
+            let Some((manifest, reader)) = store
+                .open_object_content_range_stream(stat.object_id.as_str(), content_hash, size, 0, 0)
+                .map_err(|error| format!("cannot verify local native damage manifest: {error}"))?
+            else {
+                return Err("fault recipient has no live native object content manifest".into());
+            };
+            if manifest.object_id != stat.object_id.as_str()
+                || manifest.content_hash != content_hash
+                || manifest.size_bytes != size
+                || !manifest.extents.is_empty()
+            {
+                return Err(
+                    "fault recipient manifest is not the exact loose content identity".into(),
+                );
+            }
+            // The zero range resolves the live manifest but exposes no full
+            // length. Borrow the existing native blob reader for its actual
+            // file length without reading or hashing the whole payload.
+            let blob = store
+                .open_blob_stream(content_hash)
+                .map_err(|error| format!("cannot verify local loose blob length: {error}"))?;
+            if blob.size_bytes() != size {
+                return Err(
+                    "fault recipient loose blob length differs from the exact native size".into(),
+                );
+            }
+            drop(blob);
+            // Do not retain a temporary read pin over the real deletion.
+            drop(reader);
+            Some(manifest)
+        } else {
+            None
+        };
         store
             .debug_remove_loose_blob(content_hash)
             .map_err(|error| format!("cannot remove local loose blob for {path}: {error}"))?;
-        Ok(stat)
+        Ok((stat, manifest))
     }
 
     pub(crate) fn read_files(&self, paths: &[String]) -> Vec<Result<Vec<u8>, String>> {
@@ -2406,38 +2509,15 @@ impl SifsFileManagerBackend {
         mode: u32,
     ) -> Result<DfsStat, String> {
         let path = normalize_sifs_path(path)?;
-        let mode = mode & 0o7777;
         let mut service = self.lock_service_for_mutation(None)?;
         self.refresh_service_peer_targets(&mut service);
-        let existing = match service.posix_lstat_distributed(&path) {
-            Ok(stat) => Some(stat),
-            Err(DfsPosixError::NotFound { .. } | DfsPosixError::MissingParent { .. }) => None,
-            Err(error) => return Err(format!("cannot inspect SIFS directory {path}: {error}")),
-        };
-        if let Some(stat) = existing {
-            validate_posix_directory_attrs(&path, &stat, uid, gid, mode)?;
-            return Ok(stat);
-        }
-
-        let parent = sifs_parent_path(&path).ok_or_else(|| {
-            format!("cannot provision POSIX attributes on the SIFS root directory {path}")
-        })?;
-        service
-            .posix_mkdir_all(&parent)
-            .map_err(|error| format!("cannot create SIFS directory parent {parent}: {error}"))?;
-        let attrs = DfsPosixCreateAttrs::new(mode, uid, gid);
-        let stat = match service.posix_mkdir_with_create_attrs(&path, attrs) {
-            Ok(stat) => stat,
-            Err(DfsPosixError::AlreadyExists { .. }) => service
-                .posix_lstat_distributed(&path)
-                .map_err(|error| format!("cannot inspect raced SIFS directory {path}: {error}"))?,
-            Err(error) => {
-                return Err(format!("cannot create SIFS directory {path}: {error}"));
-            }
-        };
+        let stat = service
+            .posix_ensure_directory_beneath_no_links_with_attrs(
+                &path, DfsPosixCreateAttrs::new(mode, uid, gid),
+            )
+            .map_err(|error| format!("cannot provision SIFS directory {path}: {error}"))?;
         drop(service);
         self.publish_metadata_after_mutation()?;
-        validate_posix_directory_attrs(&path, &stat, uid, gid, mode)?;
         Ok(stat)
     }
 
@@ -3358,6 +3438,7 @@ fn open_sifs_service_with_catalog_until(
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
     // The caller uses Main's normal typed call/result and attachment contract.
     let transport = sifs_main_caller_transport(data_dir, local_node_id.clone(), peer_node_ids)?;
+    let registered_main_namespace_dispatch = transport.delegates_local_namespace_authority();
     let mut service = NetworkedDfsService::new(transport, content);
     let metadata_shards = if let Some((client, shards)) = authoritative_catalog {
         service = service.with_control_plane(client);
@@ -3370,10 +3451,17 @@ fn open_sifs_service_with_catalog_until(
         read_sifs_metadata_shard_configs(&cluster_paths)?
     };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let service = if let Some(metadata) =
-        open_sifs_sharded_metadata_backend(data_dir, metadata_shards, &local_node_id)?
-    {
-        if hydrate_metadata {
+    let service = if let Some(metadata) = open_sifs_sharded_metadata_backend(
+        data_dir,
+        metadata_shards,
+        &local_node_id,
+        registered_main_namespace_dispatch,
+    )? {
+        if registered_main_namespace_dispatch {
+            service
+                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
+                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
+        } else if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
@@ -3388,7 +3476,11 @@ fn open_sifs_service_with_catalog_until(
             default_dfs_metadata_root(data_dir),
         )
         .map_err(|error| format!("cannot inspect local SIFS metadata: {error}"))?;
-        if hydrate_metadata {
+        if registered_main_namespace_dispatch {
+            service
+                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
+                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
+        } else if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
@@ -5009,17 +5101,28 @@ fn open_sifs_sharded_metadata_backend(
     data_dir: &SinomoDataDir,
     shards: Vec<DfsMetadataShardConfig>,
     local_node_id: &NodeId,
+    registered_main_namespace_dispatch: bool,
 ) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, String> {
     if shards.is_empty() {
         return Ok(None);
     }
-    sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
-        default_dfs_metadata_shards_root(data_dir),
-        shards,
-        local_node_id,
-    )
-    .map(Some)
-    .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
+    let metadata_root = default_dfs_metadata_shards_root(data_dir);
+    let backend = if registered_main_namespace_dispatch {
+        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node_deferred(
+            metadata_root,
+            shards,
+            local_node_id,
+        )
+    } else {
+        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
+            metadata_root,
+            shards,
+            local_node_id,
+        )
+    };
+    backend
+        .map(Some)
+        .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
 }
 
 fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> Vec<NodeId> {
@@ -5519,28 +5622,6 @@ fn sifs_operation_remaining(
         .ok_or_else(|| format!("SIFS operation deadline expired during {operation}"))
 }
 
-#[cfg(any(unix, test))]
-fn validate_posix_directory_attrs(
-    path: &str,
-    stat: &DfsStat,
-    uid: u32,
-    gid: u32,
-    mode: u32,
-) -> Result<(), String> {
-    if stat.kind != DfsObjectKind::Directory {
-        return Err(format!(
-            "SIFS path {path} is {:?}, not a directory",
-            stat.kind
-        ));
-    }
-    if stat.uid != uid || stat.gid != gid || stat.mode != mode {
-        return Err(format!(
-            "SIFS directory {path} has owner {}:{} mode {:04o}, expected {uid}:{gid} mode {:04o}",
-            stat.uid, stat.gid, stat.mode, mode
-        ));
-    }
-    Ok(())
-}
 
 fn sifs_parent_path(path: &str) -> Option<String> {
     let (parent, name) = path.rsplit_once('/')?;
@@ -5610,6 +5691,8 @@ fn parent_sifs_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     mod cold_open_contract;
+    mod native_owner_fixtures;
+    use native_owner_fixtures::*;
     use super::*;
     use sinomo_runtime::api::{
         DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE, DAEMON_DFS_BROWSER_DELETE_ROUTE,
@@ -6167,8 +6250,11 @@ mod tests {
         let from = "/services/stable-preflight-source.txt";
         let to = "/services/stable-preflight-target.txt";
         backend.write_file(from, b"stable original").unwrap();
-        let before = backend.lock_service().unwrap().posix_stat(from).unwrap();
-        drop(backend.service.take().unwrap());
+        let before = actual_stat(&_native_data_dir, from).unwrap();
+        assert!(
+            backend.service.get().is_none(),
+            "ordinary Main write is metadata-less at the caller"
+        );
         assert!(backend.service.get().is_none());
         let deadline = Instant::now() + Duration::from_secs(30);
         backend
@@ -6181,15 +6267,15 @@ mod tests {
             let previous = service.set_transport_operation_deadline(Some(deadline));
             assert_eq!(previous, None);
             service.set_transport_operation_deadline(previous);
-            let after = service.posix_stat(from).unwrap();
-            assert_eq!(after.object_id, before.object_id);
-            assert_eq!(after.version, before.version);
-            assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
-            assert!(matches!(
-                service.posix_stat(to),
-                Err(DfsPosixError::NotFound { .. })
-            ));
         }
+        let after = actual_stat(&_native_data_dir, from).unwrap();
+        assert_eq!(after.object_id, before.object_id);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
+        assert!(matches!(
+            actual_stat(&_native_data_dir, to),
+            Err(DfsPosixError::NotFound { .. })
+        ));
         backend
             .prepare_stable_namespace_mutation_until(deadline)
             .unwrap();
@@ -6217,7 +6303,10 @@ mod tests {
         backend
             .write_file("/services/preflight-expired-source.txt", b"original")
             .unwrap();
-        drop(backend.service.take().unwrap());
+        assert!(
+            backend.service.get().is_none(),
+            "ordinary Main write must not initialize the fallback"
+        );
         let error = backend
             .prepare_stable_namespace_mutation_until(Instant::now() - Duration::from_millis(1))
             .unwrap_err();
@@ -6436,6 +6525,7 @@ mod tests {
     struct RecordingSifsKvDaemonTransport {
         exact_receipt: bool,
         local_node_id: NodeId,
+        initial_revision: KvRevision,
         routes: Mutex<Vec<String>>,
         committed: AtomicBool,
         commit_after_next_entry_response: AtomicBool,
@@ -6449,10 +6539,20 @@ mod tests {
     }
 
     impl RecordingSifsKvDaemonTransport {
-        fn new(local_node_id: NodeId) -> Self {
+        fn new(data_dir: &SinomoDataDir, local_node_id: NodeId) -> Self {
+            // This transport is a DATA model of the response sequence. Start at
+            // the actual native fixture's published floor, rather than assuming
+            // how many commits current formation/genesis required.
+            let initial_revision = read_sifs_materialized_cluster_kv_snapshot(
+                &ClusterPaths::new(data_dir),
+            )
+            .expect("read actual seeded catalog revision")
+            .expect("actual fixture published its catalog")
+            .revision;
             Self {
                 exact_receipt: false,
                 local_node_id,
+                initial_revision,
                 routes: Mutex::new(Vec::new()),
                 committed: AtomicBool::new(false),
                 commit_after_next_entry_response: AtomicBool::new(false),
@@ -6464,6 +6564,11 @@ mod tests {
                 exact_set_keys: Mutex::new(Vec::new()),
                 generation_race: Mutex::new(None),
             }
+        }
+
+        fn revision(&self, committed: bool) -> KvRevision {
+            KvRevision(self.initial_revision.0.checked_add(u64::from(committed))
+                .expect("model transition revision fits"))
         }
 
         fn authority(revision: KvRevision) -> sinomo_runtime::kv::KvAuthorityProof {
@@ -6538,8 +6643,8 @@ mod tests {
                 .lock()
                 .expect("SIFS cache")
                 .begin_authoritative_generation();
-            // The first response was selected from revision 7 before this
-            // refresh edge. The replanned request observes revision 8.
+            // The first response was selected from the seeded revision before
+            // this refresh edge. The replan observes its next model revision.
             self.committed.store(true, Ordering::SeqCst);
         }
     }
@@ -6621,7 +6726,7 @@ mod tests {
                         committed = true;
                     }
                     self.trigger_generation_race(&route);
-                    let revision = KvRevision(if committed { 8 } else { 7 });
+                    let revision = self.revision(committed);
                     let mut values = request
                         .keys
                         .iter()
@@ -6629,8 +6734,8 @@ mod tests {
                             "/dfs/test/daemon-projection" => Some(sinomo_runtime::kv::KvEntry {
                                 key: key.clone(),
                                 value: b"fresh".to_vec(),
-                                create_revision: KvRevision(7),
-                                modify_revision: KvRevision(7),
+                                create_revision: self.initial_revision,
+                                modify_revision: self.initial_revision,
                                 version: sinomo_runtime::kv::KvVersion(1),
                                 lease_id: None,
                             }),
@@ -6638,8 +6743,8 @@ mod tests {
                                 Some(sinomo_runtime::kv::KvEntry {
                                     key: key.clone(),
                                     value: b"value".to_vec(),
-                                    create_revision: KvRevision(8),
-                                    modify_revision: KvRevision(8),
+                                    create_revision: self.revision(true),
+                                    modify_revision: self.revision(true),
                                     version: sinomo_runtime::kv::KvVersion(1),
                                     lease_id: None,
                                 })
@@ -6675,14 +6780,14 @@ mod tests {
                     )
                     .expect("decode SIFS authoritative snapshot request");
                     let keys = self.exact_set_keys.lock().expect("exact-set keys").clone();
-                    let mut snapshot = empty_sifs_kv_snapshot(KvRevision(8));
+                    let mut snapshot = empty_sifs_kv_snapshot(self.revision(true));
                     snapshot.entries = keys
                         .iter()
                         .map(|key| sinomo_runtime::kv::KvEntry {
                             key: key.clone(),
                             value: format!("authoritative:{key}").into_bytes(),
-                            create_revision: KvRevision(8),
-                            modify_revision: KvRevision(8),
+                            create_revision: self.revision(true),
+                            modify_revision: self.revision(true),
                             version: sinomo_runtime::kv::KvVersion(1),
                             lease_id: None,
                         })
@@ -6691,7 +6796,7 @@ mod tests {
                     sinomo_runtime::kv::cluster_kv_authoritative_snapshot_response_rpc_payload(
                         &sinomo_runtime::kv::KvAuthoritativeRead {
                             value: snapshot,
-                            authority: Self::authority(KvRevision(8)),
+                            authority: Self::authority(self.revision(true)),
                         },
                     )
                     .expect("encode SIFS authoritative snapshot response")
@@ -6736,25 +6841,25 @@ mod tests {
                             Some(sinomo_runtime::kv::KvEntry {
                                 key: request.key,
                                 value: b"fresh".to_vec(),
-                                create_revision: KvRevision(7),
-                                modify_revision: KvRevision(7),
+                                create_revision: self.initial_revision,
+                                modify_revision: self.initial_revision,
                                 version: sinomo_runtime::kv::KvVersion(1),
                                 lease_id: None,
                             }),
-                            KvRevision(if committed { 8 } else { 7 }),
+                            self.revision(committed),
                         ),
                         "/dfs/test/committed" if committed => (
                             Some(sinomo_runtime::kv::KvEntry {
                                 key: request.key,
                                 value: b"value".to_vec(),
-                                create_revision: KvRevision(8),
-                                modify_revision: KvRevision(8),
+                                create_revision: self.revision(true),
+                                modify_revision: self.revision(true),
                                 version: sinomo_runtime::kv::KvVersion(1),
                                 lease_id: None,
                             }),
-                            KvRevision(8),
+                            self.revision(true),
                         ),
-                        _ => (None, KvRevision(if committed { 8 } else { 7 })),
+                        _ => (None, self.revision(committed)),
                     };
                     if self
                         .wrong_authoritative_entry_key_once
@@ -6788,8 +6893,8 @@ mod tests {
                     let mut value = vec![sinomo_runtime::kv::KvEntry {
                         key: "/dfs/test/daemon-projection".to_string(),
                         value: b"fresh".to_vec(),
-                        create_revision: KvRevision(7),
-                        modify_revision: KvRevision(7),
+                        create_revision: self.initial_revision,
+                        modify_revision: self.initial_revision,
                         version: sinomo_runtime::kv::KvVersion(1),
                         lease_id: None,
                     }];
@@ -6797,8 +6902,8 @@ mod tests {
                         value.push(sinomo_runtime::kv::KvEntry {
                             key: "/dfs/test/committed".to_string(),
                             value: b"value".to_vec(),
-                            create_revision: KvRevision(8),
-                            modify_revision: KvRevision(8),
+                            create_revision: self.revision(true),
+                            modify_revision: self.revision(true),
                             version: sinomo_runtime::kv::KvVersion(1),
                             lease_id: None,
                         });
@@ -6807,7 +6912,7 @@ mod tests {
                         .out_of_prefix_authoritative_entry_once
                         .swap(false, Ordering::SeqCst)
                     {
-                        let revision = KvRevision(if committed { 8 } else { 7 });
+                        let revision = self.revision(committed);
                         value.push(sinomo_runtime::kv::KvEntry {
                             key: "/dfs/test-sibling".to_string(),
                             value: b"foreign".to_vec(),
@@ -6820,7 +6925,7 @@ mod tests {
                     sinomo_runtime::kv::cluster_kv_authoritative_range_prefix_response_rpc_payload(
                         &sinomo_runtime::kv::KvAuthoritativeRead {
                             value,
-                            authority: Self::authority(KvRevision(if committed { 8 } else { 7 })),
+                            authority: Self::authority(self.revision(committed)),
                         },
                     )
                     .expect("encode bounded SIFS projection response")
@@ -6844,16 +6949,16 @@ mod tests {
                             snapshot,
                             txn_response: Some(KvTxnResponse {
                                 succeeded: true,
-                                revision: KvRevision(8),
+                                revision: self.revision(true),
                                 responses: Vec::new(),
                             }),
                             authority: sinomo_runtime::kv::KvAuthorityProof {
                                 basis: if self.exact_receipt {
                                     sinomo_runtime::kv::KvAuthorityBasis::ExactCommittedRequest
                                 } else {
-                                    Self::authority(KvRevision(8)).basis
+                                    Self::authority(self.revision(true)).basis
                                 },
-                                ..Self::authority(KvRevision(8))
+                                ..Self::authority(self.revision(true))
                             },
                             replayed_committed_request: self.exact_receipt,
                         },
@@ -7035,23 +7140,13 @@ mod tests {
     fn one_shot_bulk_write_control_plane_refresh_fences_new_local_primary() {
         let root = temp_sifs_data_dir("one-shot-authority-refresh");
         let data_dir = SinomoDataDir::new(&root);
-        let mut shards = seed_observation_cluster(&data_dir);
+        let cuts = actual_replica_and_primary_catalogs("cli-one-shot-authority-refresh");
+        install_actual_offline_catalog(&data_dir, &cuts.state, &cuts.replica_only.value);
         let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node_id = cluster::read_cluster_state_without_kv(&cluster_paths)
-            .expect("cluster state")
-            .local_node_id;
-        let remote_primary =
-            NodeId::from_legacy_named("node_one_shot_remote_primary").expect("remote primary");
-        for shard in &mut shards {
-            shard.primary_node_id = remote_primary.clone();
-            shard.replica_node_ids = vec![local_node_id.clone()];
-        }
-        write_metadata_shard_snapshot(&cluster_paths, &shards);
-
         let control_plane = SifsOneShotBulkWriteControlPlaneKvClient::new(
             &data_dir,
             &cluster_paths,
-            local_node_id.clone(),
+            cuts.local.clone(),
         );
         control_plane
             .inner
@@ -7059,18 +7154,21 @@ mod tests {
             .expect("load remote-primary catalog");
         control_plane
             .validate_cached_catalog()
-            .expect("replica-only catalog is eligible");
-
-        shards[0].primary_node_id = local_node_id;
-        shards[0].epoch += 1;
-        write_metadata_shard_snapshot(&cluster_paths, &shards);
-        control_plane
-            .inner
-            .replace_cached_snapshot()
-            .expect("install reassigned catalog");
-        let error = control_plane
-            .validate_cached_catalog()
-            .expect_err("new local primary must fence the metadata-less requester");
+            .expect("actual replica-only catalog is eligible");
+        install_actual_offline_catalog(&data_dir, &cuts.state, &cuts.local_primary.value);
+        control_plane.inner.replace_cached_snapshot().unwrap();
+        let result = control_plane.validate_cached_catalog();
+        evidence(
+            &data_dir,
+            "one-shot-actual-catalog-refresh.json",
+            serde_json::json!({
+                "qualification":"actual3-node member/capability + native handoff-produced catalogs; OFFLINE cached catalog validation only, no mutation authority claimed",
+                "before":cuts.replica_shards,"after":cuts.primary_shards,
+                "before_proof":cuts.replica_only.authority,"after_proof":cuts.local_primary.authority,
+                "result":result.as_ref().map(|_| "accepted").map_err(ToString::to_string),
+            }),
+        );
+        let error = result.expect_err("new local primary must fence the metadata-less requester");
         assert!(
             error.to_string().contains("is primary for metadata shard"),
             "unexpected authority fence: {error}"
@@ -7081,41 +7179,36 @@ mod tests {
     fn one_shot_bulk_write_reuses_the_validated_installed_catalog() {
         let root = temp_sifs_data_dir("one-shot-installed-catalog");
         let data_dir = SinomoDataDir::new(&root);
-        let mut shards = seed_observation_cluster(&data_dir);
+        let cuts = actual_replica_and_primary_catalogs("cli-one-shot-installed-catalog");
+        install_actual_offline_catalog(&data_dir, &cuts.state, &cuts.replica_only.value);
         let cluster_paths = ClusterPaths::new(&data_dir);
-        let local_node_id = cluster::read_cluster_state_without_kv(&cluster_paths)
-            .expect("cluster state")
-            .local_node_id;
-        let remote_primary =
-            NodeId::from_legacy_named("node_one_shot_cached_primary").expect("remote primary");
-        for shard in &mut shards {
-            shard.primary_node_id = remote_primary.clone();
-            shard.replica_node_ids = vec![local_node_id.clone()];
-        }
-        write_metadata_shard_snapshot(&cluster_paths, &shards);
-
         let control_plane =
-            SifsOneShotBulkWriteControlPlaneKvClient::new(&data_dir, &cluster_paths, local_node_id);
-        let authoritative_snapshot = read_sifs_materialized_cluster_kv_snapshot(&cluster_paths)
-            .expect("read authoritative fixture snapshot")
-            .expect("authoritative fixture snapshot");
+            SifsOneShotBulkWriteControlPlaneKvClient::new(&data_dir, &cluster_paths, cuts.local);
         control_plane
             .inner
-            .install_cached_snapshot(authoritative_snapshot)
-            .expect("install returned authoritative catalog");
-
+            .install_cached_snapshot(Arc::new(cuts.replica_only.value))
+            .unwrap();
         let snapshot_path = cluster_paths.kv_paths().snapshot;
-        fs::remove_file(&snapshot_path).expect("remove materialized snapshot");
+        fs::remove_file(&snapshot_path).unwrap();
+        let catalog = control_plane.validated_cached_catalog();
+        evidence(
+            &data_dir,
+            "one-shot-actual-installed-catalog.json",
+            serde_json::json!({
+                "qualification":"actual native catalog copied into OFFLINE observational cache; file absence verifies installed-generation reuse, not live authority",
+                "actual_expected":cuts.replica_shards,
+                "result":catalog.as_ref().map(|v| serde_json::to_value(v).unwrap()).map_err(ToString::to_string),
+                "checkpoint_exists":snapshot_path.exists(),
+            }),
+        );
         assert_eq!(
-            control_plane
-                .validated_cached_catalog()
-                .expect("reuse installed catalog"),
-            shards,
-            "mkdir, bulk create, and publish must share the generation validated at open"
+            catalog.unwrap(),
+            cuts.replica_shards,
+            "all operations share exact installed generation"
         );
         assert!(
             !snapshot_path.exists(),
-            "cached validation must not trigger another daemon/KV materialization"
+            "cached validation must not rematerialize native state"
         );
     }
 
@@ -7269,76 +7362,55 @@ mod tests {
     fn sifs_observation_uses_invocation_authority_over_stale_materialized_topology() {
         let root = temp_sifs_data_dir("observation-authoritative-topology");
         let data_dir = SinomoDataDir::new(&root);
-        let shards = seed_observation_cluster(&data_dir);
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let materialized = read_sifs_materialized_cluster_kv_snapshot(&cluster_paths)
-            .expect("read materialized snapshot")
-            .expect("materialized snapshot");
-        let mut authoritative = materialized.as_ref().clone();
-        let mut current_users = shards
+        let cuts =
+            actual_replica_and_primary_catalogs_for("cli-observation-current-users", "users");
+        install_actual_offline_catalog(&data_dir, &cuts.state, &cuts.replica_only.value);
+        let paths = ClusterPaths::new(&data_dir);
+        let before = cuts
+            .replica_shards
             .iter()
             .find(|shard| shard.shard_id == "users")
             .expect("users shard")
             .clone();
-        current_users.epoch = 9;
-        current_users.primary_node_id =
-            NodeId::from_legacy_named("node_sifs_observation_current_users").expect("current node");
-        let users_key = sinomo_runtime::dfs::metadata_shard_key(
-            &current_users.file_system_id,
-            &current_users.shard_id,
-        );
-        let KvOp::Put { value, .. } =
-            KvOp::put_serde(&users_key, &current_users, None).expect("encode current users shard")
-        else {
-            unreachable!("put_serde constructs a put operation")
-        };
-        let revision = KvRevision(authoritative.revision.0.saturating_add(1));
-        let users_entry = authoritative
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == users_key)
-            .expect("materialized users entry");
-        users_entry.value = value;
-        users_entry.modify_revision = revision;
-        users_entry.version = sinomo_runtime::kv::KvVersion(users_entry.version.0 + 1);
-        authoritative.revision = revision;
-        authoritative.canonicalize();
+        let current_users = cuts
+            .primary_shards
+            .iter()
+            .find(|s| s.shard_id == "users")
+            .unwrap()
+            .clone();
+        assert_ne!(before, current_users);
         let token = sinomo_runtime::test::SinomoTestContext::new(&root)
             .try_with_authoritative_cluster_snapshot(
-                sinomo_runtime::kv::KvAuthoritativeRead {
-                    value: authoritative,
-                    authority: sinomo_runtime::kv::KvAuthorityProof {
-                        term: 4,
-                        commit_index: revision.0.saturating_add(10),
-                        revision,
-                        basis: sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
-                            voter_acks: 1,
-                            required_quorum: 1,
-                        },
-                    },
-                },
-                cluster_paths.kv_paths().snapshot.clone(),
+                cuts.local_primary,
+                paths.kv_paths().snapshot.clone(),
             )
             .expect("valid authoritative context")
             .authoritative_cluster_snapshot()
-            .expect("authoritative token");
-
-        let observation = SifsFileManagerObservation::open(&data_dir).expect("observation");
-        assert_eq!(
-            observation
-                .metadata_shard_for_path("/users/layout-probe")
-                .expect("materialized users shard")
-                .expect("materialized users assignment")
-                .epoch,
-            1,
-            "the fixture must retain the stale observational checkpoint"
+            .unwrap();
+        let observation = SifsFileManagerObservation::open(&data_dir).unwrap();
+        let old = observation
+            .metadata_shard_for_path("/users/layout-probe")
+            .unwrap();
+        let current = observation
+            .metadata_shard_for_path_at_authority("/users/layout-probe", &token)
+            .unwrap();
+        evidence(
+            &data_dir,
+            "actual-users-catalog-invocation.json",
+            serde_json::json!({
+                "qualification":"normal3-node native handoff produced both cuts; offline read-only invocation-token consumer, not live mutation/current-owner authority",
+                "old":old,"current":current,"expected_old":before,"expected_current":current_users,
+            }),
         );
         assert_eq!(
-            observation
-                .metadata_shard_for_path_at_authority("/users/layout-probe", &token)
-                .expect("authoritative users shard")
-                .expect("authoritative users assignment"),
-            current_users
+            old,
+            Some(before),
+            "observational checkpoint stays deliberately old"
+        );
+        assert_eq!(current, Some(current_users));
+        assert_eq!(
+            read_sifs_metadata_shard_configs(&paths).unwrap(),
+            cuts.replica_shards
         );
     }
 
@@ -7429,82 +7501,98 @@ mod tests {
 
     #[test]
     fn cold_mutation_backend_uses_authoritative_catalog_without_rewriting_checkpoint() {
-        struct CatalogTransport(Vec<sinomo_runtime::kv::KvEntry>);
-        impl DfsPeerTransport for CatalogTransport {
-            fn call_object_rpc(
-                &self,
-                _target: &NodeId,
-                call: network::ObjectRpcCall,
-                _options: DfsObjectRpcSendOptions,
-            ) -> Result<network::ObjectRpcResult, DfsPeerTransportError> {
-                assert_eq!(
-                    call.request.route,
-                    sinomo_runtime::kv::CLUSTER_KV_AUTHORITATIVE_RANGE_PREFIX_ROUTE
-                );
-                let request = sinomo_runtime::kv::decode_cluster_kv_authoritative_range_prefix_rpc_request_body(&call.request.body).unwrap();
-                assert_eq!(
-                    request.prefix,
-                    format!("{}/", metadata_shards_prefix(&sifs_file_system_id()))
-                );
-                let payload =
-                    sinomo_runtime::kv::cluster_kv_authoritative_range_prefix_response_rpc_payload(
-                        &sinomo_runtime::kv::KvAuthoritativeRead {
-                            value: self.0.clone(),
-                            authority: RecordingSifsKvDaemonTransport::authority(KvRevision(100)),
-                        },
-                    )
-                    .unwrap();
-                Ok(network::ObjectRpcResult::value(
-                    network::ObjectRpcResponse::from_encoded_body(payload.route, payload.body),
-                ))
-            }
-        }
-        let root = temp_sifs_data_dir("cold-mutation-authoritative-catalog");
-        let data_dir = SinomoDataDir::new(&root);
-        let stale = seed_observation_cluster(&data_dir);
+        let (fixture, data_dir, caller, old, stale) =
+            live_replica_cli_fixture("cli-cold-actual-authority");
         let paths = ClusterPaths::new(&data_dir);
         let runtime = SifsRpcRuntime::new().unwrap();
         let cold = open_sifs_service_with_hydration(&data_dir, &runtime, false).unwrap();
-        assert!(
-            cold.metadata_backend()
+        let cold_statuses = cold
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap();
+        evidence(
+            &data_dir,
+            "cold-actual-catalog-before.json",
+            serde_json::json!({
+                "actual_assignments":stale,"cold_statuses":cold_statuses,
+            }),
+        );
+        for shard in &stale {
+            assert!(
+                cold_statuses
+                    .iter()
+                    .any(|s| s.shard_id.0 == shard.shard_id && s.epoch == Some(shard.epoch))
+            );
+        }
+        drop(cold);
+        let fresh = fixture.with_native(|native, _| {
+            let state = cluster::read_cluster_state_without_kv(&paths).unwrap();
+            for shard in &stale {
+                native
+                    .reassign_metadata_shard(
+                        &sifs_file_system_id(),
+                        &shard.shard_id,
+                        caller.clone(),
+                        state
+                            .members
+                            .iter()
+                            .map(|m| m.node_id.clone())
+                            .filter(|n| *n != caller)
+                            .collect(),
+                    )
+                    .unwrap();
+            }
+            publish_actual_native_catalog(native, &caller)
+        });
+        let current = snapshot_metadata_shards(&fresh.value);
+        assert_ne!(current, stale);
+        // Preserve an EXACT genuinely captured older observational checkpoint.
+        // This DATA never grants native mutation permission or overrides KV.
+        sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &old.value).unwrap();
+        let before_checkpoint = fs::read(&paths.kv_paths().snapshot).unwrap();
+        let before = metadata_journal_heads(&data_dir, &current);
+        let peer = crate::native_test_fixture::peer_transports(&data_dir)
+            .unwrap()
+            .0;
+        let client = SifsControlPlaneKvClient::new(&data_dir, &paths).with_peer_transport(peer);
+        let result =
+            open_sifs_service_with_authoritative_catalog_until(&data_dir, &runtime, client, None);
+        let statuses = result.as_ref().map(|s| {
+            s.metadata_backend()
                 .unwrap()
                 .metadata_shard_statuses()
                 .unwrap()
-                .iter()
-                .all(|s| s.epoch == Some(1))
+        });
+        evidence(
+            &data_dir,
+            "cold-actual-catalog-after.json",
+            serde_json::json!({
+                "qualification":"real same3-owner handoffs + actual current range read; old file is prior real captured DATA, no row/proof synthesis",
+                "stale":stale,"current":current,"result":statuses.as_ref().map(|v| serde_json::to_value(v).unwrap()).map_err(ToString::to_string),
+                "checkpoint_unchanged":fs::read(&paths.kv_paths().snapshot).unwrap()==before_checkpoint,
+                "heads_before":before,"heads_after":metadata_journal_heads(&data_dir,&current),
+            }),
         );
-        let before = metadata_journal_heads(&data_dir, &stale);
-        let mut fresh = stale.clone();
-        for shard in &mut fresh {
-            shard.epoch = 3;
+        let service = result.unwrap();
+        let statuses = service
+            .metadata_backend()
+            .unwrap()
+            .metadata_shard_statuses()
+            .unwrap();
+        for shard in &current {
+            assert!(
+                statuses
+                    .iter()
+                    .any(|s| s.shard_id.0 == shard.shard_id && s.epoch == Some(shard.epoch))
+            );
         }
-        let mut store = sinomo_runtime::kv::InProcessKvStore::new();
-        for shard in &fresh {
-            DfsControlPlaneStore::new(&mut store)
-                .put_metadata_shard(shard)
-                .unwrap();
-        }
-        let client = SifsControlPlaneKvClient::new(&data_dir, &paths).with_peer_transport(
-            Arc::new(CatalogTransport(store.try_snapshot().unwrap().entries)),
-        );
-        let service =
-            open_sifs_service_with_authoritative_catalog_until(&data_dir, &runtime, client, None)
-                .unwrap();
-        assert!(
-            service
-                .metadata_backend()
-                .unwrap()
-                .metadata_shard_statuses()
-                .unwrap()
-                .iter()
-                .all(|s| s.epoch == Some(3))
-        );
+        assert_eq!(read_sifs_metadata_shard_configs(&paths).unwrap(), stale);
         assert_eq!(
-            read_sifs_metadata_shard_configs(&paths).unwrap(),
-            stale,
-            "private authority must not overwrite the daemon's observational checkpoint"
+            fs::read(&paths.kv_paths().snapshot).unwrap(),
+            before_checkpoint
         );
-        assert_eq!(metadata_journal_heads(&data_dir, &fresh), before);
+        assert_eq!(metadata_journal_heads(&data_dir, &current), before);
     }
 
     #[test]
@@ -7560,8 +7648,7 @@ mod tests {
             "open-path replica discovery must remain available with daemon-owned Raft locked"
         );
 
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone(),
         ));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
@@ -7611,7 +7698,7 @@ mod tests {
                 failure: Vec::new(),
             })
             .expect("commit through resident daemon route");
-        assert_eq!(txn.revision, KvRevision(8));
+        assert_eq!(txn.revision, transport.revision(true));
         assert!(
             read_sifs_materialized_cluster_kv_snapshot(&cluster_paths)
                 .expect("read intentionally stale materialized projection")
@@ -7624,7 +7711,7 @@ mod tests {
             .cached_snapshot()
             .expect("read coherent DFS projection")
             .expect("coherent DFS projection");
-        assert_eq!(cached.revision, KvRevision(8));
+        assert_eq!(cached.revision, transport.revision(true));
         assert_eq!(
             cached
                 .get("/dfs/test/committed")
@@ -7666,7 +7753,7 @@ mod tests {
         seed_observation_cluster(&data_dir);
         let paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&paths).expect("cluster state");
-        let mut transport = RecordingSifsKvDaemonTransport::new(state.local_node_id);
+        let mut transport = RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id);
         transport.exact_receipt = true;
         let transport = Arc::new(transport);
         let mut client =
@@ -7728,7 +7815,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let mut transport = RecordingSifsKvDaemonTransport::new(state.local_node_id.clone());
+        let mut transport = RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone());
         transport.exact_receipt = exact_receipt;
         let transport = Arc::new(transport);
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
@@ -7743,14 +7830,14 @@ mod tests {
             "/dfs/test/txn-c".to_string(),
         ];
         {
-            let mut snapshot = empty_sifs_kv_snapshot(KvRevision(7));
+            let mut snapshot = empty_sifs_kv_snapshot(transport.initial_revision);
             snapshot.entries = keys
                 .iter()
                 .map(|key| sinomo_runtime::kv::KvEntry {
                     key: key.clone(),
                     value: b"stale".to_vec(),
-                    create_revision: KvRevision(7),
-                    modify_revision: KvRevision(7),
+                    create_revision: transport.initial_revision,
+                    modify_revision: transport.initial_revision,
                     version: sinomo_runtime::kv::KvVersion(1),
                     lease_id: None,
                 })
@@ -7820,8 +7907,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone(),
         ));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
@@ -7906,8 +7992,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone(),
         ));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
@@ -7949,8 +8034,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone(),
         ));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
@@ -7984,7 +8068,7 @@ mod tests {
             .cached_snapshot()
             .expect("cached coherent projection")
             .expect("materialized coherent projection");
-        assert_eq!(snapshot.revision, KvRevision(8));
+        assert_eq!(snapshot.revision, transport.revision(true));
         assert_eq!(
             snapshot
                 .get("/dfs/test/daemon-projection")
@@ -8007,7 +8091,7 @@ mod tests {
             seed_observation_cluster(&data_dir);
             let cluster_paths = ClusterPaths::new(&data_dir);
             let state = cluster::read_cluster_state_without_kv(&cluster_paths).unwrap();
-            let transport = Arc::new(RecordingSifsKvDaemonTransport::new(state.local_node_id));
+            let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id));
             if unknown_route {
                 transport.return_unknown_exact_set_route_once();
             } else {
@@ -8036,7 +8120,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(state.local_node_id));
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
         client
@@ -8071,7 +8155,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(state.local_node_id));
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
         let prefix = "/dfs/test/";
@@ -8104,8 +8188,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone(),
         ));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
@@ -8152,8 +8235,7 @@ mod tests {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .expect("cluster state without KV");
-        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(
-            state.local_node_id.clone(),
+        let transport = Arc::new(RecordingSifsKvDaemonTransport::new(&data_dir, state.local_node_id.clone(),
         ));
         let mut client = SifsControlPlaneKvClient::new(&data_dir, &cluster_paths)
             .with_peer_transport(transport.clone());
@@ -8598,7 +8680,8 @@ mod tests {
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = Arc::new(SifsFileManagerBackend::open(&data_dir).expect("backend"));
         let contended = Arc::clone(&backend);
-        let service_guard = backend.lock_service().expect("service lock");
+        let main_guard = _native_data_dir
+            .with_native(|native, node| native.hold_main_mutation_admission(node).unwrap());
         let started_at = Instant::now();
         let writer = std::thread::spawn(move || {
             contended.write_file_wait_for_commit_with_deadline(
@@ -8612,12 +8695,30 @@ mod tests {
             .join()
             .expect("writer thread")
             .expect_err("contended lock must respect the write deadline");
-        drop(service_guard);
-
-        assert!(error.contains("operation deadline expired"));
+        let completed_after = started_at.elapsed();
+        drop(main_guard);
+        evidence(
+            &data_dir,
+            "actual-main-write-deadline.json",
+            serde_json::json!({
+                "qualification":"actual existing Main GlobalExclusive admission held, not a private caller mutex",
+                "error":error,"elapsed_nanos":completed_after.as_nanos(),
+            }),
+        );
         assert!(
-            started_at.elapsed() < Duration::from_millis(500),
-            "service lock contention exceeded the caller deadline"
+            error.contains("operation deadline expired")
+                || error.contains("native fixture RPC deadline expired; PossiblyApplied")
+                || (error.starts_with("network error at actual native Main registry: network timeout during shared DFS native RPC overall deadline in Overall after ")
+                    && error.ends_with(" (PossiblyApplied)")),
+            "{error}"
+        );
+        assert!(matches!(
+            actual_stat(&_native_data_dir, "/services/contended-wait-for-commit.txt"),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(
+            completed_after < Duration::from_millis(500),
+            "actual Main contention exceeded the caller deadline"
         );
     }
 
@@ -8630,7 +8731,34 @@ mod tests {
         let root = temp_sifs_data_dir("contended-deadline-helpers");
         let data_dir = SinomoDataDir::new(&root);
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
-        let backend = Arc::new(SifsFileManagerBackend::open(&data_dir).expect("backend"));
+        let seed = SifsFileManagerBackend::open(&data_dir).expect("actual Main seed backend");
+        seed.write_file("/services/contended-rename-source.txt", b"rename subject")
+            .unwrap();
+        seed.write_file("/services/contended-delete.txt", b"delete subject")
+            .unwrap();
+        seed.create_dir_all("/services/contended-remove.txt").unwrap();
+        drop(seed);
+        // Exercise the existing local fallback's service-lock deadline. A
+        // resident browser RPC may already own a running blocking operation
+        // when its caller returns PossiblyApplied; that is a different cut.
+        let service = _native_data_dir.with_native(|native, node| {
+            native.client(node).expect("actual current native Core owner")
+        });
+        let backend = Arc::new(SifsFileManagerBackend::from_service(
+            &data_dir,
+            SifsRpcRuntime::new().unwrap(),
+            service,
+            true,
+            None,
+        ).expect("configured native local fallback"));
+        assert!(backend.resident_client(None, true).unwrap().is_none(),
+            "the tested helpers must use this exact fallback service mutex");
+        let rename_before =
+            actual_stat(&_native_data_dir, "/services/contended-rename-source.txt").unwrap();
+        let delete_before =
+            actual_stat(&_native_data_dir, "/services/contended-delete.txt").unwrap();
+        let remove_before =
+            actual_stat(&_native_data_dir, "/services/contended-remove.txt").unwrap();
         let service_guard = backend.lock_service().expect("service lock");
         let run_contended = |label: &str, operation: ContendedOperation| {
             let contended = Arc::clone(&backend);
@@ -8710,6 +8838,26 @@ mod tests {
             }),
         );
         drop(service_guard);
+        let rename_after = actual_stat(&_native_data_dir, "/services/contended-rename-source.txt");
+        let delete_after = actual_stat(&_native_data_dir, "/services/contended-delete.txt");
+        let remove_after = actual_stat(&_native_data_dir, "/services/contended-remove.txt");
+        let target_after = actual_stat(&_native_data_dir, "/services/contended-rename-target.txt");
+        let raw = _native_data_dir.with_native(|native, _| {
+            let raw = native.rpc_observations();
+            native.checkpoint_rpc_observation_window().unwrap();
+            raw
+        });
+        evidence(&data_dir, "actual-main-deadline-helpers-no-effect.json", serde_json::json!({
+            "qualification":"actual native Core local fallback; exact service mutex held before all7helpers;30ms/500ms/no-effect oracles unchanged; not a resident-RPC cancellation claim",
+            "rename_before_debug":format!("{rename_before:?}"),"delete_before_debug":format!("{delete_before:?}"),"remove_before_debug":format!("{remove_before:?}"),
+            "rename_after_debug":format!("{rename_after:?}"),"delete_after_debug":format!("{delete_after:?}"),
+            "remove_after_debug":format!("{remove_after:?}"),"target_after_debug":format!("{target_after:?}"),
+            "raw_native_carriers_debug":format!("{raw:#?}"),
+        }));
+        assert_eq!(rename_after.unwrap(), rename_before);
+        assert_eq!(delete_after.unwrap(), delete_before);
+        assert_eq!(remove_after.unwrap(), remove_before);
+        assert!(matches!(target_after, Err(DfsPosixError::NotFound { .. })));
     }
 
     #[test]
@@ -8774,7 +8922,7 @@ mod tests {
             .ensure_posix_directory_with_attrs(target_path, 1001, 1002, 0o700)
             .expect("create matching symlink target");
         let link_path = "/sinomo/agents/symlink-home";
-        {
+        let link_before = {
             let mut service = backend.lock_service().expect("lock service");
             let node_id = service.node_id().clone();
             service
@@ -8783,12 +8931,40 @@ mod tests {
                     link_path,
                     DfsWriteOptions::replicated_eventual(vec![node_id]),
                 )
-                .expect("create home symlink");
-        }
+                .expect("create home symlink")
+        };
+        let target_before = backend.dfs_stat(target_path).expect("inspect home target");
         let symlink_error = backend
             .ensure_posix_directory_with_attrs(link_path, 1001, 1002, 0o700)
             .expect_err("a symlink leaf must never be accepted as a private home");
-        assert!(symlink_error.contains("not a directory"), "{symlink_error}");
+        assert_eq!(
+            symlink_error,
+            format!("cannot provision SIFS directory {link_path}: invalid DFS path: {link_path}")
+        );
+        let link_after = backend
+            .lock_service()
+            .expect("lock service")
+            .posix_namespace_lstat_distributed(link_path)
+            .expect("home symlink remains present");
+        let target_after = backend
+            .dfs_stat(target_path)
+            .expect("home target remains present");
+        // Background replica receipts may add locations without changing either object.
+        for (before, after) in [(link_before, link_after), (target_before, target_after)] {
+            assert_eq!(before.object_id, after.object_id);
+            assert_eq!(before.version, after.version);
+            assert_eq!(before.kind, after.kind);
+            assert_eq!(before.content_hash, after.content_hash);
+            assert_eq!(before.size_bytes, after.size_bytes);
+            assert_eq!(
+                (before.uid, before.gid, before.mode),
+                (after.uid, after.gid, after.mode)
+            );
+            assert_eq!(before.accessed_at_unix_nanos, after.accessed_at_unix_nanos);
+            assert_eq!(before.modified_at_unix_nanos, after.modified_at_unix_nanos);
+            assert_eq!(before.created_at_unix_nanos, after.created_at_unix_nanos);
+            assert_eq!(before.changed_at_unix_nanos, after.changed_at_unix_nanos);
+        }
     }
 
     #[test]
@@ -8895,9 +9071,22 @@ mod tests {
             .create_dir_all("/services/local-parent-preflight")
             .expect("create parent");
 
-        let mut service = backend.lock_service().expect("service");
+        let mut service = _native_data_dir.with_native(|native, _| {
+            native
+                .metadata_primary_service("/services/local-parent-preflight")
+                .unwrap()
+        });
+        let parent_before = service
+            .posix_stat("/services/local-parent-preflight")
+            .unwrap();
         ensure_sifs_parent_directory_for_write(&mut service, "/services/local-parent-preflight")
             .expect("local directory parent should not require distributed inspection");
+        assert_eq!(
+            service
+                .posix_stat("/services/local-parent-preflight")
+                .unwrap(),
+            parent_before
+        );
     }
 
     #[test]
@@ -8913,7 +9102,14 @@ mod tests {
             )
             .expect("create file");
 
-        let mut service = backend.lock_service().expect("service");
+        let mut service = _native_data_dir.with_native(|native, _| {
+            native
+                .metadata_primary_service("/services/local-file-parent-preflight.txt")
+                .unwrap()
+        });
+        let parent_before = service
+            .posix_stat("/services/local-file-parent-preflight.txt")
+            .unwrap();
         let error = ensure_sifs_parent_directory_for_write(
             &mut service,
             "/services/local-file-parent-preflight.txt",
@@ -8922,6 +9118,18 @@ mod tests {
         assert!(
             error.contains("parent is File"),
             "unexpected parent preflight error: {error}"
+        );
+        assert_eq!(
+            service
+                .posix_stat("/services/local-file-parent-preflight.txt")
+                .unwrap(),
+            parent_before
+        );
+        assert_eq!(
+            backend
+                .read_file("/services/local-file-parent-preflight.txt")
+                .unwrap(),
+            b"not a directory"
         );
     }
 
@@ -9077,93 +9285,92 @@ mod tests {
 
     #[test]
     fn placement_activity_local_browser_reads_compact_filtered_state() {
-        let root = temp_sifs_data_dir("placement-activity-local-browser");
-        let data_dir = SinomoDataDir::new(&root);
-        let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
-        // Open before installing the synthetic cluster snapshot so the test
-        // remains an isolated local browser and never probes a daemon.
-        let backend = SifsFileManagerBackend::open(&data_dir).expect("backend");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let owner =
-            NodeId::from_legacy_named("placement-activity-local-owner").expect("activity owner");
-        let file_system_id = sifs_file_system_id();
-        let base = DfsFileSystemConfig {
-            retention_policies: Default::default(),
-            module_metadata: Default::default(),
-            file_system_id: file_system_id.clone(),
-            display_name: "SIFS".to_string(),
-            owner_node_id: owner.clone(),
-            subtree_policies: Vec::new(),
+        use sinomo_runtime::dfs::test_support::{
+            DfsTestFaultAction, DfsTestFaultRule, DfsTestRpcPhase,
         };
-        let policy = DfsPlacementPolicy::new(
-            sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
-            1,
-            1,
-        )
-        .expect("activity policy");
-        let mut desired = base.clone();
-        desired.subtree_policies.push(
-            sinomo_runtime::dfs::normalize_placement_rule(
-                "/team/report.txt",
-                DfsPlacementScope::SelfOnly,
-                policy,
+        let (fixture, data_dir, caller, _, _) =
+            live_replica_cli_fixture("cli-real-placement-activity");
+        let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+        let path = "/team/report.txt";
+        backend
+            .write_file(path, b"actual native placement subject")
+            .unwrap();
+        let (accepted, runner, denied) = fixture.with_native(|native, _| {
+            let root = native
+                .metadata_shards()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.shard_id == "root")
+                .unwrap();
+            let denied = root.replica_node_ids.first().unwrap().clone();
+            native.install_fault(DfsTestFaultRule {
+                source: Some(root.primary_node_id.clone()),
+                target: Some(denied.clone()),
+                route: None,
+                call_id: None,
+                origin: None,
+                remaining_hits: 32,
+                action: DfsTestFaultAction::BudgetExhausted,
+            });
+            let mut policy = DfsPlacementPolicy::new(
+                sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+                1,
+                1,
             )
-            .expect("activity rule"),
+            .unwrap();
+            policy.required_node_ids = vec![denied.clone()];
+            let job = native
+                .apply_placement_policy(&caller, path, DfsPlacementScope::SelfOnly, policy)
+                .unwrap();
+            (job, root.primary_node_id, denied)
+        });
+        let (run, recorded, raw) = fixture.with_native(|native, _| {
+            let mut actual = native.metadata_primary_service("/").unwrap();
+            assert_eq!(actual.node_id(), &runner);
+            let outcome = actual.run_placement_reconciliation_bounded(16);
+            drop(actual);
+            let mut kv = native.configuration_publisher(&caller);
+            let recorded = DfsControlPlaneStore::new(kv.as_mut())
+                .placement_reconciliation(&sifs_file_system_id(), &accepted.job_id)
+                .unwrap()
+                .unwrap();
+            let raw = native.rpc_observations();
+            native.checkpoint_rpc_observation_window().unwrap();
+            (outcome, recorded, raw)
+        });
+        let page = backend.placement_activity(
+            &[DfsPlacementReconciliationActivityStatus::Retrying],
+            Some("/team/../team"),
+            None,
+            10,
         );
-        let job = DfsPlacementReconciliationJob {
-            schema_version: sinomo_runtime::dfs::DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
-            job_id: "placement-activity-local-job".to_string(),
-            file_system_id: file_system_id.clone(),
-            path: "/team/report.txt".to_string(),
-            scope: DfsPlacementScope::SelfOnly,
-            unavailable_node_ids: BTreeSet::new(),
-            candidate_snapshot: vec![DfsNodeAdvertisement::content(owner)],
-            placement_snapshot: None,
-            adaptive: false,
-            adaptive_budget: None,
-            processed_content_bytes: 0,
-            accepted_config: desired.clone(),
-            state: DfsPlacementReconciliationState::Pending,
-            cursor: None,
-            total_object_count: 0,
-            scanned_object_count: 0,
-            matched_object_count: 0,
-            updated_object_count: 0,
-            scheduled_repair_count: 0,
-            completed_repair_count: 0,
-            pending_repair_count: 0,
-            revision: 0,
-            created_at_unix_nanos: 10,
-            updated_at_unix_nanos: 10,
-            last_error: Some("temporary route failure".to_string()),
-        };
-        let mut kv = sinomo_runtime::kv::InProcessKvStore::new();
-        let mut store = DfsControlPlaneStore::new(&mut kv);
-        store.put_file_system_config(&base).expect("base config");
+        evidence(
+            &data_dir,
+            "actual-placement-activity.json",
+            serde_json::json!({
+                "qualification":"normal Main KV Apply/actual job/current3-node caps; a real metadata-follower carrier denial produces durable retry cause; no synthetic job/cache rows",
+                "accepted":accepted,"recorded":recorded,"runner":runner,"denied":denied,
+                "run_result":run.as_ref().map(|v|serde_json::to_value(v).unwrap()).map_err(ToString::to_string),
+                "page":page,"raw_native_carriers_debug":format!("{raw:#?}"),
+            }),
+        );
         assert!(
-            store
-                .compare_and_put_placement_update(&base, &desired, &job)
-                .expect("activity Apply")
+            raw.iter().any(|event| event.source == runner
+                && event.target == denied
+                && event.route.contains("metadata/journal-batch")
+                && event.phase == DfsTestRpcPhase::EndedWithoutResponse),
+            "Retrying must follow an actual original native metadata carrier failure"
         );
-        sinomo_runtime::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &kv.try_snapshot().expect("activity KV snapshot"),
-        )
-        .expect("write activity snapshot");
-
-        let page = backend
-            .placement_activity(
-                &[DfsPlacementReconciliationActivityStatus::Retrying],
-                Some("/team/../team"),
-                None,
-                10,
-            )
-            .expect("local filtered activity");
+        assert_eq!(
+            recorded.activity_status(),
+            DfsPlacementReconciliationActivityStatus::Retrying
+        );
+        let page = page.unwrap();
         assert_eq!(page.activities.len(), 1);
-        assert_eq!(page.activities[0].job_id, job.job_id);
+        assert_eq!(page.activities[0].job_id, accepted.job_id);
         assert!(
             page.partial,
-            "without cluster capability state the local browser must stay conservative"
+            "native activity index retains conservative historical completeness"
         );
         assert!(!page.history_truncated);
     }
@@ -9348,39 +9555,31 @@ mod tests {
 
     #[test]
     fn ordinary_sifs_write_cannot_succeed_before_its_receipt_threshold() {
+        use sinomo_runtime::dfs::test_support::{DfsTestFaultAction, DfsTestFaultRule};
         for overwrite in [false, true] {
-            let root = temp_sifs_data_dir("write-missing-required-replica");
-            let data_dir = SinomoDataDir::new(&root);
-            let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
-            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+            let (fixture, data_dir, caller, _, _) = live_replica_cli_fixture(if overwrite {
+                "cli-real-w2-overwrite"
+            } else {
+                "cli-real-w2-create"
+            });
             let path = "/services/needs-two-receipts";
-            if overwrite {
-                backend.write_file(path, b"before").unwrap();
-            }
-            let before = backend
-                .lock_service()
-                .unwrap()
-                .metadata_backend()
-                .unwrap()
-                .get_object_by_path(&sifs_file_system_id(), path)
-                .unwrap();
-            {
-                let mut service = backend.lock_service().unwrap();
-                let mut fs = service
-                    .metadata_backend()
-                    .unwrap()
-                    .get_file_system(&sifs_file_system_id())
+            let (configured, targets) = fixture.with_native(|native, _| {
+                let state =
+                    cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir)).unwrap();
+                let targets = state
+                    .members
+                    .iter()
+                    .map(|m| m.node_id.clone())
+                    .filter(|n| *n != caller)
+                    .collect::<Vec<_>>();
+                assert_eq!(targets.len(), 2, "two real named desired providers");
+                let mut kv = native.configuration_publisher(&caller);
+                let mut store = DfsControlPlaneStore::new(kv.as_mut());
+                let expected = store
+                    .get_file_system_config(&sifs_file_system_id())
                     .unwrap()
                     .unwrap();
-                let mut policy = DfsPlacementPolicy::new(
-                    sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
-                    2,
-                    2,
-                )
-                .unwrap();
-                policy.required_node_ids = vec![service.node_id().clone(), NodeId::generate()];
-                fs.subtree_policies
-                    .push(policy.into_rule(path.into(), DfsPlacementScope::SelfOnly));
+                let mut fs: sinomo_runtime::dfs::DfsFileSystem = expected.clone().into();
                 sinomo_runtime::dfs_history::install_history_policy(
                     &mut fs,
                     sinomo_runtime::dfs::DfsFileHistoryPolicy {
@@ -9394,34 +9593,272 @@ mod tests {
                     },
                 )
                 .unwrap();
-                service.add_file_system(fs).unwrap();
+                let desired = DfsFileSystemConfig::from(&fs);
+                assert!(
+                    store
+                        .compare_and_put_file_system_config(Some(&expected), &desired)
+                        .unwrap()
+                );
+                drop(store);
+                drop(kv);
+                let mut policy = DfsPlacementPolicy::new(
+                    sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+                    2,
+                    2,
+                )
+                .unwrap();
+                policy.required_node_ids = targets.clone();
+                let job = native
+                    .apply_placement_policy(&caller, path, DfsPlacementScope::SelfOnly, policy)
+                    .unwrap();
+                (job.accepted_config, targets)
+            });
+            fixture.with_native(|native, _| {
+                let projection = native
+                    .control_plane_client()
+                    .unwrap()
+                    .write_configuration_projection()
+                    .unwrap()
+                    .expect("actual primary write configuration");
+                let key = sinomo_runtime::dfs::file_system_config_key(&sifs_file_system_id());
+                let entry = projection
+                    .entries(&key)
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .expect("actual accepted filesystem configuration");
+                let actual: DfsFileSystemConfig =
+                    sinomo_runtime::kv::decode_kv_value(&entry.value).unwrap();
+                assert_eq!(actual.file_system_id, configured.file_system_id);
+                assert_eq!(actual.owner_node_id, configured.owner_node_id);
+                let accepted_policy = configured
+                    .subtree_policies
+                    .iter()
+                    .find(|rule| rule.path_prefix == path)
+                    .expect("accepted policy for the tested path");
+                assert_eq!(
+                    actual
+                        .subtree_policies
+                        .iter()
+                        .filter(|rule| rule.path_prefix == path)
+                        .collect::<Vec<_>>(),
+                    vec![accepted_policy],
+                    "seed must use the exact committed managed policy for {path}"
+                );
+            });
+            let backend = SifsFileManagerBackend::open(&data_dir).unwrap();
+            // Read actual ordinary options before faulting any carrier; never
+            // force supplied candidates/options as an authority substitute.
+            let options = backend
+                .ordinary_write_options_until(
+                    path,
+                    Instant::now() + sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+                )
+                .unwrap();
+            assert_eq!(options.policy.min_commit_replicas, 2);
+            assert_eq!(options.policy.desired_replicas, 2);
+            assert_eq!(
+                options
+                    .policy
+                    .required_node_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                targets.iter().cloned().collect()
+            );
+            // Healthy seed has W==N==2, so its exact head cannot later gain a
+            // missing planned receipt while the failure no-effect cut is taken.
+            if overwrite {
+                backend.write_file(path, b"before").unwrap();
+                assert_eq!(backend.read_file(path).unwrap(), b"before",
+                    "healthy ordinary W2 seed must be readable before any fault");
             }
+            let before =
+                fixture.with_native(|native, _| {
+                    let owner = native.metadata_primary_service(path).unwrap();
+                    let metadata = owner.metadata_backend().unwrap();
+                    let object = metadata
+                        .get_object_by_path(&sifs_file_system_id(), path)
+                        .unwrap();
+                    if let Some(old) = &object {
+                        let version = metadata
+                            .get_version(&old.object_id, &old.version)
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            version
+                                .retention_grant(sinomo_runtime::dfs_history::HISTORY_MODULE_ID)
+                                .is_none()
+                        );
+                        let durability = version.content_durability.as_ref().unwrap();
+                        assert_eq!(durability.policy.min_commit_replicas, 2);
+                        assert_eq!(durability.policy.desired_replicas, 2);
+                        let receipts = metadata
+                            .receipts_for_version(&old.object_id, &old.version)
+                            .unwrap();
+                        for target in &durability.desired_replica_node_ids {
+                            assert!(old.current_locations.contains(target));
+                            assert!(receipts.iter().any(|r| r.replica_node_id == *target
+                                && r.content_hash == old.content_hash));
+                        }
+                    }
+                    object
+                });
+            let denied = targets[1].clone();
+            fixture.with_native(|native, _| {
+                for route in [
+                    sinomo_runtime::dfs::DFS_DATA_STAGE_BLOB_ROUTE,
+                    sinomo_runtime::dfs::DFS_DATA_REPAIR_REPLICA_ROUTE,
+                ] {
+                    native.install_fault(DfsTestFaultRule {
+                        source: None,
+                        target: Some(denied.clone()),
+                        route: Some(route.into()),
+                        call_id: None,
+                        origin: None,
+                        remaining_hits: 32,
+                        action: DfsTestFaultAction::BudgetExhausted,
+                    });
+                }
+            });
+            fixture.with_native(|native, _| {
+                native.checkpoint_rpc_observation_window().unwrap();
+            });
+            let started = Instant::now();
             let result = backend.write_file_with_deadline(
                 path,
                 b"not yet committed",
-                Instant::now() + Duration::from_millis(300),
+                started + Duration::from_millis(300),
             );
-            assert!(
-                result.is_err(),
-                "single-file success must prove W, not just local staging"
-            );
-            let service = backend.lock_service().unwrap();
-            assert_eq!(
-                service
-                    .metadata_backend()
-                    .unwrap()
+            let completed_after = started.elapsed();
+            // The real CLI adapter seals its RPC window before returning. Read
+            // that exact verified checkpoint, not the now-empty current window.
+            let (sealed_record_count, sealed_carriers) = fixture.with_native(|native, _| {
+                let output = data_dir.root().join("ordinary-write-native-carriers.json");
+                let count = native.export_latest_rpc_observation_checkpoint(&output).unwrap();
+                let records: Vec<String> = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+                assert_eq!(records.len(), count);
+                (count, records)
+            });
+            let (after, prior_version, new_intents, raw) = fixture.with_native(|native, _| {
+                let owner = native.metadata_primary_service(path).unwrap();
+                let metadata = owner.metadata_backend().unwrap();
+                let after = metadata
                     .get_object_by_path(&sifs_file_system_id(), path)
-                    .unwrap(),
-                before,
-                "failure cannot create a head or replace the previous file"
+                    .unwrap();
+                let version = before.as_ref().map(|old| {
+                    metadata
+                        .get_version(&old.object_id, &old.version)
+                        .unwrap()
+                        .unwrap()
+                });
+                let intents = metadata
+                    .all_intents()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|intent| {
+                        intent
+                            .object_metadata
+                            .as_ref()
+                            .is_some_and(|object| object.path == path)
+                            && before
+                                .as_ref()
+                                .is_none_or(|old| intent.target_version != old.version)
+                    })
+                    .collect::<Vec<_>>();
+                let raw = native.rpc_observations();
+                native.checkpoint_rpc_observation_window().unwrap();
+                (after, version, intents, raw)
+            });
+            // The admitted ambiguous write still owns the browser FIFO. Read
+            // the old immutable content through each actual recorded N target,
+            // rather than claiming a queued browser read can pass that writer.
+            let immutable_targets = prior_version.as_ref()
+                .and_then(|version| version.content_durability.as_ref())
+                .map(|durability| durability.desired_replica_node_ids.clone())
+                .unwrap_or_default();
+            let immutable_reads = if let Some(old) = &before {
+                fixture.with_native(|native, _| immutable_targets.iter().map(|node| {
+                    let result = native.client(node).and_then(|client| {
+                        client.content().read_object_version(old.object_id.as_str(), old.version.as_str())
+                            .map_err(|error| error.to_string())
+                    });
+                    (node.clone(), result)
+                }).collect::<Vec<_>>())
+            } else {
+                Vec::new()
+            };
+            evidence(
+                &data_dir,
+                "ordinary-real-w2-threshold.json",
+                serde_json::json!({
+                    "qualification":"actual3 native providers/configuration+history owner, real W2N2 target denial after formation; ordinary SIFS API once; no fake row/ACK/provider",
+                    "overwrite":overwrite,"actual_configured":configured,"actual_options":options,"denied_target":denied,
+                    "before":before,"after":after,"prior_version":prior_version,"actual_new_intents":new_intents,
+                    "result":result,"original_action_elapsed_nanos":completed_after.as_nanos(),"raw_native_carriers_debug":format!("{raw:#?}"),
+                    "actual_cli_sealed_record_count":sealed_record_count,"actual_cli_sealed_carriers_debug":sealed_carriers,
+                    "actual_old_recorded_targets":immutable_targets,
+                    "actual_old_immutable_reads_on_recorded_targets":immutable_reads,
+                    "read_qualification":"normal healthy seed read completed before fault; post-ambiguity exact old content read physically on both named N targets, not queued browser-read availability",
+                }),
             );
-            if let Some(before) = before {
+            assert!(result.is_err(), "single-file success must prove actual W2");
+            assert_eq!(
+                new_intents.len(),
+                1,
+                "the actual new native write intent must reach guarded W2 staging"
+            );
+            assert_eq!(new_intents[0].policy.min_commit_replicas, 2);
+            assert_eq!(new_intents[0].policy.desired_replicas, 2);
+            assert_ne!(
+                new_intents[0].status,
+                sinomo_runtime::dfs::DfsWriteIntentStatus::Committed
+            );
+            assert_eq!(
+                new_intents[0]
+                    .desired_replica_node_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                targets.iter().cloned().collect()
+            );
+            let denied_target = format!("target: Id({:?})", denied.as_str());
+            let data_routes = [sinomo_runtime::dfs::DFS_DATA_STAGE_BLOB_ROUTE,
+                sinomo_runtime::dfs::DFS_DATA_REPAIR_REPLICA_ROUTE]
+                .map(|route| format!("route: {route:?}"));
+            assert!(sealed_carriers.iter().any(|event| event.contains(&denied_target)
+                && data_routes.iter().any(|route| event.contains(route))
+                && event.contains("phase: EndedWithoutResponse")
+                && event.contains("outcome_error: Some(")
+                && event.contains("shared DFS test before-dispatch fault")
+                && event.contains("delivery_state: DefinitelyNotSent")
+                && event.contains("bounded injected carrier failure")),
+                "actual named-target data carrier must hit the bounded before-dispatch fault, not merely exhaust the caller budget");
+            assert_eq!(
+                after, before,
+                "failure cannot create a head or replace any previous metadata"
+            );
+            if let Some(old) = &before {
+                let after = after.as_ref().unwrap();
+                assert_eq!(after.version, old.version);
+                assert_eq!(after.content_hash, old.content_hash);
+                assert_eq!(after.content_size_bytes, old.content_size_bytes);
+                assert_eq!(immutable_targets.len(), 2);
+                assert_eq!(immutable_targets.iter().cloned().collect::<BTreeSet<_>>(),
+                    targets.iter().cloned().collect());
+                assert_eq!(immutable_reads.len(), immutable_targets.len());
+                assert_eq!(immutable_reads.iter().map(|(node, _)| node.clone()).collect::<BTreeSet<_>>(),
+                    targets.iter().cloned().collect());
+                for (node, read) in &immutable_reads {
+                    let (manifest, bytes) = read.as_ref().unwrap_or_else(|error|
+                        panic!("actual old immutable content on {node}: {error}"));
+                    assert_eq!(manifest.object_id, old.object_id.as_str());
+                    assert_eq!(Some(manifest.content_hash.as_str()), old.content_hash.as_deref());
+                    assert_eq!(Some(manifest.size_bytes), old.content_size_bytes);
+                    assert_eq!(bytes.as_slice(), b"before");
+                }
                 assert!(
-                    service
-                        .metadata_backend()
-                        .unwrap()
-                        .get_version(&before.object_id, &before.version)
-                        .unwrap()
+                    prior_version
                         .unwrap()
                         .retention_grant(sinomo_runtime::dfs_history::HISTORY_MODULE_ID)
                         .is_none(),
@@ -9533,7 +9970,7 @@ mod tests {
 
     fn seed_observation_cluster(data_dir: &SinomoDataDir) -> Vec<DfsMetadataShardConfig> {
         let name = format!("cli-observation-{}", sinomo_runtime::core::Id::generate());
-        let (runtime, _) =
+        let (runtime, node) =
             sinomo_runtime::dfs::test_support::DfsTestRuntime::start_single_node_in_data_dir(
                 &name,
                 data_dir.clone(),
@@ -9542,28 +9979,12 @@ mod tests {
         let shards = runtime
             .metadata_shards()
             .expect("actual committed native assignments");
+        let published = publish_actual_native_catalog(&runtime, &node);
+        assert_eq!(snapshot_metadata_shards(&published.value), shards);
         runtime
             .close()
             .expect("actual current fixture closes and retains its durable volume");
         shards
-    }
-
-    fn write_metadata_shard_snapshot(
-        cluster_paths: &ClusterPaths,
-        shards: &[DfsMetadataShardConfig],
-    ) {
-        let mut kv = sinomo_runtime::kv::InProcessKvStore::new();
-        {
-            let mut control = DfsControlPlaneStore::new(&mut kv);
-            for shard in shards {
-                control.put_metadata_shard(shard).expect("metadata shard");
-            }
-        }
-        sinomo_runtime::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &kv.try_snapshot().expect("KV snapshot"),
-        )
-        .expect("write metadata shard snapshot");
     }
 
     fn metadata_journal_heads(
@@ -9589,3 +10010,7 @@ mod tests {
         sinomo_testdir::TestDir::new(&format!("sinomo-tui-sifs-file-manager-{name}"))
     }
 }
+
+#[cfg(test)]
+#[path = "sifs_file_manager/damage_expectation_tests.rs"]
+mod damage_expectation_tests;

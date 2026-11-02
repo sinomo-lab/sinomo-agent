@@ -5,6 +5,10 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod apply_patch;
+#[cfg(unix)]
+pub(crate) mod agent_home;
+#[cfg(unix)]
+pub use agent_home::prepare_agent_home_sifs;
 mod changed_files;
 mod edit_file;
 mod git_diff;

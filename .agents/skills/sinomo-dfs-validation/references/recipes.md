@@ -179,7 +179,8 @@ binary. Verify actual main/shadow executable identity. Six containers are not
 automatically six Raft voters or a three-member metadata group.
 
 Retain generated `REPORT.md`, `report.json`, raw case JSON and failed operation
-identity before teardown. Tracing/profiling stays enabled at unchanged thresholds.
+identity before teardown. Tracing stays enabled at unchanged thresholds; CPU
+profiling is opt-in with `SINOMO_TEST_CPU_PROFILE=1`.
 Use the [performance skill](../../../../skills/sinomo-performance-analysis/SKILL.md)
 for measurement tables, both W/N policies and coverage. For native deployment,
 also require source-matched old-DATA/platform evidence through the rollout owner.

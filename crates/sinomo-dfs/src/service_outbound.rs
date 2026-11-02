@@ -361,8 +361,7 @@ where
         } = prepared;
         let identities = self.begin_replica_sends(&requests)?;
         let outcomes = self
-            .transport
-            .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
+            .send_replica_requests_with_native_returns_async(requests)
             .await;
         let outcomes = self.observe_replica_fanout_result(&identities, outcomes)?;
         self.finish_replica_sends(&identities, &expected_targets, outcomes)
@@ -507,6 +506,158 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &owner,
             &DfsMetadataShardId::new(shard.shard_id.clone()),
         ))
+    }
+
+    fn apply_native_replica_return(
+        &mut self,
+        returned: crate::runtime_host::NativeOriginalRepairReturn,
+    ) -> Result<(), NetworkError> {
+        let applied = match returned {
+            crate::runtime_host::NativeOriginalRepairReturn::Fresh(fresh) => {
+                self.handle_fresh_original_repair_return(fresh).map(|_| ())
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            crate::runtime_host::NativeOriginalRepairReturn::Data(data) => {
+                crate::runtime_host::defer_native_owned_repair_completion(&std::sync::Arc::new(
+                    data,
+                ))
+                .map(|_| ())
+            }
+            #[cfg(not(any(test, feature = "test-support")))]
+            crate::runtime_host::NativeOriginalRepairReturn::Data(_) => Err(DfsError::Metadata {
+                message: "serving native Repair unexpectedly returned selected DATA-only custody"
+                    .into(),
+            }),
+        };
+        applied.map_err(|error| {
+            NetworkError::delivery_failed(
+                "apply actual native Repair return",
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                error.to_string(),
+            )
+        })
+    }
+
+    fn native_replica_send_error(error: DfsError) -> NetworkError {
+        match error {
+            DfsError::NetworkDelivery {
+                message,
+                delivery_state,
+            } => {
+                NetworkError::delivery_failed("send actual native Repair", delivery_state, message)
+            }
+            other => NetworkError::Io {
+                operation: "send actual native Repair".into(),
+                detail: other.to_string(),
+            },
+        }
+    }
+
+    fn merge_native_replica_outcomes(
+        mut indexed: Vec<(usize, DfsRoutedSendOutcome)>,
+        ordinary_indices: Vec<usize>,
+        ordinary: Vec<DfsRoutedSendOutcome>,
+    ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        if ordinary_indices.len() != ordinary.len() {
+            return Err(NetworkError::Serialization {
+                detail: "native Repair fanout lost ordinary result identity".into(),
+            });
+        }
+        indexed.extend(ordinary_indices.into_iter().zip(ordinary));
+        indexed.sort_by_key(|(index, _)| *index);
+        Ok(indexed.into_iter().map(|(_, outcome)| outcome).collect())
+    }
+
+    fn send_replica_requests_with_native_returns(
+        &mut self,
+        requests: Vec<DfsRoutedSend>,
+    ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError> {
+        let mut indexed = Vec::new();
+        let mut ordinary = Vec::new();
+        let mut ordinary_indices = Vec::new();
+        for (index, mut request) in requests.into_iter().enumerate() {
+            let Some(prepared) = request.native_repair_custody.take() else {
+                ordinary_indices.push(index);
+                ordinary.push(request);
+                continue;
+            };
+            let result = self
+                .transport
+                .native_replica_send_options()
+                .and_then(|options| {
+                    options.ok_or_else(|| NetworkError::Serialization {
+                        detail: "native Original repair has no original transport options".into(),
+                    })
+                })
+                .and_then(|(options, deadline)| {
+                    crate::runtime_host::send_prepared_native_repair_custody(
+                        prepared,
+                        request.call,
+                        options,
+                        deadline,
+                    )
+                    .map_err(Self::native_replica_send_error)
+                })
+                .and_then(|returned| self.apply_native_replica_return(returned));
+            indexed.push((
+                index,
+                DfsRoutedSendOutcome {
+                    target_node_id: request.target_node_id,
+                    result,
+                },
+            ));
+        }
+        let ordinary = self
+            .transport
+            .send_routed_calls_bounded(ordinary, DFS_REPLICA_BODY_FANOUT_CAP)?;
+        Self::merge_native_replica_outcomes(indexed, ordinary_indices, ordinary)
+    }
+
+    async fn send_replica_requests_with_native_returns_async(
+        &mut self,
+        requests: Vec<DfsRoutedSend>,
+    ) -> Result<Vec<DfsRoutedSendOutcome>, NetworkError>
+    where
+        T: AsyncDfsMessageTransport,
+    {
+        let mut indexed = Vec::new();
+        let mut ordinary = Vec::new();
+        let mut ordinary_indices = Vec::new();
+        for (index, mut request) in requests.into_iter().enumerate() {
+            let Some(prepared) = request.native_repair_custody.take() else {
+                ordinary_indices.push(index);
+                ordinary.push(request);
+                continue;
+            };
+            let result = match self.transport.native_replica_send_options()? {
+                Some((options, deadline)) => {
+                    crate::runtime_host::send_prepared_native_repair_custody_async(
+                        prepared,
+                        request.call,
+                        options,
+                        deadline,
+                    )
+                    .await
+                    .map_err(Self::native_replica_send_error)
+                    .and_then(|returned| self.apply_native_replica_return(returned))
+                }
+                None => Err(NetworkError::Serialization {
+                    detail: "native Original repair has no original transport options".into(),
+                }),
+            };
+            indexed.push((
+                index,
+                DfsRoutedSendOutcome {
+                    target_node_id: request.target_node_id,
+                    result,
+                },
+            ));
+        }
+        let ordinary = self
+            .transport
+            .send_routed_calls_bounded_async(ordinary, DFS_REPLICA_BODY_FANOUT_CAP)
+            .await?;
+        Self::merge_native_replica_outcomes(indexed, ordinary_indices, ordinary)
     }
 
     fn begin_replica_sends(
@@ -751,7 +902,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         return Err(pending_error());
                     };
                     if original.request_id != *request_id
-                        || !birth.observed.is_empty()
+                        || (!birth.observed.is_empty()
+                            && !self.native_original_repair_producer_ready(&birth)?)
                         || birth.original.source_node_id != self.node_id
                         || original.file_system_id != *file_system_id
                         || original.object_id != *object_id
@@ -845,11 +997,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     call = call.with_original_repair(birth.original_wire_material()?)?;
                 }
                 let mut send = DfsRoutedSend::new(target_node_id.clone(), call);
-                #[cfg(any(test, feature = "test-support"))]
-                {
-                    send.native_repair_custody =
+                send.native_repair_custody =
                         self.prepare_native_repair_custody_for_owned_send(&send.call.message)?;
-                }
                 requests.push(send);
                 continue;
             }
@@ -1111,7 +1260,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )
                     && store.original_repair(&request.call.message)?.is_some()
                 {
-                    store.validate_original_repair_dispatch(&request.call.message)?;
+                    if let Some(prepared) = request.native_repair_custody.as_ref() {
+                        prepared.validate_original_dispatch(store, &request.call.message)?;
+                    } else {
+                        store.validate_original_repair_dispatch(&request.call.message)?;
+                    }
                     Ok(Some(request.call.message.clone()))
                 } else {
                     Ok(None)
@@ -1120,8 +1273,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect::<Result<Vec<_>, _>>()?;
         let identities = self.begin_replica_sends(&requests)?;
         let outcomes = self
-            .transport
-            .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP);
+            .send_replica_requests_with_native_returns(requests);
         if let Some(store) = &original_store {
             match &outcomes {
                 Ok(returned)

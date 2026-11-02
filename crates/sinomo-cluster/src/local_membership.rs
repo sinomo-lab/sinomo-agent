@@ -445,11 +445,14 @@ pub(crate) fn locally_learned_remote_route_endpoints(
         .collect()
 }
 
+/// A route this node learned for a peer that committed KV may not carry: a
+/// named address it dialled, or an operator route hint.
 pub(crate) fn locally_learned_route_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
     matches!(
         endpoint.transport,
         ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback
-    ) && endpoint.address.parse::<SocketAddr>().is_err()
+    ) && (endpoint.address.parse::<SocketAddr>().is_err()
+        || crate::route_hint::is_cluster_route_hint_endpoint(endpoint))
         && endpoint.address.contains(':')
         && matches!(endpoint.source, ClusterEndpointSource::Observed)
         && endpoint.privacy != ClusterEndpointPrivacy::LocalOnly
@@ -468,6 +471,13 @@ pub(crate) fn preserve_locally_learned_remote_route_endpoints(
             continue;
         };
         for endpoint in endpoints {
+            // A learned route the member now publishes itself is redundant.
+            if member.endpoints.iter().any(|published| {
+                published.address == endpoint.address
+                    && published.endpoint_id != endpoint.endpoint_id
+            }) {
+                continue;
+            }
             upsert_member_endpoint(member, endpoint);
         }
     }

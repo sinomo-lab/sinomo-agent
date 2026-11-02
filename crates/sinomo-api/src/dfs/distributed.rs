@@ -201,6 +201,9 @@ pub enum DfsWriteIntentState {
     Rejected,
 
     Aborted,
+    PreconditionFailed {
+        failure: DfsWritePreconditionFailure,
+    },
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]

@@ -20,11 +20,10 @@ mod control_plane_driver;
 mod control_plane_options;
 mod control_routes;
 mod control_service;
-mod endpoint_recovery;
-pub use endpoint_recovery::{
-    CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE, ENDPOINT_RECOVERY_PROOF_TIMEOUT,
-    EndpointRecoveryAction, EndpointRecoveryHost, EndpointRecoveryOutcome, EndpointRecoveryRequest,
-    EndpointRecoveryResponse, EndpointRecoverySpec, endpoint_recovery_state_digest, recover_endpoint,
+mod route_hint;
+pub use route_hint::{
+    CLUSTER_CONTROL_ROUTE_HINT_ROUTE, ClusterRouteHintRequest, ClusterRouteHintResponse,
+    apply_cluster_route_hint,
 };
 mod health;
 mod invite;
@@ -62,6 +61,7 @@ pub use raft_peer_queue::send_shared_cluster_raft_append;
 #[cfg(any(test, feature = "test-support"))]
 mod raft_replication;
 mod raft_rpc;
+mod service_providers;
 mod state_authority_reachability;
 mod status_publish;
 
@@ -72,10 +72,9 @@ pub use command_observation::{
     cluster_command_observation_key,
 };
 pub use connectivity_import::{
-    PeerConnectivityFetchScope, accepted_join_connectivity_record_groups,
-    filter_peer_connectivity_response_records, merge_connectivity_probe_records_with_live_unprobed,
-    newly_healthy_connectivity_target_node_ids, peer_connectivity_import_endpoint_for_record,
-    peer_connectivity_import_records_for_reachable_peers,
+    accepted_join_connectivity_record_groups, filter_peer_connectivity_response_records,
+    merge_connectivity_probe_records_with_live_unprobed,
+    newly_healthy_connectivity_target_node_ids,
 };
 pub use connectivity_projection::{
     ClusterConnectivityEndpointProjection, ClusterConnectivityMemberProjection,
@@ -85,8 +84,7 @@ pub use connectivity_projection::{
 };
 pub use connectivity_publish::{
     ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
-    ClusterNetworkRecordExpiryHost, cluster_connectivity_publish_record_matches,
-    cluster_network_publish_interval_for_node, expire_cluster_network_records_with_host,
+    cluster_connectivity_publish_record_matches, cluster_network_publish_interval_for_node,
     publish_current_cluster_connectivity_records_to_quorum_async_with_state_and_host,
     sync_cluster_connectivity_records_to_kv,
     sync_cluster_connectivity_records_to_quorum_async_with_host,
@@ -188,7 +186,8 @@ pub use join_registration::{
     accepted_cluster_join_state_from_kv_snapshot, cluster_join_challenge_rpc_request,
     handle_cluster_join_registration_request_async_with_host,
     handle_cluster_join_registration_request_with_host, join_channel_endpoint_for_accepted_state,
-    reconcile_accepted_cluster_join_response, reconcile_cluster_join_with_introducers_with_host,
+    persist_accepted_cluster_join_snapshot, reconcile_accepted_cluster_join_response,
+    reconcile_cluster_join_with_introducers_with_host,
     record_forwarded_join_registration_acceptance_with_host,
     send_cluster_join_registration_over_membership_rpc,
 };
@@ -278,8 +277,9 @@ pub use member_publish::{
 };
 pub use membership_rpc::{
     ClusterAuthenticatedPeer, ClusterInvitePublishRequest, ClusterInvitePublishResponse,
-    ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
-    ClusterMemberPublishResponse, handle_cluster_membership_rpc_request_with_hosts,
+    ClusterJoinRaftAnchor, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
+    ClusterMemberPublishRequest, ClusterMemberPublishResponse,
+    handle_cluster_membership_rpc_request_with_hosts,
 };
 pub use membership_service::{
     ClusterMembershipServiceFuture, ClusterMembershipServiceHost, HostedClusterMembershipService,
@@ -312,7 +312,9 @@ pub use publication_cache::{
     ClusterPublicationCacheLimits,
 };
 pub use raft_fanout::{
-    ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,
+    ClusterKvCommittedFanoutAsyncHost, claim_cluster_raft_peer_catch_up,
+    cluster_raft_peer_is_behind, finish_cluster_raft_peer_catch_up,
+    record_cluster_raft_peer_append_results, replicate_cluster_kv_to_node_async_with_host,
     spawn_cluster_kv_committed_fanout_worker_on_runtime,
 };
 pub use raft_quorum::{
@@ -323,6 +325,7 @@ pub use raft_rpc::{
     handle_cluster_kv_consensus_rpc_request_async, handle_cluster_raft_append_request_async,
     handle_cluster_raft_vote_request_async,
 };
+pub use service_providers::resolve_cluster_service_providers;
 pub use state_authority_reachability::{
     ClusterStateAuthorityQuorumStatus, ClusterStateAuthorityReachabilityAsyncHost,
     ClusterStateAuthorityReachabilityHost, ClusterStateAuthorityReachabilityOptions,
@@ -366,17 +369,6 @@ pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageC
             .field("members", "Vec<ClusterMemberRecord>"),
     )?;
     layout.register_binary("sinomo-cluster", StorageRing::R1, "cluster/state.sobj.lock")?;
-    layout.register_sinomo_object(
-        "sinomo-cluster",
-        StorageRing::R1,
-        "cluster/endpoint-recovery/{operation_id}.sobj",
-        ObjectSchema::new("EndpointRecoveryReceipt", STORAGE_CONTRACT_OBJECT_VERSION)
-            .field("spec", "EndpointRecoverySpec")
-            .field("before", "ClusterBootstrapState")
-            .field("after", "ClusterBootstrapState")
-            .field("phase", "EndpointRecoveryOutcome")
-            .field("authority", "KvAuthorityProof"),
-    )?;
     Ok(())
 }
 
@@ -424,11 +416,8 @@ pub(crate) mod prelude {
 pub use connectivity_publish::cluster_connectivity_full_sync_batch_ops_from_snapshot;
 // test-support re-exports (crate internals for sibling integration tests)
 #[cfg(any(test, feature = "test-support"))]
-pub use connectivity_publish::cluster_network_expiry_delete_ops;
-#[cfg(any(test, feature = "test-support"))]
 pub use connectivity_publish::{
     cluster_connectivity_full_sync_batch_ops, cluster_connectivity_sync_is_noop,
-    expire_cluster_network_record_ops, expire_cluster_network_records,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use control_plane_options::{
@@ -477,11 +466,11 @@ pub use kv_local_store::{
 pub use kv_local_store::{
     append_cluster_raft_command, append_cluster_raft_command_uncommitted,
     append_cluster_raft_command_with_response, apply_cluster_raft_append,
-    cache_cluster_kv_snapshot_if_newer_than_raft, cached_cluster_kv_reader_node_id_for_test,
-    cluster_kv_cached_snapshot_reads_for_test, cluster_kv_metadata_cache_capacity_for_test,
-    cluster_kv_reader_node_id_cache_contains_for_test, cluster_raft_wal_paths,
-    open_cluster_raft_kv_node, open_cluster_raft_kv_node_async, read_cluster_kv_current_snapshot,
-    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_entries_limited,
+    cached_cluster_kv_reader_node_id_for_test, cluster_kv_cached_snapshot_reads_for_test,
+    cluster_kv_metadata_cache_capacity_for_test, cluster_kv_reader_node_id_cache_contains_for_test,
+    cluster_raft_wal_paths, open_cluster_raft_kv_node, open_cluster_raft_kv_node_async,
+    read_cluster_kv_current_snapshot, read_cluster_kv_prefix_entries,
+    read_cluster_kv_prefix_entries_limited,
     read_cluster_kv_prefix_entries_limited_by_payload_bytes, read_cluster_kv_snapshot,
     read_cluster_kv_store, record_cluster_kv_reader_node_id_cache_for_test,
     refresh_cluster_kv_reader_node_id_cache_for_test,

@@ -600,17 +600,17 @@ use crate::{
     DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker,
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
     DfsControlPlaneKvClient, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
-    DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataBackend,
-    DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport, DfsMetadataJournalBatchSender,
-    DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
-    DfsMetadataNodeTransport, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallSender,
-    DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState, DfsObjectId, DfsObjectPageCursor,
-    DfsPeerTransport, DfsPlacementReconciliationJob, DfsTombstoneCompactionOptions,
-    DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
-    LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome, async_dfs_metadata_journal_batch_sender_from_peer_transport,
+    DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataHistoryGcOptions,
+    DfsMetadataHistoryGcReport, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState,
+    DfsObjectId, DfsObjectPageCursor, DfsPeerTransport, DfsPlacementReconciliationJob,
+    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion,
+    DistributedRepairJob, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    async_dfs_metadata_journal_batch_sender_from_peer_transport,
     async_dfs_metadata_snapshot_install_sender_from_peer_transport,
     default_dfs_content_root_catalog_store, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
@@ -645,27 +645,6 @@ pub fn dfs_events_should_wake_repair_maintenance(events: &[NetworkedDfsServiceEv
             NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => !repair_jobs.is_empty(),
         }
     })
-}
-
-#[cfg(test)]
-pub(crate) fn run_cluster_dfs_maintenance_tick(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    message_sender: DfsMessageSender,
-    metadata_sender: DfsMetadataJournalBatchSender,
-    snapshot_sender: DfsMetadataSnapshotInstallSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    options: DfsMaintenanceTickOptions,
-) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
-    run_cluster_dfs_maintenance_tick_with_message_sender(
-        data_dir,
-        cluster_paths,
-        message_sender,
-        metadata_sender,
-        snapshot_sender,
-        control_plane,
-        options,
-    )
 }
 
 pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
@@ -3119,7 +3098,15 @@ where
                 .map_err(|error| DfsError::Metadata {
                     message: error.to_string(),
                 })?;
-            turn.advance(Phase::WriteIntents);
+            // A checkpointed repair sweep already completed this bounded
+            // intent inventory. Keep earlier phases fair without wrapping that
+            // independent cursor again merely to finish the repair cursor.
+            let next = if fair_resume && turn.continues_repair_sweep() {
+                Phase::Placement
+            } else {
+                Phase::WriteIntents
+            };
+            turn.advance(next);
             tokio::task::yield_now().await;
             tokio::task::yield_now().await;
         }
@@ -3128,6 +3115,35 @@ where
                 options.write_intent_max_records,
                 options.stale_write_intent_min_age,
             )?;
+            if fair_resume
+                && options.write_intent_max_records > 0
+                && turn.report().write_intents.scan_has_more
+            {
+                if turn.report().write_intents.visited_intent_shard_count == 0 {
+                    // No actual page progress may acknowledge or advance this
+                    // enabled phase. Keep its existing checkpoint for reentry,
+                    // after retaining any real births from preceding phases.
+                    progress_owner.checkpoint_births(service, maintenance_host)?;
+                    return Ok(None);
+                }
+                // This actual bounded page is complete. Keep its phase/cursor
+                // instead of wrapping it while a different page owner is busy.
+                // Preserve native birth persistence and publication before the
+                // normal Some(report) carrier handoff releases admission.
+                progress_owner.checkpoint_births(service, maintenance_host)?;
+                turn.report().metadata_replication = run_maintenance_publish_phase(
+                    &file_system_id,
+                    local_node_id,
+                    &metadata_shards,
+                    data_dir,
+                    metadata_publisher_host,
+                    metadata_transport,
+                    execution_exclusions,
+                    options,
+                )
+                .await?;
+                return turn.write_intent_page_report().map(Some);
+            }
             turn.advance(Phase::Placement);
             tokio::task::yield_now().await;
         }
@@ -3208,23 +3224,23 @@ where
             tokio::task::yield_now().await;
         }
         if turn.phase() == Phase::Publish {
-            turn.report().metadata_replication = if options.publish_metadata {
-                crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
-                    file_system_id,
-                    local_node_id,
-                    metadata_shards.clone(),
-                    data_dir,
-                    metadata_publisher_host,
-                    metadata_transport,
-                    execution_exclusions,
-                    options.metadata_replication,
-                )
-                .await?
-            } else {
-                DfsMetadataJournalReplicationReport {
-                    outcomes: Vec::new(),
-                }
-            };
+            turn.report().metadata_replication = run_maintenance_publish_phase(
+                &file_system_id,
+                local_node_id,
+                &metadata_shards,
+                data_dir,
+                metadata_publisher_host,
+                metadata_transport,
+                execution_exclusions,
+                options,
+            )
+            .await?;
+            if fair_resume && turn.report().repair_budget_exhausted {
+                // The SAME actual queue page checkpoint and normal Publish
+                // phase finished. Hand its carriers back normally, retaining
+                // the existing sweep while earlier phases get another turn.
+                return turn.repair_sweep_report_after_publish().map(Some);
+            }
             turn.advance(Phase::Complete);
         }
         turn.finish().map(Some)
@@ -3234,6 +3250,36 @@ where
         progress_owner.restart_after_error()?;
     }
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_maintenance_publish_phase(
+    file_system_id: &DfsFileSystemId,
+    local_node_id: &NodeId,
+    metadata_shards: &[DfsMetadataShardConfig],
+    data_dir: &SinomoDataDir,
+    metadata_publisher_host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMaintenanceTickOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    if options.publish_metadata {
+        crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
+            file_system_id.clone(),
+            local_node_id,
+            metadata_shards.to_vec(),
+            data_dir,
+            metadata_publisher_host,
+            metadata_transport,
+            execution_exclusions,
+            options.metadata_replication,
+        )
+        .await
+    } else {
+        Ok(DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        })
+    }
 }
 
 struct RepairPhaseReport {

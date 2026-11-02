@@ -402,6 +402,15 @@ impl ClusterNetworkMaintenanceCadence {
         );
     }
 
+    /// A committed local source change needs quorum publication, not a new
+    /// probe generation. The publication retry owner re-reads the stored
+    /// source set, so a waiting retry keeps its backoff and still carries it.
+    pub fn request_connectivity_source_publication(&mut self, now: Instant) {
+        if self.connectivity_publish_retry_at.is_none() {
+            self.connectivity_publish_retry_at = Some(now);
+        }
+    }
+
     pub fn request_discovery_refresh(&mut self, now: Instant) {
         if self.discovery_retry_at.is_some() {
             self.discovery_retry_at = Some(now);
@@ -510,14 +519,11 @@ impl ClusterNetworkMaintenanceCadence {
         }
     }
 
-    pub fn finish_connectivity_convergence(&mut self, superseded: bool, now: Instant) {
+    pub fn finish_connectivity_convergence(&mut self, superseded: bool, _now: Instant) {
         self.connectivity_converged = true;
-        // Close an initialized window without making it look uninitialized.
-        // Ordinary retries/reconvergence must not soften established failures
-        // again. A real environment refresh explicitly installs a new window.
-        self.startup_settle_until = self
-            .startup_settle_until
-            .map(|deadline| deadline.min(now));
+        // A settled observation batch need not establish usable forward paths.
+        // Preserve the original bounded startup window and its consumed marker;
+        // ordinary completion neither truncates nor extends that grace.
         self.record_connectivity_publish_success(superseded);
     }
 
@@ -571,24 +577,98 @@ mod tests {
     #[test]
     fn completed_settle_does_not_restart_for_ordinary_reconvergence() {
         for reason in 0..3 {
-            let start = Instant::now();
-            let mut cadence =
-                ClusterNetworkMaintenanceCadence::immediate(start, ClusterNodeRole::Workstation);
-            cadence.ensure_connectivity_settle_deadline(start, false);
-            assert!(cadence.startup_settle_until.is_some_and(|at| at > start));
-            cadence.finish_connectivity_convergence(false, start);
-            let later = Instant::now() + Duration::from_secs(1);
-            match reason {
-                0 => cadence.request_connectivity_refresh(later),
-                1 => cadence.record_connectivity_topology_superseded(),
-                _ => cadence.retain_superseding_connectivity_source_generation(later),
+            for elapsed in [1, 9] {
+                let start = Instant::now();
+                let mut cadence = ClusterNetworkMaintenanceCadence::immediate(
+                    start,
+                    ClusterNodeRole::Workstation,
+                );
+                cadence.ensure_connectivity_settle_deadline(start, false);
+                let original = Some(start + CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION);
+                assert_eq!(cadence.startup_settle_until, original);
+                cadence.finish_connectivity_convergence(false, start);
+                let later = start + Duration::from_secs(elapsed);
+                match reason {
+                    0 => cadence.request_connectivity_refresh(later),
+                    1 => cadence.record_connectivity_topology_superseded(),
+                    _ => cadence.retain_superseding_connectivity_source_generation(later),
+                }
+                cadence.ensure_connectivity_settle_deadline(later, false);
+                assert_eq!(
+                    cadence.startup_settle_until, original,
+                    "ordinary follow-up {reason} at {elapsed}s must retain the original startup deadline"
+                );
+                assert!(!cadence.connectivity_converged);
             }
-            cadence.ensure_connectivity_settle_deadline(later, false);
-            assert!(
-                cadence.startup_settle_until.is_none_or(|at| at <= later),
-                "ordinary follow-up {reason} must not create a new startup failure-grace window"
-            );
-            assert!(!cadence.connectivity_converged);
+        }
+    }
+
+    #[test]
+    fn settled_healthy_or_unreachable_batch_preserves_startup_window_and_role_expiry() {
+        let start = Instant::now();
+        for role in [
+            ClusterNodeRole::Workstation,
+            ClusterNodeRole::Server,
+            ClusterNodeRole::Test,
+            ClusterNodeRole::Mobile,
+            ClusterNodeRole::Sensor,
+        ] {
+            for state in [
+                sinomo_network::ClusterConnectivityState::Healthy,
+                sinomo_network::ClusterConnectivityState::Unreachable,
+            ] {
+                let mut cadence = ClusterNetworkMaintenanceCadence::immediate(start, role.clone());
+                cadence.ensure_connectivity_settle_deadline(start, false);
+                let deadline = start + CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION;
+                let completed = start + Duration::from_secs(1);
+                cadence.claim_due_classes(completed, true, true, false, true);
+                assert!(cadence.take_publish_claim());
+                assert!(cadence.take_probe_claim());
+                assert!(cadence.take_connectivity_publish_claim());
+                assert!(!cluster_connectivity_probe_result_needs_followup(
+                    0,
+                    true,
+                    state == sinomo_network::ClusterConnectivityState::Degraded,
+                ));
+                cadence.finish_connectivity_convergence(false, completed);
+                assert!(cadence.connectivity_converged);
+                assert_eq!(cadence.startup_settle_until, Some(deadline));
+                for at in [completed, deadline - Duration::from_nanos(1)] {
+                    assert_eq!(
+                        cadence.next_due_duration(at, false),
+                        CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL,
+                        "a settled {state:?} batch must retain the original bounded cadence: {role:?}"
+                    );
+                    assert!(
+                        sinomo_network::cluster_network_maintenance_due(
+                            at,
+                            &cadence.schedule(false)
+                        )
+                        .probe_due
+                    );
+                }
+                let interval = cluster_network_probe_interval_for_role(&role)
+                    .min(cluster_network_publish_interval_for_role(&role));
+                assert_eq!(
+                    cadence.next_due_duration(deadline, false),
+                    interval - deadline.duration_since(completed),
+                    "the original expiry must return to the unchanged role interval: {role:?}"
+                );
+                assert!(
+                    !sinomo_network::cluster_network_maintenance_due(
+                        deadline,
+                        &cadence.schedule(false)
+                    )
+                    .probe_due
+                );
+                cadence.finish_connectivity_convergence(false, deadline);
+                cadence.ensure_connectivity_settle_deadline(deadline, false);
+                assert_eq!(cadence.startup_settle_until, Some(deadline));
+                assert_eq!(
+                    cadence.next_due_duration(completed + interval, false),
+                    Duration::ZERO
+                );
+            }
         }
     }
 
@@ -605,7 +685,7 @@ mod tests {
             Some(start + CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION)
         );
         cadence.finish_connectivity_convergence(false, start);
-        let changed = Instant::now() + Duration::from_secs(1);
+        let changed = start + Duration::from_secs(1);
         cadence.request_network_environment_refresh(changed);
         let expected = changed + CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION;
         assert_eq!(cadence.startup_settle_until, Some(expected));
@@ -890,6 +970,29 @@ mod tests {
         assert_eq!(cadence.probe_retry_at, Some(now));
         assert!(cadence.connectivity_force_probe);
         assert!(!cadence.connectivity_converged);
+    }
+
+    #[test]
+    fn local_source_publication_is_due_now_without_a_probe_generation() {
+        let now = Instant::now();
+        let mut cadence = renewal_cadence(now);
+
+        cadence.request_connectivity_source_publication(now);
+
+        assert_eq!(cadence.connectivity_publish_retry_at, Some(now));
+        assert_eq!(cadence.next_due_duration(now, false), Duration::ZERO);
+        assert_eq!(cadence.connectivity_input_generation, 0);
+        assert!(!cadence.connectivity_force_probe);
+        assert!(cadence.connectivity_converged);
+
+        // A failed quorum publication keeps its backoff. Its retry re-reads
+        // the stored source set, so the newer change is still carried.
+        let retry_at = now + Duration::from_secs(4);
+        cadence.connectivity_publish_failure_streak = 3;
+        cadence.connectivity_publish_retry_at = Some(retry_at);
+        cadence.request_connectivity_source_publication(now);
+        assert_eq!(cadence.connectivity_publish_retry_at, Some(retry_at));
+        assert_eq!(cadence.connectivity_publish_failure_streak, 3);
     }
 
     #[test]

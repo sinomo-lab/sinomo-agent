@@ -2557,6 +2557,12 @@ mod tests {
     fn mirror_candidate_bundle_to_sifs_persists_local_artifacts_and_skips_workspaces() {
         let root = temp_dir("sifs-mirror");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let _owner =
+            sinomo_runtime::vfs::native_test_support::NativeMountedOwner::start_in_data_dir(
+                "sinomo-evolution-sifs-mirror",
+                data_dir.clone(),
+            )
+            .expect("start native SIFS owner");
         let mut record = stored_record_fixture(&root, EvolutionJobStatus::AwaitingApproval);
         let bundle_dir = PathBuf::from(&record.bundle.bundle_path);
         fs::create_dir_all(&bundle_dir).expect("bundle dir");
@@ -3578,6 +3584,16 @@ struct SifsWriteDigest {
 fn open_evolution_sifs_service(
     data_dir: &SinomoDataDir,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, EvolutionPersistenceError> {
+    #[cfg(test)]
+    if let Some(opened) = sinomo_runtime::vfs::native_test_support::open_registered(data_dir, None)
+    {
+        return opened.map(|opened| opened.service).map_err(|source| {
+            EvolutionPersistenceError::Sifs {
+                path: data_dir.root().display().to_string(),
+                detail: source.to_string(),
+            }
+        });
+    }
     data_dir
         .ensure_root_layout()
         .map_err(|source| EvolutionPersistenceError::Io {

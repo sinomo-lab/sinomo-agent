@@ -172,9 +172,9 @@ use sinomo_runtime::daemon::{
 };
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
-    DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardConfig, DfsObjectId,
-    DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView, DfsVersion,
-    LocalShardedMetadataBackend, LocalSobjMetadataBackend,
+    DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId, DfsOperatorInspectionCursor,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsVersion, LocalShardedMetadataBackend,
+    LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
     DfsPinAddRequest, add_local_dfs_pin, default_dfs_metadata_root,
@@ -308,10 +308,10 @@ mod error;
 mod help;
 mod media_transport;
 pub mod module_commands;
-mod providers;
-mod sandbox_host;
 #[cfg(test)]
 mod native_test_fixture;
+mod providers;
+mod sandbox_host;
 #[cfg(test)]
 mod tests;
 mod tui;
@@ -829,6 +829,7 @@ pub fn hosted_agent_chat_component_factory(
                 let shutdown = scope.shutdown_receiver();
                 scope.on_host_ready(move || {
                     let service = chat_service.clone();
+                    service.mark_host_ready();
                     let data_dir = data_dir.clone();
                     let runtime = runtime.clone();
                     if let Err(error) = service.recover(data_dir, runtime, shutdown.clone()) {
@@ -3507,7 +3508,32 @@ pub(crate) fn run_agent_readiness(options: AgentReadinessOptions) -> Result<(), 
         path: ".".to_string(),
         detail: source.to_string(),
     })?;
-    let report = run_local_agent_readiness_gate(workspace_root);
+    let owner = (|| {
+        let data_dir = SinomoDataDir::from_env_or_home().map_err(|error| error.to_string())?;
+        let state = cluster::read_cluster_state_without_kv(&ClusterPaths::new(&data_dir))
+            .map_err(|error| error.to_string())?;
+        let daemon = default_main_daemon_status()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "agent readiness requires the existing local main daemon".to_string())?;
+        let matches_owner = daemon.cluster.as_ref().is_some_and(|owner| {
+            owner.cluster_id == state.cluster_id && owner.node_id == state.local_node_id
+        });
+        let daemon_data = fs::canonicalize(&daemon.data_dir).map_err(|error| error.to_string())?;
+        let owner_data = fs::canonicalize(data_dir.root()).map_err(|error| error.to_string())?;
+        if !matches_owner || daemon_data != owner_data {
+            return Err(
+                "local main daemon does not match the configured readiness owner".to_string(),
+            );
+        }
+        sinomo_runtime::vfs::daemon_sifs_on_node(
+            data_dir.clone(),
+            daemon.address,
+            state.local_node_id,
+        )
+        .map(|vfs| (data_dir, vfs))
+        .map_err(|error| error.to_string())
+    })();
+    let report = run_local_agent_readiness_gate(workspace_root, owner);
     if options.json {
         println!(
             "{}",
@@ -5328,6 +5354,27 @@ fn agent_recall_tool_registry(
     definition: &AgentDefinition,
 ) -> Result<AgentToolRegistry, CliError> {
     let registry = AgentToolRegistry::new();
+    #[cfg(test)]
+    let memory_backend = if native_test_fixture::peer_transports(data_dir).is_some() {
+        sinomo_runtime::vfs::mounted_sifs(Some(data_dir.root()))
+            .map_err(|source| CliError::Parse {
+                detail: format!("open native agent Markdown memory VFS: {source}"),
+            })
+            .and_then(|vfs| {
+                sinomo_agent::SifsMemoryNoteBackend::from_vfs(vfs, definition.key()).map_err(
+                    |source| CliError::Parse {
+                        detail: format!("configure agent Markdown memory notes: {source}"),
+                    },
+                )
+            })?
+    } else {
+        sinomo_agent::SifsMemoryNoteBackend::new(data_dir, definition.key()).map_err(|source| {
+            CliError::Parse {
+                detail: format!("configure agent Markdown memory notes: {source}"),
+            }
+        })?
+    };
+    #[cfg(not(test))]
     let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(data_dir, definition.key())
         .map_err(|source| CliError::Parse {
             detail: format!("configure agent Markdown memory notes: {source}"),
@@ -5381,13 +5428,7 @@ fn prepare_simple_sandbox_agent_home(
     data_dir: &SinomoDataDir,
     agent_id: &str,
 ) -> Result<String, String> {
-    let path = sinomo_agent::local_workspace::agent_home_sifs_path_for_id(agent_id);
-    // These libc accessors have no preconditions and only read the effective
-    // credentials of the current process.
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    sifs_file_manager::SifsFileManagerBackend::open(data_dir)?
-        .ensure_posix_directory_with_attrs(&path, uid, gid, 0o700)?;
-    Ok(path)
+    sinomo_agent::local_workspace::prepare_agent_home_sifs(data_dir, agent_id)
 }
 
 #[cfg(not(unix))]

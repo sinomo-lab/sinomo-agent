@@ -213,6 +213,8 @@ and retrieve evidence:
 
 ```sh
 sinomo memory root add /absolute/path/to/notes
+# Alternatively, select an existing SIFS directory through a running daemon.
+sinomo memory root add /services/shared-notes --filesystem sifs
 sinomo memory root list
 ROOT_ID=your-root-id
 sinomo memory index "$ROOT_ID"
@@ -220,7 +222,16 @@ sinomo memory query "where did we decide the retention policy?"
 ```
 
 The source files remain the durable evidence. Indexes are derived and can be
-rebuilt. Keep secrets out of a registered root unless its storage and scope
+rebuilt. SIFS source files are shared through DFS; root registrations and derived
+indexes belong to the node running these commands. Register and index the source
+on each node that needs indexed retrieval. Run `memory index` again to reconcile
+source changes and deletions; queries recheck the source version and do not serve
+changed or unavailable source content as current. Agent memory-note tools do not
+automatically register or index their SIFS home.
+Joining a different cluster does not rebind an existing SIFS index root;
+register the intended source in the new cluster explicitly.
+
+Keep secrets out of a registered root unless its storage and scope
 policy are appropriate for those secrets.
 
 ## Skills

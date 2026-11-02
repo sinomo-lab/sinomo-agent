@@ -41,23 +41,12 @@ fn run() -> Result<()> {
             desktop::verify_bundle(&source, &desktop::read_manifest(&source)?)?;
             Ok(())
         }
-        #[cfg(target_os = "linux")]
-        Some("install") => {
-            let root = value(&args, "--install-dir")?;
-            let data = value(&args, "--data-dir")?;
-            let exe = env::current_exe()?;
-            let (_guard, source) = unpack_payload(exe.parent().ok_or("no package directory")?)?;
-            install(
-                &source.join(binary("sinomo")),
-                Some(&source),
-                &root,
-                &data,
-                &IntegrationOptions::default(),
-                &services::Options {
-                    start: !args.iter().any(|a| a == "--no-start"),
-                    ..services::Options::default()
-                },
-            )
+        Some("install" | "configure") => {
+            if args.iter().any(|arg| arg == "--interactive") {
+                install_gui(&args)
+            } else {
+                install_command(&args)
+            }
         }
         #[cfg(target_os = "linux")]
         Some("--launch-cli" | "--launch-app") => {
@@ -80,32 +69,10 @@ fn run() -> Result<()> {
             let status = command.status()?;
             std::process::exit(status.code().unwrap_or(1));
         }
-        Some("configure") => {
-            let root = value(&args, "--install-dir")?;
-            let data = value(&args, "--data-dir")?;
-            configure(&root, &data)?;
-            #[cfg(windows)]
-            windows_integration(&root, "install", &args)?;
-            complete_services(
-                &root,
-                &services::Options {
-                    start: !args.iter().any(|arg| arg == "--no-start"),
-                    ..services::Options::default()
-                },
-            )?;
-            Ok(())
-        }
         Some("uninstall") => {
             let root = value(&args, "--install-dir")?;
             let delete_data = args.iter().any(|a| a == "--delete-data");
-            #[cfg(windows)]
-            {
-                uninstall_nsis(&root, delete_data)
-            }
-            #[cfg(not(windows))]
-            {
-                uninstall(&root, delete_data)
-            }
+            uninstall(&root, delete_data)
         }
         Some("--uninstall") => {
             let root = installed_root()?;
@@ -125,7 +92,7 @@ fn run() -> Result<()> {
             info("Sinomo has been uninstalled.");
             Ok(())
         }
-        None => install_gui(),
+        None => install_gui(&args),
         _ => Err("unknown setup command".into()),
     }
 }
@@ -139,24 +106,23 @@ fn confirm(message: &str) -> bool {
         == MessageDialogResult::Yes
 }
 
-fn optional_integration(message: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        // Default/close means no optional integration, matching CLI and NSIS defaults.
-        MessageDialog::new()
-            .set_title("Sinomo setup")
-            .set_description(message)
-            .set_buttons(MessageButtons::YesNoCancelCustom(
-                "Skip".into(),
-                "Enable".into(),
-                "Cancel".into(),
-            ))
-            .show()
-            == MessageDialogResult::Custom("Enable".into())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        confirm(message)
+fn optional_integration(label: &str, current: bool) -> Option<bool> {
+    let result = MessageDialog::new()
+        .set_title("Sinomo configuration")
+        .set_description(format!(
+            "{label}\nCurrent setting: {}",
+            if current { "enabled" } else { "disabled" }
+        ))
+        .set_buttons(MessageButtons::YesNoCancelCustom(
+            "Keep current".into(),
+            "Enable".into(),
+            "Disable".into(),
+        ))
+        .show();
+    match result {
+        MessageDialogResult::Custom(value) if value == "Enable" => Some(true),
+        MessageDialogResult::Custom(value) if value == "Disable" => Some(false),
+        _ => None,
     }
 }
 
@@ -189,57 +155,175 @@ fn select_folder(title: &str, default: &Path) -> Option<PathBuf> {
         .pick_folder()
 }
 
-fn install_gui() -> Result<()> {
-    let home = home()?;
-    info(
-        "Select or create an EMPTY folder for setup and uninstall metadata, then select or create a separate data folder. Cancel either chooser to exit.",
-    );
-    let Some(root) = select_folder("Sinomo installation folder (must be empty)", &home) else {
-        return Ok(());
-    };
-    let Some(data) = select_folder("Sinomo data folder", &home) else {
-        return Ok(());
-    };
-    validate_locations(&root, &data)?;
-    if fs::read_dir(&root)?.next().is_some() {
-        return Err("Choose an empty installation folder. Existing installations must be managed through Sinomo rollout, not replaced by setup.".into());
+fn flag(args: &[String], yes: &str, no: &str) -> Result<Option<bool>> {
+    if args.iter().any(|v| v == yes) && args.iter().any(|v| v == no) {
+        return Err(format!("choose {yes} or {no}").into());
     }
-    let path = optional_integration(
-        "Add the data directory's bin folder to PATH for future login sessions?",
-    );
-    let menu = optional_integration("Add Sinomo to the applications menu?");
-    let desktop = optional_integration("Add a Sinomo desktop shortcut?");
-    if !confirm(&format!(
-        "Install Sinomo in {} using data in {}?",
-        root.display(),
-        data.display()
-    )) {
-        return Ok(());
-    }
-    let exe = env::current_exe()?;
-    let package = exe.parent().ok_or("no package directory")?;
-    #[cfg(target_os = "linux")]
-    let (_payload_guard, unpacked) = unpack_payload(package)?;
-    #[cfg(target_os = "linux")]
-    let source = unpacked.as_path();
-    #[cfg(not(target_os = "linux"))]
-    let source = package;
-    desktop::verify_bundle(source, &desktop::read_manifest(source)?)?;
-    install(
-        &source.join(binary("sinomo")),
-        Some(source),
+    Ok(if args.iter().any(|v| v == yes) {
+        Some(true)
+    } else if args.iter().any(|v| v == no) {
+        Some(false)
+    } else {
+        None
+    })
+}
+fn optional_value(args: &[String], key: &str) -> Option<PathBuf> {
+    args.windows(2)
+        .find(|pair| pair[0] == key)
+        .map(|pair| pair[1].clone().into())
+}
+fn selected_paths(args: &[String]) -> Result<(PathBuf, PathBuf)> {
+    let (root, data) = resolve_locations(
+        optional_value(args, "--install-dir").as_deref(),
+        optional_value(args, "--data-dir").as_deref(),
+    )?;
+    Ok((
+        if root.is_absolute() {
+            root
+        } else {
+            env::current_dir()?.join(root)
+        },
+        if data.is_absolute() {
+            data
+        } else {
+            env::current_dir()?.join(data)
+        },
+    ))
+}
+fn install_options(args: &[String]) -> Result<(IntegrationOptions, services::Options)> {
+    let integrations = IntegrationOptions {
+        add_to_path: flag(args, "--add-to-path", "--no-add-to-path")?
+            .or_else(|| args.iter().any(|v| v == "--path").then_some(true)),
+        menu_shortcut: flag(args, "--menu-shortcut", "--no-menu-shortcut")?
+            .or_else(|| args.iter().any(|v| v == "--menu").then_some(true)),
+        desktop_shortcut: flag(args, "--desktop-shortcut", "--no-desktop-shortcut")?,
+    };
+    Ok((
+        integrations,
+        services::Options {
+            start: !args.iter().any(|v| v == "--no-start"),
+            startup: flag(args, "--startup", "--no-startup")?,
+            ..services::Options::default()
+        },
+    ))
+}
+fn install_command(args: &[String]) -> Result<()> {
+    let (root, data) = selected_paths(args)?;
+    let (integrations, options) = install_options(args)?;
+    apply_install(
         &root,
         &data,
-        &IntegrationOptions {
-            add_to_path: path,
-            desktop_shortcut: desktop,
-            menu_shortcut: menu,
-        },
-        &services::Options::default(),
-    )?;
-    info(
-        "Sinomo is installed and its per-user daemon services are running. Open sinomo-app from the data directory's bin folder or your chosen shortcuts. PATH changes apply to future login sessions. Use Uninstall Sinomo in the applications menu to remove it.",
-    );
+        &integrations,
+        &options,
+        args.iter().any(|arg| arg == "--repair"),
+    )
+}
+fn apply_install(
+    root: &Path,
+    data: &Path,
+    integrations: &IntegrationOptions,
+    options: &services::Options,
+    repairing: bool,
+) -> Result<()> {
+    let exe = env::current_exe()?;
+    if !repairing && (root.join(RECEIPT).is_file() || runtime_present(data)) {
+        return install(&exe, None, root, data, integrations, options);
+    }
+    let package = exe.parent().ok_or("no package directory")?;
+    #[cfg(target_os = "linux")]
+    let (_guard, source) = unpack_payload(package)?;
+    #[cfg(not(target_os = "linux"))]
+    let source = package.to_path_buf();
+    desktop::verify_bundle(&source, &desktop::read_manifest(&source)?)?;
+    let setup = if repairing { repair } else { install };
+    setup(
+        &source.join(binary("sinomo")),
+        Some(&source),
+        root,
+        data,
+        integrations,
+        options,
+    )
+}
+fn install_gui(args: &[String]) -> Result<()> {
+    let (mut root, mut data) = selected_paths(args)?;
+    let existing = root.join(RECEIPT).is_file() || runtime_present(&data);
+    let mut repairing = args.iter().any(|arg| arg == "--repair");
+    if existing && !repairing {
+        let choice = MessageDialog::new()
+            .set_title("Sinomo maintenance")
+            .set_description("Verify/configure the installation, or repair its binaries from this package. Repair stops this node and replaces packaged runtime files while preserving your data. Downgrades are not supported.")
+            .set_buttons(MessageButtons::YesNoCancelCustom("Verify/configure".into(), "Repair binaries".into(), "Cancel".into()))
+            .show();
+        match choice {
+            MessageDialogResult::Custom(value) if value == "Repair binaries" => repairing = true,
+            MessageDialogResult::Custom(value) if value == "Verify/configure" => {}
+            _ => return Ok(()),
+        }
+    }
+    if !existing {
+        info(
+            "Choose the setup metadata folder and a separate data folder. Program files live in the data folder. Existing installations are verified and reconfigured without replacing evolved components.",
+        );
+        let Some(selected) = select_folder("Sinomo installation folder", &root) else {
+            return Ok(());
+        };
+        root = selected;
+        let Some(selected) = select_folder("Sinomo data folder", &data) else {
+            return Ok(());
+        };
+        data = selected;
+    }
+    let mut current = if root.join(RECEIPT).is_file() {
+        configuration(&root)?
+    } else {
+        Configuration {
+            startup: true,
+            ..Configuration::default()
+        }
+    };
+    let (mut integrations, mut options) = install_options(args)?;
+    current.add_to_path = integrations.add_to_path.unwrap_or(current.add_to_path);
+    current.menu_shortcut = integrations.menu_shortcut.unwrap_or(current.menu_shortcut);
+    current.desktop_shortcut = integrations
+        .desktop_shortcut
+        .unwrap_or(current.desktop_shortcut);
+    current.startup = options.startup.unwrap_or(current.startup);
+    if confirm(if repairing {
+        "Change PATH, startup or shortcut settings before repair? Choose No to preserve the current settings. Repair replaces packaged binaries and retains application data; downgrades are not supported."
+    } else if existing {
+        "Verify this Sinomo installation and change PATH, startup or shortcut settings? Choose No to verify and preserve the current settings."
+    } else {
+        "Configure optional PATH, startup and shortcuts? Choose No to use the shared default settings."
+    }) {
+        integrations.add_to_path = optional_integration(
+            "Add the binary directory to user PATH?",
+            current.add_to_path,
+        )
+        .or(integrations.add_to_path);
+        options.startup = optional_integration(
+            "Start main and shadow automatically at boot/login?",
+            current.startup,
+        )
+        .or(options.startup);
+        let desktop_available = data.join("bin").join(binary("sinomo-app")).is_file() || !existing;
+        if desktop_available {
+            integrations.menu_shortcut = optional_integration(
+                "Create a Start Menu/applications-menu shortcut?",
+                current.menu_shortcut,
+            )
+            .or(integrations.menu_shortcut);
+            integrations.desktop_shortcut =
+                optional_integration("Create a desktop shortcut?", current.desktop_shortcut)
+                    .or(integrations.desktop_shortcut);
+        }
+    }
+    apply_install(&root, &data, &integrations, &options, repairing)?;
+    info(if repairing {
+        "Packaged runtime binaries repaired. Application data and managed source were preserved. Downgrades are not supported."
+    } else {
+        "Sinomo installation verified. Selected PATH, startup and shortcut settings are applied. Existing component versions and data are preserved."
+    });
     Ok(())
 }
 

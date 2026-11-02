@@ -858,6 +858,12 @@ pub fn register_storage_paths(
         OBSERVE_CPU_PROFILE_ARTIFACT_ROOT,
         "bounded node-local CPU profile artifacts and manifests",
     )?;
+    layout.register_escape_path(
+        SINOMO_OBSERVE_MODULE_OWNER,
+        StorageRing::R1,
+        "observe/formation",
+        "operator diagnostic formation captures: JSON responses, stderr text, capture indexes and process-generation markers",
+    )?;
     Ok(())
 }
 

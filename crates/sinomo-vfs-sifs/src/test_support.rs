@@ -57,7 +57,105 @@ impl Drop for NativeMountedFixture {
     }
 }
 
-pub(super) fn open_registered(
+/// Own the real single-node runtime and its mounted-client registration.
+/// Callers must drop filesystem clients before dropping this owner.
+pub struct NativeMountedOwner {
+    native: Mutex<Option<DfsTestRuntime>>,
+    registration: Option<NativeMountedFixture>,
+    node: NodeId,
+    data_dir: SinomoDataDir,
+}
+
+impl std::fmt::Debug for NativeMountedOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeMountedOwner")
+            .field("node", &self.node)
+            .field("data_dir", &self.data_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeMountedOwner {
+    pub fn start(name: &str) -> std::result::Result<Self, String> {
+        let node = DfsTestRuntime::ordered_node_ids(name, 1).remove(0);
+        let (native, client) = DfsTestRuntime::start_single_node(name, node.clone())?;
+        drop(client);
+        Ok(Self::register(native, node))
+    }
+
+    pub fn start_in_data_dir(
+        name: &str,
+        data_dir: SinomoDataDir,
+    ) -> std::result::Result<Self, String> {
+        let (native, node) = DfsTestRuntime::start_single_node_in_data_dir(name, data_dir)?;
+        Ok(Self::register(native, node))
+    }
+
+    fn register(native: DfsTestRuntime, node: NodeId) -> Self {
+        let registration = NativeMountedFixture::register(&native, &node);
+        let data_dir = native.data_dir(&node).clone();
+        Self {
+            native: Mutex::new(Some(native)),
+            registration: Some(registration),
+            node,
+            data_dir,
+        }
+    }
+
+    pub fn data_dir(&self) -> &SinomoDataDir {
+        &self.data_dir
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node
+    }
+
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.native
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .runtime_handle()
+    }
+
+    /// Seal a completed phase through the native runtime's verified observation checkpoint.
+    pub fn checkpoint_rpc_observation_window(&self) -> std::result::Result<usize, String> {
+        self.native
+            .lock()
+            .map_err(|_| "native mounted owner mutex poisoned".to_string())?
+            .as_ref()
+            .ok_or_else(|| "native mounted owner already closed".to_string())?
+            .checkpoint_rpc_observation_window()
+    }
+
+    /// Retain this owner until every clone of the actual mounted VFS is dropped.
+    pub fn mounted_vfs(self: &Arc<Self>) -> Result<VfsHandle> {
+        let mut backend = MountedSifsVfsBackend::open(Some(self.data_dir.root()))?;
+        backend.native_owner = Some(Arc::clone(self));
+        VfsHandle::new(Arc::new(backend), "/")
+    }
+}
+
+impl Drop for NativeMountedOwner {
+    fn drop(&mut self) {
+        drop(self.registration.take());
+        if let Some(native) = self.native.get_mut().unwrap().take()
+            && let Err(error) = native.close()
+        {
+            if std::thread::panicking() {
+                eprintln!("native mounted owner shutdown failed: {error}");
+            } else {
+                panic!("native mounted owner shutdown failed: {error}");
+            }
+        }
+    }
+}
+
+/// Open a client through the existing registration for this actual native owner.
+/// An unregistered path returns `None`, preserving the caller's ordinary guard.
+pub fn open_registered(
     data: &SinomoDataDir,
     cancellation: Option<DfsCancellationFlag>,
 ) -> Option<Result<OpenedMountedSifsService>> {

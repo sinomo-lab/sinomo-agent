@@ -1,6 +1,8 @@
 //! Bounded row cursor for retained dynamic SOBJ checkpoints.
 use super::*;
-use sinomo_core::object::{LengthMode, TypeId, serde_ext};
+#[cfg(test)]
+use sinomo_core::object::serde_ext;
+use sinomo_core::object::{LengthMode, TypeId};
 use std::io::{Read, Seek, SeekFrom};
 
 // The durable cursor names consumed source bytes, never the underlying file's

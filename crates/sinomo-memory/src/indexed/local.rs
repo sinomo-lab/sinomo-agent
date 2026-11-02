@@ -63,6 +63,14 @@ std::thread_local! {
 pub struct LocalSourceConnector;
 
 impl MemorySourceConnector for LocalSourceConnector {
+    fn descriptor_identity_is_current(
+        &self,
+        root: &IndexRoot,
+        source: &super::types::SourceDescriptor,
+    ) -> Result<bool, MemoryError> {
+        Ok(descriptor_identity_is_current(root, source))
+    }
+
     fn scan_page(
         &self,
         root: &IndexRoot,

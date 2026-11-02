@@ -15,10 +15,12 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
+#[cfg(test)]
 use crate::DfsMetadataShardWriteFreeze;
 use crate::metadata_cursor::journal_write_lock_path;
 use crate::metadata_error::{MetadataBackendError, Result};
-use crate::metadata_io::{read_sobj_optional, write_sobj_atomic};
+#[cfg(test)]
+use crate::metadata_io::read_sobj_optional;
 use crate::metadata_journal::{
     durable_journal_entries_since_limited, metadata_prefix_proof_after_exact_frame,
     prune_segmented_journal_before_checkpoint,
@@ -651,6 +653,7 @@ pub(crate) fn compact_metadata_table_log_if_needed(
 /// Startup admission for existing snapshots. Only writer/recovery opens call
 /// this; read-only inspection never schedules or migrates storage.
 
+#[cfg(test)]
 pub(crate) fn schedule_metadata_table_checkpoint_if_needed(
     root: &Path,
     tables: &DfsMetadataTables,

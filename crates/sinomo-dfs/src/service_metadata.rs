@@ -17,8 +17,9 @@ use crate::{
     DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
     DfsFileSystemId, DfsLocalEventualBatchWriteProof, DfsMessageTransport, DfsMetadataShardConfig,
     DfsMetadataShardId, DfsNamespaceObjectVersionExpectation, DfsNamespacePathOccupantExpectation,
-    DfsNamespaceTransaction, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsNamespaceTransaction, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
     DfsPreparedMetadataEffect, DfsPreparedOperationPayload, DfsPreparedOperationScope,
+    DfsPreparedOperationStatus,
     DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, MetadataBackendError,
     NetworkedDfsService, dfs_perf_trace, metadata_path, normalize_current_locations,
     path_index_key,
@@ -752,72 +753,6 @@ fn metadata_receipt_projection_input(
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
-    pub(crate) fn resolve_prepared_operation(
-        &mut self,
-        record: &crate::DfsPreparedOperationRecord,
-        status: crate::DfsPreparedOperationStatus,
-        mut effects: Vec<crate::DfsPreparedMetadataEffect>,
-    ) -> Result<(), DfsError> {
-        if record.status == status {
-            return Ok(());
-        }
-        if record.status != crate::DfsPreparedOperationStatus::Prepared
-            || !matches!(
-                status,
-                crate::DfsPreparedOperationStatus::Aborted
-                    | crate::DfsPreparedOperationStatus::Superseded
-            )
-        {
-            return Err(DfsError::Metadata {
-                message: "only an actual hidden preparation can be resolved".into(),
-            });
-        }
-        let epoch = if let Some(control) = self.control_plane.as_mut() {
-            let shard = DfsControlPlaneStore::new(control.as_mut())
-                .get_metadata_shard(&record.digest.file_system_id, &record.digest.shard_id.0)?
-                .ok_or_else(|| DfsError::Metadata {
-                    message: "preparation resolution has no current assignment".into(),
-                })?;
-            if shard.primary_node_id != self.node_id {
-                return Err(DfsError::StaleOwnerEpoch {
-                    file_system_id: shard.file_system_id,
-                    local_node_id: self.node_id.clone(),
-                    primary_node_id: shard.primary_node_id,
-                    epoch: shard.epoch,
-                });
-            }
-            shard.epoch
-        } else {
-            0
-        };
-        let operation_id = format!("resolve:{}:{status:?}:{epoch}", record.digest.operation_id);
-        if let Some(digest) = self
-            .metadata_backend
-            .as_ref()
-            .expect("resolution backend")
-            .prepared_operation_digest(&operation_id)?
-        {
-            self.commit_stored_prepared_operation(&digest)?;
-            return Ok(());
-        }
-        effects.push(crate::DfsPreparedMetadataEffect::ResolvePreparedOperation {
-            digest: record.digest.clone(),
-            status,
-        });
-        self.publish_metadata_effects_on_shard(
-            DfsPreparedOperationScope {
-                file_system_id: record.digest.file_system_id.clone(),
-                shard_id: record.digest.shard_id.clone(),
-                owner_epoch: epoch,
-                operation_id,
-            },
-            Vec::new(),
-            Vec::new(),
-            effects,
-        )?;
-        Ok(())
-    }
-
     pub(crate) fn publish_metadata_effects_on_shard(
         &mut self,
         scope: DfsPreparedOperationScope,
@@ -839,6 +774,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         payload: DfsPreparedOperationPayload,
     ) -> Result<bool, DfsError> {
+        #[cfg(test)]
+        if let Some((root, _owner)) = self.native_publication_owner_for_observation()
+            && let Some(hook) = crate::runtime_host::daemon_dfs_pre_dispatch_test_hook(
+                &sinomo_core::local::SinomoDataDir::new(root),
+            )
+        {
+            hook(crate::runtime_host::DaemonDfsPreDispatchTestPoint::BeforeMetadataEffectPrepare {
+                payload: &payload,
+            }, None, None)?;
+        }
         if self.recover_matching_metadata_receipt_prepare(&payload)?
             || self.recover_matching_placement_intent_prepare(&payload)?
         {
@@ -939,6 +884,83 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(true)
+    }
+
+    /// Resume an actual hidden receipt publication after its content reply was
+    /// retained but metadata application failed. The response selects existing
+    /// preparation DATA only; it never constructs a replacement publication.
+    pub(crate) fn recover_original_repair_receipt_prepare(
+        &mut self,
+        birth: &crate::repair_queue_store::RepairOriginalBirth,
+    ) -> Result<bool, DfsError> {
+        let DfsNetworkMessage::RepairReplica(command) = &birth.original.message else {
+            return Ok(false);
+        };
+        let Some(shard) = command.authority_shard.as_ref() else {
+            return Ok(false);
+        };
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        // Reuse the exact-shard reservation index with an empty-effect read
+        // footprint. It is never prepared or published, and reuses the actual
+        // Repair request ID rather than allocating another operation identity.
+        let footprint = DfsPreparedOperationPayload::for_metadata_effects(
+            DfsPreparedOperationScope {
+                file_system_id: command.file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new(&shard.shard_id),
+                owner_epoch: shard.epoch,
+                operation_id: command.request_id.clone(),
+            },
+            vec![DfsNamespaceObjectVersionExpectation {
+                object_id: command.object_id.clone(),
+                expected_version: Some(command.version.clone()),
+            }],
+            Vec::new(),
+            Vec::new(),
+            OffsetDateTime::UNIX_EPOCH,
+        )?;
+        let mut matching = None;
+        for record in backend.prepared_operation_reservations(&footprint)? {
+            if record.status != DfsPreparedOperationStatus::Prepared
+                || record.digest.file_system_id != command.file_system_id
+                || record.digest.shard_id.0 != shard.shard_id
+                || record.digest.owner_epoch < shard.epoch
+            {
+                continue;
+            }
+            record.validate()?;
+            let original = record.payload.as_ref();
+            let input = match original.metadata_effects.split_last() {
+                Some((DfsPreparedMetadataEffect::PutFileSystem { file_system }, input))
+                    if file_system.file_system_id == original.file_system_id => input,
+                _ => original.metadata_effects.as_slice(),
+            };
+            let Some(receipt) = metadata_receipt_projection_input(input) else {
+                continue;
+            };
+            if receipt.receipt.file_system_id != command.file_system_id
+                || receipt.receipt.object_id != command.object_id
+                || receipt.receipt.committed_version != command.version
+                || receipt.receipt.owner_node_id != birth.original.source_node_id
+                || receipt.replica_node_id != birth.original.target_node_id
+                || receipt.content_hash.as_deref() != Some(command.content_hash.as_str())
+            {
+                continue;
+            }
+            if matching.replace(record).is_some() {
+                return Err(DfsError::Metadata {
+                    message: "multiple hidden publications claim the same original repair receipt"
+                        .into(),
+                });
+            }
+        }
+        let Some(record) = matching else {
+            // An absent receipt after a committed publication can be a later
+            // withdrawal. Only a still-hidden original may be continued here.
+            return Ok(false);
+        };
+        self.recover_one_prepared_operation(record)
     }
 
     /// A same-version placement producer retains a deterministic intent ID,
@@ -1117,6 +1139,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn publish_namespace_prepared_operation(
         &mut self,
         payload: DfsPreparedOperationPayload,
+        configured_file_system: Option<&DfsFileSystem>,
     ) -> Result<crate::publication_guard::DfsPreparedPublication, NamespaceTransactionApplyError>
     {
         let _execution = self.acquire_prepared_execution(&DfsPreparedOperationScope {
@@ -1132,7 +1155,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|object| (object.object_id.clone(), object.path.clone()))
             .collect::<BTreeMap<_, _>>();
         let digest =
-            self.prepare_payload_for_publication(payload)
+            self.prepare_payload_for_publication_with_file_system(payload, configured_file_system)
                 .map_err(|error| match error {
                     MetadataBackendError::Conflict {
                         object_id,
@@ -1979,37 +2002,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(Some(prepare.payload))
     }
 
-    fn materialize_namespace_transaction_in_memory(
-        &mut self,
-        transaction: &DfsNamespaceTransaction,
-    ) -> Result<(), DfsError> {
-        for object in transaction
-            .objects
-            .iter()
-            .filter(|object| object.kind == DfsObjectKind::Tombstone)
-            .chain(
-                transaction
-                    .objects
-                    .iter()
-                    .filter(|object| object.kind != DfsObjectKind::Tombstone),
-            )
-            .cloned()
-        {
-            self.transient_metadata_object_ids.remove(&object.object_id);
-            self.transient_metadata_predecessor_object_ids
-                .remove(&object.object_id);
-            self.coordinator.set_committed_version(
-                object.file_system_id.clone(),
-                object.object_id.clone(),
-                object.version.clone(),
-            );
-            self.track_metadata_tombstone(&object);
-            self.metadata.add_object(object)?;
-        }
-        self.clear_metadata_lookup_cache();
-        Ok(())
-    }
-
     pub(crate) fn apply_local_eventual_batch_commit(
         &mut self,
         requester_node_id: &NodeId,
@@ -2126,9 +2118,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let Some(digest) = backend.prepared_operation_digest(&operation_id)? else {
                     continue;
                 };
-                if backend.committed_prepared_operation(&digest)?.is_none() {
-                    continue;
-                }
+                let recovery_record = if backend.committed_prepared_operation(&digest)?.is_none() {
+                    Some(backend.prepared_operation_record(&operation_id)?.ok_or_else(|| {
+                        DfsError::Metadata {
+                            message: "recorded namespace prepare lost its immutable body".into(),
+                        }
+                    })?)
+                } else {
+                    None
+                };
                 let payload = backend
                     .prepared_operation_payload(&operation_id)?
                     .ok_or_else(|| DfsError::Metadata {
@@ -2176,8 +2174,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     .into());
                 }
-                let replay = self.commit_stored_prepared_operation(&digest)?;
-                debug_assert!(!replay.published);
+                if let Some(record) = recovery_record {
+                    record.validate()?;
+                    if record.digest != digest || record.payload.as_ref() != payload.as_ref() {
+                        return Err(DfsError::Metadata {
+                            message: "recorded namespace prepare changed during reconciliation".into(),
+                        }.into());
+                    }
+                    // The existing owner recovers the entire validated original
+                    // before a fresh policy lookup can replan any part of it.
+                    // Its established epoch transition/fencing path is retained.
+                    if !self.recover_one_prepared_operation(record)? {
+                        return Err(DfsError::Metadata {
+                            message: "recorded namespace prepare has no current recovery owner".into(),
+                        }.into());
+                    }
+                } else {
+                    let replay = self.commit_stored_prepared_operation(&digest)?;
+                    debug_assert!(!replay.published);
+                }
                 return Ok(());
             }
         }
@@ -2549,7 +2564,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             payload.journal_operation_id = captured_journal_operation_id;
             payload.metadata_effects.extend(metadata_effects);
-            let published = self.publish_namespace_prepared_operation(payload)?;
+            let configured_file_system = configured_file_system
+                .as_ref()
+                .filter(|_| !payload.transaction.objects.is_empty());
+            let published =
+                self.publish_namespace_prepared_operation(payload, configured_file_system)?;
             if !published.published {
                 return Ok(());
             }
@@ -2649,7 +2668,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )?;
             payload.journal_operation_id = journal_operation_id.clone();
             payload.metadata_effects.extend(metadata_effects);
-            let published = self.publish_namespace_prepared_operation(payload)?;
+            let configured_file_system = configured_file_system
+                .as_ref()
+                .filter(|_| !payload.transaction.objects.is_empty());
+            let published =
+                self.publish_namespace_prepared_operation(payload, configured_file_system)?;
             if !published.published {
                 return Ok(());
             }
@@ -2784,7 +2807,6 @@ fn original_filesystem_preparation_for_request(
 #[cfg(test)]
 mod filesystem_preparation_recovery_tests {
     use super::*;
-    use crate::DfsMetadataBackend;
 
     #[test]
     fn native_placement_intent_retry_recovers_the_original_prepared_body() {

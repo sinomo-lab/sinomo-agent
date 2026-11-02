@@ -39,7 +39,7 @@ pub(crate) enum ClusterCliCommand {
     Role(ClusterRoleOptions),
     StateAuthority(ClusterStateAuthorityOptions),
     RepairMembers(ClusterRepairMembersOptions),
-    RecoverEndpoint { action: cluster::EndpointRecoveryAction, request_file: String },
+    RouteHint(cluster::ClusterRouteHintRequest),
     Remove(ClusterRemoveOptions),
     CleanupLegacyShadowMembers,
     Status,
@@ -202,13 +202,14 @@ fn cluster_cli_spec() -> CliCommandSpec {
                 .repeatable(),
             ]),
             CliCommandSpec::new(
-                "recover-endpoint",
-                "recover one existing peer route without membership changes",
+                "route-hint",
+                "give this node an address for a peer it cannot reach",
             )
             .with_positionals([
-                positional("action", "apply|status|rollback"),
-                positional("request", "immutable endpoint recovery JSON request file"),
-            ]),
+                positional("node-id", "peer node id"),
+                positional("address", "peer daemon listener host:port"),
+            ])
+            .with_options([CliOptionSpec::flag("--remove", "remove the hint instead")]),
             CliCommandSpec::new("join", "join an existing cluster")
                 .with_options([
                     option("--name", "local node name", "name"),
@@ -299,22 +300,13 @@ fn parse_cluster_matches(matches: &CliCommandMatches) -> Result<ClusterCliComman
         })
     };
     match path.as_slice() {
-        ["cluster", "recover-endpoint"] => {
-            let action = match required_positional(matches, 0)? {
-                "apply" => cluster::EndpointRecoveryAction::Apply,
-                "status" => cluster::EndpointRecoveryAction::Status,
-                "rollback" => cluster::EndpointRecoveryAction::Rollback,
-                _ => {
-                    return Err(CliParseError::Parse {
-                        detail: "expected apply, status or rollback".into(),
-                    });
-                }
-            };
-            Ok(ClusterCliCommand::RecoverEndpoint {
-                action,
-                request_file: required_positional(matches, 1)?.to_owned(),
-            })
-        }
+        ["cluster", "route-hint"] => Ok(ClusterCliCommand::RouteHint(
+            cluster::ClusterRouteHintRequest {
+                node_id: node_id(required_positional(matches, 0)?)?,
+                address: required_positional(matches, 1)?.to_owned(),
+                remove: matches.contains("--remove"),
+            },
+        )),
         ["cluster", "init"] => {
             let defaults = ClusterInitOptions::default();
             Ok(ClusterCliCommand::Init(ClusterInitOptions {
@@ -785,19 +777,9 @@ pub(crate) fn run_cluster_cli_command(command: ClusterCliCommand) -> Result<(), 
         ClusterCliCommand::Role(options) => cluster_role(options),
         ClusterCliCommand::StateAuthority(options) => cluster_state_authority_role(options),
         ClusterCliCommand::RepairMembers(options) => cluster_repair_members(options),
-        ClusterCliCommand::RecoverEndpoint {
-            action,
-            request_file,
-        } => {
-            let bytes = std::fs::read(&request_file).map_err(|e| CliError::Parse {
-                detail: format!("read recovery request: {e}"),
-            })?;
-            let spec: cluster::EndpointRecoverySpec =
-                serde_json::from_slice(&bytes).map_err(|e| CliError::Parse {
-                    detail: format!("decode recovery request: {e}"),
-                })?;
-            let response = cluster_control_daemon_client("recover-endpoint")?
-                .cluster_recover_endpoint(cluster::EndpointRecoveryRequest { spec, action })?;
+        ClusterCliCommand::RouteHint(request) => {
+            let response =
+                cluster_control_daemon_client("route-hint")?.cluster_route_hint(request)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&response).map_err(|e| CliError::Parse {
@@ -1876,10 +1858,15 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         &mut host,
     )
     .map_err(CliError::from)?;
-    if let Some(snapshot) = reconciliation.kv_snapshot
+    if let Some(snapshot) = reconciliation.kv_snapshot.as_ref()
         && let Some(paths) = paths
     {
-        write_cluster_kv_snapshot(paths, &snapshot)?;
+        cluster::persist_accepted_cluster_join_snapshot(
+            paths,
+            &state.local_node_id,
+            snapshot,
+            reconciliation.raft_anchor,
+        )?;
     }
     if let Some(endpoint) = reconciliation.accepted_endpoint {
         println!("introducer accepted join: {}", endpoint.address);
@@ -3132,27 +3119,15 @@ impl cluster::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         runtime.shutdown_timeout(Duration::from_millis(250));
         result
     }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        _paths: &ClusterPaths,
-        _local_node_id: &NodeId,
-        _snapshot: KvSnapshot,
-    ) -> Result<bool, network::NetworkError> {
-        // `refresh_current_cluster_kv_store_with_host` has already persisted
-        // the imported materialized projection before invoking this hook. A
-        // CLI process does not own the resident Raft node and must never open
-        // it merely to arbitrate a read snapshot; the daemon will reconcile
-        // its own Raft-backed projection on its next committed edge.
-        Ok(false)
-    }
 }
 
 fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), CliError> {
     let Ok(state) = read_cluster_state_with_materialized_member_overlay(paths) else {
         return Ok(());
     };
-    match cluster::refresh_current_cluster_kv_store_with_host(
+    // Without a running daemon this CLI reads the materialized projection, so
+    // it persists the authoritative snapshot it fetched for those reads.
+    match cluster::refresh_current_cluster_kv_store_with_outcome(
         paths,
         &state,
         cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
@@ -3161,6 +3136,16 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             paths: paths.clone(),
         },
     ) {
+        Ok(outcome) if outcome.fetched_remote => {
+            let snapshot = outcome.store.try_snapshot()?;
+            if sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+                &paths.kv_paths(),
+                &snapshot,
+            )? {
+                cluster::invalidate_cluster_kv_observed_read_models(paths);
+            }
+            Ok(())
+        }
         Ok(_) | Err(network::NetworkError::ClusterReadOnly { .. }) => Ok(()),
         Err(network::NetworkError::Io { .. }) => Ok(()),
         Err(error) => Err(error.into()),
@@ -3234,16 +3219,7 @@ pub(crate) fn read_cluster_kv_local_snapshot_for_test(
     }
 }
 
-pub(crate) fn write_cluster_kv_snapshot(
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> Result<(), CliError> {
-    sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot)
-        .map(|_| ())
-        .map_err(sinomo_runtime::network::NetworkError::directory)
-        .map_err(Into::into)
-}
-
+#[cfg(test)]
 pub(crate) fn write_imported_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
@@ -3263,36 +3239,6 @@ pub(crate) fn sync_cluster_state_to_kv(
 ) -> Result<KvSnapshot, CliError> {
     cluster::sync_cluster_state_to_kv_with_host(paths, state, &mut CliClusterMemberMutationHost)
         .map_err(Into::into)
-}
-
-#[cfg(test)]
-pub(crate) fn expire_cluster_network_records_in_kv(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    now: OffsetDateTime,
-) -> Result<Option<KvSnapshot>, CliError> {
-    struct CliClusterNetworkRecordExpiryHost;
-
-    impl cluster::ClusterNetworkRecordExpiryHost for CliClusterNetworkRecordExpiryHost {
-        type Error = CliError;
-
-        fn commit_cluster_kv_txn_with_quorum(
-            &mut self,
-            paths: &ClusterPaths,
-            state: &mut ClusterBootstrapState,
-            request: KvTxnRequest,
-        ) -> Result<ClusterKvTxnCommitResult, Self::Error> {
-            cli_commit_cluster_kv_request_with_quorum_response(paths, state, request)
-                .map_err(Into::into)
-        }
-    }
-
-    cluster::expire_cluster_network_records_with_host(
-        paths,
-        state,
-        now,
-        &mut CliClusterNetworkRecordExpiryHost,
-    )
 }
 
 struct CliClusterInvitePublishHost;
@@ -3559,55 +3505,6 @@ mod tests {
         assert_eq!(
             retained_record.state,
             sinomo_runtime::network::ClusterConnectivityState::Healthy
-        );
-    }
-
-    #[test]
-    fn cli_snapshot_refresh_host_never_opens_local_raft_storage() {
-        let root = sinomo_testdir::TestDir::new("sinomo-cli-snapshot-refresh-no-raft-open");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = ClusterPaths::new(&data_dir);
-        paths.ensure().expect("cluster paths");
-        let state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_cli_snapshot_no_raft_open").expect("cluster id"),
-            "CLI snapshot no Raft open",
-            NodeId::from_legacy_named("node_cli_snapshot_no_raft_open").expect("node id"),
-            "local",
-            "public-key",
-            OffsetDateTime::now_utc(),
-        );
-        cluster::write_cluster_state(&paths, &state).expect("cluster state");
-        let snapshot = sinomo_runtime::kv::InProcessKvStore::new()
-            .try_snapshot()
-            .expect("KV snapshot");
-        sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &snapshot)
-            .expect("materialized snapshot");
-
-        // A durable-state marker makes a latest-observed read try the Raft
-        // path. Making node.lock a directory turns any such attempt into a
-        // deterministic error without relying on timing or another process.
-        let wal_paths = paths.kv_paths().raft_wal_paths(&state.local_node_id);
-        std::fs::create_dir_all(&wal_paths.root).expect("Raft root");
-        std::fs::write(&wal_paths.wal, b"").expect("durable-state marker");
-        std::fs::create_dir(&wal_paths.lock).expect("inaccessible node lock sentinel");
-
-        let mut host = CliClusterKvSnapshotRefreshHost {
-            paths: paths.clone(),
-        };
-        assert!(
-            !cluster::ClusterKvSnapshotRefreshHost::cache_cluster_kv_snapshot_if_newer_than_raft(
-                &mut host,
-                &paths,
-                &state.local_node_id,
-                snapshot.clone(),
-            )
-            .expect("CLI snapshot cache hook"),
-            "the generic refresh already persisted the imported projection"
-        );
-        assert_eq!(
-            sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-                .expect("materialized snapshot remains readable"),
-            snapshot
         );
     }
 

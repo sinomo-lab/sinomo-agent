@@ -1099,6 +1099,46 @@ pub fn pin_resident_raft_node_registry_for_test(
     resident_raft_node_slot(&paths.root).map(|slot| ResidentRaftNodeRegistryPin { _slot: slot })
 }
 
+/// Keeps the loaded resident writer checked out, as an in-flight mutation
+/// does, and checks the unchanged node back in when dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub struct ResidentRaftCheckoutHold {
+    slot: Arc<ResidentRaftNodeSlot>,
+    resident: Option<ResidentRaftNode>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ResidentRaftCheckoutHold {
+    fn drop(&mut self) {
+        if let Some(resident) = self.resident.take() {
+            self.slot.checkin(resident);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_resident_raft_checkout_for_test(
+    paths: &KvWalPaths,
+) -> Result<ResidentRaftCheckoutHold, KvError> {
+    let slot = resident_raft_node_slot(&paths.root)?;
+    let resident = slot
+        .checkout(&paths.root, Duration::from_secs(5))?
+        .ok_or_else(|| KvError::Io {
+            path: paths.root.display().to_string(),
+            detail: "resident cluster KV Raft node is not loaded".to_string(),
+        });
+    match resident {
+        Ok(resident) => Ok(ResidentRaftCheckoutHold {
+            slot,
+            resident: Some(resident),
+        }),
+        Err(error) => {
+            slot.release_without_cache();
+            Err(error)
+        }
+    }
+}
+
 /// Returns true only when the canonical resident writer for this exact durable
 /// root is currently checked out. This is an observational scheduling probe,
 /// not a freshness claim: callers may use it to avoid a doomed nonresident
@@ -1628,6 +1668,35 @@ where
         let mut projection = ClusterKvRaftResidentReadProjection { node };
         Ok(read(&mut projection))
     })
+}
+
+/// Captures the idle resident node's applied state, anchored at its applied
+/// index and that entry's term, as replication would send it to a lagging
+/// peer. `None` means the resident node is cold, invalid, still owned by a
+/// mutation at `deadline`, or cannot name the applied entry's term.
+pub fn read_cluster_kv_raft_anchored_snapshot_before(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+    deadline: Instant,
+) -> Option<Result<RaftSnapshot, KvError>> {
+    let read = with_idle_resident_raft_node_before(paths, node_id, deadline, |node| {
+        let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
+            &paths.root,
+            Some(node.hard_state.current_term),
+            "capture an anchored resident Raft snapshot",
+        )?;
+        let Some(last_included_term) = node.term_at(node.applied_index) else {
+            return Ok(None);
+        };
+        let mut kv = node.store.try_snapshot()?;
+        compact_kv_snapshot_event_history(&mut kv, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
+        Ok(Some(RaftSnapshot {
+            last_included_index: node.applied_index,
+            last_included_term,
+            kv: kv.into(),
+        }))
+    })?;
+    read.map(|read| read.value).transpose()
 }
 
 fn read_index_probe_metadata_from_node(
@@ -6910,13 +6979,6 @@ pub trait ClusterKvTxnQuorumHost {
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
 
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        _state: &ClusterBootstrapState,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
     fn local_is_raft_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, Self::Error>;
 
     fn forward_cluster_kv_txn_to_voter(
@@ -6955,13 +7017,6 @@ pub trait ClusterKvTxnQuorumAsyncHost: Send {
     /// `From<KvError>` bound so host error types in other crates do not need
     /// orphan-rule-breaking `From` impls.
     fn kv_error(error: KvError) -> Self::Error;
-
-    fn refresh_current_cluster_kv_store_async<'a>(
-        &'a mut self,
-        _state: &'a ClusterBootstrapState,
-    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
-        Box::pin(async { Ok(()) })
-    }
 
     fn local_is_raft_leader_async<'a>(
         &'a mut self,
@@ -7053,7 +7108,6 @@ pub fn commit_cluster_kv_txn_with_quorum_with_host<H>(
 where
     H: ClusterKvTxnQuorumHost,
 {
-    let _ = host.refresh_current_cluster_kv_store(state);
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host.forward_cluster_kv_txn_to_voter(state, &request)?
@@ -7203,7 +7257,6 @@ pub async fn commit_cluster_kv_txn_with_quorum_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let _ = host.refresh_current_cluster_kv_store_async(state).await;
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host
@@ -7386,7 +7439,6 @@ pub async fn commit_cluster_kv_txn_compact_with_quorum_async_with_host<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let _ = host.refresh_current_cluster_kv_store_async(state).await;
     if !cluster_kv_raft_local_is_voter(state) {
         if options.allow_forwarding
             && let Some(response) = host
@@ -8367,63 +8419,6 @@ impl ClusterKvRaftStore {
         })?
     }
 
-    pub fn cache_snapshot_if_newer_than_raft(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let source =
-            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
-        let cache = self
-            .paths
-            .local_cache()
-            .with_observation_source(source, true);
-        let result = cache.cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot);
-        let delivery = cache.finish_observation();
-        result.and_then(|changed| delivery.map(|()| changed))
-    }
-
-    pub fn cache_snapshot_if_newer_than_raft_and_notify(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let cache_changed = self.cache_snapshot_if_newer_than_raft(node_id, snapshot)?;
-        if cache_changed {
-            notify_cluster_kv_watchers(&self.paths);
-        }
-        Ok(cache_changed)
-    }
-
-    pub fn locked_cache_snapshot_if_newer_than_raft_and_notify(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        let source =
-            try_admit_committed_observation(&self.paths, KvObservationProposalOwnership::Absent)?;
-        let fence = source.storage_owner()?;
-        let mut owner = KvObservedOperationGuard {
-            guard: None,
-            fence: Some(fence),
-        };
-        owner.guard = Some(self.lock_operation()?);
-        // The inner file owner releases before this call returns. One outer
-        // fence covers that nested owner and the native operation permit.
-        let cache = self
-            .paths
-            .local_cache()
-            .with_observation_source(source, false);
-        let result = cache.cache_snapshot_if_newer_than_raft(node_id.clone(), snapshot);
-        drop(owner);
-        let delivery = cache.finish_observation();
-        let changed = result.and_then(|changed| delivery.map(|()| changed))?;
-        if changed {
-            notify_cluster_kv_watchers(&self.paths);
-        }
-        Ok(changed)
-    }
-
     pub fn local_vote_metadata(
         &self,
         node_id: &NodeId,
@@ -8661,6 +8656,64 @@ impl ClusterKvRaftStore {
             state: state.clone(),
             vote,
         })
+    }
+
+    /// Installs a snapshot a leader anchored at its applied position, under the
+    /// rule for a snapshot carried by AppendEntries: only one past the local
+    /// applied index replaces local state. Returns whether it was installed.
+    ///
+    /// The node is not kept resident, so the process that next owns this Raft
+    /// root, such as a joined daemon's replacement, opens it from disk.
+    pub fn install_anchored_snapshot(
+        &self,
+        node_id: &NodeId,
+        snapshot: RaftSnapshot,
+    ) -> Result<bool, KvError> {
+        let mut node = DurableRaftKvNode::open(node_id.clone(), self.wal_paths(node_id))?;
+        if snapshot.last_included_index <= node.applied_index() {
+            return Ok(false);
+        }
+        node.restore_snapshot(snapshot)?;
+        Ok(true)
+    }
+
+    /// Installs an anchored snapshot into this process's live replica under the
+    /// same rule, ownership and publication as a snapshot carried by
+    /// AppendEntries. `None` means local state already reaches the anchor.
+    pub fn install_anchored_snapshot_compact_and_publish(
+        &self,
+        node_id: &NodeId,
+        snapshot: RaftSnapshot,
+    ) -> Result<Option<(RaftAppendEntriesCompactApplyOutcome, bool)>, KvError> {
+        let incoming_snapshot = Arc::clone(&snapshot.kv);
+        let incoming_snapshot_index = snapshot.last_included_index;
+        let mut node = self.open_observed_node(node_id)?;
+        if incoming_snapshot_index <= node.applied_index() {
+            return Ok(None);
+        }
+        node.restore_snapshot(snapshot)?;
+        let outcome = RaftAppendEntriesCompactApplyOutcome {
+            response: RaftAppendEntriesResponse {
+                term: node.hard_state().current_term,
+                success: true,
+                match_index: node.last_log_index(),
+            },
+            snapshot_restored: true,
+            restored_snapshot: Some(incoming_snapshot),
+            committed_events: Arc::new(Vec::new()),
+            read_state: read_index_state_from_open_node(&node),
+            compacted_revision: node.store().compacted_revision(),
+            checkpoint_snapshot: None,
+            final_key_states: Arc::new(Vec::new()),
+            commit_advanced: true,
+            selected_lease_mutation: false,
+            observation_receipt: node.observation_receipt(),
+            restored_snapshot_applied_index: Some(incoming_snapshot_index),
+        };
+        node.refresh_resident_read_view();
+        drop(node);
+        let wrote = self.publish_compact_append_entries_apply_outcome(&outcome)?;
+        Ok(Some((outcome, wrote)))
     }
 
     pub fn apply_append_entries_with_optional_snapshot(

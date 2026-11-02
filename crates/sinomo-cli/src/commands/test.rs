@@ -166,6 +166,8 @@ pub(crate) fn test_registry() -> Result<SinomoTestRegistry, CliError> {
     let builder = super::test_cases_desktop::register(builder);
     let builder = crate::commands::test_cases_network::register_network_cluster_test_cases(builder);
     let builder = crate::commands::test_cases_agent::register_agent_cluster_test_cases(builder);
+    let builder = crate::commands::test_cases_agent_home::register(builder);
+    let builder = crate::commands::test_cases_sifs_consumers::register_sifs_consumer_test_cases(builder);
     let builder =
         crate::commands::test_cases_cluster::register_cluster_migration_test_cases(builder);
     let builder = crate::commands::test_cases_cluster_kv::register_cluster_kv_test_cases(builder);

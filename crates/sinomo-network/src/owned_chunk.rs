@@ -1013,8 +1013,9 @@ impl OwnedChunk {
     pub(crate) fn writable_payload(&mut self) -> &mut [u8] {
         let end = self.end;
         let payload_limit = self.payload_limit;
-        self.unique_slab_mut().ensure_initialized(payload_limit);
-        &mut self.unique_slab_mut().bytes_mut()[end..payload_limit]
+        let slab = self.unique_slab_mut();
+        slab.ensure_initialized(payload_limit);
+        &mut slab.bytes_mut()[end..payload_limit]
     }
 
     pub(crate) fn commit_payload(&mut self, bytes: usize) -> Result<(), NetworkError> {

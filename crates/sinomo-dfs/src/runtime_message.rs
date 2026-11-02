@@ -15,12 +15,13 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 
 /// Checkpoint only the exact actual named transfer observed before dispatch.
 /// This is queue DATA reconciliation, not metadata receipt/effect authority.
+#[cfg(test)]
 pub(crate) fn checkpoint_detached_replica_delivery(
     data_dir: &sinomo_core::local::SinomoDataDir,
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
@@ -33,6 +34,36 @@ pub(crate) fn checkpoint_detached_replica_delivery_with_layout(
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
     layout: Option<&crate::DfsSelectedOriginalDataLayout>,
     inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
+) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
+    checkpoint_detached_replica_delivery_inner(data_dir, event, layout, inspection, None)
+}
+
+pub(crate) fn checkpoint_detached_native_original_delivery(
+    data_dir: &sinomo_core::local::SinomoDataDir,
+    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
+    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
+    inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
+    admission: &crate::publication_guard::NativeRepairProducerAdmission,
+    attempt: &crate::repair_queue_store::RepairOriginalAttemptWitness,
+) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
+    checkpoint_detached_replica_delivery_inner(
+        data_dir,
+        event,
+        layout,
+        inspection,
+        Some((admission, attempt)),
+    )
+}
+
+fn checkpoint_detached_replica_delivery_inner(
+    data_dir: &sinomo_core::local::SinomoDataDir,
+    event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
+    layout: Option<&crate::DfsSelectedOriginalDataLayout>,
+    inspection: Option<&crate::content_store::RepairPayloadInspectionContext>,
+    native: Option<(
+        &crate::publication_guard::NativeRepairProducerAdmission,
+        &crate::repair_queue_store::RepairOriginalAttemptWitness,
+    )>,
 ) -> Result<crate::node_transport::DfsBackgroundReplicaDispatch, crate::DfsError> {
     use crate::node_transport::DfsBackgroundReplicaDeliveryEvent;
     use crate::node_transport::DfsBackgroundReplicaDispatch;
@@ -81,7 +112,36 @@ pub(crate) fn checkpoint_detached_replica_delivery_with_layout(
             {
                 return Ok(DfsBackgroundReplicaDispatch::Fenced);
             }
-            let original = store.validate_original_repair_dispatch(&message)?;
+            let validation = if let Some((admission, attempt)) = native {
+                admission.validate_original_dispatch(data_dir, &store, attempt, &message)
+            } else {
+                store.validate_original_repair_dispatch(&message)
+            };
+            let original = match validation {
+                Ok(original) => original,
+                Err(error) => {
+                    // Only an exact, already native-closed Original may retire
+                    // this stale worker reader. A missing proof preserves the
+                    // original validation error and its unresolved ownership.
+                    match store.matching_closed_original_repair_dispatch(&message) {
+                        Ok(Some(closed)) => return Ok(DfsBackgroundReplicaDispatch::Settled {
+                            closed, original_validation_error: error,
+                        }),
+                        Ok(None) => {}
+                        Err(proof_error) => tracing::debug!(target: "sinomo.dfs.repair",
+                            stage = "dfs.repair.dispatch.closed_proof_unavailable",
+                            intent_id = %command.intent_id,
+                            request_id = %command.request_id,
+                            source = %message.source_node_id,
+                            target = %message.target_node_id,
+                            frame_id = message.frame_id,
+                            message_id = message.message_id,
+                            error = %proof_error,
+                            "closed Original proof unavailable; original dispatch error retained"),
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(inspection) = inspection {
                 inspection.inspect(&original.root)?;
             } else {
@@ -401,6 +461,7 @@ impl DfsDetachedSendRuntime {
         self.record_recovery_scan_generation(0);
     }
 
+    #[cfg(test)]
     pub fn schedule_deferred_work<F>(
         self: &Arc<Self>,
         worker: crate::DfsNodeDetachedSendWorker,
@@ -1295,6 +1356,7 @@ pub(crate) fn execute_runtime_message_command_with_verified_fetch<F>(
     publication_owners: Option<Arc<crate::publication_guard::DfsPublicationExecutionOwners>>,
     publication_provider: Option<Arc<crate::DfsPublicationExecutionProvider>>,
     completed_phase: Option<crate::source_adoption::CompletedRemoteNamespacePhase>,
+    fresh_original_repair: Option<crate::runtime_host::FreshOriginalRepairReturn>,
     persist_repair_records: F,
 ) -> Result<DfsRuntimeMessageExecution, crate::DfsError>
 where
@@ -1387,6 +1449,14 @@ where
     service_lane
         .service
         .set_committed_work_tracker(committed_work_tracker.clone());
+    if fresh_original_repair.is_some()
+        && (is_verified_fetch || is_verified_history || preingested_blob.is_some())
+    {
+        return Err(crate::DfsError::Metadata {
+            message: "fresh native Repair return cannot enter another verified request family"
+                .into(),
+        });
+    }
     let mut process_report = match (verified_fetch, verified_history) {
         (None, Some(verified)) => service_lane.service.process_verified_original_history_report(command, verified),
         (Some(verified), None) => service_lane
@@ -1394,7 +1464,9 @@ where
             .process_verified_blob_fetch_report(command, verified),
         (None, None) => service_lane
             .service
-            .process_message_command_report_with_preingested_blob(command, preingested_blob),
+            .process_message_command_report_with_native_return(command, preingested_blob,
+                fresh_original_repair,
+            ),
         (Some(_), Some(_)) => unreachable!("mutually exclusive verified request families"),
     };
     if let Some((source, target, frame_id, message_id, response)) = repair_reply_observation {

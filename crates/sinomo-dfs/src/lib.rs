@@ -211,6 +211,7 @@ mod smoke;
 mod transfer;
 mod write_configuration_inputs;
 mod write_configuration_projection;
+mod write_precondition;
 
 pub use advisory_lock::{
     DFS_ADVISORY_LOCK_REQUEST_OUTCOME_LIMIT, DfsAdvisoryLockCommand, DfsAdvisoryLockConflict,
@@ -226,10 +227,11 @@ pub use browser_api::*;
 pub use browser_service::{
     DFS_CORE_BROWSER_ROUTES, DFS_CORE_COMPONENT_ACCESS_OPERATION, DFS_CORE_COMPONENT_ACCESS_ROUTE,
     DFS_CORE_COMPONENT_INTERFACE, DFS_CORE_COMPONENT_INTERFACE_VERSION, DfsBrowserBackend,
-    DfsBrowserServiceHost, HostedDfsBrowserService, HostedDfsPlacementAuthorityAdminService,
+    DfsBrowserMutationAttempt, DfsBrowserServiceHost, HostedDfsBrowserService,
+    HostedDfsPlacementAuthorityAdminService,
     authorize_dfs_core_component_access, dfs_browser_component_host,
     dfs_core_component_requirement, normalize_sifs_browser_path, register_dfs_browser_services,
-    run_blocking_browser_task, run_blocking_service_task,
+    run_blocking_browser_task, run_blocking_browser_task_unqueued, run_blocking_service_task, run_configured_browser_task,
 };
 pub use default_projection::*;
 #[cfg(feature = "test-support")]
@@ -291,6 +293,7 @@ pub(crate) use runtime_publish::{
 pub use write_configuration_projection::DfsWriteConfigurationProjection;
 #[cfg(feature = "test-support")]
 pub mod browser_test_support {
+    pub use super::browser_service::acquire_browser_fifo_for_test;
     pub use super::browser_service::dfs_browser_backend_open_count as daemon_dfs_browser_backend_open_count;
     pub use super::browser_service::{
         DaemonDfsBrowserPlacementConnectivitySnapshot, DfsBrowserBackend,
@@ -345,17 +348,16 @@ pub use content_store::{ContentStoreStagingRow, ContentStoreStagingWriter};
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
     DfsAuthoritativePrefixProjection, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
-    DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataOperationPermit,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHandoffCause,
-    DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
-    DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
-    DfsMetadataStorageImportCut, DfsNativeTxnCommit, DfsPlacementAuthorityPermitStatus,
-    DfsPlacementAuthorityProcessIdentity, DfsPlacementAuthorityRecoveryOutcome,
-    DfsPlacementAuthorityRecoveryRefusal, DfsWriteConfigurationReadiness,
-    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
-    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
-    metadata_shard_membership_handoff_proof_key, metadata_shard_operation_floor_key,
-    metadata_shards_prefix, placement_authority_permit_key,
+    DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardHandoffCause, DfsMetadataShardHeadWatermark,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
+    DfsMetadataShardMembershipHandoffProof, DfsMetadataStorageImportCut, DfsNativeTxnCommit,
+    DfsPlacementAuthorityPermitStatus, DfsPlacementAuthorityProcessIdentity,
+    DfsPlacementAuthorityRecoveryOutcome, DfsPlacementAuthorityRecoveryRefusal,
+    DfsWriteConfigurationReadiness, SharedDfsControlPlaneKvClient, file_system_config_key,
+    metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
+    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
+    metadata_shard_operation_floor_key, metadata_shards_prefix, placement_authority_permit_key,
     placement_reconciliation_activity_index_key, placement_reconciliation_key,
     placement_reconciliations_prefix,
     select_metadata_shard_config_for_path_strict_default_sifs_split,
@@ -437,8 +439,6 @@ pub use local_state::{
     with_cached_cluster_aware_dfs_metadata_inspection_with_topology,
 };
 pub(crate) use maintenance::record_anti_entropy_issue;
-#[cfg(test)]
-pub(crate) use maintenance::run_cluster_dfs_maintenance_tick;
 pub use maintenance::{
     DEFAULT_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
     DEFAULT_DFS_CONTENT_RESERVATION_REJECTION_GRACE, DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_AGE,
@@ -511,8 +511,7 @@ pub use metadata_api::{
     DfsCrossShardPinTransferPlan, DfsForeignShardSourceEvictionPlan, DfsMetadataBackend,
     DfsMetadataHistoryEffectsPlan, DfsMetadataReplicaApplyReport, DfsMetadataReplicaIngestPermit,
     DfsMetadataShardWriteFreeze, DfsNamespaceRequestAdmissionSnapshot,
-    DfsSelectedOriginalDataLayout,
-    DfsWriteOperationAdmissionSnapshot,
+    DfsSelectedOriginalDataLayout, DfsWriteOperationAdmissionSnapshot,
 };
 pub use metadata_backend::{
     DfsSourceAdoptionCapture, DfsSourceAdoptionJobCapture, DfsSourceAdoptionSourceCapture,
@@ -564,6 +563,8 @@ pub(crate) use metadata_records::{
 };
 pub use metadata_rejection::{DfsMetadataRejection, DfsMetadataRejectionCode};
 pub use metadata_replica_observer::{DfsMetadataReplicaObservation, DfsMetadataReplicaObserver};
+#[cfg(test)]
+pub(crate) use metadata_replication::prepare_dfs_metadata_journal_publish_with_host;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use metadata_replication::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test;
@@ -612,11 +613,6 @@ pub(crate) use metadata_replication::{
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport,
     schedule_dfs_metadata_publish_async_on_runtime_owned,
-};
-#[cfg(test)]
-pub(crate) use metadata_replication::{
-    prepare_dfs_metadata_journal_publish_with_host,
-    prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions,
 };
 pub use metadata_sharded_backend::{
     DfsResidentMetadataStatusSnapshot, LocalShardedMetadataBackend,
@@ -687,22 +683,17 @@ pub use namespace_change_feed::{
     project_dfs_namespace_change_batch,
 };
 #[cfg(test)]
-pub(crate) use node_transport::{
-    AsyncDfsDirectReadSender, AsyncDfsMessageSender, DfsDirectReadSender,
-    async_dfs_direct_read_sender_from_peer_transport, dfs_direct_read_sender_from_peer_transport,
-};
+pub(crate) use node_transport::AsyncDfsMessageSender;
+#[cfg(test)]
+pub(crate) use node_transport::process_cluster_dfs_message_command;
 pub use node_transport::{
-    AsyncDfsPeerTransport, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
-    DfsMetadataPrefixProbeAttempt, DfsMetadataPrefixProbeReturn, DfsMetadataPrefixEvidence,
-    dfs_message_response_from_rpc_result, dfs_message_response_from_rpc_result_sync,
-    dfs_routed_call_rpc_call,
+    AsyncDfsPeerTransport, DfsMetadataPrefixEvidence, DfsMetadataPrefixProbeAttempt,
+    DfsMetadataPrefixProbeReturn, DfsNodeDetachedSendState, DfsNodeDetachedSendWorker,
+    DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPeerTransportFuture, dfs_message_response_from_rpc_result,
+    dfs_message_response_from_rpc_result_sync, dfs_routed_call_rpc_call,
 };
 pub(crate) use node_transport::{DfsMessageSender, dfs_message_sender_from_peer_transport};
-#[cfg(test)]
-pub(crate) use node_transport::{
-    process_cluster_dfs_message_command, run_cluster_dfs_message_command_with_metadata_publish,
-};
 pub use operator::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
     DfsAgentObjectState, DfsAgentObjectSummary, DfsOperatorFileSystemView,
@@ -748,36 +739,38 @@ pub use posix_model::{
     DfsPosixFileSyncEvidence, DfsPosixFileSyncTarget, DfsPosixRemoteFileRangeReadStream,
     DfsPosixRemoteFileReadStream, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
-#[cfg(test)]
-pub use protocol::{
-    DfsSelectedLocalRecoveryFenceRpcData, DfsSelectedLocalRecoveryFenceRpcOutcome,
-    DfsSelectedLocalRecoveryFenceRpcRequest, DfsSelectedLocalRecoveryFenceRpcResponse,
-};
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
     DfsBulkReadResponse, DfsCanonicalAuthorization, DfsCommitVersionCommand,
     DfsCommitVersionResponse, DfsDirectReadRequest, DfsDistributedWriteCommand,
     DfsDistributedWritePatch, DfsDistributedWriteResponse, DfsDistributedWriteResult,
-    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsLocalEventualBatchWriteProof,
-    DfsMessageCommand, DfsMessageResponse, DfsMetadataAuthorityOperation,
-    DfsOriginalRepairHead, DfsOriginalRepairMaterial, DfsSelectedOriginalRepairCommand,
-    DfsImportedRepairHistoryRef, DfsOriginalRepairHistoryQueryRef, DfsOriginalRepairHistoryCarrier,
-    DfsOriginalRepairHistoryRequest, DfsOriginalRepairHistoryResponse, DfsOriginalRepairHistoryResult,
-    DfsOriginalRepairHistoryPending, DfsOriginalRepairHistoryCertificate, DfsOriginalRepairHistoryRejection,
-    DfsMetadataAuthorityProbe, DfsMetadataDurableReplication, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalFrameBatch,
-    DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsNamespaceChangePollRequest,
-    DfsNamespaceChangePollResponse, DfsNamespaceCommand, DfsNamespaceDestinationPrecondition,
-    DfsNamespaceObjectPrecondition, DfsNamespaceOperation, DfsNamespacePosixError,
-    DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor, DfsNetworkMessage,
+    DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResult, DfsImportedRepairHistoryRef,
+    DfsLocalEventualBatchWriteProof, DfsMessageCommand, DfsMessageResponse,
+    DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataDurableReplication,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataJournalFrameBatch, DfsMetadataPrefixProbe, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
+    DfsMkdirAtNoLinksWithAttrs, DfsNamespaceChangePollRequest, DfsNamespaceChangePollResponse,
+    DfsNamespaceCommand, DfsNamespaceDestinationPrecondition, DfsNamespaceObjectPrecondition,
+    DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult,
+    DfsNamespaceShardCursor, DfsNetworkMessage, DfsOriginalRepairHead,
+    DfsOriginalRepairHistoryCarrier, DfsOriginalRepairHistoryCertificate,
+    DfsOriginalRepairHistoryPending, DfsOriginalRepairHistoryQueryRef,
+    DfsOriginalRepairHistoryRejection, DfsOriginalRepairHistoryRequest,
+    DfsOriginalRepairHistoryResponse, DfsOriginalRepairHistoryResult, DfsOriginalRepairMaterial,
     DfsPosixCoordinationResult, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
     DfsReadResult, DfsRepairReplicaCommand, DfsRepairReplicaResponse, DfsRoutedMessage,
-    DfsStableNamespaceOperationReceipt, DfsStableNamespaceOperationReconciliation,
-    DfsStableNamespaceReconciliationRequest, DfsStableNamespaceReconciliationResponse,
-    DfsStableWriteOperationReceipt, DfsStableWriteOperationReconciliation,
-    DfsStableWriteReconciliationRequest, DfsStableWriteReconciliationResponse, DfsStageBlobCommand,
-    DfsStageBlobResponse, DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+    DfsSelectedOriginalRepairCommand, DfsStableNamespaceOperationReceipt,
+    DfsStableNamespaceOperationReconciliation, DfsStableNamespaceReconciliationRequest,
+    DfsStableNamespaceReconciliationResponse, DfsStableWriteOperationReceipt,
+    DfsStableWriteOperationReconciliation, DfsStableWriteReconciliationRequest,
+    DfsStableWriteReconciliationResponse, DfsStageBlobCommand, DfsStageBlobResponse,
+    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+};
+#[cfg(test)]
+pub use protocol::{
+    DfsSelectedLocalRecoveryFenceRpcData, DfsSelectedLocalRecoveryFenceRpcOutcome,
+    DfsSelectedLocalRecoveryFenceRpcRequest, DfsSelectedLocalRecoveryFenceRpcResponse,
 };
 pub use renewable_lease::{
     DEFAULT_DFS_RENEWABLE_LEASE_RELEASE_TIMEOUT, DfsRenewableExclusiveLease,
@@ -798,7 +791,8 @@ pub use repair_queue_store::{
     LocalDfsRepairQueueStore,
 };
 pub use routes::{
-    DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,
+    DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE, DFS_CONTROL_PLANE_ROUTES,
+    DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,
     DFS_DATA_COMMIT_VERSION_RESPONSE_ROUTE, DFS_DATA_COMMIT_VERSION_ROUTE,
     DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_RESPONSE_ROUTE, DFS_DATA_CONTENT_ROOT_CATALOG_PAGE_ROUTE,
     DFS_DATA_DISTRIBUTED_WRITE_RESPONSE_ROUTE, DFS_DATA_DISTRIBUTED_WRITE_ROUTE,
@@ -810,7 +804,6 @@ pub use routes::{
     DFS_DATA_REPAIR_REPLICA_RESPONSE_ROUTE, DFS_DATA_REPAIR_REPLICA_ROUTE,
     DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE, DFS_DATA_STAGE_BLOB_ROUTE, DFS_DATA_STAGE_PATCH_ROUTE,
     DFS_DATA_WRITE_RESPONSE_ROUTE, DFS_DATA_WRITE_ROUTE, DFS_DIRECT_READ_ROUTE,
-    DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE,
     DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES, DFS_METADATA_JOURNAL_BATCH_ROUTE,
     DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DFS_SMOKE_ROUTE,
     DFS_STATUS_ROUTE, DfsMessageExecutionScope, decode_dfs_inspection_rpc_response,
@@ -910,7 +903,7 @@ pub(crate) use smoke::{
     dfs_smoke_content_node_ids, dfs_smoke_replica_candidate_sets, dfs_smoke_routable_node_ids,
 };
 #[cfg(test)]
-use transfer::{DFS_REPAIR_RETRY_SUPPRESSED_TICK, RepairRetryState, fetch_inflight_timeout_ticks};
+use transfer::{DFS_REPAIR_RETRY_SUPPRESSED_TICK, fetch_inflight_timeout_ticks};
 #[cfg(any(test, feature = "test-support"))]
 mod test_runtime;
 

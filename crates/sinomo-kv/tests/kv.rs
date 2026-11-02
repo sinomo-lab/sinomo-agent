@@ -7148,12 +7148,14 @@ mod tests {
 
         let follower_id =
             NodeId::from_legacy_named("node_unanchored_cache_follower").expect("follower");
-        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("follower-raft"));
+        let follower_kv = ClusterKvPaths::new(root.join("follower"));
         assert!(
-            cache
-                .cache_snapshot_if_newer_than_raft(follower_id.clone(), leader_snapshot.clone(),)
-                .expect("cache newer snapshot")
+            write_imported_cluster_kv_snapshot_if_changed(&follower_kv, &leader_snapshot, |_| {
+                false
+            })
+            .expect("import leader read model")
         );
+        let cache = follower_kv.local_cache();
         let follower_paths = cache.raft_wal_paths(&follower_id);
         assert!(
             !follower_paths.snapshot.exists(),
@@ -7203,9 +7205,8 @@ mod tests {
             .expect("seed imported b");
         let imported = imported_store.try_snapshot().expect("imported snapshot");
         assert!(
-            cache
-                .cache_snapshot_if_newer_than_raft(node_id.clone(), imported.clone())
-                .expect("cache imported snapshot")
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &imported, |_| false)
+                .expect("import snapshot")
         );
 
         let local = paths
@@ -7251,7 +7252,6 @@ mod tests {
         let root = temp_raft_root("sinomo-kv-out-of-order-imports");
         let paths = ClusterKvPaths::new(root.to_path_buf());
         let cache = paths.local_cache();
-        let node_id = NodeId::from_legacy_named("node_out_of_order_imports").expect("node");
 
         let mut store = InProcessKvStore::new();
         store
@@ -7274,11 +7274,6 @@ mod tests {
         assert!(
             !write_cluster_kv_snapshot_if_changed(&paths, &older)
                 .expect("reject direct out-of-order import")
-        );
-        assert!(
-            !cache
-                .cache_snapshot_if_newer_than_raft(node_id.clone(), older)
-                .expect("reject out-of-order cache import")
         );
 
         let mut equivalent = newer.clone();
@@ -7304,14 +7299,6 @@ mod tests {
         assert_eq!(
             write_cluster_kv_snapshot_if_changed(&paths, &conflicting)
                 .expect_err("reject equal-revision direct conflict"),
-            KvError::ImportedSnapshotRevisionConflict {
-                revision: newer.revision,
-            }
-        );
-        assert_eq!(
-            cache
-                .cache_snapshot_if_newer_than_raft(node_id, conflicting)
-                .expect_err("reject equal-revision cache conflict"),
             KvError::ImportedSnapshotRevisionConflict {
                 revision: newer.revision,
             }
@@ -7514,17 +7501,13 @@ mod tests {
         imported.canonicalize();
 
         assert_eq!(local.revision, imported.revision);
-        assert!(paths.imported_snapshot_advances_current_for_node(&node_id, &imported));
         assert!(
-            paths
-                .local_cache()
-                .cache_snapshot_if_newer_than_raft(node_id.clone(), imported.clone())
-                .expect("cache equal-revision newer generation")
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &imported, |_| false)
+                .expect("import equal-revision newer generation")
         );
         assert!(
             !paths
-                .local_cache()
-                .cache_snapshot_if_newer_than_raft(node_id, local)
+                .write_raft_snapshot_if_changed(&local)
                 .expect("preserve imported generation over local raft view")
         );
         assert_eq!(
@@ -19799,6 +19782,116 @@ mod tests {
                 }
             }
             other => panic!("unknown cross-process worker role {other}"),
+        }
+    }
+
+    #[test]
+    fn resident_four_prefix_read_avoids_full_snapshot_and_keeps_no_effect_replay() {
+        let root = temp_raft_root("native-four-prefix-no-full-memo");
+        let node = NodeId::generate();
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let prefixes = [
+            "/cluster/members/",
+            "/cluster/endpoints/",
+            "/cluster/policy/capabilities/",
+            "/cluster/network/connectivity/",
+        ];
+        for prefix in prefixes {
+            store
+                .append_command_with_response_and_publish_report(
+                    &node,
+                    KvCommand::Op(KvOp::Put {
+                        key: format!("{prefix}actual"),
+                        value: b"native-row".to_vec(),
+                        lease_id: None,
+                    }),
+                    |_| false,
+                )
+                .unwrap();
+        }
+        let put = KvCommand::Op(KvOp::Put {
+            key: "/directory/native-memo".into(),
+            value: vec![7; 4096],
+            lease_id: None,
+        });
+        let before = store
+            .append_command_with_response_and_publish_report(&node, put.clone(), |_| false)
+            .unwrap()
+            .0
+            .snapshot;
+        let request = KvCommandRequest::new(KvRequestId::generate(), put);
+        let after = store
+            .append_request_with_response(&node, request.clone())
+            .unwrap()
+            .snapshot;
+        assert_eq!(
+            before.revision, after.revision,
+            "real committed semantic no-effect keeps KV revision"
+        );
+        assert!(after.committed_requests.len() > before.committed_requests.len());
+        reset_complete_snapshot_materializations_for_test();
+        let cut = with_cluster_kv_resident_read_projection(
+            &paths.raft_wal_paths(&node),
+            &node,
+            |projection| {
+                let mut rows = Vec::new();
+                for prefix in prefixes {
+                    rows.extend(
+                        projection
+                            .read_index_prefix_limited_by_payload_bytes(
+                                prefix,
+                                CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+                                usize::MAX,
+                            )
+                            .unwrap(),
+                    );
+                }
+                (
+                    rows,
+                    projection.read_index_request_outcome(&request.request_id),
+                )
+            },
+        )
+        .expect("actual canonical resident owner")
+        .unwrap();
+        assert_eq!(cut.value.0.len(), 4);
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            0,
+            "bounded borrowed prefix reads never build the complete snapshot/memo"
+        );
+        let KvRequestOutcome::Committed(actual) = cut.value.1.unwrap() else {
+            panic!("actual current native memo must remain committed");
+        };
+        assert_eq!(actual.request_id, request.request_id);
+        let full = read_cluster_kv_local_snapshot(&paths, &node).unwrap().value;
+        assert_eq!(
+            full.committed_requests, after.committed_requests,
+            "full native snapshot retains every current dedup response"
+        );
+        assert_eq!(full.expired_requests, after.expired_requests);
+        assert_eq!(
+            complete_snapshot_materializations_for_test(),
+            1,
+            "the explicit full snapshot still materializes its full record"
+        );
+        match store
+            .append_request_uncommitted_or_replay(&node, request)
+            .unwrap()
+        {
+            ClusterKvRaftUncommittedAppend::CommittedReplay { record, .. } => {
+                assert_eq!(record, actual)
+            }
+            other => {
+                panic!("exact original native request must replay committed outcome: {other:?}")
+            }
         }
     }
 

@@ -232,7 +232,11 @@ pub(crate) fn rollout_module_native_dylib(
         });
     }
     let mut outcomes = ClusterRolloutOutcomeSummary::default();
-    let groups = collect_cluster_build_target_groups(targets, &mut outcomes);
+    let groups = collect_cluster_build_target_groups(
+        targets,
+        &mut outcomes,
+        options.rollout.rust_target_override.as_deref(),
+    );
     if groups.is_empty() {
         return outcomes.finish();
     }
@@ -1145,6 +1149,7 @@ struct ResolvedClusterBuildGroup {
 fn build_target_from_daemon_status(
     address: &str,
     status: &DaemonStatus,
+    rust_target_override: Option<&str>,
 ) -> Result<BuildTarget, CliError> {
     let target_os = status.target_os.as_deref().ok_or_else(|| CliError::Parse {
         detail: format!(
@@ -1159,12 +1164,28 @@ fn build_target_from_daemon_status(
                 "rollout target {address} did not report its architecture; target-aware build selection is unavailable"
             ),
         })?;
-    BuildTarget::new(target_os, target_arch).map_err(build_service_cli_error)
+    if let (Some(reported), Some(requested)) = (status.rust_target.as_deref(), rust_target_override)
+        && reported != requested
+    {
+        return Err(CliError::Parse {
+            detail: format!(
+                "target {address} reports Rust target {reported}; refusing conflicting override {requested}"
+            ),
+        });
+    }
+    let target = BuildTarget::new(target_os, target_arch).map_err(build_service_cli_error)?;
+    match status.rust_target.as_deref().or(rust_target_override) {
+        Some(triple) => target
+            .with_rust_target(triple)
+            .map_err(build_service_cli_error),
+        None => Ok(target),
+    }
 }
 
 fn collect_cluster_build_target_groups(
     targets: Vec<RolloutTarget>,
     outcomes: &mut ClusterRolloutOutcomeSummary,
+    rust_target_override: Option<&str>,
 ) -> Vec<ClusterBuildTargetGroup> {
     let mut classified = Vec::new();
     let mut seen_nodes = BTreeSet::new();
@@ -1184,14 +1205,15 @@ fn collect_cluster_build_target_groups(
                 continue;
             }
         };
-        let build_target = match build_target_from_daemon_status(target.label(), &status) {
-            Ok(build_target) => build_target,
-            Err(error) => {
-                println!("{}: skipped: {error}", target.label());
-                outcomes.record_failure(target.label(), "skipped", error.to_string());
-                continue;
-            }
-        };
+        let build_target =
+            match build_target_from_daemon_status(target.label(), &status, rust_target_override) {
+                Ok(build_target) => build_target,
+                Err(error) => {
+                    println!("{}: skipped: {error}", target.label());
+                    outcomes.record_failure(target.label(), "skipped", error.to_string());
+                    continue;
+                }
+            };
         classified.push((build_target, target));
     }
     group_cluster_build_targets(classified)
@@ -1390,6 +1412,13 @@ fn supporting_build_capability(
         .filter(|capability| capability.supports(target, kinds))
         .cloned()
         .collect::<Vec<_>>();
+    matches.extend(
+        response
+            .cross_targets
+            .iter()
+            .filter(|cross| cross.supports(target, kinds))
+            .map(|cross| cross.capability.clone()),
+    );
     matches.sort_by(|left, right| {
         left.target
             .cmp(&right.target)
@@ -1520,7 +1549,20 @@ fn rank_cluster_builder_plans(
         artifact_kinds,
         requirements,
         plans.iter().map(|plan| BuildCandidate {
-            capabilities: plan.capabilities.capabilities.clone(),
+            capabilities: {
+                let mut capabilities = plan.capabilities.capabilities.clone();
+                capabilities.targets.extend(
+                    plan.capabilities
+                        .cross_targets
+                        .iter()
+                        .filter(|cross| {
+                            cross.supports(requested_target, artifact_kinds)
+                                && (cross.blocker.is_none() || plan.cache_hit)
+                        })
+                        .map(|cross| cross.capability.clone()),
+                );
+                capabilities
+            },
             cache_hit: plan.cache_hit,
             transfer_cost: plan.transfer_cost,
         }),
@@ -1608,6 +1650,14 @@ fn discover_cluster_builder_plans(
             }
         };
         if exact.supports_requested_target == Some(false) {
+            unavailable.extend(
+                exact
+                    .cross_targets
+                    .iter()
+                    .filter(|cross| cross.supports(&group.target, &artifact_kinds))
+                    .filter_map(|cross| cross.blocker.as_ref())
+                    .map(|reason| format!("{}: {reason}", contact.label())),
+            );
             continue;
         }
         let cache_hit = exact.cache_hit.unwrap_or(false);
@@ -1656,6 +1706,20 @@ fn submit_cluster_build_and_wait(
     builder: &ClusterBuilderPlan,
     source_bundle: &Path,
 ) -> Result<BuildArtifactSetManifest, CliError> {
+    if let Some(cross) = builder.capabilities.cross_targets.iter().find(|cross| {
+        cross.capability.target == builder.plan.input.target
+            && cross.capability.toolchain_fingerprint == builder.plan.input.toolchain_fingerprint
+    }) {
+        println!(
+            "  cross toolchain: {} ({})",
+            cross.capability.target.path_key(),
+            if cross.ready {
+                "qualified and ready"
+            } else {
+                "verified tools will be prepared in the build job"
+            }
+        );
+    }
     println!(
         "build server: {} ({}, {})",
         builder.contact.label(),
@@ -2040,7 +2104,11 @@ fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliE
         });
     }
     let mut outcomes = ClusterRolloutOutcomeSummary::default();
-    let groups = collect_cluster_build_target_groups(targets, &mut outcomes);
+    let groups = collect_cluster_build_target_groups(
+        targets,
+        &mut outcomes,
+        options.rust_target_override.as_deref(),
+    );
     if groups.is_empty() {
         return outcomes.finish();
     }
@@ -2141,6 +2209,83 @@ mod cluster_build_service_tests {
         NativeDylibArtifactMetadata, build_content_hash, build_source_identity_hash,
     };
 
+    #[test]
+    #[ignore = "explicit real builder qualification; compiles and downloads the setup binary"]
+    fn build_setup_with_resident_service() {
+        let Some(repo) = std::env::var_os("SINOMO_SETUP_BUILD_SOURCE") else {
+            return;
+        };
+        let destination =
+            PathBuf::from(std::env::var_os("SINOMO_SETUP_BUILD_OUTPUT").expect("artifact output"));
+        let contact = RolloutTarget::address(
+            std::env::var("SINOMO_SETUP_BUILD_NODE").expect("builder endpoint"),
+        );
+        let source = prepare_cluster_build_source_input(&RolloutOptions {
+            repo: Some(repo.into()),
+            ..RolloutOptions::default()
+        })
+        .expect("immutable source");
+        let target = BuildTarget::new("windows", "x86_64")
+            .unwrap()
+            .with_rust_target("x86_64-pc-windows-msvc")
+            .unwrap();
+        let request = BuildCapabilitiesRequest {
+            target: Some(target.clone()),
+            build_key: None,
+            artifact_kinds: vec![BuildArtifactKind::Binary],
+        };
+        let capabilities = send_daemon_build_capabilities_for_target(&contact, request)
+            .expect("builder capabilities");
+        let capability =
+            supporting_build_capability(&capabilities, &target, &[BuildArtifactKind::Binary])
+                .expect("compatible builder");
+        let plan = build_plan_for_capability(
+            &source,
+            &capability,
+            &[],
+            &[BuildOutputRequest::binary("sinomo-setup", "sinomo-setup")],
+        )
+        .unwrap();
+        let exact = send_daemon_build_capabilities_for_target(
+            &contact,
+            BuildCapabilitiesRequest {
+                target: Some(plan.input.target.clone()),
+                build_key: Some(plan.key.clone()),
+                artifact_kinds: vec![BuildArtifactKind::Binary],
+            },
+        )
+        .unwrap();
+        let builder = ClusterBuilderPlan {
+            contact,
+            cache_hit: exact.cache_hit.unwrap_or(false),
+            capabilities: exact,
+            plan,
+            transfer_cost: 0,
+        };
+        let manifest =
+            submit_cluster_build_and_wait(&builder, &source.source_bundle).expect("setup build");
+        assert_eq!(manifest.artifacts.len(), 1);
+        let artifact = &manifest.artifacts[0];
+        assert_eq!(artifact.name, "sinomo-setup");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let response = send_daemon_build_artifact_for_target(
+            &builder.contact,
+            &BuildArtifactRequest {
+                build_key: builder.plan.key.clone(),
+                artifact_id: artifact.artifact_id.clone(),
+            },
+            &destination,
+        )
+        .expect("signed artifact stream");
+        assert_eq!(response.artifact, *artifact);
+        fs::write(
+            destination.with_extension("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        println!("verified setup artifact {}", destination.display());
+    }
+
     fn exact_linux_target() -> BuildTarget {
         BuildTarget::new("linux", "aarch64")
             .expect("target")
@@ -2203,6 +2348,7 @@ mod cluster_build_service_tests {
         ClusterBuilderPlan {
             contact: RolloutTarget::address(format!("{name}:21353")),
             capabilities: BuildCapabilitiesResponse {
+                cross_targets: Vec::new(),
                 capabilities,
                 supports_requested_target: Some(true),
                 cache_hit: Some(false),
@@ -2378,6 +2524,123 @@ mod cluster_build_service_tests {
         );
 
         assert_eq!(ranked[0].contact.label(), "busy-server:21353");
+    }
+
+    fn managed_builder(name: &str, threads: u16, target: &BuildTarget) -> ClusterBuilderPlan {
+        let mut plan = builder_plan(name, threads, 0, 0);
+        let mut capability = plan.capabilities.capabilities.targets.remove(0);
+        capability.target = target.clone();
+        plan.capabilities
+            .cross_targets
+            .push(sinomo_runtime::build::CrossBuildTargetCapability {
+                capability,
+                ready: false,
+                blocker: None,
+            });
+        plan
+    }
+
+    #[test]
+    fn powerful_cross_builder_outranks_small_native_arm_builder() {
+        let requested = exact_linux_target();
+        let ranked = rank_cluster_builder_plans(
+            &requested,
+            &[BuildArtifactKind::Binary],
+            vec![
+                builder_plan("small-arm", 4, 0, 0),
+                managed_builder("x86-cloud", 64, &requested),
+            ],
+        );
+        assert_eq!(ranked[0].contact.label(), "x86-cloud:21353");
+    }
+
+    #[test]
+    fn arm_cloud_capacity_is_not_inferred_from_architecture() {
+        let requested = exact_linux_target();
+        let ranked = rank_cluster_builder_plans(
+            &requested,
+            &[BuildArtifactKind::Binary],
+            vec![
+                managed_builder("small-x86", 2, &requested),
+                builder_plan("arm-cloud", 64, 0, 0),
+            ],
+        );
+        assert_eq!(ranked[0].contact.label(), "arm-cloud:21353");
+
+        let x86 = BuildTarget::new("linux", "x86_64")
+            .unwrap()
+            .with_family("unix")
+            .unwrap()
+            .with_rust_target("x86_64-unknown-linux-gnu")
+            .unwrap();
+        let mut small = builder_plan("small-x86", 2, 0, 0);
+        small.capabilities.capabilities.targets[0].target = x86.clone();
+        let ranked = rank_cluster_builder_plans(
+            &x86,
+            &[BuildArtifactKind::Binary],
+            vec![small, managed_builder("arm-cloud", 64, &x86)],
+        );
+        assert_eq!(ranked[0].contact.label(), "arm-cloud:21353");
+    }
+
+    #[test]
+    fn managed_cross_selection_requires_precise_abi() {
+        let gnu = exact_linux_target();
+        let cross = managed_builder("cross", 64, &gnu).capabilities;
+        let coarse = BuildTarget::new("linux", "aarch64").unwrap();
+        let musl = coarse
+            .clone()
+            .with_rust_target("aarch64-unknown-linux-musl")
+            .unwrap();
+        assert!(
+            supporting_build_capability(&cross, &coarse, &[BuildArtifactKind::Binary]).is_none()
+        );
+        assert!(supporting_build_capability(&cross, &musl, &[BuildArtifactKind::Binary]).is_none());
+        assert!(supporting_build_capability(&cross, &gnu, &[BuildArtifactKind::Binary]).is_some());
+        let legacy = builder_plan("legacy-native", 4, 0, 0).capabilities;
+        assert!(
+            supporting_build_capability(&legacy, &coarse, &[BuildArtifactKind::Binary]).is_some()
+        );
+    }
+
+    #[test]
+    fn gnu_and_musl_targets_are_separate_build_groups() {
+        let gnu = exact_linux_target();
+        let musl = gnu
+            .clone()
+            .with_rust_target("aarch64-unknown-linux-musl")
+            .unwrap();
+        assert_eq!(
+            group_cluster_build_targets([
+                (gnu, RolloutTarget::address("gnu:21353".into())),
+                (musl, RolloutTarget::address("musl:21353".into())),
+            ])
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_triple_override_cannot_replace_reported_abi() {
+        let paths = DaemonPaths::with_root(std::env::temp_dir().join("sinomo-target-status"));
+        let mut status = DaemonStatus::new(&DaemonRunOptions::default(), &paths, None);
+        status.target_os = Some("linux".into());
+        status.target_arch = Some("aarch64".into());
+        status.rust_target = None;
+        let legacy = build_target_from_daemon_status("legacy", &status, None).unwrap();
+        assert_eq!(legacy.rust_target, None);
+        let upgraded =
+            build_target_from_daemon_status("legacy", &status, Some("aarch64-unknown-linux-gnu"))
+                .unwrap();
+        assert_eq!(
+            upgraded.rust_target.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        status.rust_target = Some("aarch64-unknown-linux-musl".into());
+        assert!(
+            build_target_from_daemon_status("new", &status, Some("aarch64-unknown-linux-gnu"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -5689,6 +5952,7 @@ mod rollout_authority_readiness_tests {
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            rust_target: None,
             hostname: None,
             executable: None,
             rollout: Some(ClusterNodeRolloutStatus {

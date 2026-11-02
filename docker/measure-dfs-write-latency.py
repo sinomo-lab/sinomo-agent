@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 from itertools import product
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -191,7 +192,8 @@ def main():
     parser.add_argument("--skip-readiness", action="store_true",
                         help="diagnostic reuse only; omits standard readiness/mutation/convergence/quiet gates")
     parser.add_argument("--stage-profile", action=argparse.BooleanOptionalAction, default=True,
-                        help="generate per-stage cluster reports with Observe and CPU profiles (default enabled)")
+                        help="generate per-stage cluster reports from Observe traces (default enabled); "
+                             "SINOMO_TEST_CPU_PROFILE=1 adds CPU profiles")
     args = parser.parse_args()
     fixture_raw, fixture_groups = None, None
     if args.fixtures:
@@ -333,7 +335,8 @@ def main():
                        "--fixtures", str(result_path), "--project", args.project,
                        "--binary", str(run.binary), "--profile", args.profile,
                        "--artifacts", str(run.artifacts / "stages"),
-                       "--policies", *args.policies, "--origins", *args.origins, "--shards", *args.shards]
+                       "--policies", *args.policies, "--origins", *args.origins, "--shards", *args.shards,
+                       *(["--cpu-profile"] if os.environ.get("SINOMO_TEST_CPU_PROFILE") == "1" else [])]
             try:
                 run.run("stage-profiles", command, timeout=len(result["groups"]) * 180 + 120)
                 stage_report = json.loads((run.artifacts / "stages/report.json").read_text())

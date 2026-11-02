@@ -20,7 +20,6 @@ use crate::intent::{
     stable_distributed_intent_matches_routed_write_command, stable_operation_order_token,
     stable_write_intent_id, stable_write_intent_record_matches_routed_write_command,
 };
-use crate::metadata_pages::walk_metadata_pages;
 use crate::*;
 
 pub(crate) const DFS_ROUTED_WRITE_LATE_RESPONSE_TTL: Duration = Duration::from_secs(60);
@@ -379,7 +378,8 @@ fn classify_stable_write_operation(
                     ),
                 }
             }
-            DfsWriteIntentStatus::Rejected | DfsWriteIntentStatus::Aborted => {
+            DfsWriteIntentStatus::Rejected | DfsWriteIntentStatus::Aborted
+                | DfsWriteIntentStatus::PreconditionFailed { .. } => {
                 DfsStableWriteOperationReconciliation::Conflict {
                     reason: format!(
                         "write operation {operation_id} terminated without committing (status {:?})",
@@ -914,6 +914,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object_id: command.request.object_id.clone(),
                 });
             }
+            if let DfsWriteIntentState::PreconditionFailed { failure } = &intent.state {
+                return Err(DfsError::WritePreconditionFailed { failure: failure.clone() });
+            }
             if let Some(path) = exclusive_create_payload_mismatch_path.clone() {
                 return Err(DfsError::AlreadyExists { path });
             }
@@ -971,6 +974,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     operation_id: command.request_id.clone(),
                     object_id: command.request.object_id.clone(),
                 });
+            }
+            if let DfsWriteIntentStatus::PreconditionFailed { failure } = &record.status {
+                return Err(DfsError::WritePreconditionFailed { failure: failure.clone() });
             }
             if let Some(path) = exclusive_create_payload_mismatch_path {
                 return Err(DfsError::AlreadyExists { path });
@@ -1240,7 +1246,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             operation_id: command.request_id.clone(),
             object_id: command.request.object_id.clone(),
         };
-        if !command.publication.is_current()
+        // Patch producers currently own the default-current contract only;
+        // they must reject, rather than discard, an incoming namespace guard.
+        if !command.publication.is_default_current()
             || command.exclusive_create
             || command.touch_parent_on_create
             || command.requester_blob_pre_staged
@@ -1506,6 +1514,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     reason: error.to_string(),
                     current_primary_node_id: None,
                 }),
+                Err(DfsError::WritePreconditionFailed { failure }) => {
+                    Some(DfsDistributedWriteResult::PreconditionFailed { failure })
+                }
                 Err(DfsError::WriteReconciliationRequired {
                     operation_id,
                     reason,
@@ -1520,7 +1531,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             replayed_result
         } else {
             let authority_validation =
-                if command.publication.is_current() && command.patch.is_none() {
+                if command.publication.is_default_current() && command.patch.is_none() {
                     self.rebase_routed_path_write_if_current(&mut command)
                         .and_then(|()| self.validate_routed_write_command_authority(&command))
                 } else {
@@ -1599,6 +1610,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             };
             match authority_validation.and(manifest).and_then(|manifest| {
+                if let Some(object) = command.object_metadata.as_ref() {
+                    self.check_current_write_precondition(&command.publication,
+                        &command.request.file_system_id, &command.request.object_id,
+                        &object.path, command.expected_base_version.as_ref())?;
+                } else if command.publication.current_precondition().is_some() {
+                    return Err(DfsError::Metadata { message: "conditional request has no target object".into() });
+                }
                 let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
                 let admitted = if command.publication.is_current() {
                     self.ensure_routed_write_object_metadata(
@@ -1932,14 +1950,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             });
                         }
                     }
+                    if let Some(intent) = failed_intent.as_ref().filter(|intent|
+                        owns_failed_claim && intent.publication.current_precondition().is_some()
+                            && intent.state == DfsWriteIntentState::AwaitingReceipts)
+                    {
+                        // Conditional execution retains its original input
+                        // until the existing kernel can prove a terminal
+                        // outcome. An unknown/evicted final body or interrupted
+                        // negative publication cannot become an automatic abort.
+                        return Err(DfsError::NetworkDelivery {
+                            message: format!("write {request_id} retains conditional execution {} and requires authoritative terminal reconciliation: {error}", intent.intent_id),
+                            delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                        });
+                    }
                     let mut cleanup_error = None;
                     if injected_transient_metadata && !committed && owns_failed_claim {
                         let mut cleanup_completed = true;
                         if let Some(intent) = failed_intent {
-                            if let Err(source) = self.abort_pending_write_locally(&intent.intent_id)
-                            {
-                                cleanup_error = Some(source.to_string());
-                                cleanup_completed = false;
+                            if !matches!(intent.state, DfsWriteIntentState::PreconditionFailed { .. }) {
+                                if let Err(source) = self.abort_pending_write_locally(&intent.intent_id) {
+                                    cleanup_error = Some(source.to_string());
+                                    cleanup_completed = false;
+                                }
                             }
                         }
                         if cleanup_completed {
@@ -1955,9 +1987,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     let current_primary_node_id =
                         distributed_write_rejection_current_primary(&error);
-                    DfsDistributedWriteResult::Rejected {
-                        reason: error.to_string(),
-                        current_primary_node_id,
+                    match error {
+                        DfsError::WritePreconditionFailed { failure } => {
+                            DfsDistributedWriteResult::PreconditionFailed { failure }
+                        }
+                        DfsError::UnsupportedWritePrecondition { path, reason } => {
+                            DfsDistributedWriteResult::UnsupportedPrecondition { path, reason }
+                        }
+                        error => DfsDistributedWriteResult::Rejected {
+                            reason: error.to_string(),
+                            current_primary_node_id,
+                        },
                     }
                 }
             }
@@ -2788,6 +2828,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }),
                 );
             }
+            DfsDistributedWriteResult::PreconditionFailed { failure } => {
+                failure.validate().map_err(|message| DfsError::Serialization { message })?;
+                let matches_original = self.writes.pending_routed_writes.get(&canonical_request_id)
+                    .and_then(|pending| pending.command.as_ref())
+                    .is_none_or(|command| command.publication.current_precondition()
+                        .is_some_and(|condition| crate::write_precondition::failure_matches_condition(condition, failure)));
+                if !matches_original {
+                    return Err(DfsError::Serialization { message: "write failure does not bind the original conditional request".into() });
+                }
+                self.complete_pending_routed_write(&canonical_request_id,
+                    Err(DfsError::WritePreconditionFailed { failure: failure.clone() }));
+            }
+            DfsDistributedWriteResult::UnsupportedPrecondition { path, reason } => {
+                self.complete_pending_routed_write(&canonical_request_id,
+                    Err(DfsError::UnsupportedWritePrecondition { path: path.clone(), reason: reason.clone() }));
+            }
             DfsDistributedWriteResult::Rejected { reason, .. } => {
                 let remote_intent_id = self
                     .writes
@@ -2847,6 +2903,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         authority_shard: &DfsMetadataShardConfig,
     ) -> Result<(), DfsError> {
         self.remove_transient_object_metadata(&publication.object_id);
+        if self.metadata_backend.is_none() && self.transport.delegates_local_namespace_authority() {
+            // The requester owns no durable image. Its result boundary reads
+            // the current head through Main after response processing ends.
+            self.clear_metadata_lookup_cache();
+            return Ok(());
+        }
         let backend = self
             .metadata_backend
             .as_ref()
@@ -2966,9 +3028,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => {
                     let current_primary_node_id =
                         distributed_write_rejection_current_primary(&error);
-                    DfsDistributedWriteResult::Rejected {
-                        reason: error.to_string(),
-                        current_primary_node_id,
+                    match error {
+                        DfsError::WritePreconditionFailed { failure } => {
+                            DfsDistributedWriteResult::PreconditionFailed { failure }
+                        }
+                        DfsError::UnsupportedWritePrecondition { path, reason } => {
+                            DfsDistributedWriteResult::UnsupportedPrecondition { path, reason }
+                        }
+                        error => DfsDistributedWriteResult::Rejected {
+                            reason: error.to_string(),
+                            current_primary_node_id,
+                        },
                     }
                 }
             };

@@ -16,6 +16,8 @@ default = ["sandbox", "dfs-fuse"]
 dfs-fuse = ["dep:sinomo-dfs-fuse", "sinomo-dfs-fuse/fuse"]
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
 desktop-e2e = ["dep:windows", "sinomo-runtime/network-test-support"]
+# Opt-in adaptation of an existing native owner for downstream test fixtures.
+dfs-test-support = ["sinomo-runtime/dfs-test-support"]
 # Selectable `scripted` model provider for end-to-end tests. Never in releases.
 scripted-provider = ["sinomo-lm/scripted-provider"]
 native-devices = [

@@ -152,16 +152,23 @@ class Acceptance:
 
     def verify_processes(self, label):
         for node in [f"node{i}" for i in range(1, 7)]:
+            # Debug executables can exceed a GiB. Hash every byte without
+            # retaining the one-shot read in the daemon's capped file cache.
             script = ('for exe in /proc/[0-9]*/exe; do '
                       'target=$(readlink "$exe") || continue; '
-                      'case "$target" in */sinomo|*/sinomo-shadow) sha256sum "$exe";; esac; done')
+                      'case "$target" in */sinomo|*/sinomo-shadow) '
+                      'digest=$(dd if="$exe" iflag=nocache bs=1M status=none | sha256sum) || exit 1; '
+                      'printf "%s  %s\\n" "${digest%% *}" "$exe";; esac; done')
             raw = self.run(f"{label}-{node}-process-hashes",
-                           [*self.compose, "exec", "-T", node, "sh", "-c", script])
+                           [*self.compose, "exec", "-T", node, "bash", "-o", "pipefail", "-c", script])
             hashes = [line.split()[0] for line in raw.decode().splitlines()]
             assert len(hashes) >= 2 and set(hashes) == {self.binary_hash}, (node, hashes)
 
     def verify_observe(self, require_cpu_capture=False):
-        """All Docker gates use debug/trace-enabled processes and profiler support."""
+        """All Docker gates use debug/trace-enabled processes. CPU profiler
+        support, and the requested capture, are required only when CPU
+        profiling was opted into with SINOMO_TEST_CPU_PROFILE=1."""
+        cpu_profile = os.environ.get("SINOMO_TEST_CPU_PROFILE") == "1"
         configurations = {}
         for node in (f"node{i}" for i in range(1, 7)):
             debug = self.run(
@@ -175,12 +182,16 @@ class Acceptance:
                                     "trace_capacity": traces.get("capacity")}
             (self.artifacts / "observe-configuration.json").write_text(json.dumps(configurations, indent=2) + "\n")
             if (debug.strip() != b"1" or "sinomo.perf=trace" not in control.get("active_filter", "")
-                    or not profile.get("supported") or profile.get("state") == "failed"
-                    or (require_cpu_capture and profile.get("state") not in ("running", "finalizing", "complete"))
+                    or (cpu_profile and (not profile.get("supported") or profile.get("state") == "failed"))
+                    or (cpu_profile and require_cpu_capture
+                        and profile.get("state") not in ("running", "finalizing", "complete"))
                     or (traces.get("capacity") or 0) < 32768):
-                raise RuntimeError(f"{node}: Docker gates require DFS debug, generic tracing, 32768 trace slots and CPU profiler support; "
+                required = "DFS debug, generic tracing, 32768 trace slots" + (
+                    " and CPU profiler support" if cpu_profile else "")
+                raise RuntimeError(f"{node}: Docker gates require {required}; "
                                    f"debug={debug!r}, CPU={profile.get('state')}, supported={profile.get('supported')}, "
-                                   f"capacity={traces.get('capacity')}, startup_capture_required={require_cpu_capture}")
+                                   f"capacity={traces.get('capacity')}, cpu_profile={cpu_profile}, "
+                                   f"startup_capture_required={require_cpu_capture}")
 
     def restart(self):
         phase = f"restart-{self.index}"

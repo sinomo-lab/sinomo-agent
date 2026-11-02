@@ -42,23 +42,6 @@ pub trait ComponentObjectRpcTransport: Send + Sync {
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResult, NetworkError>;
 
-    /// Call exactly one current native endpoint. No node-routing fallback is
-    /// permitted. This selects a carrier, never membership or effect authority.
-    /// Hosts without this native operation must refuse, not delegate to `call`.
-    fn call_endpoint(
-        &self,
-        _endpoint: &sinomo_core::ClusterEndpointRecord,
-        _call: ObjectRpcCall,
-        _options: ClusterObjectRpcOptions,
-        _observe_connectivity: bool,
-    ) -> Result<ObjectRpcResult, NetworkError> {
-        Err(NetworkError::delivery_failed(
-            "component explicit endpoint RPC",
-            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-            "registered component carrier does not support explicit native endpoints",
-        ))
-    }
-
     fn call_async<'a>(
         &'a self,
         target_node_id: &'a NodeId,
@@ -764,7 +747,7 @@ impl ComponentReconciler {
 
     pub fn shutdown(&mut self) -> Result<(), ComponentError> {
         self.service_registry
-            .replace_registry(self.base_registry.clone())
+            .withdraw_for_host_stop(self.base_registry.clone())
             .map_err(|error| ComponentError::Registry {
                 detail: error.to_string(),
             })?;
@@ -799,7 +782,7 @@ impl ComponentReconciler {
         timeout: std::time::Duration,
     ) -> Result<(), ComponentError> {
         self.service_registry
-            .replace_registry(self.base_registry.clone())
+            .withdraw_for_host_stop(self.base_registry.clone())
             .map_err(|error| ComponentError::Registry {
                 detail: error.to_string(),
             })?;
@@ -1631,6 +1614,14 @@ mod tests {
                     .active_snapshot()
                     .registry()
                     .owns("/fixture/blocking-stop")
+            );
+            assert!(
+                fixture
+                    .reconciler
+                    .service_registry()
+                    .active_snapshot()
+                    .host_stopping(),
+                "host stop withdraws admission without changing the published offer"
             );
 
             fixture.release.send(()).expect("release blocking worker");

@@ -122,10 +122,14 @@ def main():
     if windows:
         import zipfile
         with zipfile.ZipFile(cli_archive, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for name in ("sinomo.exe", "initial-payload.tar"):
+            for name in ("sinomo.exe", "sinomo-app.exe", "sinomo-ui-extension-host.exe", "sinomo-setup.exe", "desktop-release.json", "initial-payload.tar"):
                 archive.write(stage / name, arcname=name)
     else:
-        shutil.copy2(stage / "headless-cli.tar.gz", cli_archive)
+        with tarfile.open(cli_archive, "w:gz") as archive:
+            for name in ("sinomo", "sinomo-app", "sinomo-ui-extension-host", "sinomo-setup", "desktop-release.json", "initial-payload.tar"):
+                archive.add(stage / name, arcname=name, recursive=False)
+            for library in sorted((stage / "lib").glob("*")):
+                archive.add(library, arcname="lib/" + library.name, recursive=False)
     config = stage / "packager.json"
     config.write_text(json.dumps(configuration(stage, output, args.target, version), indent=2), encoding="utf-8")
     tool_version = subprocess.check_output([args.packager, "--version"], text=True).strip()

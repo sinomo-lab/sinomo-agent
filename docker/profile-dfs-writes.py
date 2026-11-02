@@ -71,7 +71,7 @@ def select_roots(report, node):
 
 def render_index(root, result):
     lines = ["# DFS write stage diagnostics", "",
-             "One-pair stage captures (N=1 per operation); these do not establish a full p95 gate. Debugging, tracing and profiling are normal acceptance settings, and no overhead is subtracted. "
+             "One-pair stage captures (N=1 per operation); these do not establish a full p95 gate. Debugging and tracing are normal acceptance settings, CPU profiling is opt-in, and no overhead is subtracted. "
              "Each case uses one sequential 4 KiB create/overwrite pair on a preconfigured fixture. "
              "The ordinary write probe and its timer are unchanged. Policy checks and correctness "
              "reads remain outside that timer. Capture node windows include those checks and "
@@ -118,10 +118,13 @@ def render_index(root, result):
     lines += [f"| {c['name']} | {c.get('capture_exit')} | {c.get('workload_verified', False)} | "
               f"{('skipped: ' if c.get('skipped') else '') + c['error'] if c.get('error') else ('complete' if c.get('complete') else 'partial')} |"
               for c in result["cases"]]
-    lines += ["", "CPU profiles are collected at 49 Hz while the workload runs, with a 30-second maximum. "
-              "Sample counts are not wall time or per-request CPU time. Allocator, loader and other "
-              "excluded system-library instruction ranges are recorded in each CPU manifest.", "",
-              "| Case | Node | CPU samples | Artifact bytes | Profile |", "|---|---|---:|---:|---|"]
+    if result.get("cpu_profile"):
+        lines += ["", "CPU profiles are collected at 49 Hz while the workload runs, with a 30-second maximum. "
+                  "Sample counts are not wall time or per-request CPU time. Allocator, loader and other "
+                  "excluded system-library instruction ranges are recorded in each CPU manifest.", "",
+                  "| Case | Node | CPU samples | Artifact bytes | Profile |", "|---|---|---:|---:|---|"]
+    else:
+        lines += ["", "CPU profiling was not requested; `--cpu-profile` enables it."]
     for row in result.get("cpu_profiles", []):
         links = f"[pprof]({row['artifact']})"
         if row.get("flamegraph"):
@@ -189,6 +192,8 @@ def main():
     parser.add_argument("--policies", nargs="+", choices=list(latency.POLICIES), default=list(latency.POLICIES))
     parser.add_argument("--origins", nargs="+", choices=list(latency.PEERS), default=list(latency.PEERS))
     parser.add_argument("--shards", nargs="+", choices=list(latency.BASES), default=list(latency.BASES))
+    parser.add_argument("--cpu-profile", action="store_true",
+                        help="also collect bounded CPU profiles from every node for each case")
     args = parser.parse_args()
     fixture_raw = args.fixtures.read_bytes()
     fixtures = json.loads(fixture_raw)
@@ -202,6 +207,7 @@ def main():
     run = latency.acceptance.Acceptance(args)
     result = {"schema": "sinomo.dfs-write-stage-diagnostics.v1", "classification": "diagnostic",
               "project": args.project, "binary_sha256": run.binary_hash, "profile": args.profile,
+              "cpu_profile": args.cpu_profile,
               "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() + "+dirty",
               "fixtures_sha256": hashlib.sha256(fixture_raw).hexdigest(),
               "fixture_binary_sha256": fixtures["binary_sha256"], "cases": [], "operations": [], "complete": False,
@@ -239,7 +245,8 @@ def main():
             for key, value in params.items():
                 workload += ["--param", f"{key}={value}"]
             command = ["python3", str(ROOT / "scripts/debug/capture-performance.py"), "--buffered",
-                       "--cpu-profile", "--minimum-capacity", "32768", "--nodes", *nodes.values(),
+                       *(["--cpu-profile"] if args.cpu_profile else []),
+                       "--minimum-capacity", "32768", "--nodes", *nodes.values(),
                        "--clients-file", str(run.artifacts / "clients.json"), "--output", str(capture),
                        "--source-revision", result["source_revision"], "--binary-sha256", run.binary_hash,
                        "--profile", args.profile, "--duration-seconds", "90", "--rpc-timeout", "30", "--", *workload]
@@ -251,7 +258,8 @@ def main():
                 whole = reporter.summarize(capture)
                 save(capture / "performance.json", whole)
                 (capture / "PERFORMANCE.md").write_text(reporter.markdown(whole))
-                result.setdefault("cpu_profiles", []).extend(collect_cpu_profiles(run, capture, name, nodes))
+                if args.cpu_profile:
+                    result.setdefault("cpu_profiles", []).extend(collect_cpu_profiles(run, capture, name, nodes))
                 probe = json.loads((capture / "workload.stdout").read_text())
                 latency.validate_report(probe, 1, 0, 0, policy)
                 previous_seeds = {s["payload_seed"] for s in groups[(policy, origin, shard)]["samples"]}

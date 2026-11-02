@@ -21,10 +21,9 @@ use sinomo_dfs::{
     DfsBlobTransferResult, DfsDistributedWriteCommand, DfsFileSystemId,
     DfsMetadataJournalReplicationOutcome,
     DfsMetadataPublishPlanningAttempt as DaemonDfsMetadataPublishPlanningAttempt,
-    DfsMetadataRejectionCode, DfsMetadataReplicaLagStatus, DfsNamespaceCommand,
-    DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsReplicationPolicy, DfsRoutedMessage, DfsStageBlobCommand, DfsVersion,
-    DfsWriteOptions, DistributedRepairJob,
+    DfsMetadataReplicaLagStatus, DfsNamespaceCommand, DfsNamespaceJobStatus, DfsNamespaceOperation,
+    DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy,
+    DfsRoutedMessage, DfsStageBlobCommand, DfsVersion, DfsWriteOptions, DistributedRepairJob,
     run_metadata_publish_blocking_execution as run_daemon_dfs_metadata_publish_blocking_execution,
     run_metadata_publish_lane_planning_with_admission as run_daemon_dfs_metadata_publish_lane_planning_with_admission,
 };
@@ -34,6 +33,9 @@ use std::sync::{Arc, Mutex};
 
 #[path = "tests/replica_progress_boundaries.rs"]
 mod replica_progress_boundaries;
+
+#[path = "tests/maintenance_cancellation.rs"]
+mod maintenance_cancellation;
 
 #[test]
 fn daemon_dfs_peer_transport_traits_share_one_adapter() {
@@ -5938,30 +5940,6 @@ fn daemon_dfs_maintenance_continuation_requires_explicit_progress_and_remainder(
     );
 }
 
-fn process_test_dfs_metadata_journal_batch(
-    paths: &DaemonPaths,
-    context: sinomo_dfs::DfsMetadataReplicaShardContext,
-    command: DfsMetadataJournalBatchCommand,
-) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    let authenticated_source_node_id =
-        command
-            .source_node_id
-            .clone()
-            .ok_or_else(|| DaemonError::Network {
-                address: "DFS metadata journal test source".to_string(),
-                detail: "metadata journal test command has no claimed source".to_string(),
-            })?;
-    sinomo_dfs::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test(
-        &data_dir,
-        &authenticated_source_node_id,
-        command,
-        context,
-    )
-    .map_err(Into::into)
-}
-
 #[test]
 fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
     let nodes = crate::test_support::DfsTestRuntime::ordered_node_ids("native-resident-ingress", 2);
@@ -7308,38 +7286,6 @@ fn pending_write_receipt_for_test(
         replica_node_id,
         content_hash: intent.content_hash.clone(),
         received_at: OffsetDateTime::UNIX_EPOCH,
-    }
-}
-
-fn pending_object_metadata_for_test(
-    object_id: DfsObjectId,
-    file_system_id: DfsFileSystemId,
-    version: DfsVersion,
-    owner_node_id: NodeId,
-    path: &str,
-) -> DfsObjectMetadata {
-    DfsObjectMetadata {
-        object_id,
-        file_system_id,
-        path: path.to_string(),
-        kind: DfsObjectKind::File,
-        owner_node_id: owner_node_id.clone(),
-        current_locations: vec![owner_node_id],
-        content_hash: Some("blake3:pending-base".to_string()),
-        content_size_bytes: Some(1),
-        link_target_object_id: None,
-        mode: 0o644,
-        uid: 0,
-        gid: 0,
-        accessed_at_unix_nanos: 0,
-        modified_at_unix_nanos: 0,
-        created_at_unix_nanos: 0,
-        changed_at_unix_nanos: 0,
-        version,
-        policy: DfsObjectPolicy::ReplicatedEventual,
-        created_by_event_id: None,
-        last_modified_by_event_id: None,
-        tombstone_provenance: None,
     }
 }
 
@@ -16076,22 +16022,6 @@ fn test_cluster_state_with_members(
         state.members.push(member);
     }
     state
-}
-
-fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
-    ClusterEndpointRecord {
-        endpoint_id: sinomo_core::network::ClusterEndpointId::derived(
-            "sinomo.test.endpoint",
-            format!("{}\0{address}", node_id.as_str()),
-        ),
-        node_id: node_id.clone(),
-        transport: ClusterTransportKind::LanTcp,
-        address: address.to_string(),
-        source: ClusterEndpointSource::Observed,
-        privacy: ClusterEndpointPrivacy::Lan,
-        priority: 10,
-        last_observed_latency_ms: None,
-    }
 }
 
 fn temp_root(name: &str) -> sinomo_testdir::TestDir {

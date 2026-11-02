@@ -443,6 +443,15 @@ fn run_placement_activity(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         });
     }
     let browser = open_local_daemon_sifs_browser(ctx)?;
+    if let Some(job_id) = ctx.parameter("job-id") {
+        let job = browser
+            .placement_progress(job_id)
+            .map_err(SinomoTestError::failed)?;
+        ctx.record("reconciliation", &job);
+        return Ok(SinomoTestOutcome::passed(
+            "exact placement job collected",
+        ));
+    }
     let page = browser
         .placement_activity(crate::app_api::SifsPlacementActivityRequest {
             statuses: vec![
@@ -762,11 +771,9 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("renamed", &renamed);
 
     let stage_started = Instant::now();
-    retry_bulk_mutation(
-        deadline,
-        || backend.write_file_wait_for_commit_with_deadline(&path, payload.as_bytes(), deadline),
-        || format!("cannot write SIFS file {path}"),
-    )?;
+    backend
+        .write_file_wait_for_commit_with_deadline(&path, payload.as_bytes(), deadline)
+        .map_err(SinomoTestError::failed)?;
     ctx.record("write_ms", stage_started.elapsed().as_millis());
     let stage_started = Instant::now();
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
@@ -4311,19 +4318,33 @@ fn run_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let backend = open_backend(ctx)?;
     let node = backend.node_label();
     let mut retry_metrics = DfsMutationRetryMetrics::default();
-    retry_bulk_mutation_with_metrics(
-        deadline,
-        || {
-            if foreground_repair {
-                backend
-                    .write_file_with_foreground_replica_repair_deadline(&path, &payload, deadline)
-            } else {
-                backend.write_file_with_deadline(&path, &payload, deadline)
-            }
-        },
-        || format!("cannot write SIFS file {path}"),
-        &mut retry_metrics,
-    )?;
+    if max_retries == 0 {
+        // A zero-retry probe performs exactly one semantic write. Keep the
+        // original error and deadline; an ambiguous result is not a retry grant.
+        let result = if foreground_repair {
+            backend.write_file_with_foreground_replica_repair_deadline(&path, &payload, deadline)
+        } else {
+            backend.write_file_with_deadline(&path, &payload, deadline)
+        };
+        result.map_err(|error| {
+            SinomoTestError::failed(format!("cannot write SIFS file {path}: {error}"))
+        })?;
+    } else {
+        retry_bulk_mutation_with_metrics(
+            deadline,
+            || {
+                if foreground_repair {
+                    backend.write_file_with_foreground_replica_repair_deadline(
+                        &path, &payload, deadline,
+                    )
+                } else {
+                    backend.write_file_with_deadline(&path, &payload, deadline)
+                }
+            },
+            || format!("cannot write SIFS file {path}"),
+            &mut retry_metrics,
+        )?;
+    }
     ctx.record("node", &node);
     ctx.record("path", &path);
     ctx.record("bytes", payload.len());
@@ -4566,11 +4587,19 @@ fn run_damage_local_loose_blob(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     let path = ctx.required_parameter("path")?.to_string();
     let backend = open_read_only_backend(ctx)?;
     let node = backend.node_label();
-    let stat = backend
-        .debug_remove_local_loose_blob_for_path(&path)
+    let expected = ctx
+        .parameter("expected-object-json")
+        .map(serde_json::from_str::<crate::sifs_file_manager::DfsLocalBlobDamageExpectation>)
+        .transpose()
+        .map_err(|error| {
+            SinomoTestError::failed(format!("invalid closed damage identity: {error}"))
+        })?;
+    let (stat, manifest) = backend
+        .debug_remove_local_loose_blob_for_path_with_expectation(&path, expected.as_ref())
         .map_err(SinomoTestError::failed)?;
     ctx.record("node", &node);
     ctx.record("path", &path);
+    ctx.record("file_system_id", stat.file_system_id.to_string());
     ctx.record("object_id", stat.object_id.to_string());
     ctx.record("version", stat.version.to_string());
     ctx.record("content_hash", stat.content_hash.unwrap_or_default());
@@ -4579,6 +4608,9 @@ fn run_damage_local_loose_blob(ctx: &mut SinomoTestContext) -> SinomoTestResult 
         "current_locations",
         stat_location_labels(&stat.current_locations),
     );
+    ctx.record("expected_identity_checked", expected.is_some());
+    ctx.record("fault_recipient_manifest", manifest);
+    ctx.record("unlink_completed", true);
     Ok(SinomoTestOutcome::passed(format!(
         "removed local loose blob for {path} on node {node}"
     )))

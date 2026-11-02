@@ -32,7 +32,7 @@ use sinomo_runtime::test::{
     SinomoTestRequirement, SinomoTestResult,
 };
 
-use crate::app_api::SifsAgentChannelStore;
+use crate::app_api::{AgentChatSifsStorage, SifsAgentChannelStore};
 
 const DAEMON_OBJECT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_CHANNEL_EXPECT_DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -56,6 +56,8 @@ pub fn register_agent_cluster_test_cases(
         .register(agent_runtime_persisted_session_routes())
         .register(agent_channel_write())
         .register(agent_channel_expect())
+        .register(agent_channel_cleanup())
+        .register(agent_channel_provider_reopen())
         .register(module_native_dylib_cancel_route())
         .register(agent_simple_sandbox_active_cancel())
 }
@@ -80,6 +82,30 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_agent_channel_expect(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn agent_channel_cleanup(ctx) {
+        id: "cluster.agent.channel-cleanup",
+        summary: "Remove an explicitly selected isolated SIFS channel probe namespace",
+        tags: ["cluster-agent", "chat-channel", "multi-device"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_agent_channel_cleanup(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn agent_channel_provider_reopen(ctx) {
+        id: "cluster.agent.channel-provider-reopen",
+        summary: "Reopen one chat storage instance after its selected SIFS provider is withdrawn",
+        tags: ["cluster-agent", "chat-channel", "multi-device", "provider-recovery"],
+        requirements: [SinomoTestRequirement::ClusterRuntime],
+        run: {
+            run_agent_channel_provider_reopen(ctx)
         }
     }
 }
@@ -479,6 +505,12 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let channel_id = parse_agent_channel_probe_id(&channel_parameter)?;
     let expected = ctx.required_parameter("message")?.to_string();
     let timeout = agent_channel_expect_timeout(ctx)?;
+    let cleanup = agent_channel_cleanup_on_success(ctx)?;
+    let expected_title = optional_agent_channel_title(ctx)?;
+    let expected_count = optional_agent_channel_u64(ctx, "message-count")?;
+    let expected_sequence = optional_agent_channel_u64(ctx, "message-sequence")?;
+    let expected_message_id = ctx.parameter("message-id").map(str::to_string);
+    let expected_source_node = ctx.parameter("source-node-id").map(str::to_string);
     let started = Instant::now();
     let deadline = started + timeout;
     let test_root = agent_channel_probe_root(&channel_id);
@@ -489,6 +521,11 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("channel_id", channel_id.to_string());
     ctx.record("test_root", &test_root);
     ctx.record("timeout_seconds", timeout.as_secs());
+    ctx.record("cleanup_on_success", cleanup);
+    // Failed expectations retain their original records for inspection and a
+    // later exact-ID check. A successful reader can opt out of cleanup so the
+    // same channel can be verified on several nodes and after daemon restart.
+    ctx.record("test_root_removed", false);
     loop {
         match store.load_recent_messages(&channel_id, usize::MAX) {
             Ok(messages) => {
@@ -500,11 +537,11 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     .iter()
                     .map(|message| message.message_id.to_string())
                     .collect::<Vec<_>>();
+                ctx.record("matching_message_count", matching.len());
                 if matching.len() > 1 {
                     ctx.record("matching_message_ids", &matching_message_ids);
                     ctx.record("matching_message_count", matching.len());
                     ctx.record("observed_message_count", messages.len());
-                    cleanup_agent_channel_probe(ctx, &store)?;
                     return Ok(SinomoTestOutcome::failed(format!(
                         "agent channel {channel_id} contains {} immutable records matching the expected message; expected exactly one",
                         matching.len()
@@ -517,18 +554,94 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     ctx.record("message_sequence", message.sequence);
                     ctx.record("message_source", &message.source);
                     ctx.record("observed_message_count", messages.len());
-                    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
-                    cleanup_agent_channel_probe(ctx, &store)?;
-                    return Ok(SinomoTestOutcome::passed(format!(
-                        "observed exactly one matching immutable channel record {} in {channel_id} after {}ms",
-                        message.message_id,
-                        started.elapsed().as_millis()
-                    )));
+                    let metadata = store
+                        .load_channel(&channel_id)
+                        .map_err(|source| format!("cannot load channel metadata: {source}"));
+                    let validation = match metadata {
+                        Ok(Some(channel)) => {
+                            ctx.record("channel_title", &channel.title);
+                            ctx.record("channel_next_sequence", channel.next_sequence);
+                            if channel.is_deleted() {
+                                Err("channel metadata is deleted".to_string())
+                            } else if expected_title
+                                .as_ref()
+                                .is_some_and(|title| title != &channel.title)
+                            {
+                                Err(format!(
+                                    "channel title {:?} differs from {:?}",
+                                    channel.title, expected_title
+                                ))
+                            } else if expected_count
+                                .is_some_and(|count| count != messages.len() as u64)
+                            {
+                                Err(format!(
+                                    "observed {} messages instead of {:?}",
+                                    messages.len(),
+                                    expected_count
+                                ))
+                            } else if expected_sequence
+                                .is_some_and(|sequence| sequence != message.sequence)
+                            {
+                                Err(format!(
+                                    "message sequence {} differs from {:?}",
+                                    message.sequence, expected_sequence
+                                ))
+                            } else if expected_message_id
+                                .as_ref()
+                                .is_some_and(|id| id != message.message_id.as_str())
+                            {
+                                Err(format!(
+                                    "matching content belongs to message {} instead of {:?}",
+                                    message.message_id, expected_message_id
+                                ))
+                            } else if expected_source_node.as_ref().is_some_and(|node| {
+                                message
+                                    .source
+                                    .metadata
+                                    .get("source_node_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    != Some(node.as_str())
+                            }) {
+                                Err(format!(
+                                    "message provenance {:?} differs from {:?}",
+                                    message.source, expected_source_node
+                                ))
+                            } else if messages
+                                .iter()
+                                .enumerate()
+                                .any(|(index, item)| item.sequence != index as u64 + 1)
+                            {
+                                Err("channel message sequence is not contiguous".to_string())
+                            } else if channel.next_sequence < messages.len() as u64 + 1 {
+                                Err("channel metadata sequence trails its immutable messages"
+                                    .to_string())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        Ok(None) => Err("channel metadata is absent".to_string()),
+                        Err(detail) => Err(detail),
+                    };
+                    match validation {
+                        Ok(()) => {
+                            ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                            if cleanup {
+                                cleanup_agent_channel_probe(ctx, &store)?;
+                            }
+                            return Ok(SinomoTestOutcome::passed(format!(
+                                "observed exactly one matching immutable channel record {} and channel metadata in {channel_id} after {}ms",
+                                message.message_id,
+                                started.elapsed().as_millis()
+                            )));
+                        }
+                        Err(detail) => last_state = detail,
+                    }
+                } else {
+                    last_state = format!(
+                        "observed {} immutable records, none matching the expected message",
+                        messages.len()
+                    );
                 }
-                last_state = format!(
-                    "observed {} immutable records, none matching the expected message",
-                    messages.len()
-                );
             }
             Err(source) => {
                 last_state = format!("cannot read immutable channel records: {source}");
@@ -537,10 +650,8 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
         let now = Instant::now();
         if now >= deadline {
-            ctx.record("matching_message_count", 0);
             ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
             ctx.record("last_state", &last_state);
-            cleanup_agent_channel_probe(ctx, &store)?;
             return Ok(SinomoTestOutcome::failed(format!(
                 "agent channel {channel_id} did not converge to exactly one matching immutable record within {}s: {last_state}",
                 timeout.as_secs()
@@ -548,6 +659,231 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         }
         std::thread::sleep(AGENT_CHANNEL_EXPECT_POLL_INTERVAL.min(deadline.duration_since(now)));
     }
+}
+
+fn run_agent_channel_cleanup(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let channel = ctx.required_parameter("channel")?.trim().to_string();
+    let channel_id = parse_agent_channel_probe_id(&channel)?;
+    let test_root = agent_channel_probe_root(&channel_id);
+    let (_runtime, store) = open_daemon_agent_channel_store(&test_root)?;
+    ctx.record("channel", channel);
+    ctx.record("test_root", test_root);
+    cleanup_agent_channel_probe(ctx, &store)?;
+    Ok(SinomoTestOutcome::passed(format!(
+        "removed isolated channel probe namespace for {channel_id}"
+    )))
+}
+
+fn run_agent_channel_provider_reopen(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let control_id = ctx.required_parameter("control-id")?.to_string();
+    if control_id.is_empty()
+        || control_id.len() > 128
+        || !control_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "control-id".to_string(),
+            detail:
+                "must be a new lowercase alphanumeric/hyphen fixture identity of at most 128 bytes"
+                    .to_string(),
+        });
+    }
+    let expected_original = ctx.required_parameter("original-provider")?.to_string();
+    expected_original
+        .parse::<sinomo_runtime::node::NodeId>()
+        .map_err(|source| SinomoTestError::InvalidParameter {
+            name: "original-provider".to_string(),
+            detail: source.to_string(),
+        })?;
+    let timeout = agent_channel_expect_timeout(ctx)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    // This is an explicit native Docker-controller handshake, never SIFS
+    // product state or distributed effect authority. A fresh fixture prevents
+    // a prior run's release from satisfying this observation.
+    let base = std::path::Path::new("/shared/consumer-tests");
+    std::fs::create_dir_all(base).map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    let control = base.join(&control_id);
+    std::fs::create_dir(&control).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "provider probe requires a fresh control directory {}: {source}",
+            control.display()
+        ))
+    })?;
+    let daemon =
+        DaemonApiClient::connect().map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    let storage = AgentChatSifsStorage::new(
+        SinomoDataDir::new(ctx.data_dir()),
+        daemon.address(),
+        runtime.handle(),
+    );
+    let clone = storage.clone();
+    let initial = storage
+        .open_channel_store()
+        .map_err(SinomoTestError::failed)?;
+    let original = initial.provider_node_id().to_string();
+    if original != expected_original {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "provider probe opened {original}, expected original {expected_original}"
+        )));
+    }
+    drop(initial);
+    let ready = serde_json::json!({
+        "control_id": control_id,
+        "original_provider": original,
+        "phase": "initial-provider-opened",
+    });
+    std::fs::write(
+        control.join("ready.pending.json"),
+        serde_json::to_vec_pretty(&ready).unwrap(),
+    )
+    .and_then(|_| {
+        std::fs::rename(
+            control.join("ready.pending.json"),
+            control.join("ready.json"),
+        )
+    })
+    .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    ctx.record("control_root", control.display().to_string());
+    ctx.record("original_provider", &original);
+    let release_path = control.join("release.json");
+    let release = loop {
+        if Instant::now() >= deadline {
+            return Ok(SinomoTestOutcome::failed(
+                "provider controller did not release the same storage instance before its deadline; fixture retained",
+            ));
+        }
+        match std::fs::read(&release_path) {
+            Ok(bytes) => {
+                break serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|source| {
+                    SinomoTestError::failed(format!("invalid controller release: {source}"))
+                })?;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(SinomoTestError::failed(source.to_string())),
+        }
+        std::thread::sleep(
+            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    };
+    if release
+        .get("control_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(control_id.as_str())
+        || release
+            .get("original_provider")
+            .and_then(serde_json::Value::as_str)
+            != Some(original.as_str())
+        || release.get("phase").and_then(serde_json::Value::as_str) != Some("provider-withdrawn")
+    {
+        return Ok(SinomoTestOutcome::failed(
+            "controller release does not match this exact provider fixture; data retained",
+        ));
+    }
+    let request = ObjectRpcRequest::encode_body(
+        sinomo_runtime::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
+        &sinomo_runtime::service::CLUSTER_SERVICES_KV_PREFIX.to_string(),
+    )
+    .map_err(|source| SinomoTestError::failed(source.to_string()))?;
+    let (read, providers) = loop {
+        // The controller may have restarted Main while keeping this CLI and
+        // its storage clone alive. Read-only catalog propagation and local
+        // control reconnection retain the original fixture deadline.
+        let observation: Result<_, String> = (|| {
+            let response = daemon
+                .call_request(&request)
+                .map_err(|source| source.to_string())?;
+            let read: sinomo_runtime::kv::KvLocalRead<Vec<sinomo_runtime::kv::KvEntry>> = response
+                .decode_body()
+                .map_err(|source| source.to_string())?;
+            let instances = sinomo_runtime::service::service_instances_from_entries(&read.value)
+                .map_err(|source| source.to_string())?;
+            let providers = sinomo_runtime::service::service_instances_providing_capability(
+                instances,
+                sinomo_runtime::dfs::SIFS_PATH_ACCESS_CAPABILITY,
+            );
+            Ok((read, providers))
+        })();
+        let last_state = match observation {
+            Ok((read, providers))
+                if !providers
+                    .iter()
+                    .any(|provider| provider.node_id.as_str() == original.as_str()) =>
+            {
+                break (read, providers);
+            }
+            Ok((read, _)) => format!(
+                "original provider remains advertised at catalog revision {}",
+                read.revision.0
+            ),
+            Err(detail) => detail,
+        };
+        ctx.record("last_withdrawal_state", &last_state);
+        if Instant::now() >= deadline {
+            return Ok(SinomoTestOutcome::failed(format!(
+                "actual provider withdrawal was not observed within the original deadline: {last_state}"
+            )));
+        }
+        std::thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    };
+    ctx.record("catalog_revision_after_withdrawal", read.revision.0);
+    ctx.record(
+        "providers_after_withdrawal",
+        providers
+            .iter()
+            .map(|provider| provider.node_id.to_string())
+            .collect::<Vec<_>>(),
+    );
+    let reopened = clone
+        .open_channel_store()
+        .map_err(SinomoTestError::failed)?;
+    let replacement = reopened.provider_node_id().to_string();
+    ctx.record("replacement_provider", &replacement);
+    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    if replacement == original || Instant::now() > deadline {
+        return Ok(SinomoTestOutcome::failed(
+            "reopened storage did not select a different live provider within its original deadline",
+        ));
+    }
+    Ok(SinomoTestOutcome::passed(format!(
+        "same chat storage instance reopened from withdrawn provider {original} on live provider {replacement}; no mutation was replayed"
+    )))
+}
+
+fn agent_channel_cleanup_on_success(ctx: &SinomoTestContext) -> Result<bool, SinomoTestError> {
+    match ctx.parameter("cleanup") {
+        None | Some("true") | Some("1") => Ok(true),
+        Some("false") | Some("0") => Ok(false),
+        Some(_) => Err(SinomoTestError::InvalidParameter {
+            name: "cleanup".to_string(),
+            detail: "must be true, false, 1, or 0".to_string(),
+        }),
+    }
+}
+
+fn optional_agent_channel_u64(
+    ctx: &SinomoTestContext,
+    key: &str,
+) -> Result<Option<u64>, SinomoTestError> {
+    ctx.parameter(key)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|source| SinomoTestError::InvalidParameter {
+                    name: key.to_string(),
+                    detail: format!("must be a nonnegative integer: {source}"),
+                })
+        })
+        .transpose()
 }
 
 fn cleanup_agent_channel_probe(
@@ -787,6 +1123,52 @@ mod tests {
             format!("/services/cluster-tests/runs/{channel_id}/agent-channels")
         );
         assert!(!root.starts_with("/services/sinomo-agent/channels"));
+    }
+
+    #[test]
+    fn agent_channel_expect_cleanup_defaults_to_legacy_success_cleanup() {
+        let default = SinomoTestContext::new("test-data");
+        assert!(agent_channel_cleanup_on_success(&default).unwrap());
+        for value in ["false", "0"] {
+            let retained = SinomoTestContext::new("test-data").with_parameter("cleanup", value);
+            assert!(!agent_channel_cleanup_on_success(&retained).unwrap());
+        }
+        for value in ["true", "1"] {
+            let cleanup = SinomoTestContext::new("test-data").with_parameter("cleanup", value);
+            assert!(agent_channel_cleanup_on_success(&cleanup).unwrap());
+        }
+        let invalid = SinomoTestContext::new("test-data").with_parameter("cleanup", "sometimes");
+        assert!(matches!(
+            agent_channel_cleanup_on_success(&invalid),
+            Err(SinomoTestError::InvalidParameter { ref name, .. }) if name == "cleanup"
+        ));
+    }
+
+    #[test]
+    fn agent_channel_expect_integer_assertions_do_not_ignore_invalid_values() {
+        let absent = SinomoTestContext::new("test-data");
+        assert_eq!(
+            optional_agent_channel_u64(&absent, "message-count").unwrap(),
+            None
+        );
+        let zero = SinomoTestContext::new("test-data").with_parameter("message-count", "0");
+        assert_eq!(
+            optional_agent_channel_u64(&zero, "message-count").unwrap(),
+            Some(0)
+        );
+        let count = SinomoTestContext::new("test-data").with_parameter("message-count", "2");
+        assert_eq!(
+            optional_agent_channel_u64(&count, "message-count").unwrap(),
+            Some(2)
+        );
+        for value in ["-1", "many", "18446744073709551616"] {
+            let invalid =
+                SinomoTestContext::new("test-data").with_parameter("message-count", value);
+            assert!(matches!(
+                optional_agent_channel_u64(&invalid, "message-count"),
+                Err(SinomoTestError::InvalidParameter { ref name, .. }) if name == "message-count"
+            ));
+        }
     }
 
     #[test]

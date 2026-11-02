@@ -109,7 +109,12 @@ publishes a synthetic transitive edge.
 
 Every connectivity-graph edge describes an observed adjacent-node relationship
 that the direct-link layer can attempt. Every edge is directed: evidence that A
-can directly reach B says nothing about B reaching A. An observation records at
+can directly reach B says nothing about B reaching A. An accepted join is such
+reverse evidence, so the node that accepts or relays it records the joiner's
+endpoints only as unverified routes: executable, so the member is routable
+before its first probe, but ranked below reachable edges and above edges with
+failure evidence, and never replacing an observation. An observation that did
+not time its edge has unknown latency, not zero. An observation records at
 least:
 
 - source and target node identity;
@@ -138,12 +143,23 @@ deduplicates updates, expires stale facts, and publishes a new snapshot.
 The live routing view and the stored source generation are distinct. A periodic
 publication pass forwards the generation already committed by the observation
 owner; TTL expiry in a read view does not itself authorize a new source-set
-mutation or a quorum deletion. Expired stored observations remain unusable for
-routing and are not renewed by publication. Actual source updates, explicit
-clears, and topology revocations still reconcile through the existing
-cross-process snapshot fence and writer. Publication retries re-read stored
-source data, so a newer source generation wins without replacing its evidence
-with a clock-filtered omission.
+mutation or a quorum deletion. Actual source updates, explicit clears, and
+topology revocations still reconcile through the existing cross-process snapshot
+fence and writer. Publication retries re-read stored source data, so a newer
+source generation wins without replacing its evidence with a clock-filtered
+omission.
+
+Quorum publication is semantic, so a committed record is its source's current
+statement about that edge. Routing treats it as live until the source commits a
+change or the directory revokes its source, target, or endpoint. Its observation
+and expiry times record when the source saw that state and schedule the source's
+own re-probes; they do not age the committed statement out of the graph. The
+source publishes a route-relevant change when it is recorded, including changes
+recorded outside a probe turn such as an endpoint-RPC outcome or a relayed-edge
+failure. Wall-clock expiry bounds only evidence that is not committed:
+process-local observations and request-local routing feedback. A committed edge
+that stops working is corrected by its source's next observation and by
+path-realization feedback, not by discarding unchanged statements on a timer.
 
 Routine liveness refreshes stay in the observing process's memory. The existing
 maintenance owner keeps the 900-second healthy/degraded TTL, 7200-second
@@ -153,49 +169,20 @@ Uncommitted probe results cannot postpone that deadline. Semantic source changes
 still use the existing source writer and quorum publication. A passive shadow
 accepts only its own observations in RAM, fenced by the shared source snapshot;
 it gains neither publication ownership nor a local Raft dependency.
-Peer imports reconcile the actual persisted cut under the same writer lock before
-merging accepted RAM observations. They retain newer freshness only when it still
+A joined node learns other sources' edges from committed cluster KV; it does not
+copy peers' local connectivity stores. The only peer import is the accepted-join
+handoff, which seeds a node from its introducer before that node has KV. It
+reconciles the actual persisted cut under the same writer lock before merging
+accepted RAM observations. It retains newer freshness only when it still
 matches the persisted semantic record; an unrelated import cannot roll it back
 to the old disk timestamp or persist a passive shadow's uncommitted health change.
 Newer external records and explicit source clears still supersede that cache.
 
-A cold routed caller can recover live evidence during carrier establishment
-through the existing authenticated `/cluster/network/connectivity` read. It
-accepts remote rows only from their authenticated source, against the exact
-canonical semantic baseline and current member/endpoint bindings, and rechecks
-the directory cut after the reads. Semantic matching uses the same predicate as
-quorum publication: a source-owned failure count may progress or reset within
-the same confirmed health state and failure reason. Such a count remains part
-of local failure-budget processing and route-cache ordering; its existing local
-persistence and reconciliation are unchanged. It does not require a redundant
-quorum update before an authenticated live observation can be used. State,
-failure-reason, endpoint and generation changes still require their existing
-confirmation. A successful direct read also supplies an actual local edge
-observation. Third-party rows cannot renew another source's
-evidence. Reads share the existing establishment deadline, have bounded
-concurrency, and are dropped on completion or cancellation. A pooled live carrier
-needs no such refresh. The original operation is dispatched only after carrier
-establishment, retaining its identity and body.
-
-When a source reply makes the next bridge reachable, the same request can read
-that bridge through the ordinary authenticated carrier. Each reachable source
-endpoint is queried at most once through this routed step, sharing the direct-read
-concurrency cap and original deadline. A process with cold observations cannot
-hide another process's fresh observations for the same node. Each read narrows
-endpoint selection within the existing authorized directory cut; the carrier pool
-also retains that terminal endpoint constraint and its normal owner-scope
-retirement. This adds no wire affinity or Main requirement. A routed reply supplies
-only its source-owned rows; it never invents a direct edge from the caller to that
-source. The collector does
-not recursively invoke freshness discovery or trust relayed third-party rows.
-Owner-local endpoint hints may remain in bootstrap records. The source reader
-excludes `LocalOnly` endpoints both from remote dials and from accepted remote
-edges; a peer's loopback listener does not name a listener on the caller's host.
-The bounded direct-read queue tries source-owned adjacent endpoint hints before
-unobserved or failed hints, using the latest exact local-source observation and
-then the endpoint's existing priority. This ordering prevents slow unrelated
-hints from occupying every slot first. Expired evidence can order a dial but
-cannot authorize a route, and newer failure/quarantine evidence still wins.
+These in-memory refreshes are lost on process restart; the committed statement
+remains. Cold startup, bootstrap and rejoin are genuine activity and may persist
+necessary changes; time-only refreshes after stabilization do not write.
+Committed connectivity does not change the existing read-authority
+classification, semantic routing generation or effect-authority checks.
 
 Daemon ingress treats an authenticated peer closing the routed handshake before
 an application stream exists as a normal connection exit, recorded at debug
@@ -203,14 +190,6 @@ level. The distinction comes from typed handshake I/O, not error text. Invalid
 authentication, malformed frames, unknown I/O errors and failures after relay or
 application dispatch remain errors. Existing client error text and request
 delivery classification are unchanged.
-
-These observations are lost on process restart. Stored expired rows remain
-expired and serve only as semantic baselines or endpoint hints. Cold startup,
-bootstrap and rejoin are genuine activity and may persist necessary changes;
-time-only refreshes after stabilization do not write. Older peers without usable
-live source evidence cannot make an expired route valid. Neither live evidence
-nor the raw baseline changes the existing read-authority classification,
-semantic routing generation or effect-authority checks.
 
 The existing Main maintenance turn also materializes genuine remote endpoint
 changes into the public bootstrap projection. This is limited to already-known
@@ -409,9 +388,13 @@ without attempting an eligible candidate.
 When a path cannot be realized, routing returns a structured establishment
 failure identifying the rejected or failed edge, submits that evidence to
 connectivity, and tries a bounded eligible alternative within the connection
-deadline. This closes the loop between the control-plane graph and the data
-plane: stale graph reachability is corrected rather than repeatedly advertised
-as usable.
+deadline. Alternatives overlap: the next ranked candidate starts when the
+previous one fails or after a short stagger, and the first established session
+wins, so a wrong rank order costs the stagger rather than an attempt budget. A
+candidate over an unverified edge is speculative and gets only a hop-scaled
+handshake window. This closes the loop between the control-plane graph and the
+data plane: stale graph reachability is corrected rather than repeatedly
+advertised as usable.
 
 ### Routed-Session Establishment
 

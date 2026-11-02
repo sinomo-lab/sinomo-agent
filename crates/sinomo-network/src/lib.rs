@@ -119,9 +119,8 @@ pub use connectivity_store::{
     read_local_cluster_connectivity_records, read_local_cluster_connectivity_records_for_source,
     record_local_cluster_endpoint_command_auth_denied,
     record_local_cluster_endpoint_command_connectivity,
-    write_local_cluster_connectivity_record_groups,
+    record_local_cluster_endpoint_unverified_route, write_local_cluster_connectivity_record_groups,
     write_local_cluster_connectivity_record_groups_async, write_local_cluster_connectivity_records,
-    write_local_cluster_connectivity_records_async,
 };
 pub use connectivity_store::{
     write_local_cluster_connectivity_record_set, write_local_cluster_connectivity_record_set_async,
@@ -143,7 +142,6 @@ pub use direct_link::{
     write_authenticated_transport_prelude,
 };
 pub use directory::{
-    DirectoryConnectivityBaseline,
     ClusterDirectory, ClusterDirectoryFactory, DirectoryNode, DirectoryRecordsSnapshot,
     DirectoryRoutingRecordsSnapshot, DirectorySnapshot, DirectoryVersion, EmptyClusterDirectory,
     cluster_directory_for, cluster_directory_with_bootstrap_state, set_cluster_directory_provider,

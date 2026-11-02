@@ -179,3 +179,70 @@ fn directory_rename_can_revisit_a_previous_destination_after_reopen() {
     assert!(dfs.posix_stat("/services/b/child").is_ok());
     assert!(dfs.posix_stat("/services/a").is_err());
 }
+
+#[test]
+fn main_sifs_no_links_open_preserves_identity_counts_and_link_rejection() {
+    use sinomo_dfs::{
+        DfsPosixError, open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
+    };
+    let nodes = DfsTestRuntime::ordered_node_ids("native-no-links-authority-stat", 3);
+    let mut runtime =
+        DfsTestRuntime::new("native-no-links-authority-stat", nodes[0].clone()).unwrap();
+    for node in &nodes[1..] {
+        runtime.define_node(node.clone()).unwrap();
+    }
+    runtime.start_nodes().unwrap();
+    let root = "/users/no-links-authority-stat";
+    let file = format!("{root}/data.bin");
+    let hardlink = format!("{root}/alias.bin");
+    let symlink = format!("{root}/symbolic");
+    let mut writer = runtime.client(&nodes[0]).unwrap();
+    writer.posix_mkdir_all(root).unwrap();
+    writer.posix_mkdir(&format!("{root}/first")).unwrap();
+    writer.posix_mkdir(&format!("{root}/second")).unwrap();
+    let options = DfsWriteOptions::replicated_eventual(nodes.clone());
+    writer
+        .posix_write_file(&file, b"actual no-link bytes", options.clone())
+        .unwrap();
+    writer.posix_hardlink(&file, &hardlink).unwrap();
+    writer.posix_symlink(root, &symlink, options).unwrap();
+    let expected_dir = writer.posix_stat_distributed(root).unwrap();
+    let expected_file = writer.posix_stat_distributed(&file).unwrap();
+    assert_eq!(expected_dir.link_count, 4);
+    assert_eq!(expected_file.link_count, 2);
+    drop(writer);
+
+    let (sync, asynchronous) = runtime.peer_transports(&nodes[1]).unwrap();
+    let mut opened = open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+        runtime.data_dir(&nodes[1]).clone(),
+        sync,
+        asynchronous,
+    )
+    .unwrap();
+    let actual_dir = opened
+        .service
+        .posix_open_beneath_no_links_distributed("/users", root)
+        .unwrap();
+    assert_eq!(actual_dir, expected_dir);
+    let actual_file = opened
+        .service
+        .posix_open_beneath_no_links_distributed("/users", &file)
+        .unwrap();
+    assert_eq!(actual_file, expected_file);
+    for path in [&hardlink, &symlink] {
+        assert!(matches!(
+            opened
+                .service
+                .posix_open_beneath_no_links_distributed("/users", path),
+            Err(DfsPosixError::InvalidPath { .. })
+        ));
+    }
+    assert!(matches!(
+        opened
+            .service
+            .posix_open_beneath_no_links_distributed(root, "/services"),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+    drop(opened);
+    runtime.close().unwrap();
+}

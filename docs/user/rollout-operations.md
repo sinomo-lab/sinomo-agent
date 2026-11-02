@@ -29,7 +29,7 @@ relevant tests, and confirm the current cluster is healthy.
 A desktop release contains `sinomo-app`, `sinomo-ui-extension-host`, optional
 runtime libraries, and `desktop-release.json`. It can be delivered independently
 of the daemon and native modules. The initial installer also ships the CLI and
-offline default-module/source payload; the CLI hosts local desktop supervision. Running `sinomo install` from that release installs the
+offline default-module/source payload; the CLI hosts local desktop supervision. Running `sinomo install` from that release installs or verifies the
 desktop app automatically. A runtime-only release remains headless. The explicit
 forms are:
 
@@ -205,9 +205,50 @@ existing main and shadow ports. Port flags provide connection/bootstrap defaults
 they do not relocate an existing listener. `--host` remains an explicit bind-host
 change and is checked after activation.
 
-Each build server advertises its installed host target automatically. To let a
-server build for additional installed Rust targets, set a comma-separated list
-before starting its daemon, for example:
+Each build server advertises its installed host target automatically. GNU Linux
+builders running on x86-64 or AArch64 also offer managed cross compilation for:
+
+- `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`;
+- `armv7-unknown-linux-gnueabihf`;
+- `aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl`;
+- `armv7-unknown-linux-musleabihf`.
+
+These are compatibility choices, not capacity classes. An ARM cloud VM can
+serve other architectures; a small x86 machine receives the same resource
+checks as a small ARM machine. Placement uses measured resources and cache
+availability rather than treating AArch64 as synonymous with an SBC.
+
+The first admitted job for a managed target downloads pinned Zig,
+cargo-zigbuild, and host libclang archives over HTTPS, checks their SHA-256 digests, installs the
+Rust standard library for the selected compiler through rustup if needed, and
+qualifies executable and native-library linking. Preparation is visible in the
+build log and failures fail that job explicitly. Capability discovery does not
+install tools. Tools and qualification evidence live under
+`$SINOMO_DATA_DIR/build/toolchains/managed-cross`; system libraries are not
+modified. The build key includes the compiler, SDK, exact target triple, and
+GNU glibc baseline of 2.17. A target requiring an older glibc needs an explicitly
+installed compatible SDK instead. Musl builds use dynamic libc so the binary
+and its native modules share the target runtime.
+
+Builders need `curl` and either rustup or the requested Rust target already
+installed. Set `SINOMO_BUILD_CROSS_TARGETS` to a comma-separated subset of the
+managed targets before starting the daemon, or to `off` to disable automatic
+preparation. An installed SDK for the same exact target takes precedence.
+
+Rollout uses each daemon's reported Rust target triple to distinguish GNU,
+musl, and ARM ABI variants. For a legacy daemon that reports only OS and
+architecture, verify its ABI locally before using an override for one target:
+
+```sh
+sinomo rollout cluster --repo /path/to/prepared-source \
+  --target arm-cloud.example:21353 --rust-target aarch64-unknown-linux-gnu
+```
+
+An override cannot replace a triple reported by a newer daemon. Without an
+exact triple, managed cross compilation is excluded from selection.
+
+To let a server build for additional operator-installed Rust targets, set a
+comma-separated list before starting its daemon, for example:
 
 ```sh
 SINOMO_BUILD_TARGETS=aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl \

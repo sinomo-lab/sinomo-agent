@@ -867,6 +867,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             && matches!(
                                 record.status,
                                 DfsWriteIntentStatus::Aborted | DfsWriteIntentStatus::Rejected
+                                    | DfsWriteIntentStatus::PreconditionFailed { .. }
                             )
                     });
                 if durable_closed
@@ -877,6 +878,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             matches!(
                                 intent.state,
                                 DfsWriteIntentState::Aborted | DfsWriteIntentState::Rejected
+                                    | DfsWriteIntentState::PreconditionFailed { .. }
                             )
                         })
                 {

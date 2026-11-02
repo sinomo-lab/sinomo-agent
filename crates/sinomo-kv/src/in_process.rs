@@ -4,11 +4,14 @@ use crate::internal::*;
 static EVENTS_AFTER_REVISION_PARTITION_PROBES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static COMPLETE_SNAPSHOT_MATERIALIZATIONS: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+}
+#[cfg(test)]
+thread_local! {
     static IN_PROCESS_STORE_CLONES: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
@@ -29,7 +32,7 @@ pub(crate) fn reset_complete_snapshot_materializations_for_test() {
     COMPLETE_SNAPSHOT_MATERIALIZATIONS.with(|count| count.set(0));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn complete_snapshot_materializations_for_test() -> u64 {
     COMPLETE_SNAPSHOT_MATERIALIZATIONS.with(std::cell::Cell::get)
 }
@@ -44,7 +47,7 @@ pub(crate) fn in_process_store_clones_for_test() -> u64 {
     IN_PROCESS_STORE_CLONES.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_complete_snapshot_materialization_for_test() {
     COMPLETE_SNAPSHOT_MATERIALIZATIONS.with(|count| count.set(count.get().saturating_add(1)));
 }
@@ -1184,6 +1187,13 @@ impl InProcessKvStore {
         self.events.iter().map(AsRef::as_ref)
     }
 
+    /// Existing thread-local observation for sibling native integration tests.
+    /// This counts full materializations on this thread and grants no KV access.
+    #[cfg(feature = "test-support")]
+    pub fn complete_snapshot_materializations_for_test() -> u64 {
+        complete_snapshot_materializations_for_test()
+    }
+
     /// Materializes the complete wire/persistence snapshot.
     ///
     /// This is deliberately an explicit `O(total retained state)` boundary:
@@ -1193,7 +1203,7 @@ impl InProcessKvStore {
     /// this owned representation with a persistent/COW snapshot view before
     /// putting this method on a per-operation path.
     pub fn try_snapshot(&self) -> Result<KvSnapshot, KvError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_complete_snapshot_materialization_for_test();
         metrics::histogram!("sinomo.kv.snapshot.materialize.entries")
             .record(self.entries.len() as f64);
@@ -1235,7 +1245,7 @@ impl InProcessKvStore {
     /// Consumes a store and transfers its owned state into a snapshot.
     #[allow(dead_code)]
     pub(crate) fn try_into_snapshot(self) -> Result<KvSnapshot, KvError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_complete_snapshot_materialization_for_test();
         let leases = self.try_current_leases_for_snapshot()?;
         let Self {

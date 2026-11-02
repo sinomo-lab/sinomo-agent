@@ -162,6 +162,9 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+sha2 = "0.11"
+xz2 = { version = "0.1.7", features = ["static"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sinomo-actions = { path = "crates/sinomo-actions" }
 sinomo-video = { path = "crates/sinomo-video", default-features = false }
 sinomo-lm = { path = "crates/sinomo-lm", default-features = false }
@@ -227,6 +230,7 @@ metrics = "0.24.6"
 nfs3_server = "0.11.0"
 nfs3_client = "0.9.0"
 pprof = { version = "0.15.0", default-features = false, features = ["framehop-unwinder", "prost-codec"] }
+backtrace = "0.3.76"
 netwatcher = { version = "0.7.1", features = ["tokio"] }
 notify = "8.2.0"
 ulid = "3.0.0"

@@ -6,6 +6,10 @@ use crate::{
     DfsWriteIntentStatus, DistributedWriteIntent, MetadataBackendError,
 };
 
+#[cfg(test)]
+#[path = "content_durability/repair_owner_tests.rs"]
+mod repair_owner_tests;
+
 fn current_content_version_from_backend(
     backend: &dyn DfsMetadataBackend,
     object: &DfsObjectMetadata,
@@ -240,6 +244,164 @@ fn current_managed_intent_matches(
     let source =
         crate::metadata_records::object_version_record(captured, captured.content_size_bytes);
     Ok(same_content_lineage(current, &source))
+}
+
+/// Content-root selection only. Actual epoch, writer, source and placement
+/// permission remain at their existing native effect boundaries.
+pub(crate) fn current_repair_content_matches(
+    object: &DfsObjectMetadata,
+    intent: &DfsWriteIntentRecord,
+    target: Option<&DfsObjectVersionRecord>,
+    current: Option<&DfsObjectVersionRecord>,
+) -> bool {
+    if intent.status != crate::DfsWriteIntentStatus::Committed
+        || !intent.publication.is_current()
+        || intent.file_system_id != object.file_system_id
+        || intent.object_id != object.object_id
+        || object.kind == crate::DfsObjectKind::Tombstone
+        || object.tombstone_provenance.is_some()
+        || intent.content_hash.is_none()
+        || intent.content_hash != object.content_hash
+    {
+        return false;
+    }
+    if intent.target_version == object.version {
+        return true;
+    }
+    let Some(current) = current.filter(|version| {
+        version.file_system_id == object.file_system_id
+            && version.object_id == object.object_id
+            && version.version == object.version
+            && version.content_hash == object.content_hash
+            && version.size_bytes == object.content_size_bytes
+    }) else {
+        return false;
+    };
+    if let Some(target) = target.filter(|version| {
+        version.file_system_id == intent.file_system_id
+            && version.object_id == intent.object_id
+            && version.version == intent.target_version
+            && version.content_hash == intent.content_hash
+    }) && same_content_lineage(current, target)
+    {
+        return true;
+    }
+    // Existing native data-generation binding also survives source-row GC.
+    if current
+        .content_durability
+        .as_ref()
+        .is_some_and(|plan| plan.source_version == intent.target_version)
+    {
+        return true;
+    }
+    if crate::placement::current_placement_repair_owner_matches_identity(intent) {
+        return current_managed_intent_matches(intent, object, current).unwrap_or(false);
+    }
+    let Some(captured) = intent.object_metadata.as_ref().filter(|captured| {
+        captured.file_system_id == intent.file_system_id
+            && captured.object_id == intent.object_id
+            && captured.version == intent.target_version
+            && captured.content_hash == intent.content_hash
+            && captured.content_size_bytes == object.content_size_bytes
+            && captured.kind == object.kind
+            && captured.tombstone_provenance.is_none()
+    }) else {
+        return false;
+    };
+    let source =
+        crate::metadata_records::object_version_record(captured, captured.content_size_bytes);
+    same_content_lineage(current, &source)
+}
+
+/// Positive supersession evidence only. Missing legacy version rows or an
+/// unavailable lineage are not proof that a committed owner lost its work.
+pub(crate) fn current_repair_content_is_superseded(
+    object: &DfsObjectMetadata,
+    intent: &DfsWriteIntentRecord,
+    target: Option<&DfsObjectVersionRecord>,
+    current: Option<&DfsObjectVersionRecord>,
+) -> bool {
+    if intent.file_system_id != object.file_system_id || intent.object_id != object.object_id {
+        return false;
+    }
+    if object.tombstone_provenance.is_some() {
+        return true;
+    }
+    if object.version == intent.target_version {
+        return false;
+    }
+    if object.kind == DfsObjectKind::Tombstone {
+        return true;
+    }
+    let (Some(hash), Some(actual_hash)) = (&intent.content_hash, &object.content_hash) else {
+        return false;
+    };
+    if hash != actual_hash {
+        return true;
+    }
+    let Some(current) = current.filter(|current| {
+        validate_current_content_version(object, current).is_ok()
+            && current.created_by_event_id.is_some()
+    }) else {
+        return false;
+    };
+    let captured_source = intent
+        .object_metadata
+        .as_ref()
+        .filter(|captured| {
+            captured.file_system_id == intent.file_system_id
+                && captured.object_id == intent.object_id
+                && captured.version == intent.target_version
+                && captured.content_hash == intent.content_hash
+                && captured.content_size_bytes == object.content_size_bytes
+                && captured.tombstone_provenance.is_none()
+        })
+        .map(|captured| {
+            crate::metadata_records::object_version_record(captured, captured.content_size_bytes)
+        });
+    let source = target.or(captured_source.as_ref()).filter(|source| {
+        source.file_system_id == intent.file_system_id
+            && source.object_id == intent.object_id
+            && source.version == intent.target_version
+            && source.content_hash == intent.content_hash
+            && source.size_bytes == object.content_size_bytes
+            && source.created_by_event_id.is_some()
+    });
+    source.is_some_and(|source| current.created_by_event_id != source.created_by_event_id)
+}
+
+/// Match an actual retained owner to its immutable captured content subject.
+/// A Current record is never promoted by merely finding a historical grant.
+pub(crate) fn retained_repair_content_matches(
+    object: &DfsObjectMetadata,
+    intent: &DfsWriteIntentRecord,
+    version: &DfsObjectVersionRecord,
+) -> bool {
+    if intent.status != crate::DfsWriteIntentStatus::Committed
+        || intent.publication.is_current()
+        || intent.file_system_id != object.file_system_id
+        || intent.object_id != object.object_id
+        || version.file_system_id != intent.file_system_id
+        || version.object_id != intent.object_id
+        || version.version != intent.target_version
+        || version.content_hash.is_none()
+        || version.content_hash != intent.content_hash
+        || crate::file_history::validate_intent_publication(intent).is_err()
+    {
+        return false;
+    }
+    if intent.publication.is_retained_repair() {
+        return crate::file_history::retained_repair_intent(version, None).is_ok_and(|expected| {
+            crate::file_history::retained_repair_plan_matches(intent, &expected)
+                && intent.coordinator_node_id == expected.coordinator_node_id
+                && intent.owner_epoch == expected.owner_epoch
+        });
+    }
+    // Explicit retained user writes keep their validated capture semantics.
+    matches!(
+        &intent.publication,
+        crate::DfsWritePublication::Retained { .. }
+    )
 }
 
 pub(crate) fn from_intent(intent: &DistributedWriteIntent) -> Box<DfsContentDurability> {

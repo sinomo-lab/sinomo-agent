@@ -1,9 +1,6 @@
-pub(crate) use crate::connectivity_publish::{
-    ClusterConnectivityPublishHost, ClusterNetworkRecordExpiryHost,
-};
+pub(crate) use crate::connectivity_publish::ClusterConnectivityPublishHost;
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::invite_publish::ClusterInvitePublishHost;
-use crate::kv_local_store::locked_cache_cluster_kv_snapshot_if_newer_than_raft;
 use crate::kv_local_store::locked_kv_state_authority_id;
 use crate::kv_snapshot::ClusterKvSnapshotRefreshHost;
 use crate::kv_txn_quorum::{
@@ -56,15 +53,6 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         locked_kv_state_authority_id(paths, state)
-    }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError> {
-        locked_cache_cluster_kv_snapshot_if_newer_than_raft(paths, local_node_id, snapshot)
     }
 
     fn call_node_object_rpc(
@@ -171,23 +159,6 @@ where
         request: KvTxnRequest,
     ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, Self::Error> {
         ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(self, paths, state, request)
-    }
-}
-
-impl<T> ClusterNetworkRecordExpiryHost for ClusterControlPlaneDriver<T>
-where
-    T: ClusterControlPlaneTransport,
-{
-    type Error = NetworkError;
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        request: KvTxnRequest,
-    ) -> Result<sinomo_kv::ClusterKvTxnCommitResult, Self::Error> {
-        let options = self.timeouts.kv_txn_quorum_options(true);
-        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, request, options, self)
     }
 }
 

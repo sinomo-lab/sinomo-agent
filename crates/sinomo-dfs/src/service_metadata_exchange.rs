@@ -1318,19 +1318,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(Into::into)
     }
 
-    pub(crate) fn metadata_journal_batch_for_shard_since(
-        &self,
-        shard_id: &DfsMetadataShardId,
-        after_sequence: u64,
-    ) -> Result<Option<DfsMetadataJournalBatch>, DfsError> {
-        self.metadata_journal_batch_for_shard_since_limited(
-            shard_id,
-            after_sequence,
-            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-        )
-    }
-
     pub(crate) fn metadata_journal_batch_for_shard_since_limited(
         &self,
         shard_id: &DfsMetadataShardId,

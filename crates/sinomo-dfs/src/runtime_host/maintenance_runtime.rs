@@ -623,6 +623,7 @@ struct DaemonDfsMaintenanceServiceReturn<'a> {
     cluster_paths: &'a ClusterPaths,
     runtime: &'a tokio::runtime::Handle,
     retained: Option<DaemonDfsMaintenanceServiceLane>,
+    previous_cancellation: Option<crate::DfsCancellationFlag>,
 }
 
 impl DaemonDfsMaintenanceServiceReturn<'_> {
@@ -634,6 +635,9 @@ impl DaemonDfsMaintenanceServiceReturn<'_> {
         // temporary dispatch mode; the outer worker still owns the same actual
         // checkpointed calls and starts after admission release.
         retained.lane.service.set_background_replica_dispatch(false);
+        // A foreground generation belongs to this maintenance turn. Never
+        // leave its already-triggered cancellation source on the reused lane.
+        retained.lane.service.set_cancellation(self.previous_cancellation.take());
         // This consumes the lane only at the existing checked handback. A
         // changed owner, storage generation or freeze still refuses reuse.
         restore_daemon_dfs_message_mutation_service_after_maintenance(
@@ -725,7 +729,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             DaemonDfsAuthorityPreExecutionError::Failed(error) => Err(error.into()),
         };
     }
-    let retained_lane = match try_take_daemon_dfs_message_mutation_service_for_maintenance(
+    let mut retained_lane = match try_take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
         &cluster_state,
@@ -742,11 +746,14 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     };
     // Declare the real return owner before the publication-context guard:
     // cancellation drops borrowed work and that context before cache handback.
+    let previous_cancellation = retained_lane.lane.service.cancellation.clone();
+    retained_lane.lane.service.add_cancellation(_foreground_preemption.cancellation_flag());
     let mut service_return = DaemonDfsMaintenanceServiceReturn {
         data_dir: &data_dir,
         cluster_paths: &cluster_paths,
         runtime,
         retained: Some(retained_lane),
+        previous_cancellation,
     };
     let retained = service_return
         .retained
@@ -946,7 +953,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         // Both kinds now execute the same bounded phases. Recovery has already
         // durably transferred discovered work before this future can yield to
         // foreground RPCs (including replies from its own promotion outbox).
-        sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
+        let result = sinomo_dfs::run_cluster_dfs_reactive_maintenance_tick_with_reusable_service(
             &mut maintenance_service,
             data_dir.clone(),
             cluster_paths.clone(),
@@ -958,8 +965,16 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             committed_work_tracker,
             options,
         )
-        .await
-        .map_err(DaemonError::from)
+        .await;
+        match result {
+            Err(crate::DfsError::Cancelled { .. }) if _foreground_preemption.is_requested() => {
+                // The synchronous metadata wait observed the SAME generation
+                // before Tokio could poll the outer biased select again.
+                // Existing progress/queue owners retain the unfinished turn.
+                Ok(None)
+            }
+            result => result.map_err(DaemonError::from),
+        }
     }
     .await;
     let remote_namespace_phase =

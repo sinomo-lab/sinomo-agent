@@ -10,10 +10,9 @@ use crate::{
     AsyncDfsMessageTransport, DfsCancellationFlag, DfsCommittedWorkTracker,
     DfsControlPlaneKvClient, DfsError, DfsFileSystem, DfsMessageCommittedWork, DfsMessageTransport,
     DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage, DfsObjectId, DfsOperationalMetrics,
-    DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator,
-    LocalContentStore, NetworkedDfsService, NetworkedDfsServiceEvent,
-    ResidentLocalMetadataShardLease, ResidentLocalShardedMetadataBackendLease,
-    build_dfs_routed_message,
+    DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator, LocalContentStore,
+    NetworkedDfsService, NetworkedDfsServiceEvent, ResidentLocalMetadataShardLease,
+    ResidentLocalShardedMetadataBackendLease, build_dfs_routed_message,
 };
 
 impl<T> NetworkedDfsService<T> {
@@ -362,6 +361,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<Self, DfsError> {
         self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
         self.hydrate_file_systems_from_metadata_backend()?;
+        Ok(self)
+    }
+
+    /// Attach the existing on-demand backend for an ordinary SIFS requester
+    /// whose namespace effects belong to its registered Main. This initializer
+    /// seeds only SIFS configuration; author floors, running-job guards and
+    /// replay cursors remain duties of the generic owning constructors.
+    pub fn with_boxed_metadata_backend_for_main_sifs_client(
+        mut self,
+        backend: Box<dyn DfsMetadataBackend>,
+    ) -> Result<Self, DfsError> {
+        if !self.transport.delegates_local_namespace_authority() || self.control_plane.is_none() {
+            return Err(DfsError::Metadata {
+                message: "Main SIFS client initialization requires delegated namespace routing and an existing control-plane client".into(),
+            });
+        }
+        self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(backend));
+        self.bootstrap_distributed_sifs()
+            .map_err(|source| match source {
+                crate::DfsPosixError::Dfs(error) => error,
+                other => DfsError::Metadata {
+                    message: other.to_string(),
+                },
+            })?;
         Ok(self)
     }
 

@@ -19,11 +19,8 @@ use crate::kv_forward::{
 use crate::kv_local_store::ClusterKvPathsExt;
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
-    LocalClusterRaftCommandStorage, LocalClusterRaftReadProjection,
-    imported_snapshot_advances_local_kv, locked_kv_state_authority_id,
-    write_imported_cluster_kv_snapshot_if_changed,
+    LocalClusterRaftCommandStorage, LocalClusterRaftReadProjection, locked_kv_state_authority_id,
 };
-use crate::kv_snapshot::refresh_current_cluster_kv_store_with_host;
 #[cfg(any(test, feature = "test-support"))]
 use crate::local_state_store::read_cluster_state_without_kv;
 use crate::local_state_store::{
@@ -79,14 +76,6 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 pub trait ClusterKvTxnQuorumHost {
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        _paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
-    ) -> Result<(), NetworkError> {
-        Ok(())
-    }
-
     fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
@@ -375,6 +364,24 @@ pub trait ClusterKvTxnQuorumAsyncHost:
         })
     }
 
+    fn forward_cluster_kv_authoritative_complete_range_prefix_async<'a>(
+        &'a mut self,
+        runtime: &'a tokio::runtime::Handle,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        prefix: &'a str,
+        options: ClusterKvTxnForwardOptions,
+    ) -> ClusterMembershipRpcFuture<'a, Option<KvAuthoritativeRead<Vec<sinomo_kv::KvEntry>>>>
+    where
+        Self: Sized,
+    {
+        Box::pin(async move {
+            crate::kv_forward::forward_cluster_kv_authoritative_complete_range_prefix_to_state_authority_async_with_host(
+                runtime, paths, state, prefix, options, self,
+            ).await
+        })
+    }
+
     fn forward_cluster_kv_authoritative_snapshot_async<'a>(
         &'a mut self,
         runtime: &'a tokio::runtime::Handle,
@@ -467,20 +474,6 @@ impl<T> ClusterKvTxnQuorumHost for ClusterControlPlaneDriver<T>
 where
     T: ClusterControlPlaneTransport,
 {
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<(), NetworkError> {
-        refresh_current_cluster_kv_store_with_host(
-            paths,
-            state,
-            self.timeouts.kv_snapshot_refresh_options(),
-            self,
-        )
-        .map(|_| ())
-    }
-
     fn known_kv_state_authority_id(
         &mut self,
         paths: &ClusterPaths,
@@ -598,14 +591,6 @@ where
 
     fn kv_error(error: KvError) -> Self::Error {
         crate::kv_local_store::kv_err(error)
-    }
-
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        state: &ClusterBootstrapState,
-    ) -> Result<(), Self::Error> {
-        self.host
-            .refresh_current_cluster_kv_store(self.paths, state)
     }
 
     fn local_is_raft_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, Self::Error> {
@@ -1666,31 +1651,6 @@ async fn project_committed_cluster_raft_authority_before_deadline(
     .await
 }
 
-async fn commit_cluster_kv_authoritative_barrier_with_consensus_state<H>(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    state: &mut ClusterBootstrapState,
-    options: ClusterKvTxnQuorumOptions,
-    deadline: Instant,
-    host: &mut H,
-) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>
-where
-    H: ClusterKvTxnQuorumAsyncHost,
-{
-    commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
-        runtime,
-        paths,
-        state,
-        options,
-        deadline,
-        None,
-        ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
-        |storage| storage.read_index_snapshot(),
-        host,
-    )
-    .await
-}
-
 /// Establishes the first current-term commit and projects the requested value
 /// from the resident store while the same leader/configuration is still in
 /// force. Unlike the compatibility snapshot barrier, the command result is
@@ -2534,11 +2494,7 @@ pub fn handle_cluster_kv_txn_request_with_host(
         },
         other => other,
     })?;
-    let result = commit_cluster_kv_txn_with_quorum_response_with_host(
-        paths, &mut state, request, options, host,
-    )?;
-    write_imported_cluster_kv_snapshot_if_changed(paths, &result.snapshot)?;
-    Ok(result)
+    commit_cluster_kv_txn_with_quorum_response_with_host(paths, &mut state, request, options, host)
 }
 
 pub(crate) fn locked_cluster_raft_local_is_leader(
@@ -2680,6 +2636,80 @@ fn forwarded_snapshot_read_admission_is_busy(error: &NetworkError) -> bool {
             && detail.contains("forwarded snapshot read"))
 }
 
+fn validate_complete_forwarded_read(
+    read: KvAuthoritativeRead<CompleteReadValue>,
+    projection: &CompleteReadProjection,
+    state: &ClusterBootstrapState,
+) -> Result<KvAuthoritativeRead<CompleteReadValue>, NetworkError> {
+    match (read.value, projection) {
+        (CompleteReadValue::Snapshot(value), CompleteReadProjection::Snapshot) => {
+            let read = validate_forwarded_authoritative_read(
+                KvAuthoritativeRead {
+                    value,
+                    authority: read.authority,
+                },
+                state,
+            )?;
+            Ok(KvAuthoritativeRead {
+                value: CompleteReadValue::Snapshot(read.value),
+                authority: read.authority,
+            })
+        }
+        (CompleteReadValue::Prefix(value), CompleteReadProjection::Prefix(prefix)) => {
+            let read = crate::kv_forward::validate_forwarded_authoritative_complete_range_read(
+                KvAuthoritativeRead {
+                    value,
+                    authority: read.authority,
+                },
+                state,
+                prefix,
+            )?;
+            Ok(KvAuthoritativeRead {
+                value: CompleteReadValue::Prefix(read.value),
+                authority: read.authority,
+            })
+        }
+        _ => Err(NetworkError::Serialization {
+            detail: "forwarded complete read returned another projection kind".into(),
+        }),
+    }
+}
+
+async fn forward_complete_projection_once<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvTxnForwardOptions,
+    projection: &CompleteReadProjection,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<CompleteReadValue>>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    match projection {
+        CompleteReadProjection::Snapshot => host
+            .forward_cluster_kv_authoritative_snapshot_async(runtime, paths, state, options)
+            .await
+            .map(|read| {
+                read.map(|read| KvAuthoritativeRead {
+                    value: CompleteReadValue::Snapshot(read.value),
+                    authority: read.authority,
+                })
+            }),
+        CompleteReadProjection::Prefix(prefix) => host
+            .forward_cluster_kv_authoritative_complete_range_prefix_async(
+                runtime, paths, state, prefix, options,
+            )
+            .await
+            .map(|read| {
+                read.map(|read| KvAuthoritativeRead {
+                    value: CompleteReadValue::Prefix(read.value),
+                    authority: read.authority,
+                })
+            }),
+    }
+}
+
 async fn forward_cluster_kv_authoritative_snapshot_recovering_stale_leader_async<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -2688,6 +2718,32 @@ async fn forward_cluster_kv_authoritative_snapshot_recovering_stale_leader_async
     deadline: Instant,
     host: &mut H,
 ) -> Result<Option<KvAuthoritativeRead<KvSnapshot>>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    forward_cluster_kv_complete_projection_recovering_stale_leader_async(
+        runtime,
+        paths,
+        state,
+        options,
+        deadline,
+        &CompleteReadProjection::Snapshot,
+        host,
+    )
+    .await?
+    .map(complete_read_snapshot)
+    .transpose()
+}
+
+async fn forward_cluster_kv_complete_projection_recovering_stale_leader_async<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvTxnForwardOptions,
+    deadline: Instant,
+    projection: &CompleteReadProjection,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<CompleteReadValue>>, NetworkError>
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
@@ -2701,9 +2757,9 @@ where
             ));
         };
         let leader_fence = try_capture_cluster_raft_voter_leader_fence(paths, state);
-        let mut result = host
-            .forward_cluster_kv_authoritative_snapshot_async(runtime, paths, state, options)
-            .await;
+        let mut result =
+            forward_complete_projection_once(runtime, paths, state, options, projection, host)
+                .await;
         if let Err(error) = &result
             && !forwarded_snapshot_read_admission_is_busy(error)
             && clear_verified_stale_cluster_raft_leader_async(
@@ -2717,9 +2773,9 @@ where
             .await?
             && let Some(options) = cluster_kv_forward_options_before_deadline(options, deadline)
         {
-            result = host
-                .forward_cluster_kv_authoritative_snapshot_async(runtime, paths, state, options)
-                .await;
+            result =
+                forward_complete_projection_once(runtime, paths, state, options, projection, host)
+                    .await;
         }
         remaining_authoritative_read_budget(deadline, "authoritative KV snapshot forwarding")?;
         // The receiver remains fail-fast when already forwarded. The origin
@@ -3100,35 +3156,6 @@ async fn locked_cluster_raft_local_is_leader_before_deadline(
     .await
 }
 
-async fn write_imported_cluster_kv_snapshot_if_changed_async(
-    runtime: &tokio::runtime::Handle,
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> Result<(), NetworkError> {
-    let paths = paths.clone();
-    let snapshot = snapshot.clone();
-    runtime
-        .spawn_blocking(move || {
-            write_imported_cluster_kv_snapshot_if_it_advances(&paths, &snapshot)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster kv snapshot import".to_string(),
-            detail: format!("cluster kv snapshot import task failed: {source}"),
-        })?
-        .map(|_| ())
-}
-
-fn write_imported_cluster_kv_snapshot_if_it_advances(
-    paths: &ClusterPaths,
-    snapshot: &KvSnapshot,
-) -> Result<bool, NetworkError> {
-    if !imported_snapshot_advances_local_kv(paths, snapshot) {
-        return Ok(false);
-    }
-    write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)
-}
-
 struct NetworkClusterKvTxnQuorumAsyncHost<'a, H> {
     runtime: &'a tokio::runtime::Handle,
     paths: &'a ClusterPaths,
@@ -3417,27 +3444,9 @@ where
     .await?;
     state.term = state.term.max(consensus_state.term);
     state.kv_revision = state.kv_revision.max(consensus_state.kv_revision);
-    // A forwarded commit observes the voter's post-commit snapshot; import it
-    // when it advances the local view so the forwarding node reads its own
-    // write immediately. The committed-append fan-out runs on the voter and
-    // can miss this node (cold formation: no relay route back yet), and
-    // re-committing the same payload is a semantic no-effect that triggers no
-    // new fan-out. Importing the response here makes convergence owned by the
-    // forwarded operation instead of relying on a background snapshot sweep.
-    let import_paths = paths.clone();
-    let import_snapshot = result.snapshot.clone();
-    runtime
-        .spawn_blocking(move || {
-            if imported_snapshot_advances_local_kv(&import_paths, &import_snapshot) {
-                write_imported_cluster_kv_snapshot_if_changed(&import_paths, &import_snapshot)?;
-            }
-            Ok::<_, NetworkError>(())
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster kv snapshot import".to_string(),
-            detail: format!("cluster kv snapshot import task failed: {source}"),
-        })??;
+    // The post-commit snapshot is this operation's result. The forwarding
+    // node's own view converges through Raft: a missed fan-out leaves it
+    // known-behind at the leader until a restored route or its contact.
     Ok(result)
 }
 
@@ -3525,27 +3534,16 @@ async fn read_cluster_kv_authoritative_snapshot_async_with_host_inner<H>(
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let deadline = Instant::now() + options.raft_append_timeout;
-    let mut consensus_state = state.clone();
-    let read = read_cluster_kv_authoritative_snapshot_async_with_consensus_state(
+    read_cluster_kv_complete_projection_async_with_host(
         runtime,
         paths,
-        &mut consensus_state,
+        state,
         options,
-        deadline,
+        CompleteReadProjection::Snapshot,
         host,
     )
-    .await?;
-    adopt_newer_authoritative_consensus_members(state, &consensus_state);
-    state.term = state
-        .term
-        .max(consensus_state.term)
-        .max(read.authority.term);
-    state.kv_revision = state
-        .kv_revision
-        .max(consensus_state.kv_revision)
-        .max(read.authority.revision.0);
-    Ok(read)
+    .await
+    .and_then(complete_read_snapshot)
 }
 
 fn retained_request_outcome_read(
@@ -4672,12 +4670,24 @@ pub async fn read_cluster_kv_authoritative_complete_range_prefix_async_with_host
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
-    let snapshot = read_cluster_kv_authoritative_snapshot_async_with_host(
-        runtime, paths, state, options, host,
+    let started = Instant::now();
+    let read = read_cluster_kv_complete_projection_async_with_host(
+        runtime,
+        paths,
+        state,
+        options,
+        CompleteReadProjection::Prefix(prefix.clone()),
+        host,
     )
-    .await?;
-    sinomo_kv::project_cluster_kv_authoritative_complete_range_prefix(&snapshot, &prefix)
-        .map_err(kv_err)
+    .await
+    .and_then(complete_read_prefix);
+    let result = read.and_then(|read| {
+        sinomo_kv::validate_cluster_kv_authoritative_complete_range_prefix_read(&prefix, &read)
+            .map_err(kv_err)?;
+        Ok(read)
+    });
+    record_async_authoritative_read_latency(started, "complete_prefix", result.is_ok());
+    result
 }
 
 pub async fn read_cluster_kv_authoritative_range_prefix_async_with_host<H>(
@@ -5029,19 +5039,115 @@ where
     Ok(read)
 }
 
-async fn read_cluster_kv_authoritative_snapshot_async_with_consensus_state<H>(
+#[derive(Clone)]
+enum CompleteReadProjection {
+    Snapshot,
+    Prefix(String),
+}
+
+enum CompleteReadValue {
+    Snapshot(KvSnapshot),
+    Prefix(Vec<sinomo_kv::KvEntry>),
+}
+
+impl CompleteReadProjection {
+    fn read(
+        &self,
+        storage: &mut dyn LocalClusterRaftReadProjection,
+    ) -> Result<CompleteReadValue, NetworkError> {
+        match self {
+            Self::Snapshot => storage
+                .read_index_snapshot()
+                .map(CompleteReadValue::Snapshot),
+            Self::Prefix(prefix) => storage
+                .read_index_prefix_limited_by_payload_bytes(
+                    prefix,
+                    sinomo_kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_ENTRIES,
+                    sinomo_kv::CLUSTER_KV_COMPLETE_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+                )
+                .map(CompleteReadValue::Prefix),
+        }
+    }
+}
+
+fn complete_read_snapshot(
+    read: KvAuthoritativeRead<CompleteReadValue>,
+) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError> {
+    let CompleteReadValue::Snapshot(value) = read.value else {
+        return Err(NetworkError::Serialization {
+            detail: "snapshot operation returned another projection kind".into(),
+        });
+    };
+    Ok(KvAuthoritativeRead {
+        value,
+        authority: read.authority,
+    })
+}
+
+fn complete_read_prefix(
+    read: KvAuthoritativeRead<CompleteReadValue>,
+) -> Result<KvAuthoritativeRead<Vec<sinomo_kv::KvEntry>>, NetworkError> {
+    let CompleteReadValue::Prefix(value) = read.value else {
+        return Err(NetworkError::Serialization {
+            detail: "complete prefix operation returned another projection kind".into(),
+        });
+    };
+    Ok(KvAuthoritativeRead {
+        value,
+        authority: read.authority,
+    })
+}
+
+async fn read_cluster_kv_complete_projection_async_with_host<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    options: ClusterKvTxnQuorumOptions,
+    projection: CompleteReadProjection,
+    host: &mut H,
+) -> Result<KvAuthoritativeRead<CompleteReadValue>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let deadline = Instant::now() + options.raft_append_timeout;
+    let mut consensus_state = state.clone();
+    let read = read_cluster_kv_complete_projection_async_with_consensus_state(
+        runtime,
+        paths,
+        &mut consensus_state,
+        options,
+        deadline,
+        projection,
+        host,
+    )
+    .await?;
+    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+    state.term = state
+        .term
+        .max(consensus_state.term)
+        .max(read.authority.term);
+    state.kv_revision = state
+        .kv_revision
+        .max(consensus_state.kv_revision)
+        .max(read.authority.revision.0);
+    Ok(read)
+}
+
+async fn read_cluster_kv_complete_projection_async_with_consensus_state<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     options: ClusterKvTxnQuorumOptions,
     deadline: Instant,
+    projection: CompleteReadProjection,
     host: &mut H,
-) -> Result<KvAuthoritativeRead<KvSnapshot>, NetworkError>
+) -> Result<KvAuthoritativeRead<CompleteReadValue>, NetworkError>
 where
     H: ClusterKvTxnQuorumAsyncHost,
 {
     let remaining =
         remaining_authoritative_read_budget(deadline, "authoritative KV snapshot authority proof")?;
+    let local_projection = projection.clone();
     let (local_admission_busy, forward_only) =
         match read_cluster_raft_with_read_index_attempt_async_with_projection_policy_and_admission(
             runtime,
@@ -5051,13 +5157,14 @@ where
             options.raft_append_replication_options,
             ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
             ClusterRaftReadIndexAdmissionMode::ForwardOnBusy,
-            |storage| storage.read_index_snapshot(),
+            move |storage| local_projection.read(storage),
             host,
         )
         .await?
         {
             ClusterRaftReadIndexAttempt::Confirmed(read) => return Ok(read),
             ClusterRaftReadIndexAttempt::NeedsBarrier(fence) => {
+                let local_projection = projection.clone();
                 return commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
                 runtime,
                 paths,
@@ -5066,7 +5173,7 @@ where
                 deadline,
                 Some(fence.into()),
                 ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
-                |storage| storage.read_index_snapshot(),
+                move |storage| local_projection.read(storage),
                 host,
             )
             .await;
@@ -5081,17 +5188,18 @@ where
 
     let forwarding_failure = if options.allow_forwarding {
         remaining_authoritative_read_budget(deadline, "authoritative KV read forwarding")?;
-        match forward_cluster_kv_authoritative_snapshot_recovering_stale_leader_async(
+        match forward_cluster_kv_complete_projection_recovering_stale_leader_async(
             runtime,
             paths,
             state,
             options.forward_options,
             deadline,
+            &projection,
             host,
         )
         .await
         {
-            Ok(Some(read)) => return validate_forwarded_authoritative_read(read, state),
+            Ok(Some(read)) => return validate_complete_forwarded_read(read, &projection, state),
             Ok(None) => None,
             Err(error) => Some(error),
         }
@@ -5110,6 +5218,7 @@ where
         return Err(forwarding_failure.expect("busy forwarding failure"));
     }
     if local_admission_busy {
+        let local_projection = projection.clone();
         if let Ok(Some(retry)) = retry_local_read_index_after_busy_forward(
             runtime,
             paths,
@@ -5119,7 +5228,7 @@ where
             "authoritative KV snapshot local admission retry",
             ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
             BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET,
-            |storage| storage.read_index_snapshot(),
+            move |storage| local_projection.read(storage),
             host,
         )
         .await
@@ -5127,6 +5236,7 @@ where
             match retry {
                 ClusterRaftReadIndexAttempt::Confirmed(read) => return Ok(read),
                 ClusterRaftReadIndexAttempt::NeedsBarrier(fence) => {
+                    let local_projection = projection.clone();
                     if let Ok(read) = commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
                         runtime,
                         paths,
@@ -5135,7 +5245,7 @@ where
                         deadline,
                         Some(fence.into()),
                         ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
-                        |storage| storage.read_index_snapshot(),
+                        move |storage| local_projection.read(storage),
                         host,
                     )
                     .await
@@ -5190,8 +5300,16 @@ where
             ),
         });
     }
-    commit_cluster_kv_authoritative_barrier_with_consensus_state(
-        runtime, paths, state, options, deadline, host,
+    commit_cluster_kv_authoritative_barrier_then_read_with_initial_fence_and_projection_policy(
+        runtime,
+        paths,
+        state,
+        options,
+        deadline,
+        None,
+        ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
+        move |storage| projection.read(storage),
+        host,
     )
     .await
 }
@@ -5214,12 +5332,10 @@ where
             },
             other => other,
         })?;
-    let result = commit_cluster_kv_txn_with_quorum_response_async_with_host(
+    commit_cluster_kv_txn_with_quorum_response_async_with_host(
         runtime, paths, &mut state, request, options, host,
     )
-    .await?;
-    write_imported_cluster_kv_snapshot_if_changed_async(runtime, paths, &result.snapshot).await?;
-    Ok(result)
+    .await
 }
 
 /// Executes a daemon/service transaction without constructing an owned view of
@@ -5314,17 +5430,10 @@ where
             },
             other => other,
         })?;
-    let read = read_cluster_kv_authoritative_snapshot_async_with_host(
+    read_cluster_kv_authoritative_snapshot_async_with_host(
         runtime, paths, &mut state, options, host,
     )
-    .await?;
-    // A follower's local Raft materialization can intentionally trail the
-    // leader even after it has accepted the committed log. Preserve the exact
-    // quorum-confirmed view returned by an authoritative read so local readers
-    // (including DFS replica authority validation) can converge without a
-    // separate mutation or operator-triggered snapshot refresh.
-    write_imported_cluster_kv_snapshot_if_changed_async(runtime, paths, &read.value).await?;
-    Ok(read)
+    .await
 }
 
 #[cfg(test)]
@@ -6845,46 +6954,6 @@ mod tests {
         let cached = sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .expect("read unchanged materialized conflict");
         assert_eq!(cached, materialized_conflict);
-    }
-
-    #[test]
-    fn authoritative_snapshot_imports_when_it_advances_local_raft() {
-        let root = sinomo_testdir::TestDir::new(
-            "sinomo-cluster-authoritative-snapshot-advances-local-raft",
-        );
-        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-        let state = initialize_single_voter_read_index_leader(
-            &paths,
-            "cluster_authoritative_snapshot_advances",
-            "node_authoritative_snapshot_advances",
-        );
-        let local = commit_single_voter_test_value(
-            &paths,
-            &state,
-            "/config/authoritative-snapshot-local",
-            b"local",
-        );
-        let mut imported_store = InProcessKvStore::restore(local).expect("restore local snapshot");
-        imported_store
-            .put(
-                "/config/authoritative-snapshot-newer",
-                b"newer".to_vec(),
-                None,
-            )
-            .expect("advance imported snapshot");
-        let imported = imported_store
-            .try_snapshot()
-            .expect("newer imported snapshot");
-
-        assert!(
-            write_imported_cluster_kv_snapshot_if_it_advances(&paths, &imported)
-                .expect("import newer authoritative snapshot")
-        );
-        assert_eq!(
-            sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-                .expect("read imported materialized snapshot"),
-            imported
-        );
     }
 
     #[test]
@@ -11032,4 +11101,5 @@ mod tests {
         assert_eq!(result.read_state.current_term, 1);
         assert_eq!(result.read_state.leader_id, Some(local));
     }
+    include!("kv_txn_quorum/complete_prefix_projection_native_tests.rs");
 }

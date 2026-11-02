@@ -5,7 +5,6 @@
 //! metadata behavior; this layer only turns table batches and snapshots into a
 //! durable `DfsMetadataTables` image.
 
-use crate::metadata_io::encode_sobj;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -13,33 +12,28 @@ use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde::Serializer;
 use serde::ser::{SerializeSeq, SerializeStruct};
-use serde::{Deserialize, Serialize};
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_core::storage::durable_file;
 use time::OffsetDateTime;
 
+use crate::DfsObjectId;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_io::{
     create_dir_all, metadata_durable_file_error, read_dir, remove_file_if_exists, sync_dir,
-    write_file_atomic, write_sobj_atomic,
+    write_file_atomic,
 };
-use crate::metadata_journal::segmented_journal_entry_at_sequence;
-use crate::metadata_keys::path_record_for_object;
 use crate::metadata_records::{
-    DfsDirFragmentRecord, DfsHardlinkIndexSnapshotRecord, DfsInodeRecord, DfsMetadataMutation,
-    DfsMetadataPrefixProof, DfsMetadataTableBatch, DfsMetadataTableOp, DfsMetadataTableSnapshot,
-    DfsMetadataTableSnapshotTables, DfsNamespaceTransaction, DfsObjectVersionRecord, DfsPathRecord,
-    DfsReplicaReceiptRecord, DfsWriteIntentRecord, dfs_metadata_table_snapshot_state_fingerprint,
-    normalized_object_metadata, normalized_version_record,
+    DfsHardlinkIndexSnapshotRecord, DfsMetadataPrefixProof, DfsMetadataTableBatch,
+    DfsMetadataTableOp, DfsMetadataTableSnapshot, DfsMetadataTableSnapshotTables, DfsPathRecord,
+    dfs_metadata_table_snapshot_state_fingerprint,
 };
 use crate::metadata_tables::{
     DfsMetadataTableState, DfsMetadataTables, MetadataTableReplay,
     MetadataTableSnapshotFingerprint, max_optional_sequence,
 };
-use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata};
-use crate::{DfsObjectId, DfsVersion};
 
 /// Current storage schema. Older snapshots are decoded only by the external
 /// converter; the prepared-operation protocol remains independently versioned.

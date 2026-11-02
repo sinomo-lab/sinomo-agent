@@ -1,6 +1,8 @@
 //! Shared initial-installation, integration and removal contract for CLI and graphical setup.
 mod removal;
+mod repair;
 pub mod services;
+mod transaction;
 use serde::{Deserialize, Serialize};
 use sinomo_core::local;
 use sinomo_rollout::desktop;
@@ -14,7 +16,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub const RECEIPT: &str = "sinomo-install.json";
 const DATA_OWNER: &str = "config/installer-owner";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Receipt {
     pub schema: u32,
     pub install_dir: PathBuf,
@@ -27,21 +29,215 @@ pub struct Receipt {
     pub services: Option<services::Registration>,
     #[serde(default)]
     pub setup_owner: Option<ProcessIdentity>,
+    #[serde(default)]
+    pub configuration: Option<Configuration>,
+    #[serde(default)]
+    pub complete: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub start_time: u64,
     pub exe: PathBuf,
 }
 
-/// Optional shell integration shared by CLI and graphical initial setup.
+/// Unspecified preferences preserve an existing installation's configuration.
 #[derive(Clone, Debug, Default)]
 pub struct IntegrationOptions {
+    pub add_to_path: Option<bool>,
+    pub desktop_shortcut: Option<bool>,
+    pub menu_shortcut: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Configuration {
     pub add_to_path: bool,
     pub desktop_shortcut: bool,
     pub menu_shortcut: bool,
+    #[serde(default = "default_startup")]
+    pub startup: bool,
+}
+impl Default for Configuration {
+    fn default() -> Self {
+        Self {
+            add_to_path: false,
+            desktop_shortcut: false,
+            menu_shortcut: false,
+            startup: true,
+        }
+    }
+}
+fn default_startup() -> bool {
+    true
+}
+
+pub fn installation_root(data: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+    if let Some(root) = requested {
+        return Ok(root.to_path_buf());
+    }
+    match fs::read_to_string(data.join(DATA_OWNER)) {
+        Ok(root) => Ok(PathBuf::from(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => default_install_dir(),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Resolve the same per-user installation from either a packaged setup binary
+/// or an installed CLI, including a non-default DATA directory.
+pub fn resolve_locations(root: Option<&Path>, data: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+    let default_data = local::SinomoDataDir::from_env_or_home()?.root();
+    let mut selected_root = root.map(Path::to_path_buf);
+    // An explicit process DATA choice or an installed executable binding must
+    // never be redirected by another per-user shell registration.
+    let explicit_process_data =
+        env::var_os("SINOMO_DATA_DIR").is_some_and(|value| !value.is_empty());
+    let executable_binding = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .is_some_and(|parent| parent.join(local::INSTALLED_DATA_DIR_FILE).is_file());
+    if root.is_none()
+        && data.is_none()
+        && (explicit_process_data || executable_binding || default_data.join(DATA_OWNER).is_file())
+    {
+        return Ok((installation_root(&default_data, None)?, default_data));
+    }
+    if root.is_none() && data.is_none() {
+        if let Some(path) = env::var_os("SINOMO_INSTALL_DIR") {
+            selected_root = Some(path.into());
+        }
+        #[cfg(windows)]
+        if selected_root.is_none() {
+            use std::os::windows::process::CommandExt;
+            let output=Command::new("powershell.exe").creation_flags(0x08000000).args(["-NoProfile","-NonInteractive","-Command","$ErrorActionPreference='Stop'; $p=Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Sinomo' -ErrorAction SilentlyContinue; if($p){[Console]::Write($p.InstallLocation)}"]).stdin(std::process::Stdio::null()).output()?;
+            if output.status.success() && !output.stdout.is_empty() {
+                selected_root = Some(String::from_utf8(output.stdout)?.into());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if selected_root.is_none() {
+            let registration = linux_integration_paths()?.remove(0);
+            if let Ok(text) = fs::read_to_string(registration) {
+                selected_root = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("X-Sinomo-InstallDir=").map(PathBuf::from));
+            }
+        }
+    }
+    let selected_data = if let Some(data) = data {
+        data.to_path_buf()
+    } else if let Some(root) = &selected_root {
+        if root.join(RECEIPT).is_file() {
+            read_receipt(root)?.data_dir
+        } else {
+            default_data
+        }
+    } else {
+        default_data
+    };
+    let selected_root = installation_root(&selected_data, selected_root.as_deref())?;
+    Ok((selected_root, selected_data))
+}
+
+pub fn configuration(root: &Path) -> Result<Configuration> {
+    let receipt = read_receipt(root)?;
+    if let Some(configuration) = receipt.configuration {
+        return Ok(configuration);
+    }
+    legacy_configuration(root, &receipt.data_dir)
+}
+
+fn legacy_configuration(root: &Path, data: &Path) -> Result<Configuration> {
+    let mut configuration = Configuration {
+        startup: true,
+        ..Configuration::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        configuration.add_to_path = fs::read_to_string(home()?.join(".profile"))
+            .is_ok_and(|text| text.contains(&profile_block(&data.join("bin"))));
+        let paths = linux_integration_paths()?;
+        let target = desktop_quote(&data.join("bin/sinomo-app"));
+        configuration.menu_shortcut =
+            fs::read_to_string(&paths[1]).is_ok_and(|content| content.contains(&target));
+        configuration.desktop_shortcut =
+            fs::read_to_string(&paths[2]).is_ok_and(|content| content.contains(&target));
+    }
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell.exe");
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000).args(["-NoProfile","-NonInteractive","-Command",r#"$bin=$env:SINOMO_SETUP_BIN; $entries=[Environment]::GetEnvironmentVariable('Path','User') -split ';'; $path=[bool]($entries | Where-Object {[Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') -ieq $bin.TrimEnd('\')}); $shell=New-Object -ComObject WScript.Shell; $menu=Join-Path ([Environment]::GetFolderPath('Programs')) 'Sinomo.lnk'; $desktop=Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'Sinomo.lnk'; $target=Join-Path $bin 'sinomo-app.exe'; [ordered]@{path=$path; menu=((Test-Path -LiteralPath $menu) -and ($shell.CreateShortcut($menu).TargetPath -ieq $target)); desktop=((Test-Path -LiteralPath $desktop) -and ($shell.CreateShortcut($desktop).TargetPath -ieq $target))}|ConvertTo-Json -Compress"#]).env("SINOMO_SETUP_BIN",local::command_path(&data.join("bin"))).stdin(std::process::Stdio::null());
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        let state: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        configuration.add_to_path = state["path"].as_bool().unwrap_or(false);
+        configuration.menu_shortcut = state["menu"].as_bool().unwrap_or(false);
+        configuration.desktop_shortcut = state["desktop"].as_bool().unwrap_or(false);
+    }
+    #[cfg(windows)]
+    if let Ok(bytes) = fs::read(root.join("windows-integration.json")) {
+        let ledger: serde_json::Value = serde_json::from_slice(&bytes)?;
+        configuration.add_to_path |= ledger
+            .get("pathAdded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if let Some(links) = ledger.get("shortcuts").and_then(|v| v.as_array()) {
+            configuration.desktop_shortcut |= links.iter().any(|v| {
+                v.as_str()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("desktop"))
+            });
+            configuration.menu_shortcut |= links.iter().any(|v| {
+                v.as_str()
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("start menu"))
+            });
+        }
+    }
+    Ok(configuration)
+}
+
+/// An existing complete runtime is verified without consulting the incoming
+/// distribution: component updates remain owned by rollout, including removals.
+pub fn runtime_present(data: &Path) -> bool {
+    data.join("bin").join(binary("sinomo")).is_file()
+        && data.join("bin").join(binary("sinomo-shadow")).is_file()
+}
+
+pub fn verify_runtime(data: &Path) -> Result<()> {
+    for stem in ["sinomo", "sinomo-shadow"] {
+        if !data.join("bin").join(binary(stem)).is_file() {
+            return Err(format!("installed {stem} executable is missing").into());
+        }
+    }
+    let source = sinomo_build::BuildPaths::new(data).managed_source;
+    if source.exists()
+        && (!source.join(".git/HEAD").is_file() || !source.join("Cargo.lock").is_file())
+    {
+        return Err("installed managed source checkout is incomplete".into());
+    }
+    let releases = desktop::DesktopReleases::new(data);
+    if let Some(active) = releases.status()?.active_release {
+        let directory = releases.release_dir(&active)?;
+        desktop::verify_bundle(&directory, &desktop::read_manifest(&directory)?)?;
+    }
+    for state in sinomo_module::read_native_dylib_module_loader_states(data)? {
+        let path = sinomo_module::native_module_cache_path(
+            data,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        if format!("blake3:{}", crate::bundle::hash(&path)?) != state.content_hash {
+            return Err(format!(
+                "installed native module digest mismatch: {}",
+                state.module_id
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 pub fn default_install_dir() -> Result<PathBuf> {
@@ -55,7 +251,7 @@ pub fn default_install_dir() -> Result<PathBuf> {
     }
 }
 
-/// Initial setup preserves source/releases and registers and starts per-user services.
+/// Both frontends use this verification/reconfiguration transaction.
 pub fn install(
     executable: &Path,
     desktop_source: Option<&Path>,
@@ -64,112 +260,371 @@ pub fn install(
     integrations: &IntegrationOptions,
     services: &services::Options,
 ) -> Result<()> {
+    install_inner(
+        executable,
+        desktop_source,
+        root,
+        data,
+        integrations,
+        services,
+        false,
+    )
+}
+
+/// Replace the packaged runtime offline, preserving application data. Older
+/// binaries are allowed; data downgrade/migration is not supported by repair.
+pub fn repair(
+    executable: &Path,
+    desktop_source: Option<&Path>,
+    root: &Path,
+    data: &Path,
+    integrations: &IntegrationOptions,
+    services: &services::Options,
+) -> Result<()> {
+    install_inner(
+        executable,
+        desktop_source,
+        root,
+        data,
+        integrations,
+        services,
+        true,
+    )
+}
+
+fn install_inner(
+    executable: &Path,
+    desktop_source: Option<&Path>,
+    root: &Path,
+    data: &Path,
+    integrations: &IntegrationOptions,
+    services: &services::Options,
+    repairing: bool,
+) -> Result<()> {
     if !root.is_absolute() || !data.is_absolute() {
         return Err("installation and data directories must be absolute".into());
     }
-    if desktop_source.is_none() && (integrations.desktop_shortcut || integrations.menu_shortcut) {
-        return Err(
-            "App shortcuts require a desktop bundle; supply --app-bundle DIRECTORY.".into(),
-        );
+    if root.join("sinomo-setup-recovery.json").is_file() {
+        let _admission = sinomo_rollout::acquire_installation_guard(
+            &sinomo_rollout::SelfRolloutPaths::new(data),
+        )?;
+        transaction::recover(root, data)?;
     }
-    if let Some(source) = desktop_source {
-        desktop::verify_bundle(source, &desktop::read_manifest(source)?)?;
+    // A missing/bad payload must not even claim registration or inhibit DATA.
+    let existing = root.join(RECEIPT).is_file();
+    if existing {
+        let receipt = read_receipt(root)?;
+        if fs::canonicalize(data)? != receipt.data_dir {
+            return Err("installation is bound to another data directory".into());
+        }
+    }
+    let retained = data.join("bin").join(binary("sinomo")).is_file()
+        && data.join("bin").join(binary("sinomo-shadow")).is_file();
+    if retained && !repairing {
+        verify_runtime(data)?;
+    }
+    if existing && !retained && !repairing && read_receipt(root)?.complete {
+        verify_runtime(data)?;
+    }
+    let prepared = if retained || repairing {
+        None
+    } else {
+        if let Some(source) = desktop_source {
+            desktop::verify_bundle(source, &desktop::read_manifest(source)?)?;
+        }
+        let package = executable
+            .parent()
+            .filter(|p| p.join(crate::bundle::PAYLOAD).is_file())
+            .or(desktop_source)
+            .or_else(|| executable.parent())
+            .ok_or("no package directory")?;
+        crate::bundle::prepare(package, data, executable)?
+    };
+    if repairing && !existing && !retained {
+        return Err("no installation found to repair; use install for a new deployment".into());
     }
     fs::create_dir_all(root)?;
     fs::create_dir_all(data)?;
     validate_locations(root, data)?;
-    validate_new_owner(root, data)?;
-    if fs::read_dir(root)?.next().is_some() {
-        return Err("Choose an empty installation directory. Use rollout to evolve an existing installation.".into());
+    let root = fs::canonicalize(root)?;
+    let data = fs::canonicalize(data)?;
+    if !existing {
+        validate_new_owner(&root, &data)?;
+        if fs::read_dir(&root)?.next().is_some() {
+            return Err(
+                "Choose an empty installation directory or the registered installation folder."
+                    .into(),
+            );
+        }
     }
-    let retain_components = retained_runtime(data);
-    let bin = data.join("bin");
-    fs::create_dir_all(&bin)?;
-    let _admission =
-        sinomo_rollout::acquire_installation_guard(&sinomo_rollout::SelfRolloutPaths::new(data))?;
-    local::inhibit_deployment(data)?;
-    if !bin.join(binary("sinomo")).exists() {
-        fs::copy(executable, bin.join(binary("sinomo")))?;
-    }
-    if let Some(source) = desktop_source {
-        let manifest = desktop::read_manifest(source)?;
-        for file in &manifest.files {
-            if !desktop::is_desktop_payload_file(&file.path) {
-                continue;
+    if existing {
+        let receipt = read_receipt(&root)?;
+        if !receipt.owns_data {
+            return Err("installation does not own its recorded data directory".into());
+        }
+        match fs::read_to_string(data.join(DATA_OWNER)) {
+            Ok(owner) if fs::canonicalize(&owner).is_ok_and(|owner| owner != root) => {
+                return Err("data belongs to another installation".into());
             }
-            let destination = bin.join(&file.path);
-            if !destination.exists() {
-                fs::create_dir_all(destination.parent().ok_or("no component parent")?)?;
-                fs::copy(source.join(&file.path), destination)?;
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
+    let mut desired = if existing {
+        configuration(&root)?
+    } else if retained {
+        legacy_configuration(&root, &data)?
+    } else {
+        Configuration::default()
+    };
+    if let Some(value) = integrations.add_to_path {
+        desired.add_to_path = value;
+    }
+    if let Some(value) = integrations.menu_shortcut {
+        desired.menu_shortcut = value;
+    }
+    if let Some(value) = integrations.desktop_shortcut {
+        desired.desktop_shortcut = value;
+    }
+    if let Some(value) = services.startup {
+        desired.startup = value;
+    }
+    let desktop_available =
+        data.join("bin").join(binary("sinomo-app")).is_file() || desktop_source.is_some();
+    if !desktop_available
+        && (desired.menu_shortcut || desired.desktop_shortcut)
+        && (!repairing
+            || integrations.menu_shortcut == Some(true)
+            || integrations.desktop_shortcut == Some(true))
+    {
+        return Err(
+            "App shortcuts require a desktop bundle; supply --app-bundle DIRECTORY.".into(),
+        );
+    }
+    let _admission =
+        sinomo_rollout::acquire_installation_guard(&sinomo_rollout::SelfRolloutPaths::new(&data))?;
+    transaction::recover(&root, &data)?;
+    // Native selection/predecessor metadata is projected under the same local
+    // admission used by module mutations. Incoming validation precedes fencing
+    // or shutdown and never depends on an installed daemon or its data stores.
+    let repair_plan = if repairing {
+        Some(repair::RepairPlan::prepare(
+            executable,
+            desktop_source,
+            &root,
+            &data,
+        )?)
+    } else {
+        None
+    };
+    let mut transaction = if repairing {
+        None
+    } else {
+        Some(transaction::SetupTransaction::begin(
+            &root,
+            &data,
+            prepared.is_some(),
+        )?)
+    };
+    let mut readiness_options = services.clone();
+    readiness_options.startup = Some(desired.startup);
+    let reconcile_integrations = !repairing
+        || !existing
+        || integrations.add_to_path.is_some()
+        || integrations.menu_shortcut.is_some()
+        || integrations.desktop_shortcut.is_some();
+    let result = (|| -> Result<()> {
+        if !retained || repairing {
+            local::inhibit_deployment(&data)?;
+        }
+        if let Some(plan) = &repair_plan {
+            let services = if existing {
+                read_receipt(&root)?.services
+            } else {
+                None
+            };
+            removal::stop(&root, &data, services.as_ref())?;
+            plan.apply(&data)?;
+        }
+        fs::create_dir_all(data.join("bin"))?;
+        if !data.join("bin").join(binary("sinomo")).exists() {
+            fs::copy(executable, data.join("bin").join(binary("sinomo")))?;
+        }
+        if !existing {
+            let files = installed_files()
+                .into_iter()
+                .chain([
+                    binary("sinomo-setup"),
+                    local::INSTALLED_DATA_DIR_FILE.into(),
+                    RECEIPT.into(),
+                    "windows-integration.ps1".into(),
+                    "windows-integration.json.next".into(),
+                    "uninstall.ps1".into(),
+                    "sinomo-setup-recovery.json".into(),
+                    crate::bundle::PAYLOAD.into(),
+                ])
+                .collect();
+            configure_with_files(&root, &data, None, files)?;
+        }
+        // Verification repairs the installation binding, never component selection.
+        write_if_changed(
+            &root.join(local::INSTALLED_DATA_DIR_FILE),
+            data.to_str().ok_or("invalid data path")?.as_bytes(),
+        )?;
+        write_if_changed(
+            &data.join("bin").join(local::INSTALLED_DATA_DIR_FILE),
+            data.to_str().ok_or("invalid data path")?.as_bytes(),
+        )?;
+        write_if_changed(
+            &data.join(DATA_OWNER),
+            root.to_str().ok_or("invalid installation path")?.as_bytes(),
+        )?;
+        if let Some(payload) = prepared {
+            payload.install(&data, true)?;
+        }
+        local::enable_deployment(&data)?;
+        if !retained && !repairing {
+            if let Some(source) = desktop_source {
+                let manifest = desktop::read_manifest(source)?;
+                for file in &manifest.files {
+                    if !desktop::is_desktop_payload_file(&file.path) {
+                        continue;
+                    }
+                    let destination = data.join("bin").join(&file.path);
+                    if !destination.exists() {
+                        fs::create_dir_all(destination.parent().ok_or("no component parent")?)?;
+                        fs::copy(source.join(&file.path), destination)?;
+                    }
+                }
+                if !data.join("bin/desktop-release.json").is_file() {
+                    fs::copy(
+                        source.join("desktop-release.json"),
+                        data.join("bin/desktop-release.json"),
+                    )?;
+                }
+                if source.join(binary("sinomo-setup")).is_file() {
+                    #[cfg(target_os = "linux")]
+                    let destination = data.join("bin").join(binary("sinomo-setup"));
+                    #[cfg(not(target_os = "linux"))]
+                    let destination = root.join(binary("sinomo-setup"));
+                    if !destination.is_file() {
+                        fs::copy(source.join(binary("sinomo-setup")), destination)?;
+                    }
+                }
+                let releases = desktop::DesktopReleases::new(&data);
+                if releases.status()?.active_release.is_none() {
+                    let layout = crate::InstallLayout::new(
+                        &local::SinomoDataDir::new(&data),
+                        data.join("boot"),
+                    );
+                    crate::install_desktop_bundle(&layout, source)?;
+                }
             }
         }
-        if !bin.join("desktop-release.json").exists() {
-            fs::copy(
-                source.join("desktop-release.json"),
-                bin.join("desktop-release.json"),
+        #[cfg(windows)]
+        {
+            write_if_changed(
+                &root.join("windows-integration.ps1"),
+                include_bytes!("initial_setup/windows-integration.ps1"),
+            )?;
+            write_if_changed(
+                &root.join("uninstall.ps1"),
+                include_bytes!("initial_setup/uninstall.ps1"),
             )?;
         }
-        if source.join(binary("sinomo-setup")).is_file() {
-            let destination = if cfg!(target_os = "linux") {
-                bin.join(binary("sinomo-setup"))
-            } else {
-                root.join(binary("sinomo-setup"))
-            };
-            if !destination.exists() {
-                fs::copy(source.join(binary("sinomo-setup")), destination)?;
+        local::enable_deployment(&data)?;
+        let mut effective = services.clone();
+        effective.startup = Some(desired.startup);
+        effective.start = false;
+        complete_services(&root, &effective)?;
+        #[cfg(windows)]
+        {
+            let mut args = vec!["--register".to_string()];
+            if desired.add_to_path {
+                args.push("--path".into());
+            }
+            if desired.menu_shortcut {
+                args.push("--menu".into());
+            }
+            if desired.desktop_shortcut {
+                args.push("--desktop".into());
+            }
+            if reconcile_integrations {
+                windows_integration(&root, "install", &args)?;
             }
         }
-    }
-    let mut files = Vec::new();
-    files.extend([
-        binary("sinomo-setup"),
-        local::INSTALLED_DATA_DIR_FILE.into(),
-        RECEIPT.into(),
-        "windows-integration.ps1".into(),
-        "windows-integration.json.next".into(),
-        "uninstall.ps1".into(),
-        crate::bundle::PAYLOAD.into(),
-    ]);
-    configure_with_files(root, data, desktop_source, files)?;
-    let package = executable
-        .parent()
-        .filter(|p| p.join(crate::bundle::PAYLOAD).is_file())
-        .or(desktop_source)
-        .or_else(|| executable.parent())
-        .ok_or("no package directory")?;
-    complete_payload(package, data, desktop_source, retain_components)?;
-    drop(_admission);
+        #[cfg(target_os = "linux")]
+        if reconcile_integrations {
+            linux_integration(
+                &root,
+                desired.add_to_path,
+                desired.menu_shortcut,
+                desired.desktop_shortcut,
+            )?;
+        }
+        let mut receipt = read_receipt(&root)?;
+        if receipt.configuration.as_ref() != Some(&desired) || !receipt.complete {
+            receipt.configuration = Some(desired);
+            receipt.complete = true;
+            write_receipt(&root, &receipt)?;
+        }
+        if !repairing {
+            verify_runtime(&data)?;
+        }
+        Ok(())
+    })();
     #[cfg(windows)]
-    {
-        fs::write(
-            root.join("windows-integration.ps1"),
-            include_str!("initial_setup/windows-integration.ps1"),
-        )?;
-        fs::write(
-            root.join("uninstall.ps1"),
-            include_str!("initial_setup/uninstall.ps1"),
-        )?;
-        let mut args = vec!["--register".into()];
-        if integrations.add_to_path {
-            args.push("--path".into());
+    if repairing && root.join("windows-integration.ps1").is_file() {
+        if let Err(finalization) = windows_integration(&root, "commit", &[]) {
+            return Err(match result {
+                Err(error) => {
+                    format!("{error}; shell configuration finalization failed: {finalization}")
+                        .into()
+                }
+                Ok(()) => finalization,
+            });
         }
-        if integrations.desktop_shortcut {
-            args.push("--desktop".into());
-        }
-        if integrations.menu_shortcut {
-            args.push("--menu".into());
-        }
-        windows_integration(root, "install", &args)?;
     }
-    #[cfg(target_os = "linux")]
-    linux_integration(
-        root,
-        integrations.add_to_path,
-        integrations.menu_shortcut,
-        integrations.desktop_shortcut,
-    )?;
-    complete_services(root, services)?;
-    Ok(())
+    match result {
+        Ok(()) => {
+            if let Some(transaction) = &mut transaction {
+                transaction.commit()?;
+            }
+            drop(_admission);
+            if readiness_options.start {
+                complete_services(&root,&readiness_options).map_err(|error|->Box<dyn std::error::Error>{
+                    if repairing {
+                        format!("Packaged binaries repaired and data retained, but daemon readiness verification failed: {error}. Downgrades are not supported; existing data may require a newer release. The repaired binaries remain installed.").into()
+                    } else {
+                        format!("Installation configured, but daemon readiness verification failed: {error}. Run install again to verify or repair startup.").into()
+                    }
+                })?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(transaction) = &mut transaction {
+                if let Err(recovery) = transaction.rollback() {
+                    return Err(format!(
+                        "{error}; setup recovery failed: {recovery}; recovery journal retained at {}",
+                        root.join("sinomo-setup-recovery.json").display()
+                    )
+                    .into());
+                }
+            }
+            drop(_admission);
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if fs::read(path).is_ok_and(|current| current == bytes) {
+        return Ok(false);
+    }
+    fs::create_dir_all(path.parent().ok_or("no file parent")?)?;
+    fs::write(path, bytes)?;
+    Ok(true)
 }
 
 pub fn complete_services(root: &Path, options: &services::Options) -> Result<()> {
@@ -325,6 +780,8 @@ fn configure_with_files(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         },
+        configuration: None,
+        complete: false,
     };
     // Persist recovery/removal information before installing managed state or integrations.
     write_receipt(&root, &receipt)?;
@@ -635,7 +1092,17 @@ fn schedule_running_file_removal(file: &Path, root: &Path, remove_empty_root: bo
 #[cfg(windows)]
 pub fn windows_integration(root: &Path, action: &str, args: &[String]) -> Result<()> {
     use std::os::windows::process::CommandExt;
-    if action == "uninstall" && !root.join("windows-integration.json").exists() {
+    if matches!(action, "uninstall" | "commit" | "rollback")
+        && !root.join("windows-integration.json").exists()
+    {
+        return Ok(());
+    }
+    if matches!(action, "commit" | "rollback")
+        && fs::read(root.join("windows-integration.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value.get("pendingBefore").is_none())
+    {
         return Ok(());
     }
     let mut command = Command::new("powershell.exe");
@@ -690,14 +1157,33 @@ fn desktop_quote(path: &Path) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub fn linux_integration(root: &Path, path: bool, menu: bool, desktop: bool) -> Result<()> {
-    let mut receipt = read_receipt(root)?;
+fn linux_integration_paths() -> Result<Vec<PathBuf>> {
     let home = home()?;
     let applications = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"))
         .join("applications");
-    fs::create_dir_all(&applications)?;
+    let desktop = Command::new("xdg-user-dir")
+        .arg("DESKTOP")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|p| PathBuf::from(p.trim()))
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join("Desktop"));
+    Ok(vec![
+        applications.join("net.sinomo.uninstall.desktop"),
+        applications.join("net.sinomo.app.desktop"),
+        desktop.join("net.sinomo.app.desktop"),
+        home.join(".profile"),
+    ])
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_integration(root: &Path, path: bool, menu: bool, desktop: bool) -> Result<()> {
+    let mut receipt = read_receipt(root)?;
+    let paths = linux_integration_paths()?;
     let app_entry = format!(
         "[Desktop Entry]\nType=Application\nName=Sinomo\nExec={}\nTerminal=false\nCategories=Utility;\n",
         desktop_quote(&receipt.data_dir.join("bin/sinomo-app"))
@@ -714,60 +1200,80 @@ pub fn linux_integration(root: &Path, path: bool, menu: bool, desktop: bool) -> 
             desktop_quote(root)
         )
     };
-    let mut entries = vec![(
-        applications.join("net.sinomo.uninstall.desktop"),
-        format!(
-            "[Desktop Entry]\nType=Application\nName=Uninstall Sinomo\nExec={}\nTerminal=false\nCategories=Utility;\n",
-            remove_command
-        ),
-    )];
+    let remove_entry = format!(
+        "[Desktop Entry]\nType=Application\nName=Uninstall Sinomo\nExec={}\nTerminal=false\nCategories=Utility;\nX-Sinomo-InstallDir={}\nX-Sinomo-DataDir={}\n",
+        remove_command,
+        receipt.install_dir.display(),
+        receipt.data_dir.display()
+    );
+    let mut wanted = vec![(paths[0].clone(), remove_entry)];
     if menu {
-        entries.push((
-            applications.join("net.sinomo.app.desktop"),
-            app_entry.clone(),
-        ));
+        wanted.push((paths[1].clone(), app_entry.clone()));
     }
     if desktop {
-        let directory = Command::new("xdg-user-dir")
-            .arg("DESKTOP")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| PathBuf::from(s.trim()))
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home.join("Desktop"));
-        fs::create_dir_all(&directory)?;
-        entries.push((directory.join("net.sinomo.app.desktop"), app_entry));
+        wanted.push((paths[2].clone(), app_entry));
     }
-    for (file, content) in entries {
-        use std::io::Write;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file)?;
-        receipt.integrations.push(file.clone());
-        write_receipt(root, &receipt)?;
-        output.write_all(content.as_bytes())?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(file, fs::Permissions::from_mode(0o755))?;
-    }
-    if path {
-        let profile = home.join(".profile");
-        let mut content = fs::read_to_string(&profile).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Ok(String::new())
-            } else {
-                Err(e)
+    let owned = |text: &str| {
+        ["sinomo", "sinomo-app", "sinomo-setup"]
+            .iter()
+            .any(|name| text.contains(&desktop_quote(&receipt.data_dir.join("bin").join(name))))
+    };
+    // Check all collisions before changing shell state.
+    for (file, expected) in &wanted {
+        match fs::read_to_string(file) {
+            Ok(current) if current != *expected && !owned(&current) => {
+                return Err(format!(
+                    "shortcut belongs to another application: {}",
+                    file.display()
+                )
+                .into());
             }
-        })?;
-        let block = profile_block(&receipt.data_dir.join("bin"));
-        if !content.contains(&block) {
-            content.push_str(&block);
-            fs::write(&profile, content)?;
-            receipt.integrations.push(profile);
-            write_receipt(root, &receipt)?;
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
         }
+    }
+    let mut active = Vec::new();
+    for (file, content) in &wanted {
+        write_if_changed(file, content.as_bytes())?;
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(file)?.permissions().mode() & 0o777 != 0o755 {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o755))?;
+        }
+        active.push(file.clone());
+    }
+    for file in &receipt.integrations {
+        if file == &paths[3] || active.contains(file) {
+            continue;
+        }
+        if let Ok(current) = fs::read_to_string(file) {
+            if owned(&current) {
+                fs::remove_file(file)?;
+            }
+        }
+    }
+    let profile = &paths[3];
+    let mut text = fs::read_to_string(profile).or_else(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Ok(String::new())
+        } else {
+            Err(e)
+        }
+    })?;
+    let block = profile_block(&receipt.data_dir.join("bin"));
+    if path {
+        if !text.contains(&block) {
+            text.push_str(&block);
+            write_if_changed(profile, text.as_bytes())?;
+        }
+        active.push(profile.clone());
+    } else if text.contains(&block) {
+        write_if_changed(profile, text.replace(&block, "").as_bytes())?;
+    }
+    active.sort();
+    active.dedup();
+    if active != receipt.integrations {
+        receipt.integrations = active;
+        write_receipt(root, &receipt)?;
     }
     Ok(())
 }
@@ -812,6 +1318,244 @@ fn linux_remove_integrations(receipt: &Receipt) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "isolated subprocess fixture"]
+    fn reconcile_fixture() {
+        let Some(fixture) = std::env::var_os("SINOMO_SETUP_TEST_ROOT") else {
+            return;
+        };
+        let fixture = PathBuf::from(fixture);
+        let root = fixture.join("application");
+        let data = fixture.join("data");
+        let package = fixture.join("package");
+        fs::create_dir_all(&package).unwrap();
+        let executable = package.join("sinomo");
+        fs::write(&executable, b"candidate CLI").unwrap();
+        let options = services::Options {
+            start: false,
+            ..services::Options::default()
+        };
+        // A source CLI with no package fails identically on repeat, without state.
+        for _ in 0..2 {
+            let error = install(
+                &executable,
+                None,
+                &root,
+                &data,
+                &IntegrationOptions::default(),
+                &options,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("initial-payload.tar is missing"));
+            assert!(!root.join(RECEIPT).exists());
+            assert!(!data.join(DATA_OWNER).exists());
+            assert!(!data.join(local::REMOVAL_FENCE).exists());
+        }
+        fs::create_dir_all(data.join("bin")).unwrap();
+        for name in ["sinomo", "sinomo-shadow", "sinomo-app"] {
+            fs::write(data.join("bin").join(name), b"evolved component").unwrap();
+        }
+        fs::write(data.join("personal-file"), b"keep").unwrap();
+        // Adopting an existing deployment must preserve its actual shell settings.
+        fs::write(
+            home().unwrap().join(".profile"),
+            profile_block(&data.join("bin")),
+        )
+        .unwrap();
+        install(
+            &executable,
+            None,
+            &root,
+            &data,
+            &IntegrationOptions::default(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(
+            configuration(&root).unwrap(),
+            Configuration {
+                add_to_path: true,
+                ..Configuration::default()
+            }
+        );
+        let first = fs::read(root.join(RECEIPT)).unwrap();
+        let modified = fs::metadata(root.join(RECEIPT))
+            .unwrap()
+            .modified()
+            .unwrap();
+        install(
+            &executable,
+            None,
+            &root,
+            &data,
+            &IntegrationOptions::default(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.join(RECEIPT)).unwrap(), first);
+        assert_eq!(
+            fs::metadata(root.join(RECEIPT))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified,
+            "verification must not rewrite the receipt"
+        );
+        let enabled = IntegrationOptions {
+            add_to_path: Some(true),
+            desktop_shortcut: Some(true),
+            menu_shortcut: Some(true),
+        };
+        let no_startup = services::Options {
+            startup: Some(false),
+            ..options.clone()
+        };
+        install(&executable, None, &root, &data, &enabled, &no_startup).unwrap();
+        let configured = configuration(&root).unwrap();
+        assert!(
+            configured.add_to_path
+                && configured.desktop_shortcut
+                && configured.menu_shortcut
+                && !configured.startup
+        );
+        let receipt = read_receipt(&root).unwrap();
+        let registration = receipt.services.as_ref().unwrap();
+        assert!(
+            registration
+                .enabled_links
+                .iter()
+                .all(|(link, _)| fs::symlink_metadata(link).is_err())
+        );
+        let profile = home().unwrap().join(".profile");
+        assert!(
+            fs::read_to_string(&profile)
+                .unwrap()
+                .contains(&profile_block(&data.join("bin")))
+        );
+        // A different frontend with omitted preferences preserves the settings.
+        install(
+            &executable,
+            None,
+            &root,
+            &data,
+            &IntegrationOptions::default(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(configuration(&root).unwrap(), configured);
+        let disabled = IntegrationOptions {
+            add_to_path: Some(false),
+            desktop_shortcut: Some(false),
+            menu_shortcut: Some(false),
+        };
+        install(
+            &executable,
+            None,
+            &root,
+            &data,
+            &disabled,
+            &services::Options {
+                startup: Some(true),
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(configuration(&root).unwrap(), Configuration::default());
+        assert!(
+            !fs::read_to_string(&profile)
+                .unwrap()
+                .contains(&profile_block(&data.join("bin")))
+        );
+        let paths = linux_integration_paths().unwrap();
+        assert!(!paths[1].exists() && !paths[2].exists());
+        // Integration conflicts roll back metadata and startup state.
+        fs::write(&paths[1], "[Desktop Entry]\nExec=/another/application\n").unwrap();
+        let before = fs::read(root.join(RECEIPT)).unwrap();
+        let error = install(&executable, None, &root, &data, &enabled, &no_startup).unwrap_err();
+        assert!(error.to_string().contains("another application"));
+        assert_eq!(fs::read(root.join(RECEIPT)).unwrap(), before);
+        assert!(
+            read_receipt(&root)
+                .unwrap()
+                .services
+                .unwrap()
+                .enabled_links
+                .iter()
+                .all(|(link, _)| fs::symlink_metadata(link).is_ok())
+        );
+        assert!(!data.join(local::REMOVAL_FENCE).exists());
+        fs::remove_file(&paths[1]).unwrap();
+        // A crash has a durable compensation record, and retry restores it.
+        let transaction = transaction::SetupTransaction::begin(&root, &data, false).unwrap();
+        local::inhibit_deployment(&data).unwrap();
+        fs::write(data.join(DATA_OWNER), "bad owner").unwrap();
+        std::mem::forget(transaction);
+        install(
+            &executable,
+            None,
+            &root,
+            &data,
+            &IntegrationOptions::default(),
+            &options,
+        )
+        .unwrap();
+        assert!(!data.join(local::REMOVAL_FENCE).exists());
+        assert!(!root.join("sinomo-setup-recovery.json").exists());
+        for name in ["sinomo", "sinomo-shadow", "sinomo-app"] {
+            assert_eq!(
+                fs::read(data.join("bin").join(name)).unwrap(),
+                b"evolved component"
+            );
+        }
+        uninstall(&root, false).unwrap();
+        assert!(data.join("personal-file").is_file());
+        assert!(data.join("bin/sinomo").is_file());
+        assert!(data.join(local::REMOVAL_FENCE).is_file());
+        install(
+            &executable,
+            None,
+            &root,
+            &data,
+            &IntegrationOptions::default(),
+            &options,
+        )
+        .unwrap();
+        uninstall(&root, true).unwrap();
+        assert!(!data.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_setup_verifies_reconfigures_recovers_and_removes() {
+        let fixture = sinomo_testdir::TestDir::new("setup-reconciliation");
+        let home = fixture.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "initial_setup::tests::reconcile_fixture",
+                "--nocapture",
+            ])
+            .env("SINOMO_SETUP_TEST_ROOT", fixture.path())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", fixture.join("xdg-config"))
+            .env("XDG_DATA_HOME", fixture.join("xdg-data"))
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", fixture.join("no-bus").display()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

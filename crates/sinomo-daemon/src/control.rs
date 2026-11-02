@@ -54,6 +54,7 @@ const DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH: u8 = 1 << 0;
 const DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY: u8 = 1 << 1;
 const DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY: u8 = 1 << 2;
 const DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT: u8 = 1 << 3;
+const DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION: u8 = 1 << 4;
 
 /// Identifies the durable input that invalidated a cluster-maintenance
 /// projection. Callers publish intent instead of resetting the whole
@@ -72,6 +73,9 @@ pub(crate) enum DaemonClusterMaintenanceReason {
     /// targets. The KV observer owns this wake for every node, including peers
     /// that did not execute the join request locally.
     CommittedConnectivityTopologyChanged,
+    /// The local connectivity store committed a route-relevant source change.
+    /// Main publishes the stored source set; no new probe generation starts.
+    LocalConnectivitySourceChanged,
     /// A committed member display-name generation changed.
     Rename,
     /// A committed role generation changed scheduler and member projections.
@@ -102,6 +106,9 @@ const fn daemon_cluster_maintenance_request_plan(
         },
         Reason::CommittedConnectivityTopologyChanged => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY,
+        },
+        Reason::LocalConnectivitySourceChanged => DaemonClusterMaintenanceRequestPlan {
+            dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION,
         },
         Reason::Rename => DaemonClusterMaintenanceRequestPlan {
             dirty: DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH,
@@ -313,11 +320,40 @@ fn daemon_network_environment_watch_enabled_for(value: Option<&str>, is_linux: b
 struct DaemonConnectivityTopologySubscriptions {
     _observation_subscription: sinomo_core::kv::KvCommittedObservationSubscription,
     _external_snapshot_watcher: Option<notify::RecommendedWatcher>,
+    _local_source_publication: Option<DaemonLocalConnectivitySourcePublication>,
     // The callbacks retain this too. Keeping it here makes the ownership
     // explicit and lets focused tests inspect the independent observer.
     _projection: Arc<Mutex<DaemonConnectivityTopologyProjection>>,
     #[cfg(test)]
     _scheduled_changes: Arc<AtomicU64>,
+}
+
+/// Main-only bridge from the local connectivity store's route-relevant change
+/// stream to the single publication owner. Command observations and relay
+/// feedback commit outside a maintenance turn; this wakes their publication
+/// instead of leaving it to the next scheduled turn.
+struct DaemonLocalConnectivitySourcePublication(tokio::task::JoinHandle<()>);
+
+impl Drop for DaemonLocalConnectivitySourcePublication {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn watch_daemon_local_connectivity_source(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    runtime: &tokio::runtime::Handle,
+    wake: impl Fn() + Send + 'static,
+) -> DaemonLocalConnectivitySourcePublication {
+    let mut changes = sinomo_core::network::__connectivity_store::subscribe_local_cluster_connectivity_routing_generation(
+        cluster_paths,
+    );
+    DaemonLocalConnectivitySourcePublication(runtime.spawn(async move {
+        loop {
+            changes.changed().await;
+            wake();
+        }
+    }))
 }
 
 #[derive(Clone)]
@@ -696,6 +732,15 @@ fn subscribe_daemon_connectivity_topology_sources(
     let external_snapshot_watcher = crate::daemon_paths_are_shadow(paths)
         .then(|| daemon_connectivity_topology_snapshot_watcher(&cluster_paths, observer.clone()))
         .transpose()?;
+    // Only Main publishes the local source set. A shadow keeps its own
+    // observations local and has no publication owner to wake.
+    let local_source_publication = (!crate::daemon_paths_are_shadow(paths)).then(|| {
+        watch_daemon_local_connectivity_source(&cluster_paths, runtime, || {
+            request_daemon_cluster_maintenance(
+                DaemonClusterMaintenanceReason::LocalConnectivitySourceChanged,
+            )
+        })
+    });
     // Registration precedes the coherent native seed. A discontinuity that
     // crosses the read invalidates its generation; a shadow instead joins one
     // bounded main-daemon ReadIndex request without opening local Raft.
@@ -727,6 +772,7 @@ fn subscribe_daemon_connectivity_topology_sources(
     Ok(DaemonConnectivityTopologySubscriptions {
         _observation_subscription: observation_subscription,
         _external_snapshot_watcher: external_snapshot_watcher,
+        _local_source_publication: local_source_publication,
         _projection: projection,
         #[cfg(test)]
         _scheduled_changes: scheduled_changes,
@@ -1088,6 +1134,17 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     } else {
         None
     };
+    // A clustered main that could not open its local Raft node at startup
+    // reports the later ownership through this edge.
+    let (raft_resident_ready, startup_raft_resident_ready) = if startup_cluster_runtime_enabled
+        && !startup_local_raft_resident_initialized
+        && !crate::daemon_paths_are_shadow(&paths)
+    {
+        let (ready, observed) = tokio::sync::watch::channel(false);
+        (Some(ready), Some(observed))
+    } else {
+        (None, None)
+    };
     runtime_tasks.push((
         "background maintenance",
         daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
@@ -1098,6 +1155,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
             maintenance_runtime,
             maintenance_startup_cluster,
             startup_local_raft_resident_initialized,
+            raft_resident_ready,
             maintenance_connectivity_topology_subscription,
             startup_cluster_runtime_enabled,
             maintenance_inhibitors,
@@ -1109,8 +1167,28 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     // The listener is already bound and will accept queued connections as
     // soon as the runtime enters the loop below. Notify service-owned workers
     // through an in-process edge so startup never depends on a polling timer.
-    service_host.notify_component_host_ready();
-    daemon_runtime.block_on(run_daemon_control_accept_loop(
+    // Workers use cluster storage, so a clustered main notifies them once it
+    // owns its local Raft node; a replacement may wait for its predecessor.
+    if let Some(mut raft_ready) = startup_raft_resident_ready {
+        let ready_host = service_host.clone();
+        let mut ready_shutdown = shutdown_rx.clone();
+        runtime_tasks.push((
+            "component host readiness",
+            daemon_runtime_handle.spawn(async move {
+                tokio::select! {
+                    ready = raft_ready.wait_for(|ready| *ready) => {
+                        if ready.is_ok() {
+                            ready_host.notify_component_host_ready();
+                        }
+                    }
+                    _ = ready_shutdown.wait_for(|stopping| *stopping) => {}
+                }
+            }),
+        ));
+    } else {
+        service_host.notify_component_host_ready();
+    }
+    let accept_result = daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
         paths.clone(),
         label.to_string(),
@@ -1119,7 +1197,10 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         daemon_runtime_handle.clone(),
         shutdown_tx,
         shutdown_rx.clone(),
-    ))?;
+    ));
+    if let Err(error) = &accept_result {
+        tracing::error!(%error, "sinomo {label} control accept loop failed; shutting down");
+    }
     let component_shutdown =
         service_host.shutdown_components(&daemon_runtime_handle, DAEMON_RUNTIME_TASK_JOIN_TIMEOUT);
     let _ = shutdown_signal.send(true);
@@ -1135,7 +1216,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     drain_daemon_runtime_after_task_shutdown(&daemon_runtime);
     crate::append_operational_event_best_effort(
         &paths,
-        if component_shutdown.is_ok() {
+        if accept_result.is_ok() && component_shutdown.is_ok() {
             crate::OperationalSeverity::Info
         } else {
             crate::OperationalSeverity::Error
@@ -1146,19 +1227,30 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         } else {
             "daemon.lifecycle.stop-incomplete"
         },
-        match &component_shutdown {
-            Ok(()) => format!("sinomo {label} stopped"),
-            Err(error) => format!("sinomo {label} component shutdown remains incomplete: {error}"),
+        match (&accept_result, &component_shutdown) {
+            (Ok(()), Ok(())) => format!("sinomo {label} stopped"),
+            (Err(error), Ok(())) => {
+                format!("sinomo {label} stopped after control accept loop failed: {error}")
+            }
+            (Ok(()), Err(error)) => {
+                format!("sinomo {label} component shutdown remains incomplete: {error}")
+            }
+            (Err(accept), Err(shutdown)) => format!(
+                "sinomo {label} control accept loop failed: {accept}; component shutdown remains incomplete: {shutdown}"
+            ),
         },
         None,
         serde_json::json!({
             "label": label,
             "address": bind_address,
             "pid": std::process::id(),
+            "accept_loop_error": accept_result.as_ref().err().map(ToString::to_string),
+            "component_shutdown_error": component_shutdown.as_ref().err().map(ToString::to_string),
         }),
     );
     daemon_runtime.shutdown_timeout(DAEMON_RUNTIME_SHUTDOWN_TIMEOUT);
-    component_shutdown
+    // Preserve the original run failure even when component shutdown also fails.
+    accept_result.and(component_shutdown)
 }
 
 fn join_daemon_runtime_task(
@@ -1312,6 +1404,10 @@ impl sinomo_core::cluster::ClusterMaintenanceReactorHost for DaemonClusterMainte
         if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY != 0 {
             self.cluster_network.request_discovery_refresh(now);
         }
+        if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION != 0 {
+            self.cluster_network
+                .request_connectivity_source_publication(now);
+        }
     }
 
     fn wait_for_external_change<'a>(
@@ -1334,6 +1430,7 @@ async fn run_daemon_background_maintenance_loop(
     runtime: tokio::runtime::Handle,
     startup_cluster: Option<DaemonClusterStatus>,
     startup_local_raft_resident_initialized: bool,
+    local_raft_resident_ready: Option<tokio::sync::watch::Sender<bool>>,
     connectivity_topology_subscription: Option<DaemonConnectivityTopologySubscriptions>,
     maintain_cluster_runtime: bool,
     maintenance_inhibitors: Vec<sinomo_module::ComponentMaintenanceInhibitor>,
@@ -1346,6 +1443,9 @@ async fn run_daemon_background_maintenance_loop(
         startup_local_raft_resident_initialized,
     )
     .await;
+    if let Some(ready) = local_raft_resident_ready {
+        cluster_network.notify_local_raft_resident_ready(ready);
+    }
     let current_node_resources = node_resources.take_latest();
     cluster_network.set_resource_mode(current_node_resources.mode);
     observe_daemon_node_resources(current_node_resources);
@@ -1757,19 +1857,35 @@ async fn daemon_control_stream_uses_authenticated_transport_prelude(
     }
 }
 
+/// Membership for authorizing an inbound peer, no older than this node's
+/// applied cluster state. A member admitted a moment ago must be recognized on
+/// its first contact, so an in-flight KV mutation is waited out on the
+/// blocking lane instead of answered from an earlier observation.
+async fn read_authorization_directory_records(
+    cluster_paths: &sinomo_core::network::ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> Result<sinomo_core::network::DirectoryRecordsSnapshot, DaemonError> {
+    let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
+        sinomo_core::network::cluster_directory_for(cluster_paths),
+        state,
+    );
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    let records = tokio::task::spawn_blocking(move || directory.current_records_snapshot(deadline))
+        .await
+        .map_err(|source| DaemonError::Io {
+            path: cluster_paths.root.display().to_string(),
+            detail: format!("authorization directory read task failed: {source}"),
+        })??;
+    Ok(records)
+}
+
 fn resolve_authenticated_transport_peer(
-    paths: &DaemonPaths,
+    records: sinomo_core::network::DirectoryRecordsSnapshot,
     state: &sinomo_core::ClusterBootstrapState,
     metadata: &sinomo_core::network::AuthenticatedTransportMetadata,
     local_node_id: &NodeId,
     identity: &dyn sinomo_core::network::RoutedSessionIdentity,
 ) -> Result<(NodeId, sinomo_core::network::DirectorySnapshot, [String; 2]), DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let records = sinomo_core::network::cluster_directory_with_bootstrap_state(
-        sinomo_core::network::cluster_directory_for(&cluster_paths),
-        state,
-    )
-    .records_snapshot()?;
     let (version, members, endpoints) = records.into_parts();
     let directory = sinomo_core::network::DirectorySnapshot::try_from_records(
         version,
@@ -1895,8 +2011,9 @@ async fn handle_daemon_authenticated_transport_stream_async(
         local_node_id.clone(),
         data_dir,
     )?);
+    let records = read_authorization_directory_records(&cluster_paths, &state).await?;
     let (peer_node_id, directory, admitted_pool_scopes) = resolve_authenticated_transport_peer(
-        &paths,
+        records,
         &state,
         &metadata,
         &local_node_id,
@@ -2637,6 +2754,80 @@ mod tests {
     use std::fs;
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_source_change_wakes_publication_without_a_probe_generation() {
+        use sinomo_core::network::ClusterConnectivityState;
+        assert_eq!(
+            daemon_cluster_maintenance_request_plan(
+                DaemonClusterMaintenanceReason::LocalConnectivitySourceChanged
+            )
+            .dirty,
+            DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY_PUBLICATION,
+            "a stored source change asks for publication only"
+        );
+        let root = sinomo_testdir::TestDir::new("local-source-publication-wake");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let now = OffsetDateTime::now_utc();
+        let local = NodeId::generate();
+        let remote = NodeId::generate();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::Id::generate(),
+            "local source publication",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_core::network::daemon_lan_endpoint(&remote, "127.0.0.2:21353".into(), 0);
+        let mut member = sinomo_core::ClusterMemberRecord::local_non_voting(
+            state.cluster_id.clone(),
+            remote,
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.endpoints.push(endpoint.clone());
+        state.members.push(member);
+        let wakes = Arc::new(tokio::sync::Semaphore::new(0));
+        let wake = Arc::clone(&wakes);
+        let _watch = watch_daemon_local_connectivity_source(
+            &paths,
+            &tokio::runtime::Handle::current(),
+            move || wake.add_permits(1),
+        );
+        let observe = |connectivity| {
+            sinomo_core::network::__connectivity_store::record_daemon_owned_local_cluster_endpoint_command_connectivity(
+                &paths, &state, &endpoint, connectivity, Some(1), false,
+            )
+            .unwrap()
+        };
+        let next_wake = || async {
+            tokio::time::timeout(Duration::from_secs(5), wakes.acquire())
+                .await
+                .expect("source change wakes publication")
+                .unwrap()
+                .forget();
+        };
+
+        // An endpoint RPC proves a new edge: a semantic change of this source.
+        observe(ClusterConnectivityState::Healthy);
+        next_wake().await;
+        // A repeated success only refreshes freshness in memory.
+        observe(ClusterConnectivityState::Healthy);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            wakes.available_permits(),
+            0,
+            "observation-only refresh stays quiet"
+        );
+        // A failed endpoint RPC changes the stored edge again.
+        observe(ClusterConnectivityState::Unreachable);
+        next_wake().await;
+    }
 
     #[test]
     fn transient_routed_edge_failure_remains_probeable_during_restart() {

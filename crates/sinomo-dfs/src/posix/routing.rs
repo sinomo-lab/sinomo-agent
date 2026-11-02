@@ -35,12 +35,48 @@ enum RoutedNamespaceNetworkRecovery {
     Unchanged,
 }
 
+/// Possible owners of an immediate directory child under one exact catalog.
+/// A prefix boundary can own that child; deeper disjoint prefixes cannot.
+/// Hash assignments may select any child and retain the root fallback.
+pub(super) fn directory_child_authority_shards<'a>(
+    path: &str,
+    configs: &'a [DfsMetadataShardConfig],
+) -> Result<Vec<&'a DfsMetadataShardConfig>> {
+    let path = normalize_posix_path(path)?;
+    let directory_owner = crate::select_metadata_shard_config_for_path_strict_default_sifs_split(
+        &sifs_file_system_id(),
+        configs,
+        &path,
+    )
+    .map_err(DfsError::from)?
+    .ok_or_else(|| DfsPosixError::InvalidPath { path: path.clone() })?;
+    Ok(configs
+        .iter()
+        .filter(|shard| {
+            shard.shard_id == directory_owner.shard_id
+                || match &shard.assignment {
+                    crate::DfsMetadataShardAssignment::PathPrefix { prefix } => {
+                        normalize_posix_path(prefix).is_ok_and(|prefix| {
+                            parent_posix_path(&prefix).as_deref() == Some(path.as_str())
+                        })
+                    }
+                    crate::DfsMetadataShardAssignment::NameHashRange { .. } => true,
+                    crate::DfsMetadataShardAssignment::Root => matches!(
+                        &directory_owner.assignment,
+                        crate::DfsMetadataShardAssignment::NameHashRange { .. }
+                    ),
+                }
+        })
+        .collect())
+}
+
 fn namespace_operation_uses_stable_admission(operation: &DfsNamespaceOperation) -> bool {
     matches!(
         operation,
         DfsNamespaceOperation::Mkdir { .. }
             | DfsNamespaceOperation::MkdirWithAttrs { .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { .. }
+            | DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(_)
             | DfsNamespaceOperation::MkdirAll { .. }
             | DfsNamespaceOperation::ConditionalUnlink { .. }
             | DfsNamespaceOperation::ConditionalRmdir { .. }
@@ -49,6 +85,32 @@ fn namespace_operation_uses_stable_admission(operation: &DfsNamespaceOperation) 
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// A live assignment-boundary directory needs no child/parent mutation.
+    /// Observe it at its current owner before requesting that wider footprint.
+    /// None leaves ordinary paths unchanged; Some(false) is authoritative
+    /// evidence against accepting a cached local directory after a failure.
+    pub(super) fn routed_mkdir_boundary_directory_exists(
+        &mut self,
+        path: &str,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<Option<bool>> {
+        let crate::DfsMetadataShardAssignment::PathPrefix { prefix } = &shard.assignment else {
+            return Ok(None);
+        };
+        if normalize_posix_path(prefix)? != path {
+            return Ok(None);
+        }
+        let object = self.route_namespace_lookup_path_to_metadata_primary(
+            sifs_file_system_id(),
+            shard.primary_node_id.clone(),
+            path.to_owned(),
+            POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+        )?;
+        Ok(Some(object.is_some_and(|object| {
+            object.kind == DfsObjectKind::Directory
+        })))
+    }
+
     /// Run one local-primary read against a single durable metadata cut.
     ///
     /// A short-lived client backend may share shard files with the resident
@@ -844,7 +906,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_error,
                     current_primary_node_id,
                 } => match current_primary_node_id {
-                    Some(current) if current == self.node_id => {
+                    Some(current)
+                        if current == self.node_id
+                            && !self.transport.delegates_local_namespace_authority() =>
+                    {
                         // Authority moved to this node; execute locally.
                         return self.execute_routed_namespace_operation_locally(
                             Some(&operation_id),
@@ -860,7 +925,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 current,
                             )
                             .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id {
+                        if primary == self.node_id
+                            && !self.transport.delegates_local_namespace_authority()
+                        {
                             return self.execute_routed_namespace_operation_locally(
                                 Some(&operation_id),
                                 &operation,
@@ -990,7 +1057,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_error,
                     current_primary_node_id,
                 } => match current_primary_node_id {
-                    Some(current) if current == self.node_id => {
+                    Some(current)
+                        if current == self.node_id
+                            && !self.transport.delegates_local_namespace_authority() =>
+                    {
                         return self
                             .execute_routed_namespace_operation_locally(None, &operation)
                             .map(drop);
@@ -1004,7 +1074,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 current,
                             )
                             .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id {
+                        if primary == self.node_id
+                            && !self.transport.delegates_local_namespace_authority()
+                        {
                             return self
                                 .execute_routed_namespace_operation_locally(None, &operation)
                                 .map(drop);
@@ -1167,6 +1239,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path,
                     expected_parent_object_id,
                     expected_parent_version,
+                )
+                .map(drop),
+            DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(command) => self
+                .posix_mkdir_at_no_links_local_with_attrs(
+                    &command.path,
+                    &command.expected_parent_object_id,
+                    &command.expected_parent_version,
+                    command.attrs,
                 )
                 .map(drop),
             DfsNamespaceOperation::MkdirAll { path } => self.posix_mkdir_all_local(path),
@@ -1772,7 +1852,7 @@ where
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            if primary == self.node_id {
+            if primary == self.node_id && !self.transport.delegates_local_namespace_authority() {
                 self.execute_posix_coordination_operation_local(&operation)?;
                 return self
                     .current_read_object_metadata(object_id)
@@ -1865,14 +1945,4 @@ where
             ),
         }))
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        DfsAdvisoryLockStateRecord, DfsMetadataVersionPinRecord, DfsObjectMetadata, DfsVersion,
-        directory_object,
-    };
-    use time::OffsetDateTime;
 }

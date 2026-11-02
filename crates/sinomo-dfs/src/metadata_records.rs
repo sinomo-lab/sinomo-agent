@@ -8,19 +8,16 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
-use crate::metadata_api::DfsMetadataBackend;
 use crate::metadata_keys::{normalize_node_locations, object_inode_id};
 use crate::{
-    DfsError, DfsFileSystem, DfsFileSystemId, DfsNamespaceObjectPrecondition,
-    DfsNamespaceOperation, DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-    DfsPosixCoordinationResult, DfsReplicationPolicy, DfsRevisionReference, DfsVersion,
-    normalize_current_locations,
+    DfsFileSystem, DfsFileSystemId, DfsNamespaceObjectPrecondition, DfsNamespaceOperation,
+    DfsNamespaceResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixCoordinationResult,
+    DfsReplicationPolicy, DfsRevisionReference, DfsVersion, normalize_current_locations,
 };
 
 pub use sinomo_api::dfs::metadata_records::DfsContentDurability;
@@ -1980,26 +1977,6 @@ pub(crate) fn dfs_metadata_table_snapshot_state_fingerprint(
 #[cfg(test)]
 thread_local! {
     static DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_dfs_metadata_full_snapshot_fingerprint_calls() {
-    DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn dfs_metadata_full_snapshot_fingerprint_calls() -> usize {
-    DFS_METADATA_FULL_SNAPSHOT_FINGERPRINT_CALLS.get()
-}
-
-pub(crate) fn dfs_metadata_table_snapshot_matches_checkpoint(
-    snapshot: &DfsMetadataTableSnapshot,
-    journal_sequence: u64,
-    expected_fingerprint: &str,
-) -> Result<bool, serde_json::Error> {
-    Ok(snapshot.prefix_proof.journal_sequence == journal_sequence
-        && snapshot.prefix_proof.is_well_formed()
-        && snapshot.prefix_proof.digest == expected_fingerprint)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Eq, PartialEq)]

@@ -423,15 +423,17 @@ pub use raft::{
     prepare_cluster_kv_raft_proposals, process_local_raft_access_is_denied,
     read_cluster_kv_authoritative_snapshot_async_with_host,
     read_cluster_kv_authoritative_snapshot_with_host,
+    read_cluster_kv_raft_anchored_snapshot_before,
     replicate_cluster_kv_raft_to_target_async_with_host,
     replicate_cluster_kv_raft_to_target_with_host, validate_cluster_kv_raft_config_transition,
     with_cluster_kv_resident_read_projection, with_cluster_kv_resident_read_projection_before,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use raft::{
-    ResidentRaftNodeRegistryPin, clear_process_local_raft_access_denial_for_test,
-    cluster_kv_raft_operation_owner_for_test, cluster_kv_raft_operation_queue_depth_for_test,
-    evict_resident_raft_node_for_test, pin_resident_raft_node_registry_for_test,
+    ResidentRaftCheckoutHold, ResidentRaftNodeRegistryPin,
+    clear_process_local_raft_access_denial_for_test, cluster_kv_raft_operation_owner_for_test,
+    cluster_kv_raft_operation_queue_depth_for_test, evict_resident_raft_node_for_test,
+    hold_resident_raft_checkout_for_test, pin_resident_raft_node_registry_for_test,
 };
 #[cfg(test)]
 pub(crate) use request::lock_cluster_kv_request_attempt_ledger_for_test;

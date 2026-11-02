@@ -14,8 +14,8 @@ agent context, and collaborative maintenance by conventional software and a
 specialized memory agent.
 
 This replaces the record-first target described by earlier versions of this
-document. Most of this page is **target design**: only the first local
-file-to-evidence slice exists today.
+document. Most of this page is **target design**: the implemented
+file-to-evidence slice uses local or SIFS sources with node-local derived indexes.
 [Current Implementation](#current-implementation) lists what that slice
 covers and which Rust types implement it; a mechanism described elsewhere on
 this page should not be assumed to exist unless that section or an inline
@@ -53,7 +53,8 @@ candidates are generated and when evidence is materialized.
 
 ## Current Implementation
 
-R2 `sinomo-memory` implements one bounded, node-local slice behind
+R2 `sinomo-memory` implements a bounded file-to-evidence slice with node-local
+derived indexes behind
 `IndexedFileMemoryStore`, reachable through `sinomo memory root add|list`,
 `sinomo memory index <root-id>`, and `sinomo memory query`:
 
@@ -64,7 +65,15 @@ R2 `sinomo-memory` implements one bounded, node-local slice behind
   paged scans (symbolic links are skipped) and admits configured text
   extensions below a per-root size limit. `acquire_snapshot` reads a whole file
   into a `VerifiedSourceSnapshot`, hashing it and checking identity and
-  metadata before and after the read.
+  metadata before and after the read. `register_sifs_root` explicitly registers
+  a SIFS directory through the daemon's advertised filesystem providers.
+  Its connector uses bounded, no-link directory pages and exact opened-file
+  reads; DFS supplies canonical object and version identity. These sources
+  also use `current-only` retention. The source files remain in SIFS while
+  catalog, index generations, and retrieval traces stay node-local.
+  A registered SIFS root is bound to its authenticated cluster namespace and
+  directory identity; changing clusters does not authorize the same path in
+  the new namespace.
 - **Indexing.** `index_root` is an explicit reconciliation pass over one root.
   The built-in text pipeline emits one `TextRange` anchor with lexical terms
   per non-empty line and no facts. Each source file is its own partition: an
@@ -99,14 +108,15 @@ R2 `sinomo-memory` implements one bounded, node-local slice behind
   ([file attachments](developer/file-attachments.md#indexing)); no indexing job
   calls it yet.
 
-Not implemented: SIFS and other non-local connectors; change feeds and
+Not implemented: other non-local connectors; change feeds and
 watchers; durable jobs and scheduling; workspace detection; structured, code,
 media, and model extractors; embeddings and vector serving; relation and graph
 indexes; overlay materialization and the curator; contextual priors and
 fusion; placement projections; federation; memory events; and the
 evidence-bundle tool surface. The `memory_search`, `memory_read`, and
 `memory_write` agent tools that exist today operate on Markdown notes in the
-agent's SIFS home, not on this index; see
+agent's SIFS home. These tools do not register index roots or schedule indexing;
+an operator may explicitly register the notes as a SIFS source root. See
 [agent system architecture](agent-system-architecture.md#historical-recall-and-markdown-notes).
 The old record subsystem (`DurableMemoryStore`) is still compiled into
 `sinomo-memory` but has no callers outside the crate.
@@ -136,7 +146,7 @@ The old record subsystem (`DurableMemoryStore`) is still compiled into
 
 | Term | Meaning |
 |---|---|
-| `IndexRoot` | An explicitly configured local, VFS, SIFS, or file-like namespace eligible for discovery and indexing. Only local roots exist today. |
+| `IndexRoot` | An explicitly configured local, VFS, SIFS, or file-like namespace eligible for discovery and indexing. Local and SIFS roots are supported. |
 | Memory file (`MemoryFileRef`) | A stable source object inside an index root. A path is a locator, not its identity. |
 | File version (`MemoryFileVersionRef`) | An immutable snapshot of a memory file, identified by source-native version and content identity. |
 | `MemoryAnchor` | A typed, bounded selector into one exact file version. |
@@ -303,8 +313,9 @@ service-owned managed memory.
 Local-only root definitions live in the owning node's configuration. Compact
 shared desired-root definitions may live in cluster configuration, but their
 per-file catalog, coverage, cursors, and index contents do not enter cluster
-KV. Current: roots are registered with `sinomo memory root add` and stored in
-the node-local memory catalog with the local cluster policy; there are no
+KV. Current: roots are registered with `sinomo memory root add`, selecting
+`--filesystem sifs` for SIFS sources, and stored in the node-local memory catalog
+with the local cluster policy; there are no
 shared root definitions, resource budgets, or ignore rules beyond extension and
 size filters.
 
@@ -904,8 +915,9 @@ content. They use the scope's DFS policy rather than inheriting one global
 replication mode. Derived partition snapshots may be exported as
 content-addressed artifacts for warm start or remote serving, but the source
 files and overlay operation files remain authoritative. These scope paths are
-target design: overlays are currently node-local, and the Markdown notes that
-agents write today live in each agent's SIFS home and are not indexed.
+target design: overlays are currently node-local, and Markdown notes live in
+each agent's SIFS home. Indexing those notes requires explicit source-root
+registration and an indexing pass.
 
 ## Distributed Indexing and Retrieval
 
@@ -1122,9 +1134,10 @@ An agent that wants to remember new content has two explicit choices:
 - append a scoped annotation/relation to an overlay when the source file should
   remain unchanged.
 
-Neither path is wired yet. Today an agent remembers content only through the
-`memory_write` Markdown notes in its SIFS home, which this index does not yet
-ingest.
+Neither automatic path is wired yet. An agent remembers content through the
+`memory_write` Markdown notes in its SIFS home. Those notes can be indexed as
+an explicitly registered SIFS root; writing a note does not itself schedule
+indexing.
 
 ## Collaborative Maintenance
 

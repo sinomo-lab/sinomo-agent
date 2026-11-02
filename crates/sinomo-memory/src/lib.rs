@@ -2871,6 +2871,16 @@ pub fn register_storage_paths(
         "memory/index.sobj",
         ObjectSchema::new("MemoryIndexSnapshot", STORAGE_CONTRACT_OBJECT_VERSION),
     )?;
+    layout.register_binary(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/indexed.write.lock",
+    )?;
+    layout.register_binary(
+        "sinomo-memory",
+        StorageRing::R2,
+        "memory/private/continuation.key",
+    )?;
     layout.register_escape_path(
         "sinomo-memory",
         StorageRing::R2,

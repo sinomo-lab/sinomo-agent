@@ -44,10 +44,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return self.collect_stat_path_from_authorities(path, &shard, &shards);
         }
+        self.with_stat_read_rounds(|service| {
+            service.collect_stat_path_from_authorities(path, &shard, &shards)
+        })
+    }
+
+    pub(super) fn with_stat_read_rounds(
+        &mut self,
+        mut collect: impl FnMut(&mut Self) -> Result<DfsStat>,
+    ) -> Result<DfsStat> {
         let mut changed = None;
         for _ in 0..super::POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             self.check_stat_deadline()?;
-            match self.collect_stat_path_from_authorities(path, &shard, &shards) {
+            match collect(self) {
                 Err(
                     error @ DfsPosixError::Dfs(DfsError::MetadataRejection {
                         code: DfsMetadataRejectionCode::PrefixMismatch,
@@ -158,12 +167,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &object.path,
                 Some(&object),
             );
-            return stat_from_projection(*object, path, count);
+            return stat_from_projection(self, *object, path, count);
         }
         self.stat_object_from_authorities(&object, path, Some(shards))
     }
 
-    pub(super) fn with_stat_deadline<R>(
+    pub(crate) fn with_stat_deadline<R>(
         &mut self,
         run: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
@@ -273,7 +282,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             1u64
         };
         let mut fences = Vec::new();
-        for shard in &shards {
+        // A directory's nlink counts only its immediate child directories.
+        // Reuse the listing scope decision while retaining the full catalog
+        // for ownership, query binding and the final generation comparison.
+        // File aliases can live anywhere, so their existing global scan stays.
+        let projection_shards = if target.kind == DfsObjectKind::Directory {
+            super::routing::directory_child_authority_shards(&target.path, &shards)?
+        } else {
+            shards.iter().collect()
+        };
+        for shard in projection_shards {
             let mut request = DfsStatProjectionRequest {
                 object_id: target.object_id.clone(),
                 object_path: target.path.clone(),
@@ -379,7 +397,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             canonical.ok_or_else(|| invalid("stat canonical authority omitted its object"))?;
         self.namespace_execution
             .observe_path(&object.file_system_id, &object.path, Some(&object));
-        stat_from_projection(object, path, count)
+        stat_from_projection(self, object, path, count)
     }
 
     fn stat_projection_page(
@@ -415,7 +433,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 }
 
-fn stat_from_projection(object: DfsObjectMetadata, path: &str, count: u64) -> Result<DfsStat> {
+pub(super) fn stat_from_projection<T: DfsMessageTransport>(
+    service: &NetworkedDfsService<T>,
+    mut object: DfsObjectMetadata,
+    path: &str,
+    count: u64,
+) -> Result<DfsStat> {
+    if matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Symlink)
+        && object.content_size_bytes.is_none()
+        && let Some(hash) = object.content_hash.as_deref()
+    {
+        // The authority fences above already fixed this immutable identity.
+        // Older metadata can omit its size while the exact content is local.
+        object.content_size_bytes = service.local_object_version_manifest_size_if_matches(
+            &object.object_id,
+            &object.version,
+            hash,
+        );
+    }
     Ok(DfsStat {
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
@@ -437,4 +472,116 @@ fn stat_from_projection(object: DfsObjectMetadata, path: &str, count: u64) -> Re
         policy: object.policy,
         current_locations: object.current_locations,
     })
+}
+
+#[cfg(test)]
+mod native_tests;
+
+#[cfg(test)]
+mod size_projection_tests {
+    use super::*;
+
+    #[test]
+    fn authority_stat_projection_preserves_legacy_size_from_verified_local_content() {
+        // Algorithm/content DATA only: this old-shaped projection is not a
+        // fabricated native publication or a grant of namespace authority.
+        let root = sinomo_testdir::TestDir::new("stat-legacy-local-content-size");
+        let node = NodeId::from_legacy_named("stat-legacy-content-owner").unwrap();
+        let object_id = DfsObjectId::from_legacy_named("stat-legacy-content-object").unwrap();
+        let version = DfsVersion::from_legacy_named("stat-legacy-content-version").unwrap();
+        let content = LocalContentStore::new(root.path().join("content")).unwrap();
+        let bytes = b"legacy content with no metadata size";
+        let manifest = content
+            .put_object_version_blob_only(object_id.as_str(), version.as_str(), bytes)
+            .unwrap();
+        let service = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(node.clone()),
+            content,
+        );
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: sifs_file_system_id(),
+            path: "/legacy-size".into(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: node.clone(),
+            current_locations: vec![node],
+            content_hash: Some(manifest.content_hash.clone()),
+            content_size_bytes: None,
+            link_target_object_id: None,
+            mode: 0o600,
+            uid: 1001,
+            gid: 1002,
+            accessed_at_unix_nanos: 11,
+            modified_at_unix_nanos: 12,
+            created_at_unix_nanos: 13,
+            changed_at_unix_nanos: 14,
+            version: version.clone(),
+            policy: sinomo_core::DfsObjectPolicy::LocalOwned,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let projected = stat_from_projection(&service, object.clone(), &object.path, 3).unwrap();
+        assert_eq!(projected.size_bytes, Some(bytes.len() as u64));
+        assert_eq!(projected.object_id, object_id);
+        assert_eq!(projected.version, version);
+        assert_eq!(projected.content_hash, object.content_hash);
+        assert_eq!(projected.path, object.path);
+        assert_eq!(projected.link_count, 3);
+        assert_eq!(
+            (projected.mode, projected.uid, projected.gid),
+            (0o600, 1001, 1002)
+        );
+        assert!(
+            service.metadata_backend.is_none(),
+            "size lookup needs no native table attachment"
+        );
+
+        let mut known = object.clone();
+        known.content_size_bytes = Some(7);
+        assert_eq!(
+            stat_from_projection(&service, known, &object.path, 3)
+                .unwrap()
+                .size_bytes,
+            Some(7),
+            "a known authority size is never replaced by a local hint",
+        );
+        let mut wrong_hash = object.clone();
+        wrong_hash.content_hash = Some(format!("blake3:{}", blake3::hash(b"absent other content")));
+        assert_eq!(
+            stat_from_projection(&service, wrong_hash, &object.path, 3)
+                .unwrap()
+                .size_bytes,
+            None,
+            "the exact version's manifest cannot supply another hash's size",
+        );
+        let mut directory = object.clone();
+        directory.kind = DfsObjectKind::Directory;
+        assert_eq!(
+            stat_from_projection(&service, directory, &object.path, 3)
+                .unwrap()
+                .size_bytes,
+            None,
+        );
+        let mut symlink = object.clone();
+        symlink.kind = DfsObjectKind::Symlink;
+        assert_eq!(
+            stat_from_projection(&service, symlink, &object.path, 3)
+                .unwrap()
+                .size_bytes,
+            Some(bytes.len() as u64),
+        );
+        let empty_root = sinomo_testdir::TestDir::new("stat-legacy-content-unavailable");
+        let unavailable = NetworkedDfsService::new(
+            crate::test_runtime::DfsTestRuntime::local_transport(NodeId::generate()),
+            LocalContentStore::new(empty_root.path().join("content")).unwrap(),
+        );
+        assert_eq!(
+            stat_from_projection(&unavailable, object.clone(), &object.path, 3)
+                .unwrap()
+                .size_bytes,
+            None,
+            "missing local content remains unknown instead of becoming an empty file",
+        );
+    }
 }

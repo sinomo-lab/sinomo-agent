@@ -29,13 +29,13 @@ pub type ClusterControlServiceFuture<'a, T> =
 
 /// Process operations required by the cluster-owned control service.
 pub trait ClusterControlServiceHost: Send + Sync + 'static {
-    fn recover_endpoint(
+    fn route_hint(
         &self,
-        _request: crate::EndpointRecoveryRequest,
-    ) -> ClusterControlServiceFuture<'_, crate::EndpointRecoveryResponse> {
+        _request: crate::ClusterRouteHintRequest,
+    ) -> ClusterControlServiceFuture<'_, crate::ClusterRouteHintResponse> {
         Box::pin(async {
             Err(ServiceError::UnknownRoute(
-                crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE.into(),
+                crate::CLUSTER_CONTROL_ROUTE_HINT_ROUTE.into(),
             ))
         })
     }
@@ -255,9 +255,9 @@ impl Service for HostedClusterControlService {
             let route = request.route.clone();
             let authority = authorize_request(host.as_ref(), &route, &ctx.signer).await?;
             match route.as_str() {
-                crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE => {
+                crate::CLUSTER_CONTROL_ROUTE_HINT_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
-                    ctx.respond_value(&route, host.recover_endpoint(payload).await?)?;
+                    ctx.respond_value(&route, host.route_hint(payload).await?)?;
                 }
                 CLUSTER_CONTROL_INIT_ROUTE => {
                     let payload: ClusterControlInitRequest =
@@ -437,7 +437,7 @@ mod tests {
             public_key: "remote-key".to_string(),
         };
         for route in [
-            crate::CLUSTER_CONTROL_RECOVER_ENDPOINT_ROUTE,
+            crate::CLUSTER_CONTROL_ROUTE_HINT_ROUTE,
             CLUSTER_CONTROL_INIT_ROUTE,
             CLUSTER_CONTROL_JOIN_ROUTE,
             CLUSTER_CONTROL_LEAVE_ROUTE,

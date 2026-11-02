@@ -187,6 +187,16 @@ pub trait ClusterControlPlaneTransport {
     ) {
     }
 
+    /// Makes an authorized endpoint executable without claiming that this
+    /// node can reach it; see `cluster_connectivity_record_for_unverified_route`.
+    fn record_endpoint_unverified_route(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _endpoint: &ClusterEndpointRecord,
+    ) {
+    }
+
     fn published_network_info_matches(
         &mut self,
         _paths: &ClusterPaths,

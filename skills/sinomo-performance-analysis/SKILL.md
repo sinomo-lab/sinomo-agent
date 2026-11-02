@@ -46,8 +46,10 @@ skill for formation, immutable binaries, actual main/shadow process hashes,
 retained-state ownership, recreation after binary replacement and cleanup. Do
 not substitute Docker when the user requests the real cluster.
 
-Docker verification runs with debugging, tracing and CPU profiler support enabled
-by default. Every gate must pass in that configuration at its unchanged threshold.
+Docker verification runs with debugging and tracing enabled by default; CPU
+profiling is opt-in with `SINOMO_TEST_CPU_PROFILE=1`, which performance analysis
+uses when it needs CPU profiles. Every gate must pass in the selected configuration
+at its unchanged threshold.
 Use measured timings directly: do not subtract estimated observation overhead,
 relax a gate, or require an uninstrumented rerun for acceptance. Preserve failures.
 A reduced workload or skipped gate remains diagnostic. Check trace coverage before
@@ -83,7 +85,8 @@ or latency gates unless separately requested. Preserve failed setup attempts.
 For reproducible rendering without rerunning a cluster, use the archived
 `verification_report.py ARTIFACTS`. Raw JSON and reporter/source hashes accompany
 the report. The write driver runs `profile-dfs-writes.py` by default after the
-latency matrix and links its detailed stage, I/O, CPU and coverage artifacts.
+latency matrix and links its detailed stage, I/O and coverage artifacts, plus CPU
+profiles when profiling is requested.
 `--no-stage-profile` is diagnostic only. To inspect existing retained fixtures,
 run that profiler driver with `--fixtures WRITE_LATENCY_JSON`, `--project`,
 `--binary`, `--profile` and a fresh `--artifacts` directory. It reuses the same
@@ -193,7 +196,8 @@ when the environment prevents collection.
 For idle CPU failures, use the quietness tables in the generated verification
 report and its `idle-<leg>/REPORT.md` child. The latter is collected alongside
 the unchanged gate by `docker/profile-idle.py`, using the standard Observe stage,
-I/O, process-window, RPC-route, background-counter and CPU-profile tools. Reuse that driver
+I/O, process-window, RPC-route and background-counter tools, plus CPU profiles
+when profiling is requested. Reuse that driver
 for follow-up idle captures on verified running nodes. Separate startup/recovery
 work from steady-state maintenance; preserve first failures and compare matching
 state/workload settings. Counters remain useful after trace eviction, but missing

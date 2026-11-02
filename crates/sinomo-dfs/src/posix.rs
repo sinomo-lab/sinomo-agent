@@ -10,11 +10,13 @@ use crate::service_write::{
     DfsDistributedWriteOptions, DfsWriteCreation, DfsWriteDispatch, DfsWriteRepair,
 };
 mod attrs;
+#[cfg(test)]
+mod attributed_mkdir_native_tests;
 mod cross_shard;
 #[cfg(test)]
-pub(crate) use cross_shard::{
-    cross_shard_object_version_record, install_hardlink_alias_after_commit_test_hook,
-};
+mod directory_identity_native_tests;
+#[cfg(test)]
+pub(crate) use cross_shard::install_hardlink_alias_after_commit_test_hook;
 mod jobs;
 mod links;
 pub(crate) mod locks;
@@ -73,8 +75,7 @@ use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::intent::{stable_create_object_id, stable_write_target_version};
 use crate::metadata_records::object_version_record;
 use crate::namespace::{
-    initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
-    next_version,
+    namespace_transaction_id_for_batch, namespace_transaction_id_for_object, next_version,
 };
 use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
 use crate::posix_object::{
@@ -348,6 +349,15 @@ fn select_posix_write_replica_candidates(
             }
             selected
         })
+}
+
+fn no_link_write_condition_error(error: DfsPosixError) -> DfsPosixError {
+    match error {
+        DfsPosixError::Dfs(DfsError::WritePreconditionFailed { failure }) => DfsPosixError::Conflict {
+            path: failure.path().to_string(), reason: failure.reason(),
+        },
+        other => other,
+    }
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -859,6 +869,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    fn new_posix_directory_for_creation(&self, path: &str) -> DfsObjectMetadata {
+        // A pathname can be reused after its old directory moved elsewhere.
+        // The admitted request owns retry identity; an unrequested direct
+        // create mints its identity only during this first planning attempt.
+        // Existing preparations and completions are resolved before planning.
+        let mut object =
+            recreated_posix_metadata_object(&self.node_id, path, DfsObjectKind::Directory);
+        if let Some(request) = self.namespace_execution.request() {
+            object.object_id = stable_create_object_id(
+                &request.requester_node_id,
+                path,
+                &request.operation_id,
+            );
+        }
+        object
+    }
+
     fn commit_posix_created_directory(&mut self, object: DfsObjectMetadata) -> Result<DfsStat> {
         let parent = self.parent_directory_touch_metadata_for_create(&object)?;
         let mut objects = vec![object.clone()];
@@ -908,6 +935,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_parent_object_id: &DfsObjectId,
         expected_parent_version: &DfsVersion,
     ) -> Result<DfsStat> {
+        self.posix_mkdir_at_no_links_local_with_attrs(
+            path,
+            expected_parent_object_id,
+            expected_parent_version,
+            DfsPosixCreateAttrs::directory_default(),
+        )
+    }
+
+    pub(crate) fn posix_mkdir_at_no_links_local_with_attrs(
+        &mut self,
+        path: &str,
+        expected_parent_object_id: &DfsObjectId,
+        expected_parent_version: &DfsVersion,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let path = normalize_posix_path(path)?;
         let parent = parent_posix_path(&path)
@@ -937,7 +979,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: "opened parent directory changed before no-link mkdir".to_string(),
             });
         }
-        self.posix_mkdir_local_at_normalized_path(&path, DfsPosixCreateAttrs::directory_default())
+        self.posix_mkdir_local_at_normalized_path(&path, attrs)
     }
 
     fn posix_mkdir_local_at_normalized_path(
@@ -970,7 +1012,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.version = next_version(&object.version);
             return self.commit_posix_created_directory(object);
         }
-        let mut object = new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::Directory);
+        let mut object = self.new_posix_directory_for_creation(&path);
         let attrs = self.posix_inherit_create_attrs_from_parent_local(&path, attrs, true)?;
         self.apply_posix_new_directory_metadata(&mut object, attrs)?;
         self.commit_posix_created_directory(object)
@@ -1004,10 +1046,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
-        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
+        if let Some(shard) = self.routed_namespace_shard_for_path(&normalized)? {
+            let local_chain_exists =
+                match self.routed_mkdir_boundary_directory_exists(&normalized, &shard)? {
+                    Some(true) => return Ok(()),
+                    Some(false) => false,
+                    None => self.posix_mkdir_all_chain_exists_locally(&normalized)?,
+                };
             match self.route_namespace_operation(
-                primary,
+                shard.primary_node_id,
                 DfsNamespaceOperation::MkdirAll {
                     path: path.to_string(),
                 },
@@ -1052,10 +1099,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
         let path = dispatch_path.as_ref();
-        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
-            let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
+        if let Some(shard) = self.routed_namespace_shard_for_path(&normalized)? {
+            let local_chain_exists =
+                match self.routed_mkdir_boundary_directory_exists(&normalized, &shard)? {
+                    Some(true) => return Ok(()),
+                    Some(false) => false,
+                    None => self.posix_mkdir_all_chain_exists_locally(&normalized)?,
+                };
             match self.route_namespace_operation_without_local_replay(
-                primary,
+                shard.primary_node_id,
                 DfsNamespaceOperation::MkdirAll {
                     path: path.to_string(),
                 },
@@ -1151,6 +1203,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         opened_parent: &DfsStat,
         child: &str,
     ) -> Result<DfsStat> {
+        self.posix_mkdir_at_opened_directory_no_links_impl(opened_parent, child, None)
+    }
+
+    /// Create one direct child with attributes installed in its initial
+    /// publication, while preserving the actual opened parent's generation.
+    pub fn posix_mkdir_at_opened_directory_no_links_with_attrs(
+        &mut self,
+        opened_parent: &DfsStat,
+        child: &str,
+        attrs: DfsPosixCreateAttrs,
+    ) -> Result<DfsStat> {
+        self.posix_mkdir_at_opened_directory_no_links_impl(opened_parent, child, Some(attrs))
+    }
+
+    fn posix_mkdir_at_opened_directory_no_links_impl(
+        &mut self,
+        opened_parent: &DfsStat,
+        child: &str,
+        attrs: Option<DfsPosixCreateAttrs>,
+    ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if child.is_empty()
             || matches!(child, "." | "..")
@@ -1200,15 +1272,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(primary) = self.routed_namespace_primary_for_path(&path)? {
             self.route_namespace_operation(
                 primary,
-                DfsNamespaceOperation::MkdirAtNoLinks {
-                    path: path.clone(),
-                    expected_parent_object_id: opened_parent.object_id.clone(),
-                    expected_parent_version: opened_parent.version.clone(),
+                match attrs {
+                    Some(attrs) => DfsNamespaceOperation::MkdirAtNoLinksWithAttrs(
+                        crate::DfsMkdirAtNoLinksWithAttrs {
+                            path: path.clone(),
+                            expected_parent_object_id: opened_parent.object_id.clone(),
+                            expected_parent_version: opened_parent.version.clone(),
+                            attrs,
+                        },
+                    ),
+                    None => DfsNamespaceOperation::MkdirAtNoLinks {
+                        path: path.clone(),
+                        expected_parent_object_id: opened_parent.object_id.clone(),
+                        expected_parent_version: opened_parent.version.clone(),
+                    },
                 },
             )?;
             return self.stat_routed_namespace_result(&path, false);
         }
-        self.posix_mkdir_at_no_links_local(&path, &opened_parent.object_id, &opened_parent.version)
+        self.posix_mkdir_at_no_links_local_with_attrs(
+            &path,
+            &opened_parent.object_id,
+            &opened_parent.version,
+            attrs.unwrap_or_else(DfsPosixCreateAttrs::directory_default),
+        )
     }
 
     fn posix_mkdir_all_chain_exists_locally(&self, path: &str) -> Result<bool> {
@@ -1326,11 +1413,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             path: parent_for_child.path,
                         });
                     }
-                    let mut object = new_posix_metadata_object(
-                        &self.node_id,
-                        &current,
-                        DfsObjectKind::Directory,
-                    );
+                    let mut object = self.new_posix_directory_for_creation(&current);
                     let attrs = inherit_posix_create_attrs(
                         DfsPosixCreateAttrs::directory_default(),
                         true,
@@ -1514,6 +1597,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some((expected_object_id, expected_version)),
             true,
             Some(operation_id),
+            None,
+            Default::default(),
         )
     }
 
@@ -1705,13 +1790,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         for attempt in 0..MAX_ATTEMPTS {
             let opened_parent = self.posix_open_beneath_no_links_distributed(root, &parent)?;
-            match self.posix_create_file_at_opened_directory_no_links(
+            let condition = self.no_link_scoped_write_condition(
+                root,
+                &path,
+                crate::DfsWriteTargetPrecondition::Absent {},
+            )?;
+            match self.posix_create_file_at_opened_directory_with_condition(
                 &opened_parent,
                 child,
                 bytes,
                 options.clone(),
+                condition,
             ) {
                 Ok(stat) => return Ok(stat),
+                Err(error @ DfsPosixError::Dfs(DfsError::WritePreconditionFailed { .. })) => {
+                    return Err(no_link_write_condition_error(error));
+                }
                 Err(error)
                     if attempt + 1 < MAX_ATTEMPTS
                         && (posix_error_is_retryable_write_serialization(&error)
@@ -1726,6 +1820,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         unreachable!("bounded no-link create loop returns on its final attempt")
     }
 
+    fn no_link_scoped_write_condition(
+        &self,
+        root: &str,
+        path: &str,
+        target: crate::DfsWriteTargetPrecondition,
+    ) -> Result<crate::DfsCurrentWritePrecondition> {
+        let root = normalize_posix_path(root)?;
+        let reads =
+            self.namespace_execution
+                .captured_reads()
+                .ok_or_else(|| DfsError::Metadata {
+                    message: "no-link write lost its original namespace planning scope".into(),
+                })?;
+        crate::write_precondition::opened_scope_from_reads(
+            &root,
+            path,
+            &reads,
+            &sifs_file_system_id(),
+            target,
+        )
+        .map_err(|message| DfsError::Metadata { message }.into())
+    }
+
     /// Exclusively create a direct child of an exact opened directory without
     /// performing path resolution after the open.
     ///
@@ -1737,6 +1854,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         child: &str,
         bytes: &[u8],
         options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        let parent = normalize_posix_path(&opened_parent.path)?;
+        let path = join_posix_path(&parent, child);
+        let condition = crate::DfsCurrentWritePrecondition::ParentOnly {
+            path,
+            parent: crate::DfsNamespaceObjectPrecondition {
+                object_id: opened_parent.object_id.clone(),
+                version: opened_parent.version.clone(),
+            },
+        };
+        self.posix_create_file_at_opened_directory_with_condition(
+            opened_parent,
+            child,
+            bytes,
+            options,
+            condition,
+        )
+        .map_err(no_link_write_condition_error)
+    }
+
+    fn posix_create_file_at_opened_directory_with_condition(
+        &mut self,
+        opened_parent: &DfsStat,
+        child: &str,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        condition: crate::DfsCurrentWritePrecondition,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         if child.is_empty()
@@ -1784,8 +1928,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         let path = join_posix_path(&parent, child);
-        self.posix_write_file_bytes_checked_parent_once(
-            &path, bytes, options, true, true, true, None, true, false, None, false,
+        self.posix_write_file_bytes_checked_parent_once_with_operation_id(
+            &path,
+            bytes,
+            options,
+            true,
+            true,
+            true,
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+            Some(&current_parent),
+            crate::DfsWritePublication::ConditionalCurrent {
+                precondition: Box::new(condition),
+            },
         )
     }
 
@@ -1809,7 +1968,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: "file identity or version changed before no-link replace".to_string(),
             });
         }
-        self.posix_replace_opened_file_if_version_no_links(&opened, bytes, options)
+        let condition = self.no_link_scoped_write_condition(
+            root,
+            &opened.path,
+            crate::DfsWriteTargetPrecondition::Match {
+                expected: crate::DfsNamespaceObjectPrecondition {
+                    object_id: opened.object_id.clone(),
+                    version: opened.version.clone(),
+                },
+            },
+        )?;
+        self.posix_replace_opened_file_with_condition(&opened, bytes, options, condition)
+            .map_err(no_link_write_condition_error)
     }
 
     /// Replace the exact file/version captured by a no-link open without
@@ -1819,6 +1989,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         opened: &DfsStat,
         bytes: &[u8],
         options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        let condition = crate::DfsCurrentWritePrecondition::CompareAndSwap {
+            path: opened.path.clone(),
+            expected: crate::DfsNamespaceObjectPrecondition {
+                object_id: opened.object_id.clone(),
+                version: opened.version.clone(),
+            },
+        };
+        self.posix_replace_opened_file_with_condition(opened, bytes, options, condition)
+            .map_err(no_link_write_condition_error)
+    }
+
+    fn posix_replace_opened_file_with_condition(
+        &mut self,
+        opened: &DfsStat,
+        bytes: &[u8],
+        options: DfsWriteOptions,
+        condition: crate::DfsCurrentWritePrecondition,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         match &opened.kind {
@@ -1839,7 +2027,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsObjectKind::File | DfsObjectKind::Artifact => {}
         }
-        self.posix_write_file_bytes_checked_parent_once(
+        self.posix_write_file_bytes_checked_parent_once_with_operation_id(
             &opened.path,
             bytes,
             options,
@@ -1851,9 +2039,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             false,
             Some((&opened.object_id, &opened.version)),
             false,
+            None,
+            None,
+            crate::DfsWritePublication::ConditionalCurrent {
+                precondition: Box::new(condition),
+            },
         )
     }
-
     /// Exclusive creation after resolving the final symlink. This models
     /// `open(O_CREAT)` on a dangling symlink: the link remains intact and its
     /// missing target is created, while a target that already exists wins the
@@ -3177,6 +3369,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         None,
                         true,
                         operation_id.as_deref(),
+                        None,
+                        Default::default(),
                     )
                 });
                 match attempt {
@@ -3233,7 +3427,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             expected_existing,
             resolve_links,
             None,
+            None,
+            Default::default(),
         )
+    }
+
+    fn posix_write_parent_from_main(&mut self, path: &str) -> Result<DfsObjectMetadata> {
+        let parent = parent_posix_path(path)
+            .ok_or_else(|| DfsPosixError::IsDirectory { path: path.into() })?;
+        match self.lookup_sifs_path_direct_distributed_synced(&parent)? {
+            Some(object) if object.kind == DfsObjectKind::Directory => Ok(object),
+            Some(object) if object.kind != DfsObjectKind::Tombstone => {
+                Err(DfsPosixError::NotDirectory { path: parent })
+            }
+            _ => Err(DfsPosixError::MissingParent { path: parent }),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3251,6 +3459,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_existing: Option<(&DfsObjectId, &DfsVersion)>,
         resolve_links: bool,
         operation_id: Option<&str>,
+        opened_parent: Option<&DfsObjectMetadata>,
+        publication: crate::DfsWritePublication,
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
@@ -3272,14 +3482,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
+        let main_requester = self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some();
+        let authoritative_parent = if check_parent && opened_parent.is_none() && main_requester {
+            Some(self.posix_write_parent_from_main(&path)?)
+        } else {
+            None
+        };
+        let opened_parent = opened_parent.or(authoritative_parent.as_ref());
         if check_parent {
-            self.ensure_parent_directory(&path)?;
+            if let Some(parent) = opened_parent {
+                // The no-link caller already checked this exact authoritative
+                // parent. A remote observation need not exist in its mirror.
+                if parent.file_system_id != sifs_file_system_id()
+                    || parent.kind != DfsObjectKind::Directory
+                    || parent_posix_path(&path).as_deref() != Some(parent.path.as_str())
+                {
+                    return Err(DfsPosixError::Conflict {
+                        path: path.clone(),
+                        reason: "opened parent does not belong to this exclusive create".into(),
+                    });
+                }
+            } else {
+                self.ensure_parent_directory(&path)?;
+            }
         }
         let trace_started = Instant::now();
         let trace_path = path.clone();
         let trace_bytes = bytes.len();
         let mut transient_create = false;
-        let mut object = match self.lookup_sifs_path(&path)? {
+        let current_object = if main_requester {
+            self.lookup_sifs_path_direct_distributed_synced(&path)?
+        } else {
+            self.lookup_sifs_path(&path)?
+        };
+        let mut object = match current_object {
             Some(object)
                 if exclusive_create
                     && object.kind != DfsObjectKind::Tombstone
@@ -3313,7 +3551,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::IsDirectory { path });
             }
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                self.resolve_hardlink_target(&object)?
+                self.resolve_hardlink_target_distributed(&object, None)?
             }
             Some(object)
                 if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
@@ -3324,7 +3562,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object =
                     recreated_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
-                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                let attrs = match opened_parent {
+                    Some(parent) => inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid),
+                    None => self.posix_create_attrs_for_object_authority(&object, attrs, false)?,
+                };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id {
                     object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
@@ -3341,7 +3582,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object =
                     new_posix_metadata_object(&self.node_id, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
-                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                let attrs = match opened_parent {
+                    Some(parent) => inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid),
+                    None => self.posix_create_attrs_for_object_authority(&object, attrs, false)?,
+                };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id {
                     object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
@@ -3474,7 +3718,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 candidates,
                 options.policy,
                 DfsDistributedWriteOptions {
-                    publication: Default::default(),
+                    publication: publication.clone(),
                     touch_parent_on_create,
                     creation,
                     repair: if options.foreground_replica_repair {
@@ -3505,7 +3749,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 candidates,
                 options.policy,
                 DfsDistributedWriteOptions {
-                    publication: Default::default(),
+                    publication: publication.clone(),
                     touch_parent_on_create,
                     creation,
                     repair: if options.foreground_replica_repair {
@@ -3570,6 +3814,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // Main owns the committed object and parent update. Its
                     // validated reply retired the planning overlay; use the
                     // actual durable head rather than rebuilding that overlay.
+                    if self.metadata_backend.is_none() {
+                        return self.with_stat_deadline(|service| {
+                            let authoritative = service
+                                .current_object_from_authority(
+                                    &object.file_system_id,
+                                    &object.object_id,
+                                )?
+                                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                            service.with_stat_read_rounds(|service| {
+                                service.stat_object_from_authorities(&authoritative, &path, None)
+                            })
+                        });
+                    }
                     let authoritative = self.stat_target_for_path(&path)?;
                     return self.stat_object_for_path(&authoritative, &path);
                 }
@@ -4094,11 +4351,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        if check_parent {
-            self.ensure_parent_directory(&path)?;
-        }
+        let main_requester = self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some();
+        let authoritative_parent = if check_parent && main_requester {
+            Some(self.posix_write_parent_from_main(&path)?)
+        } else {
+            if check_parent {
+                self.ensure_parent_directory(&path)?;
+            }
+            None
+        };
+        let current_object = if main_requester {
+            self.lookup_sifs_path_direct_distributed_synced(&path)?
+        } else {
+            self.lookup_sifs_path(&path)?
+        };
         let mut transient_create = false;
-        let mut object = match self.lookup_sifs_path(&path)? {
+        let mut object = match current_object {
             Some(object)
                 if exclusive_create
                     && object.kind != DfsObjectKind::Tombstone
@@ -4120,7 +4390,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 return Err(DfsPosixError::IsDirectory { path });
             }
             Some(object) if object.kind == DfsObjectKind::Hardlink => {
-                self.resolve_hardlink_target(&object)?
+                self.resolve_hardlink_target_distributed(&object, None)?
             }
             Some(object)
                 if object.kind == DfsObjectKind::Tombstone && expected_existing.is_some() =>
@@ -4131,7 +4401,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object =
                     recreated_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
-                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                let attrs = match authoritative_parent.as_ref() {
+                    Some(parent) => {
+                        inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid)
+                    }
+                    None => self.posix_create_attrs_for_object_authority(&object, attrs, false)?,
+                };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id.as_deref() {
                     object.object_id =
@@ -4149,7 +4424,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let mut object =
                     new_posix_metadata_object(&write_requester, &path, DfsObjectKind::File);
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
-                let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
+                let attrs = match authoritative_parent.as_ref() {
+                    Some(parent) => {
+                        inherit_posix_create_attrs(attrs, false, parent.mode, parent.gid)
+                    }
+                    None => self.posix_create_attrs_for_object_authority(&object, attrs, false)?,
+                };
                 apply_posix_create_attrs(&mut object, attrs);
                 if let Some(operation_id) = operation_id.as_deref() {
                     object.object_id =
@@ -4334,6 +4614,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if self.transport.delegates_local_namespace_authority()
                     && self.is_local_metadata_primary_for_object(&object)?
                 {
+                    if self.metadata_backend.is_none() {
+                        return self.with_stat_deadline(|service| {
+                            let authoritative = service
+                                .current_object_from_authority(
+                                    &object.file_system_id,
+                                    &object.object_id,
+                                )?
+                                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                            service.with_stat_read_rounds(|service| {
+                                service.stat_object_from_authorities(&authoritative, &path, None)
+                            })
+                        });
+                    }
                     let authoritative = self.stat_target_for_path(&path)?;
                     return self.stat_object_for_path(&authoritative, &path);
                 }

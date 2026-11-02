@@ -528,7 +528,6 @@ pub struct DfsPublicationExecutionOwners {
 /// Historical provenance captured while the ordinary producer actually owns
 /// mutation admission. This retains no admission/ExecutionOwners Arc and is
 /// never a successor or receipt-application permission.
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub(crate) struct NativeRepairProducerAdmission {
     provider: Arc<DfsPublicationExecutionProvider>,
@@ -538,7 +537,6 @@ pub(crate) struct NativeRepairProducerAdmission {
     authority_generation: u64,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub(crate) struct HistoricalNativeRepairProducerAdmission {
     _scope: DfsPublicationOwnerScope,
@@ -546,8 +544,71 @@ pub(crate) struct HistoricalNativeRepairProducerAdmission {
     _authority_generation: u64,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl NativeRepairProducerAdmission {
+    pub(crate) fn check_default_queue_owner(
+        &self,
+        owner: &Arc<DfsDataOwnerLock>,
+    material: &crate::DfsOriginalRepairMaterial,
+    ) -> std::result::Result<(), crate::DfsError> {
+        self.revalidate_before_dispatch()?;
+        if !Arc::ptr_eq(owner, &self.provider.data_owner)
+            || self.material != *material
+            || self.provider.data_root != owner.physical_data_root()
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "ordinary Repair queue witness differs from its admitted native producer"
+                    .into(),
+            });
+        }
+        owner
+            .checked_default_repair_queue_path()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?;
+        Ok(())
+    }
+    /// Dispatch-only refinement for this admitted SAME native Original. It is
+    /// not a receipt/application permission and cannot mint a fresh return.
+    pub(crate) fn validate_original_dispatch(
+        &self,
+        data_dir: &sinomo_core::local::SinomoDataDir,
+        queue: &crate::LocalDfsRepairQueueStore,
+        attempt: &crate::repair_queue_store::RepairOriginalAttemptWitness,
+        carrier: &crate::DfsRoutedMessage,
+    ) -> std::result::Result<crate::repair_queue_store::RepairOriginalBirth, crate::DfsError> {
+        self.revalidate_before_dispatch()?;
+        if data_dir.root() != self.provider.data_root
+            || attempt.carrier() != carrier
+            || attempt.material() != &self.material
+            || !self.material.matches_carrier(carrier)
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "native Repair dispatch changed its actual producer/body/attempt".into(),
+            });
+        }
+        queue.revalidate_original_repair_attempt_witness(attempt)?;
+        let birth = queue
+            .original_repair(carrier)?
+            .ok_or_else(|| crate::DfsError::Metadata {
+                message: "native Repair dispatch lost its complete actual Original".into(),
+            })?;
+        if birth.closed_at_sequence.is_some()
+            || (!birth.observed.is_empty()
+                && !birth.observed.iter().any(|response| {
+                    matches!(
+                        response.result,
+                        crate::DfsBlobTransferResult::Committed { .. }
+                    )
+                }))
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "native Repair continuation is closed or has unsupported result custody"
+                    .into(),
+            });
+        }
+        Ok(birth)
+    }
+
     pub(crate) fn into_historical(self) -> HistoricalNativeRepairProducerAdmission {
         HistoricalNativeRepairProducerAdmission {
             _scope: self.scope,
@@ -810,6 +871,46 @@ impl DfsPublicationExecutionProvider {
     ) -> std::result::Result<(), crate::DfsError> {
         self.validate_content_only_repair_owner(execution, scope)?;
         let _ = VerifiedOriginalRepairHistoryRead::configuration_for_material(&self.authority, material, assignment, requester, receiver)?;
+        Ok(())
+    }
+
+    fn validate_native_repair_producer_owner(
+        &self,
+        execution: &DfsPublicationExecutionOwners,
+        owner: &DfsPublicationOwnerScope,
+    ) -> std::result::Result<(), crate::DfsError> {
+        if self
+            .data_owner
+            .selected_original_data_layout()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?
+            .is_some()
+        {
+            return self.validate_content_only_repair_owner(execution, owner);
+        }
+        self.data_owner
+            .checked_default_repair_queue_path()
+            .map_err(|error| crate::DfsError::Metadata {
+                message: error.to_string(),
+            })?;
+        if self.authority.storage_generation() != self.storage_generation
+            || self.data_root != execution.data_root
+            || self.data_owner.physical_data_root() != self.data_root
+            || !Arc::ptr_eq(&self.data_owner, &execution._data_owner)
+            || !execution.admits(owner, owner.file_system_id(), owner.shard_id())
+            || DfsPublicationOwnerScope::for_backend(
+                owner.root(),
+                owner.file_system_id().clone(),
+                owner.shard_id().clone(),
+            )? != *owner
+        {
+            return Err(crate::DfsError::Metadata {
+                message:
+                    "ordinary original Repair lacks its actual current native producer admission"
+                        .into(),
+            });
+        }
         Ok(())
     }
 
@@ -1234,9 +1335,8 @@ impl std::ops::Deref for DfsPreparedPublication {
 }
 
 impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn prepare_native_repair_custody_for_owned_send(
-        &self,
+        &mut self,
         carrier: &crate::DfsRoutedMessage,
     ) -> std::result::Result<
         Option<crate::runtime_host::PreparedNativeRepairCustody>,
@@ -1245,9 +1345,50 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         let Some((data_root, owner)) = self.native_publication_owner_for_observation() else {
             return Ok(None);
         };
-        let Some(material) = owner.native_repair_custody_material_for_carrier(carrier)? else {
+        let Some(queue) = self.owned_repair_queue_store()? else {
             return Ok(None);
         };
+        let crate::DfsNetworkMessage::RepairReplica(command) = &carrier.message else {
+            return Ok(None);
+        };
+        let Some(birth) =
+            queue.original_repair_for_slot(&command.intent_id, &carrier.target_node_id)?
+        else {
+            return Err(crate::DfsError::Metadata {
+                message: "native Repair preparation lost its actual complete Original".into(),
+            });
+        };
+        let material = birth.original_wire_material()?;
+        #[cfg(any(test, feature = "test-support"))]
+        let selected_custody = owner.native_repair_custody_material_for_carrier(carrier)?;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let selected_custody: Option<crate::DfsOriginalRepairMaterial> = None;
+        if selected_custody
+            .as_ref()
+            .is_some_and(|selected| selected != &material)
+        {
+            return Err(crate::DfsError::Metadata {
+                message: "native selected custody changed the actual Original".into(),
+            });
+        }
+        // The ordinary first send/reply retains its existing owner. This typed
+        // continuation is needed only after a saved Committed reply could not
+        // finish receipt publication. Selected custody keeps its prior route.
+        if selected_custody.is_none()
+            && !birth.observed.iter().any(|response| {
+                matches!(
+                    response.result,
+                    crate::DfsBlobTransferResult::Committed { .. }
+                )
+            })
+        {
+            return Ok(None);
+        }
+        if selected_custody.is_none() && !self.native_original_repair_producer_ready(&birth)? {
+            return Err(crate::DfsError::Metadata {
+                message: "native Original repair no longer owns current named work".into(),
+            });
+        }
         let invalid = || crate::DfsError::Metadata {
             message: "native Repair custody preparation lacks its actual admitted producer".into(),
         };
@@ -1274,7 +1415,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 &assignment.file_system_id,
                 &DfsMetadataShardId::new(&assignment.shard_id),
             )?;
-        provider.validate_content_only_repair_owner(&execution, &scope)?;
+        provider.validate_native_repair_producer_owner(&execution, &scope)?;
         if !Arc::ptr_eq(&owner, &execution._data_owner)
             || assignment.primary_node_id != self.node_id
         {
@@ -1309,7 +1450,6 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
             } else { None };
         owner.map(|owner| owner.selects_original_repair_target(target).map_err(|error| crate::DfsError::Metadata { message: error.to_string() })).transpose().map(|selected| selected.unwrap_or(false))
     }
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn native_publication_owner_for_observation(
         &self,
     ) -> Option<(PathBuf, Arc<DfsDataOwnerLock>)> {
@@ -1428,14 +1568,96 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         &mut self,
         payload: crate::DfsPreparedOperationPayload,
     ) -> std::result::Result<DfsPreparedPublication, crate::DfsError> {
+        self.publish_prepared_operation_with_file_system(payload, None)
+    }
+
+    pub(crate) fn publish_prepared_operation_with_file_system(
+        &mut self,
+        payload: crate::DfsPreparedOperationPayload,
+        configured_file_system: Option<&crate::DfsFileSystem>,
+    ) -> std::result::Result<DfsPreparedPublication, crate::DfsError> {
         let _execution = self.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
             file_system_id: payload.file_system_id.clone(),
             shard_id: payload.shard_id.clone(),
             owner_epoch: payload.owner_epoch,
             operation_id: payload.operation_id.clone(),
         })?;
-        let digest = self.prepare_payload_for_publication(payload)?;
+        let digest = self.prepare_payload_for_publication_with_file_system(
+            payload,
+            configured_file_system,
+        )?;
         self.commit_stored_prepared_operation(&digest)
+    }
+
+    /// Seal an explicitly selected policy under the same existing publication
+    /// admission. A service cache alone cannot replace a native definition.
+    fn bind_admitted_file_system(
+        &self,
+        payload: &mut crate::DfsPreparedOperationPayload,
+        file_system: &crate::DfsFileSystem,
+        stored_file_system: Option<&crate::DfsFileSystem>,
+    ) -> Result<()> {
+        let invalid = || MetadataBackendError::Serde(
+            "fresh filesystem policy differs from its current publication admission".into(),
+        );
+        if file_system.file_system_id != payload.file_system_id
+            || payload.metadata_effects.iter().any(|effect| matches!(effect,
+                crate::DfsPreparedMetadataEffect::PutFileSystem { .. }))
+        {
+            return Err(invalid());
+        }
+        if self.control_plane.is_some() {
+            let provider = self.publication_provider.current().ok_or_else(invalid)?;
+            let execution = self.publication_execution.current().ok_or_else(invalid)?;
+            let scope = self.metadata_backend.as_ref().ok_or_else(invalid)?
+                .publication_owner_scope(&payload.file_system_id, &payload.shard_id)?;
+            if provider.authority.storage_generation() != provider.storage_generation
+                || provider.data_root != execution.data_root
+                || !Arc::ptr_eq(&provider.data_owner, &execution._data_owner)
+                || !execution.admits(&scope, &payload.file_system_id, &payload.shard_id)
+            {
+                return Err(invalid());
+            }
+            let authority_generation = provider.authority.generation();
+            // This validates the existing resident native floor and continuous
+            // configuration before borrowing the cache-only publication cut.
+            let view = provider.authority.write_configuration_projection()
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+                .ok_or_else(invalid)?;
+            let expected = crate::DfsFileSystemConfig::from(file_system);
+            let key = crate::file_system_config_key(&payload.file_system_id);
+            let actual = view.entries(&key)
+                .and_then(|entries| entries.iter().find(|entry| entry.key == key))
+                .ok_or_else(invalid)?
+                .decode::<crate::DfsFileSystemConfig>()
+                .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+            if actual != expected {
+                return Err(invalid());
+            }
+            let projection_generation = provider.authority.with_current_publication_configuration(
+                &payload.file_system_id,
+                |generation, shards, current| {
+                    (current.as_ref() == Some(&expected)
+                        && shards.iter().any(|shard| shard.shard_id == payload.shard_id.0
+                            && shard.primary_node_id == self.node_id
+                            && shard.epoch == payload.owner_epoch))
+                        .then_some(generation)
+                },
+            ).map_err(|error| MetadataBackendError::Serde(error.to_string()))?
+                .flatten().ok_or_else(invalid)?;
+            if provider.authority.generation() != authority_generation
+                || provider.authority.projection_generation() != projection_generation
+                || provider.authority.storage_generation() != provider.storage_generation
+            {
+                return Err(invalid());
+            }
+        }
+        if stored_file_system != Some(file_system) {
+            payload.metadata_effects.push(crate::DfsPreparedMetadataEffect::PutFileSystem {
+                file_system: file_system.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn rebind_prepared_publication_instance_if_frozen(
@@ -1503,7 +1725,15 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
 
     pub(crate) fn prepare_payload_for_publication(
         &mut self,
+        payload: crate::DfsPreparedOperationPayload,
+    ) -> Result<DfsPreparedOperationDigest> {
+        self.prepare_payload_for_publication_with_file_system(payload, None)
+    }
+
+    pub(crate) fn prepare_payload_for_publication_with_file_system(
+        &mut self,
         mut payload: crate::DfsPreparedOperationPayload,
+        configured_file_system: Option<&crate::DfsFileSystem>,
     ) -> Result<DfsPreparedOperationDigest> {
         let mut reservations = self
             .metadata_backend
@@ -1546,6 +1776,17 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
                 &payload.file_system_id,
                 &payload.operation_id,
             )?;
+        // A recorded original always keeps its exact filesystem effect (or
+        // absence). Only a fresh content/namespace producer supplies a policy.
+        if existing_prepare.is_none()
+            && let Some(file_system) = configured_file_system
+        {
+            self.bind_admitted_file_system(
+                &mut payload,
+                file_system,
+                stored_file_system.as_ref(),
+            )?;
+        }
         let supersedes_original = payload.metadata_effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -1558,7 +1799,13 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
         // Recovery re-certifies the original complete body. A refreshed local
         // filesystem projection must not append an unrelated effect to it;
         // the kernel still checks the exact retiring body and current authority.
-        if !supersedes_original && !payload.metadata_effects.iter().any(|effect| matches!(effect,
+        let captured_negative_outcome = payload.metadata_effects.iter().any(|effect| matches!(effect,
+            crate::DfsPreparedMetadataEffect::PutIntent { intent }
+                if matches!(intent.status, crate::DfsWriteIntentStatus::PreconditionFailed { .. })));
+        // An ordinary publication may bootstrap a missing definition. Updating
+        // an existing definition belongs to its explicit filesystem producer,
+        // not whichever service cache happened to prepare this operation.
+        if stored_file_system.is_none() && !supersedes_original && !captured_negative_outcome && !payload.metadata_effects.iter().any(|effect| matches!(effect,
             crate::DfsPreparedMetadataEffect::PutFileSystem { file_system } if file_system.file_system_id == payload.file_system_id)) {
             let file_system = self.metadata.filesystems.get(&payload.file_system_id).cloned()
                 .or_else(|| stored_file_system.clone())
@@ -1819,6 +2066,7 @@ impl<T: crate::DfsMessageTransport> crate::NetworkedDfsService<T> {
 
     /// The sole V7 author mint. It reads the actual prepared record and
     /// obtains actual operation-bound evidence; callers supply no ACK claims.
+    #[cfg(test)]
     pub(crate) fn authorize_prepared_publication(
         &mut self,
         digest: &DfsPreparedOperationDigest,

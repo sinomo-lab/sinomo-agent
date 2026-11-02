@@ -1479,7 +1479,7 @@ fn inspect_cluster_aware_dfs_read_only_from_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DfsFileSystem;
+
     use crate::control_plane::DfsMetadataShardAssignment;
     use sinomo_core::DfsObjectPolicy;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

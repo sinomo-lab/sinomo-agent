@@ -16,9 +16,9 @@ mod job_custody;
 mod preparation;
 mod retained;
 pub use job_custody::DfsSourceAdoptionJobOffer;
-pub(crate) use preparation::{
-    PreparedSourceAdoption, SourcePreparationPlan, SourcePreparationToken,
-};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use preparation::SourcePreparationToken;
+pub(crate) use preparation::{PreparedSourceAdoption, SourcePreparationPlan};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use retained::retained_custody_blocks_cleanup;
 pub(crate) use retained::{DfsSourceAdoptionCloseDisposition, retained_owner_for_mount};

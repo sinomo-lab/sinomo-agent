@@ -7,6 +7,7 @@
 
 mod artifact;
 mod client_protocol;
+mod cross;
 mod deployment_source;
 mod executor;
 mod log;

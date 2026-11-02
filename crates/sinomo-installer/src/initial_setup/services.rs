@@ -16,6 +16,7 @@ pub const DEFAULT_HOST: &str = "0.0.0.0";
 #[derive(Clone, Debug)]
 pub struct Options {
     pub start: bool,
+    pub startup: Option<bool>,
     pub host: String,
     pub main_port: u16,
     pub shadow_port: u16,
@@ -28,6 +29,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             start: true,
+            startup: None,
             host: DEFAULT_HOST.into(),
             main_port: sinomo_daemon::SINOMO_DAEMON_DEFAULT_PORT,
             shadow_port: sinomo_daemon::SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
@@ -38,7 +40,7 @@ impl Default for Options {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Registration {
     pub main_entry: PathBuf,
     pub shadow_entry: PathBuf,
@@ -296,14 +298,58 @@ fn check(record: &Registration) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn effect_paths(root: &Path, data: &Path) -> Result<Vec<PathBuf>> {
+    let receipt = if root.join(super::RECEIPT).is_file() {
+        read_receipt(root)?
+    } else {
+        Receipt {
+            schema: 1,
+            install_dir: root.into(),
+            data_dir: data.into(),
+            owns_data: true,
+            files: Vec::new(),
+            integrations: Vec::new(),
+            services: None,
+            setup_owner: None,
+            configuration: None,
+            complete: false,
+        }
+    };
+    let boot = crate::default_boot_dir(&SinomoDataDir::new(data));
+    let mut layout = layout(&receipt, boot.clone());
+    let _ = adopt_legacy(&receipt, &boot, &mut layout, &Options::default())?;
+    let record = receipt
+        .services
+        .clone()
+        .unwrap_or_else(|| registration(&layout, &Options::default()));
+    Ok([record.main_entry, record.shadow_entry]
+        .into_iter()
+        .chain(record.enabled_links.into_iter().map(|(link, _)| link))
+        .collect())
+}
+
 pub(super) fn install(root: &Path, options: &Options) -> Result<()> {
     let mut receipt = read_receipt(root)?;
-    if receipt.services.is_some() {
-        return Err("daemon services are already registered for this installation".into());
-    }
     let boot = crate::default_boot_dir(&SinomoDataDir::new(&receipt.data_dir));
     let mut layout = layout(&receipt, boot.clone());
-    let (effective, previous) = adopt_legacy(&receipt, &boot, &mut layout, options)?;
+    let (mut effective, mut previous) = adopt_legacy(&receipt, &boot, &mut layout, options)?;
+    if let Some(current) = &receipt.services {
+        layout.main_boot_entry = current.main_entry.clone();
+        layout.shadow_boot_entry = current.shadow_entry.clone();
+        previous = vec![
+            (current.main_entry.clone(), current.main_content.clone()),
+            (current.shadow_entry.clone(), current.shadow_content.clone()),
+        ];
+        if options.preserve_existing {
+            let (host, main) = old_bind(&current.main_content)?;
+            let (_, shadow) = old_bind(&current.shadow_content)?;
+            effective.host = host;
+            effective.main_port = main.unwrap_or(options.main_port);
+            effective.main_port_fallback = main.is_none();
+            effective.shadow_port = shadow.unwrap_or(options.shadow_port);
+            effective.shadow_port_fallback = shadow.is_none();
+        }
+    }
     let options = &effective;
     let record = registration(&layout, options);
     let mut before = record.clone();
@@ -327,26 +373,67 @@ pub(super) fn install(root: &Path, options: &Options) -> Result<()> {
             sinomo_rollout::install_binary_atomically(&source, destination)?;
         }
     }
-    receipt.services = Some(record.clone());
-    write_receipt(root, &receipt)?;
+    let specs = crate::installed_daemon_start_specs(
+        &layout,
+        &options.host,
+        options.main_port,
+        options.shadow_port,
+        options.main_port_fallback,
+        options.shadow_port_fallback,
+    );
+    if !options.preserve_existing {
+        for (index, spec) in specs.iter().enumerate() {
+            if let DaemonProbeStatus::Running(status) =
+                probe_daemon_status(&spec.paths, Duration::from_secs(1))
+            {
+                let (port, fallback) = if index == 0 {
+                    (options.main_port, options.main_port_fallback)
+                } else {
+                    (options.shadow_port, options.shadow_port_fallback)
+                };
+                if status.host != options.host || (!fallback && status.port != port) {
+                    return Err(format!(
+                        "{} is running with different bind settings; stop it before changing them",
+                        spec.label
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    if receipt.services.as_ref() != Some(&record) {
+        receipt.services = Some(record.clone());
+        write_receipt(root, &receipt)?;
+    }
     fs::create_dir_all(&layout.boot_dir)?;
-    fs::write(
-        &record.main_entry,
-        crate::boot_script_bytes(&record.main_content),
-    )?;
-    fs::write(
-        &record.shadow_entry,
-        crate::boot_script_bytes(&record.shadow_content),
-    )?;
+    let enabled = options.startup.unwrap_or(true);
+    let mut changed = false;
+    for (path, content) in [
+        (&record.main_entry, &record.main_content),
+        (&record.shadow_entry, &record.shadow_content),
+    ] {
+        if enabled || cfg!(unix) {
+            changed |= super::write_if_changed(path, &crate::boot_script_bytes(content))?;
+        } else if path.exists() {
+            fs::remove_file(path)?;
+            changed = true;
+        }
+    }
     #[cfg(unix)]
     for (link, target) in &record.enabled_links {
-        fs::create_dir_all(link.parent().expect("enablement directory"))?;
-        if fs::symlink_metadata(link).is_err() {
-            std::os::unix::fs::symlink(target, link)?;
+        if enabled {
+            fs::create_dir_all(link.parent().expect("enablement parent"))?;
+            if fs::symlink_metadata(link).is_err() {
+                std::os::unix::fs::symlink(target, link)?;
+                changed = true;
+            }
+        } else if fs::symlink_metadata(link).is_ok() {
+            fs::remove_file(link)?;
+            changed = true;
         }
     }
     let managed = manager_available();
-    if managed {
+    if managed && changed {
         systemctl(&["daemon-reload"])?;
     }
     if options.start {
@@ -448,9 +535,9 @@ pub(super) fn install(root: &Path, options: &Options) -> Result<()> {
             }
         }
     }
-    if cfg!(target_os = "linux") && !managed {
+    if cfg!(target_os = "linux") && !managed && changed {
         println!(
-            "User service units registered and enabled; no running systemd user manager. {}",
+            "User service units configured; no running systemd user manager. {}",
             if options.start {
                 "Daemon readiness verified directly for this session."
             } else {
@@ -546,6 +633,8 @@ mod tests {
             integrations: Vec::new(),
             services: None,
             setup_owner: None,
+            configuration: None,
+            complete: false,
         }
     }
     #[test]

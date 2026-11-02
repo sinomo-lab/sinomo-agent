@@ -143,7 +143,7 @@ fn build(options: DesktopOptions) -> Result<(), CliError> {
             })?
     };
     let status = read_rollout_target_status(&local)?;
-    let target = build_target_from_daemon_status(local.label(), &status)?;
+    let target = build_target_from_daemon_status(local.label(), &status, None)?;
     let group = ClusterBuildTargetGroup {
         target,
         rollout_targets: vec![local],

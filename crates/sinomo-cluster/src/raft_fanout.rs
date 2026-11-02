@@ -20,19 +20,88 @@ use sinomo_kv::{
 use sinomo_network::ClusterMembershipRpcFuture;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
+static CLUSTER_RAFT_PEERS_BEHIND: LazyLock<Mutex<BTreeMap<PathBuf, ClusterRaftPeersBehind>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClusterRaftCommittedFanoutReport {
     pub attempted_nodes: usize,
     pub replicated_nodes: Vec<NodeId>,
+    /// Targets whose append failed or was rejected; they are known-behind.
+    pub lagging_nodes: Vec<NodeId>,
     pub peer_progress_hints: Vec<sinomo_kv::ClusterKvRaftPeerProgress>,
     pub watch_event_batches_sent: usize,
+}
+
+/// Peers this process's leader knows to be behind because their committed
+/// append failed or was rejected. A restored route or the peer's own contact
+/// starts one targeted catch-up; an accepted append clears the peer.
+#[derive(Default)]
+struct ClusterRaftPeersBehind {
+    behind: BTreeSet<NodeId>,
+    catching_up: BTreeSet<NodeId>,
+}
+
+/// Record committed-append outcomes for known-behind tracking.
+pub fn record_cluster_raft_peer_append_results(
+    paths: &ClusterPaths,
+    accepted: &[NodeId],
+    lagging: &[NodeId],
+) {
+    if accepted.is_empty() && lagging.is_empty() {
+        return;
+    }
+    let Ok(mut peers) = CLUSTER_RAFT_PEERS_BEHIND.lock() else {
+        return;
+    };
+    let peers = peers.entry(paths.root.clone()).or_default();
+    for node_id in accepted {
+        peers.behind.remove(node_id);
+    }
+    peers.behind.extend(lagging.iter().cloned());
+}
+
+pub fn cluster_raft_peer_is_behind(paths: &ClusterPaths, node_id: &NodeId) -> bool {
+    CLUSTER_RAFT_PEERS_BEHIND.lock().is_ok_and(|peers| {
+        peers
+            .get(&paths.root)
+            .is_some_and(|peers| peers.behind.contains(node_id))
+    })
+}
+
+/// Claim the single catch-up attempt for `node_id`. False while another
+/// attempt for the same peer is running.
+pub fn claim_cluster_raft_peer_catch_up(paths: &ClusterPaths, node_id: &NodeId) -> bool {
+    CLUSTER_RAFT_PEERS_BEHIND.lock().is_ok_and(|mut peers| {
+        peers
+            .entry(paths.root.clone())
+            .or_default()
+            .catching_up
+            .insert(node_id.clone())
+    })
+}
+
+/// Release a claimed catch-up. An accepted append clears the peer; any other
+/// outcome leaves it known-behind for the next trigger.
+pub fn finish_cluster_raft_peer_catch_up(paths: &ClusterPaths, node_id: &NodeId, accepted: bool) {
+    let Ok(mut peers) = CLUSTER_RAFT_PEERS_BEHIND.lock() else {
+        return;
+    };
+    let peers = peers.entry(paths.root.clone()).or_default();
+    peers.catching_up.remove(node_id);
+    if accepted {
+        peers.behind.remove(node_id);
+    } else {
+        peers.behind.insert(node_id.clone());
+    }
 }
 
 fn committed_raft_fanout_target_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
@@ -185,9 +254,11 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
             )
             .await
         else {
+            report.lagging_nodes.push(target_node_id);
             continue;
         };
         if !outcome.response.accepted {
+            report.lagging_nodes.push(target_node_id);
             continue;
         }
         let match_index = outcome.response.append.match_index;
@@ -323,6 +394,11 @@ async fn run_cluster_raft_committed_fanout_worker_async_with_host<H, F>(
                         .record(report.replicated_nodes.len() as f64);
                     metrics::counter!("sinomo.kv.fanout.watch_event_batches")
                         .increment(report.watch_event_batches_sent as u64);
+                    record_cluster_raft_peer_append_results(
+                        &paths,
+                        &report.replicated_nodes,
+                        &report.lagging_nodes,
+                    );
                     persist_fanout_peer_progress_hints(
                         &runtime,
                         &paths,
@@ -489,6 +565,10 @@ where
             .saturating_add(watch_event_batches_sent);
     }
     report.replicated_nodes.sort();
+    report.lagging_nodes = scheduled
+        .into_iter()
+        .filter(|target| report.replicated_nodes.binary_search(target).is_err())
+        .collect();
     report
         .peer_progress_hints
         .sort_by(|left, right| left.peer_node_id.cmp(&right.peer_node_id));
@@ -682,6 +762,53 @@ pub async fn replicate_cluster_kv_to_node_async_with_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer_registry_paths(name: &str) -> ClusterPaths {
+        ClusterPaths::new(&sinomo_local::SinomoDataDir::new(format!(
+            "/fanout-peers-behind/{name}"
+        )))
+    }
+
+    #[test]
+    fn known_behind_peers_follow_append_outcomes_per_kv_root() {
+        let paths = peer_registry_paths("outcomes");
+        let other = peer_registry_paths("other-root");
+        let lagging = NodeId::from_legacy_named("fanout_behind_lagging").expect("node");
+        let current = NodeId::from_legacy_named("fanout_behind_current").expect("node");
+
+        record_cluster_raft_peer_append_results(
+            &paths,
+            std::slice::from_ref(&current),
+            std::slice::from_ref(&lagging),
+        );
+        assert!(cluster_raft_peer_is_behind(&paths, &lagging));
+        assert!(!cluster_raft_peer_is_behind(&paths, &current));
+        assert!(!cluster_raft_peer_is_behind(&other, &lagging));
+
+        record_cluster_raft_peer_append_results(&paths, std::slice::from_ref(&lagging), &[]);
+        assert!(!cluster_raft_peer_is_behind(&paths, &lagging));
+    }
+
+    #[test]
+    fn peer_catch_up_is_single_flight_and_clears_only_on_acceptance() {
+        let paths = peer_registry_paths("single-flight");
+        let peer = NodeId::from_legacy_named("fanout_behind_single_flight").expect("node");
+        record_cluster_raft_peer_append_results(&paths, &[], std::slice::from_ref(&peer));
+
+        assert!(claim_cluster_raft_peer_catch_up(&paths, &peer));
+        assert!(
+            !claim_cluster_raft_peer_catch_up(&paths, &peer),
+            "a second trigger joins the running attempt"
+        );
+        finish_cluster_raft_peer_catch_up(&paths, &peer, false);
+        assert!(cluster_raft_peer_is_behind(&paths, &peer));
+
+        assert!(claim_cluster_raft_peer_catch_up(&paths, &peer));
+        finish_cluster_raft_peer_catch_up(&paths, &peer, true);
+        assert!(!cluster_raft_peer_is_behind(&paths, &peer));
+        assert!(claim_cluster_raft_peer_catch_up(&paths, &peer));
+        finish_cluster_raft_peer_catch_up(&paths, &peer, true);
+    }
 
     #[test]
     fn committed_fanout_targets_every_authorized_main_daemon_member() {

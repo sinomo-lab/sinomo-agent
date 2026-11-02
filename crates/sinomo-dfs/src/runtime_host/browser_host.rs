@@ -10,6 +10,7 @@ pub(crate) struct RuntimeDfsBrowserServiceHost {
     task_owner: Arc<DfsRuntimeHost>,
     data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
     metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
+    data_plane: Arc<dyn crate::DfsDataPlaneHost>,
 }
 
 impl RuntimeDfsBrowserServiceHost {
@@ -20,6 +21,7 @@ impl RuntimeDfsBrowserServiceHost {
         task_owner: Arc<DfsRuntimeHost>,
         data_owner: std::sync::Weak<crate::runtime_host::DfsDataOwnerLock>,
         metadata_authority: Option<Arc<DaemonDfsMetadataAuthorityGeneration>>,
+        data_plane: Arc<dyn crate::DfsDataPlaneHost>,
     ) -> Self {
         Self {
             paths,
@@ -28,11 +30,46 @@ impl RuntimeDfsBrowserServiceHost {
             task_owner,
             data_owner,
             metadata_authority,
+            data_plane,
         }
     }
 }
 
 impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
+    fn data_plane_host(&self) -> Option<Arc<dyn crate::DfsDataPlaneHost>> {
+        Some(Arc::clone(&self.data_plane))
+    }
+
+    fn browser_open_runtime(&self) -> Option<tokio::runtime::Handle> {
+        Some(self.runtime.clone())
+    }
+
+    fn browser_open_configuration_readiness(
+        &self,
+    ) -> Result<crate::DfsWriteConfigurationReadiness, sinomo_core::service::ServiceError> {
+        self.metadata_authority.as_ref().ok_or_else(|| {
+            sinomo_core::service::ServiceError::Service(
+                "daemon write configuration owner is unavailable".into(),
+            )
+        })?.write_configuration_readiness()
+            .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+    }
+
+    fn ready_browser_open_configuration<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<
+        Output = Result<Option<Arc<crate::DfsWriteConfigurationProjection>>, sinomo_core::service::ServiceError>,
+    > + Send + 'a>> {
+        Box::pin(async move {
+            self.metadata_authority.as_ref().ok_or_else(|| {
+                sinomo_core::service::ServiceError::Service(
+                    "daemon write configuration owner is unavailable".into(),
+                )
+            })?.ready_write_configuration_projection_async().await
+                .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))
+        })
+    }
+
     fn ensure_write_configuration_ready<'a>(
         &'a self,
         _data_dir: &'a SinomoDataDir,
@@ -50,6 +87,12 @@ impl crate::DfsBrowserServiceHost for RuntimeDfsBrowserServiceHost {
                     "daemon write configuration owner is unavailable".into(),
                 )
             })?;
+            #[cfg(any(test, feature = "test-support"))]
+            if crate::test_runtime::browser_content_preflight_is_denied(authority.as_ref()) {
+                return Err(sinomo_core::service::ServiceError::Service(
+                    "browser content readiness denied at injected preflight".into(),
+                ));
+            }
             let configuration = authority.ready_write_configuration_projection_async().await
                 .map_err(|error| sinomo_core::service::ServiceError::Service(error.to_string()))?;
             if let Some(configuration) = configuration {

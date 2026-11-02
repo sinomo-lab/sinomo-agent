@@ -659,19 +659,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    /// Executes a cross-shard adopt frame against the object's *current*
-    /// state: a saga that parked (transport failure) may resume after
-    /// pre-existing writes settled, so the snapshot recorded at job creation
-    /// cannot be trusted. Idempotent against already-applied adoptions.
-    #[cfg(test)]
-    pub(crate) fn run_cross_shard_adopt(
-        &mut self,
-        frame_object: &DfsObjectMetadata,
-        old_path: &str,
-    ) -> Result<()> {
-        self.run_cross_shard_adopt_for_job(frame_object, old_path, None)
-    }
-
     fn run_cross_shard_adopt_for_job(
         &mut self,
         frame_object: &DfsObjectMetadata,
