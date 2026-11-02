@@ -109,7 +109,12 @@ publishes a synthetic transitive edge.
 
 Every connectivity-graph edge describes an observed adjacent-node relationship
 that the direct-link layer can attempt. Every edge is directed: evidence that A
-can directly reach B says nothing about B reaching A. An observation records at
+can directly reach B says nothing about B reaching A. An accepted join is such
+reverse evidence, so the node that accepts or relays it records the joiner's
+endpoints only as unverified routes: executable, so the member is routable
+before its first probe, but ranked below reachable edges and above edges with
+failure evidence, and never replacing an observation. An observation that did
+not time its edge has unknown latency, not zero. An observation records at
 least:
 
 - source and target node identity;

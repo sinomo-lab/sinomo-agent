@@ -24,6 +24,10 @@ pub struct ConnectivityGeneration(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectConnectivityState {
     Reachable,
+    /// An authorized endpoint without evidence either way, such as a joiner's
+    /// endpoint at the node that accepted it. Executable, but ranked below
+    /// reachable edges and above edges with failure evidence.
+    Unverified,
     /// Recent failure evidence exists, but the edge remains an executable
     /// fallback when no fully healthy path is available.
     Degraded,
@@ -286,6 +290,7 @@ impl ConnectivitySnapshot {
                 DirectConnectivityState::Reachable => {
                     return DirectConnectivityStatus::Reachable;
                 }
+                DirectConnectivityState::Unverified => {}
                 DirectConnectivityState::Degraded => saw_degraded = true,
                 DirectConnectivityState::Unreachable => saw_unreachable = true,
             }
@@ -353,6 +358,11 @@ pub fn connectivity_snapshot_from_directory_records(
             },
             state: match record.state {
                 ClusterConnectivityState::Healthy => DirectConnectivityState::Reachable,
+                // Every recorded failure counts; a degraded record without one
+                // is an unverified route, not failure evidence.
+                ClusterConnectivityState::Degraded if record.consecutive_failures == 0 => {
+                    DirectConnectivityState::Unverified
+                }
                 ClusterConnectivityState::Degraded => DirectConnectivityState::Degraded,
                 ClusterConnectivityState::Unreachable => DirectConnectivityState::Unreachable,
             },

@@ -9983,6 +9983,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
         sent: Vec<(NodeId, Duration, String)>,
         node_rpcs: Vec<(NodeId, Duration, String)>,
         connectivity: Vec<(NodeId, ClusterConnectivityState, Option<u64>)>,
+        unverified_routes: Vec<NodeId>,
     }
 
     impl ClusterControlPlaneTransport for RecordingMembershipTransport {
@@ -10054,6 +10055,15 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             self.connectivity
                 .push((endpoint.node_id.clone(), connectivity_state, latency_ms));
         }
+
+        fn record_endpoint_unverified_route(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            endpoint: &ClusterEndpointRecord,
+        ) {
+            self.unverified_routes.push(endpoint.node_id.clone());
+        }
     }
 
     let now = OffsetDateTime::now_utc();
@@ -10109,10 +10119,10 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
         )]
     );
-    assert_eq!(
-        transport.connectivity,
-        vec![(peer, ClusterConnectivityState::Healthy, None)]
-    );
+    // Join acceptance proves only that the joiner reaches this node, so the
+    // endpoint becomes an unverified route rather than a Healthy observation.
+    assert!(transport.connectivity.is_empty());
+    assert_eq!(transport.unverified_routes, vec![peer]);
 }
 
 #[test]

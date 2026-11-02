@@ -119,7 +119,7 @@ pub use connectivity_store::{
     read_local_cluster_connectivity_records, read_local_cluster_connectivity_records_for_source,
     record_local_cluster_endpoint_command_auth_denied,
     record_local_cluster_endpoint_command_connectivity,
-    write_local_cluster_connectivity_record_groups,
+    record_local_cluster_endpoint_unverified_route, write_local_cluster_connectivity_record_groups,
     write_local_cluster_connectivity_record_groups_async, write_local_cluster_connectivity_records,
 };
 pub use connectivity_store::{

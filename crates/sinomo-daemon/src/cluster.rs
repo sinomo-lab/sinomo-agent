@@ -576,18 +576,16 @@ fn remember_successful_join_endpoint_connectivity(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,
 ) {
-    // The accepted response path must become locally routable before the
-    // registration returns. Quorum publication is deliberately not performed
-    // here: JoinAccepted wakes the persistent maintenance reactor, which owns
+    // The accepted member must become locally routable before the
+    // registration returns. Acceptance proves only that the joiner reaches
+    // this node, so the endpoint is an unverified route, not a reachability
+    // observation. Quorum publication is deliberately not performed here:
+    // JoinAccepted wakes the persistent maintenance reactor, which owns
     // generation-fenced connectivity publication. The former ad-hoc publisher
     // raced subsequent learner admission commits and duplicated that owner.
-    let _ = sinomo_core::cluster::ClusterCommandConnectivityObservation {
-        connectivity_state: sinomo_core::network::ClusterConnectivityState::Healthy,
-        latency_ms: None,
-        bypass_failure_grace: false,
-        command_auth_denied: false,
-    }
-    .record_daemon_owned(paths, state, endpoint);
+    let _ = sinomo_core::network::record_local_cluster_endpoint_unverified_route(
+        paths, state, endpoint,
+    );
 }
 
 pub(crate) fn remember_cluster_endpoint_command_connectivity(
@@ -1520,8 +1518,8 @@ impl sinomo_core::cluster::ClusterJoinRegistrationHost for DaemonClusterJoinRegi
     ) -> Result<(), sinomo_core::network::NetworkError> {
         // Joining through a bridge has a narrow ordering window: the voter can
         // accept the member before the rest of the cluster has a routable edge
-        // to it. Record this accepted response-path observation immediately so
-        // local route planning does not wait for the maintenance reactor.
+        // to it. Record its endpoints as unverified routes immediately so local
+        // route planning does not wait for the maintenance reactor.
         remember_successful_join_endpoint_connectivity(paths, state, endpoint);
         Ok(())
     }
@@ -7136,6 +7134,15 @@ impl sinomo_core::cluster::ClusterControlPlaneTransport for DaemonClusterControl
             connectivity_state,
             latency_ms,
         );
+    }
+
+    fn record_endpoint_unverified_route(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+    ) {
+        remember_successful_join_endpoint_connectivity(paths, state, endpoint);
     }
 
     fn published_network_info_matches(

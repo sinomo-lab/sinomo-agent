@@ -3255,6 +3255,9 @@ pub trait ClusterJoinRegistrationHost {
         })
     }
 
+    /// Keeps the members of an accepted join routable from this node before
+    /// its first probe. Acceptance proves only that the joiner reaches this
+    /// node, so each advertised endpoint is remembered as an unverified route.
     fn remember_successful_join_targets(
         &mut self,
         paths: &ClusterPaths,
@@ -3618,13 +3621,8 @@ where
         state: &ClusterBootstrapState,
         endpoint: &ClusterEndpointRecord,
     ) -> Result<(), NetworkError> {
-        self.transport.record_endpoint_command_connectivity(
-            paths,
-            state,
-            endpoint,
-            ClusterConnectivityState::Healthy,
-            None,
-        );
+        self.transport
+            .record_endpoint_unverified_route(paths, state, endpoint);
         Ok(())
     }
 }

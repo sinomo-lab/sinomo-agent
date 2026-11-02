@@ -154,6 +154,13 @@ impl CandidatePath {
             .count()
     }
 
+    fn unverified_hop_count(&self) -> usize {
+        self.hops
+            .iter()
+            .filter(|hop| hop.connectivity_state == DirectConnectivityState::Unverified)
+            .count()
+    }
+
     fn unreachable_hop_count(&self) -> usize {
         self.hops
             .iter()
@@ -168,9 +175,15 @@ fn compare_candidate_paths(left: &CandidatePath, right: &CandidatePath) -> std::
     // last resort so a transient observation generation cannot make an
     // otherwise connected node publish zero candidates. A stale-unreachable
     // direct recovery is weaker still and must never outrank either kind.
+    // Unverified edges carry no evidence either way, so they rank after
+    // proven ones but before any edge with failure evidence.
     left.unreachable_hop_count()
         .cmp(&right.unreachable_hop_count())
         .then_with(|| left.degraded_hop_count().cmp(&right.degraded_hop_count()))
+        .then_with(|| {
+            left.unverified_hop_count()
+                .cmp(&right.unverified_hop_count())
+        })
         .then_with(|| left.hops.len().cmp(&right.hops.len()))
         .then_with(|| {
             left.total_latency_micros()
@@ -3786,6 +3799,182 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .expect("directory")
+    }
+
+    #[test]
+    fn measured_edge_outranks_an_unverified_route_that_stays_executable() {
+        let now = OffsetDateTime::now_utc();
+        let source = NodeId::from_legacy_named("node_unverified_route_source").expect("source");
+        let target = NodeId::from_legacy_named("node_unverified_route_target").expect("target");
+        let endpoint = |name: &str| ClusterEndpointRecord {
+            endpoint_id: Id::from_legacy_named(name).expect("endpoint id"),
+            node_id: target.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("{name}:21353"),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        // The unverified endpoint gets the id that wins every remaining tie.
+        let mut endpoints = [
+            endpoint("endpoint_unverified_route_a"),
+            endpoint("endpoint_unverified_route_b"),
+        ];
+        endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        let [unverified, measured] = endpoints;
+        let directory = directory_fixture_with_endpoints(
+            7,
+            [
+                (source.clone(), Vec::new()),
+                (target.clone(), vec![unverified.clone(), measured.clone()]),
+            ],
+        );
+        let state = sinomo_base::ClusterBootstrapState::initialized_locally(
+            sinomo_node::ClusterId::from_legacy_named("cluster_unverified_route").expect("cluster"),
+            "unverified route",
+            source.clone(),
+            "source",
+            "pk-source",
+            now,
+        );
+        let seeded = crate::connectivity::cluster_connectivity_record_for_unverified_route(
+            &state,
+            &unverified,
+            now,
+        );
+        let probed = crate::connectivity::cluster_connectivity_record_for_probe_outcome(
+            &state, &measured, None, true, 4, "probed", now,
+        );
+        let first_hops = |records: Vec<ClusterConnectivityRecord>| {
+            let snapshot =
+                crate::connectivity_snapshot::connectivity_snapshot_from_directory_records(
+                    &directory, records, now,
+                )
+                .expect("connectivity snapshot");
+            plan_routes(
+                &directory,
+                &snapshot,
+                &source,
+                &target,
+                RouteConstraints::default(),
+            )
+            .into_iter()
+            .map(|path| path.hops[0].endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            first_hops(vec![seeded.clone()]),
+            vec![unverified.endpoint_id.clone()],
+            "an accepted member stays routable before its first probe"
+        );
+        assert_eq!(
+            first_hops(vec![seeded, probed]),
+            vec![measured.endpoint_id, unverified.endpoint_id],
+            "an unprobed endpoint must never be dialed before a measured one"
+        );
+    }
+
+    #[test]
+    fn unverified_relay_outranks_a_shorter_path_with_failure_evidence() {
+        let now = OffsetDateTime::now_utc();
+        let node = |name: &str| NodeId::from_legacy_named(name).expect("node id");
+        let (source, introducer, bridge, bystander, joiner) = (
+            node("node_unverified_relay_source"),
+            node("node_unverified_relay_introducer"),
+            node("node_unverified_relay_bridge"),
+            node("node_unverified_relay_bystander"),
+            node("node_unverified_relay_joiner"),
+        );
+        let endpoint = |target: &NodeId| ClusterEndpointRecord {
+            endpoint_id: Id::from_legacy_named(format!("endpoint_{target}")).expect("endpoint"),
+            node_id: target.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("{target}:21353"),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        let members = [&source, &introducer, &bridge, &bystander, &joiner];
+        let directory = directory_fixture_with_endpoints(
+            7,
+            members
+                .iter()
+                .map(|member| ((*member).clone(), vec![endpoint(member)])),
+        );
+        let state_of = |local: &NodeId| {
+            sinomo_base::ClusterBootstrapState::initialized_locally(
+                sinomo_node::ClusterId::from_legacy_named("cluster_unverified_relay")
+                    .expect("cluster"),
+                "unverified relay",
+                local.clone(),
+                "local",
+                "pk-local",
+                now,
+            )
+        };
+        let probed = |from: &NodeId, to: &NodeId| {
+            crate::connectivity::cluster_connectivity_record_for_probe_outcome(
+                &state_of(from),
+                &endpoint(to),
+                None,
+                true,
+                2,
+                "probed",
+                now,
+            )
+        };
+        let records = vec![
+            // The joiner's real route: an introducer chain whose last two
+            // edges were only recorded when each node accepted a join.
+            probed(&source, &introducer),
+            crate::connectivity::cluster_connectivity_record_for_unverified_route(
+                &state_of(&introducer),
+                &endpoint(&bridge),
+                now,
+            ),
+            crate::connectivity::cluster_connectivity_record_for_unverified_route(
+                &state_of(&bridge),
+                &endpoint(&joiner),
+                now,
+            ),
+            // A bystander that cannot reach the joiner and recorded a
+            // failed startup probe, which stays executable as `Degraded`.
+            probed(&source, &bystander),
+            crate::connectivity::cluster_connectivity_record_for_startup_probe_failure(
+                &state_of(&bystander),
+                &endpoint(&joiner),
+                None,
+                0,
+                "probe failed",
+                now,
+            ),
+        ];
+        let snapshot = crate::connectivity_snapshot::connectivity_snapshot_from_directory_records(
+            &directory, records, now,
+        )
+        .expect("connectivity snapshot");
+
+        let paths = plan_routes(
+            &directory,
+            &snapshot,
+            &source,
+            &joiner,
+            RouteConstraints::default(),
+        );
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.nodes.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![source.clone(), introducer, bridge, joiner.clone()],
+                vec![source, bystander, joiner],
+            ],
+            "failure evidence must rank below routes that merely lack verification"
+        );
     }
 
     #[tokio::test]

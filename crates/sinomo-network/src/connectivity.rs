@@ -769,19 +769,49 @@ pub fn cluster_connectivity_record_for_probe_outcome(
     now: OffsetDateTime,
 ) -> ClusterConnectivityRecord {
     if healthy {
-        return cluster_connectivity_record(
+        return cluster_connectivity_record_for_success(
             state,
             endpoint,
-            ClusterConnectivityState::Healthy,
+            previous,
             Some(latency_ms),
-            0,
-            Some(timestamp.to_string()),
-            previous.and_then(|record| record.last_failure_at.clone()),
+            timestamp,
             now,
-            CLUSTER_CONNECTIVITY_TTL_SECONDS,
         );
     }
+    cluster_connectivity_record_for_failed_attempt(state, endpoint, previous, timestamp, now)
+}
 
+/// `latency_ms` is `None` when the successful attempt did not time this edge.
+/// Route planning then ranks the edge after measured ones; an unknown latency
+/// is never recorded as an instantaneous one.
+pub(crate) fn cluster_connectivity_record_for_success(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    previous: Option<&ClusterConnectivityRecord>,
+    latency_ms: Option<u64>,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    cluster_connectivity_record(
+        state,
+        endpoint,
+        ClusterConnectivityState::Healthy,
+        latency_ms,
+        0,
+        Some(timestamp.to_string()),
+        previous.and_then(|record| record.last_failure_at.clone()),
+        now,
+        CLUSTER_CONNECTIVITY_TTL_SECONDS,
+    )
+}
+
+pub(crate) fn cluster_connectivity_record_for_failed_attempt(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    previous: Option<&ClusterConnectivityRecord>,
+    timestamp: &str,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
     let observed_failures = previous
         .map(|record| record.consecutive_failures.saturating_add(1))
         .unwrap_or(1);
@@ -820,6 +850,33 @@ pub fn cluster_connectivity_record_for_probe_outcome(
         Some(timestamp.to_string()),
         now,
         ttl_seconds,
+    )
+}
+
+/// An authorized endpoint this node has no reachability evidence for, such as
+/// a joiner's advertised endpoint at the node that accepted its admission: the
+/// join proves the joiner reaches this node, not which of the joiner's
+/// endpoints this node can dial. The edge stays executable, so the new member
+/// is routable before its first probe. It is stored as `Degraded` without a
+/// recorded failure, which route planning reads as unverified: ranked below
+/// reachable edges and above edges with failure evidence. It gets no
+/// single-failure grace and is retried on the probe cadence instead of being
+/// trusted until expiry.
+pub fn cluster_connectivity_record_for_unverified_route(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    now: OffsetDateTime,
+) -> ClusterConnectivityRecord {
+    cluster_connectivity_record(
+        state,
+        endpoint,
+        ClusterConnectivityState::Degraded,
+        None,
+        0,
+        None,
+        None,
+        now,
+        CLUSTER_CONNECTIVITY_TTL_SECONDS,
     )
 }
 
