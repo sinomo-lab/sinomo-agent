@@ -693,8 +693,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            &DFS_DATA_PLANE_ROUTES[..2],
-            [DFS_SMOKE_ROUTE, DFS_DIRECT_READ_ROUTE]
+            &DFS_DATA_PLANE_ROUTES[..3],
+            [
+                DFS_SMOKE_ROUTE,
+                DFS_DIRECT_READ_ROUTE,
+                DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE
+            ]
         );
         assert_eq!(DFS_MESSAGE_DATA_PLANE_ROUTES.len(), 25);
         assert_eq!(
@@ -712,7 +716,11 @@ mod tests {
         assert_eq!(
             DFS_DATA_PLANE_ROUTES,
             [
-                &[DFS_SMOKE_ROUTE, DFS_DIRECT_READ_ROUTE][..],
+                &[
+                    DFS_SMOKE_ROUTE,
+                    DFS_DIRECT_READ_ROUTE,
+                    DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE
+                ][..],
                 DFS_MESSAGE_DATA_PLANE_ROUTES,
             ]
             .concat()

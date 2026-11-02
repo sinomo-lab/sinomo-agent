@@ -2909,8 +2909,10 @@ mod tests {
             status.bounds
         );
 
-        // Pinned destinations stay fixed while closable tabs overflow on a phone.
-        shared.new_workspace_tab(crate::state::WorkspaceTabKind::Chat);
+        // Multiple closable tabs overflow while each tab fits the phone viewport.
+        for _ in 0..3 {
+            shared.new_workspace_tab(crate::state::WorkspaceTabKind::Chat);
+        }
         root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(320.0, 720.0))))?;
         app.run_until_idle()?;
         let narrow = window.snapshot()?;

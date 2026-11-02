@@ -525,11 +525,12 @@ mod tests {
                     node.description
                         .as_deref()
                         .is_some_and(|description| description.starts_with("Pinned "))
-                        || node.name.as_deref() == Some("New tab")
+                        || matches!(node.name.as_deref(), Some("New tab" | "Navigate"))
                 })
                 .map(|node| (node.name.clone(), node.bounds))
                 .collect();
-            assert_eq!(controls.len(), 6);
+            let compact = width <= 620.0;
+            assert_eq!(controls.len(), if compact { 2 } else { 6 });
             for (_, bounds) in &controls {
                 assert!(bounds.x() >= 0.0 && bounds.max_x() <= width);
             }
@@ -574,23 +575,30 @@ mod tests {
                         .any(|node| node.name == name && node.bounds == bounds)
                 );
             }
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Settings")
-                .click()?;
+            if compact {
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Navigate")
+                    .click()?;
+                window
+                    .get_by_role(SemanticsRole::MenuItem)
+                    .with_name("Settings")
+                    .click()?;
+            } else {
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name("Settings")
+                    .click()?;
+            }
             assert_eq!(shared.borrow().active_workspace_tab, None);
             assert_eq!(shared.active_tab(), Tab::Settings);
             let selected = window.snapshot()?;
-            assert!(
-                selected
-                    .accessibility
-                    .nodes
-                    .iter()
-                    .any(
-                        |node| node.description.as_deref() == Some("Pinned Settings tab")
-                            && node.state.selected
-                    )
-            );
+            if !compact {
+                assert!(selected.accessibility.nodes.iter().any(
+                    |node| node.description.as_deref() == Some("Pinned Settings tab")
+                        && node.state.selected
+                ));
+            }
         }
         Ok(())
     }

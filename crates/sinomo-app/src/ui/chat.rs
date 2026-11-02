@@ -31096,6 +31096,16 @@ mod tests {
             );
         }
 
+        // Long failure feedback can push the manual action below the popup's
+        // viewport. Reveal it through the existing scroller before clicking.
+        let options = named_node_bounds(&snapshot, SemanticsRole::ScrollView, "Attachment options");
+        let manual = named_node_bounds(&snapshot, SemanticsRole::Button, "Enter path manually");
+        if manual.max_y() > options.max_y() {
+            window
+                .get_by_role(SemanticsRole::ScrollView)
+                .with_name("Attachment options")
+                .scroll_pixels(sui::Vector::new(0.0, options.max_y() - manual.max_y()))?;
+        }
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Enter path manually")

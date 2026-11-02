@@ -549,7 +549,7 @@ mod tests {
             foreign
                 .queue
                 .revalidate_original_repair_attempt_witness(&witness),
-            "another resident queue owner",
+            "another native/resident physical owner",
         );
         assert_eq!(unchanged_state(&foreign.queue), before);
 
