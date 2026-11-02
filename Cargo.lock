@@ -10374,6 +10374,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "fs2",
+ "libc",
  "libloading 0.9.0",
  "ring",
  "serde",

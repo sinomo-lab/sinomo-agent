@@ -41,7 +41,7 @@ pub const MEDIA_AUDIO_OBJECT_RPC_ROUTES: &[&str] = &[
 pub const MEDIA_CAPTURE_OPERATION: &str = "capture";
 pub const MEDIA_PLAYBACK_OPERATION: &str = "play";
 
-const MEDIA_AUDIO_ROUTE_AUTH_SCOPE: &str = "media.audio";
+const MEDIA_AUDIO_ROUTE_AUTH_SCOPE: &str = "local-or-cluster-member";
 /// Bounds how long a handler waits for the next captured chunk before re-checking the stream.
 #[cfg(feature = "native-devices")]
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -249,7 +249,19 @@ fn served_audio_devices(
         .as_deref()
         .map(str::trim)
         .filter(|kind| !kind.is_empty());
-    let devices = node_audio_devices()
+    let mut inventory = node_audio_devices();
+    let defaults = inventory
+        .iter()
+        .filter(|device| device.is_default)
+        .map(|device| NodeAudioDevice {
+            kind: device.kind.clone(),
+            selector: "default".into(),
+            name: format!("Default ({})", device.name),
+            is_default: true,
+        })
+        .collect::<Vec<_>>();
+    inventory.extend(defaults);
+    let devices = inventory
         .into_iter()
         .filter(|device| wanted_kind.is_none_or(|kind| kind == device.kind))
         .filter_map(|device| {
@@ -319,7 +331,11 @@ async fn handle_capture(
     require_exposed_device(ctx, &resource_id, MEDIA_CAPTURE_OPERATION)?;
     let sample_rate_hz = request.sample_rate_hz;
     let sample_format = request.sample_format;
-    let stream = capture_reader(request)?;
+    let stream = capture_reader(
+        request,
+        LocalNodePermissionStore::new(ctx.data_dir.root()),
+        resource_id,
+    )?;
     // The length is unknown because the stream ends when the caller stops reading or the chunk
     // bound is reached, so the body declares deferred completion. The device worker is held by
     // the body so releasing the body releases the microphone.
@@ -437,10 +453,12 @@ mod native {
 
     pub(super) fn capture_reader(
         request: MediaAudioCaptureRequest,
+        store: LocalNodePermissionStore,
+        resource_id: String,
     ) -> Result<CaptureStream, ServiceError> {
         let mut config =
             NativeAudioCaptureConfig::new(request.sample_rate_hz, request.sample_format);
-        config.device = request.device.clone();
+        config.device = request.device.clone().filter(|device| device != "default");
         config.chunk_ms = request.chunk_ms;
         let capture = crate::start_native_microphone_capture(config)
             .map_err(|error| ServiceError::Service(format!("open microphone: {error}")))?;
@@ -450,16 +468,31 @@ mod native {
         let worker = tokio::task::spawn_blocking(move || {
             let mut sent = 0_u64;
             loop {
+                if !store.resource_operation_exposed(&resource_id, MEDIA_CAPTURE_OPERATION) {
+                    let _ = frames_tx.try_send(Err("Microphone sharing was revoked".into()));
+                    return;
+                }
                 if max_chunks.is_some_and(|max| sent >= max) {
                     return;
                 }
                 match capture.recv_timeout(super::CAPTURE_POLL_INTERVAL) {
                     Ok(Some(chunk)) => {
                         sent = sent.saturating_add(1);
-                        if frames_tx.blocking_send(Ok(chunk.audio)).is_err() {
-                            // The caller stopped reading; releasing the device is the only
-                            // correct response.
-                            return;
+                        let mut pending = Ok(chunk.audio);
+                        loop {
+                            if !store
+                                .resource_operation_exposed(&resource_id, MEDIA_CAPTURE_OPERATION)
+                            {
+                                return;
+                            }
+                            match frames_tx.try_send(pending) {
+                                Ok(()) => break,
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                Err(mpsc::error::TrySendError::Full(value)) => {
+                                    pending = value;
+                                    std::thread::sleep(super::CAPTURE_POLL_INTERVAL);
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
@@ -490,7 +523,7 @@ mod native {
         request: MediaAudioPlaybackRequest,
     ) -> Result<u64, ServiceError> {
         let playback = crate::start_native_speaker_playback(NativeSpeakerPlaybackConfig {
-            device: request.device.clone(),
+            device: request.device.clone().filter(|device| device != "default"),
             input_sample_rate_hz: request.input_sample_rate_hz,
             input_sample_format: request.input_sample_format,
         })
@@ -502,6 +535,11 @@ mod native {
             .await
             .map_err(|error| ServiceError::Service(format!("read playback body: {error}")))?
         {
+            require_exposed_device(
+                ctx,
+                &audio_resource_id("speaker", request.device.as_deref()),
+                MEDIA_PLAYBACK_OPERATION,
+            )?;
             written_bytes = written_bytes.saturating_add(chunk.len() as u64);
             playback
                 .write(&chunk)
@@ -528,6 +566,8 @@ mod native {
 
     pub(super) fn capture_reader(
         _request: MediaAudioCaptureRequest,
+        _store: LocalNodePermissionStore,
+        _resource_id: String,
     ) -> Result<CaptureStream, ServiceError> {
         Err(unavailable())
     }

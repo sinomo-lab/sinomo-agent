@@ -10361,6 +10361,8 @@ async fn reconcile_chat_media_devices(
 fn open_chat_media_microphone(
     config: &sinomo_audio::NativeAudioCaptureConfig,
 ) -> Result<sinomo_audio::NativeAudioCapture, String> {
+    #[cfg(target_os = "android")]
+    crate::android_media::request("microphone")?;
     sinomo_audio::start_native_microphone_capture(config.clone())
         .map_err(|error| format!("microphone unavailable: {error}"))
 }
@@ -10379,6 +10381,8 @@ impl Drop for ChatMediaCameraOpenGuard {
 fn open_chat_media_camera(
     config: &sinomo_video::NativeVideoCaptureConfig,
 ) -> Result<sinomo_video::NativeVideoCapture, String> {
+    #[cfg(target_os = "android")]
+    crate::android_media::request("camera")?;
     if CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()

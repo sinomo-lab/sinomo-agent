@@ -1199,6 +1199,12 @@ enum SettingsOperation {
         config: SifsMountConfig,
     },
     RefreshRemoteManagement,
+    #[cfg(target_os = "android")]
+    OpenAndroidMediaSettings,
+    SetDeviceExposure {
+        kind: String,
+        enabled: bool,
+    },
     SetRemoteManagementPermission {
         enabled: bool,
     },
@@ -2619,6 +2625,16 @@ impl SettingsState {
                 self.remote_management_module_status = None;
                 self.external_integrations_permission_error = None;
                 self.external_integrations_permission_status = None;
+            }
+            #[cfg(target_os = "android")]
+            SettingsOperation::OpenAndroidMediaSettings => {
+                self.remote_management_permission_error = None;
+                self.remote_management_permission_status =
+                    Some("Opening Android App Use setup…".into());
+            }
+            SettingsOperation::SetDeviceExposure { .. } => {
+                self.remote_management_permission_error = None;
+                self.remote_management_permission_status = Some("Updating device sharing…".into());
             }
             SettingsOperation::SetRemoteManagementPermission { enabled } => {
                 self.remote_management_permission_error = None;
@@ -4642,6 +4658,38 @@ fn execute_settings_operation(
                     local_module_snapshot: module_snapshot,
                 },
             ))
+        }
+        #[cfg(target_os = "android")]
+        SettingsOperation::OpenAndroidMediaSettings => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                crate::android_media::request("app-use")?;
+                let permissions =
+                    sinomo_runtime::node::LocalNodePermissionStore::new(backend.data_dir.root())
+                        .load()
+                        .map_err(|error| error.to_string())?;
+                Ok(RemoteManagementOperationSuccess::PermissionChanged {
+                    permissions,
+                    target: LocalPermissionTarget::RemoteManagement,
+                    message: "App Use setup opened on this device".into(),
+                })
+            })())
+        }
+        SettingsOperation::SetDeviceExposure { kind, enabled } => {
+            SettingsOperationPayload::RemoteManagement((|| {
+                #[cfg(target_os = "android")]
+                if enabled && matches!(kind.as_str(), "microphone" | "camera") {
+                    crate::android_media::request(&kind)?;
+                }
+                let mutation = backend.set_local_device_exposure(&kind, enabled)?;
+                Ok(RemoteManagementOperationSuccess::PermissionChanged {
+                    permissions: mutation.permissions,
+                    target: LocalPermissionTarget::RemoteManagement,
+                    message: format!(
+                        "{kind} sharing {}",
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                })
+            })())
         }
         SettingsOperation::SetRemoteManagementPermission { enabled } => {
             SettingsOperationPayload::RemoteManagement((|| {
@@ -8583,10 +8631,63 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
             )],
         ));
 
+    let mut devices = SettingsCard::new("Device sharing")
+        .description("Allow authenticated cluster peers to use this node's default devices. Android permissions and device availability still apply. Turn sharing off to revoke access.");
+    for (kind, label) in [
+        ("microphone", "Microphone"),
+        ("speaker", "Speaker"),
+        ("camera", "Camera"),
+        ("motion", "Motion and environment sensors"),
+    ] {
+        let s = shared.clone();
+        let checked = snapshot.shared_devices.iter().any(|value| value == kind);
+        devices = devices.row(
+            SettingRow::new(label)
+                .control(
+                    Switch::new("")
+                        .semantic_name(format!("Share {label}"))
+                        .checked(checked)
+                        .theme_when(clone_reader(reader))
+                        .on_change(move |enabled| {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::RemoteManagementPermission,
+                                SettingsOperation::SetDeviceExposure {
+                                    kind: kind.into(),
+                                    enabled,
+                                },
+                            );
+                        }),
+                )
+                .build(shared),
+        );
+    }
+    #[cfg(target_os = "android")]
+    {
+        let s = shared.clone();
+        devices = devices.row(
+            SettingRow::new("App Use")
+                .help("Share the display and enable accessibility for touch and text input.")
+                .control(
+                    sui::Button::new("Set up App Use")
+                        .theme_when(clone_reader(reader))
+                        .on_press(move || {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::RemoteManagementPermission,
+                                SettingsOperation::OpenAndroidMediaSettings,
+                            );
+                        }),
+                )
+                .build(shared),
+        );
+    }
+
     Stack::vertical()
         .gap(16.0)
         .alignment(Alignment::Stretch)
         .with_child(permission.build(shared, reader))
+        .with_child(devices.build(shared, reader))
         .with_child(module.build(shared, reader))
         .with_child(node_external_integrations_permission_section(
             shared, reader,

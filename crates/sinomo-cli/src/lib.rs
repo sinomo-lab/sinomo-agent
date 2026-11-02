@@ -5863,3 +5863,5 @@ fn decode_cluster_kv_authoritative_snapshot_rpc_response(
     }
     Ok(read)
 }
+
+pub use commands::audio_component_factory;

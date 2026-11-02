@@ -617,6 +617,10 @@ fn install_android_lifecycle_monitor(
             &[activity.as_ref().into()],
         )?;
         env.call_method(&callback, jni_str!("start"), jni_sig!("()V"), &[])?;
+        crate::android_media::install(
+            unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) },
+            env.new_global_ref(&callback)?,
+        );
         Ok(())
     })
 }
