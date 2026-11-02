@@ -5,14 +5,16 @@ use std::cell::Cell;
 pub(super) struct MetricChart {
     name: String,
     pub series: Vec<MetricSeries>,
-    theme: DefaultTheme,
-    pub colors: [Color; 6],
+    /// Read at paint, so a theme change restyles the retained chart.
+    theme: ThemeReader,
+    /// Draw every series in this tone's color; `None` uses the decorative series hues.
+    pub tone: Option<SemanticTone>,
     unit: Option<ObserveMetricUnit>,
-    transform: ExplorerTransform,
+    pub transform: ExplorerTransform,
     kind: ObserveMetricKind,
-    pub window: ExplorerWindow,
-    pub end_at: OffsetDateTime,
-    pub paused: bool,
+    window: ExplorerWindow,
+    end_at: OffsetDateTime,
+    paused: bool,
     pub dashboard_metric: Option<DashboardMetric>,
     pub height: f32,
     hovered: Rc<Cell<Option<f32>>>,
@@ -22,8 +24,7 @@ impl MetricChart {
     pub fn new(
         name: String,
         series: Vec<MetricSeries>,
-        theme: DefaultTheme,
-        colors: [Color; 6],
+        theme: ThemeReader,
         unit: Option<ObserveMetricUnit>,
         transform: ExplorerTransform,
         kind: ObserveMetricKind,
@@ -33,7 +34,7 @@ impl MetricChart {
             name,
             series,
             theme,
-            colors,
+            tone: None,
             unit,
             transform,
             kind,
@@ -46,20 +47,22 @@ impl MetricChart {
         }
     }
 
-    pub fn hover_state(mut self, state: Rc<Cell<Option<f32>>>) -> Self {
-        self.hovered = state;
-        self
-    }
-
-    pub fn time_range(mut self, end: OffsetDateTime, window: ExplorerWindow, paused: bool) -> Self {
+    /// The trailing window the plot shows, ending at `end`.
+    pub fn set_time_range(&mut self, end: OffsetDateTime, window: ExplorerWindow, paused: bool) {
         self.end_at = end;
         self.window = window;
         self.paused = paused;
-        self
+    }
+
+    fn colors(&self, theme: &DefaultTheme) -> [Color; 6] {
+        match self.tone {
+            Some(tone) => [theme.semantic_tone_color(tone); 6],
+            None => crate::theme::agent_hues(theme),
+        }
     }
 
     fn chart_rect(&self, bounds: Rect) -> Rect {
-        let scale = self.theme.text.xs.size / DefaultTheme::default().text.xs.size;
+        let scale = (self.theme)().text.xs.size / DefaultTheme::default().text.xs.size;
         let left = match self.dashboard_metric.map(DashboardMetric::unit) {
             Some("B/s") => 100.0,
             Some("ms" | "%" | "/s") => 72.0,
@@ -168,6 +171,8 @@ impl Widget for MetricChart {
         if plot.is_empty() {
             return;
         }
+        let theme = (self.theme)();
+        let colors = self.colors(&theme);
         let values = self.finite_values().collect::<Vec<_>>();
         let percentages = self
             .dashboard_metric
@@ -203,10 +208,10 @@ impl Widget for MetricChart {
             )
         };
         let span = (max - min).max(f64::EPSILON);
-        let pal = Palette::from_theme(&self.theme, self.theme.surfaces.dark);
-        let axis = pal.text_style(
-            &self.theme,
-            self.theme.text.xs.size,
+        let pal = theme.surfaces;
+        let axis = crate::theme::token_text_style(
+            &theme,
+            theme.text.xs,
             FontWeight::NORMAL,
             pal.text_muted,
         );
@@ -264,7 +269,7 @@ impl Widget for MetricChart {
         }
         ctx.push_clip_rect(plot);
         for (index, series) in self.series.iter().enumerate() {
-            let color = self.colors[index % self.colors.len()];
+            let color = colors[index % colors.len()];
             let mut path = PathBuilder::new();
             let mut drawing = false;
             let mut previous_at: Option<OffsetDateTime> = None;

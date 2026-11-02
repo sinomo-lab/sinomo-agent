@@ -470,7 +470,7 @@ pub struct AppSignals {
     pub health_structure: Signal<HealthStructureKey>,
     pub loading_stall_lines: Signal<[Option<String>; 2]>,
     pub cluster_structure: Signal<ClusterStructureKey>,
-    pub evolution_revision: Signal<u64>,
+    pub evolution: Signal<crate::ui::evolution::EvolutionView>,
     pub files_structure: Signal<FilesStructureKey>,
     pub files_thumbnail_revision: Signal<u64>,
     pub settings_structure: Signal<SettingsStructureKey>,
@@ -508,12 +508,12 @@ impl AppSignals {
                     state.ready.as_ref().map(|ready| &ready.cluster),
                 ),
             ),
-            evolution_revision: Signal::named(
-                "evolution dashboard revision",
+            evolution: Signal::named(
+                "evolution dashboard",
                 state
                     .ready
                     .as_ref()
-                    .map(|ready| ready.evolution.revision)
+                    .map(|ready| crate::ui::evolution::EvolutionView::from_state(&ready.evolution))
                     .unwrap_or_default(),
             ),
             files_structure: Signal::named(
@@ -566,7 +566,6 @@ pub struct ShellStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HealthStructureKey {
-    pub theme: DefaultTheme,
     pub status: ShellStatus,
     pub issues: Vec<HealthIssue>,
     pub connection_label: String,
@@ -582,7 +581,6 @@ impl HealthStructureKey {
         let ready = state.is_ready();
         let health = &state.connection_health;
         Self {
-            theme: state.theme().with_size(sui::ControlSize::Small),
             status: ShellStatus {
                 label: status_text_for(state),
                 detail: if ready {
@@ -693,6 +691,12 @@ impl Shared {
 
     pub fn theme(&self) -> DefaultTheme {
         self.state.borrow().theme()
+    }
+
+    /// The current theme at a contextual control size.
+    pub fn theme_sized(&self, size: sui::ControlSize) -> DefaultTheme {
+        let state = self.state.borrow();
+        crate::theme::resolve_sized_theme(state.theme_mode, state.text_scale, size)
     }
 
     pub fn render_options(&self) -> WindowRenderOptions {
@@ -938,14 +942,14 @@ impl Shared {
     }
 
     pub fn publish_evolution_signals(&self) {
-        let revision = self
+        let view = self
             .state
             .borrow()
             .ready
             .as_ref()
-            .map(|ready| ready.evolution.revision)
+            .map(|ready| crate::ui::evolution::EvolutionView::from_state(&ready.evolution))
             .unwrap_or_default();
-        self.signals.evolution_revision.set(revision);
+        self.signals.evolution.set(view);
     }
 
     pub fn publish_settings_signals(&self) {
@@ -979,7 +983,6 @@ impl Shared {
     fn publish_health_signals_with_error(&self, action_error: Option<String>) {
         let issues = self.health_issues();
         let (
-            theme,
             ready,
             connection_label,
             connection_detail,
@@ -990,7 +993,6 @@ impl Shared {
             let state = self.state.borrow();
             let health = &state.connection_health;
             (
-                state.theme().with_size(sui::ControlSize::Small),
                 state.is_ready(),
                 health.label.clone(),
                 health.detail.clone(),
@@ -1000,7 +1002,6 @@ impl Shared {
             )
         };
         self.signals.health_structure.set(HealthStructureKey {
-            theme,
             status,
             issues,
             connection_label,
