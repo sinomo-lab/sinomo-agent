@@ -131,8 +131,13 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender(
     message_sender: DfsMessageSender,
     mut control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
-    let metadata =
-        open_service_metadata_backend(data_dir, cluster_paths, &local_node_id, &mut control_plane)?;
+    let metadata = open_service_metadata_backend(
+        data_dir,
+        cluster_paths,
+        &local_node_id,
+        &mut control_plane,
+        false,
+    )?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let mut service = NetworkedDfsService::new(
         DfsNodeTransport::with_message_sender_for_nodes(
@@ -179,6 +184,7 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_lazy(
     peer_transport: Arc<dyn DfsPeerTransport>,
     async_peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    registered_main_namespace_dispatch: bool,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
         data_dir,
@@ -190,6 +196,7 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_lazy(
         DfsNodeDetachedSendState::default(),
         control_plane,
         ClusterDfsServiceHydration::Lazy,
+        registered_main_namespace_dispatch,
     )
 }
 
@@ -214,6 +221,7 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_detach
         detached_send_state,
         control_plane,
         ClusterDfsServiceHydration::Foreground,
+        false,
     )
 }
 
@@ -238,6 +246,7 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_recove
         detached_send_state,
         control_plane,
         ClusterDfsServiceHydration::CommitPromotionRecovery,
+        false,
     )
 }
 
@@ -257,8 +266,13 @@ pub(crate) fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_recove
     if should_cancel() {
         return Ok(None);
     }
-    let metadata =
-        open_service_metadata_backend(data_dir, cluster_paths, &local_node_id, &mut control_plane)?;
+    let metadata = open_service_metadata_backend(
+        data_dir,
+        cluster_paths,
+        &local_node_id,
+        &mut control_plane,
+        false,
+    )?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let mut service = NetworkedDfsService::new(
         DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
@@ -294,26 +308,38 @@ fn open_cluster_dfs_service_with_peer_transports_for_nodes_and_state(
     detached_send_state: DfsNodeDetachedSendState,
     mut control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     hydration: ClusterDfsServiceHydration,
+    registered_main_namespace_dispatch: bool,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsError> {
-    let metadata =
-        open_service_metadata_backend(data_dir, cluster_paths, &local_node_id, &mut control_plane)?;
+    let metadata = open_service_metadata_backend(
+        data_dir,
+        cluster_paths,
+        &local_node_id,
+        &mut control_plane,
+        registered_main_namespace_dispatch,
+    )?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let mut service = NetworkedDfsService::new(
-        DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
-            local_node_id,
-            peer_node_ids,
-            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-            peer_transport,
-            async_peer_transport,
-            detached_send_state,
-        ),
-        content,
+    let mut transport = DfsNodeTransport::with_peer_transports_for_nodes_and_detached_state(
+        local_node_id,
+        peer_node_ids,
+        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+        peer_transport,
+        async_peer_transport,
+        detached_send_state,
     );
+    if registered_main_namespace_dispatch {
+        // The mounted caller selects its existing delivery role before backend
+        // attachment; it does not acquire the resident Main's author custody.
+        transport = transport.with_registered_main_namespace_dispatch();
+    }
+    let mut service = NetworkedDfsService::new(transport, content);
     if let Some(control_plane) = control_plane {
         service = service.with_boxed_control_plane(control_plane);
     }
     match hydration {
         ClusterDfsServiceHydration::Foreground => service.with_boxed_metadata_backend(metadata),
+        ClusterDfsServiceHydration::Lazy if registered_main_namespace_dispatch => {
+            service.with_boxed_metadata_backend_for_main_sifs_client(metadata)
+        }
         ClusterDfsServiceHydration::Lazy => service.with_boxed_metadata_backend_lazy(metadata),
         ClusterDfsServiceHydration::CommitPromotionRecovery => {
             service.with_boxed_metadata_backend_for_commit_promotion_recovery(metadata)
@@ -326,6 +352,7 @@ fn open_service_metadata_backend(
     cluster_paths: &ClusterPaths,
     local_node_id: &NodeId,
     control_plane: &mut Option<Box<dyn DfsControlPlaneKvClient>>,
+    registered_main_namespace_dispatch: bool,
 ) -> Result<Box<dyn DfsMetadataBackend>, DfsError> {
     if !cluster_paths.state.exists() {
         return open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths);
@@ -346,13 +373,19 @@ fn open_service_metadata_backend(
             .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
             .map_err(Into::into);
     }
-    open_local_sharded_metadata_backend_for_replica_repair(
-        default_dfs_metadata_shards_root(data_dir),
-        shards,
-        local_node_id,
-    )
-    .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
-    .map_err(Into::into)
+    let metadata_root = default_dfs_metadata_shards_root(data_dir);
+    let backend = if registered_main_namespace_dispatch {
+        crate::LocalShardedMetadataBackend::new_with_replica_repair_deferred(
+            metadata_root,
+            shards,
+            local_node_id,
+        )
+    } else {
+        open_local_sharded_metadata_backend_for_replica_repair(metadata_root, shards, local_node_id)
+    };
+    backend
+        .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

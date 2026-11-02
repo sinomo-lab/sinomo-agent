@@ -1404,6 +1404,7 @@ impl ResidentLocalShardedMetadataBackend {
             Some(local_node_id),
             &retained_ids,
             selected_layout,
+            true,
         )?
         .into_resident();
         let inner = Arc::get_mut(&mut current.inner).ok_or_else(|| {
@@ -2002,7 +2003,7 @@ impl LocalShardedMetadataBackend {
     /// shard backend.
     pub fn new(root: impl Into<PathBuf>, shards: Vec<DfsMetadataShardConfig>) -> Result<Self> {
         let root = root.into();
-        Self::open_with(root, shards, true, None)
+        Self::open_with(root, shards, true, None, true)
     }
 
     /// Open configured shards while allowing unreadable non-primary mirrors
@@ -2014,7 +2015,18 @@ impl LocalShardedMetadataBackend {
         local_node_id: &NodeId,
     ) -> Result<Self> {
         let root = root.into();
-        Self::open_with(root, shards, true, Some(local_node_id))
+        Self::open_with(root, shards, true, Some(local_node_id), true)
+    }
+
+    /// Defer initial table decoding for a caller which routes namespace
+    /// authority through its actual Main. The slot modes and first-use native
+    /// opens are identical to `new_with_replica_repair`.
+    pub(crate) fn new_with_replica_repair_deferred(
+        root: impl Into<PathBuf>,
+        shards: Vec<DfsMetadataShardConfig>,
+        local_node_id: &NodeId,
+    ) -> Result<Self> {
+        Self::open_with(root.into(), shards, true, Some(local_node_id), false)
     }
 
     pub(crate) fn new_with_replica_repair_and_layout(
@@ -2024,7 +2036,13 @@ impl LocalShardedMetadataBackend {
         layout: Arc<crate::DfsSelectedOriginalDataLayout>,
     ) -> Result<Self> {
         Self::open_with_retained_shards_and_layout(
-            root, shards, true, Some(local_node_id), &BTreeSet::new(), Some(layout),
+            root,
+            shards,
+            true,
+            Some(local_node_id),
+            &BTreeSet::new(),
+            Some(layout),
+            true,
         )
     }
 
@@ -2037,7 +2055,7 @@ impl LocalShardedMetadataBackend {
         shards: Vec<DfsMetadataShardConfig>,
     ) -> Result<Self> {
         let root = root.into();
-        Self::open_with(root, shards, false, None)
+        Self::open_with(root, shards, false, None, true)
     }
 
     /// Open read-only shard state while retaining the local node identity used
@@ -2049,7 +2067,18 @@ impl LocalShardedMetadataBackend {
         local_node_id: &NodeId,
     ) -> Result<Self> {
         let root = root.into();
-        Self::open_with(root, shards, false, Some(local_node_id))
+        Self::open_with(root, shards, false, Some(local_node_id), true)
+    }
+
+    /// Keep the ordinary inspection modes and complete lookup semantics, but
+    /// decode each shard only when a caller actually queries it. This grants
+    /// no native writer or publication authority.
+    pub fn open_for_inspection_at_node_deferred(
+        root: impl Into<PathBuf>,
+        shards: Vec<DfsMetadataShardConfig>,
+        local_node_id: &NodeId,
+    ) -> Result<Self> {
+        Self::open_with(root.into(), shards, false, Some(local_node_id), false)
     }
 
     /// Inspect the exact owner-selected original layout without initializing or
@@ -2067,6 +2096,7 @@ impl LocalShardedMetadataBackend {
             Some(local_node_id),
             &BTreeSet::new(),
             Some(layout),
+            true,
         )
     }
 
@@ -2113,6 +2143,7 @@ impl LocalShardedMetadataBackend {
         shards: Vec<DfsMetadataShardConfig>,
         initialize_layout: bool,
         replica_repair_local_node_id: Option<&NodeId>,
+        eager_open: bool,
     ) -> Result<Self> {
         Self::open_with_retained_shards(
             root,
@@ -2120,6 +2151,7 @@ impl LocalShardedMetadataBackend {
             initialize_layout,
             replica_repair_local_node_id,
             &BTreeSet::new(),
+            eager_open,
         )
     }
 
@@ -2129,9 +2161,16 @@ impl LocalShardedMetadataBackend {
         initialize_layout: bool,
         replica_repair_local_node_id: Option<&NodeId>,
         retained_ids: &BTreeSet<DfsMetadataShardId>,
+        eager_open: bool,
     ) -> Result<Self> {
         Self::open_with_retained_shards_and_layout(
-            root, shards, initialize_layout, replica_repair_local_node_id, retained_ids, None,
+            root,
+            shards,
+            initialize_layout,
+            replica_repair_local_node_id,
+            retained_ids,
+            None,
+            eager_open,
         )
     }
 
@@ -2142,6 +2181,7 @@ impl LocalShardedMetadataBackend {
         replica_repair_local_node_id: Option<&NodeId>,
         retained_ids: &BTreeSet<DfsMetadataShardId>,
         selected_layout: Option<Arc<crate::DfsSelectedOriginalDataLayout>>,
+        eager_open: bool,
     ) -> Result<Self> {
         if let Some(layout) = &selected_layout {
             layout.check_routing_root(&root)?;
@@ -2203,7 +2243,7 @@ impl LocalShardedMetadataBackend {
         let replica_repair_local_node_id = replica_repair_local_node_id.cloned();
         let (eager_slots, deferred_slots): (Vec<_>, Vec<_>) =
             shard_slots.into_iter().partition(|(shard_id, slot)| {
-                slot.should_open_eagerly() && !retained_ids.contains(shard_id)
+                eager_open && slot.should_open_eagerly() && !retained_ids.contains(shard_id)
             });
         #[cfg(test)]
         let eager_open_count = eager_slots.len();
@@ -3126,6 +3166,62 @@ mod lazy_replica_slot_tests {
         )
         .expect("open inspection sharded backend");
         assert_eq!(inspection.opened_shard_ids(), expected);
+    }
+
+    #[test]
+    fn deferred_client_routers_preserve_modes_and_open_only_on_query() {
+        let root = sinomo_testdir::TestDir::new("dfs-deferred-client-shard-slots");
+        let metadata_root = root.path().join("metadata");
+        let local = node("deferred-client-local");
+        let configs = configs(&local);
+        let prepared = LocalShardedMetadataBackend::new(&metadata_root, configs.clone())
+            .expect("ordinary strict initialization");
+        let expected = prepared.list_file_systems().unwrap();
+        drop(prepared);
+
+        let deferred = LocalShardedMetadataBackend::new_with_replica_repair_deferred(
+            &metadata_root,
+            configs.clone(),
+            &local,
+        )
+        .unwrap();
+        assert!(deferred.opened_shard_ids().is_empty());
+        for slot in deferred.shards.values() {
+            assert_eq!(
+                slot.open_mode,
+                if slot.config.primary_node_id == local {
+                    LocalMetadataShardOpenMode::Strict
+                } else {
+                    LocalMetadataShardOpenMode::ReplicaRepair
+                }
+            );
+        }
+        assert_eq!(deferred.list_file_systems().unwrap(), expected);
+        assert_eq!(
+            deferred.opened_shard_ids().len(),
+            configs.len(),
+            "an explicit complete catalogue query still opens all shards"
+        );
+        drop(deferred);
+
+        let inspected = LocalShardedMetadataBackend::open_for_inspection_at_node_deferred(
+            &metadata_root,
+            configs.clone(),
+            &local,
+        )
+        .unwrap();
+        assert!(inspected.opened_shard_ids().is_empty());
+        assert!(
+            inspected
+                .shards
+                .values()
+                .all(|slot| slot.open_mode == LocalMetadataShardOpenMode::Inspection)
+        );
+        let first = DfsMetadataShardId::new(configs[0].shard_id.clone());
+        inspected
+            .get_file_system_on_shard(&first, &configs[0].file_system_id)
+            .unwrap();
+        assert_eq!(inspected.opened_shard_ids(), BTreeSet::from([first]));
     }
 
     #[test]

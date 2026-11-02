@@ -114,6 +114,12 @@ pub fn dfs_browser_component_host(
 
 /// Daemon/process effects used by the DFS-owned browser services.
 pub trait DfsBrowserServiceHost: Send + Sync + 'static {
+    /// Reuse the component's existing Main data owner for inspections. Hosts
+    /// without that owner retain ordinary mounted-service initialization.
+    fn data_plane_host(&self) -> Option<Arc<dyn crate::DfsDataPlaneHost>> {
+        None
+    }
+
     /// Borrow the existing host runtime; never substitute the caller executor.
     fn browser_open_runtime(&self) -> Option<tokio::runtime::Handle> {
         None
@@ -818,14 +824,34 @@ impl DfsBrowserBackend {
         let control_plane = host.control_plane_client(&cluster_paths, runtime);
         let replica_control_plane = host.control_plane_client(&cluster_paths, runtime);
         let (peer_transport, async_peer_transport) = host.peer_transports(&data_dir, runtime);
-        let opened = match configuration {
-            Some(configuration) => crate::mounted_sifs::open_mounted_sifs_service_with_peer_transports_and_configuration(
+        let hosted_cluster = host.data_plane_host().is_some() && cluster_paths.state.exists();
+        let configuration = if hosted_cluster && configuration.is_none() {
+            match host.browser_open_configuration_readiness()? {
+                crate::DfsWriteConfigurationReadiness::Ready(configuration) => configuration,
+                crate::DfsWriteConfigurationReadiness::Pending => {
+                    return Err(dfs_browser_service_error(
+                        "DFS browser configuration is awaiting a coherent authoritative projection",
+                    ));
+                }
+            }
+        } else {
+            configuration
+        };
+        let opened = if hosted_cluster {
+            crate::mounted_sifs::open_hosted_browser_sifs_service(
                 data_dir.clone(), peer_transport, async_peer_transport, control_plane,
                 configuration,
-            ),
-            None => crate::open_mounted_sifs_service_with_peer_transports(
-                data_dir.clone(), peer_transport, async_peer_transport, control_plane,
-            ),
+            )
+        } else {
+            match configuration {
+                Some(configuration) => crate::mounted_sifs::open_mounted_sifs_service_with_peer_transports_and_configuration(
+                    data_dir.clone(), peer_transport, async_peer_transport, control_plane,
+                    configuration,
+                ),
+                None => crate::open_mounted_sifs_service_with_peer_transports(
+                    data_dir.clone(), peer_transport, async_peer_transport, control_plane,
+                ),
+            }
         }.map_err(dfs_browser_service_error)?;
         let node_id = opened.service.node_id().clone();
         let cache = host.placement_snapshot_cache(&data_dir, &node_id);
@@ -1001,12 +1027,21 @@ impl DfsBrowserBackend {
     pub fn health_summary(&self) -> Result<crate::DaemonDfsBrowserHealthSummary, ServiceError> {
         let cluster_paths = ClusterPaths::new(&self.data_dir);
         let service = self.lock_service_for_read()?;
-        let metadata = service.metadata_backend().ok_or_else(|| {
-            ServiceError::Service("DFS browser metadata backend is unavailable".to_string())
-        })?;
-        let status =
+        let status = if let Some(metadata) = service.metadata_backend() {
             crate::inspect_dfs_status_from_metadata(&self.data_dir, &cluster_paths, metadata)
-                .map_err(dfs_browser_service_error)?;
+                .map_err(dfs_browser_service_error)?
+        } else {
+            drop(service);
+            let owner = self.host.data_plane_host().ok_or_else(|| {
+                dfs_browser_service_error("DFS browser data owner is unavailable")
+            })?;
+            let runtime = self.host.browser_open_runtime().ok_or_else(|| {
+                dfs_browser_service_error("DFS browser host runtime is unavailable")
+            })?;
+            runtime
+                .block_on(owner.status())
+                .map_err(dfs_browser_service_error)?
+        };
         Ok(daemon_dfs_browser_health_summary(status))
     }
 
@@ -1057,7 +1092,7 @@ impl DfsBrowserBackend {
         if include_metadata {
             for entry in &mut entries {
                 let placement = entry.metadata.as_ref().and_then(|metadata| {
-                    daemon_dfs_browser_entry_placement(&mut service, &entry.path, metadata)
+                    daemon_dfs_browser_entry_placement(self, &mut service, &entry.path, metadata)
                 });
                 if let Some(metadata) = entry.metadata.as_mut() {
                     metadata.placement = placement;
@@ -1138,7 +1173,7 @@ impl DfsBrowserBackend {
                 stat.current_locations.len().max(1),
             )
             .ok();
-        let health = daemon_dfs_browser_object_health(&service, &stat.object_id);
+        let health = daemon_dfs_browser_object_health(self, &service, &stat.object_id);
         let local_pins =
             daemon_dfs_browser_local_pins(&self.data_dir, &stat.file_system_id, &stat.path);
         let local_node_id = service.node_id().clone();
@@ -3135,14 +3170,31 @@ fn daemon_dfs_browser_local_pins(
 }
 
 fn daemon_dfs_browser_object_health(
+    browser: &DfsBrowserBackend,
     service: &crate::MountedSifsService,
     object_id: &crate::DfsObjectId,
 ) -> Option<crate::DaemonDfsBrowserObjectHealth> {
-    let backend = service.metadata_backend()?;
-    let view = crate::DfsOperatorInspector::new(backend)
-        .object(object_id)
-        .ok()
-        .flatten()?;
+    let view = if let Some(backend) = service.metadata_backend() {
+        crate::DfsOperatorInspector::new(backend)
+            .object(object_id)
+            .ok()
+            .flatten()?
+    } else {
+        let owner = browser.host.data_plane_host()?;
+        let runtime = browser.host.browser_open_runtime()?;
+        match runtime
+            .block_on(owner.inspect(
+                Arc::new(browser.data_dir.clone()),
+                crate::DaemonDfsInspectionRequest::Object {
+                    object_id: object_id.clone(),
+                },
+            ))
+            .ok()?
+        {
+            crate::DaemonDfsInspectionResponse::Object { object } => object?,
+            _ => return None,
+        }
+    };
     let missing_replica_nodes = view
         .repairs
         .iter()
@@ -3160,6 +3212,7 @@ fn daemon_dfs_browser_object_health(
 }
 
 fn daemon_dfs_browser_entry_placement(
+    browser: &DfsBrowserBackend,
     service: &mut crate::MountedSifsService,
     path: &str,
     metadata: &crate::DaemonDfsBrowserEntryMetadata,
@@ -3171,7 +3224,7 @@ fn daemon_dfs_browser_entry_placement(
         .map(|placement| placement.policy.desired_replicas)
         .unwrap_or_else(|_| current_replicas.max(1))
         .max(1);
-    let agent_state = daemon_dfs_browser_object_health(service, &object_id)
+    let agent_state = daemon_dfs_browser_object_health(browser, service, &object_id)
         .map(|health| health.agent_state)
         .unwrap_or_else(|| {
             if current_replicas == 0 {
@@ -3252,9 +3305,22 @@ fn sifs_browser_write_options_with_configuration<T: DfsMessageTransport>(
     configuration: Option<&crate::DfsWriteConfigurationProjection>,
 ) -> Result<crate::DfsWriteOptions, ServiceError> {
     let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
-    let object_policy = service
-        .posix_object_policy(path)
-        .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual);
+    let object_policy = if service.metadata_backend().is_none()
+        && service.transport.delegates_local_namespace_authority()
+    {
+        // A backendless requester must retain an existing object's policy
+        // through its authority rather than treating an empty local hint as
+        // a newly created eventual object.
+        match service.with_stat_deadline(|service| service.file_history_capture_object(path)) {
+            Ok(object) => object.policy,
+            Err(DfsPosixError::NotFound { .. }) => sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            Err(error) => return Err(dfs_browser_service_error(error)),
+        }
+    } else {
+        service
+            .posix_object_policy(path)
+            .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual)
+    };
     let object_policy_us = trace_started.map_or(0, |start| start.elapsed().as_micros());
     let policy_started = trace_started.map(|_| Instant::now());
     let policy = match configuration {

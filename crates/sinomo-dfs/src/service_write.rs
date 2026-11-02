@@ -484,17 +484,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok((desired_replica_nodes, policy))
     }
 
+    fn current_object_for_write_request(
+        &mut self,
+        request: &DfsWriteRequest,
+    ) -> Result<DfsObjectMetadata, DfsError> {
+        if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && self.control_plane.is_some()
+            && !self
+                .transient_metadata_object_ids
+                .contains(&request.object_id)
+        {
+            // This is requester planning DATA. Main still owns the original
+            // write admission, current-head comparison and native publication.
+            let object = self
+                .current_object_from_authority(&request.file_system_id, &request.object_id)?
+                .ok_or_else(|| DfsError::UnknownObject {
+                    object_id: request.object_id.clone(),
+                })?;
+            self.ensure_object_not_in_cross_shard_flight(&object)?;
+            return Ok(object);
+        }
+        self.current_object_for_write(&request.object_id)
+    }
+
     fn prepare_distributed_write(
         &mut self,
-        object_id: &DfsObjectId,
-        target_version: &DfsVersion,
+        request: &DfsWriteRequest,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
         creation: DfsWriteCreation,
         repair: DfsWriteRepair,
     ) -> Result<PreparedDistributedWrite, DfsError> {
-        let object = self.current_object_for_write(object_id)?;
+        let object_id = &request.object_id;
+        let target_version = &request.target_version;
+        let object = self.current_object_for_write_request(request)?;
         let local_owned = object.policy == DfsObjectPolicy::LocalOwned;
         if !local_owned
             && !matches!(
@@ -887,7 +912,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let replay_response_journal = options.replay_response_journal;
         let operation_id = options.operation_id;
 
-        let object = self.current_object_for_write(&request.object_id)?;
+        let object = self.current_object_for_write_request(&request)?;
         let plan = if object.policy == DfsObjectPolicy::LocalOwned {
             if candidate_nodes != vec![object.owner_node_id.clone()]
                 || policy.min_commit_replicas != 1
@@ -1012,7 +1037,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         policy: DfsReplicationPolicy,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let object = self.current_object_for_write(&request.object_id)?;
+        let object = self.current_object_for_write_request(&request)?;
         self.write_distributed_bytes_with_base(
             request,
             Some(object.version),
@@ -1069,7 +1094,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let touch_parent_on_create = options.touch_parent_on_create;
         let operation_id = options.operation_id;
 
-        let object = self.current_object_for_write(&request.object_id)?;
+        let object = self.current_object_for_write_request(&request)?;
         self.write_distributed_reader_with_base(
             request,
             Some(object.version),
@@ -1154,7 +1179,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
-        let object = self.current_object_for_write(&request.object_id)?;
+        let object = self.current_object_for_write_request(&request)?;
         if !matches!(
             object.policy,
             DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
@@ -1324,7 +1349,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if source.is_empty() || self.control_plane.is_some() {
             return Ok(None);
         }
-        let object = self.current_object_for_write(&request.object_id)?;
+        let object = self.current_object_for_write_request(&request)?;
         if object.policy != DfsObjectPolicy::ReplicatedEventual {
             return Ok(None);
         }
@@ -1545,8 +1570,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             touch_parent_on_create,
             create_predecessor_object_id,
         } = self.prepare_distributed_write(
-            &request.object_id,
-            &request.target_version,
+            &request,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -1981,8 +2005,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             touch_parent_on_create,
             create_predecessor_object_id,
         } = self.prepare_distributed_write(
-            &request.object_id,
-            &request.target_version,
+            &request,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -2327,8 +2350,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             touch_parent_on_create,
             create_predecessor_object_id,
         } = self.prepare_distributed_write(
-            &request.object_id,
-            &request.target_version,
+            &request,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,

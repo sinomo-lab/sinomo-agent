@@ -375,7 +375,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn posix_file_content_object_candidate_outcome(
-        &self,
+        &mut self,
         path: String,
         object: DfsObjectMetadata,
     ) -> Result<DistributedPosixFileContentObjectOutcome> {
@@ -385,7 +385,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let candidate_kind = object.kind.clone();
         let candidate_object_id = object.object_id.clone();
         let candidate_target_id = object.link_target_object_id.clone();
-        let object = match self.resolve_hardlink_target(&object) {
+        let object = match self.resolve_hardlink_target_distributed(&object, None) {
             Ok(object) => object,
             Err(DfsPosixError::NotFound { .. }) if candidate_kind == DfsObjectKind::Hardlink => {
                 return Ok(

@@ -494,7 +494,7 @@ fn component_factory_with_selected_layout(
                         events.clone(),
                     ),
                 );
-                builder = register_services_with_data_plane_host(builder, data_plane);
+                builder = register_services_with_data_plane_host(builder, Arc::clone(&data_plane));
                 // Bind browser readiness to the existing component-owned
                 // authority once during lifecycle construction. Hot writes
                 // borrow this owner without reopening bootstrap state files.
@@ -522,6 +522,7 @@ fn component_factory_with_selected_layout(
                         Arc::clone(&host),
                         Arc::downgrade(&data_owner),
                         metadata_authority,
+                        data_plane,
                     ));
                 crate::browser_service::register_dfs_browser_component_host(&data_dir, &browser)
                     .map_err(|error| sinomo_module::ComponentError::component(&caller.component_id, error))?;

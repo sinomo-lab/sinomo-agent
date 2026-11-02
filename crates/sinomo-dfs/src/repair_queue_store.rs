@@ -3317,25 +3317,34 @@ impl LocalDfsRepairQueueStore {
     ) -> Result<(), DfsError> {
         let mut state = self.lock_state()?;
         state.refresh_from_disk()?;
+        let mut operations = Vec::new();
         for record in records {
-            if state
+            if let Some(existing) = state
                 .records
                 .get(&DfsRepairQueueKey::from_record(record))
-                .is_some_and(|existing| existing != record)
             {
-                return Err(DfsError::Metadata {
-                    message: "repair handoff conflicts with existing original producer custody"
-                        .into(),
-                });
+                // A frozen scheduling copy can have a different lease or retry
+                // observation for the same carrier. Compare every other field,
+                // then retain the entire local row and its Native custody.
+                let mut comparable = record.clone();
+                comparable.attempts = existing.attempts;
+                comparable.in_flight = existing.in_flight;
+                comparable.last_attempt_unix_nanos = existing.last_attempt_unix_nanos;
+                comparable.next_retry_unix_nanos = existing.next_retry_unix_nanos;
+                comparable.last_error = existing.last_error.clone();
+                if &comparable != existing {
+                    return Err(DfsError::Metadata {
+                        message: "repair handoff conflicts with existing original producer custody"
+                            .into(),
+                    });
+                }
+                continue;
             }
+            operations.push(DfsRepairQueueOperation::EnqueueIfMissing {
+                record: record.clone(),
+            });
         }
-        state.append_operations(
-            records
-                .iter()
-                .cloned()
-                .map(|record| DfsRepairQueueOperation::EnqueueIfMissing { record })
-                .collect(),
-        )?;
+        state.append_operations(operations)?;
         Ok(())
     }
 
@@ -7719,6 +7728,93 @@ pub(crate) mod tests {
         let view = reopen(&snapshot_path).view().expect("replay");
         assert_eq!(view.head_sequence, 1);
         assert_eq!(view.records, vec![existing]);
+    }
+
+    #[test]
+    fn handoff_import_preserves_native_original_and_local_retry_state() {
+        let root = sinomo_testdir::TestDir::new("dfs-handoff-local-retry-state");
+        let (store, content, message, descriptor, payload) = original_fixture(&root);
+        let original = store
+            .enroll_original_repair(&message, &descriptor, &payload)
+            .unwrap();
+        let existing = store.view().unwrap().records.into_iter().next().unwrap();
+        let mut captured = existing.clone();
+        captured.attempts = existing.attempts + 1;
+        captured.in_flight = !existing.in_flight;
+        captured.last_attempt_unix_nanos = existing.last_attempt_unix_nanos + 1;
+        captured.next_retry_unix_nanos = u64::MAX;
+        captured.last_error = Some("remote scheduling observation".into());
+        let mut missing = record("missing", "another-target", 0);
+        missing.content_hash = existing.content_hash.clone();
+
+        store
+            .install_handoff_records(&[captured.clone(), missing.clone()])
+            .unwrap();
+        let imported = store.view().unwrap();
+        assert_eq!(imported.records.len(), 2);
+        assert!(imported.records.contains(&existing));
+        assert!(imported.records.contains(&missing));
+        assert_eq!(
+            store.original_repair(&message).unwrap(),
+            Some(original.clone())
+        );
+        content.inspect_repair_payload_root(&original.root).unwrap();
+        let log = repair_queue_active_log_path(&root.join("repair.sobj"));
+        let imported_bytes = fs::read(&log).unwrap();
+
+        store
+            .install_handoff_records(&[captured.clone(), missing])
+            .unwrap();
+        assert_eq!(store.view().unwrap(), imported);
+        assert_eq!(fs::read(&log).unwrap(), imported_bytes);
+
+        for field in [
+            "object",
+            "version",
+            "hash",
+            "request",
+            "kind",
+            "delivery",
+            "completed",
+        ] {
+            let mut changed = captured.clone();
+            match field {
+                "object" => changed.object_id = DfsObjectId::generate(),
+                "version" => changed.version = DfsVersion::generate(),
+                "hash" => changed.content_hash = crate::content_hash(b"different content"),
+                "request" => changed.transfer_request_id = Some("different-original".into()),
+                "kind" => {
+                    changed.transfer_kind =
+                        Some(sinomo_api::dfs::maintenance::DfsRepairTransferKind::Stage)
+                }
+                "delivery" => {
+                    changed.transfer_delivery_state = if existing.transfer_delivery_state
+                        == Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+                    {
+                        None
+                    } else {
+                        Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+                    }
+                }
+                "completed" => {
+                    changed.completed_transfer_request_id = Some("different-terminal".into())
+                }
+                _ => unreachable!(),
+            }
+            let mut new = record("not-imported", "another-target", 0);
+            new.content_hash = existing.content_hash.clone();
+            assert!(
+                store.install_handoff_records(&[new, changed]).is_err(),
+                "{field}"
+            );
+            assert_eq!(store.view().unwrap(), imported, "{field}");
+            assert_eq!(fs::read(&log).unwrap(), imported_bytes, "{field}");
+            assert_eq!(
+                store.original_repair(&message).unwrap(),
+                Some(original.clone()),
+                "{field}"
+            );
+        }
     }
 
     #[test]

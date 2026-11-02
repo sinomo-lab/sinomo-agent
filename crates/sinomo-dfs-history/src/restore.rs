@@ -129,7 +129,7 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
                 .map_err(|source| restore_error(source.to_string()))?;
             self.core
                 .require_retention_shard_support(&sifs_file_system_id(), &path)?;
-            let shard = if self.core.is_distributed() {
+            let mut shard = if self.core.is_distributed() {
                 self.core
                     .namespace_shards_for_exact_paths(&sifs_file_system_id(), [path.as_str()])?
                     .into_iter()
@@ -157,10 +157,39 @@ impl<T: DfsMessageTransport> DfsHistoryService<'_, T> {
                         operation,
                     )
                     .map_err(|source| restore_error(source.to_string()))?;
-                self.core
-                    .namespace_job(&job_id)
-                    .map_err(|error| restore_error(error.to_string()))?
-                    .ok_or_else(|| restore_error("restore admission omitted its durable job"))?
+                if self.core.metadata_backend().is_some() {
+                    self.core
+                        .namespace_job(&job_id)
+                        .map_err(|error| restore_error(error.to_string()))?
+                        .ok_or_else(|| restore_error("restore admission omitted its durable job"))?
+                } else {
+                    // The same-node requester forwarded the original begin to
+                    // Main; it does not own a private durable job projection.
+                    let (current_shard, observed) =
+                        self.find_file_restore_job(&job_id)?.ok_or_else(|| {
+                            restore_error("restore admission omitted its durable job")
+                        })?;
+                    shard = current_shard;
+                    match observed {
+                        DfsMetadataQueryResult::NamespaceJob { job: Some(job), .. } => *job,
+                        DfsMetadataQueryResult::NamespaceJob {
+                            receipt: Some(receipt),
+                            ..
+                        } => {
+                            let outcome = receipt.content_copy.ok_or_else(|| {
+                                restore_error("restore receipt omitted its durable result")
+                            })?;
+                            if outcome.request != request || outcome.requester_node_id != requester
+                            {
+                                return Err(restore_error(
+                                    "restore operation identity was reused with different input",
+                                ));
+                            }
+                            return response_from_result(&outcome.result);
+                        }
+                        _ => return Err(restore_error("restore job lookup omitted its state")),
+                    }
+                }
             } else {
                 let result = self
                     .core
