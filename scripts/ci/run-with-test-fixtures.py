@@ -92,15 +92,27 @@ def active_uses(root, process_group=None):
     # Request mount metadata only; never inspect container environments.
     if shutil.which("docker"):
         ids = subprocess.check_output(["docker", "ps", "-aq"], text=True).split()
-        for offset in range(0, len(ids), 100):
-            batch = ids[offset:offset + 100]
-            output = subprocess.check_output(["docker", "inspect", "--format", "{{json .Mounts}}", *batch], text=True)
-            for identifier, line in zip(batch, output.splitlines(), strict=True):
-                for mount in json.loads(line):
-                    source = mount.get("Source", "")
-                    if source and (source == str(root) or source.startswith(str(root) + "/")
-                                   or str(root).startswith(source.rstrip("/") + "/")):
-                        uses.append({"container": identifier, "kind": "mount", "path": source})
+        for identifier in ids:
+            try:
+                output = subprocess.check_output(
+                    ["docker", "inspect", "--format", "{{json .Mounts}}", identifier],
+                    text=True, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as error:
+                # Removal between listing and inspection releases this mount.
+                # Every other lookup failure leaves ownership unknown.
+                missing = {
+                    f"error: no such object: {identifier}".lower(),
+                    f"error: no such container: {identifier}".lower(),
+                    f"error response from daemon: no such container: {identifier}".lower(),
+                }
+                if (error.stderr or "").strip().lower() in missing:
+                    continue
+                raise
+            for mount in json.loads(output):
+                source = mount.get("Source", "")
+                if source and (source == str(root) or source.startswith(str(root) + "/")
+                               or str(root).startswith(source.rstrip("/") + "/")):
+                    uses.append({"container": identifier, "kind": "mount", "path": source})
     return uses
 
 

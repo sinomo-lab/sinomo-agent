@@ -22,6 +22,7 @@ pub struct EvolutionState {
     pub refreshing: bool,
     pub revision: u64,
     refresh_rx: Option<Receiver<Result<contract::EvolutionDashboard, String>>>,
+    details_open: sui::Signal<bool>,
 }
 
 impl EvolutionState {
@@ -31,6 +32,7 @@ impl EvolutionState {
             refreshing: false,
             revision: 1,
             refresh_rx: None,
+            details_open: sui::Signal::new(false),
         }
     }
 
@@ -179,13 +181,18 @@ pub(crate) const EVOLUTION_OFFLINE_SUMMARY: &str =
 pub(crate) const PROPOSE_GOAL_COMMAND: &str = "sinomo evolve propose \"<goal>\"";
 
 pub fn view(shared: Shared) -> impl Widget {
-    let source = shared
-        .signals()
-        .evolution_revision
-        .select_named("evolution dashboard revision", |revision| *revision);
+    let key_shared = shared.clone();
     let build_shared = shared.clone();
-    let dashboard =
-        RebuildOnChange::key_from(source, move |_revision| build_dashboard(&build_shared));
+    let dashboard = RebuildOnChange::key_when(
+        move || {
+            (
+                key_shared.signals().evolution_revision.get(),
+                key_shared.theme(),
+                key_shared.evolution().details_open.get(),
+            )
+        },
+        move |_| build_dashboard(&build_shared),
+    );
     let reader: Rc<dyn Fn() -> sui::DefaultTheme> = {
         let shared = shared.clone();
         Rc::new(move || shared.theme())
@@ -203,6 +210,10 @@ pub fn view(shared: Shared) -> impl Widget {
 fn build_dashboard(shared: &Shared) -> WidgetPod {
     let theme = shared.theme();
     let dashboard = shared.evolution().dashboard.clone();
+    let unavailable = dashboard
+        .error
+        .as_ref()
+        .is_some_and(|error| !error.trim().is_empty());
     let refreshing = shared.evolution().refreshing;
     let refresh_shared = shared.clone();
     let header = Flex::horizontal()
@@ -215,16 +226,23 @@ fn build_dashboard(shared: &Shared) -> WidgetPod {
                     weighted_label("Evolution", theme, FontWeight::SEMIBOLD)
                         .semantic_name("Evolution goals"),
                 )
-                .with_child(Label::new(format!(
-                    "{} goals · {} revisions · {} active goals",
-                    dashboard.goals.len(),
-                    dashboard
-                        .goals
-                        .iter()
-                        .map(|goal| goal.revisions.len())
-                        .sum::<usize>(),
-                    dashboard.active_goal_count()
-                ))),
+                .with_child(
+                    Label::new(if unavailable {
+                        "Status unavailable".into()
+                    } else {
+                        format!(
+                            "{} goals · {} revisions · {} active goals",
+                            dashboard.goals.len(),
+                            dashboard
+                                .goals
+                                .iter()
+                                .map(|goal| goal.revisions.len())
+                                .sum::<usize>(),
+                            dashboard.active_goal_count()
+                        )
+                    })
+                    .theme(theme),
+                ),
             FlexItem::new().grow(1.0),
         )
         .with_child(
@@ -233,6 +251,7 @@ fn build_dashboard(shared: &Shared) -> WidgetPod {
             } else {
                 "Refresh"
             })
+            .theme(theme)
             .appearance(ButtonAppearance::Tonal)
             .enabled(!refreshing)
             .on_press(move || request_refresh(&refresh_shared)),
@@ -246,15 +265,33 @@ fn build_dashboard(shared: &Shared) -> WidgetPod {
             .theme(theme),
     );
     if let Some(error) = dashboard.error.filter(|error| !error.trim().is_empty()) {
+        let details = shared.evolution().details_open.clone();
+        let open = details.get();
+        let mut body = Flex::vertical().gap(10.0)
+            .with_child(weighted_label("Evolution unavailable", theme, FontWeight::SEMIBOLD))
+            .with_child(Label::new("Evolution could not be loaded from this node. Check that a capable node is connected, then refresh.").theme(theme))
+            .with_child(Button::new(if open { "Hide details" } else { "Technical details" })
+                .theme(theme).on_press(move || { details.set(!details.get()); }));
+        if open {
+            body = body.with_child(Label::new(error).theme(theme));
+        }
         content.push(
-            Surface::panel(Label::new(error).semantic_name("Evolution error"))
+            Surface::panel(body)
                 .appearance(SurfaceAppearance::Raised)
                 .padding(Insets::all(12.0))
                 .theme(theme),
         );
     }
-    if dashboard.goals.is_empty() {
-        content.push(empty_goals_card(theme));
+    if dashboard.goals.is_empty() && !unavailable {
+        if refreshing {
+            content.push(
+                Surface::panel(Label::new("Loading Evolution…").theme(theme))
+                    .padding(Insets::all(16.0))
+                    .theme(theme),
+            );
+        } else {
+            content.push(empty_goals_card(theme));
+        }
     } else {
         for goal in dashboard.goals {
             content.push(goal_card(goal, theme, shared));
@@ -279,6 +316,7 @@ fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
     command_style.line_height = theme.text.sm.line_height;
     let command = Surface::panel(
         Label::new(PROPOSE_GOAL_COMMAND)
+            .theme(theme)
             .single_line(true)
             .text_style(command_style),
     )
@@ -291,6 +329,7 @@ fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
     })
     .theme(theme);
     let copy = Button::new("Copy command")
+        .theme(theme)
         .appearance(ButtonAppearance::Tonal)
         .on_press_with_ctx(|ctx| ctx.set_clipboard_text(PROPOSE_GOAL_COMMAND));
     Surface::panel(
@@ -301,9 +340,12 @@ fn empty_goals_card(theme: sui::DefaultTheme) -> Surface {
                 theme,
                 FontWeight::SEMIBOLD,
             ))
-            .with_child(Label::new(
-                "Propose a goal from a terminal. Its revisions and metrics appear here.",
-            ))
+            .with_child(
+                Label::new(
+                    "Propose a goal from a terminal. Its revisions and metrics appear here.",
+                )
+                .theme(theme),
+            )
             .with_child(
                 Flex::horizontal()
                     .gap(8.0)
@@ -335,10 +377,13 @@ fn goal_card(
                         theme,
                         FontWeight::SEMIBOLD,
                     ))
-                    .with_child(Label::new(format!(
-                        "{} · governor {} · {} events",
-                        goal.id, goal.evolution_agent_id, goal.event_count
-                    ))),
+                    .with_child(
+                        Label::new(format!(
+                            "{} · governor {} · {} events",
+                            goal.id, goal.evolution_agent_id, goal.event_count
+                        ))
+                        .theme(theme),
+                    ),
                 FlexItem::new().grow(1.0),
             )
             .with_child(
@@ -379,20 +424,24 @@ fn goal_card(
                         revision.content_kind,
                         revision.artifacts.len(),
                         revision.metrics.len()
-                    )),
+                    ))
+                    .theme(theme),
                     FlexItem::new().grow(1.0),
                 ),
         );
         for metric in &revision.metrics {
-            revision_rows.push(Label::new(format!(
-                "    {} = {}{}",
-                metric.metric_id,
-                metric.value,
-                metric
-                    .sample_count
-                    .map(|count| format!(" (n={count})"))
-                    .unwrap_or_default()
-            )));
+            revision_rows.push(
+                Label::new(format!(
+                    "    {} = {}{}",
+                    metric.metric_id,
+                    metric.value,
+                    metric
+                        .sample_count
+                        .map(|count| format!(" (n={count})"))
+                        .unwrap_or_default()
+                ))
+                .theme(theme),
+            );
         }
     }
     body.push(
@@ -428,7 +477,8 @@ fn goal_card(
                             task.assigned_agent_run_id
                                 .as_deref()
                                 .unwrap_or("unassigned")
-                        )),
+                        ))
+                        .theme(theme),
                         FlexItem::new().grow(1.0),
                     ),
             );
@@ -453,7 +503,8 @@ fn goal_card(
                                 .as_deref()
                                 .map(|session| format!(" · {session}"))
                                 .unwrap_or_default()
-                        )),
+                        ))
+                        .theme(theme),
                         FlexItem::new().grow(1.0),
                     ),
             );
@@ -471,21 +522,27 @@ fn goal_card(
         .map(|record| format!("{} {} {}", record.quantity, record.unit, record.resource))
         .collect::<Vec<_>>()
         .join(" · ");
-    body.push(Label::new(format!(
-        "{} tasks · {} agent runs · resources: {}",
-        goal.tasks.len(),
-        goal.agent_runs.len(),
-        if cost.is_empty() {
-            "none recorded"
-        } else {
-            &cost
-        }
-    )));
+    body.push(
+        Label::new(format!(
+            "{} tasks · {} agent runs · resources: {}",
+            goal.tasks.len(),
+            goal.agent_runs.len(),
+            if cost.is_empty() {
+                "none recorded"
+            } else {
+                &cost
+            }
+        ))
+        .theme(theme),
+    );
     if let Some(event) = goal.recent_events.last() {
-        body.push(Label::new(format!(
-            "Latest activity: {} · {} · {}",
-            event.kind, event.actor, event.occurred_at
-        )));
+        body.push(
+            Label::new(format!(
+                "Latest activity: {} · {} · {}",
+                event.kind, event.actor, event.occurred_at
+            ))
+            .theme(theme),
+        );
     }
     let pause_action = if goal.status == "paused" {
         contract::EvolutionGoalControlAction::Resume
@@ -510,6 +567,7 @@ fn goal_card(
             .gap(8.0)
             .with_child(
                 Button::new("Open governor chat")
+                    .theme(theme)
                     .appearance(ButtonAppearance::Ghost)
                     .on_press(move || {
                         chat_shared.chat_mut().start_agent_chat("evolution-agent");
@@ -518,6 +576,7 @@ fn goal_card(
             )
             .with_child(
                 Button::new(pause_label)
+                    .theme(theme)
                     .appearance(ButtonAppearance::Tonal)
                     .enabled(!terminal)
                     .on_press(move || {
@@ -526,6 +585,7 @@ fn goal_card(
             )
             .with_child(
                 Button::new("Complete")
+                    .theme(theme)
                     .appearance(ButtonAppearance::Tonal)
                     .tone(SemanticTone::Success)
                     .enabled(!terminal)
@@ -539,6 +599,7 @@ fn goal_card(
             )
             .with_child(
                 Button::new("Cancel")
+                    .theme(theme)
                     .appearance(ButtonAppearance::Outline)
                     .tone(SemanticTone::Danger)
                     .enabled(!terminal)
@@ -571,7 +632,7 @@ fn status_tone(status: &str) -> SemanticTone {
 fn weighted_label(text: impl Into<String>, theme: sui::DefaultTheme, weight: FontWeight) -> Label {
     let mut style = theme.body_text_style();
     style.weight = weight;
-    Label::new(text).text_style(style)
+    Label::new(text).theme(theme).text_style(style)
 }
 
 #[cfg(test)]

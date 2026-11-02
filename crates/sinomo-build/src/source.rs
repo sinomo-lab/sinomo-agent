@@ -104,7 +104,7 @@ pub fn prepare_build_source(paths: &BuildPaths, source_repo: &Path) -> Result<Pr
     let lockfile_path = source_repo.join("Cargo.lock");
     let lockfile = crate::process::noninteractive_command("git")
         .arg("-C")
-        .arg(source_repo)
+        .arg(sinomo_core::local::command_path(source_repo))
         .args(["show", &format!("{}:Cargo.lock", bundle.revision)])
         .output()
         .map_err(|source| BuildError::Io {
@@ -230,9 +230,9 @@ fn source_bundle_command(source_repo: &Path, bundle_path: &Path) -> std::process
     command
         .args(["-c", "pack.threads=1"])
         .arg("-C")
-        .arg(source_repo)
+        .arg(sinomo_core::local::command_path(source_repo))
         .args(["bundle", "create"])
-        .arg(bundle_path)
+        .arg(sinomo_core::local::command_path(bundle_path))
         .arg("HEAD");
     command
 }
@@ -264,8 +264,13 @@ pub fn deploy_managed_source_repo(
     let output = crate::process::noninteractive_command("git")
         .arg("clone")
         .arg("--no-hardlinks")
-        .args(["--config", "core.autocrlf=false"])
-        .arg(source_repo)
+        .args([
+            "--config",
+            "core.autocrlf=false",
+            "--config",
+            "core.longpaths=true",
+        ])
+        .arg(sinomo_core::local::command_path(source_repo))
         .arg(&next)
         .output()
         .map_err(|source| BuildError::Io {
@@ -302,9 +307,9 @@ pub fn deploy_managed_source_bundle(
         require_git_repo(managed_repo, "managed source repo")?;
         let output = crate::process::noninteractive_command("git")
             .arg("-C")
-            .arg(managed_repo)
+            .arg(sinomo_core::local::command_path(managed_repo))
             .arg("fetch")
-            .arg(bundle_path)
+            .arg(sinomo_core::local::command_path(bundle_path))
             .arg("HEAD")
             .output()
             .map_err(|source| BuildError::Io {
@@ -338,8 +343,13 @@ pub fn deploy_managed_source_bundle(
     remove_dir_if_exists(&next)?;
     let output = crate::process::noninteractive_command("git")
         .arg("clone")
-        .args(["--config", "core.autocrlf=false"])
-        .arg(bundle_path)
+        .args([
+            "--config",
+            "core.autocrlf=false",
+            "--config",
+            "core.longpaths=true",
+        ])
+        .arg(sinomo_core::local::command_path(bundle_path))
         .arg(&next)
         .output()
         .map_err(|source| BuildError::Io {
@@ -527,7 +537,7 @@ fn run_git_paths(repo: &Path, args: &[&str], paths: &[&Path]) -> Result<String> 
     let mut command = crate::process::noninteractive_command("git");
     command.arg("-C").arg(repo).args(args);
     for path in paths {
-        command.arg(path);
+        command.arg(sinomo_core::local::command_path(path));
     }
     let output = command.output().map_err(|source| BuildError::Io {
         path: format!("git -C {} {}", repo.display(), args.join(" ")),
@@ -564,6 +574,39 @@ fn same_path_if_exists(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_local_paths_clone_and_replace_managed_source() {
+        let root = sinomo_testdir::TestDir::new("canonical-managed-source");
+        let repo = root.join("upstream");
+        fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "fixture"],
+            vec!["config", "user.email", "fixture@invalid"],
+        ] {
+            run_git(&repo, &args).unwrap();
+        }
+        fs::write(repo.join("source"), b"initial").unwrap();
+        run_git(&repo, &["add", "source"]).unwrap();
+        run_git(&repo, &["commit", "-qm", "Initial source"]).unwrap();
+        let repo = fs::canonicalize(repo).unwrap();
+        let managed = root.join("managed");
+        deploy_managed_source_repo(&managed, &repo, ManagedSourceDeployOptions::default()).unwrap();
+        fs::write(repo.join("source"), b"approved replacement").unwrap();
+        run_git(&repo, &["commit", "-qam", "Approved source"]).unwrap();
+        let managed = fs::canonicalize(managed).unwrap();
+        deploy_managed_source_repo(&managed, &repo, ManagedSourceDeployOptions::default()).unwrap();
+        assert_eq!(
+            fs::read(managed.join("source")).unwrap(),
+            b"approved replacement"
+        );
+        assert!(
+            !managed_source_status(&managed)
+                .unwrap()
+                .has_external_remotes
+        );
+    }
 
     #[test]
     fn prepared_source_is_content_addressed_and_reused() {

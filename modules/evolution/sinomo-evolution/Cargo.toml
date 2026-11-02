@@ -33,3 +33,4 @@ sinomo-runtime = { path = "../../../crates/sinomo-runtime" }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../../../crates/sinomo-testdir" }
+sinomo-runtime = { path = "../../../crates/sinomo-runtime", features = ["dfs-test-support"] }

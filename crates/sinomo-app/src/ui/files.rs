@@ -1852,6 +1852,10 @@ impl FilesState {
         self.document.is_some()
     }
 
+    pub(crate) fn has_unsaved_document(&self) -> bool {
+        self.document.as_ref().is_some_and(FilesDocument::dirty)
+    }
+
     pub(crate) fn take_tab_open(&mut self) -> Option<(FilesSourceKind, String, String)> {
         self.pending_tab_open.take()
     }
@@ -6916,6 +6920,9 @@ impl FilesState {
 
     fn click_row(&mut self, index: usize, activation: VirtualTableRowActivationKind) -> bool {
         match activation {
+            VirtualTableRowActivationKind::Single if cfg!(target_os = "android") => {
+                self.activate_row(index)
+            }
             VirtualTableRowActivationKind::Single => {
                 self.select_entry(index);
                 false
@@ -20818,6 +20825,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         sui::Button::new(primary_label)
             .min_width(112.0)
             .tone(file_action_submit_tone(prompt.kind))
+            .focus_on_press(!cfg!(target_os = "android"))
             .theme_when(clone_reader(reader))
             .on_press_with_ctx(move |ctx| {
                 let waker = { s.borrow().waker.clone() };
@@ -20993,6 +21001,16 @@ fn document_detail_text(shared: &Shared) -> String {
     }
     if let Some(reason) = &document.read_only_reason {
         return reason.clone();
+    }
+    if cfg!(target_os = "android") {
+        return if document.dirty() {
+            format!(
+                "{} · Tap Save to keep your changes. Attach includes this draft.",
+                document.path
+            )
+        } else {
+            document.path.clone()
+        };
     }
     if document.dirty() {
         return format!(
@@ -21246,12 +21264,14 @@ fn files_document_close_dialog(shared: &Shared, reader: &ThemeReader) -> Option<
             .theme(reader()),
         )
         .with_child(actions);
+    let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
         sui::Dialog::new("Unsaved changes", body)
             .theme(reader())
             .description("Choose whether to keep editing or discard the document changes")
             .max_width(480.0)
-            .dismiss_on_scrim(false),
+            .dismiss_on_scrim(false)
+            .on_dismiss(move || dismiss_shared.files_mut().cancel_document_close()),
     ))
 }
 
@@ -23317,7 +23337,7 @@ fn compact_files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     let (title, description, selected) = match overlay {
         CompactFilesOverlay::Commands => (
             "File commands",
-            "Commands hidden from the compact file toolbar",
+            "Create, import, or navigate files and folders",
             0,
         ),
         CompactFilesOverlay::SelectionActions => (
@@ -23609,6 +23629,7 @@ pub(crate) fn document_view(shared: Shared) -> impl Widget {
 
 #[cfg(test)]
 mod tests {
+    include!("files/mobile_regression_tests.rs");
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
@@ -33056,9 +33077,8 @@ mod tests {
     #[test]
     fn sifs_thumbnail_persists_across_browser_reopen_and_hits_before_source_decode() {
         use sinomo_runtime::dfs::*;
-        let root = sinomo_testdir::TestDir::new("persistent-thumbnail");
-        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
-        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(backend.data_dir.as_ref()).unwrap();
         let path = "/users/photo.png";
         let fixture = ThumbnailBitmap {
             width: 16,
@@ -33096,7 +33116,7 @@ mod tests {
             matches!(&stored, DfsAttachmentResponse::Descriptor { attachment: Some(a) } if a.current)
         );
         drop(browser);
-        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let browser = SifsBrowser::open(backend.data_dir.as_ref()).unwrap();
         assert_eq!(
             load_persistent_sifs_thumbnail(&browser, &request).unwrap(),
             first
@@ -33145,9 +33165,8 @@ mod tests {
     fn dfs_thumbnail_browsing_fetches_and_paints_stored_previews_in_every_view() -> sui::Result<()>
     {
         use sinomo_runtime::dfs::*;
-        let root = sinomo_testdir::TestDir::new("dfs-thumbnail-browsing");
-        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
-        let browser = SifsBrowser::open(&data_dir).unwrap();
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(backend.data_dir.as_ref()).unwrap();
         // This source cannot be decoded by the app's raster generator. A module
         // has supplied only the 128px attachment, also used in the larger views.
         let path = "/users/report.pdf";
@@ -33200,7 +33219,7 @@ mod tests {
             FilesViewMode::LargeIcons,
             FilesViewMode::Flow,
         ] {
-            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            let shared = Shared::new(AppState::ready(backend.clone()));
             let (tx, rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
             {

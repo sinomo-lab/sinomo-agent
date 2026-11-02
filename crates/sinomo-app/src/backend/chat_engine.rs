@@ -23,7 +23,7 @@ pub use wire::{
 };
 
 pub type ChatEventWake = Arc<dyn Fn() + Send + Sync + 'static>;
-const CHAT_CLIENT_POLL_WAIT: Duration = Duration::from_millis(100);
+const CHAT_CLIENT_POLL_WAIT: Duration = Duration::from_millis(wire::CHAT_EVENT_WAIT_MAX_MS);
 const CHAT_CLIENT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 static CHAT_CLIENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -134,18 +134,33 @@ struct ClientEvent {
     cursor: Option<(String, u64)>,
 }
 
+#[derive(Clone)]
+struct ChatCommandSender {
+    inner: Sender<ChatCommand>,
+    ready: Arc<tokio::sync::Notify>,
+}
+
+impl ChatCommandSender {
+    fn send(&self, command: ChatCommand) -> Result<(), std::sync::mpsc::SendError<ChatCommand>> {
+        self.inner.send(command)?;
+        self.ready.notify_one();
+        Ok(())
+    }
+}
+
 pub struct ChatHandle {
-    tx: Sender<ChatCommand>,
+    tx: ChatCommandSender,
     rx: Receiver<ClientEvent>,
     checkpoint: Arc<Mutex<ChatConnectionSnapshot>>,
     connected: Arc<AtomicBool>,
+    runtime: Arc<tokio::runtime::Runtime>,
     #[cfg(test)]
     worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
 pub struct ChatRealtimeHandoff {
-    tx: Sender<ChatCommand>,
+    tx: ChatCommandSender,
     session_id: String,
 }
 
@@ -166,8 +181,13 @@ impl ChatRealtimeHandoff {
 }
 
 impl ChatHandle {
-    pub fn spawn(daemon_address: Option<String>, event_wake: Option<ChatEventWake>) -> Self {
+    pub fn spawn(
+        runtime: Arc<tokio::runtime::Runtime>,
+        daemon_address: Option<String>,
+        event_wake: Option<ChatEventWake>,
+    ) -> Self {
         Self::spawn_restored(
+            runtime,
             daemon_address,
             event_wake,
             ChatConnectionSnapshot::default(),
@@ -175,6 +195,7 @@ impl ChatHandle {
     }
 
     pub fn spawn_restored(
+        runtime: Arc<tokio::runtime::Runtime>,
         daemon_address: Option<String>,
         event_wake: Option<ChatEventWake>,
         snapshot: ChatConnectionSnapshot,
@@ -184,11 +205,19 @@ impl ChatHandle {
         let connected = Arc::new(AtomicBool::new(false));
         let worker_connected = connected.clone();
         let (command_tx, command_rx) = channel();
+        let command_ready = Arc::new(tokio::sync::Notify::new());
+        let command_tx = ChatCommandSender {
+            inner: command_tx,
+            ready: command_ready.clone(),
+        };
+        let worker_runtime = runtime.clone();
         let (event_tx, event_rx) = channel();
         let worker = thread::Builder::new()
             .name("sinomo-chat-client".to_string())
             .spawn(move || {
                 remote_worker(
+                    worker_runtime,
+                    command_ready,
                     daemon_address,
                     command_rx,
                     event_tx,
@@ -205,9 +234,14 @@ impl ChatHandle {
             rx: event_rx,
             checkpoint,
             connected,
+            runtime,
             #[cfg(test)]
             worker: Some(worker),
         }
+    }
+
+    pub(crate) fn runtime(&self) -> Arc<tokio::runtime::Runtime> {
+        self.runtime.clone()
     }
 
     pub fn send_command(&self, command: ChatCommand) {
@@ -265,6 +299,8 @@ impl Drop for ChatHandle {
 }
 
 fn remote_worker(
+    runtime: Arc<tokio::runtime::Runtime>,
+    command_ready: Arc<tokio::sync::Notify>,
     daemon_address: Option<String>,
     command_rx: Receiver<ChatCommand>,
     event_tx: Sender<ClientEvent>,
@@ -311,6 +347,99 @@ fn remote_worker(
     };
     let client = ChatDaemonClient::at_address(address, next_client_id())
         .with_timeout(CHAT_CLIENT_RPC_TIMEOUT);
+    runtime.block_on(run_connected_worker(
+        client,
+        command_rx,
+        event_tx,
+        event_wake,
+        checkpoint,
+        connected,
+        command_ready,
+    ));
+}
+
+// The actor remains the sole owner of generation, replay cursor, and stable
+// mutation IDs. The transport seam also lets tests hold a real pending read
+// while checking command wakeups and reconnect behavior.
+trait ChatConnection: Clone + Send + Sync + 'static {
+    fn attach(
+        &self,
+        execution: Option<String>,
+    ) -> impl std::future::Future<
+        Output = Result<wire::ChatSessionOpenResponse, sinomo_client::api::DaemonApiError>,
+    > + Send;
+    fn command_with_id(
+        &self,
+        command: wire::ChatSessionCommand,
+        id: Option<String>,
+    ) -> impl std::future::Future<
+        Output = Result<wire::ChatSessionCommandResponse, sinomo_client::api::DaemonApiError>,
+    > + Send;
+    fn events(
+        &self,
+        cursor: u64,
+        limit: usize,
+        wait: Duration,
+    ) -> impl std::future::Future<
+        Output = Result<wire::ChatSessionEventsResponse, sinomo_client::api::DaemonApiError>,
+    > + Send;
+    fn close(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<wire::ChatSessionCloseResponse, sinomo_client::api::DaemonApiError>,
+    > + Send;
+}
+
+struct ChatEventPoll(
+    tokio::task::JoinHandle<
+        Result<wire::ChatSessionEventsResponse, sinomo_client::api::DaemonApiError>,
+    >,
+);
+
+impl Drop for ChatEventPoll {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl ChatConnection for ChatDaemonClient {
+    async fn attach(
+        &self,
+        execution: Option<String>,
+    ) -> Result<wire::ChatSessionOpenResponse, sinomo_client::api::DaemonApiError> {
+        self.attach_async(execution).await
+    }
+    async fn command_with_id(
+        &self,
+        command: wire::ChatSessionCommand,
+        id: Option<String>,
+    ) -> Result<wire::ChatSessionCommandResponse, sinomo_client::api::DaemonApiError> {
+        self.command_with_id_async(command, id).await
+    }
+    async fn events(
+        &self,
+        cursor: u64,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<wire::ChatSessionEventsResponse, sinomo_client::api::DaemonApiError> {
+        self.events_async(cursor, limit, wait).await
+    }
+    async fn close(
+        &self,
+    ) -> Result<wire::ChatSessionCloseResponse, sinomo_client::api::DaemonApiError> {
+        self.close_async().await
+    }
+}
+
+async fn run_connected_worker(
+    client: impl ChatConnection,
+    command_rx: Receiver<ChatCommand>,
+    event_tx: Sender<ClientEvent>,
+    event_wake: Option<ChatEventWake>,
+    checkpoint: Arc<Mutex<ChatConnectionSnapshot>>,
+    connected: Arc<AtomicBool>,
+    command_ready: Arc<tokio::sync::Notify>,
+) {
     let saved = checkpoint
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -323,6 +452,7 @@ fn remote_worker(
     let mut barriers = Vec::new();
     let mut handoffs = HashMap::<String, Sender<Result<String, String>>>::new();
     let mut request_sequence = 0u64;
+    let mut event_poll = None;
     while !stopped.load(Ordering::Acquire) {
         while let Ok(command) = command_rx.try_recv() {
             if matches!(command, ChatCommand::Shutdown) {
@@ -343,7 +473,8 @@ fn remote_worker(
             ));
         }
         if !opened {
-            match client.attach(Some(saved.execution_id.clone())) {
+            event_poll = None;
+            match client.attach(Some(saved.execution_id.clone())).await {
                 Ok(response) => {
                     if response.generation.is_empty()
                         || response.handoff_protocol != wire::CHAT_HANDOFF_PROTOCOL_VERSION
@@ -378,13 +509,16 @@ fn remote_worker(
                             error: format!("chat reconnecting: {error}"),
                         },
                     );
-                    thread::sleep(Duration::from_millis(500));
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             }
         }
         while let Some((id, command)) = pending.front() {
-            match client.command_with_id(command.clone(), Some(id.clone())) {
+            match client
+                .command_with_id(command.clone(), Some(id.clone()))
+                .await
+            {
                 Ok(response) if response.reattach_required => {
                     opened = false;
                     connected.store(false, Ordering::Release);
@@ -429,7 +563,7 @@ fn remote_worker(
             }
         }
         if pending.is_empty() && !barriers.is_empty() {
-            let detached = client.close().map(|_| ()).map_err(|e| e.to_string());
+            let detached = client.close().await.map(|_| ()).map_err(|e| e.to_string());
             for tx in barriers.drain(..) {
                 let _ = tx.send(detached.clone());
             }
@@ -441,7 +575,33 @@ fn remote_worker(
         if stopped.load(Ordering::Acquire) {
             break;
         }
-        match client.events(cursor, 256, CHAT_CLIENT_POLL_WAIT) {
+        if !opened {
+            // A failed mutation now reattaches without a timed event read in
+            // between. Use the existing disconnected-read backoff so repeated
+            // non-admission cannot turn that path into a hot retry loop.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        // Drain the read independently even while a command awaits its reply.
+        // Keeping this owned task across command wakeups avoids both head-of-line
+        // backpressure and cancel/restart churn. Drop aborts it on reconnect/exit.
+        let poll = event_poll.get_or_insert_with(|| {
+            let client = client.clone();
+            ChatEventPoll(tokio::spawn(async move {
+                client.events(cursor, 256, CHAT_CLIENT_POLL_WAIT).await
+            }))
+        });
+        let response = tokio::select! {
+            response = &mut poll.0 => Some(response.unwrap_or_else(|error| Err(sinomo_client::api::DaemonApiError::Network {
+                address: "chat event reader".into(), detail: error.to_string(),
+            }))),
+            _ = command_ready.notified() => None,
+        };
+        let Some(response) = response else {
+            continue;
+        };
+        event_poll = None;
+        match response {
             Ok(response) => {
                 if response.generation != generation {
                     generation = response.generation;
@@ -500,12 +660,12 @@ fn remote_worker(
                         error: format!("chat event stream disconnected: {error}"),
                     },
                 );
-                thread::sleep(Duration::from_millis(250));
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
     }
     connected.store(false, Ordering::Release);
-    let _ = client.close();
+    let _ = client.close().await;
     for (_, response_tx) in handoffs {
         let _ = response_tx.send(Err("chat client closed".to_string()));
     }
@@ -671,6 +831,9 @@ fn next_client_id() -> String {
     let sequence = CHAT_CLIENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("app-chat-{}-{sequence}", std::process::id())
 }
+
+#[cfg(test)]
+mod wait_tests;
 
 #[cfg(test)]
 mod tests {

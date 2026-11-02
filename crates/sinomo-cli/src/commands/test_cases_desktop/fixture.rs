@@ -51,6 +51,13 @@ pub fn require_test_desktop(expected: &str, interactive: bool) -> Result<(), Str
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ForegroundObservation {
+    pub window: u64,
+    pub process_id: u32,
+    pub input_events: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct State {
     pub case: String,
     pub expected_code: String,
@@ -59,9 +66,18 @@ pub struct State {
     pub counter: u32,
     pub enabled: bool,
     pub expanded: bool,
+    pub secondary_window: u64,
+    pub submitted_window: u64,
     pub dragged: bool,
     pub wheel_ticks: i32,
     pub input_events: u64,
+    pub target_activation_events: u64,
+    pub target_focus_events: u64,
+    pub foreground_input_events: u64,
+    pub foreground_observations: Vec<ForegroundObservation>,
+    pub interruption_window: u64,
+    pub interruption_became_foreground: bool,
+    pub input_events_after_interruption: u64,
     pub token: [f64; 2],
     #[serde(skip)]
     text_active: bool,
@@ -94,9 +110,18 @@ impl State {
             counter: 0,
             enabled: false,
             expanded: false,
+            secondary_window: 0,
+            submitted_window: 0,
             dragged: false,
             wheel_ticks: 0,
             input_events: 0,
+            target_activation_events: 0,
+            target_focus_events: 0,
+            foreground_input_events: 0,
+            foreground_observations: Vec::new(),
+            interruption_window: 0,
+            interruption_became_foreground: false,
+            input_events_after_interruption: 0,
             token: [150.0, 490.0],
             text_active: false,
             dragging: false,
@@ -113,6 +138,44 @@ impl State {
             gamepad_wgi_error: None,
             gamepad_observer: None,
             wgi_selected: None,
+        }
+    }
+    pub fn background_input_isolated(
+        &self,
+        main: u64,
+        foreground: u64,
+        initial_pointer: [i32; 2],
+        pointer: [i32; 2],
+    ) -> bool {
+        self.target_activation_events == 0
+            && self.target_focus_events == 0
+            && self.foreground_input_events == 0
+            && foreground != main
+            && (self.secondary_window == 0 || foreground != self.secondary_window)
+            && pointer == initial_pointer
+    }
+    fn observe_foreground(&mut self) {
+        let window = unsafe { GetForegroundWindow() };
+        let handle = window.0 as usize as u64;
+        if self
+            .foreground_observations
+            .last()
+            .is_some_and(|last| last.window == handle)
+        {
+            return;
+        }
+        let mut process_id = 0;
+        unsafe {
+            GetWindowThreadProcessId(window, Some(&mut process_id));
+        }
+        // Diagnostic samples supplement the synchronous activation/focus counters
+        // in the controlled windows. Sampling alone cannot detect brief activation.
+        if self.foreground_observations.len() < 256 {
+            self.foreground_observations.push(ForegroundObservation {
+                window: handle,
+                process_id,
+                input_events: self.input_events,
+            });
         }
     }
     fn poll_gamepad(&mut self) {
@@ -245,6 +308,7 @@ impl TestWindow {
         ready_file: &std::path::Path,
         expected_desktop: &str,
         interactive: bool,
+        interrupt_background: bool,
     ) -> Result<Self, String> {
         require_test_desktop(expected_desktop, interactive)?;
         let state = Arc::new(Mutex::new(State::new(case, code)));
@@ -313,7 +377,7 @@ impl TestWindow {
                             CreateWindowExW(
                                 WS_EX_TOPMOST,
                                 class.lpszClassName,
-                                w!("Foreground guard: agent must leave focus and pointer here"),
+                                w!("Foreground guard: uncontrolled window; focus may change"),
                                 WS_OVERLAPPEDWINDOW,
                                 230,
                                 120,
@@ -341,9 +405,14 @@ impl TestWindow {
                         std::thread::sleep(Duration::from_millis(25));
                     }
                     let foreground = guard.unwrap_or(window);
-                    let _ = ShowWindow(foreground, SW_SHOW);
-                    let _ = SetForegroundWindow(foreground);
-                    if GetForegroundWindow() != foreground {
+                    let _ = ShowWindow(foreground, SW_SHOWNOACTIVATE);
+                    if raw || interrupt_background {
+                        let _ = SetForegroundWindow(foreground);
+                    }
+                    if interrupt_background && GetForegroundWindow() != foreground {
+                        return Err("cannot establish the uncontrolled guard for the explicit interruption test".into());
+                    }
+                    if raw && GetForegroundWindow() != foreground {
                         // After a prior case exits, Windows may deny foreground
                         // activation. Establish it with a bounded real click on
                         // this owned, hit-tested window before recording begins.
@@ -367,6 +436,39 @@ impl TestWindow {
                     let mut message = MSG::default();
                     let mut quit = false;
                     while !quit && matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                        let interrupt = {
+                            let mut state = shared.lock().unwrap();
+                            state.observe_foreground();
+                            interrupt_background
+                                && state.input_events > 0
+                                && state.interruption_window == 0
+                        };
+                        if interrupt {
+                            // Deliberate environmental disturbance, outside the App Use
+                            // tool. No injected keyboard/mouse input and no target activation.
+                            let other = CreateWindowExW(
+                                WINDOW_EX_STYLE(0),
+                                class.lpszClassName,
+                                w!("Uncontrolled interruption: ignore this window"),
+                                WS_OVERLAPPEDWINDOW,
+                                1100,
+                                150,
+                                480,
+                                240,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            resources.windows.push(other);
+                            let _ = ShowWindow(other, SW_SHOW);
+                            let _ = SetForegroundWindow(other);
+                            let mut state = shared.lock().unwrap();
+                            state.interruption_window = other.0 as usize as u64;
+                            state.interruption_became_foreground = GetForegroundWindow() == other;
+                            state.observe_foreground();
+                        }
                         while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
                             if message.message == WM_QUIT {
                                 quit = true;
@@ -535,6 +637,26 @@ unsafe extern "system" fn window_proc(
     let mut state = unsafe { &*pointer }
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    if message == WM_ACTIVATE && wp.0 & 0xffff != WA_INACTIVE as usize {
+        state.target_activation_events += 1;
+    }
+    if message == WM_SETFOCUS {
+        state.target_focus_events += 1;
+    }
+    if matches!(
+        message,
+        WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MOUSEWHEEL
+    ) {
+        if unsafe { GetForegroundWindow() } == window {
+            state.foreground_input_events += 1;
+        }
+        if state.interruption_became_foreground {
+            state.input_events_after_interruption += 1;
+        }
+        state.observe_foreground();
+    }
+    let multi = state.case == "agent.desktop.app-multiwindow";
+    let work_window = !multi || state.secondary_window == window.0 as usize as u64;
     match message {
         WM_TIMER => {
             state.video_tick += 1;
@@ -565,13 +687,14 @@ unsafe extern "system" fn window_proc(
         }
         WM_CHAR => {
             state.input_events += 1;
-            if state.text_active {
+            if state.text_active && work_window {
                 match wp.0 {
                     8 => {
                         state.typed.pop();
                     }
                     13 => {
                         state.submitted = state.typed.clone();
+                        state.submitted_window = window.0 as usize as u64;
                     }
                     n if n >= 32 && state.typed.len() < 128 => {
                         if let Some(ch) = char::from_u32(n as u32) {
@@ -586,7 +709,7 @@ unsafe extern "system" fn window_proc(
             state.input_events += 1;
             let p = point(window, lp);
             state.mouse_down = Some(p);
-            state.text_active = inside(p, FIELD);
+            state.text_active = work_window && inside(p, FIELD);
             state.dragging =
                 (p[0] - state.token[0]).abs() < 28. && (p[1] - state.token[1]).abs() < 28.;
         }
@@ -604,16 +727,49 @@ unsafe extern "system" fn window_proc(
                 state.dragging = false;
                 state.mouse_down = None;
             } else if let Some(start) = state.mouse_down.take() {
-                if inside(start, SUBMIT) && inside(p, SUBMIT) {
+                if work_window && inside(start, SUBMIT) && inside(p, SUBMIT) {
                     state.submitted = state.typed.clone();
+                    state.submitted_window = window.0 as usize as u64;
                 }
-                if inside(start, PLUS) && inside(p, PLUS) {
+                if work_window && inside(start, PLUS) && inside(p, PLUS) {
                     state.counter += 1;
                 }
-                if inside(start, TOGGLE) && inside(p, TOGGLE) {
+                if work_window && inside(start, TOGGLE) && inside(p, TOGGLE) {
                     state.enabled = !state.enabled;
                 }
                 if inside(start, EXPAND) && inside(p, EXPAND) {
+                    if multi && !work_window {
+                        if state.secondary_window != 0 {
+                            return LRESULT(0);
+                        }
+                        state.expanded = true;
+                        drop(state);
+                        unsafe {
+                            let secondary = CreateWindowExW(
+                                WS_EX_NOACTIVATE,
+                                w!("SinomoAgentDesktopFixture"),
+                                w!("Sinomo agent test - secondary workspace"),
+                                WS_OVERLAPPEDWINDOW,
+                                800,
+                                160,
+                                930,
+                                690,
+                                Some(window),
+                                None,
+                                None,
+                                Some(pointer as *const _),
+                            );
+                            if let Ok(secondary) = secondary {
+                                (&*pointer)
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .secondary_window = secondary.0 as usize as u64;
+                                let _ = ShowWindow(secondary, SW_SHOWNOACTIVATE);
+                                let _ = SetTimer(Some(secondary), 1, 100, None);
+                            }
+                        }
+                        return LRESULT(0);
+                    }
                     state.expanded = true;
                     drop(state);
                     unsafe {
@@ -707,7 +863,18 @@ fn paint(window: HWND, state: &State) {
             (SUBMIT, "SUBMIT"),
             (PLUS, "+1"),
             (TOGGLE, if state.enabled { "ON" } else { "OFF" }),
-            (EXPAND, if state.expanded { "EXPANDED" } else { "EXPAND" }),
+            (
+                EXPAND,
+                if state.case == "agent.desktop.app-multiwindow"
+                    && state.secondary_window != window.0 as usize as u64
+                {
+                    "OPEN WINDOW"
+                } else if state.expanded {
+                    "EXPANDED"
+                } else {
+                    "EXPAND"
+                },
+            ),
         ] {
             fill(dc, rect(r), COLORREF(0x71532e));
             text(r[0] + 18., r[1] + 19., label);
@@ -778,5 +945,34 @@ unsafe fn fill(dc: HDC, rect: RECT, color: COLORREF) {
     unsafe {
         FillRect(dc, &rect, brush);
         let _ = DeleteObject(brush.into());
+    }
+}
+
+#[cfg(test)]
+mod background_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_foreground_changes_are_allowed() {
+        let mut state = State::new("agent.desktop.app-multiwindow", "test");
+        state.secondary_window = 20;
+        // The new foreground is neither controlled window. Its identity need
+        // not equal the initial foreground; pointer ownership is independent.
+        assert!(state.background_input_isolated(10, 30, [1, 2], [1, 2]));
+        assert!(state.background_input_isolated(10, 40, [1, 2], [1, 2]));
+        assert!(!state.background_input_isolated(10, 20, [1, 2], [1, 2]));
+        assert!(!state.background_input_isolated(10, 30, [1, 2], [3, 4]));
+    }
+    #[test]
+    fn transient_target_activation_cannot_be_hidden_by_final_foreground() {
+        let mut state = State::new("agent.desktop.app-form", "test");
+        state.target_activation_events = 1;
+        assert!(!state.background_input_isolated(10, 30, [1, 2], [1, 2]));
+        state.target_activation_events = 0;
+        state.target_focus_events = 1;
+        assert!(!state.background_input_isolated(10, 30, [1, 2], [1, 2]));
+        state.target_focus_events = 0;
+        state.foreground_input_events = 1;
+        assert!(!state.background_input_isolated(10, 30, [1, 2], [1, 2]));
     }
 }

@@ -10,6 +10,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(any(windows, test))]
+mod windows_resident;
+
 pub const SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS: &[&str] = &["daemon", "__complete-shadow-rollout"];
 
 /// Mark a clean main-daemon exit as an intentional supervisor restart. The
@@ -229,10 +232,7 @@ pub fn prepare_background_command(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
+        command.creation_flags(windows_resident::BACKGROUND_FLAGS);
     }
 }
 
@@ -590,6 +590,9 @@ pub fn start_daemon_command_process(
     ready_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<DaemonStatus, DaemonError> {
+    let data = crate::daemon_data_dir_path(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(&data)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     if matches!(
         probe_daemon_status(paths, probe_timeout),
         DaemonProbeStatus::Running(_) | DaemonProbeStatus::Locked { .. }
@@ -604,13 +607,29 @@ pub fn start_daemon_command_process(
         path: "current executable".to_string(),
         detail: source.to_string(),
     })?;
-    let exe = daemon_start_executable_for_command(&exe, command_prefix);
+    let installed = sinomo_core::local::SinomoDataDir::new(&data).binary(
+        if command_prefix.starts_with(&["daemon", "shadow"]) {
+            "sinomo-shadow"
+        } else {
+            "sinomo"
+        },
+    );
+    let exe = if installed.is_file() {
+        installed
+    } else {
+        daemon_start_executable_for_command(&exe, command_prefix)
+    };
     let mut command = Command::new(exe);
     command.args(command_prefix);
     for (key, value) in extra_env {
         command.env(key, value);
     }
     prepare_background_command(&mut command);
+    #[cfg(windows)]
+    windows_resident::prepare(&mut command).map_err(|source| DaemonError::Io {
+        path: format!("sinomo {label} start parent job"),
+        detail: source.to_string(),
+    })?;
     append_daemon_endpoint_args(&mut command, options);
     let child = command
         .stdin(Stdio::null())

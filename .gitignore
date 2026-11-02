@@ -22,3 +22,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# CI dependency cache is not deployment source.
+/.cache/cargo/

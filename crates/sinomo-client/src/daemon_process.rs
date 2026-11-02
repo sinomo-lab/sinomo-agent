@@ -129,6 +129,12 @@ pub(crate) fn start_app_owned_daemon_with_binary(
     })?;
     let binary = match binary {
         Some(path) => validate_app_daemon_binary(path.to_path_buf(), "desktop release")?,
+        None if sinomo_runtime::local::SinomoDataDir::new(data_dir)
+            .binary("sinomo")
+            .is_file() =>
+        {
+            sinomo_runtime::local::SinomoDataDir::new(data_dir).binary("sinomo")
+        }
         None => app_daemon_binary()?,
     };
     let mut launch_id = next_launch_id();

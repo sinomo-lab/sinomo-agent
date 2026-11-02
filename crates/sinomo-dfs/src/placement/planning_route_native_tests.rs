@@ -164,7 +164,7 @@ impl RoutingFixture {
             .unwrap();
         let control = native.shared_control_plane().unwrap();
         let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-        for _ in 0..2 {
+        loop {
             let current = control
                 .with_client(|kv| {
                     DfsControlPlaneStore::new(kv.as_mut())
@@ -173,12 +173,16 @@ impl RoutingFixture {
                 .unwrap()
                 .unwrap();
             assert_eq!(current.scanned_object_count, 0);
+            assert!(
+                current.last_error.is_none(),
+                "empty native seed policy: {current:?}"
+            );
             if current.state == DfsPlacementReconciliationState::Completed {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(!remaining.is_zero());
-            let tick = native.maintenance_tick(&owner, remaining).unwrap();
+            let tick = native.maintenance_tick(&coordinator, remaining).unwrap();
             assert!(
                 tick.outcome.is_ok(),
                 "empty actual seed policy: {:?}",
@@ -193,6 +197,10 @@ impl RoutingFixture {
                 .unwrap()
                 .state,
             DfsPlacementReconciliationState::Completed
+        );
+        assert!(
+            Instant::now() < deadline,
+            "empty native seed policy completed after its original deadline"
         );
         let mut seed = native.client(&owner).unwrap();
         let mut seed_policy = DfsReplicationPolicy::new(1, 1).unwrap();

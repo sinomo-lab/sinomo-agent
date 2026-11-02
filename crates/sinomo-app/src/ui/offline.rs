@@ -165,10 +165,10 @@ fn panel_content(
 
     let mut column = Stack::vertical()
         .gap(8.0)
-        .alignment(Alignment::Center)
-        .with_child(OfflineIcon {
+        .alignment(Alignment::Stretch)
+        .with_child(Align::center(OfflineIcon {
             color: theme.palette.text_muted,
-        })
+        }))
         .with_child(CenteredText::new(DAEMON_OFFLINE_TITLE, title_style))
         .with_child(CenteredText::new(summary, summary_style));
     if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
@@ -178,7 +178,15 @@ fn panel_content(
         .with_child(sui::SizedBox::new().height(4.0))
         .with_child(actions);
 
-    sui::SemanticRegion::new(name, Align::center(MaxWidth::new(PANEL_MAX_WIDTH, column)))
+    sui::SemanticRegion::new(
+        name,
+        sui::Padding::all(
+            16.0,
+            sui::ScrollView::vertical(Align::center(MaxWidth::new(PANEL_MAX_WIDTH, column)))
+                .content_height(sui::ContentExtent::AtLeastViewport)
+                .theme(theme),
+        ),
+    )
 }
 
 fn open_connection_settings(shared: &Shared) {
@@ -269,6 +277,58 @@ pub(crate) const OFFLINE_TEST_REASON: &str = "daemon failed to start: port in us
 mod tests {
     use super::*;
     use crate::state::AppState;
+
+    #[test]
+    fn mobile_offline_panel_wraps_long_errors_and_scrolls() -> sui::Result<()> {
+        let shared = Shared::new(AppState::connecting());
+        let reader: ThemeReader = Rc::new(move || shared.theme());
+        let detail = format!(
+            "Storage error at /data/user/0/net.sinomo.app/files/{}: Permission denied",
+            "a".repeat(64)
+        );
+        for size in [
+            Size::new(320.0, 240.0),
+            Size::new(411.0, 780.0),
+            Size::new(869.0, 300.0),
+        ] {
+            let shared = Shared::new(AppState::connecting());
+            let panel = panel_content(
+                &shared,
+                &reader,
+                "Mobile offline",
+                "Chat runs through the daemon; reconnect to load conversations.",
+                &[],
+                &DaemonAvailability::Unavailable {
+                    detail: Some(detail.clone()),
+                    reconnecting: false,
+                },
+            );
+            let mut runtime = sui::Application::new()
+                .window(sui::WindowBuilder::new().root(panel))
+                .build()?;
+            let window = runtime.window_ids()[0];
+            runtime.handle_event(window, sui::Event::Window(sui::WindowEvent::Resized(size)))?;
+            let output = runtime.render(window)?;
+            for node in output
+                .semantics
+                .iter()
+                .filter(|node| matches!(node.role, SemanticsRole::Text | SemanticsRole::Button))
+            {
+                assert!(
+                    node.bounds.x() >= 15.0 && node.bounds.max_x() <= size.width - 15.0,
+                    "offline content exceeds the phone viewport: {:?}",
+                    node.bounds
+                );
+            }
+            assert!(
+                output
+                    .semantics
+                    .iter()
+                    .any(|node| node.name.as_deref() == Some(CONNECTION_SETTINGS_LABEL))
+            );
+        }
+        Ok(())
+    }
 
     fn panel_app(shared: &Shared) -> sui::Result<sui_testing::TestApp> {
         let reader: ThemeReader = {

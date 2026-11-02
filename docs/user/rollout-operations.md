@@ -17,7 +17,8 @@ Command syntax can change with the installed binary. Use
 | Update a mixed-platform cluster from source | Cluster build and rollout |
 | Update only the current machine from managed source | Local apply |
 | Update compatible nodes from an existing artifact | Prebuilt artifact rollout |
-| Refresh installation and boot integration | Install |
+| Initial deployment and daemon startup | CLI or graphical installer |
+| Redeploy a legacy installation outside the shared installer | Install with `--runtime-service` |
 | Build or update the desktop client independently | Desktop app rollout |
 
 Before rollout, commit or otherwise preserve the intended source, run the
@@ -25,23 +26,28 @@ relevant tests, and confirm the current cluster is healthy.
 
 ## Desktop App Rollout
 
-A desktop release contains `sinomo`, `sinomo-app`, `sinomo-ui-extension-host`,
-and `desktop-release.json`. The CLI binary also hosts the desktop supervisor
-and app-owned daemon. Running `sinomo install` from that release installs the
+A desktop release contains `sinomo-app`, `sinomo-ui-extension-host`, optional
+runtime libraries, and `desktop-release.json`. It can be delivered independently
+of the daemon and native modules. The initial installer also ships the CLI and
+offline default-module/source payload; the CLI hosts local desktop supervision. Running `sinomo install` from that release installs or verifies the
 desktop app automatically. A runtime-only release remains headless. The explicit
 forms are:
 
 ```sh
-sinomo install --desktop --app-bundle /path/to/desktop-release
-sinomo install --headless
+sinomo install --desktop --app-bundle /path/to/desktop-release --add-to-path
+sinomo install --headless --add-to-path
+# Launch through PATH after starting a new login session:
 sinomo-app
 # Equivalent supervised launch through the CLI:
 sinomo rollout app launch
 ```
 
 Previously installed desktop bundles can still restore their verified GUI;
-the current CLI supplies their daemon host. New bundles must include `sinomo`
-in the manifest, and retired daemon helpers are never launched by the current CLI.
+the current CLI supplies their daemon host. The launcher always selects the canonical installed CLI rather than a daemon
+copy in an old desktop bundle. Retired daemon helpers are never launched.
+Approved desktop files are published to `<data>/bin` after the previous UI exits;
+readiness failure restores the previous release through the same location.
+A remote GUI's connection and pairing configuration is a separate client feature.
 
 Build the local desktop platform through the existing cluster build service:
 
@@ -199,9 +205,50 @@ existing main and shadow ports. Port flags provide connection/bootstrap defaults
 they do not relocate an existing listener. `--host` remains an explicit bind-host
 change and is checked after activation.
 
-Each build server advertises its installed host target automatically. To let a
-server build for additional installed Rust targets, set a comma-separated list
-before starting its daemon, for example:
+Each build server advertises its installed host target automatically. GNU Linux
+builders running on x86-64 or AArch64 also offer managed cross compilation for:
+
+- `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`;
+- `armv7-unknown-linux-gnueabihf`;
+- `aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl`;
+- `armv7-unknown-linux-musleabihf`.
+
+These are compatibility choices, not capacity classes. An ARM cloud VM can
+serve other architectures; a small x86 machine receives the same resource
+checks as a small ARM machine. Placement uses measured resources and cache
+availability rather than treating AArch64 as synonymous with an SBC.
+
+The first admitted job for a managed target downloads pinned Zig,
+cargo-zigbuild, and host libclang archives over HTTPS, checks their SHA-256 digests, installs the
+Rust standard library for the selected compiler through rustup if needed, and
+qualifies executable and native-library linking. Preparation is visible in the
+build log and failures fail that job explicitly. Capability discovery does not
+install tools. Tools and qualification evidence live under
+`$SINOMO_DATA_DIR/build/toolchains/managed-cross`; system libraries are not
+modified. The build key includes the compiler, SDK, exact target triple, and
+GNU glibc baseline of 2.17. A target requiring an older glibc needs an explicitly
+installed compatible SDK instead. Musl builds use dynamic libc so the binary
+and its native modules share the target runtime.
+
+Builders need `curl` and either rustup or the requested Rust target already
+installed. Set `SINOMO_BUILD_CROSS_TARGETS` to a comma-separated subset of the
+managed targets before starting the daemon, or to `off` to disable automatic
+preparation. An installed SDK for the same exact target takes precedence.
+
+Rollout uses each daemon's reported Rust target triple to distinguish GNU,
+musl, and ARM ABI variants. For a legacy daemon that reports only OS and
+architecture, verify its ABI locally before using an override for one target:
+
+```sh
+sinomo rollout cluster --repo /path/to/prepared-source \
+  --target arm-cloud.example:21353 --rust-target aarch64-unknown-linux-gnu
+```
+
+An override cannot replace a triple reported by a newer daemon. Without an
+exact triple, managed cross compilation is excluded from selection.
+
+To let a server build for additional operator-installed Rust targets, set a
+comma-separated list before starting its daemon, for example:
 
 ```sh
 SINOMO_BUILD_TARGETS=aarch64-unknown-linux-gnu,x86_64-unknown-linux-musl \
@@ -241,11 +288,12 @@ Import an external checkout and apply it in one step:
 sinomo rollout apply-external --repo /path/to/sinomo
 ```
 
-Use `sinomo install` instead when the goal is to refresh the installed binary,
+For legacy deployments outside the shared installer, use
+`sinomo install --runtime-service` when the goal is to refresh the installed binary,
 boot entries, daemon bind settings, and managed source together:
 
 ```sh
-cargo run -p sinomo -- install
+cargo run -p sinomo -- install --runtime-service
 ```
 
 ## Prebuilt Artifact Rollout
@@ -435,13 +483,14 @@ the existing deployment without replacing it:
 sinomo daemon start
 ```
 
-Use `install` only when the deployment itself must be replaced. Verify the
+For legacy deployments outside the shared installer, use `install --runtime-service`
+only when the deployment itself must be replaced. Verify the
 selected data directory, invoking checkout and commit, expected binary/module
 set, and outage first; installation may stop both daemons, advance managed
 source, rebuild native modules, rewrite boot entries, and restart processes:
 
 ```sh
-cargo run -p sinomo -- install
+cargo run -p sinomo -- install --runtime-service
 ```
 
 When the main daemon is unavailable but the shadow daemon is reachable, use the

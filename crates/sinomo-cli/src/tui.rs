@@ -43,11 +43,15 @@ const TUI_SESSION_SCHEMA_VERSION: u32 = 1;
 const TUI_WORKSPACE_PROJECTION_VERSION: u32 = 1;
 const TUI_MOUSE_SCROLL_LINES: isize = 4;
 
+mod diagnostics;
+mod panic_restore;
+mod startup;
+mod terminal_io;
+use diagnostics::TuiDiagnostics;
+
 pub fn run_tui() -> Result<(), CliError> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        let daemon = tui_default_daemon_status()?;
-        let (handler, daemon) = runtime_main_agent_handler_for_tui(daemon)?;
-        return run_tui_with_handler_and_daemon(handler, daemon);
+        return startup::run();
     }
 
     let stdin = io::stdin();
@@ -56,7 +60,9 @@ pub fn run_tui() -> Result<(), CliError> {
 }
 
 pub fn run_tui_with_io<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> Result<(), CliError> {
-    let daemon = tui_default_daemon_status()?;
+    let (daemon, force_local) = prepare_tui_daemon()?;
+    let _local = enter_cli_force_local_mode(force_local);
+    let _daemon = daemon.clone().map(enter_cli_default_main_daemon_status);
     run_tui_with_io_and_daemon_probe(&mut reader, &mut writer, daemon)
 }
 
@@ -83,17 +89,12 @@ pub(super) fn run_tui_with_io_and_daemon_probe<R: BufRead, W: Write>(
     )
 }
 
-fn runtime_main_agent_handler_for_tui(
-    daemon: Option<DaemonStatus>,
-) -> Result<
-    (
-        RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
-        Option<DaemonStatus>,
-    ),
-    CliError,
-> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    runtime_main_agent_handler_for_tui_with_data_dir(daemon, &data_dir)
+fn prepare_tui_daemon() -> Result<(Option<DaemonStatus>, bool), CliError> {
+    let daemon = tui_default_daemon_status()?;
+    let _daemon = daemon.clone().map(enter_cli_default_main_daemon_status);
+    let quorum = cli_local_cluster_quorum_if_relevant(true, daemon.as_ref())?;
+    let force_local = cli_force_local_mode() || daemon.is_none() || quorum == Some(false);
+    Ok((if force_local { None } else { daemon }, force_local))
 }
 
 pub(crate) fn main_agent_handler_for_tui_with_data_dir(
@@ -119,14 +120,35 @@ pub(crate) fn runtime_main_agent_handler_for_tui_with_data_dir(
     ),
     CliError,
 > {
-    let daemon_connected = daemon.is_some();
-    let (runtime_config, _) = load_tui_model_runtime_config(data_dir, daemon_connected)?;
-    let handler = RuntimeMainAgentInteractionHandler::from_default_model_config(
-        data_dir,
-        runtime_config,
-        daemon.as_ref(),
-    )?;
+    let handler =
+        RuntimeMainAgentInteractionHandler::from_default_model_config(data_dir, daemon.as_ref())?;
     Ok((handler, daemon))
+}
+
+fn load_tui_startup_configs(
+    data_dir: &SinomoDataDir,
+    daemon_connected: bool,
+) -> Result<(ModelRuntimeConfig, sinomo_lm::ModelConfig), CliError> {
+    let _local = enter_cli_force_local_mode(!daemon_connected);
+    if model_config_uses_cluster(data_dir) {
+        return read_tui_startup_configs(|| {
+            model_config_cluster_snapshot(&ClusterPaths::new(data_dir))
+        });
+    }
+    Ok((
+        load_tui_model_runtime_config(data_dir, daemon_connected)?.0,
+        load_model_config_for_node(data_dir)?.0,
+    ))
+}
+
+fn read_tui_startup_configs(
+    read_snapshot: impl FnOnce() -> Result<KvSnapshot, CliError>,
+) -> Result<(ModelRuntimeConfig, ModelConfig), CliError> {
+    let snapshot = read_snapshot()?;
+    Ok((
+        sinomo_lm::model_runtime_config_from_cluster_kv_snapshot(&snapshot)?.unwrap_or_default(),
+        sinomo_lm::model_config_from_cluster_kv_snapshot(&snapshot)?.unwrap_or_default(),
+    ))
 }
 
 pub(crate) fn load_tui_model_runtime_config(
@@ -395,20 +417,31 @@ fn new_tui_interaction_runtime<H: TuiAgentRuntimeControl>(
     Ok(runtime)
 }
 
-fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
+struct ReadyTui<H> {
+    data_dir: SinomoDataDir,
+    session_store: TuiSessionStore,
+    runtime: InteractionRuntime<JsonlEventStore, H>,
+    state: TuiState,
+    chat_projection: StableChatProjection,
+    daemon: Option<DaemonStatus>,
+    force_local: bool,
+}
+
+fn prepare_tui_session<H: TuiAgentRuntimeControl>(
     handler: H,
     daemon: Option<DaemonStatus>,
-) -> Result<(), CliError> {
+    force_local: bool,
+) -> Result<ReadyTui<H>, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     let session_store = TuiSessionStore::for_data_dir(&data_dir);
-    let mut runtime = new_tui_interaction_runtime(handler, daemon.as_ref(), &session_store)?;
-    let mut state = TuiState::new(
+    let runtime = new_tui_interaction_runtime(handler, daemon.as_ref(), &session_store)?;
+    let state = TuiState::new(
         runtime.session(),
         daemon.as_ref(),
         runtime.handler.tui_agent_runtime_info(),
     );
-    let mut chat_projection = match daemon.as_ref() {
+    let chat_projection = match daemon.as_ref() {
         Some(daemon) => StableChatProjection::open_daemon_bounded(
             &daemon.address,
             Duration::from_millis(250),
@@ -418,20 +451,46 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         None => StableChatProjection::unavailable(runtime.session()),
     };
     session_store.save_state(runtime.session(), &state)?;
-    let mut terminal = TuiTerminalSession::enter()?;
+    Ok(ReadyTui {
+        data_dir,
+        session_store,
+        runtime,
+        state,
+        chat_projection,
+        daemon,
+        force_local,
+    })
+}
 
+fn run_tui_session<H: TuiAgentRuntimeControl>(
+    ready: ReadyTui<H>,
+    mut terminal: TuiTerminalSession,
+) -> Result<(), CliError> {
+    let ReadyTui {
+        data_dir,
+        session_store,
+        mut runtime,
+        mut state,
+        mut chat_projection,
+        daemon,
+        force_local,
+    } = ready;
+    let _local = enter_cli_force_local_mode(force_local);
+    let _daemon = daemon.clone().map(enter_cli_default_main_daemon_status);
     terminal.draw(&state)?;
     loop {
         if state.exit_requested {
             break;
         }
+        let diagnostics_changed = state.diagnostics.refresh(&terminal.output);
         if refresh_tui_runtime_events(
             &mut runtime,
             &mut state,
             &session_store,
             daemon.as_ref(),
             &mut chat_projection,
-        )? {
+        )? || diagnostics_changed
+        {
             terminal.draw(&state)?;
         }
         if !event::poll(Duration::from_millis(250)).map_err(CliError::stdio)? {
@@ -467,7 +526,9 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
                 terminal.draw(&state)?;
             }
             CrosstermEvent::Paste(text) => {
-                state.insert_str(&text);
+                if !state.diagnostics.open {
+                    state.insert_str(&text);
+                }
                 terminal.draw(&state)?;
             }
             CrosstermEvent::Resize(_, _) => terminal.draw(&state)?,
@@ -725,27 +786,53 @@ fn combine_stable_chat_errors(original: CliError, projection: CliError) -> CliEr
 }
 
 struct TuiTerminalSession {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: Terminal<CrosstermBackend<fs::File>>,
+    output: terminal_io::TerminalOutput,
+    screen: Arc<TuiScreenRestore>,
+    _console: sinomo_runtime::observe::ObserveConsoleGuard,
+    _panic: panic_restore::PanicRestoreGuard,
 }
 
 impl TuiTerminalSession {
     fn enter() -> Result<Self, CliError> {
-        enable_raw_mode().map_err(CliError::stdio)?;
-        let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-            let _ = disable_raw_mode();
-            return Err(CliError::stdio(error));
-        }
-        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+        Self::enter_with_setup(|writer| Terminal::new(CrosstermBackend::new(writer)))
+    }
+
+    fn enter_with_setup(
+        create_terminal: impl FnOnce(fs::File) -> io::Result<Terminal<CrosstermBackend<fs::File>>>,
+    ) -> Result<Self, CliError> {
+        let console = sinomo_runtime::observe::suppress_observe_console();
+        // Collection is in memory. Existing filtering/file policy is unchanged.
+        let _ = sinomo_runtime::observe::init_observe_runtime(
+            sinomo_runtime::observe::ObserveRuntimeConfig::process("cli", None),
+        );
+        let (output, mut writer) = terminal_io::TerminalOutput::start().map_err(CliError::stdio)?;
+        let screen = Arc::new(TuiScreenRestore {
+            writer: writer.try_clone().map_err(CliError::stdio)?,
+            stdio: output.restorer(),
+            was_raw: crossterm::terminal::is_raw_mode_enabled().map_err(CliError::stdio)?,
+            restored: std::sync::atomic::AtomicBool::new(false),
+        });
+        let setup = (|| {
+            enable_raw_mode()?;
+            execute!(writer, EnterAlternateScreen, EnableMouseCapture)?;
+            create_terminal(writer)
+        })();
+        let terminal = match setup {
             Ok(terminal) => terminal,
             Err(error) => {
-                let _ = disable_raw_mode();
-                let mut stdout = io::stdout();
-                let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+                screen.restore();
                 return Err(CliError::stdio(error));
             }
         };
-        Ok(Self { terminal })
+        let panic = panic_restore::install(screen.clone());
+        Ok(Self {
+            terminal,
+            output,
+            screen,
+            _console: console,
+            _panic: panic,
+        })
     }
 
     fn draw(&mut self, state: &TuiState) -> Result<(), CliError> {
@@ -763,10 +850,42 @@ impl TuiTerminalSession {
 
 impl Drop for TuiTerminalSession {
     fn drop(&mut self) {
-        let _ = self.terminal.show_cursor();
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        self.screen.restore();
+    }
+}
+
+struct TuiScreenRestore {
+    writer: fs::File,
+    stdio: Arc<terminal_io::StdioRestore>,
+    was_raw: bool,
+    restored: std::sync::atomic::AtomicBool,
+}
+
+impl TuiScreenRestore {
+    fn restore(&self) {
+        if self
+            .restored
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let mut writer = &self.writer;
+        let _ = execute!(
+            writer,
+            crossterm::cursor::Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        if !self.was_raw {
+            let _ = disable_raw_mode();
+        }
+        self.stdio.restore();
+    }
+}
+
+impl panic_restore::PanicRestore for TuiScreenRestore {
+    fn restore_terminal(&self) {
+        self.restore();
     }
 }
 
@@ -1410,6 +1529,7 @@ struct TuiRuntimeActivity {
 
 #[derive(Clone, Debug)]
 struct TuiState {
+    diagnostics: TuiDiagnostics,
     session_id: String,
     workspaces: Vec<WorkspaceRef>,
     workspace_projection_version: u32,
@@ -1434,6 +1554,7 @@ struct TuiState {
     chat_selection: Option<TuiChatSelection>,
     completions: Option<TuiCompletionState>,
     status: String,
+    startup_ready: bool,
     scrollback: u16,
     exit_requested: bool,
 }
@@ -1448,6 +1569,7 @@ impl TuiState {
             .and_then(|status| status.cluster.as_ref())
             .map(|cluster| format!("cluster {}", cluster.cluster_id));
         let mut state = Self {
+            diagnostics: TuiDiagnostics::default(),
             session_id: session.session_id.to_string(),
             workspaces: initial_tui_conversation_workspaces(),
             workspace_projection_version: TUI_WORKSPACE_PROJECTION_VERSION,
@@ -1472,6 +1594,7 @@ impl TuiState {
             chat_selection: None,
             completions: None,
             status: "listening".to_string(),
+            startup_ready: true,
             scrollback: 0,
             exit_requested: false,
         };
@@ -1489,6 +1612,17 @@ impl TuiState {
 
     fn apply_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return TuiInputAction::None;
+        }
+
+        if key.code == KeyCode::F(5) {
+            self.diagnostics.toggle();
+            return TuiInputAction::None;
+        }
+        if self.diagnostics.open
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.diagnostics.key(key.code);
             return TuiInputAction::None;
         }
 
@@ -1606,6 +1740,14 @@ impl TuiState {
     }
 
     fn apply_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> TuiInputAction {
+        if self.diagnostics.open {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.diagnostics.key(KeyCode::PageUp),
+                MouseEventKind::ScrollDown => self.diagnostics.key(KeyCode::PageDown),
+                _ => {}
+            }
+            return TuiInputAction::None;
+        }
         let layout = tui_layout_areas(area, self);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -2627,6 +2769,9 @@ impl TuiState {
     }
 
     fn take_submission(&mut self) -> TuiInputAction {
+        if !self.startup_ready {
+            return TuiInputAction::None;
+        }
         let line = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.completions = None;
@@ -4263,6 +4408,18 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 fn render_tui(frame: &mut Frame<'_>, state: &TuiState) {
     let areas = tui_layout_areas(frame.area(), state);
     render_tui_menu_bar(frame, areas.menu, state);
+    if state.diagnostics.open {
+        state.diagnostics.render(frame, areas.main);
+        frame.render_widget(
+            Paragraph::new("Diagnostic output is separate from the conversation."),
+            areas.input,
+        );
+        frame.render_widget(
+            Paragraph::new("F5/Esc close   Up/Down/PgUp/PgDn scroll   Home newest"),
+            areas.status,
+        );
+        return;
+    }
     match state.view_mode {
         TuiViewMode::Sessions => render_tui_session_list(frame, areas.main, state),
         TuiViewMode::Settings => render_tui_settings(frame, areas.main, state),
@@ -4284,7 +4441,11 @@ fn render_tui_menu_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if area.is_empty() {
         return;
     }
-    let cluster_label = tui_cluster_status_label(state);
+    let cluster_label = format!(
+        "F5 Logs ({})  {}",
+        state.diagnostics.warnings(),
+        tui_cluster_status_label(state)
+    );
     // Navigation owns its space; cluster identity uses only the remainder.
     let tabs = tui_menu_tabs(&state.view_mode, area.width);
     let menu_width = tabs.iter().map(|tab| tab.label.len() as u16).sum::<u16>() + 3;
@@ -4933,7 +5094,12 @@ fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Green));
-    let input = if input.is_empty() && state.view_mode == TuiViewMode::Chat {
+    let input = if !state.startup_ready {
+        Line::styled(
+            "Chat unavailable until initialization succeeds",
+            Style::default().fg(Color::DarkGray),
+        )
+    } else if input.is_empty() && state.view_mode == TuiViewMode::Chat {
         Line::styled(
             "Type a message or / for commands",
             Style::default().fg(Color::DarkGray),
@@ -4942,7 +5108,7 @@ fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::raw(input)
     };
     frame.render_widget(Paragraph::new(input).block(block), area);
-    if state.accepts_text_input() && area.width > 2 && area.height > 2 {
+    if state.startup_ready && state.accepts_text_input() && area.width > 2 && area.height > 2 {
         let cursor_x = area
             .x
             .saturating_add(1)
@@ -4953,6 +5119,18 @@ fn render_tui_input(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    if !state.startup_ready {
+        let color = if state.status.starts_with("startup failed") {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+        frame.render_widget(
+            Paragraph::new(state.status.as_str()).style(Style::default().fg(color)),
+            area,
+        );
+        return;
+    }
     let status_style =
         if state.status.starts_with("file browser error:") || state.status == "ending session" {
             Style::default().fg(Color::Red)
@@ -7161,6 +7339,7 @@ mod tui_tests {
     fn tui_and_app_agent_switches_atomically_rebind_recall_tool_authority() {
         let root = temp_file_browser_root("agent-switch-recall-authority");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
             &data_dir,
             ModelRuntimeConfig::default(),
@@ -7226,6 +7405,7 @@ mod tui_tests {
     fn tui_agent_switch_persists_identity_and_generic_workspace_immediately() {
         let root = temp_file_browser_root("durable-agent-switch");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let workspace = root.join("plain-workspace");
         let stale_process_workspace = root.join("stale-process-workspace");
         fs::create_dir_all(&workspace).expect("create generic workspace");
@@ -7356,6 +7536,7 @@ mod tui_tests {
     fn tui_resume_prefers_canonical_agent_identity_and_conversation_workspaces() {
         let root = temp_file_browser_root("canonical-agent-resume");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let conversation_workspace = root.join("conversation-workspace");
         let stale_session_workspace = root.join("stale-session-workspace");
         fs::create_dir_all(&conversation_workspace).expect("create conversation workspace");
@@ -7473,6 +7654,7 @@ mod tui_tests {
     fn tui_resume_failure_restores_outer_session_recall_authority_and_route() {
         let root = temp_file_browser_root("resume-transaction-rollback");
         let data_dir = SinomoDataDir::new(root.join("data"));
+        let _native = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let session_store = TuiSessionStore::for_data_dir(&data_dir);
         let target_session = InteractionSession::new(
             SessionId::generate(),
@@ -8140,6 +8322,7 @@ where
     runtime: Option<RuntimeMainAgentSlot<M>>,
     runtime_storage: AgentRuntimeStorage,
     runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry,
+    admission_cancellation: Option<sinomo_agent::AgentCancellationToken>,
     runtime_cursor: AgentRuntimeEventCursor,
     agent_definition: AgentDefinition,
     skill_catalog: sinomo_agent::SkillCatalog,
@@ -8259,6 +8442,7 @@ where
             runtime: Some(RuntimeMainAgentSlot::Pending(model)),
             runtime_storage: AgentRuntimeStorage::new(),
             runtime_control_registry: sinomo_agent::AgentRuntimeControlRegistry::new(),
+            admission_cancellation: None,
             runtime_cursor: AgentRuntimeEventCursor {
                 offset: 0,
                 last_event_id: None,
@@ -8279,6 +8463,13 @@ where
             auto_compact_token_limit: None,
             workspace_root: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }
+    }
+
+    pub(crate) fn set_admission_cancellation(
+        &mut self,
+        cancellation: Option<sinomo_agent::AgentCancellationToken>,
+    ) {
+        self.admission_cancellation = cancellation;
     }
 
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
@@ -8957,15 +9148,19 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
 
     fn from_default_model_config(
         data_dir: &SinomoDataDir,
-        runtime_config: ModelRuntimeConfig,
         daemon: Option<&DaemonStatus>,
     ) -> Result<Self, CliError> {
-        let daemon_connected = daemon.is_some();
+        let (runtime_config, config) = load_tui_startup_configs(data_dir, daemon.is_some())?;
         let runtime_skill_catalog = runtime_skill_catalog(daemon)?;
+        let modules = daemon
+            .map(resident_agent_module_tool_projection)
+            .transpose()?
+            .unwrap_or_default();
         Self::from_default_model_config_with_runtime_skill_catalog(
             data_dir,
             runtime_config,
-            daemon_connected,
+            config,
+            modules,
             runtime_skill_catalog,
         )
     }
@@ -8973,16 +9168,15 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
     fn from_default_model_config_with_runtime_skill_catalog(
         data_dir: &SinomoDataDir,
         runtime_config: ModelRuntimeConfig,
-        daemon_connected: bool,
+        config: sinomo_lm::ModelConfig,
+        module_tool_projection: sinomo_agent::AgentModuleToolProjection,
         runtime_skill_catalog: RuntimeSkillCatalog,
     ) -> Result<Self, CliError> {
         let thinking = ThinkingControl::default();
-        let tool_registry = main_agent_config_tool_registry(data_dir)?;
-        let (config, _) =
-            with_tui_model_config_mode(daemon_connected, || load_model_config_for_node(data_dir))?;
+        let tool_registry =
+            main_agent_config_tool_registry_with_modules(data_dir, &module_tool_projection)?;
         let resolved = resolve_default_model(Some(&config), None)?;
         let (skill_catalog, skill_catalog_texts, skill_catalog_resources) = runtime_skill_catalog;
-        let module_tool_projection = crate::agent_module_tool_projection(data_dir);
         if resolved.provider == default_main_agent_chat_model_provider()
             && resolved.model == default_main_agent_chat_model_id()
         {
@@ -9559,7 +9753,7 @@ pub(crate) fn app_build_chat_handler(
     daemon_connected: bool,
     runtime_skill_catalog_vfs: Option<sinomo_runtime::vfs::VfsHandle>,
 ) -> Result<RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>, CliError> {
-    let (runtime_config, _) = load_tui_model_runtime_config(data_dir, daemon_connected)?;
+    let (runtime_config, config) = load_tui_startup_configs(data_dir, daemon_connected)?;
     let runtime_skill_catalog = match (daemon_connected, runtime_skill_catalog_vfs) {
         (true, Some(vfs)) => {
             load_runtime_skill_catalog_from_vfs(vfs).map_err(skill_catalog_cli_error)?
@@ -9575,7 +9769,8 @@ pub(crate) fn app_build_chat_handler(
     RuntimeMainAgentInteractionHandler::from_default_model_config_with_runtime_skill_catalog(
         data_dir,
         runtime_config,
-        daemon_connected,
+        config,
+        agent_module_tool_projection(data_dir),
         runtime_skill_catalog,
     )
 }
@@ -10345,12 +10540,17 @@ where
         .caused_by(&message.event_id);
         store.append(requested.clone())?;
 
+        let admission_cancellation = self.admission_cancellation.clone();
         let runtime = self.ensure_runtime(session)?;
         // An interrupted (paused) session resumes when a new message arrives.
         if runtime.session_snapshot()?.is_paused() {
             runtime.submit_op(AgentOp::unpause())?;
         }
-        let result = runtime.submit_op(AgentOp::start_turn(input))?;
+        let op = AgentOp::start_turn(input);
+        let result = match admission_cancellation {
+            Some(cancellation) => runtime.submit_op_with_cancellation(op, cancellation)?,
+            None => runtime.submit_op(op)?,
+        };
         let queued = interaction_event(
             session,
             "interaction.main_agent.queued",
@@ -11350,3 +11550,6 @@ fn split_command_line(input: &str) -> Result<Vec<String>, CliError> {
 
     Ok(args)
 }
+
+#[cfg(all(test, unix))]
+mod terminal_output_tests;

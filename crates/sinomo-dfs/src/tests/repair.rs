@@ -110,7 +110,10 @@ pub(super) fn native_owned_repair_fixture(
             .expect("the exact accepted empty fixture policy remains observable")
     };
     let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    for _ in 0..2 {
+    // Maintenance invocations can finish a retained turn without running placement.
+    // Observe this exact job until its existing native completion boundary.
+    let placement_owner = runtime.root_shard().unwrap().primary_node_id;
+    loop {
         let current = observed();
         assert_eq!(current.job_id, accepted.job_id);
         assert_eq!(current.file_system_id, accepted.file_system_id);
@@ -136,7 +139,9 @@ pub(super) fn native_owned_repair_fixture(
         ));
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero(), "normal empty fixture Apply budget");
-        let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
+        let tick = runtime
+            .maintenance_tick(&placement_owner, remaining)
+            .unwrap();
         assert!(
             tick.outcome.is_ok(),
             "normal empty fixture Apply: {:?}",
@@ -149,7 +154,11 @@ pub(super) fn native_owned_repair_fixture(
     assert_eq!(completed.accepted_config, accepted.accepted_config);
     assert_eq!(completed.candidate_snapshot, accepted.candidate_snapshot);
     assert_eq!(completed.placement_snapshot, accepted.placement_snapshot);
-    assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
+    assert_eq!(
+        completed.state,
+        DfsPlacementReconciliationState::Completed,
+        "actual empty policy: {completed:?}"
+    );
     assert_eq!(completed.total_object_count, 0);
     assert_eq!(completed.scanned_object_count, 0);
     assert_eq!(completed.matched_object_count, 0);
@@ -5548,9 +5557,10 @@ pub(super) fn native_committed_repair_backlog_with_nodes(
             .expect("the exact accepted native policy job remains observable")
     };
     let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    // The empty normal job has only its Scanning and Repairing passes. This is
-    // one bounded setup window, not a retry of failed work or a phase override.
-    for _ in 0..2 {
+    // Drive the existing root coordinator until this exact accepted job completes;
+    // a bounded maintenance invocation need not run a placement page.
+    let placement_owner = runtime.root_shard().unwrap().primary_node_id;
+    loop {
         let current = read_accepted();
         assert_eq!(current.job_id, accepted.job_id);
         assert_eq!(current.file_system_id, accepted.file_system_id);
@@ -5580,7 +5590,9 @@ pub(super) fn native_committed_repair_backlog_with_nodes(
             !remaining.is_zero(),
             "the empty policy job exhausted its normal setup window"
         );
-        let tick = runtime.maintenance_tick(&owner, remaining).unwrap();
+        let tick = runtime
+            .maintenance_tick(&placement_owner, remaining)
+            .unwrap();
         assert!(
             tick.outcome.is_ok(),
             "normal empty Apply progress: {:?}",

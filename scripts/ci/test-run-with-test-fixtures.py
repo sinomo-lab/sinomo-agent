@@ -118,6 +118,38 @@ class FixtureLifecycle(unittest.TestCase):
             uses = fixtures.active_uses(self.root)
         self.assertTrue(any(row.get("container") == "fixture-container" for row in uses))
 
+    def test_removed_container_does_not_hide_another_retained_mount(self):
+        def output(command, **kwargs):
+            if command[:3] == ["docker", "ps", "-aq"]:
+                return "removed-container\nretained-container\n"
+            if command[-1] == "removed-container":
+                raise subprocess.CalledProcessError(
+                    1, command, stderr="Error: No such object: removed-container\n")
+            return json.dumps([{"Source": str(self.root), "Destination": "/data"}])
+        with patch.object(fixtures.shutil, "which", return_value="docker"), patch.object(
+                fixtures.subprocess, "check_output", side_effect=output):
+            uses = fixtures.active_uses(self.root)
+        self.assertTrue(any(row.get("container") == "retained-container" for row in uses))
+        self.assertFalse(any(row.get("container") == "removed-container" for row in uses))
+
+    def test_unavailable_container_inspection_preserves_original(self):
+        original_output = fixtures.subprocess.check_output
+        def output(command, **kwargs):
+            if command[:3] == ["docker", "ps", "-aq"]:
+                return "unknown-container\n"
+            if command[:2] == ["docker", "inspect"]:
+                raise subprocess.CalledProcessError(
+                    1, command, stderr="Cannot connect to the Docker daemon")
+            return original_output(command, **kwargs)
+        out = self.artifact_root / "docker-unavailable"
+        with patch.object(fixtures.shutil, "which", return_value="docker"), patch.object(
+                fixtures.subprocess, "check_output", side_effect=output):
+            self.assertEqual(fixtures.run([sys.executable, "-c", "pass"], out, self.root), 1)
+        receipt = json.loads((out / "result.json").read_text())
+        self.assertEqual(receipt["command_exit_code"], 0)
+        self.assertFalse(receipt["reclaimed"])
+        self.assertTrue(Path(receipt["temporary_root"]).is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

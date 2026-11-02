@@ -20,7 +20,25 @@ selected a different directory, not that state was deleted.
 
 ## Process Lifecycle
 
-`sinomo install` is a deliberate redeployment transaction. It first holds new
+`sinomo install` and graphical setup verify and reconcile the same installation.
+Fresh setup registers per-user startup and starts main and shadow by default;
+repeat setup preserves existing versions and omitted settings without restarting
+healthy daemons. Use `--add-to-path`/`--no-add-to-path`,
+`--startup`/`--no-startup`, `--menu-shortcut`/`--no-menu-shortcut`, and
+`--desktop-shortcut`/`--no-desktop-shortcut` to change integrations. It does not invoke the graphical installer
+or replace an evolved release by default. Explicit `sinomo install --repair`, or
+graphical **Repair binaries**, replaces the packaged runtime even when the daemon
+cannot start, retaining application data and settings. Downgrades are unsupported;
+repair does not migrate retained data or revert repaired binaries after a startup
+failure. See [installation](getting-started.md) for package requirements.
+`--no-start` stages registration or repair without launching
+new processes. The CLI and graphical uninstaller both stop the deployment and
+remove its recorded startup integration, retaining data unless deletion is
+explicitly requested.
+
+For legacy deployments outside the shared installer,
+`sinomo install --runtime-service` explicitly selects a redeployment transaction.
+It first holds new
 agent turns and waits up to five minutes for running turns to finish, failing
 rather than interrupting them. It may then stop both daemons, replace installed
 binaries, advance managed source from the invoking checkout, build and install
@@ -30,7 +48,7 @@ start. Verify the data directory, checkout and commit, desired binary, and
 expected outage first.
 
 For ordinary process recovery with an already installed known-good binary, use
-`sinomo daemon start` rather than redeploying with `install`.
+`sinomo daemon start` rather than redeploying with `install --runtime-service`.
 
 For direct control:
 

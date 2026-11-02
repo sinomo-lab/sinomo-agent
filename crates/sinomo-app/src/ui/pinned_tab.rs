@@ -14,12 +14,19 @@ impl PinnedTab {
         let selected = shared.clone();
         let activate = shared.clone();
         let theme = shared.clone();
+        let size = if cfg!(target_os = "android") {
+            44.0
+        } else if compact {
+            24.0
+        } else {
+            32.0
+        };
         let control = IconButton::from_image(
             super::shell::tab_icons()[destination.index()].handle(),
             destination.title(),
         )
         .description(format!("Pinned {} tab", destination.title()))
-        .size(if compact { 24.0 } else { 32.0 })
+        .size(size)
         .icon_size(18.0)
         .appearance(sui::ButtonAppearance::Ghost)
         .tone(sui::SemanticTone::Neutral)
@@ -28,7 +35,7 @@ impl PinnedTab {
         })
         .theme_when(move || {
             let mut theme = theme.theme();
-            theme.metrics.min_height = if compact { 24.0 } else { 32.0 };
+            theme.metrics.min_height = size;
             theme
         })
         .on_press_with_ctx(move |ctx| {

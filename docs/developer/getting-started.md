@@ -100,7 +100,79 @@ launching the installed desktop entry point instead.
 The stable launcher at `$SINOMO_DATA_DIR/bin/sinomo-app` (with `.exe` on Windows)
 and images inside its `rollout/desktop/releases` directory keep managed release
 selection, verification, workspace restoration, and update rollback. With no
-`SINOMO_DATA_DIR` override, that installation is `~/.sinomo`.
+`SINOMO_DATA_DIR` override or installer binding, the data directory defaults to
+`~/.sinomo`.
+
+### Desktop Installer Packages
+
+`scripts/ci/build-desktop-installer.py` builds the CLI, app, UI-extension host and
+setup helper together with `--locked`, stages a desktop manifest, and invokes
+`cargo-packager` pinned to `0.11.8`. Run on the target OS:
+
+```sh
+cargo install cargo-packager --version 0.11.8 --locked
+python scripts/ci/build-desktop-installer.py --target x86_64-unknown-linux-gnu
+```
+
+On Windows, use `--target x86_64-pc-windows-msvc` with MSVC/Windows SDK, Rustup,
+Python 3.11 or newer, CMake, LLVM and Git. The GitLab Windows job requires a
+provisioned shell runner tagged `windows` with a clean CI account. Packaging runs
+a silent install/uninstall smoke test that checks directory choices, CLI launch,
+live main/shadow RPC, startup registration, cross-uninstallation, PATH restoration,
+default data retention, explicit data deletion and `--no-start`. It refuses to
+touch an existing registered Sinomo installation.
+The Linux job uses the desktop build
+libraries declared in `.gitlab-ci.yml`, plus the AppImage packaging tools.
+`APPIMAGE_EXTRACT_AND_RUN=1` allows packaging tools to run without FUSE in CI.
+
+Packages and checksums are written under `dist/installers/<target>/`. The staging
+directory is under `CARGO_TARGET_DIR/installer-stage/<target>` and must be fresh
+for each run. `--skip-build` packages an existing target-specific build;
+`--profile dev` selects debug binaries for local packaging checks.
+`--test-root DIRECTORY` puts acceptance fixtures on another volume without
+relocating build outputs or losing their retained diagnostics. Release jobs
+produce unsigned initial installers; public Windows distribution should add
+Authenticode signing using protected release credentials.
+
+Windows packages use a custom NSIS template for directory selection and optional
+integration. The installed `sinomo-data-dir` file binds bootstrap binaries to the
+chosen absolute data path without changing a global environment variable. Invalid
+bindings fail explicitly. `SINOMO_DATA_DIR` and embedded process defaults retain
+precedence. Bootstrap app images bound to that data root participate in ordinary
+managed release selection.
+
+The Linux AppImage is a graphical installer, not the installed app itself. Setup
+retains the AppImage for the app and graphical uninstaller, with launch scripts
+that keep desktop libraries available for the app. The installed CLI is a
+standalone executable and its daemons run without the AppImage, FUSE or GUI
+libraries. Package builds compile the CLI separately from the desktop targets
+to prevent native media/GUI feature unification from changing that contract.
+The Linux installer registers an applications-menu uninstaller even when the app
+menu shortcut is disabled. Neither platform installs `cargo-packager-updater`.
+
+Initial installation and removal are owned by `sinomo-installer::initial_setup`.
+The graphical setup helper supplies native dialogs and AppImage transport; the
+CLI exposes directory and integration flags over the same receipt, binding,
+release-retention and removal logic. Both frontends use the same default service
+options and register/start main and shadow through `initial_setup::services`.
+Recognizable older CLI startup entries for the same data directory are adopted
+with their existing bind settings; explicit CLI bind options override that
+choice. Entries for other data directories are preserved.
+Startup names are scoped by canonical data directory so unrelated deployments
+cannot overwrite each other's entries. The receipt records exact unit/script
+contents and enablement links for ownership-checked removal. Uninstall stops
+recovery before main. `--no-start` stages registration without launching services.
+
+The minimal-container CI gate runs the standalone CLI in a slim image with no
+service manager, display or graphical helpers. It checks dynamic dependencies,
+rejects graphical dispatch, verifies live main/shadow RPC, and exercises enabled
+unit registration, removal, data retention and staging. A desktop application's
+dependency graph is not evidence that the separately built CLI is headless.
+
+The Linux payload archive preserves the original manifest-verified executables
+while `linuxdeploy` prepares loose copies to discover shared libraries. After
+packaging, the build runs the resulting image in extraction mode and verifies
+that archive without opening desktop dialogs or initializing a user installation.
 
 These packages are deliberately outside default members because they require a
 platform, runtime, or explicit benchmark choice:

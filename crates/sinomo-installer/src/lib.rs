@@ -1,4 +1,6 @@
 //! Local runtime installation, managed-source deployment, and boot-entry orchestration.
+pub mod bundle;
+pub mod initial_setup;
 
 use sinomo_api::daemon_status_matches_options;
 use sinomo_core::local::SinomoDataDir;
@@ -128,11 +130,25 @@ pub fn prepare_desktop_install(
     }
     let source = match bundle {
         Some(path) => path.to_path_buf(),
-        None => std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .ok_or("installer has no parent directory")?
-            .to_path_buf(),
+        None => {
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+            let directory = executable
+                .parent()
+                .ok_or("installer has no parent directory")?;
+            let active = sinomo_core::local::installed_data_dir(directory)
+                .map_err(|e| e.to_string())?
+                .map(|data| sinomo_rollout::desktop::DesktopReleases::new(&data))
+                .map(|releases| -> Result<Option<PathBuf>, String> {
+                    releases
+                        .status()?
+                        .active_release
+                        .map(|id| releases.release_dir(&id))
+                        .transpose()
+                })
+                .transpose()?
+                .flatten();
+            active.unwrap_or_else(|| directory.to_path_buf())
+        }
     };
     if !source
         .join(sinomo_api::app::update::APP_BUNDLE_MANIFEST)
@@ -154,8 +170,8 @@ pub fn install_desktop_bundle(
 ) -> Result<sinomo_api::app::update::AppUpdateStatus, String> {
     let releases = sinomo_rollout::desktop::DesktopReleases::new(&layout.data_dir);
     let status = releases.install_initial(source)?;
-    // Stable launch entries are bootstrap hosts. Running images (notably Windows executables)
-    // are never overwritten; subsequent releases execute out of immutable version directories.
+    // Initial setup seeds canonical execution entries. Rollout retains immutable
+    // artifacts for recovery and publishes selected GUI files back into this bin.
     for stem in sinomo_rollout::desktop::DESKTOP_BINARY_STEMS {
         let name = sinomo_rollout::executable_name(stem);
         let destination = layout.bin_dir.join(&name);
@@ -849,12 +865,32 @@ fn installed_daemon_command(
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(appdir) = env::var_os("APPDIR").map(PathBuf::from)
+        && !binary.starts_with(&appdir)
+    {
+        // A resident standalone daemon must not retain the installer's temporary mount.
+        command.env_remove("APPDIR").env_remove("APPIMAGE");
+        if let Some(libraries) = env::var_os("LD_LIBRARY_PATH") {
+            if let Some(libraries) = standalone_library_path(&libraries, &appdir) {
+                command.env("LD_LIBRARY_PATH", libraries);
+            } else {
+                command.env_remove("LD_LIBRARY_PATH");
+            }
+        }
+    }
     sinomo_daemon::prepare_background_command(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn standalone_library_path(value: &std::ffi::OsStr, appdir: &Path) -> Option<std::ffi::OsString> {
+    let paths = env::split_paths(value).filter(|path| !path.starts_with(appdir)).collect::<Vec<_>>();
+    if paths.is_empty() { None } else { env::join_paths(paths).ok() }
 }
 
 #[cfg(target_os = "linux")]
@@ -966,11 +1002,10 @@ fn probe_installed_daemon_start_status(
     timeout: Duration,
 ) -> Option<DaemonStatus> {
     match probe_daemon_status(paths, timeout) {
-        sinomo_daemon::DaemonProbeStatus::Running(status)
-        | sinomo_daemon::DaemonProbeStatus::Locked {
-            status: Some(status),
-        } => return Some(status),
-        sinomo_daemon::DaemonProbeStatus::Locked { status: None }
+        sinomo_daemon::DaemonProbeStatus::Running(status) => return Some(status),
+        // A live lock and saved status establish ownership, not readiness.
+        // Keep waiting until the matching process actually answers its RPC.
+        sinomo_daemon::DaemonProbeStatus::Locked { .. }
         | sinomo_daemon::DaemonProbeStatus::NotRunning => {}
     }
 
@@ -1059,6 +1094,41 @@ enum BootEntryChildProcessPolicy {
     PreserveDetachedChildren,
 }
 
+pub(crate) fn boot_script_bytes(content: &str) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        // Windows Script Host interprets BOM-less scripts using the system ANSI
+        // code page. UTF-16LE keeps user-selected paths independent of that page.
+        std::iter::once(0xfeffu16)
+            .chain(content.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(windows))]
+    content.as_bytes().to_vec()
+}
+
+pub(crate) fn read_boot_script(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    #[cfg(windows)]
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        if bytes.len() % 2 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated startup script",
+            ));
+        }
+        let units: Vec<_> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16(&units)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn write_boot_entry(
     path: &Path,
     data_dir: &Path,
@@ -1088,7 +1158,7 @@ fn write_boot_entry(
         child_process_policy,
         extra_env,
     );
-    fs::write(path, content).map_err(|source| DaemonError::Io {
+    fs::write(path, boot_script_bytes(&content)).map_err(|source| DaemonError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
     })
@@ -1187,13 +1257,14 @@ fn boot_entry_content(
         };
         let command_line = format!(
             "\"{}\" {} --host {}{}",
-            binary.display(),
+            windows_boot_path(binary),
             command,
             host,
             port
         );
         format!(
-            "' Generated by sinomo install.\r\nDim shell\r\nSet shell = CreateObject(\"WScript.Shell\")\r\nDim env\r\nSet env = shell.Environment(\"Process\")\r\nenv(\"SINOMO_DATA_DIR\") = \"{}\"\r\n{}shell.Run \"{}\", 0, False\r\n",
+            "' Generated by sinomo install.\r\nDim shell\r\nSet shell = CreateObject(\"WScript.Shell\")\r\nshell.CurrentDirectory = \"{}\"\r\nDim env\r\nSet env = shell.Environment(\"Process\")\r\nenv(\"SINOMO_DATA_DIR\") = \"{}\"\r\n{}shell.Run \"{}\", 0, False\r\n",
+            vbs_string_literal(&windows_boot_path(data_dir)),
             vbs_string_literal(&data_dir.display().to_string()),
             extra_env,
             vbs_string_literal(&command_line)
@@ -1207,7 +1278,7 @@ fn boot_entry_content(
         };
         let extra_env = extra_env
             .iter()
-            .map(|(key, value)| format!("Environment={key}={value}\n"))
+            .map(|(key, value)| format!("Environment={}\n", systemd_value(&format!("{key}={value}"), false)))
             .collect::<String>();
         let port = if port_fallback {
             String::new()
@@ -1215,15 +1286,29 @@ fn boot_entry_content(
             format!(" --port {port}")
         };
         format!(
-            "[Unit]\nDescription={description}\n\n[Service]\n{kill_mode}Environment=SINOMO_DATA_DIR={}\n{}ExecStart={} {} --host {}{}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
-            data_dir.display(),
+            "[Unit]\nDescription={description}\n\n[Service]\n{kill_mode}Environment={}\n{}ExecStart={} {} --host {}{}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            systemd_value(&format!("SINOMO_DATA_DIR={}", data_dir.display()), false),
             extra_env,
-            binary.display(),
+            systemd_value(&binary.to_string_lossy(), true),
             command,
-            host,
+            systemd_value(host, true),
             port
         )
     }
+}
+
+#[cfg(any(not(windows), test))]
+fn systemd_value(value: &str, command: bool) -> String {
+    let value = value.replace('\\', "\\\\").replace('"', "\\\"")
+        .replace('%', "%%").replace('\n', "\\n").replace('\r', "\\r");
+    format!("\"{}\"", if command { value.replace('$', "$$") } else { value })
+}
+
+#[cfg(windows)]
+fn windows_boot_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") { format!(r"\\{unc}") }
+    else { text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned() }
 }
 
 #[cfg(windows)]
@@ -1234,6 +1319,46 @@ fn vbs_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_start_requires_rpc_readiness_not_only_a_held_status_lock() {
+        use fs2::FileExt;
+        let root = sinomo_testdir::TestDir::new("installed-not-yet-rpc-ready");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = DaemonRunOptions {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            port_fallback: false,
+        };
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&paths.lock)
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        sinomo_api::write_daemon_status(
+            &paths,
+            &DaemonStatus::new(&options, &paths, None),
+        )
+        .unwrap();
+        let args = vec![
+            "daemon".into(),
+            "run".into(),
+            "--host".into(),
+            options.host,
+            "--port".into(),
+            options.port.to_string(),
+        ];
+        // The real socket accepts connections but deliberately serves no RPC.
+        // A published status and live lock cannot claim endpoint readiness.
+        assert!(
+            probe_installed_daemon_start_status(&paths, &args, Duration::from_millis(30)).is_none()
+        );
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1293,6 +1418,25 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_signin_scripts_preserve_unicode_independent_of_system_code_page() {
+        let root = sinomo_testdir::TestDir::new("unicode-signin-script");
+        let path = root.join("check.vbs");
+        let content = "WScript.Quit(AscW(\"é\") - 233)";
+        fs::write(&path, boot_script_bytes(content)).unwrap();
+        assert_eq!(read_boot_script(&path).unwrap(), content);
+        let status = install_child_command("cscript.exe")
+            .args(["//B", "//Nologo"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "Script Host did not read the Unicode path literal correctly: {status}"
+        );
+    }
+
     #[test]
     fn installed_default_ports_remain_automatic_in_process_and_boot_specs() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-install-auto-ports");
@@ -1315,8 +1459,8 @@ mod tests {
 
         write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354, true, true)
             .expect("write automatic-port boot entries");
-        let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
-        let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
+        let main = read_boot_script(&layout.main_boot_entry).expect("read main boot entry");
+        let shadow = read_boot_script(&layout.shadow_boot_entry).expect("read shadow boot entry");
         assert!(!main.contains("--port"), "{main}");
         assert!(!shadow.contains("--port"), "{shadow}");
         assert!(!shadow.contains(SHADOW_MAIN_PORT_ENV), "{shadow}");
@@ -1332,11 +1476,11 @@ mod tests {
         write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354, false, false)
             .expect("write boot entries");
 
-        let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
-        let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
-        assert!(main.contains("[Service]\nEnvironment=SINOMO_DATA_DIR="));
+        let main = read_boot_script(&layout.main_boot_entry).expect("read main boot entry");
+        let shadow = read_boot_script(&layout.shadow_boot_entry).expect("read shadow boot entry");
+        assert!(main.contains("[Service]\nEnvironment=\"SINOMO_DATA_DIR="));
         assert!(!main.contains("KillMode="));
-        assert!(shadow.contains("[Service]\nKillMode=process\nEnvironment=SINOMO_DATA_DIR="));
+        assert!(shadow.contains("[Service]\nKillMode=process\nEnvironment=\"SINOMO_DATA_DIR="));
         assert_eq!(shadow.matches("KillMode=process").count(), 1);
     }
 

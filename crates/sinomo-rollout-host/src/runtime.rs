@@ -745,6 +745,8 @@ fn install_pending_shadow_at_boot(
     paths: &SelfRolloutPaths,
     current: &Path,
 ) -> Result<Option<sinomo_rollout::PendingShadowRollout>, DaemonError> {
+    sinomo_core::local::ensure_deployment_enabled(paths.bin.parent().expect("data directory"))
+        .map_err(|detail| DaemonError::Parse { detail })?;
     let Some(mut finalize) = read_pending_shadow_rollout(paths)? else {
         return Ok(None);
     };
@@ -1885,6 +1887,8 @@ pub fn handle_daemon_rollout_native_dylib_module_request(
     request: ClusterRolloutNativeDylibModuleRequest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(data_dir)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     preflight_cluster_rollout_main_bind(
         paths,
         data_dir,
@@ -2062,6 +2066,8 @@ pub fn activate_daemon_rollout_binary_manifest(
     validate_rollout_upload_component("upload id", &manifest.upload_id)?;
     validate_rollout_upload_component("artifact id", &manifest.binary.artifact_id)?;
     let data_dir = daemon_data_dir(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(data_dir)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     preflight_cluster_rollout_main_bind(
         paths,
         data_dir,
@@ -2989,6 +2995,8 @@ fn finalize_pending_shadow_rollout(
     defer_on_error: bool,
 ) -> Result<String, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(data_dir)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let Some(finalize) = read_pending_shadow_rollout(&rollout_paths)? else {
         return Ok("no pending shadow rollout\n".to_string());
@@ -3186,6 +3194,8 @@ fn spawn_candidate_main_with_log_ownership(
 
 pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(data_dir)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let cleared = clear_rollout_status(&rollout_paths)?;
     if let Err(error) = sinomo_daemon::refresh_daemon_node_status_in_kv(paths) {
@@ -3460,6 +3470,10 @@ pub fn promote_shadow_main_rollout(
     shadow_host: &str,
     shadow_port: u16,
 ) -> Result<sinomo_daemon::DaemonRunOptions, DaemonError> {
+    sinomo_core::local::ensure_deployment_enabled(
+        rollout_paths.bin.parent().expect("data directory"),
+    )
+    .map_err(|detail| DaemonError::Parse { detail })?;
     let (desired_shadow_host, desired_shadow_port) = pending
         .activation
         .shadow_host
@@ -3482,6 +3496,10 @@ pub fn recover_failed_shadow_main_rollout(
     detail: &str,
     observation: Option<MainExitObservation>,
 ) -> Result<PathBuf, DaemonError> {
+    sinomo_core::local::ensure_deployment_enabled(
+        rollout_paths.bin.parent().expect("data directory"),
+    )
+    .map_err(|detail| DaemonError::Parse { detail })?;
     let diagnostics = write_rollout_main_failure_diagnostics(
         rollout_paths,
         &pending.activation,
@@ -3520,6 +3538,10 @@ pub fn start_shadow_main_if_needed(
     main_options: &sinomo_daemon::DaemonRunOptions,
     candidate_timeout: Duration,
 ) -> Result<ShadowMainStart, DaemonError> {
+    sinomo_core::local::ensure_deployment_enabled(
+        rollout_paths.bin.parent().expect("data directory"),
+    )
+    .map_err(|detail| DaemonError::Parse { detail })?;
     if let Some(activation) = read_rollout_main_activation(rollout_paths)? {
         let mut previous_main_binary = activation
             .previous_main_binary
@@ -3726,6 +3748,8 @@ pub fn handle_daemon_rollout_build_request(
     request: ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    sinomo_core::local::ensure_deployment_enabled(data_dir)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     preflight_cluster_rollout_main_bind(
         paths,
         data_dir,
@@ -5240,7 +5264,7 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("main binary name");
-        let recovery_backups = (1..=(sinomo_rollout::ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+        let recovery_backups = (1..=3)
             .map(|generation| {
                 let path = rollout_paths
                     .bin
@@ -5325,7 +5349,7 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("main binary name");
-        let recovery_backups = (1..=(sinomo_rollout::ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+        let recovery_backups = (1..=3)
             .map(|generation| {
                 let path = rollout_paths
                     .bin
@@ -5375,12 +5399,10 @@ mod tests {
             .expect("status");
         assert_eq!(status.status, "accepted");
         assert_eq!(status.phase.as_deref(), Some("shadow-finalized"));
-        assert!(!recovery_backups[0].exists());
-        assert!(!recovery_backups[1].exists());
-        for path in &recovery_backups[2..] {
+        for path in &recovery_backups {
             assert!(
-                path.exists(),
-                "accepted finalization must retain the newest bounded recovery set: {path:?}"
+                !path.exists(),
+                "finalized rollout must remove legacy backup: {path:?}"
             );
         }
     }
@@ -5816,6 +5838,7 @@ mod tests {
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),
             target_arch: Some(std::env::consts::ARCH.to_string()),
+            rust_target: None,
             hostname: None,
             executable: None,
             rollout: None,

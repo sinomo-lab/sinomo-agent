@@ -7,14 +7,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Number of finalized, uniquely named recovery binaries retained beside each
-/// installed binary, in addition to the canonical `.previous` rollback copy.
-///
-/// Four generations is deliberately conservative: it leaves several known-good
-/// recovery points while bounding the multi-gigabyte accumulation produced by
-/// repeated debug rollouts.
-pub const ROLLOUT_RECOVERY_BACKUP_RETENTION: usize = 4;
-
 pub fn stage_rollout_bytes(bytes: &[u8], destination: &Path) -> Result<(), RolloutError> {
     if bytes.is_empty() {
         return Err(RolloutError::InvalidArtifact {
@@ -163,7 +155,8 @@ pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<()
         detail: error.to_string(),
     })?;
     if destination.exists() {
-        let previous = rollout_new_previous_binary_path(destination);
+        let previous = rollout_previous_binary_path(destination);
+        remove_staged_file_if_present(&previous)?;
         fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
             path: format!("{} -> {}", destination.display(), previous.display()),
             detail: source.to_string(),
@@ -297,7 +290,8 @@ pub fn activate_staged_rollout_binary(
     if destination.exists() {
         match ensure_non_empty_rollout_artifact(destination) {
             Ok(()) => {
-                let destination_backup = rollout_new_previous_binary_path(destination);
+                let destination_backup = previous.clone();
+                remove_staged_file_if_present(&destination_backup)?;
                 fs::rename(destination, &destination_backup).map_err(|source| {
                     RolloutError::Io {
                         path: format!(
@@ -380,25 +374,14 @@ pub fn rollout_previous_binary_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!("{file_name}.previous"))
 }
 
-/// Prune old uniquely named recovery binaries after a rollout has finalized.
+/// Remove legacy numbered recovery binaries after a rollout has finalized.
 ///
-/// This deliberately recognizes only names emitted by
-/// [`rollout_new_previous_binary_path`]: `<binary>.previous.<pid>` or
+/// Recognizes the former generated names: `<binary>.previous.<pid>` or
 /// `<binary>.previous.<pid>-<unix-nanos>-<attempt>`. The installed binary, the
 /// canonical `.previous` rollback copy, staged candidates, `.failed` artifacts,
 /// manually named backups, symlinks, directories, and backups for sibling
 /// binaries are never candidates.
 pub fn prune_rollout_binary_recovery_backups(destination: &Path) -> Result<usize, RolloutError> {
-    prune_rollout_binary_recovery_backups_with_retention(
-        destination,
-        ROLLOUT_RECOVERY_BACKUP_RETENTION,
-    )
-}
-
-fn prune_rollout_binary_recovery_backups_with_retention(
-    destination: &Path,
-    retention: usize,
-) -> Result<usize, RolloutError> {
     let Some(parent) = destination.parent() else {
         return Ok(0);
     };
@@ -416,7 +399,7 @@ fn prune_rollout_binary_recovery_backups_with_retention(
             });
         }
     };
-    let mut backups = Vec::new();
+    let mut removed = 0usize;
     for entry in entries {
         let entry = entry.map_err(|source| RolloutError::Io {
             path: parent.display().to_string(),
@@ -435,16 +418,10 @@ fn prune_rollout_binary_recovery_backups_with_retention(
         let Some(suffix) = name.strip_prefix(&prefix) else {
             continue;
         };
-        let Some(generation) = rollout_recovery_backup_generation(suffix, &entry.path()) else {
+        if !is_numbered_recovery_backup(suffix) {
             continue;
-        };
-        backups.push((generation, name, entry.path()));
-    }
-
-    backups.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    let prune_count = backups.len().saturating_sub(retention);
-    let mut removed = 0usize;
-    for (_, _, path) in backups.into_iter().take(prune_count) {
+        }
+        let path = entry.path();
         fs::remove_file(&path).map_err(|source| RolloutError::Io {
             path: path.display().to_string(),
             detail: source.to_string(),
@@ -454,7 +431,7 @@ fn prune_rollout_binary_recovery_backups_with_retention(
     Ok(removed)
 }
 
-fn rollout_recovery_backup_generation(suffix: &str, path: &Path) -> Option<(u128, u16)> {
+fn is_numbered_recovery_backup(suffix: &str) -> bool {
     let parts = suffix.split('-').collect::<Vec<_>>();
     match parts.as_slice() {
         [pid, unix_nanos, attempt]
@@ -462,45 +439,11 @@ fn rollout_recovery_backup_generation(suffix: &str, path: &Path) -> Option<(u128
                 && attempt.parse::<u16>().is_ok()
                 && unix_nanos.parse::<u128>().is_ok() =>
         {
-            Some((
-                unix_nanos.parse::<u128>().ok()?,
-                attempt.parse::<u16>().ok()?,
-            ))
+            true
         }
-        [pid] if pid.parse::<u32>().is_ok() => fs::metadata(path)
-            .ok()?
-            .modified()
-            .ok()?
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map(|duration| (duration.as_nanos(), 0)),
-        _ => None,
+        [pid] => pid.parse::<u32>().is_ok(),
+        _ => false,
     }
-}
-
-fn rollout_new_previous_binary_path(destination: &Path) -> PathBuf {
-    let previous = rollout_previous_binary_path(destination);
-    if !previous.exists() {
-        return previous;
-    }
-    let file_name = previous
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sinomo.previous");
-    for attempt in 0..1024 {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let candidate = previous.with_file_name(format!(
-            "{file_name}.{}-{suffix}-{attempt}",
-            std::process::id()
-        ));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    previous.with_file_name(format!("{file_name}.{}", std::process::id()))
 }
 
 fn set_executable(_destination: &Path) -> Result<(), RolloutError> {
@@ -558,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn install_binary_atomically_preserves_existing_previous_backup() {
+    fn install_binary_atomically_replaces_existing_previous_backup() {
         let root = sinomo_testdir::TestDir::new("sinomo-rollout-existing-install-backup");
         let source = root.join("candidate");
         let destination = root.join("sinomo");
@@ -573,10 +516,7 @@ mod tests {
             fs::read(&destination).expect("destination bytes"),
             b"candidate"
         );
-        assert_eq!(
-            fs::read(&previous).expect("previous bytes"),
-            b"older-previous"
-        );
+        assert_eq!(fs::read(&previous).expect("previous bytes"), b"current");
         let backups = fs::read_dir(root.path())
             .expect("root entries")
             .filter_map(Result::ok)
@@ -587,11 +527,7 @@ mod tests {
                     .is_some_and(|name| name.starts_with("sinomo.previous."))
             })
             .collect::<Vec<_>>();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(
-            fs::read(&backups[0]).expect("fresh backup bytes"),
-            b"current"
-        );
+        assert!(backups.is_empty());
     }
 
     #[test]
@@ -726,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_staged_rollout_binary_uses_unique_backup_when_previous_exists() {
+    fn activate_staged_rollout_binary_replaces_the_single_previous_slot() {
         let root = sinomo_testdir::TestDir::new("sinomo-rollout-existing-previous");
         let staged = root.join("staged").join("sinomo");
         let destination = root.join("bin").join("sinomo");
@@ -741,16 +677,59 @@ mod tests {
             activate_staged_rollout_binary(&staged, &destination).expect("activate staged");
         let backup = backup.expect("fresh backup");
 
-        assert_ne!(backup, previous);
+        assert_eq!(backup, previous);
         assert_eq!(
             fs::read(&destination).expect("destination bytes"),
             b"candidate"
         );
-        assert_eq!(
-            fs::read(&previous).expect("previous bytes"),
-            b"older-previous"
-        );
+        assert_eq!(fs::read(&previous).expect("previous bytes"), b"current");
         assert_eq!(fs::read(&backup).expect("backup bytes"), b"current");
+    }
+
+    #[test]
+    fn repeated_binary_and_module_replacements_keep_one_previous_version() {
+        let root = sinomo_testdir::TestDir::new("single-previous-rollout-slot");
+        for name in ["sinomo.exe", "sinomo-shadow.exe", "module.dll", "module.so"] {
+            for staged in [false, true] {
+                let directory = root.join(format!("{name}-{staged}"));
+                fs::create_dir_all(&directory).unwrap();
+                let destination = directory.join(name);
+                let candidate = directory.join("candidate");
+                let previous = rollout_previous_binary_path(&destination);
+                fs::write(&destination, b"version one").unwrap();
+                for (old, new) in [
+                    (b"version one", b"version two"),
+                    (b"version two", b"version tri"),
+                ] {
+                    fs::write(&candidate, new).unwrap();
+                    if staged {
+                        assert_eq!(
+                            activate_staged_rollout_binary(&candidate, &destination).unwrap(),
+                            Some(previous.clone())
+                        );
+                    } else {
+                        install_binary_atomically(&candidate, &destination).unwrap();
+                    }
+                    assert_eq!(fs::read(&destination).unwrap(), new);
+                    assert_eq!(fs::read(&previous).unwrap(), old);
+                    let prefix = format!("{name}.previous");
+                    assert_eq!(
+                        fs::read_dir(&directory)
+                            .unwrap()
+                            .filter(|entry| entry
+                                .as_ref()
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(&prefix))
+                            .count(),
+                        1
+                    );
+                }
+                restore_rollout_binary_from_backup(&previous, &destination).unwrap();
+                assert_eq!(fs::read(destination).unwrap(), b"version two");
+            }
+        }
     }
 
     #[test]
@@ -776,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_recovery_backup_pruning_is_bounded_and_preserves_special_files() {
+    fn finalized_recovery_backup_pruning_removes_all_legacy_generations() {
         let root = sinomo_testdir::TestDir::new("sinomo-rollout-prune-recovery-backups");
         let destination = root.join("sinomo");
         let previous = rollout_previous_binary_path(&destination);
@@ -793,7 +772,7 @@ mod tests {
         fs::write(&malformed, b"unowned backup").expect("unowned backup");
         fs::write(&sibling, b"sibling backup").expect("sibling backup");
 
-        let generations = (1..=(ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+        let generations = (1..=6)
             .map(|generation| {
                 let path = root.join(format!("sinomo.previous.7-{}-0", generation * 100));
                 fs::write(&path, format!("generation-{generation}")).expect("recovery backup");
@@ -806,14 +785,9 @@ mod tests {
         let removed =
             prune_rollout_binary_recovery_backups(&destination).expect("prune recovery backups");
 
-        assert_eq!(removed, 2);
-        assert!(!generations[0].exists());
-        assert!(!generations[1].exists());
-        for path in &generations[2..] {
-            assert!(
-                path.exists(),
-                "newest recovery backup must remain: {path:?}"
-            );
+        assert_eq!(removed, generations.len());
+        for path in &generations {
+            assert!(!path.exists(), "legacy backup must be removed: {path:?}");
         }
         for path in [
             &destination,
@@ -845,8 +819,8 @@ mod tests {
         fs::write(&external, b"external").expect("external target");
         symlink(&external, &matching_symlink).expect("matching symlink");
 
-        let removed = prune_rollout_binary_recovery_backups_with_retention(&destination, 0)
-            .expect("prune recovery backups");
+        let removed =
+            prune_rollout_binary_recovery_backups(&destination).expect("prune recovery backups");
 
         assert_eq!(removed, 0);
         assert!(matching_symlink.symlink_metadata().is_ok());

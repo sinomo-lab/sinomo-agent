@@ -55,12 +55,12 @@ for target in "${targets[@]}"; do
   esac
 
   echo "Building sinomo for ${target}"
-  packages=(-p sinomo)
   if [[ "${release_profile}" == desktop ]]; then
-    packages+=(-p sinomo-app -p sinomo-ui-extension-host)
+    # Compile presentation separately so the CLI does not inherit native GUI/media features.
+    cargo build --locked --release -p sinomo-app -p sinomo-ui-extension-host --target "${target}"
     archive_name="${archive_name/sinomo-/sinomo-desktop-}"
   fi
-  cargo build --locked --release "${packages[@]}" --target "${target}"
+  cargo build --locked --release -p sinomo --target "${target}"
 
   binary_path="${target_dir}/${target}/release/${binary_name}"
   if [[ ! -f "${binary_path}" ]]; then

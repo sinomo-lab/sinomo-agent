@@ -110,6 +110,240 @@ fn a_scripted_chat_turn_runs_and_its_context_survives_a_daemon_restart() {
         .assert_finished();
 }
 
+#[test]
+fn idle_chat_views_survive_dormancy_and_resume_with_their_context() {
+    let root = sinomo_testdir::TestDir::new("sinomo-scripted-dormancy");
+    let data_dir = SinomoDataDir::new(root.path().to_path_buf());
+    data_dir.ensure_root_layout().unwrap();
+    let script = root.join("scripts/dormancy.json");
+    ModelScript::new()
+        .expect(ScriptedExpectation::last_user_contains("Bluefin"))
+        .reply(answer("Remembered Bluefin."))
+        .expect(ScriptedExpectation::last_user_contains("Which codename"))
+        .expect(ScriptedExpectation::contains("Bluefin"))
+        .reply(answer("The codename is Bluefin."))
+        .save(&script)
+        .unwrap();
+    let port = available_loopback_port();
+    initialize_cluster(&data_dir, port);
+    let daemon = Daemon::start(&data_dir, port, "dormancy", &script);
+    run_cli(
+        &data_dir,
+        &[
+            "models",
+            "default",
+            "--provider",
+            "scripted",
+            "--model",
+            "scripted",
+        ],
+    );
+    daemon.wait_for_agent_catalog();
+    let first = daemon.chat("dormant-first");
+    let (session_id, _) = first.ready();
+    let second = daemon.resume("dormant-second", &session_id);
+    assert!(
+        assistant_text(&first.send(&session_id, "Remember the codename Bluefin."))
+            .contains("Bluefin")
+    );
+    first.poll_until(|event| matches!(event, ChatEvent::ControlState(state) if state.session_id == session_id && !state.runtime_attached));
+    let revision = owner_revision(&daemon.address, &session_id);
+    first.command(ChatSessionCommand::ControlState {
+        session_id: session_id.clone(),
+    });
+    first.poll_until(
+        |event| matches!(event, ChatEvent::ControlState(state) if !state.runtime_attached),
+    );
+    second.command(ChatSessionCommand::ControlState {
+        session_id: session_id.clone(),
+    });
+    second.poll_until(
+        |event| matches!(event, ChatEvent::ControlState(state) if !state.runtime_attached),
+    );
+    std::thread::sleep(Duration::from_secs(12));
+    assert_eq!(
+        owner_revision(&daemon.address, &session_id),
+        revision,
+        "passive views renewed execution ownership"
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+    let mut callers = Vec::new();
+    for _ in 0..16 {
+        let client = second.client.clone();
+        let command = ChatSessionCommand::Send {
+            session_id: session_id.clone(),
+            text: "Which codename did I give you?".into(),
+            attachments: vec![],
+        };
+        let barrier = barrier.clone();
+        callers.push(std::thread::spawn(move || {
+            barrier.wait();
+            client.command_with_id(command, Some("same-dormant-wake".into()))
+        }));
+    }
+    barrier.wait();
+    for caller in callers {
+        assert!(caller.join().unwrap().unwrap().accepted);
+    }
+    let events = second.poll_until(
+        |event| matches!(event, ChatEvent::TurnDone { session_id: id } if id == &session_id),
+    );
+    assert!(assistant_text(&events).contains("Bluefin"));
+    first.poll_until(|event| matches!(event, ChatEvent::UserMessage { session_id: id, text } if id == &session_id && text.contains("Which codename")));
+    assert!(owner_revision(&daemon.address, &session_id) > revision);
+    drop(daemon);
+    ScriptedReport::load(&script.with_extension("report.json"))
+        .unwrap()
+        .assert_finished();
+}
+
+#[test]
+fn immediate_cancel_stops_an_admitted_send_before_or_during_model_start() {
+    let root = sinomo_testdir::TestDir::new("sinomo-scripted-immediate-cancel");
+    let data_dir = SinomoDataDir::new(root.path().to_path_buf());
+    data_dir.ensure_root_layout().unwrap();
+    let script = root.join("scripts/immediate-cancel.json");
+    ModelScript::new()
+        .reply(ScriptedReply::await_cancellation())
+        .reply(ScriptedReply::await_cancellation())
+        .reply(ScriptedReply::await_cancellation())
+        .save(&script)
+        .unwrap();
+    let port = available_loopback_port();
+    initialize_cluster(&data_dir, port);
+    let daemon = Daemon::start(&data_dir, port, "immediate-cancel", &script);
+    run_cli(
+        &data_dir,
+        &[
+            "models",
+            "default",
+            "--provider",
+            "scripted",
+            "--model",
+            "scripted",
+        ],
+    );
+    daemon.wait_for_agent_catalog();
+    let chat = daemon.chat("immediate-cancel");
+    let (initial_session_id, _) = chat.ready();
+    let history = sinomo_client::ChatHistoryClient::at_address(daemon.address.clone());
+    assert!(
+        history
+            .list()
+            .expect("list untouched drafts")
+            .iter()
+            .all(|entry| entry.id != initial_session_id),
+        "opening a default draft must not publish an empty conversation"
+    );
+    let session_id = sinomo_runtime::events::SessionId::generate().to_string();
+    chat.command(ChatSessionCommand::NewSession {
+        session_id: session_id.clone(),
+    });
+    chat.poll_until(
+        |event| matches!(event, ChatEvent::SessionReset { session_id: id } if id == &session_id),
+    );
+    assert!(
+        history
+            .list()
+            .expect("list new draft")
+            .iter()
+            .all(|entry| entry.id != session_id),
+        "switching to a new default draft must not publish an empty conversation"
+    );
+    for _ in 0..3 {
+        chat.command(ChatSessionCommand::Send {
+            session_id: session_id.clone(),
+            text: "Wait until cancelled".into(),
+            attachments: vec![],
+        });
+        let stopped = Instant::now();
+        chat.command(ChatSessionCommand::Cancel {
+            session_id: session_id.clone(),
+            reason: "stop immediately after admission".into(),
+        });
+        chat.poll_until(|event| matches!(event, ChatEvent::TurnDone { session_id: done } if done == &session_id));
+        assert!(
+            stopped.elapsed() < Duration::from_secs(3),
+            "queued cancellation did not finish promptly"
+        );
+    }
+}
+
+#[test]
+fn a_live_model_turn_keeps_its_lease_and_can_be_cancelled() {
+    let root = sinomo_testdir::TestDir::new("sinomo-scripted-owned-active-turn");
+    let data_dir = SinomoDataDir::new(root.path().to_path_buf());
+    data_dir.ensure_root_layout().unwrap();
+    let script = root.join("scripts/active.json");
+    ModelScript::new()
+        .reply(ScriptedReply::await_cancellation())
+        .save(&script)
+        .unwrap();
+    let port = available_loopback_port();
+    initialize_cluster(&data_dir, port);
+    let daemon = Daemon::start(&data_dir, port, "active-turn", &script);
+    run_cli(
+        &data_dir,
+        &[
+            "models",
+            "default",
+            "--provider",
+            "scripted",
+            "--model",
+            "scripted",
+        ],
+    );
+    daemon.wait_for_agent_catalog();
+    let chat = daemon.chat("active-turn");
+    let (session_id, _) = chat.ready();
+    chat.command(ChatSessionCommand::Send {
+        session_id: session_id.clone(),
+        text: "Wait until cancelled.".into(),
+        attachments: vec![],
+    });
+    wait_for_requests(&script, 1);
+    let before = owner_revision(&daemon.address, &session_id);
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        owner_revision(&daemon.address, &session_id) > before,
+        "active work lost ownership renewal"
+    );
+    let cancelled = Instant::now();
+    chat.command(ChatSessionCommand::Cancel {
+        session_id: session_id.clone(),
+        reason: "native dormancy control".into(),
+    });
+    chat.poll_until(
+        |event| matches!(event, ChatEvent::TurnDone { session_id: id } if id == &session_id),
+    );
+    assert!(cancelled.elapsed() < Duration::from_secs(3));
+    drop(daemon);
+    ScriptedReport::load(&script.with_extension("report.json"))
+        .unwrap()
+        .assert_finished();
+}
+
+fn owner_revision(address: &str, chat: &str) -> u64 {
+    let payload = sinomo_runtime::kv::cluster_kv_local_entry_rpc_payload(&format!(
+        "/agent/chat-hosts/{chat}"
+    ))
+    .unwrap();
+    let request = sinomo_runtime::network::ObjectRpcRequest::from_encoded_body(
+        payload.route,
+        payload.category,
+        payload.body,
+    );
+    let response = DaemonApiClient::at_address(address)
+        .call_request(&request)
+        .unwrap();
+    sinomo_runtime::kv::decode_cluster_kv_local_entry_rpc_body(&response.body)
+        .unwrap()
+        .value
+        .unwrap()
+        .modify_revision
+        .0
+}
+
 /// Exploratory: what the user and the model see after the daemon dies while
 /// a model request is in flight.
 #[test]
@@ -416,8 +650,16 @@ impl Daemon {
         }
     }
 
-    /// Opens a chat and waits until it is ready.
+    /// Explicitly selects the test model before waiting for an execution runtime.
     fn chat(&self, client_id: &str) -> Chat {
+        self.open_chat(client_id, None)
+    }
+
+    fn resume(&self, client_id: &str, session_id: &str) -> Chat {
+        self.open_chat(client_id, Some(session_id))
+    }
+
+    fn open_chat(&self, client_id: &str, session_id: Option<&str>) -> Chat {
         let client = sinomo_client::ChatDaemonClient::at_address(
             self.address.clone(),
             format!("{client_id}-{}", std::process::id()),
@@ -429,6 +671,23 @@ impl Daemon {
             next_sequence: std::cell::Cell::new(opened.next_event_sequence),
             ready: None,
         };
+        if let Some(session_id) = session_id {
+            chat.command(ChatSessionCommand::Resume {
+                session_id: session_id.into(),
+                history: self.history(session_id),
+            });
+        }
+        // Fresh scripted controls explicitly select a model. Resume only
+        // attaches the view; component recovery owns unfinished continuations.
+        if session_id.is_none() {
+            chat.command(ChatSessionCommand::SetModel {
+                provider: "scripted".into(),
+                model: "scripted".into(),
+                account: "default".into(),
+            });
+        } else {
+            return chat;
+        }
         let mut ready = None;
         chat.poll_until(|event| {
             if let ChatEvent::Ready { session_id, info } = event {
@@ -439,22 +698,6 @@ impl Daemon {
             }
         });
         chat.ready = ready;
-        chat
-    }
-
-    /// Opens a chat and resumes `session_id` with its stored history, as the
-    /// app does after a restart.
-    fn resume(&self, client_id: &str, session_id: &str) -> Chat {
-        let chat = self.chat(client_id);
-        chat.command(ChatSessionCommand::Resume {
-            session_id: session_id.to_string(),
-            history: self.history(session_id),
-        });
-        // Sent once the session is restored and attached.
-        chat.poll_until(|event| {
-            matches!(event, ChatEvent::ToolRuntime(selection)
-                if selection.workspace_session_id.as_deref() == Some(session_id))
-        });
         chat
     }
 

@@ -1729,6 +1729,8 @@ pub struct ChatState {
     pub info: RuntimeInfo,
     pub tool_runtime: ChatToolRuntimeSelection,
     workspace_path_input: String,
+    #[cfg(target_os = "android")]
+    workspace_folder_input: String,
     workspace_error: Option<String>,
     workspace_picker_generation: u64,
     workspace_picker: NativePickerLane,
@@ -2089,13 +2091,11 @@ struct ChatModelSelectorStructure {
 struct ChatAttachmentStructure {
     theme: (AppThemeMode, AppTextScale),
     attachments: Vec<(String, u64)>,
-    path_empty: bool,
     manual_path_open: bool,
     operation_pending: bool,
     picker_pending: bool,
     pending_validations: usize,
     drop_hovered: bool,
-    picker_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2161,13 +2161,11 @@ impl ChatStructureSnapshot {
         ChatAttachmentStructure {
             theme: self.theme,
             attachments: self.attachments.clone(),
-            path_empty: self.attachment_path_empty,
             manual_path_open: self.attachment_manual_path_open,
             operation_pending: self.attachment_operation_pending,
             picker_pending: self.attachment_picker_pending,
             pending_validations: self.pending_attachment_validations,
             drop_hovered: self.attachment_drop_hovered,
-            picker_error: self.attachment_picker_error.clone(),
         }
     }
 
@@ -2568,6 +2566,7 @@ impl ChatState {
         let agent_catalog_transport_error: Option<String> = None;
         let event_wake = chat_event_wake(waker.as_ref());
         let handle = ChatHandle::spawn_restored(
+            backend.app_runtime.clone(),
             daemon_address.clone(),
             event_wake,
             restored
@@ -2632,6 +2631,8 @@ impl ChatState {
             info: RuntimeInfo::default(),
             tool_runtime: ChatToolRuntimeSelection::default(),
             workspace_path_input: String::new(),
+            #[cfg(target_os = "android")]
+            workspace_folder_input: String::new(),
             workspace_error: None,
             workspace_picker_generation: 0,
             workspace_picker: NativePickerLane::new(),
@@ -2763,6 +2764,7 @@ impl ChatState {
 
         let event_wake = chat_event_wake(self.ui_waker.as_ref());
         let handle = ChatHandle::spawn_restored(
+            backend.app_runtime.clone(),
             daemon_address.clone(),
             event_wake,
             self.handle.connection_snapshot(),
@@ -3055,6 +3057,7 @@ impl ChatState {
     pub(crate) fn reconnect_after_update_failure(&mut self) {
         let event_wake = chat_event_wake(self.ui_waker.as_ref());
         self.handle = ChatHandle::spawn_restored(
+            self.handle.runtime(),
             self.daemon_address.clone(),
             event_wake,
             self.handle.connection_snapshot(),
@@ -4160,6 +4163,8 @@ impl ChatState {
         self.tool_runtime.workspace_session_id = None;
         self.tool_runtime.workspace_root = None;
         self.workspace_path_input.clear();
+        #[cfg(target_os = "android")]
+        self.workspace_folder_input.clear();
         self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
         self.attachment_manual_path_open = false;
@@ -6876,6 +6881,18 @@ impl ChatState {
                 self.workspace_error = Some(error);
             }
         }
+    }
+
+    #[cfg(target_os = "android")]
+    fn add_workspace_folder_path(&mut self) {
+        let path = PathBuf::from(self.workspace_folder_input.trim());
+        if !path.is_absolute() {
+            self.workspace_error = Some("Enter an absolute device folder path.".into());
+            return;
+        }
+        // The daemon validates the directory and owns the conversation grant;
+        // entering a path does not grant Android storage permissions.
+        self.update_workspaces(ChatWorkspaceChange::AddFolder { path });
     }
 
     fn clear_workspace(&mut self) {
@@ -11379,7 +11396,25 @@ fn session_edit_details(
 }
 
 fn session_meta_label(session: &SessionRef) -> String {
-    let updated = session_updated_label(session.updated_unix);
+    let updated = if is_untitled_chat(session) {
+        time::OffsetDateTime::from_unix_timestamp(session.updated_unix)
+            .ok()
+            .filter(|_| session.updated_unix > 0)
+            .map(|at| {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                    at.year(),
+                    at.month() as u8,
+                    at.day(),
+                    at.hour(),
+                    at.minute(),
+                    at.second()
+                )
+            })
+            .unwrap_or_else(|| session_updated_label(session.updated_unix))
+    } else {
+        session_updated_label(session.updated_unix)
+    };
     match session.kind {
         ConversationKind::Chat => updated,
         ConversationKind::Channel => {
@@ -11392,6 +11427,22 @@ fn session_meta_label(session: &SessionRef) -> String {
                 format!("{} · {updated}", plural_agents(session.participant_count))
             }
         }
+    }
+}
+
+fn is_untitled_chat(session: &SessionRef) -> bool {
+    session.kind == ConversationKind::Chat && session.title.trim().eq_ignore_ascii_case("new chat")
+}
+
+fn session_row_title(session: &SessionRef) -> String {
+    if is_untitled_chat(session) && !session.participant_names.is_empty() {
+        format!(
+            "{} · {}",
+            session.title,
+            session.participant_names.join(", ")
+        )
+    } else {
+        session.title.clone()
     }
 }
 
@@ -11422,7 +11473,9 @@ fn session_matches_filter(session: &SessionRef, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
-    session.title.to_ascii_lowercase().contains(filter)
+    session_row_title(session)
+        .to_ascii_lowercase()
+        .contains(filter)
         || session_meta_label(session)
             .to_ascii_lowercase()
             .contains(filter)
@@ -12177,6 +12230,7 @@ fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Wi
     let s = shared.clone();
 
     SegmentedControl::new("Conversation kind")
+        .text_overflow(sui::TextOverflow::Ellipsis)
         .items(items)
         .selected(selected)
         .theme_when(clone_reader(reader))
@@ -12222,7 +12276,7 @@ fn session_row_content(
     let labels = Flex::vertical()
         .align_items(Alignment::Start)
         .with_child(
-            Label::new(session.title.clone())
+            Label::new(session_row_title(&session))
                 .single_line(true)
                 .text_style(title_style),
         )
@@ -12495,6 +12549,7 @@ fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> WidgetP
     let save = {
         let s = shared.clone();
         sui::Button::new(if rename_pending { "Saving…" } else { "Save" })
+            .focus_on_press(!cfg!(target_os = "android"))
             .appearance(sui::ButtonAppearance::Filled)
             .tone(SemanticTone::Accent)
             .min_width(64.0)
@@ -13217,9 +13272,9 @@ enum ChatOverlayKey {
         session_id: String,
         theme: (AppThemeMode, AppTextScale),
     },
-    /// The compact drawer still follows the complete chat structure because its body is not a
-    /// separately retained rebuild boundary.
-    CompactDrawer(ChatStructureKey),
+    /// The sidebar and its keyed rows observe their own content. Retain the
+    /// drawer frame while filtering so its editor keeps focus and IME state.
+    CompactDrawer((AppThemeMode, AppTextScale)),
 }
 
 impl ChatOverlayKey {
@@ -13233,7 +13288,7 @@ impl ChatOverlayKey {
                 theme: snapshot.theme,
             }
         } else if snapshot.compact_drawer_open {
-            Self::CompactDrawer(structure.clone())
+            Self::CompactDrawer(snapshot.theme)
         } else {
             Self::Hidden
         }
@@ -15386,9 +15441,21 @@ impl TranscriptView {
         style
     }
 
-    fn code_block_height(code: &ChatCodeBlock) -> f32 {
+    fn tool_header_height(theme: &DefaultTheme, subtitle: bool) -> f32 {
+        sui::ActionTileGeometry::height(theme, subtitle).max(if subtitle { 50.0 } else { 42.0 })
+    }
+
+    fn narrative_header_height(theme: &DefaultTheme) -> f32 {
+        15.0 + theme.text.xs.line_height
+    }
+
+    fn detail_header_height(theme: &DefaultTheme) -> f32 {
+        6.0 + theme.text.xs.line_height.max(16.0)
+    }
+
+    fn code_block_height(code: &ChatCodeBlock, theme: &DefaultTheme) -> f32 {
         let line_count = code.text.lines().count().max(1) as f32;
-        30.0 + line_count * 17.0 + 12.0
+        42.0 + line_count * theme.text.sm.line_height
     }
 
     /// Trace rows to draw before each message, indexed like `chat.messages`.
@@ -15457,7 +15524,7 @@ impl TranscriptView {
                 includes_reasoning,
                 latest,
                 bubble_w,
-                bubble_h: 64.0,
+                bubble_h: Self::tool_header_height(theme, true).max(64.0),
             }];
         }
 
@@ -15465,7 +15532,7 @@ impl TranscriptView {
             call_count: event_count,
             includes_reasoning,
             bubble_w,
-            bubble_h: 42.0,
+            bubble_h: Self::tool_header_height(theme, false),
         }];
         for entry in &trace.entries {
             items.push(match entry {
@@ -15513,7 +15580,9 @@ impl TranscriptView {
             label,
             text,
             bubble_w,
-            bubble_h: 34.0 + lines.len().max(1) as f32 * style.line_height + 14.0,
+            bubble_h: Self::narrative_header_height(theme)
+                + lines.len().max(1) as f32 * style.line_height
+                + 14.0,
         }
     }
 
@@ -15545,7 +15614,7 @@ impl TranscriptView {
             input_block,
             output_block,
             bubble_w,
-            bubble_h: 50.0
+            bubble_h: Self::tool_header_height(theme, true)
                 + detail_h
                 + if chat.tool_detail_expanded(&tool_detail_key(
                     trace_key,
@@ -15673,7 +15742,7 @@ impl TranscriptView {
             ..code.clone()
         });
         let content_h = if let Some(code) = &visible_code {
-            Self::code_block_height(code)
+            Self::code_block_height(code, theme)
         } else {
             let style = Self::transcript_muted_text_style(pal, theme, pal.text);
             let measure_style = style.clone();
@@ -15693,7 +15762,7 @@ impl TranscriptView {
             } else {
                 None
             },
-            height: 22.0 + content_h + button_h + 8.0,
+            height: Self::detail_header_height(theme) + content_h + button_h + 8.0,
         }
     }
 
@@ -15891,9 +15960,9 @@ impl TranscriptView {
                 let bx = area.x() + PAD;
                 let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
                 let title = if *includes_reasoning {
-                    format!("Reasoning and activity · {call_count} events")
+                    format!("Activity · {call_count}")
                 } else {
-                    format!("Tool activity · {call_count} calls")
+                    format!("Tools · {call_count}")
                 };
                 let subtitle = compact_line(latest, 72);
                 paint_action_tile(
@@ -15921,9 +15990,9 @@ impl TranscriptView {
                 let bx = area.x() + PAD;
                 let bubble = Rect::new(bx, y, *bubble_w, *bubble_h);
                 let title = if *includes_reasoning {
-                    format!("Reasoning and activity · {call_count} events")
+                    format!("Activity · {call_count}")
                 } else {
-                    format!("Tool activity · {call_count} calls")
+                    format!("Tools · {call_count}")
                 };
                 paint_action_tile(
                     ctx,
@@ -15951,7 +16020,7 @@ impl TranscriptView {
                         bubble.x() + 12.0,
                         bubble.y() + 9.0,
                         bubble.width() - 24.0,
-                        18.0,
+                        theme.text.xs.line_height,
                     ),
                     label,
                     "",
@@ -15962,9 +16031,9 @@ impl TranscriptView {
                     theme,
                     Rect::new(
                         bubble.x() + 12.0,
-                        bubble.y() + 31.0,
+                        bubble.y() + Self::narrative_header_height(theme),
                         bubble.width() - 24.0,
-                        bubble.height() - 39.0,
+                        bubble.height() - Self::narrative_header_height(theme) - 8.0,
                     ),
                     text,
                     TextBlockPaint::new()
@@ -15995,7 +16064,7 @@ impl TranscriptView {
                         .leading_tone_dot(activity_tone_semantic(tool_status_tone(&call.status)))
                         .leading_width(18.0),
                 );
-                let mut ty = y + 50.0;
+                let mut ty = y + Self::tool_header_height(theme, true);
                 let dark = widgets::theme_is_dark(&self.shared);
                 if let Some(input) = input_block {
                     Self::paint_tool_detail(
@@ -16025,6 +16094,7 @@ impl TranscriptView {
     fn tool_card_paint(pal: &Palette) -> ActionTilePaint {
         // Mesh tool-call card: quiet surface, hairline border, r-2 corners.
         ActionTilePaint::neutral()
+            .text_overflow(sui::TextOverflow::Ellipsis)
             .background(pal.panel)
             .border(pal.border)
             .title_color(pal.text)
@@ -16048,14 +16118,24 @@ impl TranscriptView {
         paint_section_label_detail(
             ctx,
             theme,
-            Rect::new(rect.x(), rect.y() + 2.0, rect.width(), 16.0),
+            Rect::new(
+                rect.x(),
+                rect.y() + 2.0,
+                rect.width(),
+                theme.text.xs.line_height.max(16.0),
+            ),
             section_label,
             &detail.title,
             sui::SectionLabelPaint::new().color(pal.text_faint),
         );
-        let y = rect.y() + 22.0;
+        let y = rect.y() + Self::detail_header_height(theme);
         if let Some(code) = &detail.code {
-            let code_rect = Rect::new(rect.x(), y, rect.width(), Self::code_block_height(code));
+            let code_rect = Rect::new(
+                rect.x(),
+                y,
+                rect.width(),
+                Self::code_block_height(code, theme),
+            );
             Self::paint_code_block(ctx, pal, theme, code_rect, code, dark);
         } else if let Some(text) = detail.text.as_deref() {
             let bottom_reserve = if detail.collapsible { 34.0 } else { 8.0 };
@@ -16609,7 +16689,7 @@ impl TranscriptControls {
                         ..
                     } => {
                         let bx = area.x() + PAD;
-                        let mut ty = y + 50.0;
+                        let mut ty = y + TranscriptView::tool_header_height(&theme, true);
                         for detail in [input_block.as_ref(), output_block.as_ref()]
                             .into_iter()
                             .flatten()
@@ -17663,7 +17743,7 @@ fn attachment_drawer_chip(
     .tone(SemanticTone::Neutral)
 }
 
-fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+fn attachment_controls(shared: &Shared, reader: &ThemeReader, scroll: &ScrollState) -> WidgetPod {
     let mut chips = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(6.0)
@@ -17794,6 +17874,7 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 .icon(IconGlyph::Add)
                 .min_height(ATTACHMENT_ENTRY_H)
                 .min_width(96.0)
+                .focus_on_press(!cfg!(target_os = "android"))
                 .theme_when(clone_reader(reader))
                 .appearance(sui::ButtonAppearance::Tonal)
                 .tone(SemanticTone::Neutral)
@@ -17816,25 +17897,54 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         );
     }
 
-    if let Some(error) = shared.chat().attachment_picker_error.clone() {
-        let s = shared.clone();
-        body = body.with_child(
-            Flex::horizontal()
-                .wrap(FlexWrap::Wrap)
+    let feedback_source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("attachment failure feedback", |key| {
+                key.0
+                    .as_deref()
+                    .and_then(|snapshot| snapshot.attachment_picker_error.clone())
+            });
+    let feedback_shared = shared.clone();
+    let feedback_reader = Rc::clone(reader);
+    let feedback_scroll = scroll.clone();
+    let feedback = RebuildOnChange::key_from(feedback_source, move |error| {
+        let Some(error) = error else {
+            return WidgetPod::new(SizedBox::new());
+        };
+        // Show a new validation failure even when the manual form was scrolled
+        // down. Feedback updates must not replace the focused path editor.
+        feedback_scroll.set_offset(sui::Vector::ZERO);
+        let colors = feedback_shared.clone();
+        WidgetPod::new(WidgetPadding::new(
+            Insets {
+                left: 0.0,
+                top: 0.0,
+                right: 0.0,
+                bottom: 8.0,
+            },
+            Flex::vertical()
                 .gap(8.0)
-                .align_items(Alignment::Center)
+                .align_items(Alignment::Stretch)
                 .with_child(
-                    StatusBadge::new("Couldn’t attach")
-                        .icon(IconGlyph::Alert)
-                        .tone(SemanticTone::Danger)
-                        .theme_when(clone_reader(reader)),
+                    Stack::horizontal().with_child(
+                        StatusBadge::new("Couldn’t attach")
+                            .icon(IconGlyph::Alert)
+                            .tone(SemanticTone::Danger)
+                            .theme_when(clone_reader(&feedback_reader)),
+                    ),
                 )
-                .with_item(
-                    small_label(shared, error).color_when(move || palette(&s).danger_text),
-                    FlexItem::flex(1.0).min_width(140.0),
+                .with_child(
+                    small_label(&feedback_shared, error)
+                        .color_when(move || palette(&colors).danger_text),
                 ),
-        );
-    }
+        ))
+    });
+    body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(feedback)
+        .with_child(body);
 
     if !shared.chat().attachments.is_empty() {
         body = body.with_child(chips);
@@ -18069,6 +18179,7 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 }
 
 fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let scroll = ScrollState::new();
     let controls = {
         let source = shared.signals().chat_structure.select_named(
             "chat attachment popup structure",
@@ -18080,7 +18191,10 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         );
         let s = shared.clone();
         let r = Rc::clone(reader);
-        RebuildOnChange::key_from(source, move |_sig| attachment_controls(&s, &r))
+        let controls_scroll = scroll.clone();
+        RebuildOnChange::key_from(source, move |_sig| {
+            attachment_controls(&s, &r, &controls_scroll)
+        })
     };
     let body = Stack::vertical()
         .gap(8.0)
@@ -18092,9 +18206,12 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             "Close attachments",
         ))
         .with_child(
-            SizedBox::new()
-                .height(COMPOSER_POPUP_H - 34.0)
-                .child(ScrollView::vertical(controls).viewport_width_hint(true)),
+            SizedBox::new().height(COMPOSER_POPUP_H - 34.0).child(
+                    ScrollView::vertical(controls)
+                        .name("Attachment options")
+                    .state(scroll)
+                    .viewport_width_hint(true),
+            ),
         );
     WidgetPod::new(
         Surface::new(
@@ -18138,6 +18255,21 @@ fn composer_workspace_popup(
         "Commands start in the default workspace. All attached folders remain available.".into()
     };
     content = content.with_child(muted_label(shared, hint));
+    #[cfg(target_os = "android")]
+    {
+        let change = shared.clone();
+        content = content.with_child(
+            TextInput::new("chat-workspace-folder-path")
+                .value(shared.chat().workspace_folder_input.clone())
+                .placeholder("Device folder path")
+                .leading_icon(IconGlyph::Folder)
+                .theme_when(composer_control_reader(reader))
+                .enabled(enabled)
+                .on_change(move |value| {
+                    change.chat_mut().workspace_folder_input = value;
+                }),
+        );
+    }
     for (index, workspace) in workspaces.iter().enumerate() {
         let name = workspace_display_name(&workspace.path);
         let title = if index == 0 {
@@ -18222,7 +18354,11 @@ fn composer_workspace_popup(
             .min_height(30.0)
             .theme_when(composer_control_reader(reader))
             .enabled(enabled)
+            .focus_on_press(!cfg!(target_os = "android"))
             .on_press_with_ctx(move |ctx| {
+                #[cfg(target_os = "android")]
+                add.chat_mut().add_workspace_folder_path();
+                #[cfg(not(target_os = "android"))]
                 add.chat_mut().request_workspace_picker();
                 request_chat_window_relayout(ctx);
             }),
@@ -18884,7 +19020,12 @@ fn composer_bar(
         )
     };
     row = row.with_child(
-        Tooltip::new(action_tooltip, action)
+        // Keep the IME open through touch release. Blurring the editor on
+        // touch-down moves this bottom-anchored button out from under the tap.
+        Tooltip::new(
+            action_tooltip,
+            action.focus_on_press(!cfg!(target_os = "android")),
+        )
             .placement(TooltipPlacement::Above)
             .alignment(TooltipAlignment::End)
             .theme(reader()),
@@ -19262,6 +19403,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     };
     let title = {
         let s = shared.clone();
+        let colors = shared.clone();
         Label::new("Conversation")
             .text_when(move || {
                 let chat = s.chat();
@@ -19270,10 +19412,13 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                     .unwrap_or_else(|| chat.empty_conversation_title())
             })
             .semantic_name("Current conversation")
+            .single_line(true)
             .text_style(pal.text_style(&theme, 13.0, FontWeight::SEMIBOLD, pal.text))
+            .color_when(move || palette(&colors).text)
     };
     let agent = {
         let s = shared.clone();
+        let colors = shared.clone();
         Label::new("Agent")
             .text_when(move || {
                 let chat = s.chat();
@@ -19293,7 +19438,9 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 format!("Agent · {display}")
             })
             .semantic_name("Current agent")
+            .single_line(true)
             .text_style(pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted))
+            .color_when(move || palette(&colors).text_muted)
     };
     let edit = {
         let s = shared.clone();
@@ -19366,9 +19513,85 @@ fn wide_pod(
     )
 }
 
+/// Keep the editor and its actions usable when a landscape keyboard leaves
+/// only a short strip of the window. Conversation navigation returns as soon
+/// as there is room for its header again.
+struct CompactChatBody {
+    header: WidgetPod,
+    main: WidgetPod,
+    show_header: Cell<bool>,
+}
+impl Widget for CompactChatBody {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let show = constraints.max.height >= 220.0;
+        self.show_header.set(show);
+        let header_h = if show { COMPACT_HEADER_H } else { 0.0 };
+        let main = self.main.measure(
+            ctx,
+            Constraints::new(
+                Size::ZERO,
+                Size::new(
+                    constraints.max.width,
+                    (constraints.max.height - header_h).max(0.0),
+                ),
+            ),
+        );
+        self.header
+            .measure(ctx, Constraints::tight(Size::new(main.width, header_h)));
+        constraints.clamp(Size::new(main.width, main.height + header_h))
+    }
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let header_h = if self.show_header.get() {
+            COMPACT_HEADER_H
+        } else {
+            0.0
+        };
+        self.header.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), bounds.width(), header_h),
+        );
+        self.main.arrange(
+            ctx,
+            Rect::new(
+                bounds.x(),
+                bounds.y() + header_h,
+                bounds.width(),
+                (bounds.height() - header_h).max(0.0),
+            ),
+        );
+    }
+    fn paint(&self, ctx: &mut PaintCtx) {
+        if self.show_header.get() {
+            self.header.paint(ctx);
+        }
+        self.main.paint(ctx);
+    }
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if self.show_header.get() {
+            self.header.semantics(ctx);
+        }
+        self.main.semantics(ctx);
+    }
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        if self.show_header.get() {
+            visitor.visit(&self.header);
+        }
+        visitor.visit(&self.main);
+    }
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        if self.show_header.get() {
+            visitor.visit(&mut self.header);
+        }
+        visitor.visit(&mut self.main);
+    }
+}
+
 fn narrow_pod(shared: &Shared, reader: &ThemeReader, selection: &SelectionScope) -> WidgetPod {
-    let body = Dock::new(main_column(shared, reader, selection))
-        .top(COMPACT_HEADER_H, compact_chat_header(shared, reader));
+    let body = CompactChatBody {
+        header: WidgetPod::new(compact_chat_header(shared, reader)),
+        main: WidgetPod::new(main_column(shared, reader, selection)),
+        show_header: Cell::new(true),
+    };
     let dialog_host = ChatDialogHost::new(body, shared.clone(), Rc::clone(reader));
     WidgetPod::new(
         Surface::window(dialog_host)
@@ -19472,9 +19695,15 @@ impl Widget for ChatView {
     }
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let use_wide = constraints.max.width >= WIDE_THRESHOLD;
-        if use_wide && !self.use_wide.get() {
-            self.shared.chat_mut().compact_drawer_open = false;
+        let use_wide = constraints.max.width >= WIDE_THRESHOLD && constraints.max.height >= 380.0;
+        if use_wide != self.use_wide.get() {
+            let mut chat = self.shared.chat_mut();
+            // The inactive layout has its own retained editor. Refresh it
+            // from the canonical draft before it becomes visible again.
+            chat.draft_revision = chat.draft_revision.wrapping_add(1);
+            if use_wide {
+                chat.compact_drawer_open = false;
+            }
         }
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
@@ -19530,7 +19759,11 @@ impl ComposerPanel {
 
     fn popup_height(&self) -> f32 {
         if self.shared.chat().composer_popup() == Some(ComposerPopup::Workspace) {
-            300.0
+            if cfg!(target_os = "android") {
+                200.0
+            } else {
+                300.0
+            }
         } else {
             COMPOSER_POPUP_H
         }
@@ -19716,6 +19949,8 @@ pub fn view(shared: Shared) -> impl Widget {
 
 #[cfg(test)]
 mod tests {
+    include!("chat/mobile_regression_tests.rs");
+    include!("chat/mobile_p2_tests.rs");
     use super::*;
     use crate::backend::{Backend, Connection};
     use crate::state::AppState;
@@ -22296,12 +22531,17 @@ mod tests {
 
     #[test]
     fn channel_config_removes_agent_and_updates_sidebar_count() {
-        let (_backend, mut state) = isolated_chat_state("channel-remove-agent");
+        let (backend, mut state) = isolated_chat_state("channel-remove-agent");
         seed_test_agents(&mut state);
         state.new_channel(None);
         wait_for(&mut state, Duration::from_secs(5), |state| {
-            state.pending_session_reset.is_none() && state.channel_create_rx.is_none()
+            state.pending_session_reset.is_none()
+                && state.channel_create_rx.is_none()
+                && !state.session_list_loading
         });
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal completed channel creation observations");
         let channel_id = state.session_id.clone();
         state.set_channel_agent_idx(1);
         state.add_selected_agent_to_channel();
@@ -22316,6 +22556,9 @@ mod tests {
             .map(|participant| participant.participant_id)
             .expect("coding participant listed");
 
+        backend
+            .checkpoint_native_fixture_observations()
+            .expect("seal completed agent addition observations");
         state.remove_channel_agent(&channel_id, &coding_participant_id);
         assert!(state.pending_channel_config.is_some());
         wait_for(&mut state, Duration::from_secs(5), |state| {
@@ -23492,6 +23735,11 @@ mod tests {
             seed_test_agents(&mut chat);
             chat.sessions.clear();
             chat.session_id = SessionId::generate().to_string();
+            let session = chat.session_id.clone();
+            chat.apply_event(ChatEvent::ToolRuntime(workspace_management_selection(
+                &session,
+                &["/Workspace"],
+            )));
             chat.messages = vec![
                 ChatMessage::user("We already have history."),
                 ChatMessage::model("Ready for the next task."),
@@ -23590,7 +23838,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Choose folder")
+                .with_name("Add folder")
                 .count()?,
             1,
             "workspace control should expose the native folder picker"
@@ -23598,7 +23846,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Remove access")
+                .with_name("Remove all")
                 .count()?,
             1,
             "workspace control should expose explicit grant revocation"
@@ -24457,13 +24705,24 @@ mod tests {
             })
             .expect("main-pane New channel action")
             .bounds;
-        let empty_copy_bottom = after
+        let transcript = after
+            .snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::List
+                    && node.name.as_deref() == Some("Conversation messages")
+            })
+            .expect("main-pane transcript semantics");
+        let empty_copy = after
             .snapshot
             .accessibility
             .nodes
             .iter()
             .filter(|node| {
-                node.role == SemanticsRole::Text
+                node.parent == Some(transcript.id)
+                    && node.role == SemanticsRole::Text
                     && matches!(
                         node.name.as_deref(),
                         Some("No channels yet")
@@ -24473,6 +24732,10 @@ mod tests {
                             | Some("Use New channel to choose agents and edit the title.")
                     )
             })
+            .collect::<Vec<_>>();
+        assert_eq!(empty_copy.len(), 3, "main-pane empty-state copy semantics");
+        let empty_copy_bottom = empty_copy
+            .iter()
             .map(|node| node.bounds.max_y())
             .fold(0.0, f32::max);
         assert!(
@@ -24490,7 +24753,7 @@ mod tests {
             let mut chat = shared.chat_mut();
             seed_default_provider(&mut chat);
             chat.models_loading = false;
-            chat.workspace_path_input = r"D:\Projects\sinomo".into();
+            chat.workspace_path_input = "/Projects/sinomo".into();
             chat.messages = vec![
                 ChatMessage::user("Keep the composer compact."),
                 ChatMessage::model("Ready."),
@@ -24553,7 +24816,7 @@ mod tests {
         {
             let mut chat = shared.chat_mut();
             chat.providers[0].models[0] = "gpt-5.6-sol".into();
-            chat.workspace_path_input = r"D:\Projects\active-workspace".into();
+            chat.workspace_path_input = "/Projects/active-workspace".into();
         }
         for width in [700.0, 360.0, 320.0] {
             window
@@ -25967,21 +26230,17 @@ mod tests {
 
     #[test]
     fn retry_chat_list_restarts_stuck_load_and_refreshes_history() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-app-chat-list-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let data_dir = SinomoDataDir::new(&root);
+        let backend = Backend::local_fallback();
         let channel_id = "01hxy6qa9k0t9vr4g9n8d3q6b1"
             .parse::<SessionId>()
             .expect("session id");
         seed_backend_chat(
-            &data_dir,
+            backend.data_dir.as_ref(),
             &channel_id,
             "Recovered by retry",
             &[ChatMessage::user("hello")],
         );
         let session_id = channel_id.to_string();
-        let backend = Backend::local_fallback_for_data_dir(data_dir);
         let mut state = ChatState::new(&backend);
         state.sessions.clear();
         let (_tx, rx) = mpsc::channel();
@@ -26012,8 +26271,6 @@ mod tests {
                 .any(|session| session.id == session_id && session.title == "Recovered by retry"),
             "retry should discard the stale worker and reload persisted sidebar history"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

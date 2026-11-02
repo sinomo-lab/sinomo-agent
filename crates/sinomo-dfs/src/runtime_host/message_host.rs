@@ -1865,7 +1865,17 @@ pub(crate) fn daemon_dfs_message_cache_exact_admission_handle(
     let Some(slot) = daemon_dfs_message_service_cache().existing_root(&data_dir.root())? else {
         return Ok(None);
     };
-    let cache = slot.lock().map_err(|_| daemon_dfs_cache_lock_error())?;
+    // Eligibility is a cache-only optimization, including on async RPC workers.
+    // A generation opener can hold this mutex while awaiting native KV work.
+    // Waiting here can occupy every mobile worker and prevent that work from
+    // completing. A busy cache must use the existing global-admission path.
+    let cache = match slot.try_lock() {
+        Ok(cache) => cache,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(daemon_dfs_cache_lock_error());
+        }
+    };
     if let Some(started) = cache_wait_started {
         daemon_dfs_perf_trace(format_args!(
             "dfs-admission-cache-lock eligibility=exact elapsed_us={} node={} data_root={}",

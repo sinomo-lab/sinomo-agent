@@ -35,7 +35,11 @@ use crate::state::{ConnectionPhase, HealthIssue, HealthStructureKey, HealthSurfa
 use crate::theme::Palette;
 use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
-pub const TOPBAR_HEIGHT: f32 = 44.0;
+pub const TOPBAR_HEIGHT: f32 = if cfg!(target_os = "android") {
+    56.0
+} else {
+    44.0
+};
 
 /// Application work coordinator owned by the window rather than by the
 /// presentation tree. Bare scheduler wakes keep legacy background lanes alive;
@@ -217,7 +221,11 @@ impl CommandController for BackgroundWorkController {
 }
 const LOGO_SIZE: f32 = 24.0;
 const EDGE_PAD: f32 = 18.0;
-const TAB_HEIGHT: f32 = 32.0;
+const TAB_HEIGHT: f32 = if cfg!(target_os = "android") {
+    44.0
+} else {
+    32.0
+};
 /// Keep outward SUI focus chrome inside the horizontally clipped tab viewport.
 const TAB_VIEWPORT_PADDING: f32 = 4.0;
 const TAB_SEG_HEIGHT: f32 = TAB_HEIGHT + (TAB_VIEWPORT_PADDING * 2.0);
@@ -226,7 +234,11 @@ const STATUS_PILL_H: f32 = 24.0;
 const STATUS_PILL_W: f32 = 150.0;
 const COMPACT_CHROME_WIDTH: f32 = 620.0;
 /// Stock compact `IconButton` footprint. Keep title-bar allocation in lockstep with the control.
-const COMPACT_STATUS_PILL_W: f32 = 28.0;
+const COMPACT_STATUS_PILL_W: f32 = if cfg!(target_os = "android") {
+    44.0
+} else {
+    28.0
+};
 const HEALTH_POPOVER_W: f32 = 420.0;
 const HEALTH_CONTENT_MIN_H: f32 = 176.0;
 const HEALTH_CONTENT_MAX_H: f32 = 548.0;
@@ -509,7 +521,14 @@ impl Shell {
         if !self.shared.is_ready() {
             return false;
         }
-        match self.shared.active_tab() {
+        let scope = self.shared.active_scope();
+        if scope.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document)
+            && let Some(id) = scope.workspace_id()
+        {
+            self.shared.close_workspace_tab(id);
+            return true;
+        }
+        let navigated = match self.shared.active_tab() {
             Tab::Cluster => self.shared.cluster_mut().navigate_back(),
             Tab::Evolution => false,
             Tab::Settings => self.shared.settings_mut().navigate_back(),
@@ -518,7 +537,21 @@ impl Shell {
                 self.shared.active_scope().files_mut().navigate_back(waker)
             }
             _ => false,
+        };
+        if navigated {
+            return true;
         }
+        // Root Back closes the native window. A dirty document on another
+        // tab must get the same close guard as the currently visible one.
+        if let Some(scope) = self.shared.workspace_scopes().into_iter().find(|scope| {
+            scope.workspace_kind() == Some(crate::state::WorkspaceTabKind::Document)
+                && scope.files().has_unsaved_document()
+        }) && let Some(id) = scope.workspace_id()
+        {
+            self.shared.close_workspace_tab(id);
+            return true;
+        }
+        false
     }
 }
 
@@ -708,6 +741,15 @@ fn build_loading_view(shared: Shared) -> Surface {
 }
 
 impl Widget for Shell {
+    fn layer_options(&self) -> sui::LayerOptions {
+        // Keep chrome retained beneath descendant overlays without wrapping the
+        // shell: window events target the root, including Android focus/startup.
+        sui::LayerOptions {
+            paint_boundary: sui::PaintBoundaryMode::Explicit,
+            composition_mode: sui::LayerCompositionMode::Normal,
+        }
+    }
+
     fn command(&mut self, ctx: &mut EventCtx, command: &Command<'_>) {
         if command.is(sui::REACTIVE_CHANGED) {
             if cluster::observation_visible(&self.shared) {
@@ -723,6 +765,8 @@ impl Widget for Shell {
         ctx.observe(&self.shared.signals().active_tab);
         ctx.observe(&self.shared.signals().cluster_structure);
         let size = constraints.max;
+        #[cfg(all(target_os = "android", feature = "mobile"))]
+        crate::sync_android_system_bars(self.shared.borrow().theme_mode);
         let safe_size = crate::platform_safe_area_insets().inset(size);
         let compact = compact_chrome(safe_size.width);
         self.sync_tab_bar_density(compact);
@@ -1551,12 +1595,13 @@ fn build_health_content(
         0.0
     };
     let height = (HEALTH_CONTENT_MIN_H + issue_space + error_space).min(HEALTH_CONTENT_MAX_H);
-    SizedBox::new().width(width).height(height).child(
+    SizedBox::new().height(height).child(widgets::MaxWidth::new(
+        width,
         ScrollView::vertical(body)
             .name("Health and recovery details")
             .theme(theme)
             .viewport_width_hint(true),
-    )
+    ))
 }
 
 fn health_status_tone(key: &HealthCenterKey) -> SemanticTone {
@@ -2327,16 +2372,12 @@ mod tests {
 
     #[test]
     fn already_ready_shell_starts_chat_history_load() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-app-ready-shell-history-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        let data_dir = SinomoDataDir::new(&root);
+        let backend = Backend::local_fallback();
         let channel_id = "01hxy6qa9k0t9vr4g9n8d3q6a0"
             .parse::<SessionId>()
             .expect("session id");
-        let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
+        let store =
+            SifsAgentChannelStore::open(backend.data_dir.as_ref()).expect("open channel store");
         let mut channel = AgentChannel::new(channel_id.clone(), "Ready shell history");
         let message = channel.append_user_message(
             AGENT_CHANNEL_APP_USER_ID,
@@ -2348,9 +2389,9 @@ mod tests {
             .append_message(&channel.channel_id, &message)
             .expect("append backend message");
         store.save_channel(&channel).expect("save backend chat");
+        drop(store);
         let session_id = channel_id.to_string();
 
-        let backend = Backend::local_fallback_for_data_dir(data_dir);
         let state = AppState::ready(backend);
         let shared = Shared::new(state);
         shared.chat_mut().sessions.clear();
@@ -2377,8 +2418,6 @@ mod tests {
                 .any(|session| session.id == session_id && session.title == "Ready shell history"),
             "already-ready shells should kick the chat history loader"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2416,6 +2455,56 @@ mod tests {
             .expect("pinned settings semantics");
         assert!(pinned.state.selected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn application_root_delivers_window_events_to_shell() -> sui::Result<()> {
+        let shared = Shared::new(AppState::connecting());
+        shared.borrow_mut().window_placement.size = None;
+        let mut runtime = crate::build_runtime(shared.clone())?;
+        let window = runtime.window_ids()[0];
+        let size = Size::new(411.0, 780.0);
+        runtime.handle_event(window, Event::Window(WindowEvent::Resized(size)))?;
+        assert_eq!(
+            shared.borrow().window_placement.size,
+            Some([size.width, size.height]),
+            "root wrappers must not swallow shell lifecycle events"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn health_content_fits_a_mobile_viewport() -> sui::Result<()> {
+        let shared = Shared::new(AppState::connecting());
+        let key = shared.signals().health_structure.get();
+        let content = build_health_content(
+            shared,
+            &key,
+            Rc::new(Cell::new(false)),
+            Rc::new(Cell::new(0)),
+            Rc::new(RefCell::new(None)),
+        );
+        let mut runtime = sui::App::new()
+            .window(sui::Window::new("Health").root(content))
+            .build()?;
+        let window = runtime.window_ids()[0];
+        runtime.handle_event(
+            window,
+            Event::Window(WindowEvent::Resized(Size::new(320.0, 600.0))),
+        )?;
+        let output = runtime.render(window)?;
+        for node in output
+            .semantics
+            .iter()
+            .filter(|node| matches!(node.role, SemanticsRole::Text | SemanticsRole::Button))
+        {
+            assert!(
+                node.bounds.x() >= 0.0 && node.bounds.max_x() <= 320.0,
+                "health content exceeds the phone viewport: {:?}",
+                node.bounds
+            );
+        }
         Ok(())
     }
 

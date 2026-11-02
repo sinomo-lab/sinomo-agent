@@ -2005,3 +2005,41 @@ fn agent_session_runtime_interrupts_active_model_turn() {
         AgentTaskLifecycleStatus::Cancelled
     );
 }
+
+#[test]
+fn admission_cancellation_stops_before_start_and_during_model_work() {
+    let model = CancellationAwareModel::default();
+    let started = model.started();
+    let input = agent_input("admitted input");
+    let runtime = AgentSessionRuntime::new(
+        Agent::new(model, "fake", "fake"),
+        AgentSession::new(input.session.session_id.clone(), AgentRole::Main),
+    );
+    let cancelled = AgentCancellationToken::new();
+    cancelled.cancel();
+    assert!(
+        runtime
+            .submit_op_with_cancellation(AgentOp::start_turn(input.clone()), cancelled)
+            .unwrap()
+            .accepted
+    );
+    runtime.join_active_turn().unwrap();
+    assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    let live = AgentCancellationToken::new();
+    assert!(
+        runtime
+            .submit_op_with_cancellation(AgentOp::start_turn(input), live.clone())
+            .unwrap()
+            .accepted
+    );
+    for _ in 0..100 {
+        if started.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+    live.cancel();
+    runtime.join_active_turn().unwrap();
+    assert!(runtime.control_snapshot().unwrap().active_turn.is_none());
+}

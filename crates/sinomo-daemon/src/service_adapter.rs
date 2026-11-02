@@ -2856,7 +2856,30 @@ impl DaemonServiceRegistryHost {
         result.map_err(|error| DaemonError::Network {
             address: "daemon component shutdown".into(),
             detail: error.to_string(),
-        })
+        })?;
+        drop(reconciler);
+        // Embedded hosts restart after cluster initialization in the same
+        // process. A drained registry retains its old runtime and bootstrap
+        // context, so it must not be reused by the replacement. A late shutdown
+        // of an older host must not remove a successor registered at this root.
+        let retired = if let Some(hosts) = DAEMON_SERVICE_REGISTRY_HOSTS.get() {
+            let mut hosts = hosts.lock().map_err(|error| DaemonError::Network {
+                address: "daemon service registry cache".into(),
+                detail: error.to_string(),
+            })?;
+            if hosts
+                .get(&self.paths.root)
+                .is_some_and(|host| Arc::ptr_eq(&host.component_reconciler, &self.component_reconciler))
+            {
+                hosts.remove(&self.paths.root)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(retired);
+        Ok(())
     }
 }
 
@@ -4261,6 +4284,52 @@ mod tests {
         assert!(response.native_rust.is_err());
         assert!(response.native_dylib.is_ok());
         assert!(response.declarative.is_ok());
+    }
+
+    #[tokio::test]
+    async fn module_catalog_reads_resident_metadata_without_loader_files() {
+        let root = sinomo_testdir::TestDir::new("daemon-resident-module-catalog");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().unwrap();
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().unwrap();
+        let host =
+            DaemonServiceRegistryHost::from_registry_for_paths(ServiceRegistry::default(), &paths)
+                .unwrap();
+        // A catalog request must not rediscover or verify installed libraries.
+        let loaders = sinomo_module::native_dylib_module_loader_state_dir(&data_dir.root());
+        std::fs::create_dir_all(&loaders).unwrap();
+        std::fs::write(loaders.join("corrupt.sobj"), b"invalid native loader state").unwrap();
+        let descriptor = host
+            .object_rpc_route_descriptor(sinomo_module::MODULE_CATALOG_ROUTE)
+            .unwrap();
+        assert_eq!(descriptor.auth_scope.as_deref(), Some("local-command"));
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_module::MODULE_CATALOG_ROUTE,
+            "module.catalog",
+            &sinomo_module::ModuleCatalogRequest::default(),
+        )
+        .unwrap();
+        let response: sinomo_module::ModuleCatalogResponse =
+            call_value_service_host_async(&host, request)
+                .await
+                .unwrap()
+                .decode_body()
+                .unwrap();
+        let resident = host.module_runtime.generations.active_snapshot();
+        assert_eq!(
+            response.registry_generation,
+            resident.module_registry.version()
+        );
+        assert_eq!(
+            response.registrations,
+            resident
+                .module_registry
+                .registry()
+                .registrations()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
     }
 
     async fn call_value_service_host_async(
@@ -6459,6 +6528,81 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn stopped_embedded_host_is_replaced_without_evicting_its_successor() {
+        let root = sinomo_testdir::TestDir::new("embedded-service-registry-restart");
+        let paths = DaemonPaths::new(&SinomoDataDir::new(&root));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let bootstrap = runtime
+            .block_on(DaemonServiceRegistryHost::new_on_runtime(
+                paths.clone(),
+                runtime.handle().clone(),
+            ))
+            .unwrap();
+        assert!(
+            bootstrap
+                .object_rpc_route_descriptor("/test/stop")
+                .is_none()
+        );
+        bootstrap
+            .shutdown_components(runtime.handle(), Duration::from_secs(2))
+            .unwrap();
+
+        let factory: crate::DaemonComponentFactory = Arc::new(
+            sinomo_module::StaticComponentFactory::new(
+                sinomo_module::ComponentDescriptor::new("test.stop", "1.0.0"),
+                |_, scope| {
+                    scope.set_services(
+                        ServiceRegistryBuilder::default()
+                            .register(TestStopService)
+                            .build(),
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap(),
+        );
+        let replacement = runtime
+            .block_on(DaemonServiceRegistryHost::new_on_runtime_with_components(
+                paths.clone(),
+                runtime.handle().clone(),
+                vec![factory],
+            ))
+            .unwrap();
+        assert!(
+            replacement
+                .object_rpc_route_descriptor("/test/stop")
+                .is_some(),
+            "replacement must install its catalog rather than reuse the stopped bootstrap host"
+        );
+        assert!(!Arc::ptr_eq(
+            &bootstrap.component_reconciler,
+            &replacement.component_reconciler
+        ));
+
+        // A late/idempotent cleanup of the first incarnation must keep the live one.
+        bootstrap
+            .shutdown_components(runtime.handle(), Duration::from_secs(2))
+            .unwrap();
+        let current = runtime
+            .block_on(DaemonServiceRegistryHost::new_on_runtime(
+                paths,
+                runtime.handle().clone(),
+            ))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &current.component_reconciler,
+            &replacement.component_reconciler
+        ));
+        replacement
+            .shutdown_components(runtime.handle(), Duration::from_secs(2))
+            .unwrap();
     }
 
     #[tokio::test]
