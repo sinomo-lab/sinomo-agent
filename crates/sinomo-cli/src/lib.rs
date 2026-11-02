@@ -110,7 +110,7 @@ use sinomo_runtime::api::{
 #[cfg(test)]
 use sinomo_runtime::api::{daemon_package_version, write_daemon_status};
 use sinomo_runtime::cli_registry::{
-    CliCommandContext, CliCommandRegistry, CliParseError, RegisteredCliCommand,
+    CliCommandContext, CliCommandHandler, CliCommandRegistry, CliParseError, RegisteredCliCommand,
 };
 use sinomo_runtime::cluster;
 #[cfg(test)]
@@ -1727,9 +1727,51 @@ fn module_hot_unload_cli(
         .map_err(|source| source.to_string())
 }
 
+/// Module management can inspect inactive artifacts, but ordinary CLI
+/// registration must not scan or load those libraries before argument dispatch.
+#[derive(Default)]
+struct DeferredModuleCliCommandHandler {
+    handler: std::sync::OnceLock<sinomo_runtime::module::ModuleCliCommandHandler>,
+}
+
+impl DeferredModuleCliCommandHandler {
+    fn handler(&self) -> &sinomo_runtime::module::ModuleCliCommandHandler {
+        self.handler.get_or_init(|| {
+            let data_dir = SinomoDataDir::from_env_or_home().ok();
+            sinomo_runtime::module::module_cli_command_handler(default_module_cli_command_config(
+                data_dir.as_ref(),
+            ))
+        })
+    }
+}
+
+impl CliCommandHandler for DeferredModuleCliCommandHandler {
+    fn metadata(&self) -> sinomo_runtime::cli_registry::CliCommandMetadata {
+        sinomo_runtime::module::module_cli_command_handler(default_module_cli_command_config(None))
+            .metadata()
+    }
+
+    fn help(&self) -> sinomo_runtime::cli_registry::CliCommandHelp {
+        self.handler().help()
+    }
+
+    fn autocomplete(&self) -> sinomo_runtime::cli_registry::CliAutocompleteSpec {
+        self.handler().autocomplete()
+    }
+
+    fn parse(
+        &self,
+        args: &[String],
+    ) -> Result<
+        Box<dyn sinomo_runtime::cli_registry::CliCommand>,
+        sinomo_runtime::cli_registry::CliParseError,
+    > {
+        self.handler().parse(args)
+    }
+}
+
 pub fn default_cli_command_registry() -> CliCommandRegistry {
     let local_data_dir = SinomoDataDir::from_env_or_home().ok();
-    let module_config = default_module_cli_command_config(local_data_dir.as_ref());
     let mut registry = CliCommandRegistry::new()
         .register(help_cli_command_handler())
         .register(app_cli_command_handler())
@@ -1738,9 +1780,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         .register(uninstall_cli_command_handler())
         .register(daemon_cli_command_handler())
         .register(debug_cli_command_handler())
-        .register(sinomo_runtime::module::module_cli_command_handler(
-            module_config,
-        ))
+        .register(DeferredModuleCliCommandHandler::default())
         .register(
             sinomo_runtime::observe::observe_cli_command_handler_with_cluster_rpc(
                 observe_cli_rpc,
@@ -4652,16 +4692,42 @@ pub(crate) fn workspace_binding_root_with_verified_sifs_mount(
     Ok(local_root)
 }
 
+#[cfg(test)]
 pub(crate) fn main_agent_config_tool_registry(
     data_dir: &SinomoDataDir,
+) -> Result<AgentToolRegistry, CliError> {
+    let modules = agent_module_tool_projection(data_dir);
+    main_agent_config_tool_registry_with_modules(data_dir, &modules)
+}
+
+pub(crate) fn main_agent_config_tool_registry_with_modules(
+    data_dir: &SinomoDataDir,
+    modules: &sinomo_agent::AgentModuleToolProjection,
 ) -> Result<AgentToolRegistry, CliError> {
     let workspace_root = std::env::current_dir().map_err(|source| CliError::Io {
         path: "current directory".to_string(),
         detail: source.to_string(),
     })?;
-    main_agent_tool_registry_for_workspace(data_dir, &workspace_root)
+    let workspace = workspace_ref_for_selected_root(data_dir, &workspace_root)?
+        .binding()
+        .clone();
+    let registry = AgentToolRegistry::new();
+    configure_agent_tool_registry_for_workspace_projection_with_modules(
+        &registry,
+        data_dir,
+        &workspace_root,
+        &[workspace],
+        std::slice::from_ref(&workspace_root),
+        &AgentDefinition::main(),
+        None,
+        None,
+        false,
+        modules,
+    )?;
+    Ok(registry)
 }
 
+#[cfg(test)]
 pub(crate) fn main_agent_tool_registry_for_workspace(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
@@ -4846,6 +4912,33 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     sandbox_node_id: Option<NodeId>,
     allow_workspace_mutation: bool,
 ) -> Result<(), CliError> {
+    let modules = agent_module_tool_projection(data_dir);
+    configure_agent_tool_registry_for_workspace_projection_with_modules(
+        registry,
+        data_dir,
+        workspace_root,
+        workspace_grants,
+        resolved_workspace_roots,
+        definition,
+        session_id,
+        sandbox_node_id,
+        allow_workspace_mutation,
+        &modules,
+    )
+}
+
+fn configure_agent_tool_registry_for_workspace_projection_with_modules(
+    registry: &AgentToolRegistry,
+    data_dir: &SinomoDataDir,
+    workspace_root: &Path,
+    workspace_grants: &[WorkspaceRef],
+    resolved_workspace_roots: &[PathBuf],
+    definition: &AgentDefinition,
+    session_id: Option<&SessionId>,
+    sandbox_node_id: Option<NodeId>,
+    allow_workspace_mutation: bool,
+    module_projection: &sinomo_agent::AgentModuleToolProjection,
+) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
         .with_additional_workspace_roots(resolved_workspace_roots.iter().skip(1).cloned());
@@ -5024,10 +5117,9 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
             },
         ),
     );
-    let module_projection = agent_module_tool_projection(data_dir);
     sinomo_agent::register_module_agent_tools(
         registry,
-        &module_projection,
+        module_projection,
         Arc::clone(&remote_transport),
     );
     sinomo_agent::register_remote_management_agent_tools(registry, remote_transport);
@@ -5038,7 +5130,14 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
 pub(crate) fn agent_module_tool_projection(
     data_dir: &SinomoDataDir,
 ) -> sinomo_agent::AgentModuleToolProjection {
-    match sinomo_agent::product_module_tool_projection(data_dir) {
+    let projection = main_daemon_status_for_data_dir(data_dir).and_then(|daemon| {
+        daemon
+            .as_ref()
+            .map(resident_agent_module_tool_projection)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    });
+    match projection {
         Ok(projection) => projection,
         Err(error) => {
             eprintln!(
@@ -5047,6 +5146,52 @@ pub(crate) fn agent_module_tool_projection(
             sinomo_agent::AgentModuleToolProjection::default()
         }
     }
+}
+
+/// Consume the resident owner's metadata; the CLI never materializes native
+/// registrations from library files. Route invocation still rechecks authority.
+fn resident_agent_module_tool_projection(
+    daemon: &DaemonStatus,
+) -> Result<sinomo_agent::AgentModuleToolProjection, CliError> {
+    use sinomo_runtime::module::{
+        MODULE_CATALOG_ROUTE, MODULE_NATIVE_RUST_LIST_ROUTE, MODULE_NATIVE_RUST_RPC_CATEGORY,
+        ModuleCatalogRequest, ModuleCatalogResponse, NativeRustModuleListRequest,
+        NativeRustModuleListResponse,
+    };
+    let request = network::ObjectRpcRequest::encode_body(
+        MODULE_CATALOG_ROUTE,
+        "module.catalog",
+        &ModuleCatalogRequest::default(),
+    )?;
+    let catalog: ModuleCatalogResponse =
+        daemon_send_daemon_rpc(&daemon.address, &request, DAEMON_PROBE_TIMEOUT)?.decode_body()?;
+    let request = network::ObjectRpcRequest::encode_body(
+        MODULE_NATIVE_RUST_LIST_ROUTE,
+        MODULE_NATIVE_RUST_RPC_CATEGORY,
+        &NativeRustModuleListRequest::default(),
+    )?;
+    let states: NativeRustModuleListResponse =
+        daemon_send_daemon_rpc(&daemon.address, &request, DAEMON_PROBE_TIMEOUT)?.decode_body()?;
+    let inactive = states
+        .modules
+        .into_iter()
+        .filter(|state| !state.active)
+        .filter_map(|state| {
+            sinomo_runtime::module::ModuleId::new(state.module_id.clone())
+                .or_else(|_| sinomo_runtime::module::ModuleId::from_legacy_named(&state.module_id))
+                .ok()
+        })
+        .collect::<BTreeSet<_>>();
+    let mut projection = sinomo_agent::AgentModuleToolProjection {
+        registrations: catalog.registrations,
+        loader_states: Vec::new(),
+    };
+    for registration in &mut projection.registrations {
+        if inactive.contains(registration.module_id()) {
+            registration.surfaces.object_rpc_routes.clear();
+        }
+    }
+    Ok(projection)
 }
 
 fn agent_mcp_tool_registry(
@@ -5503,6 +5648,12 @@ fn run_registered_cli_command(
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
     ensure_cluster_directory_installed();
+    if invocation.command.is_none() {
+        // Interactive startup owns its preflight in the background, after the
+        // first frame. Non-interactive commands keep their existing admission.
+        let _local = enter_cli_force_local_mode(invocation.options.force_local);
+        return run_tui();
+    }
     let command = invocation.command;
     let command_is_help = command.as_ref().is_some_and(cli_command_is_help);
     let supports_degraded_local_mode = command

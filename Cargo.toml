@@ -89,7 +89,7 @@ rust-version = "1.95"
 version = "0.1.0"
 
 [profile.release]
-panic = "abort"
+panic = "unwind"
 
 [profile.dev]
 debug = "limited"
