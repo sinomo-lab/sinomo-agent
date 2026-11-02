@@ -440,11 +440,12 @@ impl ChatHost {
         journal: Option<(CommandJournal, String)>,
         command: wire::ChatSessionCommand,
     ) -> Result<(), String> {
+        let admission = self.activity.admit_command(&command, journal.as_ref());
         match self.command_tx.send(HostCommand::Run {
             origin,
             journal,
             command,
-            admission: self.activity.admit(),
+            admission,
         }) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -610,11 +611,17 @@ struct HostActivity {
 struct HostActivityState {
     busy: bool,
     admissions: usize,
+    admitted_turns: Vec<std::sync::Weak<AdmittedTurn>>,
     last_active: HostTime,
     session_id: Option<SessionId>,
     /// Channel participants have work in flight (their sessions are not the
     /// chat's, so the control registry check does not see them).
     participant_work: bool,
+}
+
+struct AdmittedTurn {
+    cancellation: sinomo_agent::AgentCancellationToken,
+    journal: Option<(CommandJournal, String)>,
 }
 
 impl HostActivity {
@@ -623,6 +630,7 @@ impl HostActivity {
             state: Arc::new(Mutex::new(HostActivityState {
                 busy: false,
                 admissions: 0,
+                admitted_turns: Vec::new(),
                 last_active: HostTime::now(),
                 session_id: None,
                 participant_work: false,
@@ -1675,8 +1683,11 @@ impl HostedChatService {
             host.activity.touch();
             let control = host
                 .with_peer_request(&request.request_id, || {
-                    if storage.is_some() && host.ready.load(Ordering::Acquire) {
-                        apply_direct_control(&self.runtime_control, &request.command)
+                    if storage.is_some()
+                        && (host.ready.load(Ordering::Acquire)
+                            || matches!(request.command, wire::ChatSessionCommand::Cancel { .. }))
+                    {
+                        host.apply_control(&self.runtime_control, &request.command)
                     } else {
                         // Enqueue on the exact host just admitted, while retirement
                         // and route replacement are excluded by `hosts`. Calling
@@ -2660,8 +2671,38 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
                 continue;
             }
         };
+        if _admission
+            .cancellation()
+            .as_ref()
+            .is_some_and(sinomo_agent::AgentCancellationToken::is_cancelled)
+        {
+            fanout.push(wire::ChatEvent::Notice {
+                session_id: chat_id.clone(),
+                notice: "Cancelled before starting.".into(),
+            });
+            fanout.push(wire::ChatEvent::TurnDone {
+                session_id: chat_id.clone(),
+            });
+            continue;
+        }
         activity.begin();
         let work = admit_host_command(&data_dir.root(), &alive, journal.as_ref());
+        if work.is_err()
+            && _admission
+                .cancellation()
+                .as_ref()
+                .is_some_and(sinomo_agent::AgentCancellationToken::is_cancelled)
+        {
+            activity.end(SessionId::from_str(&chat.session_id()).ok());
+            fanout.push(wire::ChatEvent::Notice {
+                session_id: chat_id.clone(),
+                notice: "Cancelled before starting.".into(),
+            });
+            fanout.push(wire::ChatEvent::TurnDone {
+                session_id: chat_id.clone(),
+            });
+            continue;
+        }
         if matches!(work, Ok(None)) {
             activity.end(SessionId::from_str(&chat.session_id()).ok());
             break;
@@ -2687,7 +2728,12 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
                 );
             }
             if !handle_direct_control(&runtime_control, &storage, &fanout, &command)? {
-                run_worker_command(&mut chat, command.clone(), &fanout);
+                run_worker_command_cancellable(
+                    &mut chat,
+                    command.clone(),
+                    &fanout,
+                    _admission.cancellation(),
+                );
             }
             match &journal {
                 Some((journal, id)) => {
@@ -2859,6 +2905,15 @@ fn run_worker_command(
     command: wire::ChatSessionCommand,
     events: &dyn ChatEventSink,
 ) {
+    run_worker_command_cancellable(chat, command, events, None);
+}
+
+fn run_worker_command_cancellable(
+    chat: &mut local::AgentChat,
+    command: wire::ChatSessionCommand,
+    events: &dyn ChatEventSink,
+    cancellation: Option<sinomo_agent::AgentCancellationToken>,
+) {
     match command {
         wire::ChatSessionCommand::Send {
             session_id,
@@ -2879,11 +2934,16 @@ fn run_worker_command(
                 .into_iter()
                 .map(local_attachment)
                 .collect::<Vec<_>>();
-            let result = chat.send_with_attachments(&text, &attachments, &mut |event| {
-                if let Some(event) = stream_event(event, &session_id) {
-                    events.push(event);
-                }
-            });
+            let result = chat.send_with_attachments_cancellable(
+                &text,
+                &attachments,
+                cancellation.clone(),
+                &mut |event| {
+                    if let Some(event) = stream_event(event, &session_id) {
+                        events.push(event);
+                    }
+                },
+            );
             if let Err(error) = result {
                 events.push(wire::ChatEvent::Error {
                     session_id: Some(session_id.clone()),
@@ -3084,6 +3144,7 @@ fn handle_direct_control(
 }
 
 enum DirectControlEffect {
+    PendingCancellation(String),
     State(AgentSessionResumeResponse),
     Input(String, AgentSessionControlResult),
 }
@@ -3202,6 +3263,12 @@ fn publish_direct_control(
     control: DirectControlEffect,
 ) {
     match control {
+        DirectControlEffect::PendingCancellation(session_id) => {
+            events.push(wire::ChatEvent::Notice {
+                session_id,
+                notice: "Cancelling queued work…".into(),
+            });
+        }
         DirectControlEffect::State(response) => {
             events.push(wire::ChatEvent::ControlState(control_resume_state(
                 response,

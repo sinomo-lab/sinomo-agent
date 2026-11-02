@@ -198,6 +198,78 @@ fn idle_chat_views_survive_dormancy_and_resume_with_their_context() {
 }
 
 #[test]
+fn immediate_cancel_stops_an_admitted_send_before_or_during_model_start() {
+    let root = sinomo_testdir::TestDir::new("sinomo-scripted-immediate-cancel");
+    let data_dir = SinomoDataDir::new(root.path().to_path_buf());
+    data_dir.ensure_root_layout().unwrap();
+    let script = root.join("scripts/immediate-cancel.json");
+    ModelScript::new()
+        .reply(ScriptedReply::await_cancellation())
+        .reply(ScriptedReply::await_cancellation())
+        .reply(ScriptedReply::await_cancellation())
+        .save(&script)
+        .unwrap();
+    let port = available_loopback_port();
+    initialize_cluster(&data_dir, port);
+    let daemon = Daemon::start(&data_dir, port, "immediate-cancel", &script);
+    run_cli(
+        &data_dir,
+        &[
+            "models",
+            "default",
+            "--provider",
+            "scripted",
+            "--model",
+            "scripted",
+        ],
+    );
+    daemon.wait_for_agent_catalog();
+    let chat = daemon.chat("immediate-cancel");
+    let (initial_session_id, _) = chat.ready();
+    let history = sinomo_client::ChatHistoryClient::at_address(daemon.address.clone());
+    assert!(
+        history
+            .list()
+            .expect("list untouched drafts")
+            .iter()
+            .all(|entry| entry.id != initial_session_id),
+        "opening a default draft must not publish an empty conversation"
+    );
+    let session_id = sinomo_runtime::events::SessionId::generate().to_string();
+    chat.command(ChatSessionCommand::NewSession {
+        session_id: session_id.clone(),
+    });
+    chat.poll_until(
+        |event| matches!(event, ChatEvent::SessionReset { session_id: id } if id == &session_id),
+    );
+    assert!(
+        history
+            .list()
+            .expect("list new draft")
+            .iter()
+            .all(|entry| entry.id != session_id),
+        "switching to a new default draft must not publish an empty conversation"
+    );
+    for _ in 0..3 {
+        chat.command(ChatSessionCommand::Send {
+            session_id: session_id.clone(),
+            text: "Wait until cancelled".into(),
+            attachments: vec![],
+        });
+        let stopped = Instant::now();
+        chat.command(ChatSessionCommand::Cancel {
+            session_id: session_id.clone(),
+            reason: "stop immediately after admission".into(),
+        });
+        chat.poll_until(|event| matches!(event, ChatEvent::TurnDone { session_id: done } if done == &session_id));
+        assert!(
+            stopped.elapsed() < Duration::from_secs(3),
+            "queued cancellation did not finish promptly"
+        );
+    }
+}
+
+#[test]
 fn a_live_model_turn_keeps_its_lease_and_can_be_cancelled() {
     let root = sinomo_testdir::TestDir::new("sinomo-scripted-owned-active-turn");
     let data_dir = SinomoDataDir::new(root.path().to_path_buf());

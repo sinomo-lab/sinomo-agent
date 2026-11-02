@@ -199,6 +199,33 @@ impl CommandJournal {
         })
     }
 
+    /// A queued input cancelled before its effect boundary must not become
+    /// executable again after a host restart. Started work keeps its existing
+    /// interrupted/outcome reconciliation contract.
+    pub(super) fn reject_if_pending(&self, id: &str, error: &str) -> Result<(), String> {
+        let pending = self
+            .state
+            .lock()
+            .map_err(|_| "chat journal poisoned")?
+            .entries
+            .iter()
+            .any(|entry| entry.id == id && entry.state == CommandState::Pending);
+        if !pending {
+            return Ok(());
+        }
+        self.change(|state| {
+            let entry = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or("missing command receipt")?;
+            if entry.state == CommandState::Pending {
+                entry.state = CommandState::Rejected(error.into());
+            }
+            Ok(())
+        })
+    }
+
     pub(super) fn complete(
         &self,
         id: &str,

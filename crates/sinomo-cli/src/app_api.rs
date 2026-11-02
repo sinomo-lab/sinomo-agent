@@ -4167,15 +4167,10 @@ impl AgentChat {
         let (mut channel, loaded_existing_channel) =
             match self.channel_store.load_channel(&session.session_id) {
                 Ok(Some(channel)) => (channel, true),
-                Ok(None) => {
-                    let mut channel = AgentChannel::with_default_title(session.session_id.clone());
-                    // This is a compatibility shell for a standalone session,
-                    // not a newly-created conversation. Leave its empty grant
-                    // projection unmarked so it can migrate the legacy session
-                    // shadow exactly once.
-                    channel.workspace_projection_version = 0;
-                    (channel, false)
-                }
+                Ok(None) => (
+                    AgentChannel::with_default_title(session.session_id.clone()),
+                    false,
+                ),
                 Err(error) => {
                     return Err(CliError::Parse {
                         detail: format!("load chat channel failed: {error}"),
@@ -4189,6 +4184,11 @@ impl AgentChat {
             .runtime
             .handler()
             .load_persisted_agent_session(&session.session_id)?;
+        if !loaded_existing_channel && (local_session.is_some() || !history.is_empty()) {
+            // Only an existing standalone session needs legacy workspace
+            // migration. A fresh ID already has an authoritative empty grant.
+            channel.workspace_projection_version = 0;
+        }
         // An existing channel already has durable membership. Consult that
         // selection and the persisted session identity before the handler's
         // process-local default can add or re-enable a participant.
@@ -4401,6 +4401,7 @@ impl AgentChat {
                 .push(format!("save reconciled chat channel failed: {error}"));
         }
         if let Some(projected_session) = self.runtime.handler().agent_session_snapshot()?
+            && !self.is_unstarted_default_chat()
             && let Some(projected_agent_key) = projected_session
                 .agent_definition_key
                 .as_deref()
@@ -4890,9 +4891,44 @@ impl AgentChat {
         attachments: &[ChatAttachmentInput],
         on_event: &mut dyn FnMut(ChatStreamEvent),
     ) -> Result<(), CliError> {
+        self.send_with_attachments_cancellable(text, attachments, None, on_event)
+    }
+
+    pub(crate) fn send_with_attachments_cancellable(
+        &mut self,
+        text: &str,
+        attachments: &[ChatAttachmentInput],
+        cancellation: Option<sinomo_agent::AgentCancellationToken>,
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+    ) -> Result<(), CliError> {
+        if cancellation
+            .as_ref()
+            .is_some_and(sinomo_agent::AgentCancellationToken::is_cancelled)
+        {
+            return Ok(());
+        }
         self.reload_current_channel()?;
         let primary = self.prepare_primary_participant()?;
         let attachments = self.store_chat_attachments(attachments)?;
+        if self.channel.channel_kind == AgentChannelKind::Chat
+            && self.channel.next_sequence == 1
+            && self.channel.title == "New chat"
+        {
+            let first_line = text.lines().map(str::trim).find(|line| !line.is_empty());
+            let title = first_line.map(str::to_string).or_else(|| {
+                attachments
+                    .first()
+                    .map(|file| format!("File: {}", file.file_name))
+            });
+            if let Some(title) = title {
+                let mut chars = title.chars();
+                let mut title = chars.by_ref().take(72).collect::<String>();
+                if chars.next().is_some() {
+                    title.push('…');
+                }
+                self.channel.rename(title);
+            }
+        }
         let source = app_channel_source(
             self.runtime.session(),
             (!attachments.is_empty()).then(|| {
@@ -4902,7 +4938,7 @@ impl AgentChat {
             }),
         );
         let context_attachments = agent_context_attachments_from_channel_attachments(&attachments);
-        self.run_on_channel(
+        self.run_on_channel_cancellable(
             primary,
             context_attachments,
             on_event,
@@ -4911,6 +4947,7 @@ impl AgentChat {
                 source,
                 attachments,
             },
+            cancellation,
         )
     }
 
@@ -5085,6 +5122,17 @@ impl AgentChat {
         on_event: &mut dyn FnMut(ChatStreamEvent),
         action: ChannelAction<'_>,
     ) -> Result<(), CliError> {
+        self.run_on_channel_cancellable(primary, context_attachments, on_event, action, None)
+    }
+
+    fn run_on_channel_cancellable(
+        &mut self,
+        primary: Option<TaskId>,
+        context_attachments: Vec<AgentContextAttachment>,
+        on_event: &mut dyn FnMut(ChatStreamEvent),
+        action: ChannelAction<'_>,
+        cancellation: Option<sinomo_agent::AgentCancellationToken>,
+    ) -> Result<(), CliError> {
         let channel_mode = primary.is_none();
         if self.participant_runtimes_channel.as_ref() != Some(&self.channel.channel_id) {
             self.participant_runtimes.clear();
@@ -5111,6 +5159,7 @@ impl AgentChat {
             tool_runtime: self.tool_runtime.clone(),
             tool_runtime_explicit_override: self.tool_runtime_explicit_override,
             context_attachments,
+            cancellation,
             on_event: &sink,
         };
         let mut channel_runtime = AgentChannelRuntime::new(channel, store, executor)
@@ -5532,7 +5581,7 @@ impl AgentChat {
             .map_err(|source| CliError::Parse {
                 detail: format!("persist canonical chat session failed: {source}"),
             })?;
-        if let Some(participant) = participant {
+        if let Some(participant) = participant.filter(|_| !self.is_unstarted_default_chat()) {
             self.session_checkpoint_store
                 .publish(&self.channel, participant, &session)
                 .map_err(|detail| CliError::Parse {
@@ -5541,7 +5590,26 @@ impl AgentChat {
         }
         Ok(())
     }
+    /// Default drafts stay local until their first message; explicit channel
+    /// names, agent choices and workspace grants still publish immediately.
+    fn is_unstarted_default_chat(&self) -> bool {
+        self.channel.channel_kind == AgentChannelKind::Chat
+            && self.channel.next_sequence == 1
+            && self.channel.title == "New chat"
+            && !self.channel.is_deleted()
+            && self.channel.workspace_revision == 0
+            && self.channel.workspaces.is_empty()
+            && self
+                .channel
+                .participants
+                .iter()
+                .all(|agent| agent.agent_key == "main-agent")
+    }
+
     fn save_channel(&self) -> Result<(), CliError> {
+        if self.is_unstarted_default_chat() {
+            return Ok(());
+        }
         self.channel_store
             .save_channel(&self.channel)
             .map_err(|source| agent_channel_store_cli_error("save chat channel", source))
@@ -5604,6 +5672,7 @@ struct ParticipantExecutor<'a, 'b> {
     tool_runtime: ChatToolRuntimeSelection,
     tool_runtime_explicit_override: bool,
     context_attachments: Vec<AgentContextAttachment>,
+    cancellation: Option<sinomo_agent::AgentCancellationToken>,
     on_event: &'a RefCell<&'b mut dyn FnMut(ChatStreamEvent)>,
 }
 
@@ -5827,6 +5896,7 @@ impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
         let data_dir = self.data_dir;
         let checkpoints = self.session_checkpoint_store;
         let context_attachments = self.context_attachments.clone();
+        let cancellation = self.cancellation.clone();
         let speaker = chat_speaker(&channel.channel_id, participant);
         let runtime = self
             .runtime_for(channel, participant, session)
@@ -5874,6 +5944,9 @@ impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
                 event => on_event(event),
             }
         };
+        runtime
+            .handler_mut()
+            .set_admission_cancellation(cancellation);
         let result = (|| {
             let mut emit = |output: InteractionOutput| forward_output(output, &mut forward);
             let trailing = match input {
@@ -5907,6 +5980,7 @@ impl AgentChannelTurnExecutor for ParticipantExecutor<'_, '_> {
             }
             drain_runtime_events(runtime, &mut forward)
         })();
+        runtime.handler_mut().set_admission_cancellation(None);
 
         if let Some(updated) = runtime
             .handler()

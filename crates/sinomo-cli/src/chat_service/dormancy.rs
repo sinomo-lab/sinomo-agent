@@ -433,20 +433,103 @@ impl HostedChatService {
 // The same guard accounts for queued actor commands and concurrent controls.
 // Keeping it in the queued message protects admission even if a mobile process
 // is suspended for longer than the grace interval before the worker receives it.
-pub(super) struct HostAdmission(HostActivity);
+pub(super) struct HostAdmission {
+    activity: HostActivity,
+    turn: Option<Arc<AdmittedTurn>>,
+}
+impl HostAdmission {
+    pub(super) fn cancellation(&self) -> Option<sinomo_agent::AgentCancellationToken> {
+        self.turn.as_ref().map(|turn| turn.cancellation.clone())
+    }
+}
 impl Drop for HostAdmission {
     fn drop(&mut self) {
-        let mut state = self.0.lock();
+        let mut state = self.activity.lock();
         state.admissions -= 1;
+        state.admitted_turns.retain(|turn| {
+            turn.strong_count() > 0
+                && self
+                    .turn
+                    .as_ref()
+                    .is_none_or(|mine| turn.as_ptr() != Arc::as_ptr(mine))
+        });
         state.last_active = HostTime::now();
     }
 }
 impl HostActivity {
     pub(super) fn admit(&self) -> HostAdmission {
+        self.admit_inner(None)
+    }
+
+    pub(super) fn admit_command(
+        &self,
+        command: &wire::ChatSessionCommand,
+        journal: Option<&(CommandJournal, String)>,
+    ) -> HostAdmission {
+        let turn = matches!(command, wire::ChatSessionCommand::Send { .. }).then(|| {
+            Arc::new(AdmittedTurn {
+                cancellation: sinomo_agent::AgentCancellationToken::new(),
+                journal: journal.cloned(),
+            })
+        });
+        self.admit_inner(turn)
+    }
+
+    fn admit_inner(&self, turn: Option<Arc<AdmittedTurn>>) -> HostAdmission {
         let mut state = self.lock();
         state.admissions += 1;
+        if let Some(turn) = &turn {
+            state.admitted_turns.push(Arc::downgrade(turn));
+        }
         state.last_active = HostTime::now();
-        HostAdmission(self.clone())
+        HostAdmission {
+            activity: self.clone(),
+            turn,
+        }
+    }
+
+    pub(super) fn cancel_admitted_turns(&self) -> Result<bool, String> {
+        let turns = self
+            .lock()
+            .admitted_turns
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        for turn in &turns {
+            turn.cancellation.cancel();
+            if let Some((journal, id)) = &turn.journal {
+                journal.reject_if_pending(id, "chat input cancelled before execution")?;
+            }
+        }
+        Ok(!turns.is_empty())
+    }
+}
+
+impl ChatHost {
+    pub(super) fn apply_control(
+        &self,
+        registry: &AgentRuntimeControlRegistry,
+        command: &wire::ChatSessionCommand,
+    ) -> Result<Option<DirectControlEffect>, String> {
+        if let wire::ChatSessionCommand::Cancel { session_id, .. } = command {
+            SessionId::from_str(session_id).map_err(|error| error.to_string())?;
+        }
+        let pending_cancel = matches!(command, wire::ChatSessionCommand::Cancel { .. })
+            && self.activity.cancel_admitted_turns()?;
+        if pending_cancel && !self.ready.load(Ordering::Acquire) {
+            return Ok(Some(DirectControlEffect::PendingCancellation(
+                command_chat_id(command).unwrap_or_default().to_string(),
+            )));
+        }
+        let effect = apply_direct_control(registry, command)?;
+        if pending_cancel
+            && matches!(&effect, Some(DirectControlEffect::Input(_, result)) if !result.accepted)
+        {
+            return Ok(Some(DirectControlEffect::PendingCancellation(
+                command_chat_id(command).unwrap_or_default().to_string(),
+            )));
+        }
+        Ok(effect)
     }
 }
 
@@ -477,7 +560,9 @@ impl HostedChatService {
                 }
                 Some(ChatRoute::Local(host)) => {
                     host.activity.touch();
-                    if !host.ready.load(Ordering::Acquire) {
+                    if !host.ready.load(Ordering::Acquire)
+                        && !matches!(command, wire::ChatSessionCommand::Cancel { .. })
+                    {
                         return host.enqueue(origin.into(), journal, command);
                     }
                     (host.alive.clone(), host.activity.admit())
@@ -499,7 +584,7 @@ impl HostedChatService {
             if !Arc::ptr_eq(&host.alive, &alive) || !host.alive.load(Ordering::Acquire) {
                 return Err("chat host stopped before control admission".into());
             }
-            let effect = apply_direct_control(&self.runtime_control, &command)?;
+            let effect = host.apply_control(&self.runtime_control, &command)?;
             Ok((host.fanout.clone(), effect))
         })();
         match result {

@@ -6732,8 +6732,8 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
     };
     let theme_control = {
         let s = shared.clone();
-        sui::SegmentedControl::new("theme")
-            .segments(["Light", "Dark", "Void", "System"])
+        Select::new("theme")
+            .options(["Light", "Dark", "Void", "System"])
             .selected(mode_index)
             .theme_when(clone_reader(reader))
             .on_change(move |i, _| {

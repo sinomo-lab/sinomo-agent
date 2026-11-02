@@ -213,9 +213,9 @@ percent-encoding = "2.3.2"
 rfd = "0.17.2"
 serde_json = "1.0.150"
 signal-hook = { version = "0.3.18", default-features = false }
-sui = { package = "sinomo-ui", version = "=0.6.0", default-features = false }
-sui-lucide = { package = "sinomo-ui-lucide", version = "=1.47.3" }
-sui-testing = { package = "sinomo-ui-testing", version = "=0.6.0" }
+sui = { package = "sinomo-ui", git = "https://github.com/sinomo-lab/sui.git", branch = "main", default-features = false }
+sui-lucide = { package = "sinomo-ui-lucide", git = "https://github.com/sinomo-lab/sui.git", branch = "main" }
+sui-testing = { package = "sinomo-ui-testing", git = "https://github.com/sinomo-lab/sui.git", branch = "main" }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "network", "system"] }
 tar = "0.4.46"
