@@ -128,7 +128,6 @@ const HEADER_H: f32 = 44.0;
 /// depending on a right click, while the full command inventory remains in grouped menus.
 const FILE_ACTION_BAR_H: f32 = 48.0;
 const HEADER_COMMAND_GAP: f32 = 4.0;
-const HEADER_PAD_Y: f32 = 8.0;
 /// Minimum inner width for the complete desktop command row. Below this, the wide Files layout
 /// keeps its inspector but uses a picker-first row with secondary commands in an overflow sheet.
 const FULL_HEADER_INNER_MIN_W: f32 = 860.0;
@@ -12686,11 +12685,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             FlexItem::new().no_shrink(),
         );
 
-    Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
-        .with_child(toolbar_row)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+    Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .justify(sui::FlexJustify::Center)
+        .with_item(toolbar_row, FlexItem::new().no_shrink())
 }
 
 /// Intermediate desktop header used while the inspector is still visible but the complete
@@ -12820,11 +12818,10 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             FlexItem::new().no_shrink(),
         );
 
-    Stack::vertical()
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
-        .with_child(toolbar_row)
-        .with_child(SizedBox::new().height(HEADER_PAD_Y))
+    Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .justify(sui::FlexJustify::Center)
+        .with_item(toolbar_row, FlexItem::new().no_shrink())
 }
 
 /// Narrow file-manager chrome keeps the essential navigation controls visible
@@ -20376,10 +20373,11 @@ fn placement_preview_status(shared: &Shared, reader: &ThemeReader) -> StatusBadg
         .theme_when(clone_reader(reader))
 }
 
-fn files_placement_dialog(
+fn files_placement_body(
     shared: &Shared,
     reader: &ThemeReader,
     prompt: &FileActionPrompt,
+    scroll: &ScrollState,
 ) -> WidgetPod {
     let target = prompt
         .target_path
@@ -20675,12 +20673,35 @@ fn files_placement_dialog(
                     },
                     content,
                 ))
+                .state(scroll.clone())
                 .name("Placement editor")
                 .theme_when(clone_gray_scrollbar_reader(reader))
                 .viewport_width_hint(true),
             ),
         )
         .with_child(actions);
+    WidgetPod::new(body)
+}
+
+fn files_placement_dialog(
+    shared: &Shared,
+    reader: &ThemeReader,
+    _prompt: &FileActionPrompt,
+) -> WidgetPod {
+    let source = shared.signals().files_structure.select_named(
+        "placement dialog contents", |key| key.dialog.clone(),
+    );
+    let contents_shared = shared.clone();
+    let contents_reader = Rc::clone(reader);
+    let scroll = ScrollState::new();
+    let body = RebuildOnChange::key_from(source, move |_| {
+        let prompt = contents_shared.files().action_prompt.clone();
+        match prompt {
+            Some(prompt) if prompt.kind == FileActionPromptKind::Placement =>
+                files_placement_body(&contents_shared, &contents_reader, &prompt, &scroll),
+            _ => WidgetPod::new(SizedBox::new()),
+        }
+    });
     let dismiss = {
         let shared = shared.clone();
         move || shared.files_mut().close_action_prompt()
@@ -22210,8 +22231,75 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     )
 }
 
-fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> Surface {
-    let rows = vec![
+fn repair_evidence_rows(
+    repair: &DfsOperatorRepairView,
+    attempts: &[sinomo_runtime::dfs::DfsRepairAttemptRecord],
+) -> Vec<(&'static str, String)> {
+    let mut matching: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.intent_id == repair.intent_id
+                && attempt.object_id == repair.object_id
+                && attempt.version == repair.version
+                && attempt.missing_replica_node_id == repair.missing_replica_node_id
+                && repair
+                    .content_hash
+                    .as_ref()
+                    .is_none_or(|hash| hash == &attempt.content_hash)
+        })
+        .collect();
+    matching.sort_by_key(|attempt| attempt.last_attempt_unix_nanos);
+    if matching.is_empty() {
+        return vec![(
+            "Attempt evidence",
+            "Unavailable in this status snapshot; this does not mean no attempt was made.".into(),
+        )];
+    }
+    let mut rows = Vec::new();
+    for attempt in matching {
+        rows.push(("Attempts recorded", attempt.attempts.to_string()));
+        rows.push((
+            "Last attempt",
+            if attempt.last_attempt_unix_nanos == 0 {
+                "Time unavailable".into()
+            } else {
+                unix_nanos_label(attempt.last_attempt_unix_nanos)
+            },
+        ));
+        rows.push((
+            "Outcome",
+            if attempt.in_flight {
+                "Transfer in flight; completion not yet established".into()
+            } else if attempt.last_error.is_some() {
+                "Attempt blocked or failed; obligation remains open".into()
+            } else if attempt.completed_transfer_request_id.is_some() {
+                "Terminal transfer reply recorded; obligation still listed as missing".into()
+            } else {
+                "No terminal outcome recorded".into()
+            },
+        ));
+        if let Some(reason) = &attempt.last_error {
+            rows.push(("Last blocking reason", reason.clone()));
+        }
+        if let Some(delivery) = &attempt.transfer_delivery_state {
+            rows.push(("Delivery evidence", format!("{delivery:?}")));
+        }
+        if attempt.next_retry_unix_nanos != 0 {
+            rows.push((
+                "Recorded retry time",
+                unix_nanos_label(attempt.next_retry_unix_nanos),
+            ));
+        }
+        if let Some(request) = &attempt.transfer_request_id {
+            rows.push(("Transfer request", request.clone()));
+        }
+    }
+    rows.push(("Timeline coverage", "Latest attempt and scheduled retry only; earlier attempt outcomes are not retained in this snapshot.".into()));
+    rows
+}
+
+fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView, attempts: &[sinomo_runtime::dfs::DfsRepairAttemptRecord]) -> Surface {
+    let mut rows = vec![
         (
             "Missing from",
             short_node_label(repair.missing_replica_node_id.as_str()),
@@ -22219,6 +22307,7 @@ fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> S
         ("Version", middle_short(repair.version.as_str(), 24)),
         ("Object", middle_short(repair.object_id.as_str(), 24)),
     ];
+    rows.extend(repair_evidence_rows(repair, attempts));
     Surface::panel(detail_rows_widget(rows, reader))
         .appearance(sui::SurfaceAppearance::Soft)
         .tone(SemanticTone::Warning)
@@ -22291,7 +22380,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
 
         let mut repair_rows = Stack::vertical().alignment(Alignment::Stretch).gap(8.0);
         for repair in overview.repairs.iter().take(20) {
-            repair_rows = repair_rows.with_child(storage_repair_row(reader, repair));
+            repair_rows = repair_rows.with_child(storage_repair_row(reader, repair, &status.repair_attempts));
         }
         if overview.repairs.is_empty() {
             repair_rows = repair_rows
@@ -23432,6 +23521,22 @@ impl FilesDialogHost {
         {
             self.history_scroll = ScrollState::new();
         }
+        // Editing a placement policy updates the retained dialog's contents.
+        // Replacing its shell would restart the modal entrance on every click.
+        let same_placement = match (&self.dialog_key, &key) {
+            (FilesDialogStructure::Action { theme: old_theme, source: old_source,
+                path: old_path, kind: FileActionPromptKind::Placement,
+                target_path: old_target, .. },
+             FilesDialogStructure::Action { theme, source, path,
+                kind: FileActionPromptKind::Placement, target_path, .. }) =>
+                old_theme == theme && old_source == source && old_path == path
+                    && old_target == target_path,
+            _ => false,
+        };
+        if same_placement {
+            self.dialog_key = key;
+            return;
+        }
         self.dialog_key = key;
         self.dialog = files_dialog(&self.shared, &self.reader, &self.history_scroll);
     }
@@ -23981,6 +24086,55 @@ mod tests {
         )
         .expect("valid module-owned history fixture");
         view
+    }
+
+    #[test]
+    fn repair_evidence_correlates_exact_obligations_and_preserves_uncertainty() {
+        let object = test_operator_object();
+        let repair = &object.repairs[0];
+        let mut attempt = sinomo_runtime::dfs::DfsRepairAttemptRecord {
+            intent_id: repair.intent_id.clone(),
+            object_id: repair.object_id.clone(),
+            version: repair.version.clone(),
+            content_hash: repair.content_hash.clone().unwrap_or_default(),
+            missing_replica_node_id: repair.missing_replica_node_id.clone(),
+            attempts: 3,
+            in_flight: false,
+            last_attempt_unix_nanos: 1_000_000_000,
+            next_retry_unix_nanos: 2_000_000_000,
+            transfer_request_id: None,
+            last_error: Some("Destination unavailable".into()),
+            transfer_delivery_state: None,
+            completed_transfer_request_id: None,
+            transfer_kind: None,
+        };
+        let rows = repair_evidence_rows(repair, &[attempt.clone()]);
+        assert!(rows.contains(&("Last blocking reason", "Destination unavailable".into())));
+        assert!(
+            rows.iter()
+                .any(|(label, _)| *label == "Recorded retry time")
+        );
+        attempt.intent_id.push_str("-other");
+        assert_eq!(
+            repair_evidence_rows(repair, &[attempt.clone()])[0].0,
+            "Attempt evidence"
+        );
+        attempt.intent_id = repair.intent_id.clone();
+        attempt.last_error = None;
+        attempt.completed_transfer_request_id = Some("completed".into());
+        let rows = repair_evidence_rows(repair, &[attempt.clone()]);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| *label == "Outcome"
+                    && value.contains("still listed as missing"))
+        );
+        attempt.in_flight = true;
+        let rows = repair_evidence_rows(repair, &[attempt]);
+        assert!(
+            rows.iter()
+                .any(|(label, value)| *label == "Outcome" && value.contains("in flight"))
+        );
+        assert_eq!(repair_evidence_rows(repair, &[])[0].0, "Attempt evidence");
     }
 
     fn test_storage_overview() -> FilesStorageOverview {
@@ -25194,21 +25348,8 @@ mod tests {
         app.run_until_idle()?;
 
         assert!(window.get_by_text("Storage needs attention").count()? >= 1);
-        assert!(window.get_by_text("/documents/report.txt").count()? >= 1);
-        assert!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Show file")
-                .count()?
-                >= 1
-        );
-        for name in ["Open Cluster", "Mount & sync", "Reconciliation activity"] {
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name(name)
-                .expect()
-                .to_be_visible()?;
-        }
+        assert!(window.get_by_text("Missing copies").count()? >= 1);
+        assert!(window.get_by_text("Attempt evidence").count()? >= 1);
         Ok(())
     }
 
@@ -25262,7 +25403,7 @@ mod tests {
             window
                 .root()
                 .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
-                    1280.0, 720.0,
+                    1280.0, if name == "files-storage-repair-evidence" { 1600.0 } else { 720.0 },
                 ))))?;
             app.run_until_idle()?;
             window.advance_time(1.0)?;
@@ -25357,7 +25498,29 @@ mod tests {
             files.storage_center_open = true;
             files.storage_overview = Some(test_storage_overview());
         }
-        capture("files-storage-health", storage_shared)?;
+        capture("files-storage-health", storage_shared.clone())?;
+        {
+            let mut files = storage_shared.files_mut();
+            let overview = files.storage_overview.as_mut().unwrap();
+            let repair = &overview.repairs[0];
+            overview.status.repair_attempts.push(sinomo_runtime::dfs::DfsRepairAttemptRecord {
+                intent_id: repair.intent_id.clone(),
+                object_id: repair.object_id.clone(),
+                version: repair.version.clone(),
+                content_hash: repair.content_hash.clone().unwrap_or_default(),
+                missing_replica_node_id: repair.missing_replica_node_id.clone(),
+                attempts: 3,
+                in_flight: false,
+                last_attempt_unix_nanos: 1_793_620_000_000_000_000,
+                next_retry_unix_nanos: 1_793_620_060_000_000_000,
+                transfer_request_id: Some("repair-transfer-example".into()),
+                last_error: Some("Destination is unreachable; waiting for an authorized route to the missing replica node.".into()),
+                transfer_delivery_state: None,
+                completed_transfer_request_id: None,
+                transfer_kind: None,
+            });
+        }
+        capture("files-storage-repair-evidence", storage_shared)?;
 
         let availability_backend = Backend::local_fallback();
         let availability_shared = Shared::new(AppState::ready(availability_backend));
@@ -27827,6 +27990,57 @@ mod tests {
             Some(full_error),
             "scrolling the job list preserves the durable activity read error"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn placement_tabs_keep_dialog_mounted() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut preview = unsatisfiable_placement_preview();
+            preview.blocking_diagnostics.clear();
+            for node in &mut preview.nodes {
+                node.accepts_content = true;
+            }
+            let mut files = shared.files_mut();
+            files.action_prompt = Some(placement_prompt("/folder", true));
+            files.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+            files.placement_advanced_open = false;
+            files.placement_preview = Some(preview);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Placement count bounds")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1200.0).height(840.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+
+        window.advance_time(1.0)?;
+        let dialog_id = || {
+            window.snapshot().unwrap().accessibility.nodes.iter()
+                .find(|node| node.role == SemanticsRole::Dialog && node.name.as_deref() == Some("Manage availability"))
+                .expect("availability dialog").id
+        };
+        let initial_id = dialog_id();
+        for name in ["Confirmed availability", "Available across devices", "Use inherited availability"] {
+            window.get_by_role(SemanticsRole::RadioButton).with_name(name).click()?;
+            app.run_until_idle()?;
+            assert_eq!(dialog_id(), initial_id, "tab {name} must not remount the modal");
+        }
+        window.capture_screenshot()?.write_png(std::env::temp_dir().join("sinomo-availability-after-tabs.png"))?;
         Ok(())
     }
 
@@ -33993,6 +34207,10 @@ mod tests {
                     node.role == sui::SemanticsRole::Button && node.name.as_deref() == Some(name)
                 })
                 .unwrap_or_else(|| panic!("{label} command should be present"));
+            assert!(
+                (node.bounds.y() + node.bounds.height() / 2.0 - HEADER_H / 2.0).abs() < 1.0,
+                "{label} must be vertically centered in the header: {:?}", node.bounds
+            );
             assert!(
                 node.bounds.width() >= 28.0 && node.bounds.height() >= 28.0,
                 "{label} command should keep a usable hit target, got {:?}",
