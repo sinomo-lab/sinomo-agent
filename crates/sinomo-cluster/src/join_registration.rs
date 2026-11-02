@@ -5,8 +5,8 @@ use crate::keyspace::{
     cluster_capability_policy_key, cluster_endpoint_prefix, cluster_identity_key,
     cluster_invitation_key, cluster_invitation_state_key, cluster_member_key,
 };
+use crate::kv_local_store::install_cluster_kv_anchored_snapshot;
 use crate::kv_local_store::kv_err;
-use crate::kv_local_store::write_imported_cluster_kv_snapshot_if_changed;
 use crate::local_membership::{
     ClusterLocalDaemonMembershipObservation, apply_local_daemon_membership_observation,
     merge_cluster_join_registration,
@@ -2393,11 +2393,36 @@ pub fn record_forwarded_join_registration_acceptance_with_host(
     if !response.accepted {
         return Ok(());
     }
-    if let Some(snapshot) = response.kv_snapshot.as_ref() {
-        write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)?;
+    if let Some(snapshot) = forwarded_acceptance_raft_snapshot(response)
+        && let Err(error) =
+            install_cluster_kv_anchored_snapshot(paths, &state.local_node_id, snapshot)
+    {
+        warn_forwarded_acceptance_raft_snapshot(&error);
     }
     persist_accepted_cluster_join_state(paths, response.state.clone())?;
     host.remember_successful_join_targets(paths, state, request_members)
+}
+
+/// The authority's admission snapshot at its anchored Raft position. An
+/// introducer behind it installs it before answering the joiner, so a later
+/// Raft append rewrites its view without losing the member it just introduced.
+fn forwarded_acceptance_raft_snapshot(
+    response: &ClusterJoinRegistrationResponse,
+) -> Option<sinomo_kv::RaftSnapshot> {
+    let anchor = response.raft_anchor?;
+    Some(sinomo_kv::RaftSnapshot {
+        last_included_index: anchor.last_included_index,
+        last_included_term: anchor.last_included_term,
+        kv: Arc::new(response.kv_snapshot.clone()?),
+    })
+}
+
+fn warn_forwarded_acceptance_raft_snapshot(error: &NetworkError) {
+    // The admission is already committed; replication still catches up.
+    tracing::warn!(
+        %error,
+        "introducer could not install the authority's admission snapshot"
+    );
 }
 
 pub async fn record_forwarded_join_registration_acceptance_async_with_host(
@@ -2415,8 +2440,9 @@ pub async fn record_forwarded_join_registration_acceptance_async_with_host(
     }
     let trace = ForwardedJoinAcceptanceTrace::new(invite_id, requested_learner_node_id);
     let paths_for_state = paths.clone();
+    let local_node_id = state.local_node_id.clone();
     let response_state = response.state.clone();
-    let snapshot = response.kv_snapshot.clone();
+    let raft_snapshot = forwarded_acceptance_raft_snapshot(response);
     let revision = response.state.kv_revision;
     let term = response.state.term;
     let state_worker_started = trace.as_ref().map(|trace| {
@@ -2430,29 +2456,32 @@ pub async fn record_forwarded_join_registration_acceptance_async_with_host(
     let trace_for_state = trace.clone();
     let state_result = match runtime
         .spawn_blocking(move || {
-            if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(snapshot) = raft_snapshot {
                 let started = trace_for_state.as_ref().map(|trace| {
                     trace.start(
-                        "forwarded_imported_snapshot",
+                        "forwarded_anchored_snapshot",
                         revision,
                         term,
-                        format_args!("importing the authority response snapshot"),
+                        format_args!("installing the authority's anchored admission snapshot"),
                     )
                 });
-                let result =
-                    write_imported_cluster_kv_snapshot_if_changed(&paths_for_state, snapshot);
+                let result = install_cluster_kv_anchored_snapshot(
+                    &paths_for_state,
+                    &local_node_id,
+                    snapshot,
+                );
                 if let (Some(trace), Some(started)) = (trace_for_state.as_ref(), started) {
                     match &result {
-                        Ok(wrote) => trace.phase(
-                            "forwarded_imported_snapshot",
+                        Ok(installed) => trace.phase(
+                            "forwarded_anchored_snapshot",
                             started.elapsed(),
                             revision,
                             term,
-                            if *wrote { "written" } else { "unchanged" },
-                            format_args!("authority response snapshot import completed"),
+                            if *installed { "installed" } else { "current" },
+                            format_args!("anchored admission snapshot install completed"),
                         ),
                         Err(error) => trace.phase(
-                            "forwarded_imported_snapshot",
+                            "forwarded_anchored_snapshot",
                             started.elapsed(),
                             revision,
                             term,
@@ -2461,15 +2490,17 @@ pub async fn record_forwarded_join_registration_acceptance_async_with_host(
                         ),
                     }
                 }
-                result?;
+                if let Err(error) = result {
+                    warn_forwarded_acceptance_raft_snapshot(&error);
+                }
             } else if let Some(trace) = trace_for_state.as_ref() {
                 trace.phase(
-                    "forwarded_imported_snapshot",
+                    "forwarded_anchored_snapshot",
                     Duration::ZERO,
                     revision,
                     term,
                     "skipped",
-                    format_args!("authority response did not include a KV snapshot"),
+                    format_args!("authority response did not anchor its snapshot"),
                 );
             }
             let started = trace_for_state.as_ref().map(|trace| {

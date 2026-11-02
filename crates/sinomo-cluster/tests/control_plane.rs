@@ -15387,6 +15387,85 @@ fn cluster_join_registration_leaves_current_acceptor_endpoints_unwritten() {
 }
 
 #[test]
+fn introducer_keeps_the_member_it_introduced_across_raft_appends() {
+    let fixture = join_authority_fixture("join_introducer_keeps_member");
+    let authority_id = fixture.state.local_node_id.clone();
+    // The introducer replica has applied the cluster up to this admission.
+    let before = sinomo_kv::read_cluster_kv_raft_anchored_snapshot_before(
+        &cluster_raft_wal_paths(&fixture.paths, &authority_id),
+        &authority_id,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .expect("resident authority")
+    .expect("pre-join anchored snapshot");
+    let introducer_root = sinomo_testdir::TestDir::new("join_introducer_keeps_member_introducer");
+    let introducer_paths = ClusterPaths::new(&SinomoDataDir::new(&introducer_root));
+    introducer_paths.ensure().expect("introducer cluster paths");
+    let introducer_id = NodeId::from_legacy_named("introducer").expect("introducer");
+    let mut introducer_state = fixture.state.clone();
+    introducer_state.local_node_id = introducer_id.clone();
+    write_cluster_state(&introducer_paths, &introducer_state).expect("introducer state");
+    persist_accepted_cluster_join_snapshot(
+        &introducer_paths,
+        &introducer_id,
+        &before.kv,
+        Some(ClusterJoinRaftAnchor {
+            last_included_index: before.last_included_index,
+            last_included_term: before.last_included_term,
+        }),
+    )
+    .expect("seed introducer replica");
+
+    let request = join_authority_fixture_request(&fixture);
+    let response = handle_cluster_join_registration_request_with_host(
+        &fixture.paths,
+        request.clone(),
+        fixture.now,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("handle join registration");
+    assert!(response.accepted, "{}", response.detail);
+    record_forwarded_join_registration_acceptance_with_host(
+        &introducer_paths,
+        &introducer_state,
+        &request.members,
+        &response,
+        &mut RecordingJoinRegistrationHost::default(),
+    )
+    .expect("record forwarded acceptance");
+
+    // A Raft append rebuilds the introducer's members from its own KV view
+    // before replication has delivered the admission.
+    let heartbeat = ClusterRaftAppendRequest {
+        state: fixture.state.clone(),
+        snapshot: None,
+        read_index_probe: false,
+        append: RaftAppendEntriesRequest {
+            term: before.last_included_term,
+            leader_id: authority_id.clone(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        },
+    };
+    let leader = ClusterAuthenticatedPeer {
+        node_id: authority_id.to_string(),
+        public_key: fixture.state.members[0].node_public_key.clone(),
+    };
+    handle_cluster_raft_append_request(&introducer_paths, heartbeat, &leader).expect("heartbeat");
+
+    let after = read_cluster_state_without_kv(&introducer_paths).expect("introducer state");
+    assert!(
+        after
+            .members
+            .iter()
+            .any(|member| member.node_id == fixture.joined_node_id),
+        "a Raft append must not erase the member the introducer just introduced"
+    );
+}
+
+#[test]
 fn accepted_join_starts_the_joiner_raft_state_at_the_anchored_admission() {
     let fixture = join_authority_fixture("join_anchored_raft_state");
     let mut host = RecordingJoinRegistrationHost::default();

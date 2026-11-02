@@ -108,7 +108,9 @@ member. The same commit includes the accepting member's current listener
 advertisements, so the joiner's first committed view can route back to it.
 The joiner starts its replicated KV state from that committed view, anchored
 at the authority's log position, so its first reads already include its own
-admission and replication continues from there.
+admission and replication continues from there. An introducer that relays the
+admission installs the same view when it is behind, before it answers the
+joiner.
 Normal invitations use learner or non-voting roles. Authority promotion
 is a separate committed membership change. The current lifecycle records learner
 admission, requires proof that the learner reached the required committed log

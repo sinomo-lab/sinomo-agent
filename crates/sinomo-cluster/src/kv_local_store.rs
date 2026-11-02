@@ -1,4 +1,6 @@
+#[cfg(any(test, feature = "test-support"))]
 use crate::connectivity_publish::cluster_connectivity_publish_record_matches;
+#[cfg(any(test, feature = "test-support"))]
 use crate::keyspace::cluster_connectivity_key;
 use crate::local_state_store::read_cluster_state_without_kv;
 #[cfg(test)]
@@ -8,6 +10,7 @@ use crate::raft_quorum::{
 };
 #[allow(unused_imports)]
 use sinomo_kv::KvError;
+#[cfg(any(test, feature = "test-support"))]
 use sinomo_network::ClusterConnectivityRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
@@ -24,14 +27,19 @@ use sinomo_kv::{
     KvSnapshot, KvTxnResponse, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftSnapshot,
 };
 use sinomo_node::NodeId;
-use std::collections::{BTreeMap, HashMap};
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(any(test, feature = "test-support"))]
+use std::time::Duration;
+use std::time::Instant;
+#[cfg(any(test, feature = "test-support"))]
 use std::time::SystemTime;
-use std::time::{Duration, Instant};
+#[cfg(any(test, feature = "test-support"))]
 use time::OffsetDateTime;
 
 const FILE_CACHE_CAPACITY: usize = 4096;
@@ -285,6 +293,7 @@ pub fn write_cluster_kv_snapshot(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn imported_cluster_kv_snapshot_phase_trace(
     phase: &'static str,
     duration: Duration,
@@ -306,6 +315,7 @@ fn imported_cluster_kv_snapshot_phase_trace(
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn write_imported_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
@@ -519,6 +529,7 @@ pub fn invalidate_cluster_kv_observed_read_models(paths: &ClusterPaths) {
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn imported_snapshot_requires_route_read_model_materialization(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
@@ -529,6 +540,7 @@ fn imported_snapshot_requires_route_read_model_materialization(
     route_connectivity_projection_changed(existing.as_ref(), snapshot, OffsetDateTime::now_utc())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn route_connectivity_projection_changed(
     existing: &KvSnapshot,
     incoming: &KvSnapshot,
@@ -550,6 +562,7 @@ fn route_connectivity_projection_changed(
     Ok(false)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 // Routing reads every committed row as its source's current statement, so
 // the route projection changes with committed semantics, not with row age.
 fn committed_connectivity_records_by_key(
@@ -1038,6 +1051,33 @@ pub fn apply_cluster_raft_append(
         .kv_paths()
         .apply_raft_append_compact_with_publish_report(node_id, snapshot, append)
         .map_err(kv_err)?;
+    publish_cluster_raft_apply_outcome(paths, outcome, wrote)
+}
+
+/// Installs an authority's anchored snapshot into this live replica when it is
+/// ahead of local state, and publishes it as a leader-sent snapshot is.
+pub fn install_cluster_kv_anchored_snapshot(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    snapshot: RaftSnapshot,
+) -> Result<bool, NetworkError> {
+    let Some((outcome, wrote)) = paths
+        .kv_paths()
+        .raft_store()
+        .install_anchored_snapshot_compact_and_publish(node_id, snapshot)
+        .map_err(kv_err)?
+    else {
+        return Ok(false);
+    };
+    publish_cluster_raft_apply_outcome(paths, outcome, wrote)?;
+    Ok(true)
+}
+
+fn publish_cluster_raft_apply_outcome(
+    paths: &ClusterPaths,
+    outcome: sinomo_kv::RaftAppendEntriesCompactApplyOutcome,
+    wrote: bool,
+) -> Result<RaftAppendEntriesResponse, NetworkError> {
     let delivery_prepared = outcome
         .observation_receipt
         .as_ref()

@@ -8677,6 +8677,45 @@ impl ClusterKvRaftStore {
         Ok(true)
     }
 
+    /// Installs an anchored snapshot into this process's live replica under the
+    /// same rule, ownership and publication as a snapshot carried by
+    /// AppendEntries. `None` means local state already reaches the anchor.
+    pub fn install_anchored_snapshot_compact_and_publish(
+        &self,
+        node_id: &NodeId,
+        snapshot: RaftSnapshot,
+    ) -> Result<Option<(RaftAppendEntriesCompactApplyOutcome, bool)>, KvError> {
+        let incoming_snapshot = Arc::clone(&snapshot.kv);
+        let incoming_snapshot_index = snapshot.last_included_index;
+        let mut node = self.open_observed_node(node_id)?;
+        if incoming_snapshot_index <= node.applied_index() {
+            return Ok(None);
+        }
+        node.restore_snapshot(snapshot)?;
+        let outcome = RaftAppendEntriesCompactApplyOutcome {
+            response: RaftAppendEntriesResponse {
+                term: node.hard_state().current_term,
+                success: true,
+                match_index: node.last_log_index(),
+            },
+            snapshot_restored: true,
+            restored_snapshot: Some(incoming_snapshot),
+            committed_events: Arc::new(Vec::new()),
+            read_state: read_index_state_from_open_node(&node),
+            compacted_revision: node.store().compacted_revision(),
+            checkpoint_snapshot: None,
+            final_key_states: Arc::new(Vec::new()),
+            commit_advanced: true,
+            selected_lease_mutation: false,
+            observation_receipt: node.observation_receipt(),
+            restored_snapshot_applied_index: Some(incoming_snapshot_index),
+        };
+        node.refresh_resident_read_view();
+        drop(node);
+        let wrote = self.publish_compact_append_entries_apply_outcome(&outcome)?;
+        Ok(Some((outcome, wrote)))
+    }
+
     pub fn apply_append_entries_with_optional_snapshot(
         &self,
         node_id: &NodeId,
