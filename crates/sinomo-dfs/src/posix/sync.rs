@@ -708,7 +708,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNamespaceResult::Rejected {
                     current_primary_node_id: Some(current),
                     ..
-                } if current == self.node_id => {
+                } if current == self.node_id
+                    && !self.transport.delegates_local_namespace_authority() =>
+                {
                     return self
                         .execute_posix_coordination_operation_local(&operation)?
                         .ok_or_else(|| {

@@ -906,7 +906,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_error,
                     current_primary_node_id,
                 } => match current_primary_node_id {
-                    Some(current) if current == self.node_id => {
+                    Some(current)
+                        if current == self.node_id
+                            && !self.transport.delegates_local_namespace_authority() =>
+                    {
                         // Authority moved to this node; execute locally.
                         return self.execute_routed_namespace_operation_locally(
                             Some(&operation_id),
@@ -922,7 +925,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 current,
                             )
                             .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id {
+                        if primary == self.node_id
+                            && !self.transport.delegates_local_namespace_authority()
+                        {
                             return self.execute_routed_namespace_operation_locally(
                                 Some(&operation_id),
                                 &operation,
@@ -1052,7 +1057,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     posix_error,
                     current_primary_node_id,
                 } => match current_primary_node_id {
-                    Some(current) if current == self.node_id => {
+                    Some(current)
+                        if current == self.node_id
+                            && !self.transport.delegates_local_namespace_authority() =>
+                    {
                         return self
                             .execute_routed_namespace_operation_locally(None, &operation)
                             .map(drop);
@@ -1066,7 +1074,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 current,
                             )
                             .map_err(DfsPosixError::Dfs)?;
-                        if primary == self.node_id {
+                        if primary == self.node_id
+                            && !self.transport.delegates_local_namespace_authority()
+                        {
                             return self
                                 .execute_routed_namespace_operation_locally(None, &operation)
                                 .map(drop);
@@ -1842,7 +1852,7 @@ where
         let file_system_id = sifs_file_system_id();
         let mut primary = primary_node_id;
         for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
-            if primary == self.node_id {
+            if primary == self.node_id && !self.transport.delegates_local_namespace_authority() {
                 self.execute_posix_coordination_operation_local(&operation)?;
                 return self
                     .current_read_object_metadata(object_id)

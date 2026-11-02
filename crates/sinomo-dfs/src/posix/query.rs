@@ -132,6 +132,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let object = final_object.expect("a normalized absolute path has a final object");
+        if self.transport.delegates_local_namespace_authority() && self.control_plane.is_some() {
+            // Preserve the no-link walk's exact identity and routing cut while
+            // deriving counts through the existing native authority queries.
+            // A private replica aggregate would decode every shard again.
+            return self.with_stat_deadline(|service| {
+                service.with_stat_read_rounds(|service| {
+                    service.stat_object_from_authorities(&object, &path, shard_snapshot.as_deref())
+                })
+            });
+        }
         self.namespace_lstat_object_for_path(&object, &path)
     }
 

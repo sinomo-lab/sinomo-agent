@@ -163,10 +163,10 @@ pub fn open_mounted_sifs_service(
     open_mounted_sifs_service_with_cancellation(data_dir, None)
 }
 
-/// Like [`open_mounted_sifs_service`], with a cooperative cancellation flag
-/// installed on the service before any distributed work runs. Budgeted callers
-/// (app catalog loads) flip the flag to abandon the open and every subsequent
-/// distributed operation promptly when the cluster link is degraded.
+/// Like [`open_mounted_sifs_service`], with cooperative cancellation for
+/// namespace operations. Configuration reads retain their transport deadlines.
+/// Budgeted callers (app catalog loads) flip the flag to abandon subsequent
+/// namespace work promptly when the cluster link is degraded.
 pub fn open_mounted_sifs_service_with_cancellation(
     data_dir: Option<PathBuf>,
     cancellation: Option<crate::DfsCancellationFlag>,
@@ -227,7 +227,7 @@ pub fn open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
 }
 
 /// Like [`open_mounted_sifs_service_with_peer_transports_and_default_control_plane`],
-/// with a cooperative cancellation flag installed before namespace bootstrap.
+/// with cooperative cancellation for namespace operations.
 ///
 /// Budgeted application mounts use this entry point so abandoning catalog
 /// hydration also cancels the daemon-backed distributed work it started.
@@ -379,21 +379,19 @@ fn open_mounted_sifs_service_from_context(
         sync_peer_transport,
         async_peer_transport,
         control_plane,
+        cluster_state.is_some(),
     )?;
     service.set_cancellation(cancellation);
-    if cluster_state.is_some() {
-        // Clustered mounts are clients of the actual Main owner. Select that
-        // existing route before bootstrap can rebind or recover local state.
-        service.transport = service.transport.with_registered_main_namespace_dispatch();
+    if cluster_state.is_none() {
+        service
+            .bootstrap_distributed_sifs()
+            .map_err(|source| match source {
+                DfsPosixError::Dfs(error) => error,
+                other => DfsError::Metadata {
+                    message: other.to_string(),
+                },
+            })?;
     }
-    service
-        .bootstrap_distributed_sifs()
-        .map_err(|source| match source {
-            DfsPosixError::Dfs(error) => error,
-            other => DfsError::Metadata {
-                message: other.to_string(),
-            },
-        })?;
     // LookupPath is already a read-only authoritative query. Do not let an
     // eligible transient failure silently escalate a mounted stat/read into a
     // durable SyncPath apply outside the adapter's handoff. Directory listing

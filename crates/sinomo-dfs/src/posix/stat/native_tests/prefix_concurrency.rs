@@ -95,6 +95,31 @@ fn native_cut(
 }
 
 fn run_real_prefix_advances(name: &'static str, advances: usize) {
+    run_real_prefix_advances_for_open(name, advances, false);
+}
+
+fn subject_path_lookup_count(frames: &[DfsRoutedMessage], source: &NodeId, target: &str) -> usize {
+    frames
+        .iter()
+        .filter(|frame| {
+            if &frame.source_node_id != source {
+                return false;
+            }
+            let DfsNetworkMessage::NamespaceRequest(request) = &frame.message else {
+                return false;
+            };
+            match &request.operation {
+                DfsNamespaceOperation::LookupPath { path, .. } => path == "/" || path == target,
+                DfsNamespaceOperation::LookupPaths { paths } => {
+                    paths.iter().any(|path| path == "/" || path == target)
+                }
+                _ => false,
+            }
+        })
+        .count()
+}
+
+fn run_real_prefix_advances_for_open(name: &'static str, advances: usize, no_links: bool) {
     assert!(matches!(
         advances,
         1 | super::super::super::POSIX_ROUTED_SYNC_RETRY_ROUNDS
@@ -118,6 +143,13 @@ fn run_real_prefix_advances(name: &'static str, advances: usize) {
         .client(&cluster.services.primary_node_id)
         .unwrap();
     let mut reader = cluster.runtime.client(&cluster.caller.node_id).unwrap();
+    let root_requests = no_links.then(|| {
+        cluster
+            .runtime
+            .capture_namespace_requests(&cluster.root.primary_node_id, 32)
+            .unwrap()
+    });
+    let mut lookups_at_first_projection = None;
     let captured = Arc::new(Mutex::new(Vec::new()));
     let gate = Arc::new(Semaphore::new(0));
     cluster.runtime.install_fault(FaultRule {
@@ -139,7 +171,11 @@ fn run_real_prefix_advances(name: &'static str, advances: usize) {
     let mut read = OwnedStatRead {
         gate: Arc::clone(&gate),
         task: Some(std::thread::spawn(move || {
-            let result = reader.posix_stat_distributed(target);
+            let result = if no_links {
+                reader.posix_open_beneath_no_links_distributed("/", target)
+            } else {
+                reader.posix_stat_distributed(target)
+            };
             (result, reader.transport.operation_deadline())
         })),
     };
@@ -162,6 +198,17 @@ fn run_real_prefix_advances(name: &'static str, advances: usize) {
             );
             std::thread::sleep(Duration::from_millis(2));
         };
+        if round == 0
+            && let Some(requests) = root_requests.as_ref()
+        {
+            let count =
+                subject_path_lookup_count(&requests.records(), &cluster.caller.node_id, target);
+            assert!(
+                count > 0,
+                "NoLinks must actually capture its path before the first projection"
+            );
+            lookups_at_first_projection = Some(count);
+        }
         assert_eq!(page.request.object_id, baseline.object_id);
         assert_eq!(page.request.object_version, baseline.version);
         assert!(
@@ -226,9 +273,16 @@ fn run_real_prefix_advances(name: &'static str, advances: usize) {
             _ => None,
         })
         .collect::<Vec<_>>();
+    let root_heads = root_requests.as_ref().map(|capture| capture.records());
+    let lookups_after_collection = root_heads
+        .as_ref()
+        .map(|heads| subject_path_lookup_count(heads, &cluster.caller.node_id, target));
     let evidence = serde_json::json!({
         "qualification": "actual normal3 split-owner native read-concurrency control; no Docker or production-fix attribution",
         "advances": advances, "existing_read_rounds": super::super::super::POSIX_ROUTED_SYNC_RETRY_ROUNDS,
+        "no_links_open": no_links, "actual_root_request_heads": root_heads,
+        "lookups_at_first_projection": lookups_at_first_projection,
+        "lookups_after_collection": lookups_after_collection,
         "action_elapsed_us": action_started.elapsed().as_micros(),
         "original_deadline_restored": restored_deadline == Some(original_deadline),
         "actual_publications": publications, "actual_receiver_responses": frames,
@@ -246,6 +300,13 @@ fn run_real_prefix_advances(name: &'static str, advances: usize) {
         eprintln!("stat concurrency evidence export failed: {error}");
     }
     assert_eq!(restored_deadline, Some(original_deadline));
+    if no_links {
+        assert!(lookups_at_first_projection.is_some());
+        assert_eq!(
+            lookups_after_collection, lookups_at_first_projection,
+            "stat read rounds must retain the opened identity without another path lookup"
+        );
+    }
     assert_eq!(
         changed.len(),
         advances,
@@ -287,6 +348,7 @@ fn run_real_prefix_advances(name: &'static str, advances: usize) {
     drop(read);
     cluster.runtime.clear_faults();
     drop(writer);
+    drop(root_requests);
     cluster.close();
 }
 
@@ -300,5 +362,19 @@ fn native_stat_four_real_prefix_advances_preserve_bounded_refusal() {
     run_real_prefix_advances(
         "stat-four-real-native-prefix-advances",
         super::super::super::POSIX_ROUTED_SYNC_RETRY_ROUNDS,
+    );
+}
+
+#[test]
+fn native_no_links_stat_one_real_prefix_advance_uses_existing_read_rounds() {
+    run_real_prefix_advances_for_open("no-links-stat-one-real-native-prefix-advance", 1, true);
+}
+
+#[test]
+fn native_no_links_stat_four_real_prefix_advances_preserve_bounded_refusal() {
+    run_real_prefix_advances_for_open(
+        "no-links-stat-four-real-native-prefix-advances",
+        super::super::super::POSIX_ROUTED_SYNC_RETRY_ROUNDS,
+        true,
     );
 }
