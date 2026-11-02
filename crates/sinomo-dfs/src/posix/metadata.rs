@@ -1372,12 +1372,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         captured_catalog: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsObjectMetadata> {
-        if object.kind != DfsObjectKind::Hardlink
-            || self.metadata_backend.is_some()
-            || !self.transport.delegates_local_namespace_authority()
-            || self.control_plane.is_none()
-        {
+        if object.kind != DfsObjectKind::Hardlink || self.control_plane.is_none() {
             return self.resolve_hardlink_target(object);
+        }
+        if self.metadata_backend.is_some() || !self.transport.delegates_local_namespace_authority()
+        {
+            // A target in a shard this node replicates reads locally; any
+            // other target is read from its authority.
+            return resolve_hardlink_target_with(object, |target_id| {
+                match self.current_read_object_metadata_distributed(target_id) {
+                    Ok(target) => Ok(Some(target)),
+                    Err(DfsError::UnknownObject { .. }) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            });
         }
         let owned_catalog;
         let catalog = match captured_catalog {
@@ -1476,7 +1484,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsPosixError::NotFound {
                 path: path.to_string(),
             })?;
-        self.resolve_hardlink_target(&object)
+        self.resolve_hardlink_target_distributed(&object, None)
     }
 
     pub(super) fn ensure_parent_directory(&self, path: &str) -> Result<()> {

@@ -576,7 +576,7 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 }
 
 #[test]
-fn sync_path_response_object_updates_outsider_read_view_without_journal_batches() {
+fn lookup_response_object_updates_outsider_read_view_without_journal_batches() {
     let name = "native-sync-path-outsider";
     let (runtime, initial, config) =
         crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
@@ -638,7 +638,10 @@ fn sync_path_response_object_updates_outsider_read_view_without_journal_batches(
         .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
             config.file_system_id.clone(),
             owner.clone(),
-            DfsNamespaceOperation::SyncPath { path: path.into() },
+            DfsNamespaceOperation::LookupPath {
+                path: path.into(),
+                inline_range: None,
+            },
             SIFS_CLUSTER_PUMP_DEADLINE,
             false,
             true,

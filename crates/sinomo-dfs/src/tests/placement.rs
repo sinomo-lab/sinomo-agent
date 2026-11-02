@@ -766,7 +766,6 @@ fn non_replica_read_surfaces_authority_failure_without_sync_path() {
             };
             let label = match &namespace.operation {
                 DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
-                DfsNamespaceOperation::SyncPath { .. } => "sync-path",
                 DfsNamespaceOperation::MetadataQuery { query }
                     if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
                 {
@@ -872,7 +871,7 @@ fn non_replica_read_surfaces_authority_failure_without_sync_path() {
     assert_eq!(
         calls.lock().expect("read calls").as_slice(),
         ["lookup-path"],
-        "a non-replica read answers only from its primary, never from SyncPath or a local copy"
+        "a non-replica read answers only from its primary, never from a local copy"
     );
 
     // Authoritative stat resolves the non-replica path through the same

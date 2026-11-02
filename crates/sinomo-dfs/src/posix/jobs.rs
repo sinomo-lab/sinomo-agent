@@ -204,6 +204,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.metadata_backend.is_none() {
             return Ok(DfsNamespaceJobMaintenanceReport::default());
         }
+        // A shard's primary resumes its own jobs; a local copy of a shard this
+        // node does not replicate is not kept current.
+        let replicated = self.locally_replicated_sifs_metadata_shards();
         let mut cursor = None;
         let mut report = DfsNamespaceJobMaintenanceReport::default();
         loop {
@@ -217,7 +220,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
             report.scanned_job_count = report.scanned_job_count.saturating_add(page.jobs.len());
             for job in page.jobs {
-                if job.status != DfsNamespaceJobStatus::Running {
+                if job.status != DfsNamespaceJobStatus::Running
+                    || self.path_in_unreplicated_sifs_shard(
+                        replicated.as_ref(),
+                        &job.file_system_id,
+                        &job.root_path,
+                    )?
+                {
                     continue;
                 }
                 if report.resumed_job_count >= max_jobs {

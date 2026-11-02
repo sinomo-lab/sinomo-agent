@@ -1482,8 +1482,8 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
 
 /// A 3-node SIFS cluster where `observer` is NOT in the root shard's replica
 /// set: the primary is the namespace authority, `writer` receives the pushed
-/// journal stream, and the outsider observer only converges its local mirror
-/// through routed-response batches and SyncPath pulls.
+/// journal stream, and the outsider observer keeps no copy of the shard and
+/// reads it through the primary.
 fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
     let mut cluster = sifs_posix_cluster(name, "/users");
     let mut installed = Vec::new();

@@ -201,13 +201,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let file_system_id = sifs_file_system_id();
             self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
-            if destination_primary != self.node_id
-                && self
-                    .cross_shard_namespace_locks
-                    .blocks(&file_system_id, &to)
-            {
-                self.sync_remote_namespace_path_until_quiet(&to)?;
-            }
             self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
             return self.coordinate_cross_shard_directory_rename(&from, &to, source);
         }
@@ -226,17 +219,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let file_system_id = sifs_file_system_id();
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
-        // A previous foreign mutation can already be complete on its author
-        // while this source's replica still retains its Running guard. Refresh
-        // through the existing authenticated journal path before deciding Busy;
-        // an actually running job keeps its guard and is still rejected below.
-        if destination_primary != self.node_id
-            && self
-                .cross_shard_namespace_locks
-                .blocks(&file_system_id, &to)
-        {
-            self.sync_remote_namespace_path_until_quiet(&to)?;
-        }
+        // Guards come only from shards this node replicates, which replication
+        // keeps current; the destination primary enforces its own.
         self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
         // Reject up front while writes are still settling so the caller sees
         // a clean retriable error with no job created.
@@ -728,10 +712,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             // A duplicate saga runner can retain the adoption frame after
             // another runner has already adopted and evicted the source-side
-            // object. Refresh the destination authority before classifying
-            // that exact replay as a missing source.
-            self.sync_remote_namespace_path(&target_path)?;
-            current = self.object_by_id(&frame_object.object_id)?;
+            // object. Read the destination from its authority before
+            // classifying that exact replay as a missing source.
+            current = match self.lookup_sifs_path_direct_distributed_synced(&target_path)? {
+                Some(object) if object.object_id == frame_object.object_id => Some(object),
+                _ => self.object_by_id(&frame_object.object_id)?,
+            };
         }
         let Some(current) = current else {
             return Err(DfsPosixError::NotFound { path: old_path });

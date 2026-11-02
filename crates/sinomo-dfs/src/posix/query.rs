@@ -285,9 +285,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    pub(crate) fn posix_object_policy(&self, path: &str) -> Result<sinomo_core::DfsObjectPolicy> {
-        self.posix_object_metadata_hint(path)
-            .map(|object| object.policy)
+    /// Policy of the object a write to `path` would replace, or `None` when
+    /// nothing exists there yet. A node whose durable store replicates the
+    /// path's shard uses that view; any other asks the shard's authority, since
+    /// a missing local record does not mean the path is new.
+    pub fn posix_existing_object_policy(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<sinomo_core::DfsObjectPolicy>> {
+        let requested = normalize_posix_path(path)?;
+        let local_store_replicates = match self.refresh_sifs_metadata_shards()? {
+            Some(shards) => self
+                .select_sifs_metadata_shard_for_path_from_snapshot(&requested, &shards)?
+                .is_none_or(|shard| {
+                    self.metadata_backend.is_some()
+                        && crate::service_routed_journal::shard_lists_node(&shard, &self.node_id)
+                }),
+            None => true,
+        };
+        if local_store_replicates {
+            return Ok(self
+                .posix_object_metadata_hint(path)
+                .ok()
+                .map(|object| object.policy));
+        }
+        match self.with_stat_deadline(|service| service.file_history_capture_object(path)) {
+            Ok(object) => Ok(Some(object.policy)),
+            Err(DfsPosixError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
@@ -472,9 +498,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.namespace_lstat_object_for_path(&object, &path)
     }
 
-    pub fn posix_stat_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsStat>> {
-        let Some(object) = self.object_by_id(object_id)? else {
-            return Ok(None);
+    pub fn posix_stat_object(&mut self, object_id: &DfsObjectId) -> Result<Option<DfsStat>> {
+        let object = match self.current_read_object_metadata_distributed(object_id) {
+            Ok(object) => object,
+            Err(crate::DfsError::UnknownObject { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         if object.kind == DfsObjectKind::Tombstone {
             return Ok(None);

@@ -5502,8 +5502,8 @@ fn sifs_write_options(
         candidates.insert(0, service.node_id().clone());
     }
     let object_policy = service
-        .posix_stat(path)
-        .map(|stat| stat.policy)
+        .posix_existing_object_policy(path)
+        .map_err(|error| error.to_string())?
         .unwrap_or(sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual);
     let (_, advertisements, policy) = service
         .managed_replication_policy_for_path(path, object_policy, candidates.len())

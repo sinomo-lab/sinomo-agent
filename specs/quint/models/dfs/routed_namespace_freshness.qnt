@@ -1,12 +1,12 @@
 /// DFS routed namespace freshness.
 ///
-/// This module refines `dfs_authority_routing` for the fragile namespace
-/// response path. It models the requester-side catch-up contract after a routed
-/// namespace mutation or distributed current lookup: a successful operation may
-/// complete only after the requester has replayed enough primary-sourced
-/// metadata journal, or after an explicit SyncPath response has installed the
-/// authoritative path object. It intentionally does not model backend metadata
-/// tables, object indexes, or read-snapshot caching.
+/// This module refines `dfs_authority_routing` for the namespace response path.
+/// It models how a requester completes a routed namespace mutation or a
+/// distributed current lookup: from the primary's authoritative answer, or, on
+/// a metadata replica, from a local view known to have reached the primary's
+/// sequence. Only a replica ingests primary-sourced journal batches or synced
+/// path objects; a non-replica keeps no copy of the shard. It intentionally does
+/// not model backend metadata tables, object indexes, or read-snapshot caching.
 module dfs_routed_namespace_freshness {
   import common.* from "../../lib/common"
 
@@ -15,7 +15,7 @@ module dfs_routed_namespace_freshness {
     | RoutedDelete
     | DistributedLookup
 
-  type RequesterRole = MetadataReplica | NonReplicaMirror
+  type RequesterRole = MetadataReplica | NonReplica
   type PathState = PathMissing | PathLive | PathTombstone
   type RequestPhase = Idle | CatchingUp | Terminal
   type TerminalOutcome = NoOutcome | CompletedFresh | FailedBounded
@@ -26,6 +26,7 @@ module dfs_routed_namespace_freshness {
     | SyncedPathApplied
     | LocalReplicaHitCompleted
     | FreshRequestCompleted
+    | PrimaryAnswerCompleted
     | BoundedFailure
     | TerminalStutter
 
@@ -34,7 +35,7 @@ module dfs_routed_namespace_freshness {
   pure val NamespaceOperations: Set[NamespaceOperation] =
     Set(RoutedCreate, RoutedDelete, DistributedLookup)
   pure val RequesterRoles: Set[RequesterRole] =
-    Set(MetadataReplica, NonReplicaMirror)
+    Set(MetadataReplica, NonReplica)
   pure val PathStates: Set[PathState] =
     Set(PathMissing, PathLive, PathTombstone)
 
@@ -51,6 +52,7 @@ module dfs_routed_namespace_freshness {
   var localPathState: PathState
   var returnedPathState: PathState
   var syncedPathApplied: bool
+  var answeredByPrimary: bool
   var lastBatchLimitReached: bool
   var acceptedJournalBatchSources: Set[Node]
   var terminalOutcome: TerminalOutcome
@@ -112,6 +114,7 @@ module dfs_routed_namespace_freshness {
     acceptedJournalBatchSources' = Set(),
     terminalOutcome' = NoOutcome,
     lastDecision' = NoDecision,
+    answeredByPrimary' = false,
   }
 
   /// Start either a routed mutation or a distributed current lookup. Mutations
@@ -158,16 +161,18 @@ module dfs_routed_namespace_freshness {
       terminalOutcome' = NoOutcome,
       phase' = CatchingUp,
       lastDecision' = NamespaceRequestStarted,
+      answeredByPrimary' = false,
     }
   }
 
-  /// Apply one bounded metadata journal batch from the current primary. If the
-  /// batch does not reach the target sequence, the requester must keep syncing
-  /// instead of treating the routed operation as complete.
+  /// A metadata replica applies one bounded journal batch from the current
+  /// primary. If the batch does not reach the target sequence, its local view
+  /// is not yet fresh. A non-replica receives no batches.
   action applyPrimaryJournalBatch(source: Node): bool = {
     val nextSeq = advanceOne(requesterSeq, targetSeq)
     all {
       phase == CatchingUp,
+      requesterRole == MetadataReplica,
       primaryReachable,
       source == currentPrimary,
       requesterSeq < targetSeq,
@@ -189,14 +194,15 @@ module dfs_routed_namespace_freshness {
       terminalOutcome' = terminalOutcome,
       phase' = phase,
       lastDecision' = JournalBatchApplied,
+      answeredByPrimary' = answeredByPrimary,
     }
   }
 
-  /// SyncPath installs the authoritative path object directly. This is the
-  /// abstraction for routed responses that carry `synced_path_object(s)` and for
-  /// distributed non-replica lookup/listing catch-up.
+  /// A metadata replica installs the authoritative path object a routed
+  /// response carries (`synced_path_object(s)`).
   action applySyncedPathObject: bool = all {
     phase == CatchingUp,
+    requesterRole == MetadataReplica,
     primaryReachable,
     localPathState' = primaryPathState,
     syncedPathApplied' = true,
@@ -215,11 +221,12 @@ module dfs_routed_namespace_freshness {
     terminalOutcome' = terminalOutcome,
     phase' = phase,
     lastDecision' = SyncedPathApplied,
+    answeredByPrimary' = answeredByPrimary,
   }
 
   /// A metadata replica may complete from its local view only when that local
-  /// view is already known to be at the target journal sequence. Non-replica
-  /// mirrors must use primary-sourced catch-up for distributed current reads.
+  /// view is already known to be at the target journal sequence. A non-replica
+  /// completes only from the primary's answer.
   action completeLocalReplicaCurrentHit: bool = all {
     phase == CatchingUp,
     operation == DistributedLookup,
@@ -247,10 +254,12 @@ module dfs_routed_namespace_freshness {
     acceptedJournalBatchSources' = acceptedJournalBatchSources,
     phase' = Terminal,
     lastDecision' = LocalReplicaHitCompleted,
+    answeredByPrimary' = answeredByPrimary,
   }
 
   action completeFreshRequest: bool = all {
     phase == CatchingUp,
+    requesterRole == MetadataReplica,
     requesterHasFreshPath(
       localPathState,
       primaryPathState,
@@ -276,6 +285,32 @@ module dfs_routed_namespace_freshness {
     acceptedJournalBatchSources' = acceptedJournalBatchSources,
     phase' = Terminal,
     lastDecision' = FreshRequestCompleted,
+    answeredByPrimary' = answeredByPrimary,
+  }
+
+  /// Complete from the reachable primary's authoritative answer, without
+  /// changing the requester's local view.
+  action completeFromPrimaryAnswer: bool = all {
+    phase == CatchingUp,
+    primaryReachable,
+    returnedPathState' = primaryPathState,
+    answeredByPrimary' = true,
+    terminalOutcome' = CompletedFresh,
+    operation' = operation,
+    requester' = requester,
+    currentPrimary' = currentPrimary,
+    requesterRole' = requesterRole,
+    primaryReachable' = primaryReachable,
+    primarySeq' = primarySeq,
+    requesterSeq' = requesterSeq,
+    targetSeq' = targetSeq,
+    primaryPathState' = primaryPathState,
+    localPathState' = localPathState,
+    syncedPathApplied' = syncedPathApplied,
+    lastBatchLimitReached' = lastBatchLimitReached,
+    acceptedJournalBatchSources' = acceptedJournalBatchSources,
+    phase' = Terminal,
+    lastDecision' = PrimaryAnswerCompleted,
   }
 
   action failBounded: bool = all {
@@ -304,6 +339,7 @@ module dfs_routed_namespace_freshness {
     acceptedJournalBatchSources' = acceptedJournalBatchSources,
     phase' = Terminal,
     lastDecision' = BoundedFailure,
+    answeredByPrimary' = answeredByPrimary,
   }
 
   action stutterTerminal: bool = all {
@@ -325,6 +361,7 @@ module dfs_routed_namespace_freshness {
     terminalOutcome' = terminalOutcome,
     phase' = phase,
     lastDecision' = TerminalStutter,
+    answeredByPrimary' = answeredByPrimary,
   }
 
   action step = any {
@@ -357,6 +394,7 @@ module dfs_routed_namespace_freshness {
     applySyncedPathObject,
     completeLocalReplicaCurrentHit,
     completeFreshRequest,
+    completeFromPrimaryAnswer,
     failBounded,
     stutterTerminal,
   }

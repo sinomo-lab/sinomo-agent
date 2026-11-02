@@ -643,17 +643,6 @@ fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_wri
             },
         ),
     );
-    let sync_path = test_dfs_message_command_from_message(
-        &source,
-        &target,
-        3,
-        namespace_command(
-            "dfs_sync_path_no_inline_repair",
-            DfsNamespaceOperation::SyncPath {
-                path: "/services/no-inline-repair".to_string(),
-            },
-        ),
-    );
     let read = test_dfs_message_command_from_message(
         &source,
         &target,
@@ -691,7 +680,6 @@ fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_wri
 
     assert!(!dfs_message_allows_write_repair_progress(&lookup));
     assert!(!dfs_message_allows_write_repair_progress(&mkdir));
-    assert!(!dfs_message_allows_write_repair_progress(&sync_path));
     assert!(!dfs_message_allows_write_repair_progress(&read));
     assert!(!dfs_message_allows_write_repair_progress(&background_write));
     assert!(dfs_message_allows_write_repair_progress(
@@ -1331,9 +1319,9 @@ fn served_foreground_write_returns_committed_response_before_replica_repair_comp
 }
 
 #[test]
-fn served_sync_path_does_not_retry_repairs_inline() {
+fn served_lookup_path_does_not_retry_repairs_inline() {
     let (runtime, primary, requester, service, base, broken_intent, _path) =
-        native_broken_patch_wait("native-served-sync-no-inline-repair");
+        native_broken_patch_wait("native-served-lookup-no-inline-repair");
     let record = service
         .metadata_backend()
         .unwrap()
@@ -1349,8 +1337,9 @@ fn served_sync_path_does_not_retry_repairs_inline() {
         .route_namespace_operation_to_metadata_primary_without_local_replay(
             sifs_file_system_id(),
             primary.clone(),
-            DfsNamespaceOperation::SyncPath {
+            DfsNamespaceOperation::LookupPath {
                 path: "/services".into(),
+                inline_range: None,
             },
         )
         .unwrap();

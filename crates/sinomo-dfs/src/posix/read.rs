@@ -1353,7 +1353,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_read_file_for_object(&mut self, object_id: &DfsObjectId) -> Result<Vec<u8>> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
-            .current_read_object_metadata(object_id)
+            .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });
@@ -1425,7 +1425,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
         let object = self
-            .current_read_object_metadata(object_id)
+            .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });

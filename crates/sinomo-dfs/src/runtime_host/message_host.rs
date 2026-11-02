@@ -3862,7 +3862,6 @@ fn daemon_dfs_genesis_ingress_scopes(
                     | Op::PollNamespaceChanges { .. }
                     | Op::LookupPath { .. }
                     | Op::LookupPaths { .. }
-                    | Op::SyncPath { .. }
                     | Op::FileSync { .. }
                     | Op::DirectorySync { .. }
                     | Op::AbortPendingWrite { .. }

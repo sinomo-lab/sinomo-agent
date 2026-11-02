@@ -3469,14 +3469,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        let main_requester = self.metadata_backend.is_none()
-            && self.transport.delegates_local_namespace_authority()
-            && self.control_plane.is_some();
-        let authoritative_parent = if check_parent && opened_parent.is_none() && main_requester {
-            Some(self.posix_write_parent_from_main(&path)?)
-        } else {
-            None
-        };
+        let plans_from_authority = !self.plans_write_from_local_metadata(&path)?;
+        let authoritative_parent =
+            if check_parent && opened_parent.is_none() && plans_from_authority {
+                Some(self.posix_write_parent_from_main(&path)?)
+            } else {
+                None
+            };
         let opened_parent = opened_parent.or(authoritative_parent.as_ref());
         if check_parent {
             if let Some(parent) = opened_parent {
@@ -3499,7 +3498,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_path = path.clone();
         let trace_bytes = bytes.len();
         let mut transient_create = false;
-        let current_object = if main_requester {
+        let current_object = if plans_from_authority {
             self.lookup_sifs_path_direct_distributed_synced(&path)?
         } else {
             self.lookup_sifs_path(&path)?
@@ -4316,10 +4315,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => Err(error),
             };
         }
-        let main_requester = self.metadata_backend.is_none()
-            && self.transport.delegates_local_namespace_authority()
-            && self.control_plane.is_some();
-        let authoritative_parent = if check_parent && main_requester {
+        let plans_from_authority = !self.plans_write_from_local_metadata(&path)?;
+        let authoritative_parent = if check_parent && plans_from_authority {
             Some(self.posix_write_parent_from_main(&path)?)
         } else {
             if check_parent {
@@ -4327,7 +4324,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             None
         };
-        let current_object = if main_requester {
+        let current_object = if plans_from_authority {
             self.lookup_sifs_path_direct_distributed_synced(&path)?
         } else {
             self.lookup_sifs_path(&path)?
@@ -4907,7 +4904,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
-            .current_read_object_metadata(object_id)
+            .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });
@@ -5120,7 +5117,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<DfsStat> {
         let _namespace_plan = self.namespace_execution.begin_planning();
         let object = self
-            .current_read_object_metadata(object_id)
+            .current_read_object_metadata_distributed(object_id)
             .map_err(DfsPosixError::from)?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path: object.path });

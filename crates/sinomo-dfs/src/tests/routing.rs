@@ -2385,8 +2385,8 @@ fn local_owned_read_is_routed_to_owner_node() {
         )
         .unwrap();
     assert_eq!(stat.policy, DfsObjectPolicy::LocalOwned);
-    // The facade's SyncPath does not replay into Main's store. Certify the
-    // actual author cut on both metadata members before the object-id read.
+    // Certify the actual author cut on both metadata members before the
+    // object-id read.
     // The barrier and existing lookup share the original five-second budget.
     let sync_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
     let object = owner_dfs
@@ -2414,18 +2414,6 @@ fn local_owned_read_is_routed_to_owner_node() {
         !remaining.is_zero(),
         "metadata setup retains its original sync budget"
     );
-    let synced = reader
-        .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-            stat.file_system_id.clone(),
-            owner.clone(),
-            DfsNamespaceOperation::SyncPath { path: path.into() },
-            remaining,
-            true,
-            true,
-        )
-        .unwrap();
-    assert_eq!(synced.result, DfsNamespaceResult::Applied);
-    assert!(!synced.metadata_journal_has_more);
     assert_eq!(
         reader
             .request_remote_object_read_without_cache(&stat.object_id)

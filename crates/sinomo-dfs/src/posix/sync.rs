@@ -171,7 +171,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: object_id.to_string(),
                 })?
         } else {
-            self.current_read_object_metadata(object_id)
+            self.current_read_object_metadata_distributed(object_id)
                 .map_err(DfsPosixError::from)?
         };
         if object.kind == DfsObjectKind::Directory {

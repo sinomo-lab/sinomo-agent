@@ -172,6 +172,8 @@ Shard rules:
 - Journal batches are bounded by entry count and encoded size.
 - A replica applies the primary's sequence exactly; it does not append local
   entries into that sequence.
+- Only the primary and configured replicas hold a shard's metadata. Journal
+  batches, snapshot installs and routed-response batches feed replicas only.
 - A sequence fork triggers authoritative snapshot recovery rather than merge.
 - Scans and hydration are cursor-based, so restart and listing do not require
   one unbounded allocation.
@@ -367,9 +369,11 @@ exists elsewhere. The branch never becomes a second canonical history.
 Distributed POSIX stat derives current inode fields through bounded authenticated
 metadata projections; see [the authoritative stat contract](dfs-authoritative-stat.md)
 for generation, cross-shard completeness, compatibility and outage behavior.
-Path metadata is answered by the shard's primary or one of its replicas. A node
-outside the replica set reads through the primary and surfaces the primary's
-error rather than a local copy.
+Path and object metadata is answered by the shard's primary or one of its
+replicas. A node outside the replica set reads paths, open handles, inode
+identities and hardlink targets through the primary, plans its writes against
+the primary's current object, and surfaces the primary's error rather than a
+local copy.
 
 Reads prefer the closest valid copy:
 

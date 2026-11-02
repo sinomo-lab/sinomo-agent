@@ -10,10 +10,17 @@ use sinomo_core::node::NodeId;
 use crate::*;
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// The journal position a routed request advertises for `shard`, so its
+    /// primary returns the entries this node's replica is missing. A node that
+    /// does not replicate the shard advertises nothing and receives no batches.
     pub(crate) fn local_metadata_journal_after_sequence_for_shard(
         &mut self,
-        shard_id: &DfsMetadataShardId,
+        shard: &DfsMetadataShardConfig,
     ) -> Result<Option<u64>, DfsError> {
+        if !shard_lists_node(shard, &self.node_id) {
+            return Ok(None);
+        }
+        let shard_id = &DfsMetadataShardId::new(shard.shard_id.clone());
         self.refresh_routed_replica_projection(shard_id)?;
         if let Some(after_sequence) = self
             .replication
@@ -211,7 +218,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(shard) = self.select_metadata_shard_for_object(&object)? else {
             return Ok(Vec::new());
         };
-        if shard.primary_node_id != self.node_id {
+        if shard.primary_node_id != self.node_id || !shard_lists_node(&shard, requester_node_id) {
             return Ok(Vec::new());
         }
         self.metadata_journal_batches_for_shard_since_limited(
@@ -288,6 +295,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         validated_authority_shard: &DfsMetadataShardConfig,
         frames: &DfsMetadataJournalFrameBatch,
     ) -> Result<(), DfsError> {
+        if !shard_lists_node(validated_authority_shard, &self.node_id) {
+            // Response batches feed only the shard's replicas; any other node
+            // reads the shard through its primary.
+            return Ok(());
+        }
         let batch = frames.decoded()?;
         let permit = self.validate_routed_response_journal_batch(
             primary_node_id,
@@ -503,4 +515,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             validated_authority_shard.epoch,
         ))
     }
+}
+
+/// Whether `node_id` is the shard's primary or one of its replicas.
+pub(crate) fn shard_lists_node(shard: &DfsMetadataShardConfig, node_id: &NodeId) -> bool {
+    shard.primary_node_id == *node_id || shard.replica_node_ids.contains(node_id)
 }

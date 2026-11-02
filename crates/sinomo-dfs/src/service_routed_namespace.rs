@@ -255,8 +255,7 @@ fn namespace_operation_should_replay_journal_batches(operation: &DfsNamespaceOpe
 fn namespace_operation_returns_synced_response_objects(operation: &DfsNamespaceOperation) -> bool {
     matches!(
         operation,
-        DfsNamespaceOperation::SyncPath { .. }
-            | DfsNamespaceOperation::LookupPath { .. }
+        DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
             | DfsNamespaceOperation::ReconcilePlacement { .. }
             | DfsNamespaceOperation::Mkdir { .. }
@@ -275,8 +274,7 @@ fn namespace_request_returns_synced_response_objects(
     // mutations request object payloads only for foreground response replay.
     matches!(
         operation,
-        DfsNamespaceOperation::SyncPath { .. }
-            | DfsNamespaceOperation::LookupPath { .. }
+        DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
             | DfsNamespaceOperation::ReconcilePlacement { .. }
     ) || (include_metadata_journal_batches
@@ -315,7 +313,6 @@ fn namespace_operation_uses_durable_request_admission(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::PollNamespaceChanges { .. }
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
-                | DfsNamespaceOperation::SyncPath { .. }
                 // Progress is already owned by the exact durable job. A new
                 // Pending row would reacquire its retained physical writer.
                 | DfsNamespaceOperation::ResumeNamespaceJobBounded { .. }
@@ -378,7 +375,6 @@ pub(crate) fn namespace_operation_response_retry_safe(operation: &DfsNamespaceOp
                 | DfsNamespaceOperation::PollNamespaceChanges { .. }
                 | DfsNamespaceOperation::LookupPath { .. }
                 | DfsNamespaceOperation::LookupPaths { .. }
-                | DfsNamespaceOperation::SyncPath { .. }
                 | DfsNamespaceOperation::AdvisoryLock { .. }
                 | DfsNamespaceOperation::FileSync { .. }
                 | DfsNamespaceOperation::DirectorySync { .. }
@@ -825,7 +821,6 @@ fn namespace_transaction_proves_operation_completed(
         | DfsNamespaceOperation::ClearDirRecursive { .. }
         | DfsNamespaceOperation::ReconcilePlacement { .. }
         | DfsNamespaceOperation::AbortPendingWrite { .. }
-        | DfsNamespaceOperation::SyncPath { .. }
         | DfsNamespaceOperation::LookupPath { .. }
         | DfsNamespaceOperation::LookupPaths { .. }
         | DfsNamespaceOperation::AdvisoryLock { .. }
@@ -2013,122 +2008,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .next())
     }
 
-    fn synced_namespace_objects_for_sync_path(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        path: &str,
-    ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
-        let Some(normalized_path) = posix_path::normalized_posix_path_key(path) else {
-            return Ok(Vec::new());
-        };
-        let mut objects = Vec::new();
-        let mut include_direct_children = false;
-        if let Some(object) =
-            self.synced_namespace_object_for_path(file_system_id, &normalized_path)?
-        {
-            include_direct_children =
-                object.kind == DfsObjectKind::Directory && file_system_id == &sifs_file_system_id();
-            objects.push(object);
-        }
-        if include_direct_children {
-            let children = self
-                .child_objects_for_sifs_dir(&normalized_path)
-                .map_err(dfs_error_from_posix_namespace_sync)?;
-            let mut children_by_path = BTreeMap::<String, DfsObjectMetadata>::new();
-            for object in children {
-                let object = self.object_metadata_with_receipt_locations(object)?;
-                children_by_path.insert(metadata_path(&object.path), object);
-            }
-            for tombstone in
-                self.direct_child_tombstones_for_sifs_dir(file_system_id, &normalized_path)?
-            {
-                let path = metadata_path(&tombstone.path);
-                children_by_path.insert(path, tombstone);
-            }
-            objects.extend(children_by_path.into_values());
-        }
-        Ok(objects)
-    }
-
-    fn direct_child_tombstones_for_sifs_dir(
-        &self,
-        file_system_id: &DfsFileSystemId,
-        directory_path: &str,
-    ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
-        let mut memory_by_path = BTreeMap::<String, DfsObjectMetadata>::new();
-        for ((tombstone_file_system_id, metadata_path), object) in &self.tombstones_by_metadata_path
-        {
-            if tombstone_file_system_id == file_system_id
-                && metadata_path_is_direct_child_of_posix_dir(directory_path, metadata_path)
-            {
-                memory_by_path.insert(metadata_path.clone(), object.clone());
-            }
-        }
-        for object in self.metadata.objects.values() {
-            if object.file_system_id != *file_system_id {
-                continue;
-            }
-            let object_metadata_path = metadata_path(&object.path);
-            if !metadata_path_is_direct_child_of_posix_dir(directory_path, &object_metadata_path) {
-                continue;
-            }
-            let replace = memory_by_path
-                .get(&object_metadata_path)
-                .is_none_or(|existing| {
-                    existing.version < object.version
-                        || (existing.version == object.version
-                            && existing.kind == DfsObjectKind::Tombstone
-                            && object.kind != DfsObjectKind::Tombstone)
-                });
-            if replace {
-                memory_by_path.insert(object_metadata_path, object.clone());
-            }
-        }
-        let mut candidate_paths = memory_by_path.keys().cloned().collect::<BTreeSet<_>>();
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            for object in backend.child_tombstones_for_directory(file_system_id, directory_path)? {
-                let object_metadata_path = metadata_path(&object.path);
-                if !metadata_path_is_direct_child_of_posix_dir(
-                    directory_path,
-                    &object_metadata_path,
-                ) {
-                    continue;
-                }
-                candidate_paths.insert(object_metadata_path);
-            }
-        }
-        let mut tombstones = Vec::new();
-        for path in candidate_paths {
-            let memory_object = memory_by_path.get(&path);
-            let backend_object = self
-                .metadata_backend
-                .as_ref()
-                .map(|backend| backend.get_object_by_path(file_system_id, &path))
-                .transpose()?
-                .flatten();
-            let authoritative = match (memory_object, backend_object.as_ref()) {
-                (Some(memory_object), Some(backend_object))
-                    if self.local_write_view_overrides_backend(
-                        &memory_object.object_id,
-                        memory_object,
-                        Some(backend_object),
-                    ) =>
-                {
-                    Some(memory_object.clone())
-                }
-                (_, Some(backend_object)) => Some(backend_object.clone()),
-                (Some(memory_object), None) => Some(memory_object.clone()),
-                (None, None) => None,
-            };
-            if let Some(object) = authoritative
-                && object.kind == DfsObjectKind::Tombstone
-            {
-                tombstones.push(self.object_metadata_with_receipt_locations(object)?);
-            }
-        }
-        Ok(tombstones)
-    }
-
     fn synced_mkdir_all_paths(path: &str) -> Vec<String> {
         let Some(normalized) = posix_path::normalized_posix_path_key(path) else {
             return Vec::new();
@@ -2192,9 +2071,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation: &DfsNamespaceOperation,
     ) -> Result<Vec<DfsObjectMetadata>, DfsError> {
         let paths: Vec<String> = match operation {
-            DfsNamespaceOperation::SyncPath { path } => {
-                return self.synced_namespace_objects_for_sync_path(file_system_id, path);
-            }
             DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::Mkdir { path }
@@ -2310,6 +2186,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut trace_execute_ms = 0;
         let mut trace_completion_ms = 0;
         let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
+        let mut journal_recipient_shard_ids = BTreeSet::<DfsMetadataShardId>::new();
         let read_only_lookup = matches!(
             &command.operation,
             DfsNamespaceOperation::MetadataQuery { .. }
@@ -2485,6 +2362,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         affected_shard_ids = shards
                             .iter()
                             .filter(|shard| shard.primary_node_id == self.node_id)
+                            .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
+                            .collect();
+                        // Only the requester's own replicas are fed by them.
+                        journal_recipient_shard_ids = shards
+                            .iter()
+                            .filter(|shard| {
+                                shard.primary_node_id == self.node_id
+                                    && crate::service_routed_journal::shard_lists_node(
+                                        shard,
+                                        &command.requesting_node_id,
+                                    )
+                            })
                             .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
                             .collect();
                         let foreign_shard = shards
@@ -2989,7 +2878,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     | DfsNamespaceOperation::PollNamespaceChanges { .. }
                     | DfsNamespaceOperation::LookupPath { .. }
                     | DfsNamespaceOperation::LookupPaths { .. }
-                    | DfsNamespaceOperation::SyncPath { .. }
                     | DfsNamespaceOperation::AdvisoryLock { .. }
                     | DfsNamespaceOperation::FileSync { .. }
                     | DfsNamespaceOperation::DirectorySync { .. }
@@ -3011,7 +2899,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && namespace_operation_should_replay_journal_batches(&command.operation)
         {
             let mut batches = Vec::new();
-            for shard_id in &affected_shard_ids {
+            for shard_id in affected_shard_ids
+                .iter()
+                .filter(|shard_id| journal_recipient_shard_ids.contains(shard_id))
+            {
                 let after_sequence = command
                     .metadata_journal_after_sequences
                     .iter()
@@ -3053,9 +2944,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Vec::new()
         };
         let synced_path_object = match &command.operation {
-            DfsNamespaceOperation::SyncPath { .. } | DfsNamespaceOperation::LookupPath { .. } => {
-                synced_path_objects.first().cloned()
-            }
+            DfsNamespaceOperation::LookupPath { .. } => synced_path_objects.first().cloned(),
             _ => None,
         };
         if posix_coordination_result.is_none()
@@ -3409,6 +3298,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if response_applied
             && apply_synced_path_object
             && let Some(object) = response.synced_path_object.as_ref()
+            && self.routed_response_object_is_locally_read(object)?
             && let Err(error) = self.apply_metadata_object_to_service_state(object.clone())
         {
             let reason = format!("routed namespace path sync failed: {error}");
@@ -3436,6 +3326,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         if response_applied && apply_synced_path_object {
             for object in &response.synced_path_objects {
+                if !self.routed_response_object_is_locally_read(object)? {
+                    continue;
+                }
                 if let Err(error) = self.apply_metadata_object_to_service_state(object.clone()) {
                     let reason = format!("routed namespace path sync failed: {error}");
                     if let Some(pending) = self
@@ -3642,13 +3535,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.local_metadata_shard_cursors_for(None)
     }
 
+    /// Whether this service keeps `object`'s shard in its own metadata, so a
+    /// routed response may refresh its view of the object. Any other shard is
+    /// read through its primary.
+    fn routed_response_object_is_locally_read(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<bool, DfsError> {
+        let Some(shards) = self.metadata_shard_config_snapshot(&object.file_system_id)? else {
+            return Ok(true);
+        };
+        Ok(crate::control_plane::select_metadata_shard_config_for_path(
+            &object.file_system_id,
+            &shards,
+            &object.path,
+        )?
+        .is_none_or(|shard| self.reads_shard_from_local_metadata(&shard)))
+    }
+
     pub(crate) fn local_metadata_shard_cursors_for(
         &mut self,
         requested_shards: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
         let shards = match requested_shards {
+            // Only shards this node replicates are fed by response batches.
             Some(requested) => requested
                 .iter()
+                .filter(|shard| {
+                    crate::service_routed_journal::shard_lists_node(shard, &self.node_id)
+                })
                 .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
                 .collect::<BTreeSet<_>>(),
             None => self
@@ -4430,15 +4345,21 @@ where
         replay_journal_batches: bool,
         apply_synced_path_object: bool,
     ) -> Result<PendingRoutedNamespaceResult, DfsError> {
-        let readonly_placement_lookup =
-            matches!(&operation, DfsNamespaceOperation::LookupPaths { .. })
-                && !replay_journal_batches
-                && !apply_synced_path_object;
+        let readonly_placement_read = !replay_journal_batches
+            && !apply_synced_path_object
+            && match &operation {
+                DfsNamespaceOperation::LookupPaths { .. } => true,
+                DfsNamespaceOperation::MetadataQuery { query } => matches!(
+                    query.selection,
+                    crate::DfsMetadataSelection::SubtreeObjectPageV1 { .. }
+                ),
+                _ => false,
+            };
         if !matches!(&operation, DfsNamespaceOperation::ReconcilePlacement { .. })
-            && !readonly_placement_lookup
+            && !readonly_placement_read
         {
             return Err(DfsError::Distributed {
-                message: "async placement routing accepts only ReconcilePlacement or read-only LookupPaths".to_string(),
+                message: "async placement routing accepts only ReconcilePlacement, read-only LookupPaths or subtree object pages".to_string(),
             });
         }
         validate_namespace_operation_id(&request_id)?;

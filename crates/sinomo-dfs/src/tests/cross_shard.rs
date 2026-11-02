@@ -4000,6 +4000,12 @@ fn same_node_distinct_shard_hardlink_alias_uses_durable_saga_and_survives_cold_r
             DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. }
             | DfsNamespaceOperation::PollNamespaceChanges { .. } => owner_read = true,
+            // A delegating caller resolves hardlink targets through Main.
+            DfsNamespaceOperation::MetadataQuery { query }
+                if matches!(query.selection, DfsMetadataSelection::CurrentObject { .. }) =>
+            {
+                owner_read = true
+            }
             DfsNamespaceOperation::MetadataQuery { query }
                 if matches!(query.selection, DfsMetadataSelection::StatAtPathV1 { .. }) =>
             {

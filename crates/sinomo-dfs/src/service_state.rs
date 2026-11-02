@@ -147,9 +147,9 @@ pub const DFS_ROUTED_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 16;
 /// replication and explicit sync operations continue catch-up beyond it.
 pub(crate) const DFS_ROUTED_WRITE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
 /// Journal batches a namespace primary ships in one foreground namespace
-/// response. Namespace mutations also carry synced path objects and can pull
-/// additional journal batches with bounded SyncPath rounds, so keep the first
-/// response small enough to return promptly on deep real-cluster journals.
+/// response. Replicas receive the rest through ordinary journal replication,
+/// so keep the first response small enough to return promptly on deep
+/// real-cluster journals.
 pub const DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT: usize = 1;
 /// Maximum journal entries packed into one foreground namespace response
 /// batch. Namespace catch-up is latency-sensitive and benefits from denser
