@@ -3,9 +3,9 @@
 //! This module owns the default distributed SIFS topology, shard layout, and
 //! service advertisements that make a cluster's DFS usable after bootstrap.
 
-pub(crate) mod genesis;
 #[cfg(test)]
 pub(crate) mod bootstrap_observation;
+pub(crate) mod genesis;
 #[cfg(test)]
 mod genesis_followup_tests;
 
@@ -15,7 +15,7 @@ use sinomo_core::network::{
     ClusterConnectivityGraph, ClusterPaths, cluster_healthy_route_next_hop,
     pooled_routed_relationship_is_active,
 };
-use sinomo_core::node::{DFS_METADATA_PREPARED_OPERATION_V7_CAPABILITY, NodeId};
+use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -28,20 +28,18 @@ use time::OffsetDateTime;
 use crate::control_plane::topology_preserving_metadata_shard_replicas;
 use crate::service_sync::rebind_completed_metadata_shard_membership_handoff;
 use crate::{
-    AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
-    DfsControlPlaneStore, DfsError, DfsFileSystem, DfsFileSystemConfig, DfsFileSystemId,
-    DfsMessageSender, DfsMetadataBackend, DfsMetadataJournalBatchSender,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffProof,
-    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsPeerTransport, DfsSmokeOptions,
-    DfsSmokeReport, DfsSubtreePolicy, ResidentLocalShardedMetadataBackend, SIFS_SERVICES_PATH,
-    SIFS_USERS_PATH, content_service_key, default_dfs_metadata_shards_root,
-    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
+    AsyncDfsControlPlaneKvClient, DfsControlPlaneAsyncStore, DfsError, DfsFileSystem,
+    DfsFileSystemConfig, DfsFileSystemId, DfsMetadataBackend, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardHeadWatermark, DfsMetadataShardId,
+    DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffProof,
+    DfsNodeAdvertisement, DfsPeerTransport, DfsSmokeOptions, DfsSmokeReport, DfsSubtreePolicy,
+    ResidentLocalShardedMetadataBackend, SIFS_SERVICES_PATH, SIFS_USERS_PATH, content_service_key,
+    default_dfs_metadata_shards_root, dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport, distributed_sifs,
     file_system_config_key, local_dfs_metadata_shard_path, metadata_service_key,
     metadata_shard_key, metadata_shard_membership_handoff_key,
-    metadata_shard_membership_handoff_proof_key, open_cluster_aware_dfs_metadata_backend,
-    open_local_metadata_shard_backend, open_local_sharded_metadata_backend_for_replica_repair,
+    metadata_shard_membership_handoff_proof_key, open_local_metadata_shard_backend,
+    open_local_sharded_metadata_backend_for_replica_repair,
     run_cluster_dfs_smoke_with_runtime_client, sifs_node_files_path,
 };
 
@@ -232,20 +230,6 @@ pub fn invalidate_default_cluster_dfs_materialization_for_replica_progress(
     true
 }
 
-/// Whether the settled/default materializer currently consumes exact replica
-/// generations.
-#[cfg(test)]
-fn default_cluster_dfs_materialization_awaits_replica_progress(data_dir: &SinomoDataDir) -> bool {
-    DFS_DEFAULT_MATERIALIZATION_SIGNATURES
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .is_ok_and(|signatures| {
-            signatures
-                .get(&data_dir.root())
-                .is_some_and(|cached| cached.awaiting_replica_progress)
-        })
-}
-
 /// Prime the real process-local subscription state for cross-crate reactor
 /// tests. This is compiled only when a consumer explicitly enables the
 /// `test-support` feature; production callers establish the same state solely
@@ -266,31 +250,6 @@ pub fn test_establish_default_cluster_dfs_replica_progress_subscription(data_dir
         },
         true,
     );
-}
-
-#[cfg(test)]
-static DFS_DEFAULT_MATERIALIZATION_RUNS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
-    OnceLock::new();
-
-#[cfg(test)]
-fn record_default_materialization_run(data_root: &Path) {
-    if let Ok(mut runs) = DFS_DEFAULT_MATERIALIZATION_RUNS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-    {
-        let count = runs.entry(data_root.to_path_buf()).or_default();
-        *count = count.saturating_add(1);
-    }
-}
-
-#[cfg(test)]
-fn default_materialization_run_count(data_root: &Path) -> usize {
-    DFS_DEFAULT_MATERIALIZATION_RUNS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .ok()
-        .and_then(|runs| runs.get(data_root).copied())
-        .unwrap_or_default()
 }
 
 pub type DfsDefaultClusterBootstrapFuture<'a, T> =

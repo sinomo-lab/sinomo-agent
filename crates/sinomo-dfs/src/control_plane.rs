@@ -36,8 +36,7 @@ use std::time::Instant;
 mod recovery_ballot;
 #[cfg(test)]
 pub(crate) use recovery_ballot::{
-    DfsMetadataShardRecoveryBallot, DfsMetadataShardRecoveryBallotRequest,
-    DfsRecoveryBallotBegin, DfsRecoveryBallotFloorView, DfsRecoveryBallotRefusal,
+    DfsMetadataShardRecoveryBallotRequest, DfsRecoveryBallotBegin, DfsRecoveryBallotRefusal,
     DfsRecoveryBallotVerify, metadata_shard_recovery_ballot_key,
 };
 
@@ -9557,33 +9556,6 @@ mod tests {
             DfsPlacementAuthorityRecoveryOutcome::Changed
         );
         assert!(client.authoritative.get(&key).is_some());
-    }
-
-    fn membership_handoff_proof(
-        handoff: &DfsMetadataShardMembershipHandoff,
-        journal_sequence: u64,
-    ) -> DfsMetadataShardMembershipHandoffProof {
-        let retiring_node_ids = metadata_shard_configured_node_ids(&handoff.retiring_shard);
-        let desired_node_ids = metadata_shard_configured_node_ids(&handoff.desired_shard);
-        let acknowledged_node_ids = retiring_node_ids
-            .union(&desired_node_ids)
-            .cloned()
-            .collect();
-        let state_fingerprint = handoff
-            .retiring_primary_fence
-            .as_ref()
-            .filter(|fence| fence.journal_sequence == journal_sequence)
-            .map(|fence| fence.state_fingerprint.clone())
-            .unwrap_or_else(|| format!("blake3:membership-handoff-{journal_sequence}"));
-        DfsMetadataShardMembershipHandoffProof {
-            cause: crate::DfsMetadataShardHandoffCause::Membership,
-            handoff_id: handoff.handoff_id.clone(),
-            retiring_shard: handoff.retiring_shard.clone(),
-            desired_shard: handoff.desired_shard.clone(),
-            journal_sequence,
-            state_fingerprint,
-            acknowledged_node_ids,
-        }
     }
 
     #[test]

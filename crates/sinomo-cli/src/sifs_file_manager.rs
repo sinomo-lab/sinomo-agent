@@ -5,6 +5,8 @@ use crate::file_manager::{
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
+#[cfg(test)]
+use sinomo_runtime::dfs::DfsPeerTransportFuture;
 #[cfg(any(unix, test))]
 use sinomo_runtime::dfs::DfsPosixCreateAttrs;
 use sinomo_runtime::dfs::{
@@ -12,25 +14,23 @@ use sinomo_runtime::dfs::{
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError, DfsFileSystemConfig,
     DfsMessageTransport, DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement,
     DfsNodeTransport, DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView,
-    DfsOperatorStatus, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
-    DfsPinAddRequest, DfsPinMode, DfsPlacementBlockingDiagnostic, DfsPlacementImpact,
-    DfsPlacementNodePreview, DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
+    DfsOperatorStatus, DfsPeerTransport, DfsPeerTransportError, DfsPinAddRequest, DfsPinMode,
+    DfsPlacementBlockingDiagnostic, DfsPlacementImpact, DfsPlacementNodePreview,
+    DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
     DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
     DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
-    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
-    DfsPosixDistributedFilePrefixReadOutcome, DfsPosixDistributedFileReadOutcome, DfsPosixError,
-    DfsResolvedPlacementPolicy, DfsStableNamespaceOperationReconciliation, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    discovered_cluster_dfs_peer_node_ids, metadata_shards_prefix,
-    open_cluster_aware_dfs_metadata_backend_for_inspection,
+    DfsPlacementReconciliationJob, DfsPlacementScope, DfsPosixDistributedFilePrefixReadOutcome,
+    DfsPosixDistributedFileReadOutcome, DfsPosixError, DfsResolvedPlacementPolicy,
+    DfsStableNamespaceOperationReconciliation, DfsStat, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, default_dfs_pin_root, discovered_cluster_dfs_peer_node_ids,
+    metadata_shards_prefix, open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     preview_placement_with_unavailable_nodes,
     select_metadata_shard_config_for_path_strict_default_sifs_split, sifs_file_system_id,
     with_cached_cluster_aware_dfs_metadata_inspection,
 };
 use sinomo_runtime::dfs_attachments::DfsAttachmentsExt;
-use sinomo_runtime::dfs_history::DfsHistoryExt;
 use sinomo_runtime::kv::{
     KvError, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnRequest, KvTxnResponse,
 };
@@ -641,6 +641,7 @@ impl SifsFileManagerBackend {
         }))
     }
 
+    #[cfg(test)]
     fn from_resident_owner(
         data_dir: &SinomoDataDir,
         rpc_runtime: SifsRpcRuntime,
@@ -1488,14 +1489,6 @@ impl SifsFileManagerBackend {
                     .collect()
             })
             .map_err(|error| format!("cannot list {path}: {error}"))
-    }
-
-    pub(crate) fn debug_remove_local_loose_blob_for_path(
-        &self,
-        path: &str,
-    ) -> Result<DfsStat, String> {
-        self.debug_remove_local_loose_blob_for_path_with_expectation(path, None)
-            .map(|(stat, _)| stat)
     }
 
     pub(crate) fn debug_remove_local_loose_blob_for_path_with_expectation(
@@ -9946,24 +9939,6 @@ mod tests {
             .close()
             .expect("actual current fixture closes and retains its durable volume");
         shards
-    }
-
-    fn write_metadata_shard_snapshot(
-        cluster_paths: &ClusterPaths,
-        shards: &[DfsMetadataShardConfig],
-    ) {
-        let mut kv = sinomo_runtime::kv::InProcessKvStore::new();
-        {
-            let mut control = DfsControlPlaneStore::new(&mut kv);
-            for shard in shards {
-                control.put_metadata_shard(shard).expect("metadata shard");
-            }
-        }
-        sinomo_runtime::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &kv.try_snapshot().expect("KV snapshot"),
-        )
-        .expect("write metadata shard snapshot");
     }
 
     fn metadata_journal_heads(

@@ -19,10 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, TryLockError};
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
-use crate::advisory_lock::{
-    DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord, DfsAdvisoryLockTransitionContext,
-    prepare_advisory_lock_state_for_migration,
-};
+use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::content_root_catalog::{
     DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
     DfsContentRootCatalogPageRequest, DfsContentRootCatalogShardIdentity,
@@ -59,12 +56,9 @@ use crate::metadata_pages::{
     collect_metadata_pages, finish_cursor_page, finish_sorted_cursor_page, walk_metadata_pages,
 };
 use crate::metadata_records::*;
-#[cfg(test)]
-use crate::metadata_shard_index::object_shard_index_path;
 use crate::metadata_shard_index::{
-    DfsObjectShardIndexRecord, object_shard_index_record, read_object_shard_index,
-    read_object_shard_index_for_rebuild, remove_object_shard_index, write_new_object_shard_indexes,
-    write_object_shard_index,
+    DfsObjectShardIndexRecord, read_object_shard_index, read_object_shard_index_for_rebuild,
+    remove_object_shard_index, write_new_object_shard_indexes, write_object_shard_index,
 };
 use crate::metadata_shard_migration::DfsObjectShardMigrationBundle;
 use crate::metadata_shard_pages::{
@@ -76,7 +70,6 @@ use crate::metadata_summary::{
     accumulate_metadata_summary_detail_counts, metadata_summary_for_file_system_from_tables,
     metadata_summary_from_tables,
 };
-use crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION;
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
@@ -106,16 +99,6 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_sharded_metadata_status_query_count() -> usize {
     SHARDED_METADATA_STATUS_QUERY_COUNT.replace(0)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_sharded_metadata_object_id_lookup_count() {
-    SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn sharded_metadata_object_id_lookup_count() -> usize {
-    SHARDED_METADATA_OBJECT_ID_LOOKUP_COUNT.get()
 }
 
 #[cfg(test)]
@@ -920,16 +903,6 @@ impl ResidentLocalMetadataShardSlot {
 thread_local! {
     static RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn reset_resident_metadata_status_durable_cursor_reads() {
-    RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS.set(0);
-}
-
-#[cfg(test)]
-fn resident_metadata_status_durable_cursor_reads() -> usize {
-    RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS.get()
 }
 
 fn initialize_resident_metadata_shard_status_snapshot(
@@ -2374,11 +2347,6 @@ impl LocalShardedMetadataBackend {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn object_shard_index_path(&self, object_id: &DfsObjectId) -> PathBuf {
-        object_shard_index_path(&self.root, object_id)
-    }
-
     pub(crate) fn read_object_shard_index(
         &self,
         object_id: &DfsObjectId,
@@ -2949,7 +2917,7 @@ impl LocalShardedMetadataBackend {
 #[cfg(test)]
 mod lazy_replica_slot_tests {
     use super::*;
-    use crate::namespace::{directory_object, distributed_sifs};
+
     use sinomo_core::DfsObjectPolicy;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -6597,7 +6565,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 #[cfg(test)]
 mod bounded_intent_maintenance_tests {
     use super::*;
-    use crate::{DfsWriteIntentMaintenanceCursor, DfsWriteIntentStatus};
+    use crate::DfsWriteIntentMaintenanceCursor;
     use sinomo_core::DfsObjectPolicy;
 
     fn shard(name: &str, owner: &NodeId) -> DfsMetadataShardConfig {
@@ -6618,35 +6586,6 @@ mod bounded_intent_maintenance_tests {
         }
     }
 
-    fn intent(
-        owner: &NodeId,
-        key: &str,
-        status: DfsWriteIntentStatus,
-        order: i64,
-    ) -> DfsWriteIntentRecord {
-        let at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(order);
-        DfsWriteIntentRecord {
-            publication: Default::default(),
-            intent_id: key.into(),
-            file_system_id: crate::sifs_file_system_id(),
-            object_id: DfsObjectId::from_legacy_named(format!("bounded-object-{key}")).unwrap(),
-            base_version: Some(crate::DfsVersion::from_legacy_named("bounded-old-base").unwrap()),
-            target_version: crate::DfsVersion::from_legacy_named("bounded-old-target").unwrap(),
-            coordinator_node_id: owner.clone(),
-            operation_id: None,
-            operation_order_token: None,
-            owner_epoch: 1,
-            desired_replica_node_ids: vec![owner.clone()],
-            policy: crate::DfsReplicationPolicy::new(1, 1).unwrap(),
-            status,
-            content_hash: None,
-            object_metadata: None,
-            touch_parent_on_create: false,
-            create_predecessor_object_id: None,
-            created_at: at,
-            updated_at: Some(at),
-        }
-    }
     #[test]
     fn bounded_intent_page_limits_lazy_empty_shard_openings_and_zero_work() {
         let root = sinomo_testdir::TestDir::new("bounded-intent-empty-shards");

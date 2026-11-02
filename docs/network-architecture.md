@@ -164,8 +164,11 @@ Uncommitted probe results cannot postpone that deadline. Semantic source changes
 still use the existing source writer and quorum publication. A passive shadow
 accepts only its own observations in RAM, fenced by the shared source snapshot;
 it gains neither publication ownership nor a local Raft dependency.
-Peer imports reconcile the actual persisted cut under the same writer lock before
-merging accepted RAM observations. They retain newer freshness only when it still
+A joined node learns other sources' edges from committed cluster KV; it does not
+copy peers' local connectivity stores. The only peer import is the accepted-join
+handoff, which seeds a node from its introducer before that node has KV. It
+reconciles the actual persisted cut under the same writer lock before merging
+accepted RAM observations. It retains newer freshness only when it still
 matches the persisted semantic record; an unrelated import cannot roll it back
 to the old disk timestamp or persist a passive shadow's uncommitted health change.
 Newer external records and explicit source clears still supersede that cache.

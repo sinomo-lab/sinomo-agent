@@ -23,16 +23,6 @@ thread_local! {
     static OBJECT_SHARD_INDEX_WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_object_shard_index_write_count() {
-    OBJECT_SHARD_INDEX_WRITE_COUNT.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn object_shard_index_write_count() -> usize {
-    OBJECT_SHARD_INDEX_WRITE_COUNT.get()
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub(crate) struct DfsObjectShardIndexRecord {
     pub(crate) object_id: DfsObjectId,

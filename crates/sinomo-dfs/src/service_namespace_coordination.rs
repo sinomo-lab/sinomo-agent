@@ -245,35 +245,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    pub(crate) fn affected_namespace_transaction_shards_from_snapshot(
-        file_system_id: &DfsFileSystemId,
-        transaction: &DfsNamespaceTransaction,
-        shards: &[DfsMetadataShardConfig],
-    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
-        if transaction.objects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut candidate_paths = BTreeSet::new();
-        for object in &transaction.objects {
-            let normalized =
-                posix_path::normalized_posix_path_key(&object.path).ok_or_else(|| {
-                    DfsError::Distributed {
-                        message: format!("invalid namespace transaction path: {}", object.path),
-                    }
-                })?;
-            if let Some(parent) = posix_path::parent_posix_path(&normalized) {
-                candidate_paths.insert(parent);
-            }
-            candidate_paths.insert(normalized);
-        }
-
-        Self::namespace_shards_for_normalized_paths_from_snapshot(
-            file_system_id,
-            shards,
-            candidate_paths.iter().map(String::as_str),
-        )
-    }
-
     /// Resolve the shard that stores the transaction's exact object records.
     ///
     /// Unlike affected-operation routing, this deliberately does not add each

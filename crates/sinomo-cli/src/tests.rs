@@ -10,9 +10,8 @@ use super::{
     ClusterRemoveOptions, ClusterRenameOptions, ClusterRoleOptions, ClusterRolloutBuildRequest,
     ClusterStateAuthorityOptions, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStatusOptions, DfsCliCommand,
-    DfsCommonOptions, DfsFilterOptions, DfsHostMountOptions,
-    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
-    DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
+    DfsCommonOptions, DfsHostMountOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions,
+    DfsPinCliCommand, DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
     DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
     InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions,
@@ -94,16 +93,12 @@ use sinomo_runtime::core::{
     ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole,
     ClusterMemberState, ClusterMigrationMode, ClusterMigrationPhase, ClusterMigrationRecord,
     ClusterNodeAvailability, ClusterNodeRole, ClusterNodeStatusRecord, ClusterTransportKind,
-    Confidence, DfsObjectPolicy, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind,
-    Id, LatencyClass, PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy,
-    RoutingMetadata, RoutingScope, Salience, Source, TrustDomain, TrustRing,
+    Confidence, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass,
+    PrivacyClass, RollbackPolicy, RollbackTrigger, RolloutPlan, RolloutStrategy, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustDomain, TrustRing,
 };
 use sinomo_runtime::daemon::daemon_status_matches_options;
-use sinomo_runtime::dfs::{
-    DfsMetadataBackend, DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsObjectVersionRecord,
-    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
-    metadata_shard_key,
-};
+use sinomo_runtime::dfs::default_dfs_metadata_shards_root;
 use sinomo_runtime::events::{
     EventId, EventStore, InMemoryEventStore, JsonlEventStore, ReplayQuery, SessionId,
 };
@@ -9646,7 +9641,6 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         &merged_state,
         cluster::ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
-            force_kv_snapshot_sync: false,
         },
         &mut CliLocalMemberPublishHost,
     )
@@ -12134,12 +12128,12 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .any(|entry| entry.key == "/config/current")
     );
 
-    let cached_ahead = paths
-        .kv_paths()
-        .local_cache()
-        .cache_snapshot_if_newer_than_raft(state.local_node_id.clone(), stale_snapshot)
-        .expect("cache stale snapshot");
-    assert!(!cached_ahead);
+    let wrote_stale = sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(
+        &paths.kv_paths(),
+        &stale_snapshot,
+    )
+    .expect("write stale snapshot");
+    assert!(!wrote_stale);
     let snapshot_after_stale = read_cluster_kv_local_snapshot_for_test(&paths)
         .expect("snapshot after stale cache attempt");
     assert!(

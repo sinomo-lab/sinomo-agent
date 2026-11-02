@@ -595,6 +595,7 @@ pub struct HostedChatService {
     ephemeral_clients: Arc<Mutex<std::collections::BTreeSet<String>>>,
     environment: Arc<std::sync::OnceLock<HostEnvironment>>,
     workers: Arc<Mutex<ChatWorkers>>,
+    host_readiness: Arc<ChatHostReadiness>,
     /// Starts hosts in place of the agent runtime worker (tests).
     host_factory: Option<Arc<dyn Fn(&str) -> ChatHost + Send + Sync>>,
 }
@@ -613,8 +614,15 @@ impl HostedChatService {
             ephemeral_clients: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             environment: Arc::new(std::sync::OnceLock::new()),
             workers: Arc::new(Mutex::new(ChatWorkers::default())),
+            host_readiness: Arc::new(ChatHostReadiness::default()),
             host_factory: None,
         }
+    }
+
+    /// The daemon's cluster services can host chats. Hosts that started
+    /// earlier wait for this edge instead of failing.
+    pub(crate) fn mark_host_ready(&self) {
+        self.host_readiness.set(ChatHostReadinessState::Ready);
     }
 
     fn require_running(&self) -> Result<(), String> {
@@ -731,6 +739,7 @@ impl HostedChatService {
     }
 
     fn begin_drain(&self) -> Result<bool, String> {
+        self.host_readiness.set(ChatHostReadinessState::Stopping);
         let Some(mut workers) = try_drain_lock(&self.workers, "workers")? else {
             return Ok(false);
         };
@@ -1065,6 +1074,7 @@ impl HostedChatService {
             ready: ready.clone(),
             alive: alive.clone(),
             activity: activity.clone(),
+            host_readiness: Arc::clone(&self.host_readiness),
         };
         self.spawn_worker(format!("sinomo-chat-{chat_id}"), move || {
             chat_host_worker(context, command_rx)
@@ -2325,6 +2335,7 @@ struct ChatHostContext {
     ready: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     activity: HostActivity,
+    host_readiness: Arc<ChatHostReadiness>,
 }
 
 fn admit_host_command(
@@ -2360,6 +2371,7 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
         ready,
         alive,
         activity,
+        host_readiness,
     } = context;
     struct WorkerLife(Arc<AtomicBool>);
     impl Drop for WorkerLife {
@@ -2382,7 +2394,7 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
         runtime_control: &runtime_control,
         storage: &storage,
         fanout: &fanout,
-        alive: &alive,
+        readiness: &host_readiness,
     }) else {
         return;
     };
@@ -2502,10 +2514,63 @@ fn chat_host_worker(context: ChatHostContext, command_rx: Receiver<HostCommand>)
 /// How long a chat host waits for cluster services that are still starting
 /// before it reports the chat unavailable.
 const CHAT_HOST_STARTUP_WAIT: Duration = Duration::from_secs(30);
-const CHAT_HOST_STARTUP_RETRY: Duration = Duration::from_millis(250);
-/// Starts the error of a cluster store whose Raft node another process still
-/// holds, as while a replacement daemon takes over from its predecessor.
-const RAFT_NODE_BUSY_ERROR: &str = "raft node is busy";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ChatHostReadinessState {
+    #[default]
+    Pending,
+    Ready,
+    Stopping,
+}
+
+/// Whether the daemon's cluster services can host chats. The component host
+/// signals readiness once the daemon owns its local Raft node; a stopping
+/// component releases any host still waiting.
+#[derive(Debug, Default)]
+struct ChatHostReadiness {
+    state: Mutex<ChatHostReadinessState>,
+    changed: Condvar,
+}
+
+impl ChatHostReadiness {
+    fn set(&self, next: ChatHostReadinessState) {
+        if let Ok(mut state) = self.state.lock() {
+            if *state != ChatHostReadinessState::Stopping {
+                *state = next;
+            }
+            self.changed.notify_all();
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| *state == ChatHostReadinessState::Ready)
+    }
+
+    /// Wait for readiness. False when the component stops or `deadline`
+    /// passes first.
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        loop {
+            match *state {
+                ChatHostReadinessState::Ready => return true,
+                ChatHostReadinessState::Stopping => return false,
+                ChatHostReadinessState::Pending => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            state = match self.changed.wait_timeout(state, remaining) {
+                Ok((state, _)) => state,
+                Err(_) => return false,
+            };
+        }
+    }
+}
 
 struct ChatHostOpening<'a> {
     chat_id: &'a str,
@@ -2514,57 +2579,52 @@ struct ChatHostOpening<'a> {
     runtime_control: &'a sinomo_agent::AgentRuntimeControlRegistry,
     storage: &'a local::AgentChatSifsStorage,
     fanout: &'a ChatFanout,
-    alive: &'a AtomicBool,
+    readiness: &'a ChatHostReadiness,
 }
 
-/// Open the chat and restore its session. While the daemon is still starting
-/// (its cluster services unpublished, or its Raft node held by the process it
-/// replaces) a chat would fail for a moment; the host waits for them instead,
-/// telling viewers once, and reports only a failure that outlasts the wait.
+/// Open the chat and restore its session once the daemon's cluster services
+/// are ready. A host started while the daemon is still starting tells viewers
+/// once and waits for that readiness edge; any failure after it is reported.
 fn open_chat_host(opening: &ChatHostOpening<'_>) -> Option<local::AgentChat> {
-    let deadline = Instant::now() + CHAT_HOST_STARTUP_WAIT;
-    let mut waiting = false;
-    loop {
-        let (error, session_id) = match local::AgentChat::with_runtime_control_registry_and_sifs(
-            opening.data_dir.clone(),
-            true,
-            opening.runtime_control.clone(),
-            opening.storage.clone(),
-        ) {
-            Ok(mut chat) => match chat.resume_session(opening.chat_id, opening.history) {
-                Ok(()) => return Some(chat),
-                Err(error) => (
-                    format!("chat restoration failed: {error}"),
-                    Some(opening.chat_id.to_string()),
-                ),
-            },
-            Err(error) => (format!("chat unavailable: {error}"), None),
-        };
-        if chat_startup_failure_is_transient(&error)
-            && Instant::now() < deadline
-            && opening.alive.load(Ordering::Acquire)
+    if !opening.readiness.is_ready() {
+        tracing::info!(chat_id = %opening.chat_id, "chat host waiting for cluster services");
+        opening.fanout.push(wire::ChatEvent::Notice {
+            session_id: opening.chat_id.to_string(),
+            notice: "waiting for cluster services to start".to_string(),
+        });
+        if !opening
+            .readiness
+            .wait_until(Instant::now() + CHAT_HOST_STARTUP_WAIT)
         {
-            if !waiting {
-                waiting = true;
-                tracing::info!(chat_id = %opening.chat_id, %error, "chat host waiting for cluster services");
-                opening.fanout.push(wire::ChatEvent::Notice {
-                    session_id: opening.chat_id.to_string(),
-                    notice: "waiting for cluster services to start".to_string(),
-                });
-            }
-            std::thread::sleep(CHAT_HOST_STARTUP_RETRY);
-            continue;
+            let error = "chat unavailable: daemon cluster services did not start".to_string();
+            tracing::warn!(chat_id = %opening.chat_id, %error, "daemon chat host initialization failed");
+            opening.fanout.push(wire::ChatEvent::Error {
+                session_id: None,
+                error,
+            });
+            return None;
         }
-        tracing::warn!(chat_id = %opening.chat_id, %error, "daemon chat host initialization failed");
-        opening
-            .fanout
-            .push(wire::ChatEvent::Error { session_id, error });
-        return None;
     }
-}
-
-fn chat_startup_failure_is_transient(error: &str) -> bool {
-    error.contains(local::NO_SIFS_PROVIDER_ERROR) || error.contains(RAFT_NODE_BUSY_ERROR)
+    let (error, session_id) = match local::AgentChat::with_runtime_control_registry_and_sifs(
+        opening.data_dir.clone(),
+        true,
+        opening.runtime_control.clone(),
+        opening.storage.clone(),
+    ) {
+        Ok(mut chat) => match chat.resume_session(opening.chat_id, opening.history) {
+            Ok(()) => return Some(chat),
+            Err(error) => (
+                format!("chat restoration failed: {error}"),
+                Some(opening.chat_id.to_string()),
+            ),
+        },
+        Err(error) => (format!("chat unavailable: {error}"), None),
+    };
+    tracing::warn!(chat_id = %opening.chat_id, %error, "daemon chat host initialization failed");
+    opening
+        .fanout
+        .push(wire::ChatEvent::Error { session_id, error });
+    None
 }
 
 /// How often an idle chat host checks for completed background work.
@@ -3878,19 +3938,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_chat_host_waits_out_only_daemon_startup_failures() {
-        for starting in [
-            "chat unavailable: failed to parse command: open filesystem provider agent catalog SIFS failed: no cluster service instance provides sifs.path.access (catalog revision 6, 0 entries, 0 decoded instances; services: [none]; provider capabilities: [none])",
-            "chat restoration failed: failed to parse command: configure resumed chat tool runtime failed: failed to parse command: load attached sandbox `x`: daemon service error at /sandbox/status: failed to parse command: network serialization error: invalid DFS runtime operation: distributed DFS error: raft node is busy at D:\\data\\cluster\\kv-raft\\node",
-        ] {
-            assert!(chat_startup_failure_is_transient(starting), "{starting}");
-        }
-        for lasting in [
-            "chat unavailable: failed to parse command: open agent channel SIFS store failed: device authorization was denied",
-            "chat restoration failed: agent session `x` references unknown agent definition `gone`",
-        ] {
-            assert!(!chat_startup_failure_is_transient(lasting), "{lasting}");
-        }
+    fn chat_host_readiness_waits_for_the_ready_edge_or_stop() {
+        let readiness = ChatHostReadiness::default();
+        assert!(!readiness.wait_until(Instant::now() + Duration::from_millis(10)));
+        readiness.set(ChatHostReadinessState::Ready);
+        assert!(readiness.wait_until(Instant::now()));
+
+        let stopping = Arc::new(ChatHostReadiness::default());
+        let waiter = {
+            let stopping = Arc::clone(&stopping);
+            std::thread::spawn(move || {
+                stopping.wait_until(Instant::now() + Duration::from_secs(30))
+            })
+        };
+        stopping.set(ChatHostReadinessState::Stopping);
+        assert!(
+            !waiter.join().expect("waiter"),
+            "stop releases a waiting host"
+        );
+        stopping.set(ChatHostReadinessState::Ready);
+        assert!(
+            !stopping.is_ready(),
+            "a stopped component never becomes ready"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::{
     DfsNodeAdvertisement, LocalContentStore,
     MountedSifsMutationHandoffRequest as DaemonDfsMountedMutationHandoffRequest,
     MountedSifsMutationHandoffResponse as DaemonDfsMountedMutationHandoffResponse,
-    content_services_prefix, discovered_cluster_dfs_peer_node_ids,
+    content_services_prefix,
 };
 use fs2::FileExt as _;
 use sinomo_core::cluster::ClusterKvPathsExt as _;
@@ -2477,6 +2477,8 @@ use sinomo_core::node::NodeId;
 use sinomo_dfs::DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL as DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL;
 #[cfg(test)]
 use sinomo_dfs::DfsFileSystemConfig;
+#[cfg(any(test, feature = "test-support"))]
+use sinomo_dfs::DfsMetadataBackend;
 #[cfg(test)]
 use sinomo_dfs::LocalDfsRepairQueueStore;
 #[cfg(test)]
@@ -2486,17 +2488,15 @@ use sinomo_dfs::{
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
     DfsMaintenanceRunOptions, DfsMessageResponse, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataJournalBatchSender,
-    DfsMetadataPeerTransportError, DfsMetadataShardAssignment, DfsMetadataShardStatus,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
-    DfsMetadataSnapshotInstallSender, DfsMetadataSummary, DfsObjectId, DfsObjectMetadata,
-    DfsObjectVersionRecord, DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptSnapshot,
-    DfsReplicaReceiptRecord, DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus,
-    LocalSobjMetadataBackend, cluster_dfs_all_file_system_configs,
-    cluster_dfs_all_metadata_shard_head_watermarks,
+    DfsMetadataShardAssignment, DfsMetadataShardStatus, DfsMetadataSnapshotInstallResult,
+    DfsMetadataSummary, DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord,
+    DfsOperatorInspector, DfsOperatorRepairView, DfsRepairAttemptSnapshot, DfsReplicaReceiptRecord,
+    DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
+    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     default_dfs_content_root_catalog_store, default_dfs_metadata_root, distributed_sifs,
-    distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
-    sifs_node_files_path, write_dfs_repair_attempt_snapshot,
+    file_system_config_key, metadata_shard_key, sifs_node_files_path,
+    write_dfs_repair_attempt_snapshot,
 };
 #[cfg(test)]
 use sinomo_dfs::{
@@ -2513,7 +2513,7 @@ use sinomo_dfs::{
     DfsFileSystemId, DfsInboundAttachment, DfsMaintenanceExecutionExclusions,
     DfsMaintenanceForegroundPreemption as DaemonDfsMaintenanceForegroundPreemption,
     DfsMaintenanceTickOptions, DfsMaintenanceTickReport, DfsMessageCommand,
-    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult, DfsMetadataBackend,
+    DfsMessageCommittedWork, DfsMessageExecutionScope, DfsMessageProcessResult,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
     DfsMetadataLaneKey as DaemonDfsMetadataPublishLaneKey, DfsMetadataPublishScheduleOptions,
     DfsMetadataPublishScheduleStart, DfsMetadataSchedulerRegistry, DfsMetadataShardId,
@@ -2558,7 +2558,7 @@ use sinomo_dfs::{
     DfsMetadataShardConfig, DfsMetadataShardMembershipHandoffProof, DfsPlacementReconciliationJob,
     DfsPlacementReconciliationState,
     dfs_metadata_shard_config_key_is_exact as daemon_dfs_metadata_shard_config_key_is_exact,
-    metadata_shard_membership_handoff_proof_key, read_local_dfs_metadata_shard_write_freeze,
+    read_local_dfs_metadata_shard_write_freeze,
 };
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -3346,16 +3346,14 @@ pub(crate) use control_plane::{
 };
 #[cfg(test)]
 pub(crate) use control_plane::{
-    NativePlacementProgressRpcGate, gated_native_placement_control_plane_for_test,
-};
-#[cfg(test)]
-pub(crate) use control_plane::{
     test_retained_client_configuration_projection, test_retained_client_configuration_sync,
 };
 
 mod data_plane;
 mod native_prefix_return;
-pub use native_prefix_return::{OwnedNativeMetadataPrefixReturn, NativeMetadataPrefixPhysicalOwner};
+pub use native_prefix_return::{
+    NativeMetadataPrefixPhysicalOwner, OwnedNativeMetadataPrefixReturn,
+};
 #[cfg(test)]
 mod selected_recovery_fence_call;
 #[cfg(test)]
@@ -3372,26 +3370,28 @@ pub(crate) mod deferred_work_test;
 pub use deferred_work_test::{DfsTestDeferredResponseCapture, DfsTestDeferredResponsePause};
 #[cfg(feature = "storage-conversion")]
 mod storage_import;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use data_plane::daemon_dfs_node_transport;
 use data_plane::with_daemon_dfs_control_plane_seeded_on_runtime;
 #[cfg(test)]
 use data_plane::*;
 pub(crate) use data_plane::{
-    DaemonDfsDataPlaneHost, daemon_dfs_control_plane_client_on_runtime, daemon_dfs_node_transport,
+    DaemonDfsDataPlaneHost, daemon_dfs_control_plane_client_on_runtime,
     daemon_dfs_node_transport_on_runtime, daemon_dfs_peer_transports_on_runtime,
     with_daemon_dfs_control_plane_on_runtime,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use message_host::defer_native_owned_repair_completion;
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use data_plane::{
-    NativeRepairCustodySelection, call_native_original_repair_owned,
-    select_native_original_repair_custody,
 };
 pub(crate) use data_plane::{
     FreshOriginalRepairReturn, NativeOriginalRepairReturn, OwnedOriginalRepairCompletion,
     PreparedNativeRepairCustody, prepare_native_repair_custody,
     send_prepared_native_repair_custody, send_prepared_native_repair_custody_async,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use data_plane::{
+    NativeRepairCustodySelection, call_native_original_repair_owned,
+    select_native_original_repair_custody,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use message_host::defer_native_owned_repair_completion;
 #[cfg(feature = "storage-conversion")]
 pub use storage_import::DfsStorageImportContentReceiver;
 
@@ -3434,8 +3434,6 @@ mod message_host;
 pub(crate) use message_host::*;
 
 mod reconciliation_host;
-#[cfg(test)]
-pub(crate) use reconciliation_host::ensure_default_distributed_dfs_async_on_runtime;
 use reconciliation_host::notify_daemon_default_dfs_reconciliation_replica_progress;
 pub(crate) use reconciliation_host::{
     DaemonDefaultDfsReconciliationReactor, run_daemon_default_dfs_reconciliation_reactor,
@@ -3458,8 +3456,6 @@ mod publish_host;
 use publish_host::{
     daemon_dfs_metadata_publish_discovery_lanes_boxed_async,
     daemon_dfs_metadata_publish_schedule_options, daemon_dfs_metadata_replication_options,
-    publish_default_dfs_metadata_journal_with_sender,
-    publish_default_dfs_metadata_journal_with_senders,
 };
 pub(crate) use publish_host::{
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,

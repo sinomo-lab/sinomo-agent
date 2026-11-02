@@ -1,7 +1,6 @@
 //! Real completed namespace moves expose physical history rows which no longer
 //! own their remembered path. GC must compare the actual namespace occupant.
 use super::*;
-use crate::*;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

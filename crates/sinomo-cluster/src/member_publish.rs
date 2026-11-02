@@ -4,9 +4,7 @@ use crate::keyspace::{
 };
 use crate::kv_local_store::kv_err;
 use crate::kv_local_store::{
-    imported_snapshot_advances_local_kv, local_cluster_kv_snapshot_revision,
-    read_cluster_kv_current_or_cached_snapshot_arc_if_present,
-    write_imported_cluster_kv_snapshot_if_changed,
+    local_cluster_kv_snapshot_revision, read_cluster_kv_current_or_cached_snapshot_arc_if_present,
 };
 use crate::local_state_store::read_cluster_state;
 use crate::member_mutation::ClusterMemberMutationAsyncHost;
@@ -52,12 +50,6 @@ pub trait ClusterMemberPublishHost {
 
 pub struct ClusterLocalMemberPublishOptions {
     pub member_publish_timeout: Duration,
-    /// Publish even when the local KV snapshot already reflects the local
-    /// member records. This is reserved for an explicit, targeted learner
-    /// recovery operation so a voter can hand back a newer KV snapshot (see
-    /// `ClusterMemberPublishRequest::local_kv_revision`). Normal publication
-    /// is source-change driven and must leave this disabled.
-    pub force_kv_snapshot_sync: bool,
 }
 
 pub trait ClusterLocalMemberPublishHost {
@@ -247,6 +239,45 @@ fn cluster_member_publish_txn_from_authoritative_snapshot(
     Ok(txn)
 }
 
+/// Brings this node's committed member records up to its current local
+/// advertisements. Each starts from the committed record, so only the local
+/// owner's endpoints change; the result is empty when they already match.
+pub(crate) fn local_member_endpoint_publication_txn(
+    state: &ClusterBootstrapState,
+    snapshot: &KvSnapshot,
+) -> Result<KvTxn, NetworkError> {
+    let mut members = Vec::new();
+    for local in cluster_local_process_members(state) {
+        let Some(committed) = snapshot
+            .get(&cluster_member_key(&local.node_id))
+            .and_then(|entry| entry.decode::<ClusterMemberRecord>().ok())
+        else {
+            continue;
+        };
+        if committed.cluster_id != state.cluster_id
+            || committed.node_public_key != local.node_public_key
+            || !committed.state.is_authorized()
+        {
+            continue;
+        }
+        let mut member = committed;
+        member.endpoints = local.endpoints;
+        members.push(member);
+    }
+    let txn = if members.is_empty() {
+        None
+    } else {
+        Some(cluster_member_publish_txn_from_authoritative_snapshot(
+            snapshot, &members, None,
+        )?)
+    };
+    Ok(txn.filter(|txn| !txn.success.is_empty()).unwrap_or(KvTxn {
+        compares: Vec::new(),
+        success: Vec::new(),
+        failure: Vec::new(),
+    }))
+}
+
 fn require_member_publish_commit(
     result: ClusterKvTxnCommitResult,
 ) -> Result<KvSnapshot, NetworkError> {
@@ -278,23 +309,10 @@ pub(crate) fn publish_local_members_via_voter_with_host(
         local_kv_revision: local_cluster_kv_snapshot_revision(paths),
     };
     let mut failures = Vec::new();
-    let mut accepted_without_newer_snapshot = false;
     for endpoint in member_publish_targets_voter_first(paths, state) {
         match host.send_cluster_member_publish(&endpoint, &request, options.member_publish_timeout)
         {
-            Ok(response) if response.accepted => {
-                let mut imported_newer_snapshot = false;
-                if let Some(snapshot) = response.kv_snapshot
-                    && imported_snapshot_advances_local_kv(paths, &snapshot)
-                {
-                    write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-                    imported_newer_snapshot = true;
-                }
-                if !options.force_kv_snapshot_sync || imported_newer_snapshot {
-                    return Ok(());
-                }
-                accepted_without_newer_snapshot = true;
-            }
+            Ok(response) if response.accepted => return Ok(()),
             Ok(response) => failures.push(format!(
                 "{} ({:?}) rejected member publish: {}",
                 endpoint.address, endpoint.transport, response.detail
@@ -304,9 +322,6 @@ pub(crate) fn publish_local_members_via_voter_with_host(
                 endpoint.address, endpoint.transport, error
             )),
         }
-    }
-    if options.force_kv_snapshot_sync && accepted_without_newer_snapshot {
-        return Ok(());
     }
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
@@ -355,37 +370,12 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
         local_kv_revision,
     };
     let mut failures = Vec::new();
-    let mut accepted_without_newer_snapshot = false;
     for endpoint in targets {
         match host
             .send_cluster_member_publish_async(&endpoint, &request, options.member_publish_timeout)
             .await
         {
-            Ok(response) if response.accepted => {
-                let mut imported_newer_snapshot = false;
-                if let Some(snapshot) = response.kv_snapshot {
-                    let paths_for_write = paths.clone();
-                    imported_newer_snapshot = runtime
-                        .spawn_blocking(move || {
-                            if !imported_snapshot_advances_local_kv(&paths_for_write, &snapshot) {
-                                return Ok(false);
-                            }
-                            write_imported_cluster_kv_snapshot_if_changed(
-                                &paths_for_write,
-                                &snapshot,
-                            )
-                        })
-                        .await
-                        .map_err(|source| NetworkError::Io {
-                            operation: "cluster local member publish snapshot import".to_string(),
-                            detail: format!("member publish snapshot import task failed: {source}"),
-                        })??;
-                }
-                if !options.force_kv_snapshot_sync || imported_newer_snapshot {
-                    return Ok(());
-                }
-                accepted_without_newer_snapshot = true;
-            }
+            Ok(response) if response.accepted => return Ok(()),
             Ok(response) => failures.push(format!(
                 "{} ({:?}) rejected member publish: {}",
                 endpoint.address, endpoint.transport, response.detail
@@ -395,9 +385,6 @@ pub(crate) async fn publish_local_members_via_voter_async_with_host(
                 endpoint.address, endpoint.transport, error
             )),
         }
-    }
-    if options.force_kv_snapshot_sync && accepted_without_newer_snapshot {
-        return Ok(());
     }
     Err(NetworkError::ClusterReadOnly {
         detail: format!(
@@ -425,9 +412,8 @@ pub fn publish_local_members_to_quorum_if_needed_with_host(
     // Publication is source-change driven. A matching local materialized view
     // proves this source revision has already been applied; an unchanged
     // periodic network tick must not create an authoritative read barrier or a
-    // duplicate publish RPC. Learners that need snapshot catch-up explicitly
-    // set `force_kv_snapshot_sync` and therefore continue below.
-    if already_published && !options.force_kv_snapshot_sync {
+    // duplicate publish RPC.
+    if already_published {
         return Ok(None);
     }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
@@ -480,9 +466,8 @@ pub async fn publish_local_members_to_quorum_if_needed_async_with_host(
         })?;
     // See the synchronous path above: stable publication is a quiet state, not
     // an opportunity to run a quorum barrier or ask a voter to compare the
-    // same record again. Forced learner synchronization remains an explicit,
-    // targeted recovery operation.
-    if already_published && !options.force_kv_snapshot_sync {
+    // same record again.
+    if already_published {
         return Ok(None);
     }
     if sinomo_kv::cluster_kv_raft_local_is_voter(state)
@@ -625,24 +610,22 @@ fn prepare_cluster_member_publish_request(
     })
 }
 
-fn cluster_member_publish_response_snapshot(
-    snapshot: KvSnapshot,
+/// The voter's authoritative revision bounds every publisher. A publisher
+/// reporting a higher revision indicates diverged replicated history.
+fn warn_if_member_publisher_is_ahead(
+    snapshot: &KvSnapshot,
     state: &ClusterBootstrapState,
     publisher_revision: Option<KvRevision>,
-) -> Option<KvSnapshot> {
-    let Some(publisher_revision) = publisher_revision else {
-        return Some(snapshot);
-    };
-    if publisher_revision < snapshot.revision {
-        return Some(snapshot);
-    }
-    if publisher_revision > snapshot.revision && sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+) {
+    if let Some(publisher_revision) = publisher_revision
+        && publisher_revision > snapshot.revision
+        && sinomo_kv::cluster_kv_raft_local_is_voter(state)
+    {
         eprintln!(
             "warning: member publish reported KV revision {} ahead of the authoritative voter's {} -- replicated KV history may have diverged",
             publisher_revision.0, snapshot.revision.0
         );
     }
-    None
 }
 
 fn cluster_member_publish_already_current_response(
@@ -650,13 +633,12 @@ fn cluster_member_publish_already_current_response(
     snapshot: KvSnapshot,
     publisher_revision: Option<KvRevision>,
 ) -> ClusterMemberPublishResponse {
-    let kv_snapshot =
-        cluster_member_publish_response_snapshot(snapshot, &state, publisher_revision);
+    warn_if_member_publisher_is_ahead(&snapshot, &state, publisher_revision);
     ClusterMemberPublishResponse {
         accepted: true,
         detail: "member endpoints already current".to_string(),
         state,
-        kv_snapshot,
+        kv_snapshot: None,
     }
 }
 
@@ -708,16 +690,12 @@ where
                 .as_ref()
                 .is_some_and(|response| response.succeeded) =>
         {
-            let kv_snapshot = cluster_member_publish_response_snapshot(
-                result.snapshot,
-                &state,
-                publisher_revision,
-            );
+            warn_if_member_publisher_is_ahead(&result.snapshot, &state, publisher_revision);
             Ok(ClusterMemberPublishResponse {
                 accepted: true,
                 detail: "member endpoints published".to_string(),
                 state: read_cluster_state(paths).unwrap_or(state),
-                kv_snapshot,
+                kv_snapshot: None,
             })
         }
         Ok(_) => Ok(ClusterMemberPublishResponse {
@@ -814,11 +792,7 @@ where
                 .as_ref()
                 .is_some_and(|response| response.succeeded) =>
         {
-            let kv_snapshot = cluster_member_publish_response_snapshot(
-                result.snapshot,
-                &state,
-                publisher_revision,
-            );
+            warn_if_member_publisher_is_ahead(&result.snapshot, &state, publisher_revision);
             let paths_for_state = paths.clone();
             let fallback_state = state.clone();
             let response_state = runtime
@@ -834,7 +808,7 @@ where
                 accepted: true,
                 detail: "member endpoints published".to_string(),
                 state: response_state,
-                kv_snapshot,
+                kv_snapshot: None,
             })
         }
         Ok(_) => Ok(ClusterMemberPublishResponse {
@@ -1225,7 +1199,6 @@ mod tests {
             &state,
             ClusterLocalMemberPublishOptions {
                 member_publish_timeout: Duration::from_secs(1),
-                force_kv_snapshot_sync: false,
             },
             &mut host,
         )

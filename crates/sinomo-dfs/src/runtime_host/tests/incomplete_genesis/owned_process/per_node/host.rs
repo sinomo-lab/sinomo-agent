@@ -134,83 +134,28 @@ async fn probe(
     selected: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
     observed_source: &std::sync::Mutex<Option<sinomo_core::ClusterEndpointRecord>>,
 ) -> Result<ProbeReply, NetworkError> {
-    if request.prefix_contact_hints.is_some() && !matches!(request.kind, ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey) {
-        return Err(invalid("PREFIX route hints are not admitted for this probe kind"));
-    }
-    if request.owned_contact_hint.is_some()
-        && !matches!(request.kind, ProbeKind::RegisteredEndpointPing | ProbeKind::FormationEndpointPing
-            | ProbeKind::RegisteredEndpointWrongId)
-    {
-        return Err(invalid("owned route hint is not admitted for this probe kind"));
-    }
-    if matches!(request.kind, ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey) {
-        return prefix::probe(
-            request, deadline, root, runtime, source, cluster, peers, contacts,
-        );
+    if matches!(request.kind, ProbeKind::PrefixRound) {
+        return prefix::probe(request, deadline, root, runtime, source, cluster, peers);
     }
     if matches!(request.kind, ProbeKind::RequestMetadataMembers) {
         return membership::request(request, deadline, root, runtime, source, cluster, peers).await;
     }
     if matches!(request.kind, ProbeKind::PreparePrefixBaseline) {
-        return membership::prepare_prefix_baseline(request, deadline, root, runtime, source, cluster, peers).await;
-    }
-    if matches!(request.kind, ProbeKind::ObserveOwnedEndpoint) {
-        if request.target != *source {
-            return Err(invalid("owned endpoint observation must execute at its actual target"));
-        }
-        let data = SinomoDataDir::new(root);
-        let paths = ClusterPaths::new(&data);
-        let owner = crate::runtime_host::require_daemon_dfs_data_owner_lock(
-            &crate::runtime_host::DfsRuntimePaths::new(&data),
-        ).map_err(|e| invalid(e.to_string()))?;
-        let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths)?;
-        if owner.physical_data_root() != root || state.local_node_id != *source || state.cluster_id != *cluster {
-            return Err(invalid("owned endpoint observation changed actual source/root/cluster"));
-        }
-        // This is exactly the receiver's resolve_authenticated_transport_peer
-        // composition, read only. It supplies no authentication or grant.
-        let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
-            sinomo_core::network::cluster_directory_for(&paths), &state,
-        ).snapshot()?;
-        let (address, key) = contacts.get(source).ok_or_else(|| invalid("actual held listener missing"))?;
-        let member = directory.node(source).filter(|m| &m.public_key == key)
-            .ok_or_else(|| invalid("receiver directory lacks its current owner/key"))?;
-        let endpoint = member.endpoints.iter().find(|e| &e.node_id == source
-            && &e.address == address && matches!(e.transport,
-                sinomo_core::ClusterTransportKind::Loopback | sinomo_core::ClusterTransportKind::LanTcp))
-            .ok_or_else(|| invalid(format!("receiver directory has no current descriptor for its held listener; observed endpoints: {:?}", member.endpoints)))?;
-        // Do not run a positive baseline on the parent-supplied bootstrap LAN
-        // hint. Require the actual native listener producer's local projection
-        // (including its real loopback control endpoint) to match this receiver
-        // descriptor. Publication/readiness may wait only in the original cap.
-        let local = state.members.iter().find(|m| &m.node_id == source
-            && m.state.is_authorized() && &m.node_public_key == key)
-            .ok_or_else(|| invalid("native listener owner/member key unavailable"))?;
-        let port = address.parse::<SocketAddr>().map_err(|e| invalid(e.to_string()))?.port();
-        if !local.endpoints.iter().any(|e| e == endpoint)
-            || !local.endpoints.iter().any(|e| e.node_id == *source
-                && e.transport == sinomo_core::ClusterTransportKind::Loopback
-                && e.address == format!("127.0.0.1:{port}")) {
-            return Err(invalid("actual native listener advertisement has not replaced bootstrap hints"));
-        }
-        *observed_source.lock().unwrap() = Some(endpoint.clone());
-        return Ok(ProbeReply { responder_node_id: None, route: DRIVER_ROUTE.into(),
-            body: crate::metadata_io::encode_sobj(endpoint).map_err(|e| invalid(e.to_string()))? });
+        return membership::prepare_prefix_baseline(
+            request, deadline, root, runtime, source, cluster, peers,
+        )
+        .await;
     }
     let wire = match request.kind {
-        ProbeKind::Ping
-        | ProbeKind::EndpointPing
-        | ProbeKind::EndpointWrongPeer
-        | ProbeKind::RegisteredEndpointPing
-        | ProbeKind::FormationEndpointPing
-        | ProbeKind::RegisteredEndpointWrongPeer
-        | ProbeKind::RegisteredEndpointWrongId => {
+        ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
             sinomo_core::cluster::cluster_network_ping_rpc_request(&request.nonce, 0)?
         }
         ProbeKind::DfsStatus | ProbeKind::EndpointDfsStatus => {
             ObjectRpcRequest::encode_body(crate::DFS_STATUS_ROUTE, crate::DFS_RPC_CATEGORY, &())?
         }
-        ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey | ProbeKind::RequestMetadataMembers | ProbeKind::PreparePrefixBaseline | ProbeKind::ObserveOwnedEndpoint => unreachable!("native owner call dispatched above"),
+        ProbeKind::PrefixRound
+        | ProbeKind::RequestMetadataMembers
+        | ProbeKind::PreparePrefixBaseline => unreachable!("native owner call dispatched above"),
     };
     let route = wire.route.clone();
     let remaining = deadline
@@ -223,14 +168,7 @@ async fn probe(
                 NetworkDeliveryState::DefinitelyNotSent,
             )
         })?;
-    let registered_endpoint = matches!(
-        request.kind,
-        ProbeKind::RegisteredEndpointPing
-            | ProbeKind::FormationEndpointPing
-            | ProbeKind::RegisteredEndpointWrongPeer
-            | ProbeKind::RegisteredEndpointWrongId
-    );
-    let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint || registered_endpoint {
+    let result = if request.kind.path() == ProbePath::AuthenticatedEndpoint {
         let data = SinomoDataDir::new(root);
         let paths = ClusterPaths::new(&data);
         // Endpoint contacts use the actual native-written member view, never
@@ -271,20 +209,6 @@ async fn probe(
                     "native member key differs from the owned fixture identity",
                 ));
             }
-            if node == &request.target
-                && let Some(hint) = &request.owned_contact_hint
-            {
-                if &hint.node_id != node || &hint.address != address
-                    || !matches!(hint.transport, sinomo_core::ClusterTransportKind::Loopback
-                        | sinomo_core::ClusterTransportKind::LanTcp)
-                {
-                    return Err(invalid("owned hint differs from intended held listener"));
-                }
-                // Explicit input selection, never a failed-call fallback.
-                // Native transport must authenticate this target and reject a
-                // stale/foreign endpoint ID even if these route bytes match.
-                return Ok(hint.clone());
-            }
             // Preserve the native descriptor ID/type/privacy checked by the
             // routed handshake. Address scope alone cannot recreate that ID.
             // A missing owned advertisement stays unavailable; do not choose
@@ -307,10 +231,7 @@ async fn probe(
                 })
         };
         let mut endpoint = contact(&request.target)?;
-        if matches!(
-            request.kind,
-            ProbeKind::EndpointWrongPeer | ProbeKind::RegisteredEndpointWrongPeer
-        ) {
+        if matches!(request.kind, ProbeKind::EndpointWrongPeer) {
             let other = peers
                 .iter()
                 .find(|node| *node != source && **node != request.target)
@@ -319,43 +240,21 @@ async fn probe(
             // all native handshake checks remain unchanged, and must refuse it.
             endpoint.address = contact(other)?.address;
         }
-        if matches!(request.kind, ProbeKind::RegisteredEndpointWrongId) {
-            let invalid_id =
-                sinomo_core::Id::derived("dfs.test.unknown-native-endpoint", &request.nonce);
-            if state
-                .members
-                .iter()
-                .flat_map(|m| &m.endpoints)
-                .any(|e| e.endpoint_id == invalid_id)
-            {
-                return Err(invalid("negative endpoint ID unexpectedly already exists"));
-            }
-            endpoint.endpoint_id = invalid_id;
-        }
         *selected.lock().unwrap() = Some(endpoint.clone());
         eprintln!(
             "NATIVE_ENDPOINT_PROBE source={source} target={} nonce={} endpoint={endpoint:?}",
             request.target, request.nonce
         );
-        if registered_endpoint {
-            transport.call_endpoint(
+        let mut host = sinomo_daemon::DaemonObjectRpcAsyncHost::direct_only(runtime)
+            .with_paths(&sinomo_daemon::DaemonPaths::new(&data));
+        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths)
+            .call_endpoint(
+                &state,
                 &endpoint,
                 ObjectRpcCall::value(wire),
                 ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
-                matches!(request.kind, ProbeKind::FormationEndpointPing),
-            )?
-        } else {
-            let mut host = sinomo_daemon::DaemonObjectRpcAsyncHost::direct_only(runtime)
-                .with_paths(&sinomo_daemon::DaemonPaths::new(&data));
-            sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths)
-                .call_endpoint(
-                    &state,
-                    &endpoint,
-                    ObjectRpcCall::value(wire),
-                    ClusterObjectRpcOptions::default().with_overall_timeout(remaining),
-                )
-                .await?
-        }
+            )
+            .await?
     } else {
         transport
             .call_async(
@@ -382,13 +281,7 @@ async fn probe(
         return Err(invalid("native driver reply names another responder"));
     }
     let responder_node_id = match request.kind {
-        ProbeKind::Ping
-        | ProbeKind::EndpointPing
-        | ProbeKind::EndpointWrongPeer
-        | ProbeKind::RegisteredEndpointPing
-        | ProbeKind::FormationEndpointPing
-        | ProbeKind::RegisteredEndpointWrongPeer
-        | ProbeKind::RegisteredEndpointWrongId => {
+        ProbeKind::Ping | ProbeKind::EndpointPing | ProbeKind::EndpointWrongPeer => {
             let ping: sinomo_core::cluster::ClusterNetworkPingResponse = response.decode_body()?;
             if ping.responder_node_id != request.target
                 || ping.nonce != request.nonce
@@ -411,7 +304,9 @@ async fn probe(
             // Preserve only an actual native header, never copy the target.
             header_responder
         }
-        ProbeKind::PrefixRound | ProbeKind::PrefixRoundWrongKey | ProbeKind::RequestMetadataMembers | ProbeKind::PreparePrefixBaseline | ProbeKind::ObserveOwnedEndpoint => unreachable!("native owner call dispatched above"),
+        ProbeKind::PrefixRound
+        | ProbeKind::RequestMetadataMembers
+        | ProbeKind::PreparePrefixBaseline => unreachable!("native owner call dispatched above"),
     };
     if Instant::now() >= deadline {
         return Err(NetworkError::timeout(

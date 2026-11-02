@@ -182,25 +182,6 @@ impl ClusterPublicationCache {
         }
     }
 
-    pub fn connectivity_record_matches(
-        &self,
-        paths: &ClusterPaths,
-        record: &ClusterConnectivityRecord,
-        now: OffsetDateTime,
-    ) -> bool {
-        let source_key = connectivity_source_key(paths, &record.source_node_id);
-        let record_key = connectivity_record_key(record);
-        self.state.lock().is_ok_and(|state| {
-            state
-                .connectivity
-                .get(&source_key)
-                .and_then(|source| source.records.get(&record_key))
-                .is_some_and(|known| {
-                    cluster_connectivity_publish_record_matches(known, record, now)
-                })
-        })
-    }
-
     pub fn connectivity_record_set_matches(
         &self,
         paths: &ClusterPaths,
@@ -432,8 +413,18 @@ mod tests {
             &record.source_node_id,
             std::slice::from_ref(&record),
         );
-        assert!(cache.connectivity_record_matches(&paths_a, &record, now));
-        assert!(!cache.connectivity_record_matches(&paths_b, &record, now));
+        assert!(cache.connectivity_record_set_matches(
+            &paths_a,
+            &record.source_node_id,
+            std::slice::from_ref(&record),
+            now,
+        ));
+        assert!(!cache.connectivity_record_set_matches(
+            &paths_b,
+            &record.source_node_id,
+            std::slice::from_ref(&record),
+            now,
+        ));
 
         // Publication never renews an unchanged row, so its age cannot make
         // it unpublished; only a semantic change can.
@@ -444,10 +435,20 @@ mod tests {
             &aged.source_node_id,
             std::slice::from_ref(&aged),
         );
-        assert!(cache.connectivity_record_matches(&paths_b, &aged, now));
+        assert!(cache.connectivity_record_set_matches(
+            &paths_b,
+            &aged.source_node_id,
+            std::slice::from_ref(&aged),
+            now,
+        ));
         let mut changed = aged;
         changed.state = sinomo_network::ClusterConnectivityState::Unreachable;
-        assert!(!cache.connectivity_record_matches(&paths_b, &changed, now));
+        assert!(!cache.connectivity_record_set_matches(
+            &paths_b,
+            &changed.source_node_id,
+            std::slice::from_ref(&changed),
+            now,
+        ));
     }
 
     #[test]
@@ -491,9 +492,24 @@ mod tests {
             );
         }
 
-        assert!(!cache.connectivity_record_matches(&paths, &first, now));
-        assert!(cache.connectivity_record_matches(&paths, &second, now));
-        assert!(cache.connectivity_record_matches(&paths, &third, now));
+        assert!(!cache.connectivity_record_set_matches(
+            &paths,
+            &first.source_node_id,
+            std::slice::from_ref(&first),
+            now,
+        ));
+        assert!(cache.connectivity_record_set_matches(
+            &paths,
+            &second.source_node_id,
+            std::slice::from_ref(&second),
+            now,
+        ));
+        assert!(cache.connectivity_record_set_matches(
+            &paths,
+            &third.source_node_id,
+            std::slice::from_ref(&third),
+            now,
+        ));
         assert_eq!(
             connectivity_record_count(&cache.state.lock().expect("publication cache").connectivity),
             2

@@ -1,5 +1,4 @@
 use super::*;
-use std::path::Path;
 
 fn content_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())

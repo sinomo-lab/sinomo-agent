@@ -4,7 +4,6 @@
 //! has one voter. This is not a real KV-majority or abrupt-takeover proof.
 use super::*;
 use crate::test_runtime::{DfsTestRuntime, FaultAction, FaultRule, RpcPhase};
-use crate::*;
 use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 use std::sync::Arc;

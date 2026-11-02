@@ -16,9 +16,7 @@ mod cross_shard;
 #[cfg(test)]
 mod directory_identity_native_tests;
 #[cfg(test)]
-pub(crate) use cross_shard::{
-    cross_shard_object_version_record, install_hardlink_alias_after_commit_test_hook,
-};
+pub(crate) use cross_shard::install_hardlink_alias_after_commit_test_hook;
 mod jobs;
 mod links;
 pub(crate) mod locks;
@@ -77,8 +75,7 @@ use crate::dfs_now_unix_nanos as now_unix_nanos;
 use crate::intent::{stable_create_object_id, stable_write_target_version};
 use crate::metadata_records::object_version_record;
 use crate::namespace::{
-    initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_object,
-    next_version,
+    namespace_transaction_id_for_batch, namespace_transaction_id_for_object, next_version,
 };
 use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
 use crate::posix_object::{

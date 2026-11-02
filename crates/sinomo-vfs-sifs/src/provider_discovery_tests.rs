@@ -14,13 +14,13 @@ use sinomo_dfs::test_support::DfsTestRuntime;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Scenario {
-    HeldFirstProvider,
+    ResolvedRemoteFirst,
     LostMutationReply,
 }
 
 #[test]
-fn discovered_provider_held_first_status_does_not_starve_healthy_second() {
-    native_provider_control(Scenario::HeldFirstProvider);
+fn discovered_provider_follows_daemon_resolution_without_probes() {
+    native_provider_control(Scenario::ResolvedRemoteFirst);
 }
 
 #[test]
@@ -58,18 +58,18 @@ fn native_catalog_snapshot(
 }
 
 fn native_provider_control(scenario: Scenario) {
-    let name = if scenario == Scenario::HeldFirstProvider {
-        "vfs-provider-fallback-native"
+    let name = if scenario == Scenario::ResolvedRemoteFirst {
+        "vfs-provider-resolution-native"
     } else {
         "vfs-provider-reply-loss-native"
     };
     let (native, nodes) = DfsTestRuntime::start_cluster(name, 3).unwrap();
-    let source = nodes[2].clone(); // Local provider is deliberately tried first.
+    let source = nodes[2].clone(); // The connected daemon's node.
     let data = native.data_dir(&source).clone();
     let paths = ClusterPaths::new(&data);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&paths).unwrap();
     let catalog_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
-    loop {
+    let remote = loop {
         let read = native_catalog_snapshot(
             &native,
             &source,
@@ -80,15 +80,23 @@ fn native_provider_control(scenario: Scenario) {
             instances,
             sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY,
         );
-        if providers.len() >= 2 && providers.iter().any(|provider| provider.node_id == source) {
-            break;
+        if providers.len() >= 2
+            && providers.iter().any(|provider| provider.node_id == source)
+            && let Some(remote) = providers.iter().find(|provider| provider.node_id != source)
+        {
+            break remote.node_id.clone();
         }
         assert!(
             Instant::now() < catalog_deadline,
             "normal native catalog must advertise both actual providers before fault injection"
         );
         std::thread::yield_now();
-    }
+    };
+    // The daemon owns provider selection; this proxy returns its resolution.
+    let resolved = match scenario {
+        Scenario::ResolvedRemoteFirst => vec![remote.clone(), source.clone()],
+        Scenario::LostMutationReply => vec![source.clone(), remote.clone()],
+    };
 
     let member = state
         .members
@@ -107,12 +115,11 @@ fn native_provider_control(scenario: Scenario) {
         }),
     );
     let native = Arc::new(Mutex::new(native));
-    let seen_probes = Arc::new(Mutex::new(Vec::new()));
     let seen_operations = Arc::new(Mutex::new(Vec::new()));
     let native_receipt = Arc::new(Mutex::new(None::<sinomo_api::DaemonDfsBrowserStatResponse>));
     let file_path = "/services/provider-mutation-reply-loss.md";
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let (result, probe_nodes, operation_nodes) = runtime.block_on(async {
+    let (result, operation_nodes) = runtime.block_on(async {
         let listener = AsyncDaemonControlListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr_string().unwrap();
         let first_gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -122,7 +129,7 @@ fn native_provider_control(scenario: Scenario) {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_native = native.clone();
         let server_source = source.clone();
-        let server_probes = seen_probes.clone();
+        let server_resolved = resolved.clone();
         let server_operations = seen_operations.clone();
         let server_gate = first_gate.clone();
         let server_receipt = native_receipt.clone();
@@ -136,7 +143,7 @@ fn native_provider_control(scenario: Scenario) {
                 let mut carrier = accepted.into_inner();
                 let native = server_native.clone();
                 let source = server_source.clone();
-                let probes = server_probes.clone();
+                let resolved = server_resolved.clone();
                 let operations = server_operations.clone();
                 let gate = server_gate.clone();
                 let status = status.clone();
@@ -157,7 +164,7 @@ fn native_provider_control(scenario: Scenario) {
                         let context = RpcPeerContext::unauthenticated_local(stream.session_id.clone(), stream.channel_binding);
                         let native = native.clone();
                         let source = source.clone();
-                        let probes = probes.clone();
+                        let resolved = resolved.clone();
                         let operations = operations.clone();
                         let gate = gate.clone();
                         let status = status.clone();
@@ -169,37 +176,30 @@ fn native_provider_control(scenario: Scenario) {
                                     let _: () = inbound.decode_body().await?;
                                     return ObjectRpcOutgoingResponse::encode_borrowed_value(DAEMON_STATUS_ROUTE, &status);
                                 }
-                                if inbound.request.route == sinomo_core::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE {
-                                    let prefix: String = inbound.decode_body().await?;
-                                    assert_eq!(prefix, sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX);
-                                    // Project the actual initialized native owner's committed catalog
-                                    // into this proxy's observational local-range response.
-                                    let entries = tokio::task::spawn_blocking(move ||
-                                        native_catalog_snapshot(&native.lock().unwrap(), &source, &prefix)
-                                    ).await.unwrap();
-                                    let instances = sinomo_core::service::service_instances_from_entries(&entries.value).unwrap();
-                                    assert!(sinomo_core::service::service_instances_providing_capability(instances, sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY).len() >= 2);
-                                    return ObjectRpcOutgoingResponse::encode_borrowed_value(sinomo_core::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE, &entries);
+                                if inbound.request.route == sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE {
+                                    let request: sinomo_core::service::ServiceProvidersRequest = inbound.decode_body().await?;
+                                    assert_eq!(request.capability, sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY);
+                                    return ObjectRpcOutgoingResponse::encode_borrowed_value(
+                                        sinomo_core::service::CLUSTER_SERVICE_PROVIDERS_ROUTE,
+                                        &sinomo_core::service::ServiceProvidersResponse { providers: resolved },
+                                    );
                                 }
                                 assert_eq!(inbound.request.route, DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE);
                                 let forward: DaemonObjectRpcForwardRequest = inbound.decode_body().await?;
                                 assert_eq!(forward.destination_process_affinity, sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon);
                                 let target = forward.target_node_id.clone();
-                                let is_probe = forward.request.route == sinomo_api::DAEMON_DFS_BROWSER_STATUS_ROUTE;
-                                if is_probe { probes.lock().unwrap().push(target.clone()); }
-                                else {
-                                    assert_eq!(forward.request.route, sinomo_api::DAEMON_DFS_BROWSER_NO_LINKS_ROUTE);
-                                    operations.lock().unwrap().push(target.clone());
-                                }
-                                let held = match scenario {
-                                    Scenario::HeldFirstProvider => is_probe && target == source,
-                                    Scenario::LostMutationReply => !is_probe,
-                                };
+                                assert_eq!(
+                                    forward.request.route,
+                                    sinomo_api::DAEMON_DFS_BROWSER_NO_LINKS_ROUTE,
+                                    "selection must not probe providers"
+                                );
+                                operations.lock().unwrap().push(target.clone());
+                                let held = scenario == Scenario::LostMutationReply;
                                 let timeout = Duration::from_millis(forward.overall_timeout_millis.unwrap_or(5000));
                                 let native_source = source.clone();
                                 let response = tokio::task::spawn_blocking(move || native.lock().unwrap()
                                     .rpc_request(&native_source, &target, forward.request, timeout)).await.unwrap().unwrap();
-                                if !is_probe {
+                                if held {
                                     let actual: sinomo_api::DaemonDfsBrowserNoLinksResponse = response.decode_body().unwrap();
                                     let sinomo_api::DaemonDfsBrowserNoLinksResponse::Metadata { metadata } = actual else {
                                         panic!("native owner must produce the actual exact operation receipt");
@@ -227,13 +227,14 @@ fn native_provider_control(scenario: Scenario) {
         let mut backend = DaemonSifsVfsBackend::new(address).with_timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT);
         backend.discovery_data_dir = Some(data);
         let mut call = tokio::task::spawn_blocking(move || match scenario {
-            Scenario::HeldFirstProvider => backend.stat_beneath_no_links("/services", "/services"),
+            Scenario::ResolvedRemoteFirst => backend.stat_beneath_no_links("/services", "/services"),
             Scenario::LostMutationReply => backend.create_new_versioned_beneath_no_links(
                 "/services", file_path, b"native committed bytes; caller outcome unknown",
                 &VfsWriteOptions::default().create_new(),
             ),
         });
-        let observed_ingress = tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, entered_rx).await.is_ok_and(|result| result.is_ok());
+        let observed_ingress = scenario != Scenario::LostMutationReply
+            || tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT, entered_rx).await.is_ok_and(|result| result.is_ok());
         let completed = tokio::time::timeout(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT + Duration::from_secs(1), &mut call).await;
         let before_release = completed.is_ok();
         first_gate.add_permits(1);
@@ -242,7 +243,7 @@ fn native_provider_control(scenario: Scenario) {
         server.await.unwrap();
         assert!(observed_ingress, "control must observe the actual selected native response before holding delivery");
         assert!(before_release, "operation must not require the failed provider reply");
-        (result, seen_probes.lock().unwrap().clone(), seen_operations.lock().unwrap().clone())
+        (result, seen_operations.lock().unwrap().clone())
     });
     if scenario == Scenario::LostMutationReply {
         let receipt = native_receipt
@@ -267,18 +268,14 @@ fn native_provider_control(scenario: Scenario) {
         .unwrap()
         .close()
         .unwrap();
-    assert_eq!(probe_nodes.first(), Some(&source));
     match scenario {
-        Scenario::HeldFirstProvider => {
-            let metadata =
-                result.expect("healthy later provider must complete under the original deadline");
+        Scenario::ResolvedRemoteFirst => {
+            let metadata = result.expect("the resolved provider completes the operation");
             assert_eq!(metadata.path, "/services");
-            assert!(probe_nodes.len() >= 2);
-            assert_ne!(probe_nodes[1], source);
             assert_eq!(
                 operation_nodes,
-                vec![probe_nodes[1].clone()],
-                "one operation send to selected healthy provider"
+                vec![remote],
+                "one operation send to the daemon's first resolved provider"
             );
         }
         Scenario::LostMutationReply => {

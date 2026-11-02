@@ -21,6 +21,7 @@ impl SourceRawDocument {
     pub(crate) fn context(&self) -> Result<SourceDocumentContext<'_>> {
         SourceDocumentContext::new(&self.bytes, &self.row_pointer)
     }
+    #[cfg(test)]
     pub(crate) fn decoded_value(&self) -> Result<serde_json::Value> {
         decode_original_document(&self.bytes)
     }
@@ -137,6 +138,7 @@ impl<'a> SourceDocumentContext<'a> {
         })
     }
 }
+#[cfg(test)]
 pub(crate) fn raw_payload_wire(
     raw: &SourceRawDocument,
     relative_json_pointer: &str,

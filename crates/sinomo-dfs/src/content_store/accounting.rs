@@ -1,15 +1,15 @@
 use super::{
     CONTENT_STORE_STATS_FILE, CONTENT_STORE_STATS_LOCK_FILE, CONTENT_STORE_STATS_VERSION,
     ContentStoreError, LocalContentStore, Result, VersionManifestEntry, decode_stats_snapshot,
-    encode_stats_snapshot, ensure_bytes_match_hash, file_content_hash, publish_file_as_blob,
+    encode_stats_snapshot, ensure_bytes_match_hash, publish_file_as_blob,
     write_content_addressed_blob_bytes, write_content_addressed_blob_bytes_prehashed,
 };
 use crate::content_store::INLINE_BLOB_SMALL_LIMIT_BYTES;
 use crate::content_store::fs_ops::{
-    file_len_if_exists, read_dir, read_file, recursive_file_count_and_bytes, remove_file,
+    file_len_if_exists, read_file, recursive_file_count_and_bytes, remove_file,
     remove_file_if_exists, write_file_atomic,
 };
-use crate::content_store::inline_bindings::{InlineBindingView, InlineVersionState};
+use crate::content_store::inline_bindings::InlineVersionState;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs;

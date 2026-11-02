@@ -15,12 +15,13 @@ use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) const DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 
 /// Checkpoint only the exact actual named transfer observed before dispatch.
 /// This is queue DATA reconciliation, not metadata receipt/effect authority.
+#[cfg(test)]
 pub(crate) fn checkpoint_detached_replica_delivery(
     data_dir: &sinomo_core::local::SinomoDataDir,
     event: crate::node_transport::DfsBackgroundReplicaDeliveryEvent,
@@ -460,6 +461,7 @@ impl DfsDetachedSendRuntime {
         self.record_recovery_scan_generation(0);
     }
 
+    #[cfg(test)]
     pub fn schedule_deferred_work<F>(
         self: &Arc<Self>,
         worker: crate::DfsNodeDetachedSendWorker,

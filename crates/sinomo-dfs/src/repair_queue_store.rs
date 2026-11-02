@@ -7,8 +7,6 @@
 
 use crate::DfsError;
 use crate::maintenance::DfsRepairAttemptRecord;
-#[cfg(test)]
-use crate::metadata_io::write_sobj_atomic;
 use crate::metadata_io::{encode_sobj, metadata_durable_file_error, write_file_atomic};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};

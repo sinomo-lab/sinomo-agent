@@ -1132,6 +1132,17 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     } else {
         None
     };
+    // A clustered main that could not open its local Raft node at startup
+    // reports the later ownership through this edge.
+    let (raft_resident_ready, startup_raft_resident_ready) = if startup_cluster_runtime_enabled
+        && !startup_local_raft_resident_initialized
+        && !crate::daemon_paths_are_shadow(&paths)
+    {
+        let (ready, observed) = tokio::sync::watch::channel(false);
+        (Some(ready), Some(observed))
+    } else {
+        (None, None)
+    };
     runtime_tasks.push((
         "background maintenance",
         daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
@@ -1142,6 +1153,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
             maintenance_runtime,
             maintenance_startup_cluster,
             startup_local_raft_resident_initialized,
+            raft_resident_ready,
             maintenance_connectivity_topology_subscription,
             startup_cluster_runtime_enabled,
             maintenance_inhibitors,
@@ -1153,7 +1165,27 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     // The listener is already bound and will accept queued connections as
     // soon as the runtime enters the loop below. Notify service-owned workers
     // through an in-process edge so startup never depends on a polling timer.
-    service_host.notify_component_host_ready();
+    // Workers use cluster storage, so a clustered main notifies them once it
+    // owns its local Raft node; a replacement may wait for its predecessor.
+    if let Some(mut raft_ready) = startup_raft_resident_ready {
+        let ready_host = service_host.clone();
+        let mut ready_shutdown = shutdown_rx.clone();
+        runtime_tasks.push((
+            "component host readiness",
+            daemon_runtime_handle.spawn(async move {
+                tokio::select! {
+                    ready = raft_ready.wait_for(|ready| *ready) => {
+                        if ready.is_ok() {
+                            ready_host.notify_component_host_ready();
+                        }
+                    }
+                    _ = ready_shutdown.wait_for(|stopping| *stopping) => {}
+                }
+            }),
+        ));
+    } else {
+        service_host.notify_component_host_ready();
+    }
     let accept_result = daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
         paths.clone(),
@@ -1396,6 +1428,7 @@ async fn run_daemon_background_maintenance_loop(
     runtime: tokio::runtime::Handle,
     startup_cluster: Option<DaemonClusterStatus>,
     startup_local_raft_resident_initialized: bool,
+    local_raft_resident_ready: Option<tokio::sync::watch::Sender<bool>>,
     connectivity_topology_subscription: Option<DaemonConnectivityTopologySubscriptions>,
     maintain_cluster_runtime: bool,
     maintenance_inhibitors: Vec<sinomo_module::ComponentMaintenanceInhibitor>,
@@ -1408,6 +1441,9 @@ async fn run_daemon_background_maintenance_loop(
         startup_local_raft_resident_initialized,
     )
     .await;
+    if let Some(ready) = local_raft_resident_ready {
+        cluster_network.notify_local_raft_resident_ready(ready);
+    }
     let current_node_resources = node_resources.take_latest();
     cluster_network.set_resource_mode(current_node_resources.mode);
     observe_daemon_node_resources(current_node_resources);

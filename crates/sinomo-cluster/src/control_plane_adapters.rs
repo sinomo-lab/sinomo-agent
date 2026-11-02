@@ -1,7 +1,6 @@
 pub(crate) use crate::connectivity_publish::ClusterConnectivityPublishHost;
 use crate::control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 use crate::invite_publish::ClusterInvitePublishHost;
-use crate::kv_local_store::locked_cache_cluster_kv_snapshot_if_newer_than_raft;
 use crate::kv_local_store::locked_kv_state_authority_id;
 use crate::kv_snapshot::ClusterKvSnapshotRefreshHost;
 use crate::kv_txn_quorum::{
@@ -54,15 +53,6 @@ where
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, NetworkError> {
         locked_kv_state_authority_id(paths, state)
-    }
-
-    fn cache_cluster_kv_snapshot_if_newer_than_raft(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, NetworkError> {
-        locked_cache_cluster_kv_snapshot_if_newer_than_raft(paths, local_node_id, snapshot)
     }
 
     fn call_node_object_rpc(

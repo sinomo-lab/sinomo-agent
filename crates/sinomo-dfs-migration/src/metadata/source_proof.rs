@@ -33,13 +33,6 @@ pub(super) fn validate(proof: &DfsMetadataPrefixProof) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn extend(
-    previous: &DfsMetadataPrefixProof,
-    sequence: u64,
-    exact_frame: &[u8],
-) -> Result<DfsMetadataPrefixProof> {
-    extend_as(previous, sequence, exact_frame, previous.version)
-}
 pub(super) fn extend_as(
     previous: &DfsMetadataPrefixProof,
     sequence: u64,

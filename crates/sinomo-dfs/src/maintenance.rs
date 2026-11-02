@@ -600,17 +600,17 @@ use crate::{
     DFS_PENDING_TRANSFER_STALE_AFTER, DfsCommittedWorkTracker,
     DfsContentRootCatalogCollectionValidation, DfsContentRootCatalogIncompleteReason,
     DfsControlPlaneKvClient, DfsDistributedWriteResult, DfsError, DfsFileSystemConfig,
-    DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataBackend,
-    DfsMetadataHistoryGcOptions, DfsMetadataHistoryGcReport, DfsMetadataJournalBatchSender,
-    DfsMetadataJournalPublisherHost, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataJournalReplicationTransport,
-    DfsMetadataNodeTransport, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallSender,
-    DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState, DfsObjectId, DfsObjectPageCursor,
-    DfsPeerTransport, DfsPlacementReconciliationJob, DfsTombstoneCompactionOptions,
-    DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
-    LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
-    NetworkedDfsWriteOutcome, async_dfs_metadata_journal_batch_sender_from_peer_transport,
+    DfsFileSystemId, DfsMessageSender, DfsMessageTransport, DfsMetadataHistoryGcOptions,
+    DfsMetadataHistoryGcReport, DfsMetadataJournalBatchSender, DfsMetadataJournalPublisherHost,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataJournalReplicationTransport, DfsMetadataNodeTransport, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
+    DfsMetadataSnapshotInstallSender, DfsNamespaceJobMaintenanceReport, DfsNodeDetachedSendState,
+    DfsObjectId, DfsObjectPageCursor, DfsPeerTransport, DfsPlacementReconciliationJob,
+    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion,
+    DistributedRepairJob, LocalDfsMetadataJournalPublisherHost, NetworkedDfsService,
+    NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
+    async_dfs_metadata_journal_batch_sender_from_peer_transport,
     async_dfs_metadata_snapshot_install_sender_from_peer_transport,
     default_dfs_content_root_catalog_store, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
@@ -645,27 +645,6 @@ pub fn dfs_events_should_wake_repair_maintenance(events: &[NetworkedDfsServiceEv
             NetworkedDfsWriteOutcome::Committed { repair_jobs, .. } => !repair_jobs.is_empty(),
         }
     })
-}
-
-#[cfg(test)]
-pub(crate) fn run_cluster_dfs_maintenance_tick(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    message_sender: DfsMessageSender,
-    metadata_sender: DfsMetadataJournalBatchSender,
-    snapshot_sender: DfsMetadataSnapshotInstallSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
-    options: DfsMaintenanceTickOptions,
-) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
-    run_cluster_dfs_maintenance_tick_with_message_sender(
-        data_dir,
-        cluster_paths,
-        message_sender,
-        metadata_sender,
-        snapshot_sender,
-        control_plane,
-        options,
-    )
 }
 
 pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(

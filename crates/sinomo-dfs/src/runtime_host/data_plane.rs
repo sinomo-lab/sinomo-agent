@@ -1653,6 +1653,7 @@ pub(crate) fn daemon_dfs_control_plane_client_on_runtime(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn daemon_dfs_node_transport(
     local_node_id: sinomo_core::node::NodeId,
     peer_node_ids: impl IntoIterator<Item = NodeId>,
@@ -1706,56 +1707,6 @@ pub(crate) fn daemon_dfs_client_node_transport(
         async_peer,
     )
     .with_registered_main_namespace_dispatch()
-}
-
-/// Test-only contact restriction on the SAME actual registered native host.
-/// Not a replacement carrier, fresh owner, source authority or decoded return.
-#[cfg(test)]
-pub(crate) fn daemon_dfs_native_prefix_contact_scoped_transport_for_test(
-    local_node_id: NodeId,
-    peer_node_ids: Vec<NodeId>,
-    data_dir: &SinomoDataDir,
-    runtime: &tokio::runtime::Handle,
-    contacts: std::collections::BTreeMap<NodeId, (String, String)>,
-    hints: std::collections::BTreeMap<NodeId, sinomo_core::ClusterEndpointRecord>,
-) -> Result<DfsNodeTransport, DfsRuntimeError> {
-    let host = registered_dfs_runtime_host(data_dir)?.ok_or_else(|| DfsRuntimeError::Parse {
-        detail: "native scoped PREFIX has no existing registered host".into(),
-    })?;
-    if contacts.len() != 3
-        || hints.len() != contacts.len()
-        || hints.iter().any(|(node, endpoint)| {
-            endpoint.node_id != *node
-                || contacts.get(node).is_none_or(|(address, _)| *address != endpoint.address)
-                || !matches!(endpoint.transport, sinomo_core::ClusterTransportKind::Loopback
-                    | sinomo_core::ClusterTransportKind::LanTcp)
-        })
-        || !contacts.contains_key(&local_node_id)
-        || peer_node_ids
-            .iter()
-            .any(|peer| !contacts.contains_key(peer))
-    {
-        return Err(DfsRuntimeError::Parse {
-            detail: "native scoped PREFIX contact set differs".into(),
-        });
-    }
-    let mut context = super::native_prefix_return::NativePrefixOwnerContext::new(data_dir, runtime);
-    context.contact_scope = Some(super::native_prefix_return::NativePrefixContactScope {
-        owned: contacts, hints,
-    });
-    let peer = Arc::new(DaemonDfsPeerTransport {
-        host,
-        native_prefix: Some(context),
-    });
-    let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
-    let async_peer: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = peer;
-    Ok(DfsNodeTransport::with_peer_transports_for_nodes(
-        local_node_id,
-        peer_node_ids,
-        sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
-        sync_peer,
-        async_peer,
-    ))
 }
 
 #[derive(Clone)]
@@ -2908,15 +2859,6 @@ pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)
-}
-
-#[cfg(test)]
-pub(super) fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
-    Arc::new(|_endpoint, _command, _timeout| {
-        Err(DfsMetadataPeerTransportError::new(
-            "test DFS metadata snapshot sender has no daemon runtime",
-        ))
-    })
 }
 
 // DFS inspection request/response types live in `sinomo-dfs`; this module only

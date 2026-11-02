@@ -7148,12 +7148,14 @@ mod tests {
 
         let follower_id =
             NodeId::from_legacy_named("node_unanchored_cache_follower").expect("follower");
-        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("follower-raft"));
+        let follower_kv = ClusterKvPaths::new(root.join("follower"));
         assert!(
-            cache
-                .cache_snapshot_if_newer_than_raft(follower_id.clone(), leader_snapshot.clone(),)
-                .expect("cache newer snapshot")
+            write_imported_cluster_kv_snapshot_if_changed(&follower_kv, &leader_snapshot, |_| {
+                false
+            })
+            .expect("import leader read model")
         );
+        let cache = follower_kv.local_cache();
         let follower_paths = cache.raft_wal_paths(&follower_id);
         assert!(
             !follower_paths.snapshot.exists(),
@@ -7203,9 +7205,8 @@ mod tests {
             .expect("seed imported b");
         let imported = imported_store.try_snapshot().expect("imported snapshot");
         assert!(
-            cache
-                .cache_snapshot_if_newer_than_raft(node_id.clone(), imported.clone())
-                .expect("cache imported snapshot")
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &imported, |_| false)
+                .expect("import snapshot")
         );
 
         let local = paths
@@ -7251,7 +7252,6 @@ mod tests {
         let root = temp_raft_root("sinomo-kv-out-of-order-imports");
         let paths = ClusterKvPaths::new(root.to_path_buf());
         let cache = paths.local_cache();
-        let node_id = NodeId::from_legacy_named("node_out_of_order_imports").expect("node");
 
         let mut store = InProcessKvStore::new();
         store
@@ -7274,11 +7274,6 @@ mod tests {
         assert!(
             !write_cluster_kv_snapshot_if_changed(&paths, &older)
                 .expect("reject direct out-of-order import")
-        );
-        assert!(
-            !cache
-                .cache_snapshot_if_newer_than_raft(node_id.clone(), older)
-                .expect("reject out-of-order cache import")
         );
 
         let mut equivalent = newer.clone();
@@ -7304,14 +7299,6 @@ mod tests {
         assert_eq!(
             write_cluster_kv_snapshot_if_changed(&paths, &conflicting)
                 .expect_err("reject equal-revision direct conflict"),
-            KvError::ImportedSnapshotRevisionConflict {
-                revision: newer.revision,
-            }
-        );
-        assert_eq!(
-            cache
-                .cache_snapshot_if_newer_than_raft(node_id, conflicting)
-                .expect_err("reject equal-revision cache conflict"),
             KvError::ImportedSnapshotRevisionConflict {
                 revision: newer.revision,
             }
@@ -7514,17 +7501,13 @@ mod tests {
         imported.canonicalize();
 
         assert_eq!(local.revision, imported.revision);
-        assert!(paths.imported_snapshot_advances_current_for_node(&node_id, &imported));
         assert!(
-            paths
-                .local_cache()
-                .cache_snapshot_if_newer_than_raft(node_id.clone(), imported.clone())
-                .expect("cache equal-revision newer generation")
+            write_imported_cluster_kv_snapshot_if_changed(&paths, &imported, |_| false)
+                .expect("import equal-revision newer generation")
         );
         assert!(
             !paths
-                .local_cache()
-                .cache_snapshot_if_newer_than_raft(node_id, local)
+                .write_raft_snapshot_if_changed(&local)
                 .expect("preserve imported generation over local raft view")
         );
         assert_eq!(

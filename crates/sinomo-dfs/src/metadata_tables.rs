@@ -30,11 +30,10 @@ use crate::metadata_records::{
     DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
     DfsNamespaceJobStatus, DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState,
     DfsNamespaceRequestCompletion, DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord,
-    DfsNamespaceRequestStatus, DfsNamespaceTransaction, DfsNamespaceTransactionReceipt,
-    DfsObjectVersionRecord, DfsPathRecord, DfsPreparedOperationEviction,
-    DfsPreparedOperationRecord, DfsPreparedOperationStatus, DfsReplicaReceiptRecord,
-    DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord,
-    normalized_object_metadata,
+    DfsNamespaceRequestStatus, DfsNamespaceTransactionReceipt, DfsObjectVersionRecord,
+    DfsPathRecord, DfsPreparedOperationEviction, DfsPreparedOperationRecord,
+    DfsPreparedOperationStatus, DfsReplicaReceiptRecord, DfsWriteIntentReceipt,
+    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, normalized_object_metadata,
 };
 
 mod prepared_operation;
@@ -1809,14 +1808,6 @@ impl DfsMetadataTables {
                     .map(String::as_str)
                     .find(|owner| *owner != operation_id)
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn namespace_prepare_footprint_indexes_match_history(&self) -> bool {
-        let (object_owners, path_owners) =
-            Self::namespace_prepare_footprint_indexes_from_history(&self.prepared_operations_v7);
-        self.namespace_prepare_object_owners == object_owners
-            && self.namespace_prepare_path_owners == path_owners
     }
 
     pub(crate) fn apply(&mut self, op: DfsMetadataTableOp) {

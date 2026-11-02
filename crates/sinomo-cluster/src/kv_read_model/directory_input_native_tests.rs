@@ -106,7 +106,7 @@ fn resident_directory_cut_preserves_full_memo_after_real_no_effect_commit() {
 }
 
 #[test]
-fn resident_directory_uses_newer_imported_rows_and_native_rows_on_revision_tie() {
+fn resident_directory_reads_native_rows_over_newer_or_tied_materialized_rows() {
     let (_root, paths, state, native) = resident("directory-native-imported-selection");
     let original = members(&read_cluster_directory_input(&paths).unwrap().unwrap());
     let mut import_store = sinomo_kv::InProcessKvStore::restore(native.clone()).unwrap();
@@ -126,11 +126,12 @@ fn resident_directory_uses_newer_imported_rows_and_native_rows_on_revision_tie()
     // claim that these rows are a new authenticated quorum certificate.
     crate::write_imported_cluster_kv_snapshot_if_changed(&paths, &imported).unwrap();
     let selected = read_cluster_directory_input(&paths).unwrap().unwrap();
-    assert_eq!(selected.revision, imported.revision);
+    assert_eq!(selected.revision, native.revision);
     assert!(
-        members(&selected)
+        !members(&selected)
             .iter()
-            .any(|m| m.node_id == joined.node_id)
+            .any(|m| m.node_id == joined.node_id),
+        "resident Raft state is canonical even when the materialized file is newer"
     );
     assert_eq!(
         full_native(&paths, &state).entries,

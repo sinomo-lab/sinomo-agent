@@ -378,30 +378,6 @@ impl ClusterKvPaths {
         self.local_cache().write_raft_snapshot_if_changed(snapshot)
     }
 
-    pub fn imported_snapshot_advances_current_for_node(
-        &self,
-        node_id: &NodeId,
-        snapshot: &KvSnapshot,
-    ) -> bool {
-        if let Some(current) =
-            read_resident_raft_local_materialized_generation(&self.raft_wal_paths(node_id), node_id)
-        {
-            return match current {
-                Ok(current) => kv_snapshot_materialized_generation(snapshot) > current.value,
-                Err(_) => true,
-            };
-        }
-        // Cold, unavailable, denied or replaced native owners retain the
-        // established immutable/materialized/error behavior below.
-        match read_cluster_kv_current_snapshot_for_node(self, node_id.clone()) {
-            Ok(local_snapshot) => {
-                kv_snapshot_materialized_generation(snapshot)
-                    > kv_snapshot_materialized_generation(&local_snapshot)
-            }
-            Err(_) => true,
-        }
-    }
-
     pub fn apply_raft_append_with_response_and_publish_report<F>(
         &self,
         node_id: &NodeId,
@@ -609,24 +585,6 @@ impl ClusterKvPaths {
         node_id: &NodeId,
     ) -> Result<DurableRaftKvNode, KvError> {
         self.raft_store().open_node_async(node_id).await
-    }
-
-    pub fn cache_snapshot_if_newer_than_raft_and_notify(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        self.raft_store()
-            .cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
-    }
-
-    pub fn locked_cache_snapshot_if_newer_than_raft_and_notify(
-        &self,
-        node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, KvError> {
-        self.raft_store()
-            .locked_cache_snapshot_if_newer_than_raft_and_notify(node_id, snapshot)
     }
 
     pub async fn locked_last_raft_log_index_async(&self, node_id: &NodeId) -> Result<u64, KvError> {

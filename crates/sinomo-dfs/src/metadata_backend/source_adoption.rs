@@ -49,12 +49,6 @@ impl DfsSourceAdoptionSourceCapture {
     pub(crate) fn prefix(&self) -> &DfsMetadataPrefixProof {
         &self.custody.prefix
     }
-    pub(crate) fn writer_custody(&self) -> DfsSourceAdoptionWriterCustody {
-        self.custody.clone()
-    }
-    pub(crate) fn into_parts(self) -> (DfsCrossShardSourceFamily, DfsSourceAdoptionWriterCustody) {
-        (self.family, self.custody)
-    }
 }
 
 /// Actual original coordinator-job custody, captured independently of any
@@ -76,9 +70,6 @@ impl DfsSourceAdoptionJobCapture {
     }
     pub(crate) fn writer_custody(&self) -> DfsSourceAdoptionWriterCustody {
         self.custody.clone()
-    }
-    pub(crate) fn into_parts(self) -> (DfsNamespaceJobRecord, DfsSourceAdoptionWriterCustody) {
-        (self.job, self.custody)
     }
 }
 
@@ -107,9 +98,6 @@ impl DfsSourceAdoptionCapture {
             },
         )
     }
-    pub(crate) fn scope(&self) -> &DfsPublicationOwnerScope {
-        self.source.scope()
-    }
     pub(crate) fn family(&self) -> &DfsCrossShardSourceFamily {
         &self.family
     }
@@ -118,12 +106,6 @@ impl DfsSourceAdoptionCapture {
     }
     pub(crate) fn job(&self) -> &DfsNamespaceJobRecord {
         &self.job
-    }
-    pub(crate) fn job_scope(&self) -> &DfsPublicationOwnerScope {
-        self.job_root.as_ref().unwrap_or(&self.source).scope()
-    }
-    pub(crate) fn job_writer_custody(&self) -> DfsSourceAdoptionWriterCustody {
-        self.job_root.as_ref().unwrap_or(&self.source).clone()
     }
     pub(crate) fn from_held(
         source: DfsSourceAdoptionWriterCustody,

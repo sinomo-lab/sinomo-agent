@@ -187,6 +187,18 @@ sinomo cluster health
 sinomo cluster doctor
 ```
 
+If a node cannot reach any peer because their addresses changed while it was
+offline, give it one current address:
+
+```sh
+sinomo cluster route-hint <peer-node-id> <host:port>
+```
+
+The hint is only a route: the peer is still authenticated on every call and
+membership is unchanged. Once the node has caught up, committed cluster state
+supplies the peer's published addresses, and a hint for an address the peer
+publishes is dropped. Remove a hint with `--remove`.
+
 `cluster repair-members` and `cluster cleanup-legacy-shadow-members` are focused
 repair commands. Read their current help, confirm the source peer and data
 directory, and preserve a backup before using them. Never create a replacement

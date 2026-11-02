@@ -9612,7 +9612,6 @@ dependencies = [
  "sinomo-lm",
  "sinomo-runtime",
  "sinomo-testdir",
- "tokio",
 ]
 
 [[package]]

@@ -18,18 +18,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use crate::DfsMetadataShardConfig;
 use crate::direct_read::handle_dfs_direct_read_request_with_initialized_content_store;
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_PLANE_SERVICE_ROUTES, DFS_DIRECT_READ_ROUTE,
     DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
     DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsFileSystemId, DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataReplicaShardContext, DfsMetadataShardConfig,
-    DfsMetadataShardId, DfsMetadataShardMembershipHandoff, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsOperatorStatus, DfsOutboundAttachment, DfsSmokeReport,
-    LocalContentStore, dfs_module_surfaces, dfs_route_is_message_data_plane,
-    inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status, metadata_shard_key,
-    metadata_shard_membership_handoff_key,
+    DfsMetadataJournalBatchResponse, DfsMetadataReplicaShardContext, DfsMetadataShardId,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsOperatorStatus,
+    DfsOutboundAttachment, DfsSmokeReport, LocalContentStore, dfs_module_surfaces,
+    dfs_route_is_message_data_plane, inspect_cluster_aware_dfs, inspect_cluster_aware_dfs_status,
 };
 use sinomo_core::local::SinomoDataDir;
 #[cfg(test)]
@@ -1445,66 +1445,19 @@ mod tests {
     use super::*;
     use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY, DfsMetadataJournalFrameBatch};
     use crate::{
-        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystem, DfsMetadataBackend,
-        DfsMetadataJournalBatch, DfsMetadataJournalBatchResponse,
-        DfsMetadataJournalReplicationReport, DfsMetadataShardAssignment, DfsMetadataShardId,
-        DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-        DfsMetadataSnapshotInstallResult, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-        DfsObjectVersionRecord, DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsSmokeAttempt,
-        DfsVersion, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalSobjMetadataBackend,
-        default_dfs_metadata_shards_root, metadata_shard_key, sifs_file_system_id,
+        DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchResponse,
+        DfsMetadataShardAssignment, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
+        DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsObjectId,
+        DfsVersion, LocalSobjMetadataBackend, metadata_shard_key, sifs_file_system_id,
     };
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::cluster::ClusterKvPathsExt;
-    use sinomo_core::kv::{
-        ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvEntry,
-        KvLocalRead, KvRevision, KvTxnRequest, KvVersion,
-    };
+
     use sinomo_core::node::NodeId;
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
-    use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
-
-    struct UnavailableComponentObjectRpc;
-
-    impl sinomo_module::ComponentObjectRpcTransport for UnavailableComponentObjectRpc {
-        fn call(
-            &self,
-            _target_node_id: &NodeId,
-            _call: sinomo_core::network::ObjectRpcCall,
-            _options: sinomo_core::network::ClusterObjectRpcOptions,
-            _observe_connectivity: bool,
-        ) -> Result<sinomo_core::network::ObjectRpcResult, sinomo_core::network::NetworkError>
-        {
-            Err(sinomo_core::network::NetworkError::delivery_failed(
-                "test component object RPC",
-                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
-                "unavailable",
-            ))
-        }
-
-        fn call_async<'a>(
-            &'a self,
-            target_node_id: &'a NodeId,
-            call: sinomo_core::network::ObjectRpcCall,
-            options: sinomo_core::network::ClusterObjectRpcOptions,
-            observe_connectivity: bool,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            sinomo_core::network::ObjectRpcResult,
-                            sinomo_core::network::NetworkError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move { self.call(target_node_id, call, options, observe_connectivity) })
-        }
-    }
 
     #[derive(Clone, Default)]
     struct VecSink {

@@ -487,7 +487,10 @@ snapshot. Components remain pending until required services are available;
 registry replacement preserves unchanged scopes and atomically publishes one
 new generation. Daemon-owned foundational methods, such as process status,
 shutdown, and cluster transport, remain host services. Domain behavior and
-long-lived workers live in their owner component.
+long-lived workers live in their owner component. Host readiness callbacks run
+once the daemon accepts requests and, for a clustered main, owns its local Raft
+node, so workers that use cluster storage start after a predecessor's handoff
+rather than retrying through it.
 
 The service-catalog publisher compares source-owned records by stable service
 semantics; equal records produce no writes. Registry generation changes drive
@@ -496,7 +499,11 @@ local admission without publishing the withdrawal, so the node's committed
 offer survives the replacement and a retiring process cannot remove records its
 successor owns. The publisher also reconciles when a committed change reaches
 the node's own records, which repairs a predecessor's late write without a
-timer. Removing a member retires its records.
+timer. Removing a member retires its records. The same component resolves the
+providers of a capability for local clients: its own node first when the live
+registry offers the capability, then ready providers on authorized members that
+the routing graph can reach, by route cost. Clients send each operation to one
+resolved provider instead of probing candidates.
 
 This does not require every module to be dynamically loaded. Static native Rust
 modules still participate through the same catalog and binding split: the

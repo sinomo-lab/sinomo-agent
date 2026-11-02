@@ -7,9 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sinomo_core::node::NodeId;
 
-use crate::advisory_lock::{
-    DfsAdvisoryLockCommand, DfsAdvisoryLockStateRecord, DfsAdvisoryLockTransitionContext,
-};
+use crate::advisory_lock::DfsAdvisoryLockStateRecord;
 use crate::content_root_catalog::{
     DfsContentRootCatalogIncompleteReason, DfsContentRootCatalogPage,
     DfsContentRootCatalogPageRequest,
@@ -39,10 +37,9 @@ use crate::{
 pub(crate) mod selected_local_recovery;
 #[cfg(test)]
 pub(crate) use selected_local_recovery::{
-    DfsLocalRecoveryInventoryKind, DfsSelectedLocalRecoveryContext,
-    DfsSelectedLocalRecoveryFence, DfsSelectedLocalRecoveryFenceData,
-    DfsSelectedLocalRecoveryPhysicalIdentity, SELECTED_LOCAL_RECOVERY_PREPARE_LIMIT,
-    FAIL_SELECTED_LOCAL_RECOVERY_NAMESPACE, read_selected_local_recovery_fence,
+    DfsLocalRecoveryInventoryKind, DfsSelectedLocalRecoveryContext, DfsSelectedLocalRecoveryFence,
+    DfsSelectedLocalRecoveryFenceData, FAIL_SELECTED_LOCAL_RECOVERY_NAMESPACE,
+    SELECTED_LOCAL_RECOVERY_PREPARE_LIMIT, read_selected_local_recovery_fence,
     write_selected_local_recovery_fence,
 };
 

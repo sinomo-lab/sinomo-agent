@@ -25,8 +25,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
+#[cfg(test)]
 use time::OffsetDateTime;
 
+#[cfg(test)]
+use crate::LocalShardedMetadataBackend;
 #[cfg(test)]
 use crate::cluster_dfs_peer_node_ids;
 use crate::maintenance::DfsMaintenanceExecutionExclusions;
@@ -34,25 +37,23 @@ use crate::metadata_sharded_backend::ResidentMetadataReplicationCursorStatusObse
 use crate::node_transport::value_response_from_rpc_result;
 use crate::{
     AsyncDfsPeerTransport, DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
-    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsDistributedWriteResult, DfsError, DfsFileSystem,
+    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT, DfsDistributedWriteResult, DfsError,
     DfsFileSystemId, DfsMetadataBackend, DfsMetadataDurableReplication, DfsMetadataJournalBatch,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataJournalFrameRecord, DfsMetadataPrefixProbe, DfsMetadataReplicaApplyReport,
     DfsMetadataReplicaIngestPermit, DfsMetadataReplicationSuppressionRecord,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsNamespaceResult, DfsObjectKind, DfsObjectRpcSendOptions,
-    DfsObjectVersionRecord, DfsPeerTransport, DfsPeerTransportFuture, DfsVersion,
-    LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
+    DfsMetadataSnapshotInstallResult, DfsNamespaceResult, DfsObjectRpcSendOptions,
+    DfsPeerTransport, DfsPeerTransportFuture, LocalSobjMetadataBackend, NetworkedDfsServiceEvent,
     ResidentLocalMetadataShardLease, cluster_dfs_metadata_shards,
     decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response,
     default_dfs_metadata_replication_suppression_snapshot_path,
     dfs_metadata_journal_batch_rpc_call, dfs_metadata_snapshot_install_rpc_call,
     dfs_now_unix_nanos, discovered_cluster_dfs_peer_node_ids, distributed_sifs,
-    distributed_sifs_bootstrap_objects_for_nodes, local_dfs_metadata_shard_path,
-    metadata_shard_key, metadata_shard_membership_handoff_key, open_local_metadata_shard_backend,
-    put_local_dfs_metadata_replication_suppression,
+    local_dfs_metadata_shard_path, metadata_shard_key, metadata_shard_membership_handoff_key,
+    open_local_metadata_shard_backend, put_local_dfs_metadata_replication_suppression,
     read_dfs_metadata_replication_suppression_snapshot, sifs_file_system_id,
 };
 use crate::{metadata_cursor, metadata_lock};
@@ -8059,32 +8060,6 @@ fn dfs_metadata_caught_up_probe_command(
             journal_frames: Vec::new(),
             next_after_sequence: journal_sequence,
         },
-    }
-}
-
-#[cfg(test)]
-fn dfs_metadata_journal_batch_command(
-    local_node_id: &NodeId,
-    target_node_id: &NodeId,
-    file_system_id: &DfsFileSystemId,
-    authority_epoch: u64,
-    batch: DfsMetadataJournalBatch,
-) -> DfsMetadataJournalBatchCommand {
-    let next_after_sequence = batch.next_after_sequence;
-    DfsMetadataJournalBatchCommand {
-        request_id: format!(
-            "dfs_meta_{}_{}_{}",
-            local_node_id, target_node_id, next_after_sequence
-        ),
-        source_node_id: Some(local_node_id.clone()),
-        file_system_id: Some(file_system_id.clone()),
-        authority_epoch: Some(authority_epoch),
-        verify_prefix_only: false,
-        prefix_probe: None,
-        authority_probe: None,
-        durable_replication: None,
-        batch: crate::test_support::structural_journal_frame_batch(batch)
-            .expect("encode structural current frame fixture"),
     }
 }
 

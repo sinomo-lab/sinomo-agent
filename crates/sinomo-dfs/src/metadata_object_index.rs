@@ -5,8 +5,7 @@
 //! directory-fragment indexes from an in-memory table snapshot.
 
 use crate::metadata_keys::{
-    bucket_dirfrag_id, dentry_key, dirfrag_hash_range, normalize_path, object_inode_id,
-    path_record_for_object,
+    bucket_dirfrag_id, dentry_key, dirfrag_hash_range, normalize_path, path_record_for_object,
 };
 use crate::metadata_records::{
     DfsDirFragmentId, DfsDirFragmentRecord, DfsInodeRecord, DfsMetadataTableOp, DfsPathRecord,

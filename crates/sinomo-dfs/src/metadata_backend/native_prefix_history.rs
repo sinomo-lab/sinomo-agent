@@ -76,17 +76,8 @@ pub(crate) struct NativePrefixHistorySource {
     physical: NativePrefixHistoryPhysicalOwner,
 }
 impl NativePrefixHistorySource {
-    pub(crate) fn assignment(&self) -> &DfsMetadataShardConfig {
-        &self.assignment
-    }
     pub(crate) fn prefix(&self) -> &DfsMetadataPrefixProof {
         &self.prefix
-    }
-    pub(crate) fn physical_owner(&self) -> &NativePrefixHistoryPhysicalOwner {
-        &self.physical
-    }
-    pub(crate) fn source_node_id(&self) -> &NodeId {
-        &self.assignment.primary_node_id
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -1946,13 +1946,3 @@ where
         }))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        DfsAdvisoryLockStateRecord, DfsMetadataVersionPinRecord, DfsObjectMetadata, DfsVersion,
-        directory_object,
-    };
-    use time::OffsetDateTime;
-}

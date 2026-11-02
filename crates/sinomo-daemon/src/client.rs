@@ -1659,93 +1659,6 @@ pub fn send_object_rpc_call_to_target_with_options(
     )
 }
 
-/// The actual registered carrier owns paths/runtime. A concrete endpoint is
-/// a contact hint, not membership or effect authority. The native handshake
-/// validates its target key and endpoint ID; a merged hint list cannot replace it.
-/// Never fall back to another endpoint, node route or local loopback identity.
-pub(crate) fn send_object_rpc_call_to_exact_endpoint_on_runtime(
-    daemon_paths: &DaemonPaths,
-    endpoint: &ClusterEndpointRecord,
-    call: ObjectRpcCall,
-    options: sinomo_core::network::ClusterObjectRpcOptions,
-    runtime: &tokio::runtime::Handle,
-    observe_connectivity: bool,
-) -> Result<ObjectRpcResult, NetworkError> {
-    use sinomo_core::network::{NetworkDeliveryState, NetworkTimeoutPhase};
-    let deadline = options
-        .overall_timeout()
-        .map(|cap| std::time::Instant::now() + cap);
-    let daemon_paths = daemon_paths.clone();
-    let endpoint = endpoint.clone();
-    let runtime_for_future = runtime.clone();
-    let future = Box::pin(async move {
-        let refuse = |detail: &str| {
-            NetworkError::delivery_failed(
-                "registered native explicit endpoint",
-                NetworkDeliveryState::DefinitelyNotSent,
-                detail,
-            )
-        };
-        let data = daemon_data_dir_from_paths(&daemon_paths)?;
-        let paths = sinomo_core::network::ClusterPaths::new(&data);
-        let state = sinomo_core::cluster::read_cluster_state_cached_shared(&paths)?;
-        if endpoint.node_id == state.local_node_id {
-            return Err(refuse(
-                "explicit remote endpoint cannot select a local-loopback carrier",
-            ));
-        }
-        let _member = state
-            .members
-            .iter()
-            .find(|member| {
-                member.node_id == endpoint.node_id
-                    && member.cluster_id == state.cluster_id
-                    && member.state.is_authorized()
-            })
-            .ok_or_else(|| refuse("endpoint target is not a current authorized native member"))?;
-        // Do not require discovery hints to be present in merged membership.
-        // The existing endpoint API authenticates this authorized target and
-        // the receiver validates the exact endpoint ID before service dispatch.
-        let options = match deadline {
-            Some(deadline) => options.with_overall_timeout(
-                deadline
-                    .checked_duration_since(std::time::Instant::now())
-                    .filter(|left| !left.is_zero())
-                    .ok_or_else(|| {
-                        NetworkError::timeout(
-                            "registered native endpoint before dispatch",
-                            NetworkTimeoutPhase::Overall,
-                            options.overall_timeout().unwrap(),
-                            NetworkDeliveryState::DefinitelyNotSent,
-                        )
-                    })?,
-            ),
-            None => options,
-        };
-        let mut host = DaemonObjectRpcAsyncHost::new(&runtime_for_future, observe_connectivity)
-            .with_paths(&daemon_paths);
-        sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths)
-            .call_endpoint(&state, &endpoint, call, options)
-            .await
-    });
-    // Same owner-runtime bridge as ordinary component RPC. No detached task
-    // can outlive a timed-out caller, and current-thread nesting refuses.
-    if let Ok(current) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            current.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| runtime.block_on(future));
-        }
-        return Err(NetworkError::delivery_failed(
-            "component exact-endpoint owner-runtime bridge",
-            NetworkDeliveryState::DefinitelyNotSent,
-            "synchronous component RPC cannot run inside a current-thread Tokio runtime",
-        ));
-    }
-    runtime.block_on(future)
-}
-
 pub(crate) fn send_object_rpc_call_to_target_on_runtime_with_daemon_paths_and_network_error(
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,
@@ -2085,29 +1998,6 @@ pub fn fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime(
             runtime,
         )?;
     sinomo_core::kv::validate_cluster_kv_current_term_authority_proof(&read.authority)?;
-    Ok(read)
-}
-
-/// Explicit recovery read from one native authoritative snapshot. Old servers
-/// reject the distinct route instead of degrading to an incomplete prefix.
-pub fn fetch_cluster_kv_authoritative_complete_range_prefix_from_endpoint_on_runtime(
-    endpoint: &ClusterEndpointRecord,
-    prefix: &str,
-    timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvAuthoritativeRead<Vec<KvEntry>>, DaemonError> {
-    let read: KvAuthoritativeRead<Vec<KvEntry>> =
-        send_daemon_rpc_borrowed_value_to_endpoint_on_runtime(
-            endpoint,
-            sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_COMPLETE_RANGE_PREFIX_ROUTE,
-            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
-            &ClusterKvAuthoritativeRangePrefixRequest {
-                prefix: prefix.to_string(),
-            },
-            timeout,
-            runtime,
-        )?;
-    sinomo_core::kv::validate_cluster_kv_authoritative_complete_range_prefix_read(prefix, &read)?;
     Ok(read)
 }
 
