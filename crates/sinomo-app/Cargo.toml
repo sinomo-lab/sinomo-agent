@@ -6,7 +6,7 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-include = ["**/*.rs", "build.rs", "Cargo.toml", "assets/**/*", "java/**/*"]
+include = ["**/*.rs", "**/*.sublime-syntax", "build.rs", "Cargo.toml", "assets/**/*", "java/**/*"]
 
 [package.metadata.sinomo]
 ring = "application"
@@ -42,6 +42,7 @@ tracing = { workspace = true }
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 rfd = { workspace = true, optional = true }
+two-face.workspace = true
 syntect = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "webp", "gif", "bmp", "ico", "tiff"] }
 pulldown-cmark.workspace = true

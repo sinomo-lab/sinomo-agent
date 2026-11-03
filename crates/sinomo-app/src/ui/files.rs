@@ -21,6 +21,7 @@
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
 mod formats;
+mod source_editor;
 use formats::DocumentFormat;
 
 use std::cell::{Cell, RefCell};
@@ -22134,6 +22135,9 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                         .viewport_width_hint(true)
                         .theme_when(clone_gray_scrollbar_reader(&r)));
                 }
+            }
+            if !matches!(document.format, DocumentFormat::Hex | DocumentFormat::Image) {
+                return source_editor::view(&document, &s, &r);
             }
             let editor_shared = s.clone();
             let mut editor = TextSurface::new(format!("files-document:{}", document.path))
