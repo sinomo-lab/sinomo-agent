@@ -192,6 +192,12 @@ wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 [workspace.dependencies]
 sha2 = "0.11"
 xz2 = { version = "0.1.7", features = ["static"] }
+csv = "1.4"
+half = "2.7.1"
+npyz = "0.9.1"
+parquet = { version = "60.1", default-features = false, features = ["snap", "zstd", "brotli", "lz4", "flate2-zlib-rs", "json"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled", "limits", "hooks"] }
+tempfile = "3.27"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 sinomo-actions = { path = "crates/sinomo-actions" }
 sinomo-video = { path = "crates/sinomo-video", default-features = false }
@@ -240,11 +246,15 @@ getrandom = "0.4.3"
 local-ip-address = "0.6.13"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 percent-encoding = "2.3.2"
+similar = "2.7.0"
 rfd = "0.17.2"
 serde_json = "1.0.150"
 signal-hook = { version = "0.3.18", default-features = false }
 sui = { package = "sinomo-ui", version = "0.6.1", default-features = false }
 sui-lucide = { package = "sinomo-ui-lucide", version = "1.47.3" }
+mime_guess = "2.0.5"
+tiny_http = "0.12"
+sui-webview = { package = "sinomo-ui-webview", version = "0.6.1" }
 sui-testing = { package = "sinomo-ui-testing", version = "0.6.1" }
 two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }

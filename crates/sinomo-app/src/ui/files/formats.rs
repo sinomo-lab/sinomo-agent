@@ -27,6 +27,17 @@ pub(super) enum DocumentFormat {
     Text,
     Log,
     JsonLines,
+    Diff,
+    Sobj,
+    Html,
+    Svg,
+    Pdf,
+    Sqlite,
+    Parquet,
+    Zip,
+    Npy,
+    Npz,
+    Notebook,
     Markdown,
     Json,
     Csv,
@@ -38,7 +49,18 @@ pub(super) enum DocumentFormat {
 impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::Sqlite => "SQLite",
+            Self::Parquet => "Parquet",
+            Self::Zip => "ZIP",
+            Self::Npy => "NumPy array",
+            Self::Npz => "NumPy archive",
+            Self::Notebook => "Jupyter notebook",
+            Self::Html => "HTML",
+            Self::Svg => "SVG",
+            Self::Pdf => "PDF",
             Self::Text => "Text",
+            Self::Sobj => "SOBJ",
+            Self::Diff => "Unified diff",
             Self::Log => "Log",
             Self::JsonLines => "JSON Lines",
             Self::Markdown => "Markdown",
@@ -48,6 +70,38 @@ impl DocumentFormat {
             Self::Image => "Image",
             Self::Hex => "Hex",
         }
+    }
+
+    pub(super) fn binary_artifact(self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite | Self::Parquet | Self::Zip | Self::Npy | Self::Npz
+        )
+    }
+    pub(super) fn artifact(name: &str, prefix: &[u8]) -> Option<Self> {
+        if prefix.starts_with(b"SQLite format 3\0") {
+            return Some(Self::Sqlite);
+        }
+
+        if prefix.starts_with(b"\x93NUMPY") {
+            return Some(Self::Npy);
+        }
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "parquet" | "pq" => Some(Self::Parquet),
+            "sqlite" | "sqlite3" => Some(Self::Sqlite),
+            "npy" => Some(Self::Npy),
+            "zip" => Some(Self::Zip),
+            "npz" => Some(Self::Npz),
+            _ => None,
+        }
+    }
+    pub(super) fn hex_buffer(self) -> bool {
+        self.binary_artifact() || matches!(self, Self::Hex | Self::Image | Self::Sobj | Self::Pdf)
     }
 
     pub(super) fn paged(self) -> bool {
@@ -74,6 +128,19 @@ impl DocumentFormat {
 
 /// Called on the document load worker. Raster validation warms the bounded preview cache.
 pub(super) fn document_from_bytes(path: &str, bytes: &[u8]) -> (DocumentFormat, String) {
+    if let Some(format) = DocumentFormat::artifact(path, bytes) {
+        return (format, encode_hex(bytes));
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return (DocumentFormat::Pdf, encode_hex(bytes));
+    }
+    if bytes.starts_with(sinomo_runtime::object::MAGIC)
+        || Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sobj"))
+    {
+        return (DocumentFormat::Sobj, encode_hex(bytes));
+    }
     if bytes.len() as u64 <= FILE_DOCUMENT_MAX_BYTES
         && image::guess_format(bytes).is_ok_and(supported_image)
         && image_bitmap(bytes).is_ok()
@@ -96,14 +163,18 @@ pub(super) fn text_format(path: &str) -> DocumentFormat {
         .to_ascii_lowercase();
     match extension.as_str() {
         "md" | "markdown" | "mdown" => DocumentFormat::Markdown,
-        "json" | "ipynb" => DocumentFormat::Json,
+        "html" | "htm" => DocumentFormat::Html,
+        "svg" => DocumentFormat::Svg,
+        "diff" | "patch" => DocumentFormat::Diff,
+        "json" => DocumentFormat::Json,
+        "ipynb" => DocumentFormat::Notebook,
         "csv" => DocumentFormat::Csv,
         "tsv" | "tab" => DocumentFormat::Tsv,
         _ => DocumentFormat::log_format(path).unwrap_or(DocumentFormat::Text),
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(super) fn encode_hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len().saturating_mul(3));
     for (index, byte) in bytes.iter().enumerate() {
         if index != 0 {
@@ -116,7 +187,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 pub(super) fn document_bytes(format: DocumentFormat, text: &str) -> Result<Vec<u8>, String> {
     let limit = FILE_DOCUMENT_MAX_BYTES as usize;
-    if !matches!(format, DocumentFormat::Hex | DocumentFormat::Image) {
+    if !format.hex_buffer() {
         return Ok(text.as_bytes().to_vec());
     }
     if text.len() > limit.saturating_mul(6) {
@@ -151,14 +222,16 @@ fn note(text: impl Into<String>, reader: &ThemeReader) -> WidgetPod {
 }
 
 fn text_preview(text: String, reader: &ThemeReader) -> WidgetPod {
-    WidgetPod::new(
-        TextSurface::new("formatted-document-preview")
-            .value(text)
-            .read_only(true)
-            .wrap(TextWrap::NoWrap)
-            .theme_when(clone_reader(reader))
-            .text_style_when(|theme| theme.mono_text_style(theme.palette.text)),
-    )
+    let mut text = TextSurface::new("formatted-document-preview")
+        .value(text)
+        .read_only(true)
+        .wrap(TextWrap::NoWrap)
+        .theme_when(clone_reader(reader))
+        .text_style_when(|theme| super::source_editor::mono(&theme));
+    text.set_selection(0, 0);
+    WidgetPod::new(super::editor_surface::EditorSurface::new(
+        text, reader, sui::Signal::new(Default::default()), sui::Insets::all(10.),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,7 +361,7 @@ pub(super) fn json_preview_content(text: &str) -> Result<(String, JsonPreviewLim
     ))
 }
 
-pub(super) struct PreviewWidget(WidgetPod);
+pub(super) struct PreviewWidget(pub(super) WidgetPod);
 
 impl Widget for PreviewWidget {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
@@ -317,10 +390,24 @@ pub(super) fn preview_widget(
     reader: &ThemeReader,
 ) -> Option<PreviewWidget> {
     Some(PreviewWidget(match format {
-        DocumentFormat::Text
+        DocumentFormat::Sqlite
+        | DocumentFormat::Parquet
+        | DocumentFormat::Zip
+        | DocumentFormat::Npy
+        | DocumentFormat::Npz
+        | DocumentFormat::Notebook
+        | DocumentFormat::Pdf
+        | DocumentFormat::Html
+        | DocumentFormat::Svg
+        | DocumentFormat::Text
         | DocumentFormat::Hex
         | DocumentFormat::Log
         | DocumentFormat::JsonLines => return None,
+        DocumentFormat::Sobj => note(
+            super::sobj::summary(text).unwrap_or_else(|e| format!("Fields unavailable: {e}")),
+            reader,
+        ),
+        DocumentFormat::Diff => WidgetPod::new(super::diff::patch(text).view(reader)),
         DocumentFormat::Image => match document_bytes(format, text) {
             Ok(bytes) => WidgetPod::new(DocumentImage::new(bytes, reader)),
             Err(error) => note(error, reader),

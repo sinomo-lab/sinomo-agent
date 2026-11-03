@@ -17,6 +17,9 @@ gui = ["dep:sui", "dep:sui-lucide"]
 desktop = [
     "gui",
     "dep:rfd",
+    "dep:sui-webview",
+    "dep:tiny_http",
+    "dep:cap-std",
     "sui/desktop",
 ]
 mobile = ["gui", "sui/mobile", "native-devices"]
@@ -31,6 +34,14 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [dependencies]
+bytes.workspace = true
+csv.workspace = true
+half.workspace = true
+npyz.workspace = true
+parquet.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+zip.workspace = true
 sysinfo.workspace = true
 notify.workspace = true
 fs2.workspace = true
@@ -44,8 +55,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 rfd = { workspace = true, optional = true }
 two-face.workspace = true
 syntect = { workspace = true }
+similar.workspace = true
 image = { workspace = true, features = ["jpeg", "png", "webp", "gif", "bmp", "ico", "tiff"] }
-pulldown-cmark.workspace = true
+pulldown-cmark = { workspace = true, features = ["html"] }
 percent-encoding.workspace = true
 
 # Published SUI dependencies shared by desktop and Android.
@@ -74,6 +86,13 @@ sinomo-agent = { path = "../sinomo-agent" }
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
 sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }
 sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+sui-webview = { workspace = true, optional = true }
+mime_guess.workspace = true
+getrandom.workspace = true
+tiny_http = { workspace = true, optional = true }
+cap-std = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_System_Threading", "Win32_System_Registry"] }

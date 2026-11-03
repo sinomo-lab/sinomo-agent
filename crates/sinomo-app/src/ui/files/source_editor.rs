@@ -126,7 +126,7 @@ fn colors(path: &str, text: &str, dark: bool, limited: bool) -> Colors {
     }
     result
 }
-fn mono(theme: &DefaultTheme) -> TextStyle {
+pub(super) fn mono(theme: &DefaultTheme) -> TextStyle {
     let mut style = theme.mono_text_style(theme.palette.text);
     style.font_size = theme.text.sm.size;
     style.line_height = theme.text.sm.line_height;
@@ -134,14 +134,13 @@ fn mono(theme: &DefaultTheme) -> TextStyle {
 }
 type Revision = (u64, bool, u32, u32);
 struct Source {
-    surface: TextSurface,
+    surface: super::editor_surface::EditorSurface,
     path: String,
     shared: Shared,
     reader: ThemeReader,
     status: Signal<TextSurfaceStatus>,
     notice: Signal<String>,
     language: Signal<String>,
-    scroll: Signal<f32>,
     gutter: f32,
     revision: Rc<Cell<u64>>,
     styled: Option<Revision>,
@@ -161,7 +160,7 @@ impl Source {
                 Ok(colors) => {
                     if *started == key {
                         let style = mono(&(self.reader)());
-                        self.surface.set_style_spans(
+                        self.surface.text.set_style_spans(
                             colors
                                 .tokens
                                 .into_iter()
@@ -199,8 +198,8 @@ impl Source {
         if self.styled == Some(key) {
             return;
         }
-        self.surface.set_style_spans(Vec::new());
-        let text = self.surface.current_value();
+        self.surface.text.set_style_spans(Vec::new());
+        let text = self.surface.text.current_value();
         let end = text.floor_char_boundary(text.len().min(COLOR_BYTES));
         let limited = end < text.len();
         let prefix = text[..end].to_owned();
@@ -233,7 +232,7 @@ impl Widget for Source {
             self.surface.command(ctx, cmd);
             return;
         };
-        let text = self.surface.current_value();
+        let text = self.surface.text.current_value();
         let result = match action {
             Navigation::Find(query, forward) => {
                 search(text, query, self.status.get().selection, *forward).ok_or("No match")
@@ -248,7 +247,7 @@ impl Widget for Source {
         };
         match result {
             Ok(range) => {
-                self.surface.set_selection(range.start, range.end);
+                self.surface.text.set_selection(range.start, range.end);
                 self.notice.set(String::new());
                 ctx.request_focus();
             }
@@ -279,7 +278,7 @@ impl Widget for Source {
         let mut style = mono(&theme);
         style.color = theme.palette.text_muted;
         let height = style.line_height.max(style.font_size).max(1.0);
-        let scroll = ctx.observe(&self.scroll);
+        let scroll = ctx.observe(&self.surface.scroll_y);
         let first = status.visible_lines.start;
         let scroll = if (scroll / height).floor() as usize == first {
             scroll
@@ -309,15 +308,6 @@ impl Widget for Source {
     }
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         self.surface.semantics(ctx);
-        // SUI reports its exact pixel offset here, including partially visible lines.
-        if let Some(info) = ctx.nodes().last().and_then(|n| n.editable_text.as_ref())
-            && self.scroll.get() != info.scroll_y
-        {
-            self.scroll.set(info.scroll_y);
-        }
-    }
-    fn layer_options(&self) -> sui::LayerOptions {
-        self.surface.layer_options()
     }
     fn accepts_focus(&self) -> bool {
         true
@@ -582,29 +572,31 @@ pub(super) fn view(
         .value(document.text.clone())
         .read_only(!document.editable())
         .wrap(TextWrap::NoWrap)
-        .padding(Insets {
-            left: gutter,
-            top: PADDING,
-            right: PADDING,
-            bottom: PADDING,
-        })
         .text_style_when(|theme| mono(&theme))
         .theme_when(clone_reader(reader))
         .on_change(move |value| {
             signal.set(signal.get().wrapping_add(1));
             changed.files_mut().set_document_text(value);
-        })
-        .status(status.clone());
+        });
     surface.set_selection(0, 0);
     let editor = widgets::Boxed::new(Source {
-        surface,
+        surface: super::editor_surface::EditorSurface::new(
+            surface,
+            reader,
+            status.clone(),
+            Insets {
+                left: gutter,
+                top: PADDING,
+                right: PADDING,
+                bottom: PADDING,
+            },
+        ),
         path: document.path.clone(),
         shared: shared.clone(),
         reader: Rc::clone(reader),
         status,
         notice,
         language,
-        scroll: Signal::new(0.),
         gutter,
         revision: edited,
         styled: None,

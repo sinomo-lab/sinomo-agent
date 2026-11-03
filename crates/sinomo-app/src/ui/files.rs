@@ -20,9 +20,13 @@
 //! under strict limits, and keep decoded pixels plus renderer registrations bounded. Sorting and
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
+pub(super) mod artifact;
+mod diff;
+mod editor_surface;
 mod formats;
 mod paged;
 mod source_editor;
+mod sobj;
 use formats::DocumentFormat;
 
 use std::cell::{Cell, RefCell};
@@ -978,9 +982,29 @@ struct SifsFileFingerprint {
     policy: String,
 }
 
+/// A large delimited file is paged before it has an editable source buffer.
+enum SourceSnapshot {
+    Local(LocalFileFingerprint),
+    Sifs(SifsFileFingerprint),
+}
+impl SourceSnapshot {
+    fn matches(&self, load: &FilesDocumentLoad) -> bool {
+        match self {
+            Self::Local(expected) => load.local_fingerprint.as_ref().is_some_and(|actual| {
+                actual.canonical_path == expected.canonical_path
+                    && actual.len == expected.len
+                    && actual.modified_at_unix_nanos == expected.modified_at_unix_nanos
+                    && actual.symlink == expected.symlink
+            }),
+            Self::Sifs(expected) => load.sifs_fingerprint.as_ref() == Some(expected),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesDocumentLoad {
     format: DocumentFormat,
+    preview_open: bool,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -1009,6 +1033,11 @@ struct FilesDocument {
     format: DocumentFormat,
     #[serde(default)]
     preview_open: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sobj_field: Option<sobj::FieldDraft>,
+    /// Asset directory for a generated report that has no backing file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report_base: Option<String>,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -1036,6 +1065,8 @@ impl FilesDocument {
         Self {
             format: DocumentFormat::Text,
             preview_open: false,
+            sobj_field: None,
+            report_base: None,
             source,
             path,
             title,
@@ -1053,7 +1084,31 @@ impl FilesDocument {
     }
 
     fn dirty(&self) -> bool {
-        !self.loading && self.load_error.is_none() && self.text != self.saved_text
+        !self.loading
+            && self.load_error.is_none()
+            && (self.text != self.saved_text
+                || self
+                    .sobj_field
+                    .as_ref()
+                    .is_some_and(sobj::FieldDraft::modified))
+    }
+
+    fn deferred_csv(&self) -> bool {
+        matches!(self.format, DocumentFormat::Csv | DocumentFormat::Tsv)
+            && self.text.is_empty()
+            && self.saved_text.is_empty()
+            && self
+                .local_fingerprint
+                .as_ref()
+                .map(|f| f.len)
+                .or_else(|| self.sifs_fingerprint.as_ref().and_then(|f| f.size_bytes))
+                .is_some_and(|n| n > FILE_DOCUMENT_MAX_BYTES)
+    }
+    fn streamed_artifact(&self) -> bool {
+        self.format.binary_artifact() && self.text.is_empty() && self.read_only_reason.is_some()
+    }
+    fn streamed_pdf(&self) -> bool {
+        self.format == DocumentFormat::Pdf && self.text.is_empty() && self.read_only_reason.is_some()
     }
 
     fn records_only(&self) -> bool {
@@ -1194,7 +1249,14 @@ struct FilesHistoryActionOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesHistoryPreview {
     identity: DfsFileVersionIdentity,
-    result: Option<Result<FilesPreview, String>>,
+    compare: bool,
+    result: Option<Result<HistoryContent, String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryContent {
+    Preview(FilesPreview),
+    Comparison(diff::Review),
 }
 
 #[derive(Clone, Debug)]
@@ -1919,6 +1981,50 @@ impl FilesState {
             {
                 self.begin_document_load(document.source, document.path, document.title, waker);
             } else {
+                if document.format == DocumentFormat::Hex
+                    && (Path::new(&document.path)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("sobj"))
+                        || document.text.starts_with("53 4F 42 4A"))
+                {
+                    document.format = DocumentFormat::Sobj;
+                    document.preview_open = !document.dirty()
+                        && formats::document_bytes(document.format, &document.text)
+                            .is_ok_and(|bytes| sobj::can_inspect(&bytes));
+                }
+                // Older checkpoints kept reports as plain text or binary drafts.
+                let restored_format = match document.format {
+                    DocumentFormat::Text => match formats::text_format(&document.path) {
+                        f @ (DocumentFormat::Html | DocumentFormat::Svg | DocumentFormat::Notebook) => Some(f),
+                        _ => None,
+                    },
+                    DocumentFormat::Json if formats::text_format(&document.path) == DocumentFormat::Notebook => {
+                        Some(DocumentFormat::Notebook)
+                    }
+                    DocumentFormat::Hex if document.text.starts_with("25 50 44 46 2D") => Some(DocumentFormat::Pdf),
+                    _ => None,
+                };
+                if let Some(format) = restored_format {
+                    document.format = format;
+                    document.preview_open = !document.dirty();
+                }
+                if document.format == DocumentFormat::Hex && !document.dirty() {
+                    let prefix: Vec<_> = document
+                        .text
+                        .split_ascii_whitespace()
+                        .take(16)
+                        .map_while(|s| u8::from_str_radix(s, 16).ok())
+                        .collect();
+                    if let Some(format) = DocumentFormat::artifact(&document.path, &prefix) {
+                        document.format = format;
+                        document.preview_open = true;
+                        if format == DocumentFormat::Sqlite {
+                            document.text.clear();
+                            document.saved_text.clear();
+                            document.read_only_reason = Some("SQLite preview".into());
+                        }
+                    }
+                }
                 if document.saving {
                     document.saving = false;
                     document.save_error = Some("The app closed during a save. Your edits are preserved; reload or retry with version protection.".into());
@@ -1959,6 +2065,23 @@ impl FilesState {
         } else {
             name.to_string()
         }
+    }
+
+    pub(crate) fn generated_report(&mut self, source: FilesSourceKind, base: String, html: String) {
+        let mut doc = FilesDocument::loading(
+            source,
+            format!("report:{}", sinomo_runtime::core::Id::generate()),
+            "HTML report".into(),
+        );
+        doc.loading = false;
+        doc.format = DocumentFormat::Html;
+        doc.preview_open = true;
+        doc.saved_text = html.clone();
+        doc.text = html;
+        doc.report_base = Some(base);
+        doc.read_only_reason = Some("Generated in chat".into());
+        self.document = Some(doc);
+        self.document_revision = self.document_revision.wrapping_add(1);
     }
 
     pub(crate) fn document_matches(&self, source: FilesSourceKind, path: &str) -> bool {
@@ -3230,7 +3353,9 @@ impl FilesState {
                     Ok(load) => {
                         self.document = Some(FilesDocument {
                             format: load.format,
-                            preview_open: (load.format.has_preview() && !load.format.paged()) || load.read_only_reason.as_deref() == Some(UNDECODABLE_LOG),
+                            preview_open: load.preview_open,
+                            sobj_field: None,
+                            report_base: None,
                             source: load.source,
                             path: load.path,
                             title: load.title,
@@ -4370,6 +4495,16 @@ impl FilesState {
         title: String,
         waker: Option<sui::UiHandle>,
     ) {
+        self.begin_document_load_mode(source, path, title, waker, None);
+    }
+    fn begin_document_load_mode(
+        &mut self,
+        source: FilesSourceKind,
+        path: String,
+        title: String,
+        waker: Option<sui::UiHandle>,
+        expected: Option<SourceSnapshot>,
+    ) {
         self.document_external_task = None;
         if let Some(waker) = waker {
             self.ensure_worker(waker);
@@ -4396,6 +4531,7 @@ impl FilesState {
         if tx
             .send(FilesWorkerCommand::ReadDocument {
                 request_id,
+                expected,
                 source,
                 path,
             })
@@ -4444,6 +4580,10 @@ impl FilesState {
             return;
         };
         if !document.editable() || !document.dirty() || document.saving {
+            return;
+        }
+        if let Err(error) = sobj::apply_field(document) {
+            document.save_error = Some(error);
             return;
         }
         let bytes = match formats::document_bytes(document.format, &document.text) {
@@ -4564,18 +4704,23 @@ impl FilesState {
         if document.loading || document.load_error.is_some() {
             return;
         }
-        if document.records_only() {
+        if document.report_base.is_some() {
+            return;
+        }
+        if document.deferred_csv()
+            || document.streamed_artifact()
+            || document.streamed_pdf()
+            || document.records_only()
+        {
             self.attachment_error = Some("Attach the original file from the file browser.".into());
             return;
         }
-        if document.text.len() as u64 > FILE_ATTACHMENT_MAX_BYTES
-            && !matches!(document.format, DocumentFormat::Image | DocumentFormat::Hex)
-        {
+        if document.text.len() as u64 > FILE_ATTACHMENT_MAX_BYTES && !document.format.hex_buffer() {
             self.attachment_error = Some("This file exceeds the attachment size limit.".into());
             return;
         }
         self.attachment_error = None;
-        let bytes = match formats::document_bytes(document.format, &document.text) {
+        let bytes = match sobj::draft_bytes(document) {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.attachment_error = Some(error);
@@ -5344,12 +5489,13 @@ impl FilesState {
     fn toggle_history_preview(
         &mut self,
         identity: DfsFileVersionIdentity,
+        compare: bool,
         waker: Option<sui::UiHandle>,
     ) {
         if self
             .history_preview
             .as_ref()
-            .is_some_and(|preview| preview.identity == identity)
+            .is_some_and(|preview| preview.identity == identity && preview.compare == compare)
         {
             self.history_preview = None;
             self.pending_history_preview_request_id = None;
@@ -5364,17 +5510,29 @@ impl FilesState {
             return;
         };
         let name = history_entry_file_name(entry);
+        let command = if compare {
+            HistoryRead::Compare {
+                path: entry.current_path.clone(),
+                hash: entry.content_hash.clone(),
+                size: entry.size_bytes,
+                saved_path: entry.captured.object.path.clone(),
+            }
+        } else {
+            HistoryRead::Preview { name }
+        };
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
         self.history_preview = Some(FilesHistoryPreview {
             identity: identity.clone(),
+            compare,
             result: None,
         });
         self.history_revision = self.history_revision.wrapping_add(1);
         let Some(tx) = self.worker_tx.clone() else {
             self.history_preview = Some(FilesHistoryPreview {
                 identity,
+                compare,
                 result: Some(Err(
                     "The Files background worker is not available.".to_string()
                 )),
@@ -5388,13 +5546,14 @@ impl FilesState {
             .send(FilesWorkerCommand::HistoryPreview {
                 request_id,
                 identity: identity.clone(),
-                name,
+                read: command,
             })
             .is_err()
         {
             self.pending_history_preview_request_id = None;
             self.history_preview = Some(FilesHistoryPreview {
                 identity,
+                compare,
                 result: Some(Err(
                     "The Files background worker stopped before reading this version.".to_string(),
                 )),
@@ -7389,12 +7548,24 @@ enum FilesWorkerResult {
     HistoryPreview {
         request_id: u64,
         identity: DfsFileVersionIdentity,
-        result: Result<FilesPreview, String>,
+        result: Result<HistoryContent, String>,
     },
     StorageOverview {
         request_id: u64,
         sessions: Vec<crate::external_edit::Summary>,
         result: Result<FilesStorageOverview, String>,
+    },
+}
+
+enum HistoryRead {
+    Preview {
+        name: String,
+    },
+    Compare {
+        path: String,
+        hash: String,
+        size: u64,
+        saved_path: String,
     },
 }
 
@@ -7433,6 +7604,7 @@ enum FilesWorkerCommand {
     },
     ReadDocument {
         request_id: u64,
+        expected: Option<SourceSnapshot>,
         source: FilesSourceKind,
         path: String,
     },
@@ -7505,7 +7677,7 @@ enum FilesWorkerCommand {
     HistoryPreview {
         request_id: u64,
         identity: DfsFileVersionIdentity,
-        name: String,
+        read: HistoryRead,
     },
     StorageOverview {
         request_id: u64,
@@ -7972,6 +8144,7 @@ fn files_worker_loop(
             }
             FilesWorkerCommand::ReadDocument {
                 request_id,
+                expected,
                 source,
                 path,
             } => {
@@ -7979,7 +8152,11 @@ fn files_worker_loop(
                 let (path, result) = if source == FilesSourceKind::Local {
                     match requested_path {
                         Ok(path) => {
-                            let result = load_local_text_document(&path, FILE_DOCUMENT_MAX_BYTES);
+                            let result = load_local_document_mode(
+                                &path,
+                                FILE_DOCUMENT_MAX_BYTES,
+                                expected.is_some(),
+                            );
                             (path, result)
                         }
                         Err(error) => (path, Err(error)),
@@ -8005,8 +8182,12 @@ fn files_worker_loop(
                     match (&browser, &open_error) {
                         (Some(browser), _) => {
                             let path = browser.normalize(&requested_path);
-                            let result =
-                                load_sifs_text_document(browser, &path, FILE_DOCUMENT_MAX_BYTES);
+                            let result = load_sifs_document_mode(
+                                browser,
+                                &path,
+                                FILE_DOCUMENT_MAX_BYTES,
+                                expected.is_some(),
+                            );
                             (path, result)
                         }
                         (None, Some(error)) => (requested_path, Err(error.clone())),
@@ -8016,6 +8197,15 @@ fn files_worker_loop(
                         ),
                     }
                 };
+                let result = result.and_then(|mut loaded| {
+                    if let Some(expected) = expected {
+                        if !expected.matches(&loaded) {
+                            return Err("The file changed after preview opened. Reload to edit the current version.".into());
+                        }
+                        loaded.preview_open = false;
+                    }
+                    Ok(loaded)
+                });
                 let _ = result_tx.send(FilesWorkerResult::Document {
                     request_id,
                     source,
@@ -8207,25 +8397,54 @@ fn files_worker_loop(
             FilesWorkerCommand::HistoryPreview {
                 request_id,
                 identity,
-                name,
+                read,
             } => {
-                ensure_files_worker_operator(
-                    &mut operator,
-                    &mut operator_open_error,
-                    daemon_address.as_deref(),
-                    &app_runtime,
-                );
-                let result = match (&operator, &operator_open_error) {
-                    (Some(operator), _) => operator
-                        .read_file_history(&DfsFileHistoryReadRequest {
-                            identity: identity.clone(),
-                            offset: 0,
-                            max_bytes: FILE_PREVIEW_MAX_BYTES as u32,
-                        })
-                        .map_err(|error| history_error_message(&error))
-                        .and_then(|outcome| history_preview_from_outcome(&name, outcome)),
-                    (None, Some(error)) => Err(error.clone()),
-                    (None, None) => Err("DFS history service did not start".to_string()),
+                let result = match read {
+                    HistoryRead::Compare {
+                        path,
+                        hash,
+                        size,
+                        saved_path,
+                    } => {
+                        ensure_files_worker_browser(
+                            &mut browser,
+                            &mut open_error,
+                            daemon_address.as_deref(),
+                            &app_runtime,
+                        );
+                        browser
+                            .as_ref()
+                            .ok_or_else(|| {
+                                open_error
+                                    .clone()
+                                    .unwrap_or_else(|| "SIFS browser unavailable".into())
+                            })
+                            .and_then(|browser| {
+                                diff::compare(browser, &identity, &saved_path, &hash, size, &path)
+                            })
+                            .map(HistoryContent::Comparison)
+                    }
+                    HistoryRead::Preview { name } => {
+                        ensure_files_worker_operator(
+                            &mut operator,
+                            &mut operator_open_error,
+                            daemon_address.as_deref(),
+                            &app_runtime,
+                        );
+                        match (&operator, &operator_open_error) {
+                            (Some(operator), _) => operator
+                                .read_file_history(&DfsFileHistoryReadRequest {
+                                    identity: identity.clone(),
+                                    offset: 0,
+                                    max_bytes: FILE_PREVIEW_MAX_BYTES as u32,
+                                })
+                                .map_err(|error| history_error_message(&error))
+                                .and_then(|outcome| history_preview_from_outcome(&name, outcome)),
+                            (None, Some(error)) => Err(error.clone()),
+                            (None, None) => Err("DFS history service did not start".to_string()),
+                        }
+                        .map(HistoryContent::Preview)
+                    }
                 };
                 let _ = result_tx.send(FilesWorkerResult::HistoryPreview {
                     request_id,
@@ -9630,25 +9849,107 @@ fn decode_loaded_document(
     path: &str,
     data: Option<Vec<u8>>,
     binary_limit: u64,
-) -> Result<(DocumentFormat, String, Option<String>), String> {
+) -> Result<(DocumentFormat, String, Option<String>, bool), String> {
     if let Some(data) = data {
         if data.len() as u64 > binary_limit {
+            let format = formats::text_format(path);
             return Ok((
-                formats::text_format(path),
+                format,
                 String::from_utf8(data).map_err(|e| e.to_string())?,
                 None,
+                format.has_preview() && !format.paged(),
             ));
         }
         let (format, text) = formats::document_from_bytes(path, &data);
-        return Ok((format, text, None));
+        let preview_open = format.has_preview()
+            && !format.paged()
+            && (format != DocumentFormat::Sobj || sobj::can_inspect(&data));
+        return Ok((format, text, None, preview_open));
     }
     DocumentFormat::log_format(path)
-        .map(|format| (format, String::new(), Some(UNDECODABLE_LOG.into())))
+        .map(|format| (format, String::new(), Some(UNDECODABLE_LOG.into()), true))
         .ok_or_else(|| "Binary file exceeds the hex editor size limit.".into())
 }
 
+fn pdf_name(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+fn streamed_document_load(
+    format: DocumentFormat,
+    source: FilesSourceKind,
+    path: &str,
+    local_fingerprint: Option<LocalFileFingerprint>,
+    sifs_fingerprint: Option<SifsFileFingerprint>,
+) -> FilesDocumentLoad {
+    FilesDocumentLoad {
+        format,
+        preview_open: true,
+        source,
+        path: path.into(),
+        title: Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        text: String::new(),
+        local_fingerprint,
+        sifs_fingerprint,
+        read_only_reason: Some(format!("{} preview", format.label())),
+    }
+}
+
+#[cfg(test)]
 fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentLoad, String> {
+    load_local_document_mode(path, max_bytes, false)
+}
+fn load_local_document_mode(
+    path: &str,
+    max_bytes: u64,
+    materialize: bool,
+) -> Result<FilesDocumentLoad, String> {
     let before = local_file_fingerprint(path)?;
+    if before.len > max_bytes {
+        let mut signature = [0; 16];
+        fs::File::open(&before.canonical_path)
+            .and_then(|mut f| f.read_exact(&mut signature))
+            .map_err(|e| e.to_string())?;
+        if let Some(format) = DocumentFormat::artifact(path, &signature) {
+            return Ok(streamed_document_load(
+                format,
+                FilesSourceKind::Local,
+                path,
+                Some(before),
+                None,
+            ));
+        }
+    }
+    let text_format = formats::text_format(path);
+    if !materialize
+        && before.len > max_bytes
+        && matches!(text_format, DocumentFormat::Csv | DocumentFormat::Tsv)
+    {
+        let reason = local_document_read_only_reason(&before);
+        let mut load = streamed_document_load(
+            text_format,
+            FilesSourceKind::Local,
+            path,
+            Some(before),
+            None,
+        );
+        load.read_only_reason = reason;
+        return Ok(load);
+    }
+    if before.len > max_bytes && pdf_name(path) {
+        return Ok(streamed_document_load(
+            DocumentFormat::Pdf,
+            FilesSourceKind::Local,
+            path,
+            Some(before),
+            None,
+        ));
+    }
     let (content, fingerprint) = if before.len > max_bytes {
         let mut file = fs::File::open(&before.canonical_path).map_err(|e| e.to_string())?;
         let bytes = read_large_text(before.len, |_, buffer| {
@@ -9668,15 +9969,26 @@ fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentL
         let (data, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
         (Some(data), fingerprint)
     };
-    let (format, text, encoding_reason) = decode_loaded_document(path, content, max_bytes)?;
+    let (format, text, encoding_reason, preview_open) =
+        decode_loaded_document(path, content, max_bytes)?;
     let title = Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
+    if format == DocumentFormat::Sqlite {
+        return Ok(streamed_document_load(
+            format,
+            FilesSourceKind::Local,
+            path,
+            Some(fingerprint),
+            None,
+        ));
+    }
     let read_only_reason =
         encoding_reason.or_else(|| local_document_read_only_reason(&fingerprint));
     Ok(FilesDocumentLoad {
         format,
+        preview_open,
         source: FilesSourceKind::Local,
         path: path.to_string(),
         title,
@@ -9751,13 +10063,73 @@ fn read_sifs_snapshot_bytes(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn load_sifs_text_document(
     browser: &SifsBrowser,
     path: &str,
     max_bytes: u64,
 ) -> Result<FilesDocumentLoad, String> {
+    load_sifs_document_mode(browser, path, max_bytes, false)
+}
+fn load_sifs_document_mode(
+    browser: &SifsBrowser,
+    path: &str,
+    max_bytes: u64,
+    materialize: bool,
+) -> Result<FilesDocumentLoad, String> {
     let details = browser.stat(path)?;
     let fingerprint = sifs_file_fingerprint(&details)?;
+    // Probe the opened generation, so a SQLite database does not need a particular extension.
+    if fingerprint.size_bytes.is_some_and(|n| n > max_bytes) {
+        let size = fingerprint.size_bytes.unwrap();
+        let prefix = browser.read_object_range(
+            &sinomo_client::api::DaemonDfsBrowserReadObjectRangeRequest {
+                object_id: fingerprint.object_id.clone(),
+                version: fingerprint.version.clone(),
+                content_hash: fingerprint
+                    .content_hash
+                    .clone()
+                    .ok_or("Missing SIFS content hash")?,
+                size_bytes: size,
+                offset: 0,
+                length: size.min(16) as u32,
+            },
+        )?;
+        if let Some(format) = DocumentFormat::artifact(path, &prefix) {
+            return Ok(streamed_document_load(
+                format,
+                FilesSourceKind::Sifs,
+                path,
+                None,
+                Some(fingerprint),
+            ));
+        }
+    }
+    let text_format = formats::text_format(path);
+    if !materialize
+        && fingerprint.size_bytes.is_some_and(|n| n > max_bytes)
+        && matches!(text_format, DocumentFormat::Csv | DocumentFormat::Tsv)
+    {
+        let mut load = streamed_document_load(
+            text_format,
+            FilesSourceKind::Sifs,
+            path,
+            None,
+            Some(fingerprint),
+        );
+        load.read_only_reason =
+            (details.mode & 0o222 == 0).then(|| "SIFS marks this file read-only.".into());
+        return Ok(load);
+    }
+    if fingerprint.size_bytes.is_some_and(|size| size > max_bytes) && pdf_name(path) {
+        return Ok(streamed_document_load(
+            DocumentFormat::Pdf,
+            FilesSourceKind::Sifs,
+            path,
+            None,
+            Some(fingerprint),
+        ));
+    }
     let mode = details.mode;
     let bytes = if let Some(size) = fingerprint.size_bytes.filter(|&n| n > max_bytes) {
         let hash = fingerprint
@@ -9789,7 +10161,17 @@ fn load_sifs_text_document(
             max_bytes,
         )?)
     };
-    let (format, text, encoding_reason) = decode_loaded_document(path, bytes, max_bytes)?;
+    let (format, text, encoding_reason, preview_open) =
+        decode_loaded_document(path, bytes, max_bytes)?;
+    if format == DocumentFormat::Sqlite {
+        return Ok(streamed_document_load(
+            format,
+            FilesSourceKind::Sifs,
+            path,
+            None,
+            Some(fingerprint),
+        ));
+    }
     let title = path
         .rsplit('/')
         .find(|part| !part.is_empty())
@@ -9805,6 +10187,7 @@ fn load_sifs_text_document(
     });
     Ok(FilesDocumentLoad {
         format,
+        preview_open,
         source: FilesSourceKind::Sifs,
         path: path.to_string(),
         title,
@@ -14347,6 +14730,34 @@ fn file_entry_key(entry: &SifsEntry) -> u64 {
     key.max(1)
 }
 
+fn paint_file_name(
+    ctx: &mut PaintCtx,
+    theme: &DefaultTheme,
+    name_cell: Rect,
+    name: &str,
+    icon: Option<IconGlyph>,
+    side: f32,
+    icon_color: Color,
+    label_color: Color,
+) {
+    let style = LeadingLabelCellPaint::new()
+        .icon_color(icon_color)
+        .label_color(label_color)
+        .label_weight(FontWeight::MEDIUM)
+        .icon_slot_side(ROW_THUMBNAIL_SIDE)
+        .icon_inset(2.0)
+        .gap(8.0);
+    let style = if icon.is_none() {
+        style.padding(6.0 + side + 8.0, 8.0)
+    } else {
+        style.icon(icon.unwrap()).padding(6.0, 8.0)
+    };
+    let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
+    let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
+    let display_name = display_name_for_width(name, label_width, average_char_width);
+    paint_leading_label_cell(ctx, theme, name_cell, &display_name, style);
+}
+
 fn paint_file_table_row(
     ctx: &mut PaintCtx,
     shared: &Shared,
@@ -14415,22 +14826,16 @@ fn paint_file_table_row(
                 ))
             })
             .unwrap_or(false);
-        let style = LeadingLabelCellPaint::new()
-            .icon_color(icon_color)
-            .label_color(label_color)
-            .label_weight(FontWeight::MEDIUM)
-            .icon_slot_side(ROW_THUMBNAIL_SIDE)
-            .icon_inset(2.0)
-            .gap(8.0);
-        let style = if painted {
-            style.padding(6.0 + side + 8.0, 8.0)
-        } else {
-            style.icon(entry_icon(entry)).padding(6.0, 8.0)
-        };
-        let label_width = (name_cell.width() - ROW_THUMBNAIL_SIDE - 22.0).max(0.0);
-        let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
-        let display_name = display_name_for_width(&entry.name, label_width, average_char_width);
-        paint_leading_label_cell(ctx, &theme, name_cell, &display_name, style);
+        paint_file_name(
+            ctx,
+            &theme,
+            name_cell,
+            &entry.name,
+            (!painted).then(|| entry_icon(entry)),
+            side,
+            icon_color,
+            label_color,
+        );
     }
 
     if let Some(placement_cell) = row.column_rects.get(2).copied() {
@@ -18472,6 +18877,11 @@ fn preview_card(
     if !loading && error.is_none() {
         if let Some((format, text)) = preview.and_then(|preview| preview.native_preview.as_ref()) {
             if let Some(widget) = formats::preview_widget(*format, text, reader) {
+                if *format == DocumentFormat::Json {
+                    return inspector_card(
+                        "Preview", SizedBox::new().height(260.).child(widget), reader, None,
+                    );
+                }
                 return inspector_card("Preview", SizedBox::new().height(260.0).child(
                     ScrollView::vertical(widget).viewport_width_hint(true)
                         .theme_when(clone_gray_scrollbar_reader(reader))), reader, None);
@@ -22164,6 +22574,61 @@ fn document_view_index(files: &FilesState) -> usize {
     }
 }
 
+#[cfg(all(feature="desktop",any(target_os="windows",target_os="linux",target_os="macos")))]
+fn report_view(
+    doc: &FilesDocument,
+    shared: &Shared,
+    address: Option<&str>,
+    runtime: &tokio::runtime::Handle,
+) -> WidgetPod {
+    use super::reports::{Content, Report};
+    let base = doc.report_base.clone().unwrap_or_else(|| {
+        Path::new(&doc.path)
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_string_lossy()
+            .into_owned()
+    });
+    let content = if doc.streamed_pdf() {
+        if let Some(f) = &doc.local_fingerprint {
+            Content::LocalPdf(f.canonical_path.clone(), f.len, f.modified_at_unix_nanos)
+        } else if let Some(f) = &doc.sifs_fingerprint {
+            let (Some(hash),Some(size))=(&f.content_hash,f.size_bytes) else {
+                return WidgetPod::new(Label::new("SIFS did not provide the PDF size or content hash."));
+            };
+            Content::SifsPdf(f.object_id.clone(), f.version.clone(), hash.clone(), size)
+        } else {
+            return WidgetPod::new(Label::new("Missing PDF version"));
+        }
+    } else {
+        let bytes = match formats::document_bytes(doc.format, &doc.text) {
+            Ok(bytes) => bytes,
+            Err(e) => return WidgetPod::new(Label::new(e)),
+        };
+        Content::Bytes(bytes)
+    };
+    let mime = match doc.format {
+        DocumentFormat::Notebook => super::reports::NOTEBOOK_MIME,
+        DocumentFormat::Pdf => "application/pdf",
+        DocumentFormat::Svg => "image/svg+xml",
+        _ => "text/html",
+    };
+    let name = if doc.report_base.is_some() {
+        format!("{}.html", doc.path.trim_start_matches("report:"))
+    } else {
+        doc.title.clone()
+    };
+    shared.borrow().reports.widget(Report {
+        source: doc.source,
+        base,
+        name,
+        mime,
+        content,
+        address: address.map(str::to_owned),
+        runtime: runtime.clone(),
+    })
+}
+
 /// The open document's panel. It is mounted once per document; the editor owns its buffer,
 /// caret, and selection and is rebuilt only when a load replaces the text.
 fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -22189,12 +22654,55 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             let Some(document) = files.document.as_ref() else {
                 return WidgetPod::new(SizedBox::new());
             };
+            if document.preview_open
+                && (document.format.binary_artifact()
+                    || matches!(document.format, DocumentFormat::Csv | DocumentFormat::Tsv))
+            {
+                return artifact::view(document, &s, &r);
+            }
+            if document.preview_open
+                && matches!(
+                    document.format,
+                    DocumentFormat::Html | DocumentFormat::Svg | DocumentFormat::Pdf
+                        | DocumentFormat::Notebook
+                )
+            {
+                #[cfg(all(
+                    feature = "desktop",
+                    any(target_os = "windows", target_os = "linux", target_os = "macos")
+                ))]
+                {
+                    return report_view(
+                        document,
+                        &s,
+                        files.daemon_address.as_deref(),
+                        &files.app_runtime,
+                    );
+                }
+                #[cfg(not(all(
+                    feature = "desktop",
+                    any(target_os = "windows", target_os = "linux", target_os = "macos")
+                )))]
+                return WidgetPod::new(
+                    Label::new("Browser preview is available on desktop.")
+                        .theme_when(clone_reader(&r)),
+                );
+            }
+            if document.format == DocumentFormat::Sobj && document.preview_open {
+                return sobj::view(document, &s, &r);
+            }
             if document.format.paged() && document.preview_open {
                 return paged::view(document, &s, &r, &active);
+            }
+            if document.format == DocumentFormat::Diff && document.preview_open {
+                return WidgetPod::new(diff::patch(&document.text).view(&r));
             }
             if document.preview_open {
                 if let Some(preview) = formats::preview_widget(document.format, &document.text, &r)
                 {
+                    if document.format == DocumentFormat::Json {
+                        return WidgetPod::new(preview);
+                    }
                     return WidgetPod::new(
                         ScrollView::vertical(preview)
                             .name("File format preview")
@@ -22203,7 +22711,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                     );
                 }
             }
-            if !matches!(document.format, DocumentFormat::Hex | DocumentFormat::Image) {
+            if !document.format.hex_buffer() {
                 return source_editor::view(document, &s, &r, &active);
             }
             let editor_shared = s.clone();
@@ -22215,20 +22723,20 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                     style.line_height = theme.text.sm.line_height;
                     style
                 })
-                .padding(Insets::all(12.0))
                 .min_width(0.0)
-                .min_height(420.0)
+                .min_height(0.0)
                 .wrap(TextWrap::NoWrap)
                 .value(document.text.clone())
                 .on_change(move |value| editor_shared.files_mut().set_document_text(value));
             if !document.editable() {
                 editor = editor.read_only(true);
             }
-            WidgetPod::new(
-                Surface::field(editor)
-                    .theme_when(clone_reader(&r))
-                    .fill_width(true),
-            )
+            WidgetPod::new(editor_surface::EditorSurface::new(
+                editor,
+                &r,
+                sui::Signal::new(Default::default()),
+                Insets::all(12.),
+            ))
         })
     };
     let modes = {
@@ -22245,28 +22753,60 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 return WidgetPod::new(SizedBox::new().height(0.));
             }
             let mut row = Flex::horizontal().gap(8.0).align_items(Alignment::Center);
-            if document.format.has_preview() && !document.records_only() {
+            if document.format.has_preview()
+                && !document.records_only()
+                && !document.streamed_artifact()
+                && !document.streamed_pdf()
+            {
                 let change = s.clone();
                 row = row.with_child(
                     SegmentedControl::new("Document view")
                         .items([
-                            SegmentedControlItem::new("Preview"),
-                            SegmentedControlItem::new(
-                                if matches!(
-                                    document.format,
-                                    DocumentFormat::Image | DocumentFormat::Hex
-                                ) {
-                                    "Hex editor"
-                                } else {
-                                    "Source"
-                                },
-                            ),
+                            SegmentedControlItem::new(if document.format == DocumentFormat::Sobj {
+                                "Fields"
+                            } else {
+                                "Preview"
+                            }),
+                            SegmentedControlItem::new(if document.format.hex_buffer() {
+                                "Hex editor"
+                            } else {
+                                "Source"
+                            }),
                         ])
                         .selected(if document.preview_open { 0 } else { 1 })
                         .theme_when(clone_reader(&r))
                         .on_change_with_ctx(move |ctx, index, _| {
+                            let waker = change.borrow().waker.clone();
                             let mut files = change.files_mut();
+                            if index == 1
+                                && let Some(d) =
+                                    files.document.as_ref().filter(|d| d.deferred_csv())
+                            {
+                                let expected = d
+                                    .local_fingerprint
+                                    .clone()
+                                    .map(SourceSnapshot::Local)
+                                    .or_else(|| {
+                                        d.sifs_fingerprint.clone().map(SourceSnapshot::Sifs)
+                                    });
+                                let (source, path, title) =
+                                    (d.source, d.path.clone(), d.title.clone());
+                                files
+                                    .begin_document_load_mode(source, path, title, waker, expected);
+                                request_files_overlay_rebuild(ctx);
+                                return;
+                            }
                             if let Some(document) = files.document.as_mut() {
+                                if document.format == DocumentFormat::Sobj {
+                                    if let Err(error) = sobj::apply_field(document) {
+                                        document.save_error = Some(error);
+                                        files.document_revision =
+                                            files.document_revision.wrapping_add(1);
+                                        request_files_overlay_rebuild(ctx);
+                                        return;
+                                    }
+                                    document.sobj_field = None;
+                                }
                                 document.preview_open = index == 0;
                             }
                             files.document_revision = files.document_revision.wrapping_add(1);
@@ -22390,7 +22930,13 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     .enabled_when(move || {
         let files = attach_enabled.files();
         files.document.as_ref().is_some_and(|document| {
-            !document.records_only() && !document.loading && document.load_error.is_none()
+            document.report_base.is_none()
+                && !document.deferred_csv()
+                && !document.streamed_artifact()
+                && !document.streamed_pdf()
+                && !document.records_only()
+                && !document.loading
+                && document.load_error.is_none()
         }) && !files.attachment_loading
     })
     .on_press_with_ctx(move |ctx| {
@@ -22447,28 +22993,29 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         .files_structure
         .select_named("document state", |key| key.dialog.clone());
     if in_tab {
-        let header = TrailingSlotRow::new(
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .gap(10.)
-                .with_item(
-                    Label::new(title)
-                        .single_line(true)
-                        .theme_when(clone_reader(reader)),
-                    FlexItem::fill(),
-                )
-                .with_child(tools),
-            actions,
-        )
-        .trailing_width(200.0)
-        .trailing_height(36.0)
-        .gap(8.0);
+        let header = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .align_items(Alignment::Center)
+            .gap(8.)
+            .with_item(
+                Label::new(title)
+                    .single_line(true)
+                    .theme_when(clone_reader(reader)),
+                FlexItem::flex(1.).basis(112.).min_width(96.),
+            )
+            .with_child(tools)
+            .with_child(actions);
         return Some(WidgetPod::new(source_editor::SearchHost::new(
             RefreshOn::new(
                 document_state,
-                Surface::panel(Dock::new(body).top(52.0, WidgetPadding::all(8.0, header)))
-                    .theme_when(clone_reader(reader))
-                    .fill(),
+                Surface::panel(
+                    Flex::vertical()
+                        .align_items(Alignment::Stretch)
+                        .with_child(WidgetPadding::all(8., header))
+                        .with_item(body, FlexItem::fill()),
+                )
+                .theme_when(clone_reader(reader))
+                .fill(),
             ),
             active_search,
         )));
@@ -23937,7 +24484,12 @@ fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) ->
         None => (
             "Reading version",
             SemanticTone::Accent,
-            "Reading a bounded prefix of this saved version.".to_string(),
+            if preview.compare {
+                "Comparing versions…"
+            } else {
+                "Reading the saved version…"
+            }
+            .to_string(),
             None,
         ),
         Some(Err(error)) => (
@@ -23946,7 +24498,12 @@ fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) ->
             error.clone(),
             None,
         ),
-        Some(Ok(preview)) => (
+        Some(Ok(HistoryContent::Comparison(review))) => {
+            return Surface::panel(SizedBox::new().height(340.).child(review.view(reader)))
+                .theme_when(clone_reader(reader))
+                .fill_width(true);
+        }
+        Some(Ok(HistoryContent::Preview(preview))) => (
             if preview.binary {
                 "Binary content"
             } else {
@@ -24064,6 +24621,32 @@ fn history_entry_card(
         .wrap(FlexWrap::Wrap)
         .gap(6.0)
         .align_items(Alignment::Center);
+    if !entry.deleted && !entry.is_current {
+        let action = shared.clone();
+        let selected = identity.clone();
+        let label = if previewing && preview.is_some_and(|p| p.compare) {
+            "Hide comparison"
+        } else {
+            "Compare with current"
+        };
+        actions = actions.with_child(
+            history_card_button(
+                reader,
+                label,
+                IconGlyph::History,
+                ButtonAppearance::Outline,
+                SemanticTone::Neutral,
+                !loading,
+            )
+            .on_press_with_ctx(move |ctx| {
+                let waker = action.borrow().waker.clone();
+                action
+                    .files_mut()
+                    .toggle_history_preview(selected.clone(), true, waker);
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
     if !folder_mode && !entry.is_current && !entry.deleted {
         let action = shared.clone();
         let selected = identity.clone();
@@ -24108,7 +24691,7 @@ fn history_entry_card(
         actions = actions.with_child(
             history_card_button(
                 reader,
-                if previewing {
+                if previewing && preview.is_some_and(|p| !p.compare) {
                     "Hide preview"
                 } else {
                     "Preview"
@@ -24122,7 +24705,7 @@ fn history_entry_card(
                 let waker = { action.borrow().waker.clone() };
                 action
                     .files_mut()
-                    .toggle_history_preview(selected.clone(), waker);
+                    .toggle_history_preview(selected.clone(), false, waker);
                 request_files_overlay_rebuild(ctx);
             }),
         );
@@ -25943,6 +26526,39 @@ mod tests {
         window.advance_time(1.0)?;
         app.run_until_idle()?;
 
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Compare with current")
+            .click()?;
+        let FilesWorkerCommand::HistoryPreview {
+            request_id,
+            identity,
+            read: HistoryRead::Compare { .. },
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected a history comparison request");
+        };
+        assert!(
+            shared
+                .files_mut()
+                .apply_worker_result(FilesWorkerResult::HistoryPreview {
+                    request_id,
+                    identity,
+                    result: Ok(HistoryContent::Comparison(diff::patch(
+                        "--- saved\n+++ current\n@@ -1 +1 @@\n-old\n+new\n"
+                    ))),
+                })
+        );
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Unified diff")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide comparison")
+            .click()?;
         for name in [
             "Save version",
             "Restore",
@@ -26580,6 +27196,27 @@ mod tests {
         assert!(!saved.is_current && !saved.deleted);
         assert_eq!(saved.pins, vec!["before edit".to_string()]);
 
+        // Exercise exact saved/current reads, including content that has no text diff.
+        let compare = || {
+            diff::compare(
+                &browser,
+                &saved.identity,
+                &path,
+                &saved.content_hash,
+                saved.size_bytes,
+                &saved.current_path,
+            )
+            .unwrap()
+        };
+        let comparison = format!("{:?}", compare());
+        assert!(comparison.contains("-first draft") && comparison.contains("+second draft"));
+        browser.write_file(&path, b"").unwrap();
+        let empty = format!("{:?}", compare());
+        assert!(empty.contains("(empty)") && empty.contains("-first draft"));
+        browser.write_file(&path, b"binary\0").unwrap();
+        let binary = format!("{:?}", compare());
+        assert!(binary.contains("Binary content differs") && binary.contains(&saved.content_hash));
+        browser.write_file(&path, b"second draft\n").unwrap();
         let preview = operator
             .read_file_history(&DfsFileHistoryReadRequest {
                 identity: first.clone(),
@@ -26919,7 +27556,8 @@ mod tests {
             let current = files.history_entries[0].clone();
             files.history_preview = Some(FilesHistoryPreview {
                 identity: current.identity.clone(),
-                result: Some(Ok(preview_from_read_with_line_limit(
+                compare: false,
+                result: Some(Ok(HistoryContent::Preview(preview_from_read_with_line_limit(
                     "report.txt",
                     SifsFileRead {
                         bytes: b"Quarterly report\n\nRevenue grew 12%.\nNext steps: ship it.\n"
@@ -26927,7 +27565,7 @@ mod tests {
                         truncated: false,
                     },
                     HISTORY_PREVIEW_MAX_LINES,
-                ))),
+                )))),
             });
             files.history_notice =
                 Some("Saved the current version as \u{201c}current-draft\u{201d}.".into());
@@ -38025,6 +38663,7 @@ mod tests {
             ("notes.md", b"# Project notes\n\n**Ready** for review.\n\n- First item\n- Second item\n".to_vec()),
             ("data.json", br#"{"project":"Sinomo","ready":true,"count":3}"#.to_vec()),
             ("table.csv", b"name,description\nalpha,\"one,two\"\nbeta,three\n".to_vec()),
+            ("failed-run.ipynb", include_bytes!("../../assets/notebook/testdata/failed-run.ipynb").to_vec()),
             ("image.png", png.into_inner()),
         ];
         for width in [560.0, 1100.0] {
@@ -38101,6 +38740,53 @@ mod tests {
             normalized_path.parent().and_then(Path::file_name),
             Some(std::ffi::OsStr::new("folder"))
         );
+    }
+
+    #[test]
+    fn notebook_local_and_sifs_source_round_trip() {
+        let original =
+            include_str!("../../assets/notebook/testdata/failed-run.ipynb").replace('\n', "\r\n");
+        let original = format!("\u{feff}{original}");
+        let root = sinomo_testdir::TestDir::new("notebook-file");
+        let local = root.join("failed-run.IPYNB");
+        fs::write(&local, &original).unwrap();
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(&backend.data_dir).unwrap();
+        let path = "/failed-run.ipynb";
+        browser.write_file(path, original.as_bytes()).unwrap();
+        for load in [
+            load_local_text_document(local.to_str().unwrap(), FILE_DOCUMENT_MAX_BYTES).unwrap(),
+            load_sifs_text_document(&browser, path, FILE_DOCUMENT_MAX_BYTES).unwrap(),
+        ] {
+            assert_eq!(load.format, DocumentFormat::Notebook);
+            assert!(load.preview_open);
+            assert_eq!(
+                formats::document_bytes(load.format, &load.text).unwrap(),
+                original.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a disposable SIFS daemon"]
+    fn notebook_failed_run_from_live_sifs() {
+        let address = std::env::var("SINOMO_FILES_HISTORY_E2E_ADDRESS").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let browser = SifsBrowser::open_daemon_on_runtime(&address, rt.handle()).unwrap();
+        let path = format!(
+            "/notebook-{}/failed-run.ipynb",
+            sinomo_runtime::core::Id::generate()
+        );
+        browser
+            .create_dir_all(path.rsplit_once('/').unwrap().0)
+            .unwrap();
+        let original = include_bytes!("../../assets/notebook/testdata/failed-run.ipynb");
+        browser.write_file(&path, original).unwrap();
+        let load = load_sifs_text_document(&browser, &path, FILE_DOCUMENT_MAX_BYTES).unwrap();
+        assert_eq!(load.format, DocumentFormat::Notebook);
+        assert!(load.preview_open);
+        assert_eq!(load.text.as_bytes(), original);
+        println!("Notebook fixture {path}");
     }
 
     #[test]
@@ -38220,6 +38906,8 @@ mod tests {
         files.document = Some(FilesDocument {
             format: DocumentFormat::Text,
             preview_open: false,
+            sobj_field: None,
+            report_base: None,
             source: loaded.source,
             path: loaded.path,
             title: loaded.title,
@@ -38276,6 +38964,8 @@ mod tests {
                     files.document = Some(FilesDocument {
                         format: DocumentFormat::Text,
                         preview_open: false,
+                        sobj_field: None,
+                        report_base: None,
                         source: FilesSourceKind::Local,
                         path: document_path.clone(),
                         title: "service_handler.rs".to_string(),

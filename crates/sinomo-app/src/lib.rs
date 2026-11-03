@@ -196,7 +196,8 @@ pub fn run() -> sui::Result<()> {
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
     let final_shared = shared.clone();
-    let result = app.run_with_handle(move |ui| {
+    let platform = sui::DesktopPlatform::new().with_extension(shared.borrow().reports.clone());
+    let result = app.run_with_platform_and_handle(platform, move |ui| {
         // Stash a waker so background work (e.g. provider device-login) can refresh the UI.
         shared.borrow_mut().waker = Some(ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
