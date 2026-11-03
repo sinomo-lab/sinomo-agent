@@ -29,6 +29,9 @@ pub(super) enum DocumentFormat {
     JsonLines,
     Diff,
     Sobj,
+    Html,
+    Svg,
+    Pdf,
     Markdown,
     Json,
     Csv,
@@ -40,6 +43,9 @@ pub(super) enum DocumentFormat {
 impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::Html => "HTML",
+            Self::Svg => "SVG",
+            Self::Pdf => "PDF",
             Self::Text => "Text",
             Self::Sobj => "SOBJ",
             Self::Diff => "Unified diff",
@@ -55,7 +61,7 @@ impl DocumentFormat {
     }
 
     pub(super) fn hex_buffer(self) -> bool {
-        matches!(self, Self::Hex | Self::Image | Self::Sobj)
+        matches!(self, Self::Hex | Self::Image | Self::Sobj | Self::Pdf)
     }
 
     pub(super) fn paged(self) -> bool {
@@ -82,6 +88,9 @@ impl DocumentFormat {
 
 /// Called on the document load worker. Raster validation warms the bounded preview cache.
 pub(super) fn document_from_bytes(path: &str, bytes: &[u8]) -> (DocumentFormat, String) {
+    if bytes.starts_with(b"%PDF-") {
+        return (DocumentFormat::Pdf, encode_hex(bytes));
+    }
     if bytes.starts_with(sinomo_runtime::object::MAGIC)
         || Path::new(path)
             .extension()
@@ -111,6 +120,8 @@ pub(super) fn text_format(path: &str) -> DocumentFormat {
         .to_ascii_lowercase();
     match extension.as_str() {
         "md" | "markdown" | "mdown" => DocumentFormat::Markdown,
+        "html" | "htm" => DocumentFormat::Html,
+        "svg" => DocumentFormat::Svg,
         "diff" | "patch" => DocumentFormat::Diff,
         "json" | "ipynb" => DocumentFormat::Json,
         "csv" => DocumentFormat::Csv,
@@ -335,7 +346,10 @@ pub(super) fn preview_widget(
     reader: &ThemeReader,
 ) -> Option<PreviewWidget> {
     Some(PreviewWidget(match format {
-        DocumentFormat::Text
+        DocumentFormat::Pdf
+        | DocumentFormat::Html
+        | DocumentFormat::Svg
+        | DocumentFormat::Text
         | DocumentFormat::Hex
         | DocumentFormat::Log
         | DocumentFormat::JsonLines => return None,

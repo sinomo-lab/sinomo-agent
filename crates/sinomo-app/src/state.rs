@@ -334,6 +334,8 @@ impl ReadyState {
 
 /// Root application state. Sub-tab state is held in dedicated modules.
 pub struct AppState {
+    #[cfg(all(feature="desktop", any(target_os="linux",target_os="windows",target_os="macos")))]
+    pub(crate) reports: crate::ui::reports::ReportHost,
     pub(crate) window_placement: crate::restoration::WindowPlacement,
     pub(crate) updates: crate::updates::AppUpdates,
     pub active_tab: Tab,
@@ -373,6 +375,8 @@ impl AppState {
         let text_scale = app_config::load_text_scale(&data_dir);
         let render_mode = app_config::load_render_mode(&data_dir);
         Self {
+            #[cfg(all(feature="desktop", any(target_os="linux",target_os="windows",target_os="macos")))]
+            reports: crate::ui::reports::ReportHost::new(&data_dir),
             updates: crate::updates::AppUpdates::default(),
             window_placement: crate::restoration::load(&data_dir)
                 .ok()
@@ -407,6 +411,8 @@ impl AppState {
         let render_mode = app_config::load_render_mode(&data_dir);
         let connection_health = ConnectionHealth::from_backend(&backend);
         Self {
+            #[cfg(all(feature="desktop", any(target_os="linux",target_os="windows",target_os="macos")))]
+            reports: crate::ui::reports::ReportHost::new(&data_dir),
             updates: crate::updates::AppUpdates::default(),
             window_placement: crate::restoration::WindowPlacement::default(),
             active_tab: Tab::Sinomo,

@@ -1015,6 +1015,9 @@ struct FilesDocument {
     preview_open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sobj_field: Option<sobj::FieldDraft>,
+    /// Asset directory for a generated report that has no backing file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report_base: Option<String>,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -1043,6 +1046,7 @@ impl FilesDocument {
             format: DocumentFormat::Text,
             preview_open: false,
             sobj_field: None,
+            report_base: None,
             source,
             path,
             title,
@@ -1067,6 +1071,10 @@ impl FilesDocument {
                     .sobj_field
                     .as_ref()
                     .is_some_and(sobj::FieldDraft::modified))
+    }
+
+    fn streamed_pdf(&self) -> bool {
+        self.format == DocumentFormat::Pdf && self.text.is_empty() && self.read_only_reason.is_some()
     }
 
     fn records_only(&self) -> bool {
@@ -1950,6 +1958,19 @@ impl FilesState {
                         && formats::document_bytes(document.format, &document.text)
                             .is_ok_and(|bytes| sobj::can_inspect(&bytes));
                 }
+                // Older checkpoints kept reports as plain text or binary drafts.
+                let restored_format = match document.format {
+                    DocumentFormat::Text => match formats::text_format(&document.path) {
+                        f @ (DocumentFormat::Html | DocumentFormat::Svg) => Some(f),
+                        _ => None,
+                    },
+                    DocumentFormat::Hex if document.text.starts_with("25 50 44 46 2D") => Some(DocumentFormat::Pdf),
+                    _ => None,
+                };
+                if let Some(format) = restored_format {
+                    document.format = format;
+                    document.preview_open = !document.dirty();
+                }
                 if document.saving {
                     document.saving = false;
                     document.save_error = Some("The app closed during a save. Your edits are preserved; reload or retry with version protection.".into());
@@ -1990,6 +2011,23 @@ impl FilesState {
         } else {
             name.to_string()
         }
+    }
+
+    pub(crate) fn generated_report(&mut self, source: FilesSourceKind, base: String, html: String) {
+        let mut doc = FilesDocument::loading(
+            source,
+            format!("report:{}", sinomo_runtime::core::Id::generate()),
+            "HTML report".into(),
+        );
+        doc.loading = false;
+        doc.format = DocumentFormat::Html;
+        doc.preview_open = true;
+        doc.saved_text = html.clone();
+        doc.text = html;
+        doc.report_base = Some(base);
+        doc.read_only_reason = Some("Generated in chat".into());
+        self.document = Some(doc);
+        self.document_revision = self.document_revision.wrapping_add(1);
     }
 
     pub(crate) fn document_matches(&self, source: FilesSourceKind, path: &str) -> bool {
@@ -3263,6 +3301,7 @@ impl FilesState {
                             format: load.format,
                             preview_open: load.preview_open,
                             sobj_field: None,
+                            report_base: None,
                             source: load.source,
                             path: load.path,
                             title: load.title,
@@ -4600,13 +4639,14 @@ impl FilesState {
         if document.loading || document.load_error.is_some() {
             return;
         }
-        if document.records_only() {
+        if document.report_base.is_some() {
+            return;
+        }
+        if document.streamed_pdf() || document.records_only() {
             self.attachment_error = Some("Attach the original file from the file browser.".into());
             return;
         }
-        if document.text.len() as u64 > FILE_ATTACHMENT_MAX_BYTES
-            && !document.format.hex_buffer()
-        {
+        if document.text.len() as u64 > FILE_ATTACHMENT_MAX_BYTES && !document.format.hex_buffer() {
             self.attachment_error = Some("This file exceeds the attachment size limit.".into());
             return;
         }
@@ -9743,8 +9783,44 @@ fn decode_loaded_document(
         .ok_or_else(|| "Binary file exceeds the hex editor size limit.".into())
 }
 
+fn pdf_name(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+fn streamed_pdf_load(
+    source: FilesSourceKind,
+    path: &str,
+    local_fingerprint: Option<LocalFileFingerprint>,
+    sifs_fingerprint: Option<SifsFileFingerprint>,
+) -> FilesDocumentLoad {
+    FilesDocumentLoad {
+        format: DocumentFormat::Pdf,
+        preview_open: true,
+        source,
+        path: path.into(),
+        title: Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        text: String::new(),
+        local_fingerprint,
+        sifs_fingerprint,
+        read_only_reason: Some("PDF preview".into()),
+    }
+}
+
 fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentLoad, String> {
     let before = local_file_fingerprint(path)?;
+    if before.len > max_bytes && pdf_name(path) {
+        return Ok(streamed_pdf_load(
+            FilesSourceKind::Local,
+            path,
+            Some(before),
+            None,
+        ));
+    }
     let (content, fingerprint) = if before.len > max_bytes {
         let mut file = fs::File::open(&before.canonical_path).map_err(|e| e.to_string())?;
         let bytes = read_large_text(before.len, |_, buffer| {
@@ -9856,6 +9932,14 @@ fn load_sifs_text_document(
 ) -> Result<FilesDocumentLoad, String> {
     let details = browser.stat(path)?;
     let fingerprint = sifs_file_fingerprint(&details)?;
+    if fingerprint.size_bytes.is_some_and(|size| size > max_bytes) && pdf_name(path) {
+        return Ok(streamed_pdf_load(
+            FilesSourceKind::Sifs,
+            path,
+            None,
+            Some(fingerprint),
+        ));
+    }
     let mode = details.mode;
     let bytes = if let Some(size) = fingerprint.size_bytes.filter(|&n| n > max_bytes) {
         let hash = fingerprint
@@ -22269,6 +22353,60 @@ fn document_view_index(files: &FilesState) -> usize {
     }
 }
 
+#[cfg(all(feature="desktop",any(target_os="windows",target_os="linux",target_os="macos")))]
+fn report_view(
+    doc: &FilesDocument,
+    shared: &Shared,
+    address: Option<&str>,
+    runtime: &tokio::runtime::Handle,
+) -> WidgetPod {
+    use super::reports::{Content, Report};
+    let base = doc.report_base.clone().unwrap_or_else(|| {
+        Path::new(&doc.path)
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_string_lossy()
+            .into_owned()
+    });
+    let content = if doc.streamed_pdf() {
+        if let Some(f) = &doc.local_fingerprint {
+            Content::LocalPdf(f.canonical_path.clone(), f.len, f.modified_at_unix_nanos)
+        } else if let Some(f) = &doc.sifs_fingerprint {
+            let (Some(hash),Some(size))=(&f.content_hash,f.size_bytes) else {
+                return WidgetPod::new(Label::new("SIFS did not provide the PDF size or content hash."));
+            };
+            Content::SifsPdf(f.object_id.clone(), f.version.clone(), hash.clone(), size)
+        } else {
+            return WidgetPod::new(Label::new("Missing PDF version"));
+        }
+    } else {
+        let bytes = match formats::document_bytes(doc.format, &doc.text) {
+            Ok(bytes) => bytes,
+            Err(e) => return WidgetPod::new(Label::new(e)),
+        };
+        Content::Bytes(bytes)
+    };
+    let mime = match doc.format {
+        DocumentFormat::Pdf => "application/pdf",
+        DocumentFormat::Svg => "image/svg+xml",
+        _ => "text/html",
+    };
+    let name = if doc.report_base.is_some() {
+        format!("{}.html", doc.path.trim_start_matches("report:"))
+    } else {
+        doc.title.clone()
+    };
+    shared.borrow().reports.widget(Report {
+        source: doc.source,
+        base,
+        name,
+        mime,
+        content,
+        address: address.map(str::to_owned),
+        runtime: runtime.clone(),
+    })
+}
+
 /// The open document's panel. It is mounted once per document; the editor owns its buffer,
 /// caret, and selection and is rebuilt only when a load replaces the text.
 fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
@@ -22294,6 +22432,33 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             let Some(document) = files.document.as_ref() else {
                 return WidgetPod::new(SizedBox::new());
             };
+            if document.preview_open
+                && matches!(
+                    document.format,
+                    DocumentFormat::Html | DocumentFormat::Svg | DocumentFormat::Pdf
+                )
+            {
+                #[cfg(all(
+                    feature = "desktop",
+                    any(target_os = "windows", target_os = "linux", target_os = "macos")
+                ))]
+                {
+                    return report_view(
+                        document,
+                        &s,
+                        files.daemon_address.as_deref(),
+                        &files.app_runtime,
+                    );
+                }
+                #[cfg(not(all(
+                    feature = "desktop",
+                    any(target_os = "windows", target_os = "linux", target_os = "macos")
+                )))]
+                return WidgetPod::new(
+                    Label::new("Browser preview is available on desktop.")
+                        .theme_when(clone_reader(&r)),
+                );
+            }
             if document.format == DocumentFormat::Sobj && document.preview_open {
                 return sobj::view(document, &s, &r);
             }
@@ -22338,7 +22503,10 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 editor = editor.read_only(true);
             }
             WidgetPod::new(editor_surface::EditorSurface::new(
-                editor, &r, sui::Signal::new(Default::default()), Insets::all(12.),
+                editor,
+                &r,
+                sui::Signal::new(Default::default()),
+                Insets::all(12.),
             ))
         })
     };
@@ -22356,7 +22524,8 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                 return WidgetPod::new(SizedBox::new().height(0.));
             }
             let mut row = Flex::horizontal().gap(8.0).align_items(Alignment::Center);
-            if document.format.has_preview() && !document.records_only() {
+            if document.format.has_preview() && !document.records_only() && !document.streamed_pdf()
+            {
                 let change = s.clone();
                 row = row.with_child(
                     SegmentedControl::new("Document view")
@@ -22366,13 +22535,11 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                             } else {
                                 "Preview"
                             }),
-                            SegmentedControlItem::new(
-                                if document.format.hex_buffer() {
-                                    "Hex editor"
-                                } else {
-                                    "Source"
-                                },
-                            ),
+                            SegmentedControlItem::new(if document.format.hex_buffer() {
+                                "Hex editor"
+                            } else {
+                                "Source"
+                            }),
                         ])
                         .selected(if document.preview_open { 0 } else { 1 })
                         .theme_when(clone_reader(&r))
@@ -22382,7 +22549,8 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
                                 if document.format == DocumentFormat::Sobj {
                                     if let Err(error) = sobj::apply_field(document) {
                                         document.save_error = Some(error);
-                                        files.document_revision = files.document_revision.wrapping_add(1);
+                                        files.document_revision =
+                                            files.document_revision.wrapping_add(1);
                                         request_files_overlay_rebuild(ctx);
                                         return;
                                     }
@@ -22511,7 +22679,11 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     .enabled_when(move || {
         let files = attach_enabled.files();
         files.document.as_ref().is_some_and(|document| {
-            !document.records_only() && !document.loading && document.load_error.is_none()
+            document.report_base.is_none()
+                && !document.streamed_pdf()
+                && !document.records_only()
+                && !document.loading
+                && document.load_error.is_none()
         }) && !files.attachment_loading
     })
     .on_press_with_ctx(move |ctx| {
@@ -22583,10 +22755,14 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         return Some(WidgetPod::new(source_editor::SearchHost::new(
             RefreshOn::new(
                 document_state,
-                Surface::panel(Flex::vertical().align_items(Alignment::Stretch)
-                    .with_child(WidgetPadding::all(8., header)).with_item(body, FlexItem::fill()))
-                    .theme_when(clone_reader(reader))
-                    .fill(),
+                Surface::panel(
+                    Flex::vertical()
+                        .align_items(Alignment::Stretch)
+                        .with_child(WidgetPadding::all(8., header))
+                        .with_item(body, FlexItem::fill()),
+                )
+                .theme_when(clone_reader(reader))
+                .fill(),
             ),
             active_search,
         )));
@@ -38430,6 +38606,7 @@ mod tests {
             format: DocumentFormat::Text,
             preview_open: false,
             sobj_field: None,
+            report_base: None,
             source: loaded.source,
             path: loaded.path,
             title: loaded.title,
@@ -38487,6 +38664,7 @@ mod tests {
                         format: DocumentFormat::Text,
                         preview_open: false,
                         sobj_field: None,
+                        report_base: None,
                         source: FilesSourceKind::Local,
                         path: document_path.clone(),
                         title: "service_handler.rs".to_string(),

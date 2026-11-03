@@ -334,6 +334,18 @@ impl Shared {
         Some(id)
     }
 
+    pub(crate) fn open_generated_report(&self, source: FilesSourceKind, base: String, html: String) {
+        let Some(backend) = self.borrow().ready.as_ref().map(|r| r.backend.clone()) else {
+            return;
+        };
+        let mut files = FilesState::new_tab(&backend, &self.root_scope().files());
+        files.generated_report(source, base, html);
+        self.insert_workspace_tab(
+            WorkspaceTabKind::Document,
+            WorkspaceContent::Files(RefCell::new(files)),
+        );
+    }
+
     pub(crate) fn open_document_tab(
         &self,
         source: FilesSourceKind,
