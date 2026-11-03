@@ -1465,15 +1465,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The object a committed write reports. A shard this service does not
     /// replicate is read from its primary; otherwise the local view answers,
     /// and the primary only when that view does not show the object yet.
-    pub(super) fn committed_write_stat_target(&mut self, path: &str) -> Result<DfsObjectMetadata> {
+    /// The stat a committed write, truncate or symlink returns for `path`. A
+    /// service that reads the path's shard locally stats its own record; any
+    /// other reads the committed head and its link count from the authorities.
+    pub(super) fn committed_write_stat(&mut self, path: &str) -> Result<DfsStat> {
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        if !self.local_metadata_answers_path_from_snapshot(path, shard_snapshot.as_deref())? {
-            return self.stat_target_from_authority(path);
+        if self.local_metadata_answers_path_from_snapshot(path, shard_snapshot.as_deref())? {
+            match self.stat_target_for_path(path) {
+                Ok(object) => return self.stat_object_for_path(&object, path),
+                Err(DfsPosixError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
-        match self.stat_target_for_path(path) {
-            Err(DfsPosixError::NotFound { .. }) => self.stat_target_from_authority(path),
-            result => result,
-        }
+        let object = self.stat_target_from_authority(path)?;
+        self.with_stat_deadline(|service| {
+            service.with_stat_read_rounds(|service| {
+                service.stat_object_from_authorities(&object, path, shard_snapshot.as_deref())
+            })
+        })
     }
 
     /// The committed head of `path` as its metadata authority reports it.

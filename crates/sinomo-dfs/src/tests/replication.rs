@@ -576,6 +576,82 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 }
 
 #[test]
+fn outsider_patches_symlinks_and_stats_through_the_primary() {
+    let name = "native-outsider-patch-through-primary";
+    let (runtime, mut primary_service, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    let primary = config.primary_node_id.clone();
+    let outsider = config.replica_node_ids[0].clone();
+    let path = "/services/outsider-patch.txt";
+    let created = primary_service
+        .posix_write_file(
+            path,
+            b"0123456789",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    drop(primary_service);
+    let remaining = config
+        .replica_node_ids
+        .iter()
+        .filter(|node| **node != outsider)
+        .cloned()
+        .collect();
+    runtime
+        .reassign_metadata_shard(
+            &config.file_system_id,
+            &config.shard_id,
+            primary.clone(),
+            remaining,
+        )
+        .unwrap();
+    let outsider_row = || {
+        LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(config.shard_id.clone()),
+            crate::default_dfs_metadata_shards_root(runtime.data_dir(&outsider))
+                .join(crate::metadata_keys::key_segment(&config.shard_id)),
+        )
+        .unwrap()
+        .get_object(&created.object_id)
+        .unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while outsider_row().is_some() {
+        assert!(Instant::now() < deadline, "the outsider kept its copy");
+        runtime
+            .maintenance_tick(&outsider, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+            .unwrap();
+    }
+
+    let mut client = runtime.client(&outsider).unwrap();
+    assert!(client.transport.delegates_local_namespace_authority());
+    let options = DfsWriteOptions::replicated_eventual(vec![primary.clone()]);
+    let truncated = client
+        .posix_truncate_file_for_object(&created.object_id, 4, options.clone())
+        .expect("truncate reads its base from the primary");
+    assert_eq!(truncated.size_bytes, Some(4));
+    assert_eq!(truncated.link_count, 1);
+    let patched = client
+        .posix_write_file_at(path, 2, b"ab", options.clone())
+        .expect("write-at reads its base from the primary");
+    assert_eq!(patched.object_id, created.object_id);
+    assert_eq!(patched.size_bytes, Some(4));
+    let link = client
+        .posix_symlink("outsider-patch.txt", "/services/outsider-link", options)
+        .expect("symlink checks its parent at the primary");
+    assert_eq!(link.kind, DfsObjectKind::Symlink);
+    let by_id = client
+        .posix_stat_object(&created.object_id)
+        .unwrap()
+        .expect("stat by object id reads the primary");
+    assert_eq!(by_id.size_bytes, Some(4));
+    assert_eq!(by_id.link_count, 1);
+    assert!(outsider_row().is_none(), "the outsider keeps no copy");
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn removed_replica_discards_its_shard_copy_and_recovers_when_added_back() {
     let name = "native-removed-replica-discards-copy";
     let (runtime, mut primary_service, config) =

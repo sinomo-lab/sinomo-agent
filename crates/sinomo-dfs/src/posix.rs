@@ -3846,13 +3846,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 if !options.foreground_replica_repair {
                     if transient_create && remote_metadata_primary {
-                        let authoritative = self.stat_target_for_path(&path)?;
-                        return self.stat_object_for_path(&authoritative, &path);
+                        return self.committed_write_stat(&path);
                     }
                     return self.stat_object_for_path(&committed_object, &path);
                 }
-                let object = self.committed_write_stat_target(&path)?;
-                self.stat_object_for_path(&object, &path)
+                self.committed_write_stat(&path)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
@@ -4627,15 +4625,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 if !options.foreground_replica_repair {
                     if transient_create {
-                        let authoritative = self.stat_target_for_path(&path)?;
-                        return self.stat_object_for_path(&authoritative, &path);
+                        return self.committed_write_stat(&path);
                     }
                     return self.stat_object_for_path(&committed_object, &path);
                 }
                 // The local view may not show the committed object; its
                 // metadata authority does.
-                let object = self.committed_write_stat_target(&path)?;
-                self.stat_object_for_path(&object, &path)
+                self.committed_write_stat(&path)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
@@ -4650,12 +4646,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         required_receipts,
                     });
                 }
-                let object = self.stat_target_for_path(&path)?;
-                let mut stat = self.stat_object(&object)?;
-                stat.path = path.clone();
+                let mut stat = self.committed_write_stat(&path)?;
                 if let Ok(manifest) = self
                     .content
-                    .read_manifest(object.object_id.as_str(), target_version_for_stat.as_str())
+                    .read_manifest(stat.object_id.as_str(), target_version_for_stat.as_str())
                 {
                     stat.size_bytes = Some(manifest.size_bytes);
                 }
@@ -4691,6 +4685,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.posix_write_file_at_from_reader_impl(path, offset, &mut reader, options)
     }
 
+    /// The current object a patch, write-at or truncate of the resolved `path`
+    /// replaces: this service's own record when it plans writes from local
+    /// metadata, otherwise the path authority's.
+    fn posix_patch_base_object(&mut self, path: &str) -> Result<Option<DfsObjectMetadata>> {
+        if self.plans_write_from_local_metadata(path)? {
+            return self.lookup_sifs_path(path);
+        }
+        self.lookup_sifs_path_direct_distributed_synced(path)
+    }
+
+    /// Rejection for a patch whose path ends in a slash: IsDirectory when the
+    /// path names a directory, NotDirectory otherwise.
+    fn posix_patch_trailing_slash_error(&mut self, path: String) -> DfsPosixError {
+        match self.posix_patch_base_object(&path) {
+            Ok(Some(object)) if object.kind == DfsObjectKind::Directory => {
+                DfsPosixError::IsDirectory { path }
+            }
+            Ok(_) => DfsPosixError::NotDirectory { path },
+            Err(error) => error,
+        }
+    }
+
+    /// The current bytes a patch rewrites. An object read from its authority
+    /// is fetched as that authority described it, not re-resolved locally.
+    fn posix_patch_current_bytes(
+        &mut self,
+        path: &str,
+        object: &DfsObjectMetadata,
+    ) -> Result<NetworkedDfsReadOutcome> {
+        if self.plans_write_from_local_metadata(path)? {
+            return self.read_current_object_or_fetch_remote(&object.object_id);
+        }
+        self.read_object_metadata_or_fetch_remote_without_cache(object)
+    }
+
     fn posix_write_file_at_from_reader_impl(
         &mut self,
         path: &str,
@@ -4712,22 +4741,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
-            return match self.ensure_resolved_path_is_directory(&path) {
-                Ok(()) => Err(DfsPosixError::IsDirectory { path }),
-                Err(DfsPosixError::NotDirectory { path }) => {
-                    Err(DfsPosixError::NotDirectory { path })
-                }
-                Err(DfsPosixError::NotFound { path }) => Err(DfsPosixError::NotDirectory { path }),
-                Err(error) => Err(error),
-            };
+            return Err(self.posix_patch_trailing_slash_error(path));
         }
         let object = self
-            .lookup_sifs_path(&path)?
+            .posix_patch_base_object(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
-        let object = self.resolve_hardlink_target(&object)?;
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
@@ -4782,16 +4804,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             return match outcome {
                 NetworkedDfsWriteOutcome::Committed { .. } => {
-                    let object = self.stat_target_for_path(&path)?;
-                    self.stat_object_for_path(&object, &path)
+                    self.committed_write_stat(&path)
                 }
                 NetworkedDfsWriteOutcome::Pending {
                     intent_id,
                     durable_receipts,
                     required_receipts,
                 } if !options.wait_for_commit => {
-                    let object = self.stat_target_for_path(&path)?;
-                    let mut stat = self.stat_object_for_path(&object, &path)?;
+                    let mut stat = self.committed_write_stat(&path)?;
                     stat.size_bytes = object.content_size_bytes;
                     let _ = intent_id;
                     let _ = durable_receipts;
@@ -4810,7 +4830,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
         }
 
-        let current = match self.read_current_object_or_fetch_remote(&object.object_id)? {
+        let current = match self.posix_patch_current_bytes(&path, &object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -4852,16 +4872,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
-                let object = self.stat_target_for_path(&path)?;
-                self.stat_object_for_path(&object, &path)
+                self.committed_write_stat(&path)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
                 durable_receipts,
                 required_receipts,
             } if !options.wait_for_commit => {
-                let object = self.stat_target_for_path(&path)?;
-                let mut stat = self.stat_object_for_path(&object, &path)?;
+                let mut stat = self.committed_write_stat(&path)?;
                 stat.size_bytes = Some(result_size);
                 let _ = intent_id;
                 let _ = durable_receipts;
@@ -4930,22 +4948,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
-            return match self.ensure_resolved_path_is_directory(&path) {
-                Ok(()) => Err(DfsPosixError::IsDirectory { path }),
-                Err(DfsPosixError::NotDirectory { path }) => {
-                    Err(DfsPosixError::NotDirectory { path })
-                }
-                Err(DfsPosixError::NotFound { path }) => Err(DfsPosixError::NotDirectory { path }),
-                Err(error) => Err(error),
-            };
+            return Err(self.posix_patch_trailing_slash_error(path));
         }
         let object = self
-            .lookup_sifs_path(&path)?
+            .posix_patch_base_object(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
-        let object = self.resolve_hardlink_target(&object)?;
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         if expected_object_id.is_some_and(|expected| expected != &object.object_id) {
             return Err(DfsPosixError::NotFound { path });
         }
@@ -4989,17 +5000,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match outcome {
                 NetworkedDfsWriteOutcome::Committed { .. } => {
-                    let object = self.stat_target_for_path(&path)?;
-                    return self.stat_object_for_path(&object, &path);
+                    return self.committed_write_stat(&path);
                 }
                 NetworkedDfsWriteOutcome::Pending {
                     intent_id,
                     durable_receipts,
                     required_receipts,
                 } if !options.wait_for_commit => {
-                    let object = self.stat_target_for_path(&path)?;
-                    let mut stat = self.stat_object_for_path(&object, &path)?;
-                    stat.size_bytes = object.content_size_bytes.map(|size| size.max(patch_end));
+                    let mut stat = self.committed_write_stat(&path)?;
+                    stat.size_bytes = stat.size_bytes.map(|size| size.max(patch_end));
                     let _ = intent_id;
                     let _ = durable_receipts;
                     let _ = required_receipts;
@@ -5018,7 +5027,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        let mut current = match self.read_current_object_or_fetch_remote(&object.object_id)? {
+        let mut current = match self.posix_patch_current_bytes(&path, &object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -5069,16 +5078,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
-                let object = self.stat_target_for_path(&path)?;
-                self.stat_object_for_path(&object, &path)
+                self.committed_write_stat(&path)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
                 durable_receipts,
                 required_receipts,
             } if !options.wait_for_commit => {
-                let object = self.stat_target_for_path(&path)?;
-                let mut stat = self.stat_object_for_path(&object, &path)?;
+                let mut stat = self.committed_write_stat(&path)?;
                 stat.size_bytes = Some(result_size);
                 let _ = intent_id;
                 let _ = durable_receipts;
@@ -5136,22 +5143,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
-            return match self.ensure_resolved_path_is_directory(&path) {
-                Ok(()) => Err(DfsPosixError::IsDirectory { path }),
-                Err(DfsPosixError::NotDirectory { path }) => {
-                    Err(DfsPosixError::NotDirectory { path })
-                }
-                Err(DfsPosixError::NotFound { path }) => Err(DfsPosixError::NotDirectory { path }),
-                Err(error) => Err(error),
-            };
+            return Err(self.posix_patch_trailing_slash_error(path));
         }
         let object = self
-            .lookup_sifs_path(&path)?
+            .posix_patch_base_object(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
-        let object = self.resolve_hardlink_target(&object)?;
+        let object = self.resolve_hardlink_target_distributed(&object, None)?;
         if expected_object_id.is_some_and(|expected| expected != &object.object_id) {
             return Err(DfsPosixError::NotFound { path });
         }
@@ -5159,7 +5159,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::IsDirectory { path });
         }
         let base_version = object.version.clone();
-        let mut current = match self.read_current_object_or_fetch_remote(&object.object_id)? {
+        let mut current = match self.posix_patch_current_bytes(&path, &object)? {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
@@ -5211,16 +5211,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
-                let object = self.stat_target_for_path(&path)?;
-                self.stat_object_for_path(&object, &path)
+                self.committed_write_stat(&path)
             }
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
                 durable_receipts,
                 required_receipts,
             } if !options.wait_for_commit => {
-                let object = self.stat_target_for_path(&path)?;
-                let mut stat = self.stat_object_for_path(&object, &path)?;
+                let mut stat = self.committed_write_stat(&path)?;
                 stat.size_bytes = Some(len as u64);
                 let _ = intent_id;
                 let _ = durable_receipts;

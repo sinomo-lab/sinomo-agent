@@ -393,10 +393,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         object_id: &DfsObjectId,
     ) -> Result<DfsObjectMetadata, DfsError> {
+        let source = self.object_read_source(object_id, None)?;
+        self.current_read_object_metadata_from_source(object_id, source)
+    }
+
+    /// Read `object_id` from the source [`Self::object_read_source`] chose.
+    pub(crate) fn current_read_object_metadata_from_source(
+        &mut self,
+        object_id: &DfsObjectId,
+        source: DfsObjectReadSource,
+    ) -> Result<DfsObjectMetadata, DfsError> {
         let DfsObjectReadSource::Authority {
             file_system_id,
             hinted_shard,
-        } = self.object_read_source(object_id, None)?
+        } = source
         else {
             return self.current_read_object_metadata(object_id);
         };
