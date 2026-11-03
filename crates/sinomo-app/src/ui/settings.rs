@@ -6875,11 +6875,38 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         )
         .build(shared, reader);
 
-    Stack::vertical()
+    let content = Stack::vertical()
         .gap(16.0)
         .alignment(Alignment::Stretch)
         .with_child(theme_and_text)
-        .with_child(display)
+        .with_child(display);
+    if cfg!(target_os = "android") {
+        return content;
+    }
+    use crate::backend::app_config::{FileOpenAction, save_file_open_action};
+    let files = shared.files();
+    let preference = std::sync::Arc::clone(&files.open_files_externally);
+    let selected = std::sync::Arc::clone(&preference);
+    let data_dir = files.data_dir.clone();
+    let picker = Select::new("Default file action")
+        .options(["Open in Sinomo", "Open externally"])
+        .selected_when(move || Some(usize::from(selected.load(Ordering::Relaxed))))
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _| {
+            let action = if index == 1 {
+                FileOpenAction::External
+            } else {
+                FileOpenAction::Internal
+            };
+            match save_file_open_action(&data_dir, action) {
+                Ok(()) => preference.store(action == FileOpenAction::External, Ordering::Relaxed),
+                Err(error) => tracing::warn!(%error, "could not save the default file action"),
+            }
+        });
+    drop(files);
+    content.with_child(SettingsCard::new("Files").row(SettingRow::new("Default file action")
+        .help("Double-click a file or press Enter to open it. Right-click for the other option.")
+        .control(picker).build(shared)).build(shared, reader))
 }
 
 /// Connection status first, since that is why people usually open this page, then the app build

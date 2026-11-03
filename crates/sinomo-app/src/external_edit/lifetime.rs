@@ -558,6 +558,25 @@ fn ordinary(mut process: Process, ticket: &Path, mut system: System) -> Result<b
     }
     Ok(false)
 }
+fn launch_editor(path: &Path) -> Result<Launch> {
+    if let Some(program) = std::env::var_os("SINOMO_EXTERNAL_EDITOR").filter(|p| !p.is_empty()) {
+        editor(Path::new(&program), path)
+    } else {
+        default_launch(path)
+    }
+}
+
+pub(super) fn open_unmanaged(path: &Path) -> Result<()> {
+    if let Launch::Ordinary(Process::Child(mut child)) | Launch::Wait(Process::Child(mut child)) =
+        launch_editor(path)?
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+    Ok(())
+}
+
 pub fn monitor() -> Result<()> {
     let key = std::env::args().nth(2).ok_or("Missing edit session")?;
     let token = std::env::args().nth(3).ok_or("Missing launch ticket")?;
@@ -579,13 +598,7 @@ pub fn monitor() -> Result<()> {
     read(&working, LIMIT)?;
     let mut sys = System::new();
     refresh(&mut sys);
-    let launch = if let Some(program) =
-        std::env::var_os("SINOMO_EXTERNAL_EDITOR").filter(|p| !p.is_empty())
-    {
-        editor(Path::new(&program), &working)?
-    } else {
-        default_launch(&working)?
-    };
+    let launch = launch_editor(&working)?;
     {
         let mut out = std::io::stdout().lock();
         writeln!(out, "OK").map_err(err)?;

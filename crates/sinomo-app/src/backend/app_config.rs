@@ -12,8 +12,18 @@ use sinomo_runtime::local::SinomoDataDir;
 use crate::rendering::AppRenderMode;
 use crate::theme::{AppTextScale, AppThemeMode};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileOpenAction {
+    #[default]
+    Internal,
+    External,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppUiConfig {
+    #[serde(default)]
+    pub file_open_action: FileOpenAction,
     #[serde(default)]
     pub theme: AppThemeMode,
     #[serde(default = "default_render_mode")]
@@ -29,6 +39,7 @@ pub struct AppUiConfig {
 impl Default for AppUiConfig {
     fn default() -> Self {
         Self {
+            file_open_action: FileOpenAction::default(),
             theme: AppThemeMode::System,
             render_mode: default_render_mode(),
             text_scale: AppTextScale::default(),
@@ -99,6 +110,15 @@ pub fn load_media_preferences(data_dir: &SinomoDataDir) -> AppMediaPreferences {
     load_ui_config(data_dir).media
 }
 
+pub fn save_file_open_action(
+    data_dir: &SinomoDataDir,
+    action: FileOpenAction,
+) -> Result<(), String> {
+    let mut config = load_ui_config(data_dir);
+    config.file_open_action = action;
+    save_ui_config(data_dir, &config)
+}
+
 pub fn save_theme(data_dir: &SinomoDataDir, theme: AppThemeMode) -> Result<(), String> {
     let mut config = load_ui_config(data_dir);
     config.theme = theme;
@@ -159,6 +179,24 @@ mod tests {
             "sinomo-app-config-{slug}-{}-{unique}",
             std::process::id()
         )))
+    }
+
+    #[test]
+    fn file_open_default_preserves_other_preferences_and_reads_older_config() {
+        let data = temp_data_dir("file-open");
+        let path = ui_config_file(&data);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(
+            load_ui_config(&data).file_open_action,
+            FileOpenAction::Internal
+        );
+        save_theme(&data, AppThemeMode::Dark).unwrap();
+        save_file_open_action(&data, FileOpenAction::External).unwrap();
+        let saved = load_ui_config(&data);
+        assert_eq!(saved.file_open_action, FileOpenAction::External);
+        assert_eq!(saved.theme, AppThemeMode::Dark);
+        fs::remove_dir_all(data.root()).unwrap();
     }
 
     #[test]

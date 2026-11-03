@@ -292,6 +292,15 @@ fn snapshot(browser: &SifsBrowser, path: &str) -> Result<(String, String, String
     }
     Ok((d.object_id, d.version, hash, bytes))
 }
+pub(crate) fn open_local(path: &Path) -> Result<String> {
+    let meta = fs::symlink_metadata(path).map_err(err)?;
+    if !meta.is_file() || link(&meta) {
+        return Err("Select a regular local file".into());
+    }
+    lifetime::open_unmanaged(&std::path::absolute(path).map_err(err)?)?;
+    Ok(format!("Opened {}", path.display()))
+}
+
 fn launch(path: &Path, folder: bool) -> Result<()> {
     #[cfg(windows)]
     if !folder {

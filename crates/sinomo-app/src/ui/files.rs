@@ -29,7 +29,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -100,7 +100,10 @@ use sinomo_runtime::{
 };
 use time::format_description::well_known::Rfc3339;
 
-use crate::backend::Backend;
+use crate::backend::{
+    Backend,
+    app_config::{self, FileOpenAction},
+};
 use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutcome};
 use crate::state::{Shared, Tab};
 use crate::theme::{AppTextScale, AppThemeMode};
@@ -1259,6 +1262,7 @@ struct FilesStorageOverview {
 
 /// State backing the files tab.
 pub struct FilesState {
+    pub(super) open_files_externally: Arc<AtomicBool>,
     pending_tab_open: Option<(FilesSourceKind, String, String)>,
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
@@ -1973,7 +1977,15 @@ impl FilesState {
                     (0, Vec::new())
                 }
             };
-        Self::with_preview_catalog(backend, ui_preview_catalog_generation, ui_preview_entries)
+        Self::with_preview_catalog(
+            backend,
+            ui_preview_catalog_generation,
+            ui_preview_entries,
+            Arc::new(AtomicBool::new(
+                app_config::load_ui_config(&backend.data_dir).file_open_action
+                    == FileOpenAction::External,
+            )),
+        )
     }
 
     /// Opening a UI tab reuses the observed catalog; discovery is refreshed by its worker.
@@ -1982,6 +1994,7 @@ impl FilesState {
             backend,
             existing.ui_preview_catalog_generation,
             existing.ui_preview_entries.clone(),
+            Arc::clone(&existing.open_files_externally),
         )
     }
 
@@ -1989,9 +2002,11 @@ impl FilesState {
         backend: &Backend,
         ui_preview_catalog_generation: u64,
         ui_preview_entries: Vec<UiExtensionCatalogEntry>,
+        open_files_externally: Arc<AtomicBool>,
     ) -> Self {
         let local_path = default_local_path(backend.data_dir.root());
         Self {
+            open_files_externally,
             data_dir: backend.data_dir.clone(),
             daemon_address: backend.connection.daemon_address().map(str::to_string),
             daemon_unavailable_detail: backend.connection_issue_detail(),
@@ -6665,10 +6680,11 @@ impl FilesState {
         action: crate::external_edit::Action,
         waker: Option<sui::UiHandle>,
     ) {
-        self.start_external_edit_target(path, None, action, waker);
+        self.start_external_edit_target(FilesSourceKind::Sifs, path, None, action, waker);
     }
     fn start_external_edit_target(
         &mut self,
+        source: FilesSourceKind,
         path: String,
         session: Option<String>,
         action: crate::external_edit::Action,
@@ -6679,14 +6695,14 @@ impl FilesState {
         }
         let request_id = self.next_request_id;
         self.next_request_id = request_id.wrapping_add(1);
-        if self.document.as_ref().is_some_and(|doc| doc.source == FilesSourceKind::Sifs && doc.path == path) {
+        if self.document.as_ref().is_some_and(|doc| doc.source == source && doc.path == path) {
             self.document_external_task = Some(request_id);
         }
         self.tasks.insert(
             0,
             FilesTask {
                 id: request_id,
-                source: FilesSourceKind::Sifs,
+                source,
                 title: action.label().into(),
                 detail: path.clone(),
                 state: FilesTaskState::Running,
@@ -6697,6 +6713,7 @@ impl FilesState {
         if !self.operations_sender().is_some_and(|tx| {
             tx.send(FilesWorkerCommand::ExternalEdit {
                 request_id,
+                source,
                 path,
                 session,
                 action,
@@ -7124,20 +7141,48 @@ impl FilesState {
         }
     }
 
+    fn can_open_externally(entry: &SifsEntry) -> bool {
+        !cfg!(target_os = "android") && !entry.is_link && !entry.is_dir
+    }
+
+    fn alternate_open(&self, entry: &SifsEntry) -> FileContextAction {
+        if !Self::can_open_externally(entry) {
+            return FileContextAction::OpenInNewTab;
+        }
+        if self.open_files_externally.load(Ordering::Relaxed) {
+            FileContextAction::OpenInSinomo
+        } else {
+            FileContextAction::ExternalEdit(crate::external_edit::Action::Open)
+        }
+    }
+
     /// Activate a listing row from keyboard or double-click: directories navigate and files open
-    /// in the document surface.
+    /// using the configured action.
     /// Returns whether the navigation changed the *path*.
     fn activate_row(&mut self, index: usize) -> bool {
-        let is_dir = self.entries.get(index).map(|e| e.is_dir).unwrap_or(false);
-        if is_dir {
-            let target = self.entries[index].path.clone();
-            self.navigate(target);
-            true
-        } else {
-            self.select_entry(index);
-            self.open_selected_document(self.worker_waker.clone());
-            false
+        let Some(entry) = self.entries.get(index) else {
+            return false;
+        };
+        if entry.is_dir {
+            self.navigate(entry.path.clone());
+            return true;
         }
+        let external =
+            Self::can_open_externally(entry) && self.open_files_externally.load(Ordering::Relaxed);
+        let path = entry.path.clone();
+        self.select_entry(index);
+        if external {
+            self.start_external_edit_target(
+                self.source,
+                path,
+                None,
+                crate::external_edit::Action::Open,
+                self.worker_waker.clone(),
+            );
+        } else {
+            self.open_selected_document(self.worker_waker.clone());
+        }
+        false
     }
 
     /// The breadcrumb path segments as `(label, target_path)` pairs, root first.
@@ -7334,6 +7379,7 @@ enum FilesLiveUpdate {
 enum FilesWorkerCommand {
     ExternalEdit {
         request_id: u64,
+        source: FilesSourceKind,
         path: String,
         session: Option<String>,
         action: crate::external_edit::Action,
@@ -7627,11 +7673,16 @@ fn files_worker_loop(
         match command {
             FilesWorkerCommand::ExternalEdit {
                 request_id,
+                source,
                 path,
                 session,
                 action,
             } => {
-                let result = if let Some(key) = session {
+                let result = if source == FilesSourceKind::Local
+                    && action == crate::external_edit::Action::Open
+                {
+                    crate::external_edit::open_local(Path::new(&path))
+                } else if let Some(key) = session {
                     crate::external_edit::act_on_session(&data_dir, &key, action)
                 } else {
                     daemon_address
@@ -17039,6 +17090,7 @@ enum FileContextAction {
     ExternalEdit(crate::external_edit::Action),
     Open,
     OpenInNewTab,
+    OpenInSinomo,
     AttachToChat,
     Copy,
     CopySelected,
@@ -17083,6 +17135,7 @@ impl FileContextAction {
             Self::ExternalEdit(action) => action.label(),
             Self::Open => "Open",
             Self::OpenInNewTab => "Open in new tab",
+            Self::OpenInSinomo => "Open in Sinomo",
             Self::AttachToChat => "Attach to current chat",
             Self::Copy => "Copy to",
             Self::CopySelected => "Copy selected to",
@@ -17131,7 +17184,11 @@ impl FileContextAction {
 
     fn group(self) -> u8 {
         match self {
-            Self::ExternalEdit(_) | Self::Open | Self::OpenInNewTab | Self::AttachToChat => 0,
+            Self::ExternalEdit(_)
+            | Self::Open
+            | Self::OpenInSinomo
+            | Self::OpenInNewTab
+            | Self::AttachToChat => 0,
             Self::Copy
             | Self::CopySelected
             | Self::Transfer
@@ -17173,9 +17230,10 @@ impl FileContextAction {
         let can_read = files.loaded && !files.loading && files.error.is_none();
         let can_modify = files.can_modify_current_location();
         match self {
-            Self::ExternalEdit(_) => {
+            Self::ExternalEdit(action) => {
                 !cfg!(target_os = "android")
-                    && files.source == FilesSourceKind::Sifs
+                    && (action == crate::external_edit::Action::Open
+                        || files.source == FilesSourceKind::Sifs)
                     && files
                         .selected_entry()
                         .is_some_and(|e| !e.is_dir && !e.is_link)
@@ -17193,6 +17251,7 @@ impl FileContextAction {
             Self::OpenLocalFile | Self::OpenLocalFolder => !files.picker_lane.is_pending(),
             Self::GoToPath => !files.loading,
             Self::Open
+            | Self::OpenInSinomo
             | Self::OpenInNewTab
             | Self::CopyPath
             | Self::CopyPaths
@@ -17293,16 +17352,7 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
     };
     let mut actions = Vec::with_capacity(18);
     actions.push(FileContextAction::Open);
-    actions.push(FileContextAction::OpenInNewTab);
-    if !cfg!(target_os = "android")
-        && files.source == FilesSourceKind::Sifs
-        && !entry.is_dir
-        && !entry.is_link
-    {
-        actions.push(FileContextAction::ExternalEdit(
-            crate::external_edit::Action::Open,
-        ));
-    }
+    actions.push(files.alternate_open(entry));
     if !entry.is_dir {
         actions.push(FileContextAction::AttachToChat);
     }
@@ -17400,18 +17450,13 @@ fn selection_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntr
         return Vec::new();
     };
     let mut entries = vec![action_entry(FileContextAction::Open, files, false)];
-    entries.push(action_entry(FileContextAction::OpenInNewTab, files, false));
+    entries.push(action_entry(files.alternate_open(entry), files, false));
     if !cfg!(target_os = "android")
         && files.source == FilesSourceKind::Sifs
         && !entry.is_dir
         && !entry.is_link
     {
         use crate::external_edit::Action;
-        entries.push(action_entry(
-            FileContextAction::ExternalEdit(Action::Open),
-            files,
-            false,
-        ));
         entries.push(FileContextMenuEntry::submenu(
             "External working copy",
             [
@@ -18083,12 +18128,14 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
             if let Some(entry) = files.selected_entry().cloned()
                 && !entry.is_dir
                 && !entry.is_link
-                && files.source == FilesSourceKind::Sifs
+                && (action == crate::external_edit::Action::Open
+                    || files.source == FilesSourceKind::Sifs)
             {
-                files.start_external_edit(entry.path, action, waker);
+                let source = files.source;
+                files.start_external_edit_target(source, entry.path, None, action, waker);
             }
         }
-        FileContextAction::OpenInNewTab => {
+        FileContextAction::OpenInSinomo | FileContextAction::OpenInNewTab => {
             let selected = shared.files().selected_entry().cloned();
             if let Some(entry) = selected {
                 let source = shared.files().source;
@@ -23536,6 +23583,7 @@ fn files_storage_center_body(
                         .on_press_with_ctx(move |ctx| {
                             let waker = s.borrow().waker.clone();
                             s.files_mut().start_external_edit_target(
+                                FilesSourceKind::Sifs,
                                 path.clone(),
                                 Some(key.clone()),
                                 action,
@@ -35367,6 +35415,45 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn file_open_default_applies_to_existing_tabs_and_both_sources() {
+        let backend = Backend::local_fallback();
+        let root = FilesState::new(&backend);
+        let mut tab = FilesState::new_tab(&backend, &root);
+        let (tx, rx) = mpsc::channel();
+        tab.operations_tx = Some(tx);
+        tab.entries = vec![SifsEntry {
+            name: "note.txt".into(),
+            path: "/note.txt".into(),
+            is_dir: false,
+            is_link: false,
+            size: Some(4),
+        }];
+        root.open_files_externally.store(true, Ordering::Relaxed);
+        for source in [FilesSourceKind::Local, FilesSourceKind::Sifs] {
+            tab.source = source;
+            assert_eq!(
+                tab.alternate_open(&tab.entries[0]),
+                FileContextAction::OpenInSinomo
+            );
+            tab.activate_row(0);
+            assert!(
+                matches!(rx.try_recv(), Ok(FilesWorkerCommand::ExternalEdit {
+                source: queued, action: crate::external_edit::Action::Open, session: None, ..
+            }) if queued == source)
+            );
+            assert!(tab.pending_tab_open.is_none());
+        }
+        root.open_files_externally.store(false, Ordering::Relaxed);
+        tab.activate_row(0);
+        assert_eq!(tab.pending_tab_open.take().unwrap().1, "/note.txt");
+        assert_eq!(
+            tab.alternate_open(&tab.entries[0]),
+            FileContextAction::ExternalEdit(crate::external_edit::Action::Open)
+        );
+    }
+
     #[test]
     fn file_context_menu_adapts_to_sifs_and_marked_batches() {
         let mut files = FilesState::new(&Backend::local_fallback());
@@ -37065,6 +37152,18 @@ mod tests {
             };
             assert_eq!(path, "/services/artifact.txt");
             assert_eq!(action, crate::external_edit::Action::Open);
+
+            shared.files().open_files_externally.store(true, Ordering::Relaxed);
+            window.advance_time(1.0)?;
+            window.get_by_role(sui::SemanticsRole::Button)
+                .with_name("Open selection actions").click()?;
+            window.advance_time(1.0)?;
+            window.get_by_role(sui::SemanticsRole::MenuItem)
+                .with_name("Open in Sinomo").click()?;
+            assert_eq!(shared.active_scope().workspace_kind(), Some(crate::state::WorkspaceTabKind::Document));
+            assert_eq!(shared.active_scope().files().document.as_ref().unwrap().path, "/services/artifact.txt");
+            window.advance_time(1.0)?;
+            shared.files().open_files_externally.store(false, Ordering::Relaxed);
         }
         window
             .get_by_role(sui::SemanticsRole::Button)
