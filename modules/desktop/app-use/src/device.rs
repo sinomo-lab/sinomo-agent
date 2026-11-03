@@ -446,3 +446,6 @@ impl Drop for DesktopCapture {
         self.stop();
     }
 }
+
+#[cfg(target_os = "android")]
+pub(super) use platform::{frame_trace_enabled, trace_frame};

@@ -161,15 +161,41 @@ public final class AppUseAccessibilityService extends AccessibilityService {
                             if (!capture) throw new Failure("invalid", "capture is not open");
                             validate(request.getJSONObject("target"));
                             AppUseProjectionService.Frame frame;
+                            long after = request.getLong("after");
+                            long waitMs = Math.max(0, Math.min(100, request.optLong("wait_ms", 0)));
+                            long deadline = android.os.SystemClock.elapsedRealtime() + waitMs;
                             synchronized (AppUseProjectionService.LOCK) {
+                                validate(request.getJSONObject("target"));
                                 frame = AppUseProjectionService.latest;
-                                AppUseProjectionService.frameRequested = true;
+                                // Old clients retain their nonblocking prefetch behavior.
+                                // Waiting clients request a fresh frame only when needed.
+                                if (waitMs == 0 || frame == null || frame.sequence <= after)
+                                    AppUseProjectionService.frameRequested = true;
+                                while (waitMs > 0 && (frame == null || frame.sequence <= after)) {
+                                    long remaining = deadline - android.os.SystemClock.elapsedRealtime();
+                                    if (remaining <= 0) break;
+                                    AppUseProjectionService.LOCK.wait(remaining);
+                                    validate(request.getJSONObject("target"));
+                                    frame = AppUseProjectionService.latest;
+                                }
                             }
-                            if (frame == null || frame.sequence <= request.getLong("after")) { response.put("available", false); break; }
+                            if (frame == null || frame.sequence <= after) { response.put("available", false); break; }
                             response.put("available", true).put("format", "rgba8").put("width", frame.width).put("height", frame.height)
                                     .put("sequence", frame.sequence).put("timestamp_ns", frame.timestamp)
                                     .put("captured_at_unix_ms", frame.capturedAt).put("bytes", frame.bytes.length);
-                            respond(out, response); out.write(frame.bytes); out.flush(); continue;
+                            long writeStartedNs = android.os.SystemClock.elapsedRealtimeNanos();
+                            respond(out, response); out.write(frame.bytes); out.flush();
+                            if (android.util.Log.isLoggable("SinomoMediaStage", android.util.Log.VERBOSE)) {
+                                long completedNs = android.os.SystemClock.elapsedRealtimeNanos();
+                                android.util.Log.v("SinomoMediaStage", new JSONObject()
+                                    .put("sequence", frame.sequence).put("captured_at_unix_ms", frame.capturedAt)
+                                    .put("copy_us", frame.copyUs)
+                                    .put("java_queue_us", (writeStartedNs - frame.publishedAtNs) / 1000)
+                                    .put("socket_write_us", (completedNs - writeStartedNs) / 1000)
+                                    .put("completed_unix_ms", System.currentTimeMillis())
+                                    .put("bytes", frame.bytes.length).toString());
+                            }
+                            continue;
                         }
                         default: throw new Failure("unsupported", "unknown app-use operation");
                     }

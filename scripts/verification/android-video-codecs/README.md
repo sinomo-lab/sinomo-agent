@@ -171,3 +171,36 @@ The consumer's `network-ping` mode measures nonce-verified RPC round trips for
 0, 16 KiB and 64 KiB prepared responses, with five warmups and 30 measured calls
 per size. This separates basic transport/dispatch cost from capture and codecs;
 its percentiles must not be subtracted from frame-age percentiles.
+
+## Capture-stage attribution
+
+Enable an Observe capture with `sinomo.perf=trace` around a bounded streaming
+workload. `media.frame.encode` spans measure encoding; `media.frame.source`
+events carry the source sequence, acquisition timestamp, native handoff time,
+encoded-ready time and pull duration. The consumer's `wire_received_unix_us`
+marks complete record arrival before decoder scheduling. Join frames by source
+sequence and acquisition timestamp, and reject missing or ambiguous matches.
+
+For Android's internal handoff, save the existing value of
+`adb shell getprop log.tag.SinomoMediaStage`, then enable
+`adb shell setprop log.tag.SinomoMediaStage V`. The tag emits metadata-only JSON
+for Java row copying, Java mailbox age, local socket writes, native normalization,
+publication, native frame preparation/serialization and host callbacks. Collect
+with `adb logcat -d -v raw -s SinomoMediaStage:V '*:S'` and restore the previous
+property afterward. Logging is off by default. A native `call_next_us` measurement
+may include waiting before acquisition; socket writes and reads overlap. Do not
+add these stage percentiles as if they were disjoint durations.
+
+`network-ping` also records client send/receive wall clocks and the remote
+response timestamp. Use zero-payload samples before and after streaming to bound
+clock offset with a much shorter round trip than shell-based clock sampling.
+This still assumes no clock step between brackets.
+
+`analyze_capture_stages.py --frames FRAMES --traces SOURCE_TRACE --native-log LOG
+--clock-before PINGS --clock-after PINGS --output SUMMARY` joins those records and
+uses the standard verification percentile reducer. Its post-encode delivery
+interval includes queues, forwarding and receiver parsing, not just the link.
+Preserve raw process metadata: if an embedded app omits its trace node ID, record
+that limitation and independently verify its node/PID using daemon status. Do
+not rewrite missing identity fields or report the strict collector's rejection
+as a successful capture.

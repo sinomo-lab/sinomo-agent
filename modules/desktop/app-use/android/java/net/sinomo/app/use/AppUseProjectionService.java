@@ -42,11 +42,12 @@ public final class AppUseProjectionService extends Service {
     static final class Frame {
         final byte[] bytes;
         final int width, height;
-        final long sequence, timestamp, capturedAt;
-        Frame(byte[] bytes, int width, int height, long sequence, long timestamp, long capturedAt) {
+        final long sequence, timestamp, capturedAt, copyUs, publishedAtNs;
+        Frame(byte[] bytes, int width, int height, long sequence, long timestamp, long capturedAt, long copyUs) {
             this.bytes = bytes; this.width = width; this.height = height;
             this.sequence = sequence; this.timestamp = timestamp;
             this.capturedAt = capturedAt;
+            this.copyUs = copyUs; this.publishedAtNs = SystemClock.elapsedRealtimeNanos();
         }
     }
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -78,7 +79,7 @@ public final class AppUseProjectionService extends Service {
                             android.util.Log.i("SinomoAppUse", "Shared content geometry changed from " + width + "x" + height + " to " + w + "x" + h);
                             // Rotation/app-only selection invalidates coordinates. Do
                             // not keep input alive against a stale raw display grant.
-                            target = null; latest = null; stopSelf();
+                            target = null; latest = null; LOCK.notifyAll(); stopSelf();
                         }
                     }
                 }
@@ -131,8 +132,11 @@ public final class AppUseProjectionService extends Service {
                 }
             }
             synchronized (LOCK) {
-                if (!closing && clients > 0 && target != null && width == w && height == h)
-                    latest = new Frame(bytes, w, h, ++sequence, captureTimestamp, capturedAt);
+                if (!closing && clients > 0 && target != null && width == w && height == h) {
+                    latest = new Frame(bytes, w, h, ++sequence, captureTimestamp, capturedAt,
+                            (SystemClock.elapsedRealtimeNanos() - started - captureTimestamp) / 1000);
+                    LOCK.notifyAll();
+                }
             }
         } catch (RuntimeException error) {
             android.util.Log.e("SinomoAppUse", "Native frame delivery failed", error);
@@ -155,7 +159,7 @@ public final class AppUseProjectionService extends Service {
         }
     }
     @Override public void onDestroy() {
-        synchronized (LOCK) { closing = true; if (current == this) { current = null; target = null; latest = null; clients = 0; inputClients = 0; } }
+        synchronized (LOCK) { closing = true; if (current == this) { current = null; target = null; latest = null; clients = 0; inputClients = 0; LOCK.notifyAll(); } }
         if (reader != null) reader.setOnImageAvailableListener(null, null);
         if (display != null) display.release();
         if (reader != null) reader.close();

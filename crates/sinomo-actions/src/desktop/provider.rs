@@ -499,3 +499,45 @@ mod tests {
         assert!(!idle.output_payload_status(&payload("capture", 5)));
     }
 }
+
+#[cfg(test)]
+#[test]
+#[ignore = "manual native capture callback latency control; no device or model"]
+fn measure_native_frame_callback_latency() {
+    use std::time::Instant;
+    let pixels = vec![127_u8; 1080 * 2280 * 4];
+    let delivery = DesktopFrameDelivery {
+        capture_id: "latency-control".into(),
+        frame: DesktopRawFrame {
+            sequence: 1,
+            width: 1080,
+            height: 2280,
+            stride: 1080 * 4,
+            timestamp_ns: 1,
+            duration_ns: 100_000_000,
+            captured_at_unix_ms: 1,
+            pixels: pixels.clone(),
+        },
+    };
+    let bytes = sinomo_runtime::module_api::encode_sobj(&delivery).unwrap();
+    for iteration in 0..25 {
+        let callbacks = InvocationCallbacks {
+            permission: "unused-control".into(),
+            capture: Some((delivery.capture_id.clone(), 0)),
+            frame: Mutex::new(None),
+        };
+        let started = Instant::now();
+        assert!(callbacks.output_payload_status(std::hint::black_box(&bytes)));
+        let elapsed_us = started.elapsed().as_micros();
+        let sample = callbacks.frame.lock().unwrap().take().unwrap();
+        assert_eq!(sample.width, 1080);
+        assert_eq!(sample.height, 2280);
+        assert_eq!(sample.data.as_ref(), pixels.as_slice());
+        println!(
+            "NATIVE_CALLBACK_SAMPLE {}",
+            serde_json::json!({
+            "iteration":iteration,"warmup":iteration<5,"elapsed_us":elapsed_us,
+            "encoded_bytes":bytes.len(),"verified":true})
+        );
+    }
+}

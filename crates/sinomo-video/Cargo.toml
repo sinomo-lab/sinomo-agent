@@ -16,6 +16,7 @@ default = []
 native-devices = ["sinomo-runtime/native-devices"]
 
 [dependencies]
+tracing.workspace = true
 openh264.workspace = true
 h264-reader.workspace = true
 sinomo-lm.workspace = true

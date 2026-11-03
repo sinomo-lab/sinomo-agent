@@ -187,8 +187,10 @@ pub fn capture(
     let deadline = started + Duration::from_millis(config.lease_ms.min(300_000));
     let mut after = 0;
     while Instant::now() < deadline {
+        let next_capture = Instant::now() + cadence;
         authorize(&permissions, &config.target, "capture")?;
-        let value = bridge.call(json!({"op":"frame", "target":config.target, "after":after}))?;
+        let value = bridge.call(json!({"op":"frame", "target":config.target, "after":after,
+            "wait_ms":cadence.as_millis().clamp(1, 100)}))?;
         if value["available"].as_bool() == Some(true) {
             if value["format"].as_str() != Some("rgba8") {
                 return Err(platform("unsupported Android frame format"));
@@ -209,14 +211,19 @@ pub fn capture(
             if sequence <= after {
                 return Err(platform("non-monotonic Android frame"));
             }
+            let read_started = Instant::now();
             let mut bytes = vec![0; len as usize];
             bridge.0.read_exact(&mut bytes).map_err(platform)?;
+            let read_us = read_started.elapsed().as_micros();
+            let normalize_started = Instant::now();
             // Keep the shared native-media contract BGRA; swizzle after the
             // bounded row copy rather than per-byte JNI/Java pixel operations.
             for pixel in bytes.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
                 pixel[3] = 255;
             }
+            let normalize_us = normalize_started.elapsed().as_micros();
+            let publish_started = Instant::now();
             authorize(&permissions, &config.target, "capture")?;
             after = sequence;
             mailbox.publish(NativeVideoSample {
@@ -236,11 +243,49 @@ pub fn capture(
                     stride: width * 4,
                 }]),
             });
+            if frame_trace_enabled() {
+                trace_frame(json!({"kind":"capture", "sequence":sequence,
+                    "captured_at_unix_ms":number("captured_at_unix_ms")?,
+                    "read_us":read_us, "normalize_us":normalize_us,
+                    "publish_us":publish_started.elapsed().as_micros()}));
+            }
         }
-        match stop.recv_timeout(cadence.min(Duration::from_millis(100))) {
+        // Capture/transfer work consumes this interval; do not add a second
+        // full-frame sleep after receiving a frame. The OS bridge wakes us when
+        // the requested image becomes available, or within 100 ms on timeout.
+        match stop.recv_timeout(
+            next_capture
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        ) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
     Ok(())
+}
+
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_write(
+        priority: libc::c_int,
+        tag: *const libc::c_char,
+        message: *const libc::c_char,
+    ) -> libc::c_int;
+}
+
+/// Local, opt-in native diagnostics using the same Android log tag as capture.
+pub(crate) fn frame_trace_enabled() -> bool {
+    let mut value = [0 as libc::c_char; 92]; // Android PROP_VALUE_MAX.
+    unsafe {
+        libc::__system_property_get(c"log.tag.SinomoMediaStage".as_ptr(), value.as_mut_ptr());
+    }
+    matches!(value[0] as u8, b'V' | b'v')
+}
+pub(crate) fn trace_frame(value: serde_json::Value) {
+    if let Ok(message) = std::ffi::CString::new(value.to_string()) {
+        unsafe {
+            __android_log_write(2, c"SinomoMediaStage".as_ptr(), message.as_ptr());
+        }
+    }
 }

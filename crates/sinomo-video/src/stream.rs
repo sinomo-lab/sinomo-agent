@@ -19,6 +19,13 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
+fn unix_micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+}
+
 pub const VIDEO_STREAM_VERSION: u32 = 1;
 pub const H264_STREAM_VERSION: u32 = 2;
 use crate::codec::VideoTransport;
@@ -243,13 +250,23 @@ pub fn desktop_capture_body_with_transport(
                     std::thread::sleep(wait.min(Duration::from_millis(100)));
                     continue;
                 }
+                let pull_started = Instant::now();
                 let Some(sample) = capture
                     .next(sequence, Duration::from_millis(100))
                     .map_err(|e| e.to_string())?
                 else {
                     continue;
                 };
+                let pull_us = pull_started.elapsed().as_micros() as u64;
+                let trace_frame =
+                    tracing::enabled!(target: "sinomo.perf", tracing::Level::TRACE);
+                let native_ready_us = if trace_frame { unix_micros() } else { 0 };
                 sequence = sample.sequence;
+                let encode_span = tracing::trace_span!(target: "sinomo.perf", "media.frame.encode",
+                    stage = "media.frame.encode", sequence = sample.sequence,
+                    captured_at_unix_ms = sample.captured_at_unix_ms as u64,
+                    outcome = tracing::field::Empty);
+                let encode_guard = encode_span.enter();
                 let frame_started = Instant::now();
                 let (mut metadata, bytes) = if transport == VideoTransport::H264 {
                     let frame = realtime_frame(&sample)?;
@@ -299,6 +316,10 @@ pub fn desktop_capture_body_with_transport(
                     let (metadata, encoded) = encode_sample(&sample, &encoding)?;
                     (metadata, encoded.image)
                 };
+                let encode_us = frame_started.elapsed().as_micros() as u64;
+                encode_span.record("outcome", "ok");
+                drop(encode_guard);
+                drop(encode_span);
                 capture.check_active().map_err(|error| error.to_string())?;
                 if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
                     break;
@@ -307,8 +328,16 @@ pub fn desktop_capture_body_with_transport(
                 metadata.identity = capture.identity();
                 metadata.tiles = capture.tiles();
                 next_encode = frame_started + encode_interval;
+                let encoded_ready_us = if trace_frame { unix_micros() } else { 0 };
                 match sender.try_send(record(&metadata, &bytes)?) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        tracing::trace!(target: "sinomo.perf", stage = "media.frame.source", sequence = sample.sequence,
+                            captured_at_unix_ms = sample.captured_at_unix_ms as u64,
+                            native_ready_unix_us = native_ready_us as u64,
+                            encoded_ready_unix_us = encoded_ready_us as u64,
+                            pull_us, encode_us, payload_bytes = bytes.len(),
+                            transport = ?transport, "source frame stages");
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         return Err("video producer lost reserved queue capacity".into());
                     }
@@ -469,6 +498,8 @@ pub struct VideoStreamReader {
     next_packet: u64,
     pub last_wire_bytes: usize,
     pub last_decode_us: u128,
+    /// Complete wire record arrival, before decoder scheduling or pixel conversion.
+    pub last_received_unix_us: u128,
 }
 impl VideoStreamReader {
     pub async fn read<R: AsyncRead + Unpin>(
@@ -491,6 +522,7 @@ impl VideoStreamReader {
         let Some((metadata, frame)) = read_packet(reader).await? else {
             return Ok(None);
         };
+        self.last_received_unix_us = unix_micros();
         let mut state = std::mem::take(self);
         let (state, result) = tokio::task::spawn_blocking(move || {
             let result = state.decode_packet(metadata, frame);
