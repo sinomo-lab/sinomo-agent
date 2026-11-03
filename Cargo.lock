@@ -9858,6 +9858,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "similar",
  "sinomo-agent",
  "sinomo-audio",
  "sinomo-cli",

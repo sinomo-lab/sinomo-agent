@@ -240,6 +240,7 @@ getrandom = "0.4.3"
 local-ip-address = "0.6.13"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 percent-encoding = "2.3.2"
+similar = "2.7.0"
 rfd = "0.17.2"
 serde_json = "1.0.150"
 signal-hook = { version = "0.3.18", default-features = false }

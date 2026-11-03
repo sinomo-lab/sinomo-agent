@@ -20,6 +20,7 @@
 //! under strict limits, and keep decoded pixels plus renderer registrations bounded. Sorting and
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
+mod diff;
 mod formats;
 mod paged;
 mod source_editor;
@@ -1194,7 +1195,14 @@ struct FilesHistoryActionOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesHistoryPreview {
     identity: DfsFileVersionIdentity,
-    result: Option<Result<FilesPreview, String>>,
+    compare: bool,
+    result: Option<Result<HistoryContent, String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryContent {
+    Preview(FilesPreview),
+    Comparison(diff::Review),
 }
 
 #[derive(Clone, Debug)]
@@ -5344,12 +5352,13 @@ impl FilesState {
     fn toggle_history_preview(
         &mut self,
         identity: DfsFileVersionIdentity,
+        compare: bool,
         waker: Option<sui::UiHandle>,
     ) {
         if self
             .history_preview
             .as_ref()
-            .is_some_and(|preview| preview.identity == identity)
+            .is_some_and(|preview| preview.identity == identity && preview.compare == compare)
         {
             self.history_preview = None;
             self.pending_history_preview_request_id = None;
@@ -5364,17 +5373,29 @@ impl FilesState {
             return;
         };
         let name = history_entry_file_name(entry);
+        let command = if compare {
+            HistoryRead::Compare {
+                path: entry.current_path.clone(),
+                hash: entry.content_hash.clone(),
+                size: entry.size_bytes,
+                saved_path: entry.captured.object.path.clone(),
+            }
+        } else {
+            HistoryRead::Preview { name }
+        };
         if let Some(waker) = waker {
             self.ensure_worker(waker);
         }
         self.history_preview = Some(FilesHistoryPreview {
             identity: identity.clone(),
+            compare,
             result: None,
         });
         self.history_revision = self.history_revision.wrapping_add(1);
         let Some(tx) = self.worker_tx.clone() else {
             self.history_preview = Some(FilesHistoryPreview {
                 identity,
+                compare,
                 result: Some(Err(
                     "The Files background worker is not available.".to_string()
                 )),
@@ -5388,13 +5409,14 @@ impl FilesState {
             .send(FilesWorkerCommand::HistoryPreview {
                 request_id,
                 identity: identity.clone(),
-                name,
+                read: command,
             })
             .is_err()
         {
             self.pending_history_preview_request_id = None;
             self.history_preview = Some(FilesHistoryPreview {
                 identity,
+                compare,
                 result: Some(Err(
                     "The Files background worker stopped before reading this version.".to_string(),
                 )),
@@ -7389,12 +7411,24 @@ enum FilesWorkerResult {
     HistoryPreview {
         request_id: u64,
         identity: DfsFileVersionIdentity,
-        result: Result<FilesPreview, String>,
+        result: Result<HistoryContent, String>,
     },
     StorageOverview {
         request_id: u64,
         sessions: Vec<crate::external_edit::Summary>,
         result: Result<FilesStorageOverview, String>,
+    },
+}
+
+enum HistoryRead {
+    Preview {
+        name: String,
+    },
+    Compare {
+        path: String,
+        hash: String,
+        size: u64,
+        saved_path: String,
     },
 }
 
@@ -7505,7 +7539,7 @@ enum FilesWorkerCommand {
     HistoryPreview {
         request_id: u64,
         identity: DfsFileVersionIdentity,
-        name: String,
+        read: HistoryRead,
     },
     StorageOverview {
         request_id: u64,
@@ -8207,25 +8241,54 @@ fn files_worker_loop(
             FilesWorkerCommand::HistoryPreview {
                 request_id,
                 identity,
-                name,
+                read,
             } => {
-                ensure_files_worker_operator(
-                    &mut operator,
-                    &mut operator_open_error,
-                    daemon_address.as_deref(),
-                    &app_runtime,
-                );
-                let result = match (&operator, &operator_open_error) {
-                    (Some(operator), _) => operator
-                        .read_file_history(&DfsFileHistoryReadRequest {
-                            identity: identity.clone(),
-                            offset: 0,
-                            max_bytes: FILE_PREVIEW_MAX_BYTES as u32,
-                        })
-                        .map_err(|error| history_error_message(&error))
-                        .and_then(|outcome| history_preview_from_outcome(&name, outcome)),
-                    (None, Some(error)) => Err(error.clone()),
-                    (None, None) => Err("DFS history service did not start".to_string()),
+                let result = match read {
+                    HistoryRead::Compare {
+                        path,
+                        hash,
+                        size,
+                        saved_path,
+                    } => {
+                        ensure_files_worker_browser(
+                            &mut browser,
+                            &mut open_error,
+                            daemon_address.as_deref(),
+                            &app_runtime,
+                        );
+                        browser
+                            .as_ref()
+                            .ok_or_else(|| {
+                                open_error
+                                    .clone()
+                                    .unwrap_or_else(|| "SIFS browser unavailable".into())
+                            })
+                            .and_then(|browser| {
+                                diff::compare(browser, &identity, &saved_path, &hash, size, &path)
+                            })
+                            .map(HistoryContent::Comparison)
+                    }
+                    HistoryRead::Preview { name } => {
+                        ensure_files_worker_operator(
+                            &mut operator,
+                            &mut operator_open_error,
+                            daemon_address.as_deref(),
+                            &app_runtime,
+                        );
+                        match (&operator, &operator_open_error) {
+                            (Some(operator), _) => operator
+                                .read_file_history(&DfsFileHistoryReadRequest {
+                                    identity: identity.clone(),
+                                    offset: 0,
+                                    max_bytes: FILE_PREVIEW_MAX_BYTES as u32,
+                                })
+                                .map_err(|error| history_error_message(&error))
+                                .and_then(|outcome| history_preview_from_outcome(&name, outcome)),
+                            (None, Some(error)) => Err(error.clone()),
+                            (None, None) => Err("DFS history service did not start".to_string()),
+                        }
+                        .map(HistoryContent::Preview)
+                    }
                 };
                 let _ = result_tx.send(FilesWorkerResult::HistoryPreview {
                     request_id,
@@ -22192,6 +22255,9 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             if document.format.paged() && document.preview_open {
                 return paged::view(document, &s, &r, &active);
             }
+            if document.format == DocumentFormat::Diff && document.preview_open {
+                return WidgetPod::new(diff::patch(&document.text).view(&r));
+            }
             if document.preview_open {
                 if let Some(preview) = formats::preview_widget(document.format, &document.text, &r)
                 {
@@ -22447,26 +22513,23 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         .files_structure
         .select_named("document state", |key| key.dialog.clone());
     if in_tab {
-        let header = TrailingSlotRow::new(
-            Flex::horizontal()
-                .align_items(Alignment::Center)
-                .gap(10.)
-                .with_item(
-                    Label::new(title)
-                        .single_line(true)
-                        .theme_when(clone_reader(reader)),
-                    FlexItem::fill(),
-                )
-                .with_child(tools),
-            actions,
-        )
-        .trailing_width(200.0)
-        .trailing_height(36.0)
-        .gap(8.0);
+        let header = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .align_items(Alignment::Center)
+            .gap(8.)
+            .with_item(
+                Label::new(title)
+                    .single_line(true)
+                    .theme_when(clone_reader(reader)),
+                FlexItem::flex(1.).basis(112.).min_width(96.),
+            )
+            .with_child(tools)
+            .with_child(actions);
         return Some(WidgetPod::new(source_editor::SearchHost::new(
             RefreshOn::new(
                 document_state,
-                Surface::panel(Dock::new(body).top(52.0, WidgetPadding::all(8.0, header)))
+                Surface::panel(Flex::vertical().align_items(Alignment::Stretch)
+                    .with_child(WidgetPadding::all(8., header)).with_item(body, FlexItem::fill()))
                     .theme_when(clone_reader(reader))
                     .fill(),
             ),
@@ -23937,7 +24000,12 @@ fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) ->
         None => (
             "Reading version",
             SemanticTone::Accent,
-            "Reading a bounded prefix of this saved version.".to_string(),
+            if preview.compare {
+                "Comparing versions…"
+            } else {
+                "Reading the saved version…"
+            }
+            .to_string(),
             None,
         ),
         Some(Err(error)) => (
@@ -23946,7 +24014,12 @@ fn history_preview_panel(reader: &ThemeReader, preview: &FilesHistoryPreview) ->
             error.clone(),
             None,
         ),
-        Some(Ok(preview)) => (
+        Some(Ok(HistoryContent::Comparison(review))) => {
+            return Surface::panel(SizedBox::new().height(340.).child(review.view(reader)))
+                .theme_when(clone_reader(reader))
+                .fill_width(true);
+        }
+        Some(Ok(HistoryContent::Preview(preview))) => (
             if preview.binary {
                 "Binary content"
             } else {
@@ -24064,6 +24137,32 @@ fn history_entry_card(
         .wrap(FlexWrap::Wrap)
         .gap(6.0)
         .align_items(Alignment::Center);
+    if !entry.deleted && !entry.is_current {
+        let action = shared.clone();
+        let selected = identity.clone();
+        let label = if previewing && preview.is_some_and(|p| p.compare) {
+            "Hide comparison"
+        } else {
+            "Compare with current"
+        };
+        actions = actions.with_child(
+            history_card_button(
+                reader,
+                label,
+                IconGlyph::History,
+                ButtonAppearance::Outline,
+                SemanticTone::Neutral,
+                !loading,
+            )
+            .on_press_with_ctx(move |ctx| {
+                let waker = action.borrow().waker.clone();
+                action
+                    .files_mut()
+                    .toggle_history_preview(selected.clone(), true, waker);
+                request_files_overlay_rebuild(ctx);
+            }),
+        );
+    }
     if !folder_mode && !entry.is_current && !entry.deleted {
         let action = shared.clone();
         let selected = identity.clone();
@@ -24108,7 +24207,7 @@ fn history_entry_card(
         actions = actions.with_child(
             history_card_button(
                 reader,
-                if previewing {
+                if previewing && preview.is_some_and(|p| !p.compare) {
                     "Hide preview"
                 } else {
                     "Preview"
@@ -24122,7 +24221,7 @@ fn history_entry_card(
                 let waker = { action.borrow().waker.clone() };
                 action
                     .files_mut()
-                    .toggle_history_preview(selected.clone(), waker);
+                    .toggle_history_preview(selected.clone(), false, waker);
                 request_files_overlay_rebuild(ctx);
             }),
         );
@@ -25943,6 +26042,39 @@ mod tests {
         window.advance_time(1.0)?;
         app.run_until_idle()?;
 
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Compare with current")
+            .click()?;
+        let FilesWorkerCommand::HistoryPreview {
+            request_id,
+            identity,
+            read: HistoryRead::Compare { .. },
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected a history comparison request");
+        };
+        assert!(
+            shared
+                .files_mut()
+                .apply_worker_result(FilesWorkerResult::HistoryPreview {
+                    request_id,
+                    identity,
+                    result: Ok(HistoryContent::Comparison(diff::patch(
+                        "--- saved\n+++ current\n@@ -1 +1 @@\n-old\n+new\n"
+                    ))),
+                })
+        );
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Unified diff")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide comparison")
+            .click()?;
         for name in [
             "Save version",
             "Restore",
@@ -26580,6 +26712,27 @@ mod tests {
         assert!(!saved.is_current && !saved.deleted);
         assert_eq!(saved.pins, vec!["before edit".to_string()]);
 
+        // Exercise exact saved/current reads, including content that has no text diff.
+        let compare = || {
+            diff::compare(
+                &browser,
+                &saved.identity,
+                &path,
+                &saved.content_hash,
+                saved.size_bytes,
+                &saved.current_path,
+            )
+            .unwrap()
+        };
+        let comparison = format!("{:?}", compare());
+        assert!(comparison.contains("-first draft") && comparison.contains("+second draft"));
+        browser.write_file(&path, b"").unwrap();
+        let empty = format!("{:?}", compare());
+        assert!(empty.contains("(empty)") && empty.contains("-first draft"));
+        browser.write_file(&path, b"binary\0").unwrap();
+        let binary = format!("{:?}", compare());
+        assert!(binary.contains("Binary content differs") && binary.contains(&saved.content_hash));
+        browser.write_file(&path, b"second draft\n").unwrap();
         let preview = operator
             .read_file_history(&DfsFileHistoryReadRequest {
                 identity: first.clone(),
@@ -26919,7 +27072,8 @@ mod tests {
             let current = files.history_entries[0].clone();
             files.history_preview = Some(FilesHistoryPreview {
                 identity: current.identity.clone(),
-                result: Some(Ok(preview_from_read_with_line_limit(
+                compare: false,
+                result: Some(Ok(HistoryContent::Preview(preview_from_read_with_line_limit(
                     "report.txt",
                     SifsFileRead {
                         bytes: b"Quarterly report\n\nRevenue grew 12%.\nNext steps: ship it.\n"
@@ -26927,7 +27081,7 @@ mod tests {
                         truncated: false,
                     },
                     HISTORY_PREVIEW_MAX_LINES,
-                ))),
+                )))),
             });
             files.history_notice =
                 Some("Saved the current version as \u{201c}current-draft\u{201d}.".into());

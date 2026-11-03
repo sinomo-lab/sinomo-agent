@@ -27,6 +27,7 @@ pub(super) enum DocumentFormat {
     Text,
     Log,
     JsonLines,
+    Diff,
     Markdown,
     Json,
     Csv,
@@ -39,6 +40,7 @@ impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Text => "Text",
+            Self::Diff => "Unified diff",
             Self::Log => "Log",
             Self::JsonLines => "JSON Lines",
             Self::Markdown => "Markdown",
@@ -96,6 +98,7 @@ pub(super) fn text_format(path: &str) -> DocumentFormat {
         .to_ascii_lowercase();
     match extension.as_str() {
         "md" | "markdown" | "mdown" => DocumentFormat::Markdown,
+        "diff" | "patch" => DocumentFormat::Diff,
         "json" | "ipynb" => DocumentFormat::Json,
         "csv" => DocumentFormat::Csv,
         "tsv" | "tab" => DocumentFormat::Tsv,
@@ -321,6 +324,7 @@ pub(super) fn preview_widget(
         | DocumentFormat::Hex
         | DocumentFormat::Log
         | DocumentFormat::JsonLines => return None,
+        DocumentFormat::Diff => WidgetPod::new(super::diff::patch(text).view(reader)),
         DocumentFormat::Image => match document_bytes(format, text) {
             Ok(bytes) => WidgetPod::new(DocumentImage::new(bytes, reader)),
             Err(error) => note(error, reader),
