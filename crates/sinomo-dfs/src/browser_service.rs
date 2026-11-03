@@ -1948,7 +1948,7 @@ impl DfsBrowserBackend {
             // mutex for one bounded metadata page keeps large subtree previews
             // from starving unrelated reads and writes.
             let page = {
-                let service = self.lock_service_for_read()?;
+                let mut service = self.lock_service_for_read()?;
                 service
                     .placement_impact_page_for_config_with_snapshot_and_unavailable_nodes(
                         config,

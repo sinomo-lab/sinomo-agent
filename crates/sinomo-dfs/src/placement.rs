@@ -1947,7 +1947,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// form when the caller also needs structured diagnostics explaining an
     /// incomplete total.
     pub fn placement_impact_for_config(
-        &self,
+        &mut self,
         config: &DfsFileSystemConfig,
         path: &str,
         scope: DfsPlacementScope,
@@ -1965,7 +1965,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Whole-scan convenience API for callers that already have a stable
     /// candidate/reachability snapshot.
     pub fn placement_impact_for_config_with_unavailable_nodes(
-        &self,
+        &mut self,
         config: &DfsFileSystemConfig,
         path: &str,
         scope: DfsPlacementScope,
@@ -1984,7 +1984,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn placement_impact_scan_for_config(
-        &self,
+        &mut self,
         config: &DfsFileSystemConfig,
         path: &str,
         scope: DfsPlacementScope,
@@ -2025,7 +2025,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// service between calls, and resume from `next_cursor`.
     #[allow(clippy::too_many_arguments)]
     pub fn placement_impact_page_for_config(
-        &self,
+        &mut self,
         config: &DfsFileSystemConfig,
         path: &str,
         scope: DfsPlacementScope,
@@ -2047,7 +2047,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Reachability-aware one-page impact scan.
     #[allow(clippy::too_many_arguments)]
     pub fn placement_impact_page_for_config_with_unavailable_nodes(
-        &self,
+        &mut self,
         config: &DfsFileSystemConfig,
         path: &str,
         scope: DfsPlacementScope,
@@ -2073,7 +2073,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// decisions share one digest; diagnostics alone never grant authorization.
     #[allow(clippy::too_many_arguments)]
     pub fn placement_impact_page_for_config_with_snapshot_and_unavailable_nodes(
-        &self,
+        &mut self,
         config: &DfsFileSystemConfig,
         path: &str,
         scope: DfsPlacementScope,
@@ -2088,11 +2088,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })?;
         let mut impact = DfsPlacementImpact::default();
         let mut blocking_diagnostics = Vec::new();
-        let page = self.placement_object_page_for_file_system(
-            &config.file_system_id,
-            cursor,
-            max_objects,
-        )?;
+        let page =
+            self.placement_scope_page(&config.file_system_id, &path, scope, cursor, max_objects)?;
         let mut next_cursor = page.next_cursor;
         let mut metadata_snapshot_xor = [0_u8; 32];
         let mut metadata_snapshot_has_objects = false;
@@ -3731,7 +3728,41 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         job: &DfsPlacementReconciliationJob,
         max_objects: usize,
     ) -> Result<DfsObjectPage, DfsError> {
-        let mut pager = PlacementShardPager::new(shards, job, max_objects)?;
+        let pager = PlacementShardPager::new(shards, job, max_objects)?;
+        self.drain_placement_shard_pager(pager)
+    }
+
+    /// One page of the objects `scope` selects at `path`, read from every
+    /// shard at its primary when shards are configured; otherwise from this
+    /// service's own metadata.
+    fn placement_scope_page(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+        scope: DfsPlacementScope,
+        cursor: Option<&DfsObjectPageCursor>,
+        max_objects: usize,
+    ) -> Result<DfsObjectPage, DfsError> {
+        if let Some(shards) = self.metadata_shard_config_snapshot(file_system_id)?
+            && !shards.is_empty()
+        {
+            let pager = PlacementShardPager::for_scope(
+                shards,
+                file_system_id,
+                path,
+                scope,
+                cursor,
+                max_objects,
+            )?;
+            return self.drain_placement_shard_pager(pager);
+        }
+        self.placement_object_page_for_file_system(file_system_id, cursor, max_objects)
+    }
+
+    fn drain_placement_shard_pager(
+        &mut self,
+        mut pager: PlacementShardPager,
+    ) -> Result<DfsObjectPage, DfsError> {
         while let Some((shard, path, after, limit)) = pager.next_request() {
             let (objects, next) =
                 self.subtree_object_page_from_authority(&shard, &path, after.as_ref(), limit)?;
@@ -3740,8 +3771,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(pager.finish())
     }
 
-    /// One page of `shard`'s objects under `path`. This node's own shards are
-    /// read from its backend; every other shard is asked at its primary.
+    /// One page of `shard`'s objects under `path`. A shard this service leads
+    /// and holds in its backend is read there; any other is asked at its
+    /// primary.
     fn subtree_object_page_from_authority(
         &mut self,
         shard: &crate::DfsMetadataShardConfig,
@@ -3754,7 +3786,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             after: after.cloned(),
             limit,
         };
-        let result = if shard.primary_node_id == self.node_id {
+        let backend_holds_led_shard = shard.primary_node_id == self.node_id
+            && self.metadata_backend.as_ref().is_some_and(|backend| {
+                backend
+                    .resident_exact_shard_id()
+                    .is_none_or(|shard_id| shard_id.0 == shard.shard_id)
+            });
+        let result = if backend_holds_led_shard {
             self.query_own_shard_metadata(shard, selection)?
         } else {
             self.query_metadata_authority_impl(shard, selection)?
@@ -4900,6 +4938,26 @@ impl PlacementShardPager {
             shards = owner.into_iter().collect();
             (0, None)
         } else {
+            // A subtree spans the shard owning its root and every shard whose
+            // prefix lies under that root; hash-range shards may hold any name.
+            let owner = crate::control_plane::select_metadata_shard_config_for_path(
+                file_system_id,
+                &shards,
+                path,
+            )?
+            .map(|owner| owner.shard_id);
+            shards.retain(|shard| {
+                owner.as_ref() == Some(&shard.shard_id)
+                    || match &shard.assignment {
+                        crate::DfsMetadataShardAssignment::Root => false,
+                        crate::DfsMetadataShardAssignment::PathPrefix { prefix } => {
+                            normalize_posix_path(prefix).is_ok_and(|prefix| {
+                                crate::posix_path::posix_path_is_at_or_under_prefix(&prefix, path)
+                            })
+                        }
+                        crate::DfsMetadataShardAssignment::NameHashRange { .. } => true,
+                    }
+            });
             shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
             let resume = cursor.and_then(|cursor| {
                 cursor
@@ -7321,7 +7379,7 @@ mod tests {
             policy: directory.policy.clone(),
             current_locations: directory.current_locations.clone(),
         };
-        let preview = |snapshot: &crate::DfsPlacementSnapshot| {
+        let mut preview = |snapshot: &crate::DfsPlacementSnapshot| {
             let mut preview = preview_placement_with_snapshot_and_unavailable_nodes(
                 &config,
                 &directory.path,
@@ -8222,28 +8280,9 @@ mod tests {
                 31,
             )
             .expect("bounded page");
-        let raw_first = service
-            .placement_object_page_for_file_system(&config.file_system_id, None, 31)
-            .unwrap();
-        assert_eq!(
-            raw_first.objects.len(),
-            31,
-            "unchanged metadata page budget"
-        );
-        let outside = raw_first
-            .objects
-            .iter()
-            .filter(|object| {
-                object.path != "/services/paged" && !object.path.starts_with("/services/paged/")
-            })
-            .map(|object| object.path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outside,
-            vec!["/services"],
-            "actual bootstrap parent is outside the proposed subtree"
-        );
-        assert_eq!(first_page.impact.affected_object_count, 30);
+        // The preview pages only the proposed subtree at its shard primary,
+        // so the whole page budget goes to objects inside it.
+        assert_eq!(first_page.impact.affected_object_count, 31);
         assert!(first_page.next_cursor.is_some());
         assert!(first_page.blocking_diagnostics.is_empty());
         let mut paged_count = first_page.impact.affected_object_count;

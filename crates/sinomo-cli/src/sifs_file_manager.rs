@@ -1219,7 +1219,7 @@ impl SifsFileManagerBackend {
             // its mutex for one bounded metadata page, then release it before
             // resuming from the returned cursor.
             let page = {
-                let service = self.lock_service()?;
+                let mut service = self.lock_service()?;
                 service
                     .placement_impact_page_for_config_with_unavailable_nodes(
                         config,
