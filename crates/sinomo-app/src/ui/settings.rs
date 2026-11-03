@@ -8961,13 +8961,19 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         ("motion", "Motion and environment sensors"),
     ] {
         let s = shared.clone();
-        let checked = snapshot.shared_devices.iter().any(|value| value == kind);
+        let checked = settings_projection(shared, "settings device exposure", move |snapshot| {
+            snapshot
+                .remote_management
+                .snapshot
+                .shared_devices
+                .iter()
+                .any(|value| value == kind)
+        });
         devices = devices.row(
             SettingRow::new(label)
-                .control(
+                .control(synced_switch(
                     Switch::new("")
                         .semantic_name(format!("Share {label}"))
-                        .checked(checked)
                         .theme_when(clone_reader(reader))
                         .on_change(move |enabled| {
                             queue_settings_operation(
@@ -8979,7 +8985,8 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                                 },
                             );
                         }),
-                )
+                    checked,
+                ))
                 .build(shared),
         );
     }
