@@ -1362,10 +1362,7 @@ pub(crate) fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
     if journal.exists() {
         for entry in read_dir(&journal)? {
             let source = entry.path();
-            if matches!(
-                source.file_name().and_then(|name| name.to_str()),
-                Some("write.lock" | "membership-handoff-write-freeze.sobj")
-            ) {
+            if journal_entry_survives_state_reset(&source) {
                 continue;
             }
             if !archived {
@@ -1380,6 +1377,47 @@ pub(crate) fn archive_metadata_backend_state(root: &Path) -> Result<bool> {
         sync_dir(root)?;
     }
     Ok(archived)
+}
+
+/// Delete a shard copy's metadata state in place: records, journal,
+/// acknowledgement floors and earlier archives. The shard root, its writer lock
+/// and its membership-handoff freeze marker remain.
+pub(crate) fn discard_metadata_backend_state(root: &Path) -> Result<()> {
+    let remove = |path: &Path| -> Result<()> {
+        let removed = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        match removed {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(MetadataBackendError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    };
+    remove(&root.join("records"))?;
+    remove(&root.join("coordination"))?;
+    remove(&root.join("replica-repair-archives"))?;
+    let journal = root.join("journal");
+    if journal.exists() {
+        for entry in read_dir(&journal)? {
+            let path = entry.path();
+            if !journal_entry_survives_state_reset(&path) {
+                remove(&path)?;
+            }
+        }
+    }
+    sync_dir(root)
+}
+
+fn journal_entry_survives_state_reset(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("write.lock" | "membership-handoff-write-freeze.sobj")
+    )
 }
 
 fn move_metadata_archive_path(source: &Path, destination: &Path) -> Result<()> {

@@ -172,8 +172,11 @@ Shard rules:
 - Journal batches are bounded by entry count and encoded size.
 - A replica applies the primary's sequence exactly; it does not append local
   entries into that sequence.
-- Only the primary and configured replicas hold a shard's metadata. Journal
-  batches, snapshot installs and routed-response batches feed replicas only.
+- Only the primary and configured replicas hold a shard's metadata, plus a
+  replica a pending membership handoff is adding. Journal batches, snapshot
+  installs and routed-response batches feed only those nodes. A node outside
+  a shard's placement deletes its copy when it opens metadata for that
+  placement; if it is added back, it receives the shard from the primary.
 - A sequence fork triggers authoritative snapshot recovery rather than merge.
 - Scans and hydration are cursor-based, so restart and listing do not require
   one unbounded allocation.

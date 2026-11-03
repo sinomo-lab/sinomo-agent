@@ -9,7 +9,7 @@ use crate::{
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataShardMembershipHandoff,
 };
 use sinomo_core::node::NodeId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type DfsMetadataShardsByFileSystem =
     BTreeMap<String, Result<Vec<DfsMetadataShardConfig>, String>>;
@@ -170,6 +170,30 @@ pub fn metadata_shards_from_authority_projection(
         .collect::<Result<Vec<_>, _>>()?;
     shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
     Ok(shards)
+}
+
+/// Configured shards of `file_system_id` whose copy `local_node_id` does not
+/// hold (see [`DfsMetadataReplicaShardContext::local_node_holds_copy`]).
+pub fn metadata_shard_copies_to_discard(
+    projection: &DfsAuthoritativePrefixProjection,
+    local_node_id: &NodeId,
+    file_system_id: &DfsFileSystemId,
+) -> Result<BTreeSet<DfsMetadataShardId>, DfsError> {
+    let mut discard = BTreeSet::new();
+    for shard in metadata_shards_from_authority_projection(projection, file_system_id)? {
+        let shard_id = DfsMetadataShardId::new(shard.shard_id);
+        let holds_copy = metadata_replica_context_from_authority_entries(
+            projection.entries(),
+            local_node_id,
+            file_system_id,
+            &shard_id,
+        )?
+        .is_none_or(|context| context.local_node_holds_copy());
+        if !holds_copy {
+            discard.insert(shard_id);
+        }
+    }
+    Ok(discard)
 }
 
 pub fn metadata_shard_index_from_authority_entries(

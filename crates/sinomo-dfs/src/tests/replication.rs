@@ -576,6 +576,86 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 }
 
 #[test]
+fn removed_replica_discards_its_shard_copy_and_recovers_when_added_back() {
+    let name = "native-removed-replica-discards-copy";
+    let (runtime, mut primary_service, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    let primary = config.primary_node_id.clone();
+    let removed = config.replica_node_ids[0].clone();
+    let path = "/services/discarded-copy.txt";
+    let stat = primary_service
+        .posix_write_file(
+            path,
+            b"replicated row",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    drop(primary_service);
+    let removed_row = || {
+        let shard_root = crate::default_dfs_metadata_shards_root(runtime.data_dir(&removed))
+            .join(crate::metadata_keys::key_segment(&config.shard_id));
+        LocalSobjMetadataBackend::open_for_inspection(
+            DfsMetadataShardId::new(config.shard_id.clone()),
+            shard_root,
+        )
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
+    };
+    let settle = |nodes: &[&NodeId], done: &dyn Fn() -> bool, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} did not settle");
+            for node in nodes {
+                runtime
+                    .maintenance_tick(node, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+                    .unwrap();
+            }
+        }
+    };
+    settle(
+        &[&primary, &removed],
+        &|| removed_row().is_some(),
+        "replication",
+    );
+
+    let remaining = config
+        .replica_node_ids
+        .iter()
+        .filter(|node| **node != removed)
+        .cloned()
+        .collect();
+    runtime
+        .reassign_metadata_shard(
+            &config.file_system_id,
+            &config.shard_id,
+            primary.clone(),
+            remaining,
+        )
+        .unwrap();
+    settle(
+        &[&removed],
+        &|| removed_row().is_none(),
+        "discarding the removed copy",
+    );
+
+    runtime
+        .reassign_metadata_shard(
+            &config.file_system_id,
+            &config.shard_id,
+            primary.clone(),
+            config.replica_node_ids.clone(),
+        )
+        .unwrap();
+    settle(
+        &[&primary, &removed],
+        &|| removed_row().is_some_and(|row| row.version == stat.version),
+        "re-adding the replica",
+    );
+    runtime.close().unwrap();
+}
+
+#[test]
 fn lookup_response_object_updates_outsider_read_view_without_journal_batches() {
     let name = "native-sync-path-outsider";
     let (runtime, initial, config) =

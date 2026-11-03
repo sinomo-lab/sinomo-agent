@@ -937,16 +937,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             "metadata-snapshot-repair-start node={} target={} shard={} reason={:?}",
             self.node_id, target_node_id, shard_id.0, reason
         ));
-        // Snapshot repair serves only the shard's configured replicas.
         let shard = match self.metadata_shard_config_for_shard_id(shard_id)? {
-            Some(shard)
-                if shard.primary_node_id == self.node_id
-                    && shard.replica_node_ids.contains(target_node_id) =>
-            {
-                shard
-            }
+            Some(shard) if shard.primary_node_id == self.node_id => shard,
             _ => return Ok(()),
         };
+        // Snapshot repair serves only nodes that hold a copy of the shard.
+        let pending_membership_handoff = self
+            .retained_metadata_replica_context(&shard.file_system_id, shard_id)?
+            .and_then(|context| context.pending_membership_handoff);
+        if !crate::metadata_replication::node_holds_metadata_shard_copy(
+            &shard,
+            pending_membership_handoff.as_ref(),
+            target_node_id,
+        ) {
+            return Ok(());
+        }
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
@@ -1102,7 +1107,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
                 Some(shard)
                     if command.primary_handoff_id.is_none()
-                        && !shard.replica_node_ids.contains(&self.node_id) =>
+                        && !retained_context
+                            .as_ref()
+                            .is_some_and(DfsMetadataReplicaShardContext::local_node_holds_copy) =>
                 {
                     Err(DfsMetadataRejection::new(
                         DfsMetadataRejectionCode::Other,
@@ -1859,16 +1866,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ("metadata primary must not apply a replica journal batch".to_string()).into(),
             ));
         }
-        // Only the shard's replicas, including one a pending membership
-        // handoff is adding, ingest its journal.
-        if !shard.replica_node_ids.contains(&self.node_id)
-            && !pending_membership_handoff.as_ref().is_some_and(|handoff| {
-                crate::service_routed_journal::shard_lists_node(
-                    &handoff.desired_shard,
-                    &self.node_id,
-                )
-            })
-        {
+        // Only nodes that hold a copy of the shard ingest its journal.
+        if !crate::metadata_replication::node_holds_metadata_shard_copy(
+            &shard,
+            pending_membership_handoff.as_ref(),
+            &self.node_id,
+        ) {
             return Ok(Err((format!(
                 "local node {} is not a configured replica for metadata shard {}",
                 self.node_id, shard.shard_id

@@ -618,6 +618,7 @@ pub use metadata_sharded_backend::{
     DfsResidentMetadataStatusSnapshot, LocalShardedMetadataBackend,
     ResidentLocalMetadataShardHandle, ResidentLocalMetadataShardLease,
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
+    discard_local_metadata_shard_copies,
 };
 pub use model::{
     DfsFileSystem, DfsMetadataStore, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics,
@@ -853,7 +854,7 @@ pub use metadata_authority_projection::{
     dfs_metadata_shard_config_key_is_exact, dfs_metadata_shard_config_key_parts,
     metadata_replica_context_from_authority_entries,
     metadata_replica_context_from_authority_projection,
-    metadata_replica_context_matches_authority_entries,
+    metadata_replica_context_matches_authority_entries, metadata_shard_copies_to_discard,
     metadata_shard_index_from_authority_entries, metadata_shards_from_authority_projection,
     namespace_command_matches_authority_index,
 };

@@ -180,6 +180,26 @@ fn compile_routing_indexes(
         .collect()
 }
 
+/// Delete this node's local copies of `shard_ids` under the sharded metadata
+/// root, together with the object-shard index rows routing into them. Each
+/// shard root stays in place and its slot reopens empty; a node later added
+/// back as a replica receives the shard again from its primary.
+pub fn discard_local_metadata_shard_copies(
+    root: &Path,
+    shard_ids: &BTreeSet<DfsMetadataShardId>,
+) -> Result<()> {
+    for shard_id in shard_ids {
+        let shard_root = root.join(key_segment(&shard_id.0));
+        if shard_root.is_dir() {
+            crate::metadata_table_store::discard_metadata_backend_state(&shard_root)?;
+        }
+    }
+    if shard_ids.is_empty() {
+        return Ok(());
+    }
+    crate::metadata_shard_index::remove_object_shard_index_rows_for_shards(root, shard_ids)
+}
+
 fn load_routing_topology_history(
     root: &std::path::Path,
     active: &[DfsMetadataShardConfig],
@@ -1331,11 +1351,14 @@ impl ResidentLocalShardedMetadataBackend {
     /// Rebuild the normal router while retaining only identical physical
     /// shard slots. The caller's current authority generation still owns
     /// admission; this DATA comparison creates no writer capability.
+    /// Rebuild the router for `shards`. The local copies named by `discarded`
+    /// are deleted before the changed slots reopen.
     pub(crate) fn into_reconfigured_for_replica_repair(
         self,
         root: PathBuf,
         mut shards: Vec<DfsMetadataShardConfig>,
         local_node_id: &NodeId,
+        discarded: &BTreeSet<DfsMetadataShardId>,
     ) -> Result<Self> {
         canonicalize_routing_topology(&mut shards);
         let reusable = self.with_router(
@@ -1349,6 +1372,9 @@ impl ResidentLocalShardedMetadataBackend {
                         continue;
                     }
                     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+                    if discarded.contains(&shard_id) {
+                        continue;
+                    }
                     let Some(slot) = self.inner.shards.get(&shard_id) else {
                         continue;
                     };
@@ -1397,6 +1423,7 @@ impl ResidentLocalShardedMetadataBackend {
         // normal current opening. Retained exact slots keep their one shared
         // checkout state, status and instance; no second pool is opened.
         drop(self);
+        discard_local_metadata_shard_copies(&root, discarded)?;
         let mut current = LocalShardedMetadataBackend::open_with_retained_shards_and_layout(
             root,
             shards,
