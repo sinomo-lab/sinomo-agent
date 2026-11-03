@@ -38,3 +38,5 @@ pub(crate) use registered::*;
 pub(crate) use rollout::*;
 pub(crate) use support::*;
 pub(crate) use test::*;
+
+pub use daemon::audio_component_factory;

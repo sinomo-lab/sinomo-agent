@@ -29,9 +29,16 @@
 //! follows the Mesh design language: one shared [`FramedField`] holding
 //! queued-steering chips, attachment chips, the borderless message
 //! `TextArea` and the action bar (attach · voice · model/context/activity ·
-//! Send-becomes-Stop). Each region is wrapped in a [`RebuildOnChange`] keyed on
-//! a small signature of the state it renders; the provider/model/effort
-//! `Select`s live in the model popup above the field.
+//! Send-becomes-Stop); the provider/model/effort `Select`s live in the model
+//! popup above the field.
+//!
+//! Views are built once and stay mounted. Changing text, toggles, and optional
+//! sections bind to projections of the chat structure signal (`text_from`,
+//! `SwitchView::selected_from`, `Presence::shown_from`, [`widgets::Restyle`]),
+//! and every widget reads the theme live, so neither theme changes nor clicks
+//! replace dialogs, popups, editors, or scroll views. A [`RebuildOnChange`] is
+//! reserved for small leaves whose structure follows data (chip lists, option
+//! lists, a programmatically replaced editor buffer).
 
 mod restoration;
 pub(crate) use restoration::ChatWorkspaceSnapshot;
@@ -46,23 +53,24 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sui::{
-    ActionTilePaint, Align, Alignment, ArrangeCtx, CalloutPaint, CodePanelPaint, CodeTextLine,
-    CodeTextPaint, CodeTextSpan, Color, Command, Constraints, ContentExtent, ContextMenu,
-    ControlSize, DefaultTheme, Dock, EmptyState, Event, EventCtx, EventPhase, FieldAppearance,
-    Flex, FlexItem, FlexWrap, FontWeight, FramedField, Icon, IconButton, IconGlyph, ImageHandle,
-    ImageSource, Insets, KeyState, KeyedChildren, Label, ListItem, ListView, MeasureCtx,
-    MeasuredBottomDock, MenuItem, Observable, PaintCtx, Path, Point, PointerButton,
-    PointerEventKind, RebuildOnChange, Rect, RegisteredImage, RichDocumentModel, RichDocumentView,
-    RichDocumentViewState, RichText, ScrollDelta, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone,
-    SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
-    SideSheet, SideSheetPlacement, Signal, Size, SizedBox, SplitView, Stack, StackHostOptions,
-    StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, SwitchView, TEXT_COMMAND,
-    TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextInput, TextStyle, Tooltip,
-    TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
-    paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
-    paint_section_label_detail, paint_text_block, paint_text_cell, wrap_text_lines,
+    ActionTilePaint, Align, Alignment, ArrangeCtx, Axis, CalloutPaint, CodePanelPaint,
+    CodeTextLine, CodeTextPaint, CodeTextSpan, Color, Command, Constraints, ContentExtent,
+    ContextMenu, ControlSize, DefaultTheme, Dock, EmptyState, Event, EventCtx, EventPhase,
+    FieldAppearance, Flex, FlexItem, FlexWrap, FontWeight, FramedField, Icon, IconButton,
+    IconGlyph, ImageHandle, ImageSource, Insets, KeyState, KeyedChildren, Label, ListItem,
+    ListView, MeasureCtx, MeasuredBottomDock, MenuItem, Observable, PaintCtx, Path, Point,
+    PointerButton, PointerEventKind, Presence, RebuildOnChange, Rect, RegisteredImage,
+    RichDocumentModel, RichDocumentView, RichDocumentViewState, RichText, ScrollDelta, ScrollState,
+    ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SelectionScope,
+    SemanticRegion, SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole,
+    SemanticsValue, Separator, SideSheet, SideSheetPlacement, Signal, Size, SizedBox, SplitView,
+    Stack, StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole,
+    SwitchView, TEXT_COMMAND, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextInput,
+    TextStyle, Tooltip, TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph,
+    paint_action_tile, paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel,
+    paint_rounded_rect, paint_section_label_detail, paint_text_block, paint_text_cell,
+    wrap_text_lines,
 };
 use sui_lucide::LucideIcon;
 
@@ -126,7 +134,7 @@ use crate::native_picker::{
     NativePickerKind, NativePickerLane, NativePickerOutcome, NativePickerResult,
 };
 use crate::state::{Shared, Tab};
-use crate::theme::{AppTextScale, AppThemeMode, Palette};
+use crate::theme::{AppTextScale, AppThemeMode};
 use crate::ui::chat_render::{self, ChatCodeBlock};
 #[cfg(not(test))]
 use crate::ui::media_setup::camera_frame_failure_is_terminal;
@@ -136,7 +144,8 @@ use crate::ui::media_setup::{
 };
 use crate::ui::offline::{DaemonOfflinePanel, daemon_gate};
 use crate::ui::settings::SettingsSection;
-use crate::ui::widgets;
+use crate::ui::widgets::{self, Restyle};
+use sui::SurfacePalette;
 
 /// Typed application-wide notification emitted by chat worker lanes.
 pub const CHAT_WORK_READY: sui::CommandKey<()> = sui::CommandKey::new("sinomo.chat.work-ready");
@@ -199,9 +208,6 @@ const COMPOSER_CHIP_ROW_PAD_TOP: f32 = 8.0;
 const COMPOSER_BAR_PAD_X: f32 = 8.0;
 const COMPOSER_BAR_PAD_Y: f32 = 6.0;
 const COMPOSER_BAR_GAP: f32 = 4.0;
-/// Quiet bar controls use the Small size; Send remains a Medium primary action.
-const COMPOSER_GHOST_BUTTON_SIZE: f32 = 28.0;
-const SEND_BUTTON_SIZE: f32 = 32.0;
 const COMPOSER_INPUT_MIN_LINES: usize = 2;
 /// Keep empty-state actions below the title, guidance, and optional detail line.
 const EMPTY_ACTION_OFFSET_Y: f32 = 112.0;
@@ -500,13 +506,11 @@ fn transcript_recovery_action_button(
     primary: bool,
 ) -> sui::Button {
     let activation_shared = shared.clone();
-    let theme_shared = shared.clone();
     sui::Button::new(action.label())
         .description(action.description())
         .icon(action.icon())
         .min_width(TranscriptView::recovery_card_action_width(action))
-        .min_height(28.0)
-        .theme_when(move || theme_shared.theme().with_size(ControlSize::Small))
+        .theme_when(small_control_reader(&shared_reader(shared)))
         .appearance(if primary {
             sui::ButtonAppearance::Filled
         } else {
@@ -1742,6 +1746,9 @@ pub struct ChatState {
     draft_revision: u64,
     attachment_draft_generation: u64,
     attachment_path_input: String,
+    /// Bumped when the manual attachment path is replaced programmatically, so the retained
+    /// path editor remounts with the new value; typing never changes it.
+    attachment_path_revision: u64,
     attachment_manual_path_open: bool,
     attachment_controls_open: bool,
     attachment_picker: NativePickerLane,
@@ -1848,7 +1855,6 @@ pub struct ChatStructureKey(Option<Box<ChatStructureSnapshot>>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatStructureSnapshot {
-    theme: (AppThemeMode, AppTextScale),
     chats_heading: String,
     provider_idx: usize,
     model_idx: usize,
@@ -1863,9 +1869,10 @@ struct ChatStructureSnapshot {
     workspaces: Option<Vec<ChatWorkspace>>,
     workspace_update_pending: bool,
     attachments: Vec<(String, u64)>,
-    attachment_path_empty: bool,
+    attachment_path_revision: u64,
     attachment_manual_path_open: bool,
     attachment_operation_pending: bool,
+    attachment_picker_requested: bool,
     attachment_picker_pending: bool,
     pending_attachment_validations: usize,
     attachment_drop_hovered: bool,
@@ -1878,8 +1885,6 @@ struct ChatStructureSnapshot {
     context: Option<ChatContextStructure>,
     activity: Vec<ChatActivityStructure>,
     tool_calls: Vec<ChatToolStructure>,
-    expanded_traces: usize,
-    expanded_tool_details: usize,
     task_count: usize,
     active_turn: bool,
     tasks: Vec<ChatTaskStructure>,
@@ -1936,6 +1941,8 @@ struct ChatActivityStructure {
     tone: ActivityTone,
 }
 
+/// What the activity popup shows of a tool call. Streamed output is absent: the popup lists
+/// calls by status, so output chunks must not replace its content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatToolStructure {
     step_index: usize,
@@ -1944,8 +1951,6 @@ struct ChatToolStructure {
     input_preview: String,
     process_status: Option<String>,
     exit_code: Option<i32>,
-    stdout_len: usize,
-    stderr_len: usize,
     output_files: Vec<ChatToolOutputFile>,
 }
 
@@ -1967,14 +1972,12 @@ struct ChatProviderStructure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatSidebarStructure {
-    theme: (AppThemeMode, AppTextScale),
     agents: Vec<(String, String, String)>,
     runtime_agent: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatSessionsStructure {
-    theme: (AppThemeMode, AppTextScale),
     sessions: Vec<SessionRef>,
     session_id: String,
     session_filter: String,
@@ -1992,19 +1995,25 @@ struct ChatSessionsStructure {
     channel_config_error: Option<ChannelConfigError>,
 }
 
-/// Only changes to the editor's content may replace its controls. Conversation
-/// progress must preserve pointer capture, text selection, and keyboard focus.
+/// The session editor's projected state. The dialog stays mounted for one session and each of
+/// its parts observes only its own slice, so conversation progress and clicks inside the dialog
+/// preserve pointer capture, text selection, and keyboard focus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatSessionEditStructure {
-    session_id: String,
     title: String,
     kind: ConversationKind,
-    participant_count: usize,
-    participant_names: Vec<String>,
     details_open: bool,
     confirming_delete: bool,
     rename_pending: bool,
     rename_error: Option<String>,
+    membership: ChatSessionMembershipStructure,
+}
+
+/// Channel membership as the editor's agent list and details panel present it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChatSessionMembershipStructure {
+    participant_count: usize,
+    participant_names: Vec<String>,
     agents: Vec<(String, String)>,
     creating_channel: bool,
     channel_notice: Option<String>,
@@ -2022,11 +2031,8 @@ impl ChatSessionEditStructure {
             .find(|session| session.id == edit_id)?;
         let is_channel = session.kind == ConversationKind::Channel;
         Some(Self {
-            session_id: session.id.clone(),
             title: session.title.clone(),
             kind: session.kind,
-            participant_count: session.participant_count,
-            participant_names: session.participant_names.clone(),
             details_open: snapshot.session_edit_details_open,
             confirming_delete: snapshot.session_delete_confirm_id.as_deref() == Some(edit_id),
             rename_pending: snapshot
@@ -2038,46 +2044,49 @@ impl ChatSessionEditStructure {
                 .as_ref()
                 .filter(|error| error.session_id == edit_id)
                 .map(|error| error.detail.clone()),
-            agents: if is_channel {
-                snapshot
-                    .agents
-                    .iter()
-                    .map(|(key, name, _)| (key.clone(), name.clone()))
-                    .collect()
-            } else {
-                Vec::new()
+            membership: ChatSessionMembershipStructure {
+                participant_count: session.participant_count,
+                participant_names: session.participant_names.clone(),
+                agents: if is_channel {
+                    snapshot
+                        .agents
+                        .iter()
+                        .map(|(key, name, _)| (key.clone(), name.clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                creating_channel: is_channel
+                    && snapshot.channel_create_pending
+                    && snapshot.session_id == edit_id,
+                channel_notice: snapshot
+                    .notice
+                    .as_ref()
+                    .filter(|notice| {
+                        let lower = notice.to_ascii_lowercase();
+                        is_channel
+                            && (lower.contains("channel create failed")
+                                || lower.contains("channel config failed"))
+                    })
+                    .cloned(),
+                channel_config_pending: is_channel && snapshot.pending_channel_config.is_some(),
+                channel_config_error: snapshot
+                    .channel_config_error
+                    .as_ref()
+                    .filter(|error| is_channel && error.channel_id == edit_id)
+                    .map(|error| error.detail.clone()),
+                stored_participants: snapshot
+                    .channel_participants
+                    .as_ref()
+                    .filter(|cache| is_channel && cache.channel_id == edit_id)
+                    .map(|cache| cache.refs.clone()),
             },
-            creating_channel: is_channel
-                && snapshot.channel_create_pending
-                && snapshot.session_id == edit_id,
-            channel_notice: snapshot
-                .notice
-                .as_ref()
-                .filter(|notice| {
-                    let lower = notice.to_ascii_lowercase();
-                    is_channel
-                        && (lower.contains("channel create failed")
-                            || lower.contains("channel config failed"))
-                })
-                .cloned(),
-            channel_config_pending: is_channel && snapshot.pending_channel_config.is_some(),
-            channel_config_error: snapshot
-                .channel_config_error
-                .as_ref()
-                .filter(|error| is_channel && error.channel_id == edit_id)
-                .map(|error| error.detail.clone()),
-            stored_participants: snapshot
-                .channel_participants
-                .as_ref()
-                .filter(|cache| is_channel && cache.channel_id == edit_id)
-                .map(|cache| cache.refs.clone()),
         })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatModelSelectorStructure {
-    theme: (AppThemeMode, AppTextScale),
     provider_idx: usize,
     model_idx: usize,
     effort_idx: usize,
@@ -2088,23 +2097,9 @@ struct ChatModelSelectorStructure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ChatAttachmentStructure {
-    theme: (AppThemeMode, AppTextScale),
-    attachments: Vec<(String, u64)>,
-    manual_path_open: bool,
-    operation_pending: bool,
-    picker_pending: bool,
-    pending_validations: usize,
-    drop_hovered: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatActivityPopupStructure {
-    theme: (AppThemeMode, AppTextScale),
     activity: Vec<ChatActivityStructure>,
     tool_calls: Vec<ChatToolStructure>,
-    expanded_traces: usize,
-    expanded_tool_details: usize,
     task_count: usize,
     active_turn: bool,
     tasks: Vec<ChatTaskStructure>,
@@ -2117,7 +2112,6 @@ struct ChatActivityPopupStructure {
 impl ChatStructureSnapshot {
     fn sidebar_structure(&self) -> ChatSidebarStructure {
         ChatSidebarStructure {
-            theme: self.theme,
             agents: self.agents.clone(),
             runtime_agent: self.runtime_agent.clone(),
         }
@@ -2125,7 +2119,6 @@ impl ChatStructureSnapshot {
 
     fn sessions_structure(&self) -> ChatSessionsStructure {
         ChatSessionsStructure {
-            theme: self.theme,
             sessions: self.sessions.clone(),
             session_id: self.session_id.clone(),
             session_filter: self.session_filter.clone(),
@@ -2146,7 +2139,6 @@ impl ChatStructureSnapshot {
 
     fn model_selector_structure(&self) -> ChatModelSelectorStructure {
         ChatModelSelectorStructure {
-            theme: self.theme,
             provider_idx: self.provider_idx,
             model_idx: self.model_idx,
             effort_idx: self.effort_idx,
@@ -2157,25 +2149,10 @@ impl ChatStructureSnapshot {
         }
     }
 
-    fn attachment_structure(&self) -> ChatAttachmentStructure {
-        ChatAttachmentStructure {
-            theme: self.theme,
-            attachments: self.attachments.clone(),
-            manual_path_open: self.attachment_manual_path_open,
-            operation_pending: self.attachment_operation_pending,
-            picker_pending: self.attachment_picker_pending,
-            pending_validations: self.pending_attachment_validations,
-            drop_hovered: self.attachment_drop_hovered,
-        }
-    }
-
     fn activity_popup_structure(&self) -> ChatActivityPopupStructure {
         ChatActivityPopupStructure {
-            theme: self.theme,
             activity: self.activity.clone(),
             tool_calls: self.tool_calls.clone(),
-            expanded_traces: self.expanded_traces,
-            expanded_tool_details: self.expanded_tool_details,
             task_count: self.task_count,
             active_turn: self.active_turn,
             tasks: self.tasks.clone(),
@@ -2185,11 +2162,19 @@ impl ChatStructureSnapshot {
             notice: self.notice.clone(),
         }
     }
+
+    /// Mirrors [`ChatState::workspace_changes_allowed`] for controls bound to the projection.
+    fn workspace_changes_allowed(&self) -> bool {
+        !self.streaming
+            && !self.active_turn
+            && !self.workspace_picker_pending
+            && !self.workspace_update_pending
+            && self.workspaces.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ComposerBarStructure {
-    theme: (AppThemeMode, AppTextScale),
     streaming: bool,
     media_active: bool,
     workspace_label: String,
@@ -2205,41 +2190,12 @@ struct ComposerBarStructure {
     can_reuse_latest_answer: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ComposerBarLayoutStructure {
-    theme: (AppThemeMode, AppTextScale),
-    streaming: bool,
-    media_active: bool,
-    workspace_label: String,
-    workspace_description: String,
-    workspace_selected: bool,
-    workspace_picker_pending: bool,
-    workspace_update_pending: bool,
-    voice_link_hint: Option<String>,
-    can_reuse_latest_answer: bool,
-}
-
-impl From<&ComposerBarStructure> for ComposerBarLayoutStructure {
-    fn from(structure: &ComposerBarStructure) -> Self {
-        Self {
-            theme: structure.theme,
-            streaming: structure.streaming,
-            media_active: structure.media_active,
-            workspace_label: structure.workspace_label.clone(),
-            workspace_description: structure.workspace_description.clone(),
-            workspace_selected: structure.workspace_selected,
-            workspace_picker_pending: structure.workspace_picker_pending,
-            workspace_update_pending: structure.workspace_update_pending,
-            voice_link_hint: structure.voice_link_hint.clone(),
-            can_reuse_latest_answer: structure.can_reuse_latest_answer,
-        }
-    }
-}
-
 impl ChatStructureKey {
+    /// The theme is deliberately not part of the key: retained widgets read it live, so a theme
+    /// change restyles them in place instead of replacing them.
     pub(crate) fn new(
-        theme_mode: AppThemeMode,
-        text_scale: AppTextScale,
+        _theme_mode: AppThemeMode,
+        _text_scale: AppTextScale,
         chat: Option<&ChatState>,
     ) -> Self {
         let Some(chat) = chat else {
@@ -2264,7 +2220,6 @@ impl ChatStructureKey {
                 .collect(),
         });
         Self(Some(Box::new(ChatStructureSnapshot {
-            theme: (theme_mode, text_scale),
             chats_heading: chats_heading_text(chat),
             provider_idx: chat.provider_idx,
             model_idx: chat.model_idx,
@@ -2283,9 +2238,10 @@ impl ChatStructureKey {
                 .iter()
                 .map(|attachment| (attachment.file_name.clone(), attachment.size_bytes))
                 .collect(),
-            attachment_path_empty: chat.attachment_path_input.is_empty(),
+            attachment_path_revision: chat.attachment_path_revision,
             attachment_manual_path_open: chat.attachment_manual_path_open,
             attachment_operation_pending: chat.attachment_operation_pending(),
+            attachment_picker_requested: chat.attachment_picker_pending(),
             attachment_picker_pending: chat.attachment_picker_lane_pending(),
             pending_attachment_validations: chat.pending_attachment_validations.len(),
             attachment_drop_hovered: chat.attachment_drop_hovered,
@@ -2316,13 +2272,9 @@ impl ChatStructureKey {
                     input_preview: call.input_preview.clone(),
                     process_status: call.process_status.clone(),
                     exit_code: call.exit_code,
-                    stdout_len: call.stdout.len(),
-                    stderr_len: call.stderr.len(),
                     output_files: call.output_files.clone(),
                 })
                 .collect(),
-            expanded_traces: chat.expanded_traces.len(),
-            expanded_tool_details: chat.expanded_tool_details.len(),
             task_count: chat.control.task_count,
             active_turn: chat.control.active_turn,
             tasks: chat
@@ -2398,7 +2350,6 @@ impl ChatStructureKey {
             voice_link_hint: voice_link_hint(chat),
             can_reuse_latest_answer: chat.can_reuse_latest_answer(),
             composer_bar: ComposerBarStructure {
-                theme: (theme_mode, text_scale),
                 streaming: chat.streaming,
                 media_active: chat.media_call.active,
                 workspace_label: workspace_button_label(chat),
@@ -2644,6 +2595,7 @@ impl ChatState {
             draft_revision: 0,
             attachment_draft_generation: 0,
             attachment_path_input: String::new(),
+            attachment_path_revision: 0,
             attachment_manual_path_open: false,
             attachment_controls_open: false,
             attachment_picker: NativePickerLane::new(),
@@ -3800,14 +3752,10 @@ impl ChatState {
         if self.composer_popup == Some(ComposerPopup::Attachments)
             && popup != Some(ComposerPopup::Attachments)
         {
-            let had_path = !self.attachment_path_input.trim().is_empty();
-            self.attachment_path_input.clear();
+            self.clear_attachment_path_input();
             self.attachment_manual_path_open = false;
             self.attachment_controls_open = false;
             self.attachment_picker_error = None;
-            if had_path {
-                self.draft_revision = self.draft_revision.wrapping_add(1);
-            }
         }
         if popup == Some(ComposerPopup::Attachments) {
             self.attachment_controls_open = true;
@@ -4156,7 +4104,10 @@ impl ChatState {
 
         self.session_id = session_id;
         self.messages.clear();
-        self.input.clear();
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.draft_revision = self.draft_revision.wrapping_add(1);
+        }
         self.cursor = 0;
         self.advance_workspace_picker_generation();
         self.tool_runtime.workspaces = None;
@@ -4166,7 +4117,7 @@ impl ChatState {
         #[cfg(target_os = "android")]
         self.workspace_folder_input.clear();
         self.advance_attachment_draft_generation();
-        self.attachment_path_input.clear();
+        self.clear_attachment_path_input();
         self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         self.attachments.clear();
@@ -6343,7 +6294,7 @@ impl ChatState {
             self.input.clear();
             self.cursor = 0;
             self.advance_attachment_draft_generation();
-            self.attachment_path_input.clear();
+            self.clear_attachment_path_input();
             self.attachment_manual_path_open = false;
             self.attachment_controls_open = false;
             if self.composer_popup == Some(ComposerPopup::Attachments) {
@@ -6374,8 +6325,11 @@ impl ChatState {
         self.control.active_turn = true;
         self.input.clear();
         self.cursor = 0;
+        // The input host keys on the revision, not on streaming, so the
+        // focused `TextArea` is replaced only because its text was.
+        self.draft_revision = self.draft_revision.wrapping_add(1);
         self.advance_attachment_draft_generation();
-        self.attachment_path_input.clear();
+        self.clear_attachment_path_input();
         self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         if self.composer_popup == Some(ComposerPopup::Attachments) {
@@ -6518,7 +6472,7 @@ impl ChatState {
         self.input = answer;
         self.cursor = self.input.len();
         self.advance_attachment_draft_generation();
-        self.attachment_path_input.clear();
+        self.clear_attachment_path_input();
         self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         self.attachments.clear();
@@ -6766,7 +6720,7 @@ impl ChatState {
         self.input.clear();
         self.cursor = 0;
         self.advance_attachment_draft_generation();
-        self.attachment_path_input.clear();
+        self.clear_attachment_path_input();
         self.attachment_manual_path_open = false;
         self.attachment_controls_open = false;
         if self.composer_popup == Some(ComposerPopup::Attachments) {
@@ -6964,7 +6918,6 @@ impl ChatState {
                 self.attachment_picker_error = Some(error);
             }
         }
-        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     /// Drain native-picker and path-validation completions without blocking the UI thread.
@@ -7018,7 +6971,6 @@ impl ChatState {
                 self.attachment_picker_error = Some(error);
             }
         }
-        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     fn apply_attachment_validation_result(&mut self, result: LocalAttachmentValidationResult) {
@@ -7072,7 +7024,6 @@ impl ChatState {
         } else {
             Some(errors.join(" "))
         };
-        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     fn request_local_attachment_validation(
@@ -7134,17 +7085,23 @@ impl ChatState {
                 paths,
             });
         self.attachment_picker_error = None;
-        self.draft_revision = self.draft_revision.wrapping_add(1);
         Ok(request_id)
     }
 
     fn toggle_manual_attachment_path(&mut self) {
         self.attachment_manual_path_open = !self.attachment_manual_path_open;
         if !self.attachment_manual_path_open {
-            self.attachment_path_input.clear();
+            self.clear_attachment_path_input();
         }
         self.attachment_picker_error = None;
-        self.draft_revision = self.draft_revision.wrapping_add(1);
+    }
+
+    /// Clear the manual attachment path; a programmatic clear replaces the retained editor.
+    fn clear_attachment_path_input(&mut self) {
+        if !self.attachment_path_input.is_empty() {
+            self.attachment_path_input = String::new();
+            self.attachment_path_revision = self.attachment_path_revision.wrapping_add(1);
+        }
     }
 
     fn set_attachment_path_input(&mut self, value: String) {
@@ -7156,7 +7113,7 @@ impl ChatState {
         let value = self.attachment_path_input.clone();
         match self.queue_attachment_path(&value) {
             Ok(()) => {
-                self.attachment_path_input.clear();
+                self.clear_attachment_path_input();
             }
             Err(error) => {
                 self.attachment_picker_error = Some(error);
@@ -7211,15 +7168,11 @@ impl ChatState {
         }
         self.attachment_drop_hovered = true;
         self.open_attachment_surface();
-        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     /// Clear the transient drag target when the pointer leaves or the host cancels the drag.
     pub(crate) fn cancel_external_attachment_hover(&mut self) {
-        if self.attachment_drop_hovered {
-            self.attachment_drop_hovered = false;
-            self.draft_revision = self.draft_revision.wrapping_add(1);
-        }
+        self.attachment_drop_hovered = false;
     }
 
     pub(crate) fn open_attachment_surface(&mut self) {
@@ -7285,7 +7238,6 @@ impl ChatState {
         }
         self.open_attachment_surface();
         self.attachment_picker_error = None;
-        self.draft_revision = self.draft_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -7348,7 +7300,6 @@ impl ChatState {
         }
         self.open_attachment_surface();
         self.attachment_picker_error = None;
-        self.draft_revision = self.draft_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -7357,7 +7308,6 @@ impl ChatState {
             return;
         }
         self.attachments.remove(index);
-        self.draft_revision = self.draft_revision.wrapping_add(1);
     }
 
     fn attachment_inputs(&self) -> Vec<ChatAttachmentInput> {
@@ -9212,14 +9162,66 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+/// The theme at the compact control size chat chrome uses (sidebar, composer bar, popups).
 fn small_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     let reader = Rc::clone(reader);
     move || reader().with_size(ControlSize::Small)
 }
 
-fn composer_control_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
-    let reader = Rc::clone(reader);
-    move || reader().with_size(ControlSize::Small)
+/// A [`ThemeReader`] over the shared app theme.
+fn shared_reader(shared: &Shared) -> ThemeReader {
+    let shared = shared.clone();
+    Rc::new(move || shared.theme())
+}
+
+/// A projection of the chat structure signal bound to retained widgets.
+type ChatProjection<U> = sui::Selector<Signal<ChatStructureKey>, ChatStructureKey, U>;
+
+/// Project one value out of the chat structure. A widget bound to the projection updates in
+/// place, and only when the projected value changes.
+fn chat_projection<U>(
+    shared: &Shared,
+    name: &'static str,
+    select: impl Fn(Option<&ChatStructureSnapshot>) -> U + Send + Sync + 'static,
+) -> ChatProjection<U>
+where
+    U: Clone + PartialEq + Send + Sync + 'static,
+{
+    shared
+        .signals()
+        .chat_structure
+        .select_named(name, move |key| select(key.0.as_deref()))
+}
+
+/// Show `child` while `shown` holds. The leading `gap` belongs to the child, so a hidden
+/// section leaves no spacing behind in a gap-free parent stack.
+fn revealed<W>(gap: f32, child: W, shown: impl Observable<bool> + 'static) -> Presence
+where
+    W: Widget + 'static,
+{
+    Presence::new(WidgetPadding::new(
+        Insets {
+            left: 0.0,
+            top: gap,
+            right: 0.0,
+            bottom: 0.0,
+        },
+        child,
+    ))
+    .shown_from(shown)
+    .transition(crate::ui::widgets::reveal_transition())
+    .collapse(Axis::Vertical)
+}
+
+/// Keep `button` mounted while its label follows `label`.
+fn label_from(
+    button: sui::Button,
+    label: impl Observable<String> + 'static,
+) -> Restyle<sui::Button, String> {
+    Restyle::new(button, label, |mut button, label| {
+        button.set_label(label.clone());
+        button
+    })
 }
 
 #[cfg(not(test))]
@@ -10361,6 +10363,8 @@ async fn reconcile_chat_media_devices(
 fn open_chat_media_microphone(
     config: &sinomo_audio::NativeAudioCaptureConfig,
 ) -> Result<sinomo_audio::NativeAudioCapture, String> {
+    #[cfg(target_os = "android")]
+    crate::android_media::request("microphone")?;
     sinomo_audio::start_native_microphone_capture(config.clone())
         .map_err(|error| format!("microphone unavailable: {error}"))
 }
@@ -10379,6 +10383,8 @@ impl Drop for ChatMediaCameraOpenGuard {
 fn open_chat_media_camera(
     config: &sinomo_video::NativeVideoCaptureConfig,
 ) -> Result<sinomo_video::NativeVideoCapture, String> {
+    #[cfg(target_os = "android")]
+    crate::android_media::request("camera")?;
     if CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -10665,8 +10671,8 @@ fn app_native_audio_format(
 
 /// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
 /// bespoke painters so muted/accent text matches the chrome).
-fn palette(shared: &Shared) -> Palette {
-    Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
+fn palette(shared: &Shared) -> SurfacePalette {
+    shared.theme().surfaces
 }
 
 fn format_bytes(bytes: usize) -> String {
@@ -10815,11 +10821,11 @@ fn color_from_rgb(rgb: [u8; 3]) -> Color {
     )
 }
 
-fn diff_line_color(line: &str, pal: &Palette) -> Color {
+fn diff_line_color(line: &str, pal: &SurfacePalette) -> Color {
     if line.starts_with('+') && !line.starts_with("+++") {
-        pal.ok_text
+        pal.good_text
     } else if line.starts_with('-') && !line.starts_with("---") {
-        pal.danger_text
+        pal.bad_text
     } else if line.starts_with("@@") {
         pal.accent_text
     } else {
@@ -10827,11 +10833,11 @@ fn diff_line_color(line: &str, pal: &Palette) -> Color {
     }
 }
 
-fn diff_line_background(line: &str, pal: &Palette) -> Option<Color> {
+fn diff_line_background(line: &str, pal: &SurfacePalette) -> Option<Color> {
     if line.starts_with('+') && !line.starts_with("+++") {
-        Some(pal.ok_soft)
+        Some(pal.good_soft)
     } else if line.starts_with('-') && !line.starts_with("---") {
-        Some(pal.danger_soft)
+        Some(pal.bad_soft)
     } else if line.starts_with("@@") {
         Some(pal.accent_soft)
     } else {
@@ -11248,36 +11254,17 @@ fn transcript_message_recovery_action(message: &ChatMessage) -> Option<RecoveryC
     }
 }
 
-/// A small uppercase section heading `Label` (AGENTS / CHATS), color tracking the theme.
-fn heading(shared: &Shared, text: &str) -> Label {
-    let s = shared.clone();
-    Label::new(text)
-        .text_style({
-            let theme = shared.theme();
-            sui::TextStyle {
-                weight: FontWeight::SEMIBOLD,
-                ..small_theme_text_style(&theme)
-            }
-        })
-        .color_when(move || palette(&s).text_faint)
-}
-
-fn chats_heading(shared: &Shared) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .chat_structure
-        .select_named("chat sidebar heading", |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| (snapshot.theme, snapshot.chats_heading.clone()))
-                .unwrap_or((
-                    (AppThemeMode::System, AppTextScale::Standard),
-                    String::new(),
-                ))
-        });
-    let s = shared.clone();
-    RebuildOnChange::key_from(source, move |(_theme, text)| {
-        WidgetPod::new(heading(&s, text))
+/// The CONVERSATIONS / CHATS / CHANNELS section heading with its live count. The stock section
+/// label has no text binding, so only this one-line leaf is replaced when the count changes.
+fn chats_heading(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = chat_projection(shared, "chat sidebar heading", |snapshot| {
+        snapshot
+            .map(|snapshot| snapshot.chats_heading.clone())
+            .unwrap_or_default()
+    });
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |text| {
+        WidgetPod::new(SectionLabel::new(text.clone()).theme_when(clone_reader(&r)))
     })
 }
 
@@ -11299,23 +11286,27 @@ fn small_theme_text_style(theme: &DefaultTheme) -> sui::TextStyle {
     }
 }
 
+/// A label in the theme's small body style, resolved live so theme and text-scale changes
+/// restyle it in place.
 fn small_label(shared: &Shared, text: impl Into<String>) -> Label {
-    Label::new(text).text_style(small_text_style(shared))
+    let s = shared.clone();
+    Label::new(text).text_style_when(move || small_text_style(&s))
 }
 
 fn dialog_section_label(shared: &Shared, text: impl Into<String>) -> Label {
-    let s = shared.clone();
-    let theme = shared.theme();
+    let style = shared.clone();
+    let colors = shared.clone();
     Label::new(text)
-        .text_style(sui::TextStyle {
+        .text_style_when(move || sui::TextStyle {
             weight: FontWeight::SEMIBOLD,
-            ..small_theme_text_style(&theme)
+            ..small_text_style(&style)
         })
-        .color_when(move || palette(&s).text_muted)
+        .color_when(move || palette(&colors).text_muted)
 }
 
 fn session_edit_detail_row(
     shared: &Shared,
+    reader: &ThemeReader,
     label: &str,
     value: impl Into<String>,
 ) -> sui::PropertyRow {
@@ -11327,11 +11318,12 @@ fn session_edit_detail_row(
     .inline()
     .label_width(100.0)
     .gap(12.0)
-    .theme(shared.theme())
+    .theme_when(clone_reader(reader))
 }
 
 fn session_edit_details(
     shared: &Shared,
+    reader: &ThemeReader,
     session: &SessionRef,
     participant_count: usize,
     participant_names: &[String],
@@ -11353,36 +11345,42 @@ fn session_edit_details(
                     .map(|session| session.updated_unix)
             });
     let updated_shared = shared.clone();
+    let updated_reader = Rc::clone(reader);
     let mut details = Stack::vertical()
         .gap(10.0)
         .alignment(Alignment::Stretch)
         .with_child(dialog_section_label(shared, "Conversation details"))
         .with_child(session_edit_detail_row(
             shared,
+            reader,
             "Type",
             session_kind_icon_description(session.kind),
         ))
         .with_child(RebuildOnChange::key_from(updated, move |updated| {
             WidgetPod::new(session_edit_detail_row(
                 &updated_shared,
+                &updated_reader,
                 "Updated",
                 session_updated_label(updated.unwrap_or_default()),
             ))
         }))
         .with_child(session_edit_detail_row(
             shared,
+            reader,
             "Conversation ID",
             &session.id,
         ));
     if session.kind == ConversationKind::Channel {
         details = details.with_child(session_edit_detail_row(
             shared,
+            reader,
             "Agents",
             active_agents_label(participant_count),
         ));
         if !participant_names.is_empty() {
             details = details.with_child(session_edit_detail_row(
                 shared,
+                reader,
                 "Agent names",
                 participant_names.join(", "),
             ));
@@ -11392,7 +11390,7 @@ fn session_edit_details(
         .appearance(SurfaceAppearance::Soft)
         .padding(Insets::all(14.0))
         .fill_width(true)
-        .theme(shared.theme())
+        .theme_when(clone_reader(reader))
 }
 
 fn session_meta_label(session: &SessionRef) -> String {
@@ -11800,9 +11798,13 @@ impl Widget for RetainedSessionRow {
     fn paint(&self, ctx: &mut PaintCtx) {
         let active = self.shared.chat().session_id == self.session_id;
         if active || self.hovered || self.pressed {
-            let pal = palette(&self.shared);
-            let color = if active { pal.selected } else { pal.hover };
-            paint_rounded_rect(ctx, ctx.bounds(), color, 6.0);
+            let theme = self.shared.theme();
+            let color = if active {
+                theme.surfaces.selected
+            } else {
+                theme.surfaces.hover
+            };
+            paint_rounded_rect(ctx, ctx.bounds(), color, theme.radius.md);
         }
         self.child.paint(ctx);
     }
@@ -12123,16 +12125,11 @@ impl Widget for KeyedSessionRows {
 }
 
 fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let small_reader: ThemeReader = {
-        let reader = Rc::clone(reader);
-        Rc::new(move || reader().with_size(ControlSize::Small))
-    };
     let new_chat = {
         let s = shared.clone();
         sui::Button::new("New chat")
             .icon(IconGlyph::Chat)
-            .min_height(28.0)
-            .theme_when(clone_reader(&small_reader))
+            .theme_when(small_control_reader(reader))
             .on_press(move || {
                 s.chat_mut().new_session();
             })
@@ -12141,8 +12138,7 @@ fn session_create_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         let s = shared.clone();
         sui::Button::new("New channel")
             .icon(IconGlyph::Add)
-            .min_height(28.0)
-            .theme_when(clone_reader(&small_reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
@@ -12188,7 +12184,7 @@ fn sessions_scroll_rebuild(
         .name("chat-sessions-scroll")
         .state(scroll_state.clone())
         .content_height(ContentExtent::AtLeastViewport)
-        .theme(shared.theme())
+        .theme_when(clone_reader(reader))
 }
 
 fn request_session_filter_refresh(ctx: &mut EventCtx) {
@@ -12199,13 +12195,9 @@ fn request_session_filter_refresh(ctx: &mut EventCtx) {
 }
 
 fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let (items, selected) = {
+    let items = {
         let chat = shared.chat();
-        let selected = SessionKindFilter::ALL
-            .iter()
-            .position(|filter| *filter == chat.session_kind_filter)
-            .unwrap_or(0);
-        let items = SessionKindFilter::ALL
+        SessionKindFilter::ALL
             .iter()
             .copied()
             .map(|filter| {
@@ -12224,15 +12216,23 @@ fn session_kind_filter_control(shared: &Shared, reader: &ThemeReader) -> impl Wi
                     .semantic_name(filter.semantic_name())
                     .description(description)
             })
-            .collect::<Vec<_>>();
-        (items, selected)
+            .collect::<Vec<_>>()
     };
+    let selected = shared.clone();
     let s = shared.clone();
 
     SegmentedControl::new("Conversation kind")
         .text_overflow(sui::TextOverflow::Ellipsis)
         .items(items)
-        .selected(selected)
+        .selected_when(move || {
+            let kind = selected.chat().session_kind_filter;
+            Some(
+                SessionKindFilter::ALL
+                    .iter()
+                    .position(|filter| *filter == kind)
+                    .unwrap_or(0),
+            )
+        })
         .theme_when(clone_reader(reader))
         .on_change_with_ctx(move |ctx, index, _label| {
             if let Some(filter) = SessionKindFilter::ALL.get(index).copied() {
@@ -12256,44 +12256,69 @@ fn session_row_description(session: &SessionRef) -> String {
     }
 }
 
+/// One conversation row. Colors follow the live theme and the active conversation, so neither a
+/// theme change nor switching conversations replaces the row.
 fn session_row_content(
     shared: &Shared,
     reader: &ThemeReader,
     session: SessionRef,
 ) -> impl Widget + use<> {
-    let theme = reader();
-    let pal = Palette::from_theme(&theme, widgets::theme_is_dark(shared));
-    let active = shared.chat().session_id == session.id;
-    let label_color = if active { pal.text } else { pal.text_muted };
-    let title_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, label_color);
-    let meta_style = pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_faint);
-    let icon_color = match session.kind {
-        ConversationKind::Chat if active => pal.accent,
-        ConversationKind::Chat => pal.text_faint,
-        ConversationKind::Channel => pal.accent,
+    let is_active = {
+        let shared = shared.clone();
+        let session_id = session.id.clone();
+        move || shared.chat().session_id == session_id
+    };
+    let title = {
+        let r = Rc::clone(reader);
+        let active = is_active.clone();
+        Label::new(session_row_title(&session))
+            .single_line(true)
+            .text_style_when(move || {
+                let theme = r();
+                let color = if active() {
+                    theme.surfaces.text
+                } else {
+                    theme.surfaces.text_muted
+                };
+                crate::theme::token_text_style(&theme, theme.text.xs, FontWeight::MEDIUM, color)
+            })
+    };
+    let meta = {
+        let r = Rc::clone(reader);
+        Label::new(session_meta_label(&session))
+            .single_line(true)
+            .text_style_when(move || {
+                let theme = r();
+                crate::theme::token_text_style(
+                    &theme,
+                    theme.text.xs,
+                    FontWeight::NORMAL,
+                    theme.surfaces.text_faint,
+                )
+            })
+    };
+    let icon = {
+        let r = Rc::clone(reader);
+        let kind = session.kind;
+        let active = is_active.clone();
+        Icon::new(IconGlyph::Chat).size(16.0).color_when(move || {
+            let pal = r().surfaces;
+            match kind {
+                ConversationKind::Chat if active() => pal.accent,
+                ConversationKind::Chat => pal.text_faint,
+                ConversationKind::Channel => pal.accent,
+            }
+        })
     };
 
     let labels = Flex::vertical()
         .align_items(Alignment::Start)
-        .with_child(
-            Label::new(session_row_title(&session))
-                .single_line(true)
-                .text_style(title_style),
-        )
-        .with_child(
-            Label::new(session_meta_label(&session))
-                .single_line(true)
-                .text_style(meta_style),
-        );
+        .with_child(title)
+        .with_child(meta);
     let body = Flex::horizontal()
         .main_gap(7.0)
         .align_items(Alignment::Center)
-        .with_child(
-            SizedBox::new()
-                .width(20.0)
-                .height(20.0)
-                .child(Icon::new(IconGlyph::Chat).size(16.0).color(icon_color)),
-        )
+        .with_child(SizedBox::new().width(20.0).height(20.0).child(icon))
         .with_item(labels, FlexItem::flex(1.0).min_width(0.0));
 
     let s = shared.clone();
@@ -12302,11 +12327,10 @@ fn session_row_content(
     let selected_id = session.id.clone();
     let edit = IconButton::new(IconGlyph::MoreHorizontal, format!("Edit {}", session.title))
         .size(SIDEBAR_ROW_EDIT_H)
-        .icon_size(14.0)
         .selected_when(move || {
             selected_shared.chat().session_edit_id.as_deref() == Some(selected_id.as_str())
         })
-        .theme_when(clone_reader(reader))
+        .theme_when(small_control_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
         .tone(SemanticTone::Neutral)
         .on_press_with_ctx(move |ctx| {
@@ -12323,125 +12347,102 @@ fn session_row_content(
         .gap(SIDEBAR_ROW_EDIT_GAP)
 }
 
-/// The sidebar column: AGENTS heading + list, then conversations. Wrapped in a
-/// [`RebuildOnChange`] keyed on the agent/chat signature so it rebuilds when those lists change
-/// (e.g. a new chat is persisted) but not on every token.
+/// The sidebar column: AGENTS heading + list, then conversations. The column is built once; the
+/// agent list is the only part replaced when the agent catalog changes, and conversation rows
+/// are keyed, so filtering and streaming keep the search field's focus and the list's scroll.
 fn sidebar(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .chat_structure
-        .select_named("chat sidebar structure", |key| {
-            key.0
-                .as_deref()
-                .map(ChatStructureSnapshot::sidebar_structure)
+    let agents = {
+        let source = chat_projection(shared, "chat sidebar agents", |snapshot| {
+            snapshot.map(ChatStructureSnapshot::sidebar_structure)
         });
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    let sessions_scroll_state = scroll_state.clone();
-    RebuildOnChange::key_from(source, move |_sig| {
-        let mut column = Flex::vertical()
-            .main_gap(4.0)
-            .align_items(Alignment::Stretch)
-            .with_child(SizedBox::new().height(18.0))
-            .with_child(
-                WidgetPadding::horizontal(18.0, heading(&s, "AGENTS")).fill_child_height(true),
-            )
-            .with_child(SizedBox::new().height(2.0))
-            .with_child(WidgetPadding::horizontal(8.0, agents_list(&s, &r)).fill_child_height(true))
-            .with_child(SizedBox::new().height(16.0))
-            .with_child(WidgetPadding::horizontal(18.0, chats_heading(&s)).fill_child_height(true))
-            .with_child(SizedBox::new().height(6.0))
-            .with_child(
-                WidgetPadding::horizontal(
-                    8.0,
-                    SizedBox::new()
-                        .height(28.0)
-                        .child(session_kind_filter_control(&s, &r)),
-                )
-                .fill_child_height(true),
-            )
-            .with_child(SizedBox::new().height(6.0))
-            .with_child(
-                WidgetPadding::horizontal(8.0, session_filter_input(&s, &r)).fill_child_width(true),
-            )
-            .with_child(SizedBox::new().height(6.0))
-            .with_child(WidgetPadding::horizontal(8.0, session_create_actions(&s, &r)).fill_child())
-            .with_child(SizedBox::new().height(8.0))
-            .with_item(
-                WidgetPadding::horizontal(
-                    8.0,
-                    sessions_scroll_rebuild(&s, &r, &sessions_scroll_state),
-                )
-                .fill_child_height(true),
-                FlexItem::flex(1.0).min_height(0.0),
-            );
-        column = column.with_child(slow_session_load_actions_host(&s, &r));
-        WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
-    })
-}
-
-fn slow_session_load_actions_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared.signals().chat_structure.select_named(
-        "chat slow session recovery structure",
-        |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| {
-                    (
-                        snapshot.theme,
-                        snapshot.session_list_loading,
-                        snapshot.session_list_slow_notice_shown,
-                        snapshot.session_list_details_open,
-                    )
-                })
-                .unwrap_or((
-                    (AppThemeMode::System, AppTextScale::Standard),
-                    false,
-                    false,
-                    false,
-                ))
-        },
-    );
-    let s = shared.clone();
-    let r = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |_structure| {
-        let Some(actions) = slow_session_load_actions(&s, &r) else {
-            return WidgetPod::new(SizedBox::new().height(0.0));
-        };
-        WidgetPod::new(
-            Stack::vertical()
-                .alignment(Alignment::Stretch)
-                .with_child(SizedBox::new().height(8.0))
-                .with_child(WidgetPadding::horizontal(8.0, actions).fill_child_height(true))
-                .with_child(SizedBox::new().height(8.0)),
-        )
-    })
-}
-
-fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<impl Widget + use<>> {
-    let details_open = {
-        let chat = shared.chat();
-        if !(chat.session_list_loading && chat.session_list_slow_notice_shown) {
-            return None;
-        }
-        if !chat.session_list_details_open {
-            return None;
-        }
-        chat.session_list_details_open
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(source, move |_agents| WidgetPod::new(agents_list(&s, &r)))
     };
+    let column = Flex::vertical()
+        .main_gap(4.0)
+        .align_items(Alignment::Stretch)
+        .with_child(SizedBox::new().height(18.0))
+        .with_child(
+            WidgetPadding::horizontal(
+                18.0,
+                SectionLabel::new("AGENTS").theme_when(clone_reader(reader)),
+            )
+            .fill_child_height(true),
+        )
+        .with_child(SizedBox::new().height(2.0))
+        .with_child(WidgetPadding::horizontal(8.0, agents).fill_child_height(true))
+        .with_child(SizedBox::new().height(16.0))
+        .with_child(
+            WidgetPadding::horizontal(18.0, chats_heading(shared, reader)).fill_child_height(true),
+        )
+        .with_child(SizedBox::new().height(6.0))
+        .with_child(
+            WidgetPadding::horizontal(
+                8.0,
+                SizedBox::new()
+                    .height(28.0)
+                    .child(session_kind_filter_control(shared, reader)),
+            )
+            .fill_child_height(true),
+        )
+        .with_child(SizedBox::new().height(6.0))
+        .with_child(
+            WidgetPadding::horizontal(8.0, session_filter_input(shared, reader))
+                .fill_child_width(true),
+        )
+        .with_child(SizedBox::new().height(6.0))
+        .with_child(
+            WidgetPadding::horizontal(8.0, session_create_actions(shared, reader)).fill_child(),
+        )
+        .with_child(SizedBox::new().height(8.0))
+        .with_item(
+            WidgetPadding::horizontal(8.0, sessions_scroll_rebuild(shared, reader, scroll_state))
+                .fill_child_height(true),
+            FlexItem::flex(1.0).min_height(0.0),
+        )
+        .with_child(slow_session_load_actions_host(shared, reader));
+    Surface::sidebar(column)
+        .fill()
+        .theme_when(clone_reader(reader))
+}
 
+/// Slow history-load diagnostics under the conversation list, revealed while the list is still
+/// loading after the slow notice and the user opened its details.
+fn slow_session_load_actions_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let shown = chat_projection(shared, "chat slow session recovery shown", |snapshot| {
+        snapshot.is_some_and(|snapshot| {
+            snapshot.session_list_loading
+                && snapshot.session_list_slow_notice_shown
+                && snapshot.session_list_details_open
+        })
+    });
+    Presence::new(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(SizedBox::new().height(8.0))
+            .with_child(
+                WidgetPadding::horizontal(8.0, slow_session_load_actions(shared, reader))
+                    .fill_child_height(true),
+            )
+            .with_child(SizedBox::new().height(8.0)),
+    )
+    .shown_from(shown)
+    .transition(crate::ui::widgets::reveal_transition())
+    .collapse(Axis::Vertical)
+}
+
+/// The open history-diagnostics panel. It is only shown with its details open, so "Hide" is the
+/// one toggle state it presents.
+fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let details = {
         let s = shared.clone();
-        sui::Button::new(if details_open { "Hide" } else { "Details" })
-            .icon(if details_open {
-                IconGlyph::ChevronUp
-            } else {
-                IconGlyph::ChevronDown
-            })
+        sui::Button::new("Hide")
+            .icon(IconGlyph::ChevronUp)
             .min_height(26.0)
             .min_width(78.0)
             .theme_when(clone_reader(reader))
@@ -12456,9 +12457,8 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
         let s = shared.clone();
         sui::Button::new("Retry")
             .icon(IconGlyph::Redo)
-            .min_height(28.0)
             .min_width(78.0)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .on_press(move || {
                 let waker = { s.borrow().waker.clone() };
                 s.chat_mut().retry_chat_list_with_waker(waker);
@@ -12468,9 +12468,8 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
         let s = shared.clone();
         sui::Button::new("Check SIFS")
             .icon(IconGlyph::Storage)
-            .min_height(28.0)
             .min_width(112.0)
-            .theme_when(clone_reader(reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
             .on_press(move || open_files_tab(&s))
@@ -12479,9 +12478,8 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
         let s = shared.clone();
         sui::Button::new("Connection")
             .icon(IconGlyph::Alert)
-            .min_height(28.0)
             .min_width(128.0)
-            .theme_when(clone_reader(reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Tonal)
             .tone(SemanticTone::Neutral)
             .on_press(move || open_settings_section(&s, SettingsSection::System))
@@ -12508,61 +12506,77 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
     .trailing_width(86.0)
     .trailing_height(26.0)
     .gap(8.0);
-    let mut body = Flex::vertical()
+    let body = Flex::vertical()
         .main_gap(6.0)
         .align_items(Alignment::Stretch)
-        .with_child(SizedBox::new().height(26.0).child(summary));
+        .with_child(SizedBox::new().height(26.0).child(summary))
+        .with_child(muted_label(
+            shared,
+            "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
+        ))
+        .with_child(SizedBox::new().height(28.0).child(actions))
+        .with_child(SizedBox::new().height(28.0).child(connection));
 
-    if details_open {
-        body = body
-            .with_child(muted_label(
-                shared,
-                "Chat and channel history stays in SIFS. You can keep chatting while it syncs.",
-            ))
-            .with_child(SizedBox::new().height(28.0).child(actions))
-            .with_child(SizedBox::new().height(28.0).child(connection));
-    }
-
-    Some(
-        Surface::panel(body)
-            .padding(Insets {
-                left: 10.0,
-                top: 10.0,
-                right: 10.0,
-                bottom: 10.0,
-            })
-            .fill_width(true)
-            .theme_when(clone_reader(reader)),
-    )
+    Surface::panel(body)
+        .padding(Insets {
+            left: 10.0,
+            top: 10.0,
+            right: 10.0,
+            bottom: 10.0,
+        })
+        .fill_width(true)
+        .theme_when(clone_reader(reader))
 }
 
-fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let (rename_pending, details_open) = {
-        let chat = shared.chat();
-        (
-            chat.pending_session_rename.as_ref().is_some_and(|pending| {
-                chat.session_edit_id.as_deref() == Some(pending.session_id.as_str())
-            }),
-            chat.session_edit_details_open,
-        )
-    };
+/// Project one value out of the session editor's state; the default stands in while no session
+/// is being edited.
+fn session_edit_projection<U>(
+    shared: &Shared,
+    name: &'static str,
+    select: impl Fn(&ChatSessionEditStructure) -> U + Send + Sync + 'static,
+) -> ChatProjection<U>
+where
+    U: Clone + Default + PartialEq + Send + Sync + 'static,
+{
+    chat_projection(shared, name, move |snapshot| {
+        snapshot
+            .and_then(ChatSessionEditStructure::from_snapshot)
+            .map(|edit| select(&edit))
+            .unwrap_or_default()
+    })
+}
+
+/// The editor footer: the details toggle, Done, and Save. Labels and icons follow the projected
+/// editor state, so the buttons stay mounted (and focused) while it changes.
+fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let save = {
         let s = shared.clone();
-        sui::Button::new(if rename_pending { "Saving…" } else { "Save" })
-            .focus_on_press(!cfg!(target_os = "android"))
-            .appearance(sui::ButtonAppearance::Filled)
-            .tone(SemanticTone::Accent)
-            .min_width(64.0)
-            .theme_when(clone_reader(reader))
-            .enabled_when({
-                let s = s.clone();
-                move || s.chat().can_save_session_title()
-            })
-            .on_press_with_ctx(move |ctx| {
-                s.chat_mut().save_session_title();
-                ctx.request_measure();
-                ctx.request_paint();
-            })
+        let rename_pending =
+            session_edit_projection(shared, "chat session editor save label", |edit| {
+                if edit.rename_pending {
+                    "Saving…".to_string()
+                } else {
+                    "Save".to_string()
+                }
+            });
+        label_from(
+            sui::Button::new("Save")
+                .focus_on_press(!cfg!(target_os = "android"))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Accent)
+                .min_width(64.0)
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_save_session_title()
+                })
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().save_session_title();
+                    ctx.request_measure();
+                    ctx.request_paint();
+                }),
+            rename_pending,
+        )
     };
     let done = {
         let s = shared.clone();
@@ -12579,63 +12593,71 @@ fn session_edit_dialog_actions(shared: &Shared, reader: &ThemeReader) -> WidgetP
     };
     let details_toggle = {
         let s = shared.clone();
-        sui::Button::new(if details_open {
-            "Hide details"
-        } else {
-            "Show details"
-        })
-        .icon(if details_open {
-            IconGlyph::ChevronUp
-        } else {
-            IconGlyph::ChevronDown
-        })
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Ghost)
-        .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_session_edit_details();
-            ctx.request_measure();
-            ctx.request_paint();
-            ctx.request_semantics();
-        })
+        let details_open =
+            session_edit_projection(shared, "chat session editor details toggle", |edit| {
+                edit.details_open
+            });
+        Restyle::new(
+            sui::Button::new("Show details")
+                .icon(IconGlyph::ChevronDown)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_session_edit_details();
+                    ctx.request_measure();
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }),
+            details_open,
+            |mut button, open| {
+                button.set_label(if *open {
+                    "Hide details"
+                } else {
+                    "Show details"
+                });
+                button.icon(if *open {
+                    IconGlyph::ChevronUp
+                } else {
+                    IconGlyph::ChevronDown
+                })
+            },
+        )
     };
 
-    WidgetPod::new(
-        Stack::vertical()
-            .gap(16.0)
-            .alignment(Alignment::Stretch)
-            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-            .with_child(
-                Flex::horizontal()
-                    .gap(8.0)
-                    .wrap(FlexWrap::Wrap)
-                    .align_items(Alignment::Center)
-                    .justify(sui::FlexJustify::End)
-                    .with_child(details_toggle)
-                    .spacer()
-                    .with_item(
-                        Flex::horizontal()
-                            .gap(8.0)
-                            .with_child(done)
-                            .with_child(save),
-                        FlexItem::new().no_shrink(),
-                    ),
-            ),
-    )
+    Stack::vertical()
+        .gap(16.0)
+        .alignment(Alignment::Stretch)
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+        .with_child(
+            Flex::horizontal()
+                .gap(8.0)
+                .wrap(FlexWrap::Wrap)
+                .align_items(Alignment::Center)
+                .justify(sui::FlexJustify::End)
+                .with_child(details_toggle)
+                .spacer()
+                .with_item(
+                    Flex::horizontal()
+                        .gap(8.0)
+                        .with_child(done)
+                        .with_child(save),
+                    FlexItem::new().no_shrink(),
+                ),
+        )
 }
 
-fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let (
-        session,
-        draft,
-        confirming_delete,
-        details_open,
-        participants,
-        agent_status,
-        agent_keys,
-        agent_options,
-        rename_error,
-    ) = {
+/// Channel membership for the session being edited, as the editor's agent list presents it.
+struct SessionEditMembership {
+    session: SessionRef,
+    participants: Vec<ChannelAgentRef>,
+    agent_status: Option<ChannelAgentsStoreStatus>,
+    agent_keys: Vec<String>,
+    agent_options: Vec<String>,
+}
+
+impl SessionEditMembership {
+    fn current(shared: &Shared) -> Option<Self> {
         let chat = shared.chat();
         let edit_id = chat.session_edit_id.as_deref()?;
         let session = chat
@@ -12676,56 +12698,63 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
         } else {
             channel_agents_store_status(&participants, creating_channel, chat.notice.as_deref())
         };
-        let agent_keys = chat
-            .agents
-            .iter()
-            .map(|agent| agent.key.clone())
-            .collect::<Vec<_>>();
-        let agent_options = chat
-            .agents
-            .iter()
-            .map(|agent| agent.name.clone())
-            .collect::<Vec<_>>();
-        let rename_error = chat
-            .session_rename_error
-            .as_ref()
-            .filter(|error| error.session_id == edit_id)
-            .map(|error| error.detail.clone());
-        (
+        Some(Self {
+            agent_keys: chat.agents.iter().map(|agent| agent.key.clone()).collect(),
+            agent_options: chat.agents.iter().map(|agent| agent.name.clone()).collect(),
             session,
-            chat.session_title_draft.clone(),
-            chat.session_delete_confirm_id.as_deref() == Some(edit_id),
-            chat.session_edit_details_open,
             participants,
             agent_status,
-            agent_keys,
-            agent_options,
-            rename_error,
-        )
-    };
-    let session_id = session.id.clone();
-    let is_channel = session.kind == ConversationKind::Channel;
-    let participant_count = if is_channel {
-        participants
-            .len()
-            .max(session.participant_count)
-            .max(session.participant_names.len())
-    } else {
-        session.participant_count
-    };
-    let participant_names = if is_channel {
-        let names = participants
+        })
+    }
+
+    fn participant_count(&self) -> usize {
+        if self.session.kind == ConversationKind::Channel {
+            self.participants
+                .len()
+                .max(self.session.participant_count)
+                .max(self.session.participant_names.len())
+        } else {
+            self.session.participant_count
+        }
+    }
+
+    fn participant_names(&self) -> Vec<String> {
+        if self.session.kind != ConversationKind::Channel {
+            return Vec::new();
+        }
+        let names = self
+            .participants
             .iter()
             .map(|participant| participant.agent_name.clone())
             .collect::<Vec<_>>();
         if names.is_empty() {
-            session.participant_names.clone()
+            self.session.participant_names.clone()
         } else {
             names
         }
-    } else {
-        Vec::new()
+    }
+}
+
+/// The editor body, mounted once per edited session. The title field keeps its edit buffer and
+/// focus; hints, the agent list, details, and the delete confirmation each follow their own
+/// slice of the editor state.
+fn session_edit_dialog_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll: &ScrollState,
+) -> Option<impl Widget + use<>> {
+    let (session, draft) = {
+        let chat = shared.chat();
+        let edit_id = chat.session_edit_id.as_deref()?;
+        let session = chat
+            .sessions
+            .iter()
+            .find(|session| session.id == edit_id)
+            .cloned()?;
+        (session, chat.session_title_draft.clone())
     };
+    let session_id = session.id.clone();
+    let is_channel = session.kind == ConversationKind::Channel;
     let placeholder = if is_channel {
         "Channel title"
     } else {
@@ -12743,114 +12772,111 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
                 s.chat_mut().set_session_title_draft(value);
             })
     };
-    let mut body = Stack::vertical()
-        .gap(14.0)
-        .alignment(Alignment::Stretch)
-        .with_child(
-            sui::PropertyRow::new(
-                if is_channel {
-                    "Channel name"
-                } else {
-                    "Chat name"
-                },
-                input,
-            )
-            .stacked()
-            .gap(8.0)
-            .theme_when(clone_reader(reader)),
-        );
-    if is_untitled_channel(&session) {
-        body = body.with_child(muted_label(
-            shared,
-            "Add a name so this channel is easy to find.",
-        ));
-    }
-    if let Some(error) = rename_error {
-        body = body.with_child(muted_label(
-            shared,
-            format!("Rename failed: {error}. Edit the title or retry Save."),
-        ));
-    }
+    let mut body = Stack::vertical().alignment(Alignment::Stretch).with_child(
+        sui::PropertyRow::new(
+            if is_channel {
+                "Channel name"
+            } else {
+                "Chat name"
+            },
+            input,
+        )
+        .stacked()
+        .gap(8.0)
+        .theme_when(clone_reader(reader)),
+    );
     if is_channel {
-        body = body
-            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-            .with_child(channel_agents_editor(
-                shared,
-                reader,
-                session_id.clone(),
-                participants,
-                agent_status,
-                agent_keys,
-                agent_options,
-            ));
+        let untitled = session_edit_projection(shared, "chat session editor untitled", |edit| {
+            edit.kind == ConversationKind::Channel
+                && edit.title.trim().eq_ignore_ascii_case("new channel")
+        });
+        body = body.with_child(revealed(
+            14.0,
+            muted_label(shared, "Add a name so this channel is easy to find."),
+            untitled,
+        ));
+    }
+    let rename_error = {
+        let text = session_edit_projection(shared, "chat session editor rename error", |edit| {
+            edit.rename_error
+                .as_ref()
+                .map(|error| format!("Rename failed: {error}. Edit the title or retry Save."))
+                .unwrap_or_default()
+        });
+        let shown = session_edit_projection(shared, "chat session editor rename failed", |edit| {
+            edit.rename_error.is_some()
+        });
+        revealed(14.0, muted_label(shared, "").text_from(text), shown)
+    };
+    body = body.with_child(rename_error);
+
+    let membership = session_edit_projection(shared, "chat session editor membership", |edit| {
+        edit.membership.clone()
+    });
+    if is_channel {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let channel_id = session_id.clone();
+        let agents = RebuildOnChange::key_from(membership.clone(), move |_membership| {
+            let Some(current) = SessionEditMembership::current(&s) else {
+                return WidgetPod::new(SizedBox::new());
+            };
+            WidgetPod::new(channel_agents_editor(
+                &s,
+                &r,
+                channel_id.clone(),
+                current.participants,
+                current.agent_status,
+                current.agent_keys,
+                current.agent_options,
+            ))
+        });
+        body = body.with_child(
+            WidgetPadding::new(
+                Insets {
+                    left: 0.0,
+                    top: 14.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                },
+                Stack::vertical()
+                    .gap(14.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+                    .with_child(agents),
+            )
+            .fill_child_width(true),
+        );
     }
 
-    if details_open {
-        body = body.with_child(session_edit_details(
-            shared,
-            &session,
-            participant_count,
-            &participant_names,
-        ));
-    }
+    let details = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let content = RebuildOnChange::key_from(membership, move |_membership| {
+            let Some(current) = SessionEditMembership::current(&s) else {
+                return WidgetPod::new(SizedBox::new());
+            };
+            WidgetPod::new(session_edit_details(
+                &s,
+                &r,
+                &current.session,
+                current.participant_count(),
+                &current.participant_names(),
+            ))
+        });
+        let shown = session_edit_projection(shared, "chat session editor details shown", |edit| {
+            edit.details_open
+        });
+        revealed(14.0, content, shown)
+    };
+    body = body.with_child(details);
 
     let delete_label = if is_channel {
         "Delete channel"
     } else {
         "Delete chat"
     };
-    if confirming_delete {
-        let confirm_title = compact_line(&session.title, 34);
-        let confirm = {
-            let s = shared.clone();
-            sui::Button::new(delete_label)
-                .icon(IconGlyph::Trash)
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Filled)
-                .tone(SemanticTone::Danger)
-                .on_press_with_ctx(move |ctx| {
-                    let waker = s.borrow().waker.clone();
-                    s.chat_mut().confirm_delete_session(waker);
-                    ctx.request_measure();
-                    ctx.request_paint();
-                })
-        };
-        let cancel = {
-            let s = shared.clone();
-            sui::Button::new("Cancel")
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .on_press_with_ctx(move |ctx| {
-                    s.chat_mut().cancel_delete_session();
-                    ctx.request_measure();
-                    ctx.request_paint();
-                })
-        };
-        let confirmation = Stack::vertical()
-            .gap(12.0)
-            .alignment(Alignment::Stretch)
-            .with_child(dialog_section_label(shared, &format!("{delete_label}?")))
-            .with_child(muted_label(
-                shared,
-                format!("Permanently delete \"{confirm_title}\"? This cannot be undone."),
-            ))
-            .with_child(
-                Flex::horizontal()
-                    .gap(6.0)
-                    .align_items(Alignment::Center)
-                    .with_child(cancel)
-                    .spacer()
-                    .with_child(confirm),
-            );
-        body = body.with_child(
-            Surface::panel(confirmation)
-                .appearance(SurfaceAppearance::Soft)
-                .tone(SemanticTone::Danger)
-                .padding(Insets::all(14.0))
-                .theme_when(clone_reader(reader)),
-        );
-    } else if details_open {
+    let delete_row = {
         let delete_session_id = session.id.clone();
         let delete = {
             let s = shared.clone();
@@ -12879,33 +12905,101 @@ fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<Wid
         } else {
             "Permanently remove this chat and its history."
         };
-        body = body.with_child(
-            Flex::horizontal()
-                .gap(12.0)
-                .wrap(FlexWrap::Wrap)
-                .justify(sui::FlexJustify::End)
-                .align_items(Alignment::Center)
-                .with_item(
-                    Stack::vertical()
-                        .gap(4.0)
-                        .alignment(Alignment::Stretch)
-                        .with_child(dialog_section_label(shared, "Remove conversation"))
-                        .with_child(muted_label(shared, delete_hint)),
-                    FlexItem::fill().min_width(140.0),
-                )
-                .with_item(delete, FlexItem::new().no_shrink()),
-        );
-    }
+        Flex::horizontal()
+            .gap(12.0)
+            .wrap(FlexWrap::Wrap)
+            .justify(sui::FlexJustify::End)
+            .align_items(Alignment::Center)
+            .with_item(
+                Stack::vertical()
+                    .gap(4.0)
+                    .alignment(Alignment::Stretch)
+                    .with_child(dialog_section_label(shared, "Remove conversation"))
+                    .with_child(muted_label(shared, delete_hint)),
+                FlexItem::fill().min_width(140.0),
+            )
+            .with_item(delete, FlexItem::new().no_shrink())
+    };
+    let confirmation = {
+        let confirm = {
+            let s = shared.clone();
+            sui::Button::new(delete_label)
+                .icon(IconGlyph::Trash)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Danger)
+                .on_press_with_ctx(move |ctx| {
+                    let waker = s.borrow().waker.clone();
+                    s.chat_mut().confirm_delete_session(waker);
+                    ctx.request_measure();
+                    ctx.request_paint();
+                })
+        };
+        let cancel = {
+            let s = shared.clone();
+            sui::Button::new("Cancel")
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Tonal)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().cancel_delete_session();
+                    ctx.request_measure();
+                    ctx.request_paint();
+                })
+        };
+        let prompt = session_edit_projection(shared, "chat session editor delete prompt", |edit| {
+            format!(
+                "Permanently delete \"{}\"? This cannot be undone.",
+                compact_line(&edit.title, 34)
+            )
+        });
+        let confirmation = Stack::vertical()
+            .gap(12.0)
+            .alignment(Alignment::Stretch)
+            .with_child(dialog_section_label(shared, format!("{delete_label}?")))
+            .with_child(muted_label(shared, "").text_from(prompt))
+            .with_child(
+                Flex::horizontal()
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .with_child(cancel)
+                    .spacer()
+                    .with_child(confirm),
+            );
+        Surface::panel(confirmation)
+            .appearance(SurfaceAppearance::Soft)
+            .tone(SemanticTone::Danger)
+            .padding(Insets::all(14.0))
+            .theme_when(clone_reader(reader))
+    };
+    // Details reveal the delete row; requesting deletion swaps it for the confirmation.
+    let delete_step = session_edit_projection(shared, "chat session editor delete step", |edit| {
+        usize::from(edit.confirming_delete)
+    });
+    let delete_shown =
+        session_edit_projection(shared, "chat session editor delete shown", |edit| {
+            edit.details_open || edit.confirming_delete
+        });
+    body = body.with_child(revealed(
+        14.0,
+        SwitchView::new()
+            .selected_from(delete_step)
+            .with_child(delete_row)
+            .with_child(confirmation),
+        delete_shown,
+    ));
 
-    Some(WidgetPod::new(
+    Some(
         ScrollView::vertical(body)
             .name("chat-session-editor-scroll")
             .shrink_height(true)
-            .state(ScrollState::new())
-            .theme(reader()),
-    ))
+            .state(scroll.clone())
+            .theme_when(clone_reader(reader)),
+    )
 }
 
+/// The session editor dialog. [`ChatDialogHost`] mounts it once per edited session; clicks and
+/// conversation progress inside it update its parts in place.
 fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let title = {
         let chat = shared.chat();
@@ -12916,31 +13010,11 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             ConversationKind::Chat => "Edit chat",
         }
     };
-    let source =
-        shared
-            .signals()
-            .chat_structure
-            .select_named("chat session editor structure", |key| {
-                key.0
-                    .as_deref()
-                    .and_then(ChatSessionEditStructure::from_snapshot)
-            });
-    let content_shared = shared.clone();
-    let content_reader = Rc::clone(reader);
-    let body = RebuildOnChange::key_from(source.clone(), move |_structure| {
-        session_edit_dialog_body(&content_shared, &content_reader)
-            .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
-    });
-    let footer_shared = shared.clone();
-    let footer_reader = Rc::clone(reader);
-    let footer = RebuildOnChange::key_from(source, move |_| {
-        session_edit_dialog_actions(&footer_shared, &footer_reader)
-    });
+    let scroll = ScrollState::new();
+    let body = session_edit_dialog_body(shared, reader, &scroll)?;
     let close = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Close, "Close edit dialog")
-            .size(28.0)
-            .icon_size(14.0)
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
@@ -12954,11 +13028,10 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
         sui::Dialog::new(title, body)
-            .theme(shared.theme())
-            .max_width(520.0)
+            .theme_when(clone_reader(reader))
             .description("Make it easy to find.")
             .header_action(close)
-            .action(footer)
+            .action(session_edit_dialog_actions(shared, reader))
             .dismiss_on_scrim(true)
             .on_dismiss(move || {
                 dismiss_shared.chat_mut().close_session_edit();
@@ -13047,16 +13120,14 @@ fn channel_agents_editor(
                     _ => format!("Waiting for {remove_label}"),
                 };
                 IconButton::new(IconGlyph::Alert, action_label)
-                    .size(26.0)
-                    .icon_size(14.0)
+                    .size(CHANNEL_AGENT_ROW_ACTION)
                     .enabled(false)
                     .theme_when(clone_reader(reader))
             } else {
                 let s = shared.clone();
                 let enabled_shared = shared.clone();
                 IconButton::new(IconGlyph::Trash, format!("Remove {remove_label}"))
-                    .size(26.0)
-                    .icon_size(14.0)
+                    .size(CHANNEL_AGENT_ROW_ACTION)
                     .theme_when(clone_reader(reader))
                     .enabled_when(move || enabled_shared.chat().pending_channel_config.is_none())
                     .on_press_with_ctx(move |ctx| {
@@ -13263,18 +13334,18 @@ fn chat_overlay(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     }
 }
 
+/// Which overlay shell is mounted. Only opening, closing, or switching the overlay replaces the
+/// shell; its contents and the theme update in place, so clicks inside never restart its
+/// entrance or drop focus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ChatOverlayKey {
     Hidden,
-    /// Retain the dialog while its body changes. Theme changes intentionally replace the outer
-    /// dialog so its non-reactive frame tokens stay current.
     SessionEdit {
         session_id: String,
-        theme: (AppThemeMode, AppTextScale),
     },
     /// The sidebar and its keyed rows observe their own content. Retain the
     /// drawer frame while filtering so its editor keeps focus and IME state.
-    CompactDrawer((AppThemeMode, AppTextScale)),
+    CompactDrawer,
 }
 
 impl ChatOverlayKey {
@@ -13283,12 +13354,9 @@ impl ChatOverlayKey {
             return Self::Hidden;
         };
         if let Some(session_id) = snapshot.session_edit_id.clone() {
-            Self::SessionEdit {
-                session_id,
-                theme: snapshot.theme,
-            }
+            Self::SessionEdit { session_id }
         } else if snapshot.compact_drawer_open {
-            Self::CompactDrawer(snapshot.theme)
+            Self::CompactDrawer
         } else {
             Self::Hidden
         }
@@ -13458,46 +13526,19 @@ fn media_call_panel_signature_for(chat: &ChatState) -> MediaCallPanelSignature {
     }
 }
 
+/// The voice and video panel. It is built once; titles, toggles, and device lists follow their own
+/// projections of the call state, so device changes and toggles never replace the panel.
 fn media_call_panel(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source = shared
-        .signals()
-        .chat_structure
-        .select_named("chat media call structure", |key| {
-            key.0
-                .as_deref()
-                .map(|snapshot| (snapshot.theme, snapshot.media_panel.clone()))
-        });
-    let build_shared = shared.clone();
-    let build_reader = Rc::clone(reader);
-    RebuildOnChange::key_from(source, move |signature| {
-        let signature = &signature
-            .as_ref()
-            .expect("media panel is built only after chat is ready")
-            .1;
-        media_call_panel_body(&build_shared, &build_reader, signature)
-    })
+    media_call_panel_frame(shared, reader, media_call_three_column_body(shared, reader))
 }
 
-fn media_call_panel_body(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> WidgetPod {
-    media_call_panel_frame(
-        shared,
-        reader,
-        media_call_three_column_body(shared, reader, signature),
-    )
-}
-
-fn media_call_panel_frame<W>(shared: &Shared, reader: &ThemeReader, body: W) -> WidgetPod
+fn media_call_panel_frame<W>(shared: &Shared, reader: &ThemeReader, body: W) -> impl Widget + use<W>
 where
     W: Widget + 'static,
 {
     let close_shared = shared.clone();
     let close = IconButton::new(IconGlyph::Close, "Close video call")
         .description("End the call and close audio/video setup")
-        .size(32.0)
         .icon_size(16.0)
         .appearance(sui::ButtonAppearance::Ghost)
         .tone(SemanticTone::Neutral)
@@ -13516,40 +13557,34 @@ where
     )
     .fill_child();
     let s = shared.clone();
-    WidgetPod::new(
-        SemanticRegion::new(
-            "Media call",
-            Surface::new(
-                SurfaceRole::Panel,
-                Dock::new(body).top(MEDIA_CALL_HEADER_H, header),
-            )
-            .border(SurfaceBorder::Bottom)
-            .corner_radius(0.0)
-            .fill()
-            .theme_when(clone_reader(reader)),
+    SemanticRegion::new(
+        "Media call",
+        Surface::new(
+            SurfaceRole::Panel,
+            Dock::new(body).top(MEDIA_CALL_HEADER_H, header),
         )
-        .description_when(move || media_call_accessibility_summary(&s)),
+        .border(SurfaceBorder::Bottom)
+        .corner_radius(0.0)
+        .fill()
+        .theme_when(clone_reader(reader)),
     )
+    .description_when(move || media_call_accessibility_summary(&s))
 }
 
-fn media_call_three_column_body(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
+fn media_call_three_column_body(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let columns = Flex::horizontal()
         .gap(10.0)
         .align_items(Alignment::Stretch)
         .with_item(
-            media_call_agent_video_column(shared, reader, signature),
+            media_call_agent_video_column(shared, reader),
             FlexItem::fixed(196.0).min_height(276.0),
         )
         .with_item(
-            media_call_user_video_column(shared, reader, signature),
+            media_call_user_video_column(shared, reader),
             FlexItem::fixed(196.0).min_height(276.0),
         )
         .with_item(
-            media_call_control_column(shared, reader, signature),
+            media_call_control_column(shared, reader),
             FlexItem::fixed(274.0).min_height(276.0),
         );
     let columns = ScrollView::horizontal(columns)
@@ -13559,61 +13594,80 @@ fn media_call_three_column_body(
     WidgetPadding::symmetric(PAD, 8.0, columns).fill_child()
 }
 
-fn media_call_agent_video_column(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
-    let avatar = Align::center(MediaAvatarWidget::new(
-        crate::ui::shell::logo_image_handle(),
-        format!("{} avatar", signature.agent_name),
-        Size::new(92.0, 92.0),
-        IconGlyph::Sparkles,
-        shared.theme().palette.text_muted,
-    ));
+fn media_call_agent_name(shared: &Shared) -> ChatProjection<String> {
+    chat_projection(shared, "media call agent name", |snapshot| {
+        snapshot
+            .map(|snapshot| snapshot.media_panel.agent_name.clone())
+            .unwrap_or_default()
+    })
+}
+
+fn media_call_agent_video_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    // The avatar image names the agent in its semantics; it is a single image leaf.
+    let avatar = {
+        let s = shared.clone();
+        RebuildOnChange::key_from(media_call_agent_name(shared), move |agent_name| {
+            WidgetPod::new(Align::center(MediaAvatarWidget::new(
+                s.clone(),
+                crate::ui::shell::logo_image_handle(),
+                format!("{agent_name} avatar"),
+                Size::new(92.0, 92.0),
+                IconGlyph::Sparkles,
+            )))
+        })
+    };
+    let name = media_call_agent_name(shared);
     media_call_participant_column(
         shared,
         reader,
         "Agent video",
-        signature.agent_name.clone(),
-        "Avatar shown until the agent publishes video.",
+        small_label(shared, name.get()).text_from(name),
+        small_label(shared, "Avatar shown until the agent publishes video."),
         avatar,
     )
 }
 
-fn media_call_user_video_column(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
+fn media_call_user_video_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let placeholder = Align::center(
         MediaAvatarWidget::new(
+            shared.clone(),
             LucideIcon::User.handle(),
             "User avatar placeholder",
             Size::new(58.0, 58.0),
             IconGlyph::Chat,
-            shared.theme().palette.text_muted,
         )
-        .tint(shared.theme().palette.text_muted),
+        .tinted(),
     );
     let visual = SwitchView::new()
-        .selected(signature.camera_enabled as usize)
+        .selected_from(chat_projection(
+            shared,
+            "media call user visual",
+            |snapshot| {
+                usize::from(snapshot.is_some_and(|snapshot| snapshot.media_panel.camera_enabled))
+            },
+        ))
         .with_child(placeholder)
         .with_child(MediaCameraPreviewWidget::new(shared.clone()));
+    let title = chat_projection(shared, "media call user title", |snapshot| {
+        if snapshot.is_some_and(|snapshot| snapshot.media_panel.camera_enabled) {
+            "Camera preview".to_string()
+        } else {
+            "Video off".to_string()
+        }
+    });
+    let description = chat_projection(shared, "media call user description", |snapshot| {
+        if snapshot.is_some_and(|snapshot| snapshot.media_panel.camera_enabled) {
+            "Preview from the selected video source.".to_string()
+        } else {
+            "Enable video when you want to share the camera.".to_string()
+        }
+    });
     media_call_participant_column(
         shared,
         reader,
         "Your video",
-        if signature.camera_enabled {
-            "Camera preview".to_string()
-        } else {
-            "Video off".to_string()
-        },
-        if signature.camera_enabled {
-            "Preview from the selected video source."
-        } else {
-            "Enable video when you want to share the camera."
-        },
+        small_label(shared, title.get()).text_from(title),
+        small_label(shared, description.get()).text_from(description),
         visual,
     )
 }
@@ -13622,8 +13676,8 @@ fn media_call_participant_column<W>(
     shared: &Shared,
     reader: &ThemeReader,
     semantic_name: &'static str,
-    title: String,
-    description: &'static str,
+    title: Label,
+    description: Label,
     visual: W,
 ) -> impl Widget + use<W>
 where
@@ -13634,12 +13688,8 @@ where
     let content = Stack::vertical()
         .gap(4.0)
         .alignment(Alignment::Stretch)
-        .with_child(small_label(shared, title).color_when(move || palette(&title_shared).text))
-        .with_child(
-            Label::new(description)
-                .text_style(small_theme_text_style(&reader()))
-                .color_when(move || palette(&description_shared).text_faint),
-        )
+        .with_child(title.color_when(move || palette(&title_shared).text))
+        .with_child(description.color_when(move || palette(&description_shared).text_faint))
         .with_child(SizedBox::new().height(160.0).child(visual));
     SemanticRegion::new(
         semantic_name,
@@ -13650,35 +13700,38 @@ where
     .role(SemanticsRole::GenericContainer)
 }
 
+/// A participant image with a glyph fallback. Its tint and fallback color come from the live
+/// theme, so a theme change repaints it in place.
 struct MediaAvatarWidget {
+    shared: Shared,
     handle: ImageHandle,
     label: String,
     size: Size,
-    tint: Option<Color>,
+    tinted: bool,
     fallback: IconGlyph,
-    fallback_color: Color,
 }
 
 impl MediaAvatarWidget {
     fn new(
+        shared: Shared,
         handle: ImageHandle,
         label: impl Into<String>,
         size: Size,
         fallback: IconGlyph,
-        fallback_color: Color,
     ) -> Self {
         Self {
+            shared,
             handle,
             label: label.into(),
             size,
-            tint: None,
+            tinted: false,
             fallback,
-            fallback_color,
         }
     }
 
-    fn tint(mut self, tint: Color) -> Self {
-        self.tint = Some(tint);
+    /// Draw the image in the theme's muted text color.
+    fn tinted(mut self) -> Self {
+        self.tinted = true;
         self
     }
 }
@@ -13689,11 +13742,12 @@ impl Widget for MediaAvatarWidget {
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
+        let muted = self.shared.theme().palette.text_muted;
         let rect = centered_rect(ctx.bounds(), self.size);
         if ctx.image_registered(self.handle) {
             let mut source = ImageSource::new(self.handle);
-            if let Some(tint) = self.tint {
-                source = source.with_tint(tint);
+            if self.tinted {
+                source = source.with_tint(muted);
             }
             ctx.draw_image_source(rect, source);
         } else {
@@ -13701,7 +13755,7 @@ impl Widget for MediaAvatarWidget {
                 ctx,
                 self.fallback,
                 centered_rect(rect, Size::new(28.0, 28.0)),
-                self.tint.unwrap_or(self.fallback_color),
+                muted,
             );
         }
     }
@@ -13861,24 +13915,20 @@ fn centered_rect(bounds: Rect, size: Size) -> Rect {
     )
 }
 
-fn media_call_control_column(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
+fn media_call_control_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let content = Stack::vertical()
         .gap(8.0)
         .alignment(Alignment::Stretch)
-        .with_child(media_call_video_source_control(shared, reader, signature))
+        .with_child(media_call_video_source_control(shared, reader))
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-        .with_child(media_call_audio_source_control(shared, reader, signature))
+        .with_child(media_call_audio_source_control(shared, reader))
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-        .with_child(media_call_model_control(shared, reader, signature))
-        .with_child(SizedBox::new().height(36.0).child(media_call_toggle_button(
-            shared,
-            reader,
-            signature.active,
-        )));
+        .with_child(media_call_model_control(shared, reader))
+        .with_child(
+            SizedBox::new()
+                .height(36.0)
+                .child(media_call_toggle_button(shared, reader)),
+        );
     SemanticRegion::new(
         "Call controls",
         Surface::field(WidgetPadding::symmetric(10.0, 8.0, content).fill_child())
@@ -13888,19 +13938,44 @@ fn media_call_control_column(
     .role(SemanticsRole::GenericContainer)
 }
 
-fn media_call_video_source_control(
+/// One switch between two prebuilt variants of a control, following a projected flag.
+fn media_call_toggle<A, B>(
     shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
+    name: &'static str,
+    select: fn(&MediaCallPanelSignature) -> bool,
+    off: A,
+    on: B,
+) -> SwitchView
+where
+    A: Widget + 'static,
+    B: Widget + 'static,
+{
+    SwitchView::new()
+        .selected_from(chat_projection(shared, name, move |snapshot| {
+            usize::from(snapshot.is_some_and(|snapshot| select(&snapshot.media_panel)))
+        }))
+        .with_child(off)
+        .with_child(on)
+}
+
+fn media_call_video_source_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let selected_shared = shared.clone();
     let change_shared = shared.clone();
     let selector = media_call_device_selector(
+        shared,
         "Video device",
-        signature.cameras.clone(),
+        None,
+        |signature| signature.cameras.clone(),
         move || Some(selected_shared.chat().media_setup.camera_index),
-        move |index, _| change_shared.chat_mut().media_setup.select_camera(index),
+        move |index| change_shared.chat_mut().media_setup.select_camera(index),
         reader,
+    );
+    let camera = media_call_toggle(
+        shared,
+        "media call camera button",
+        |signature| signature.camera_enabled,
+        media_call_camera_button(shared, reader, false),
+        media_call_camera_button(shared, reader, true),
     );
     Stack::vertical()
         .gap(3.0)
@@ -13915,32 +13990,34 @@ fn media_call_video_source_control(
                     .gap(6.0)
                     .align_items(Alignment::Stretch)
                     .with_item(selector, FlexItem::flex(1.0).min_width(90.0))
-                    .with_item(
-                        media_call_camera_button(shared, reader, signature.camera_enabled),
-                        FlexItem::fixed(108.0).min_height(30.0),
-                    ),
+                    .with_item(camera, FlexItem::fixed(108.0).min_height(30.0)),
             ),
         )
 }
 
-fn media_call_audio_source_control(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
+fn media_call_audio_source_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let selected_shared = shared.clone();
     let change_shared = shared.clone();
     let selector = media_call_device_selector(
+        shared,
         "Audio device",
-        signature.microphones.clone(),
+        None,
+        |signature| signature.microphones.clone(),
         move || Some(selected_shared.chat().media_setup.microphone_index),
-        move |index, _| {
+        move |index| {
             change_shared
                 .chat_mut()
                 .media_setup
                 .select_microphone(index)
         },
         reader,
+    );
+    let mic = media_call_toggle(
+        shared,
+        "media call microphone button",
+        |signature| signature.mic_enabled,
+        media_call_mic_button(shared, reader, false),
+        media_call_mic_button(shared, reader, true),
     );
     let label_shared = shared.clone();
     Stack::vertical()
@@ -13956,30 +14033,26 @@ fn media_call_audio_source_control(
                     .gap(6.0)
                     .align_items(Alignment::Stretch)
                     .with_item(selector, FlexItem::flex(1.0).min_width(90.0))
-                    .with_item(
-                        media_call_mic_button(shared, reader, signature.mic_enabled),
-                        FlexItem::fixed(108.0).min_height(30.0),
-                    ),
+                    .with_item(mic, FlexItem::fixed(108.0).min_height(30.0)),
             ),
         )
 }
 
-fn media_call_model_control(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
+fn media_call_model_control(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let selected_shared = shared.clone();
     let change_shared = shared.clone();
-    let selector = sui::Select::new("Realtime model")
-        .options(signature.realtime_models.clone())
-        .placeholder("No realtime models")
-        .selected_when(move || {
+    let selector = media_call_device_selector(
+        shared,
+        "Realtime model",
+        Some("No realtime models"),
+        |signature| signature.realtime_models.clone(),
+        move || {
             let chat = selected_shared.chat();
             (!chat.current_realtime_models().is_empty()).then_some(chat.media_call.model_idx)
-        })
-        .theme_when(clone_reader(reader))
-        .on_change(move |index, _| change_shared.chat_mut().set_media_call_model(index));
+        },
+        move |index| change_shared.chat_mut().set_media_call_model(index),
+        reader,
+    );
     let label_shared = shared.clone();
     Stack::vertical()
         .gap(3.0)
@@ -13990,22 +14063,40 @@ fn media_call_model_control(
         .with_child(SizedBox::new().height(36.0).child(selector))
 }
 
+/// A media `Select` whose option list is the only thing that replaces it. The selection reads the
+/// live call state, so choosing a device or model keeps the control mounted.
 fn media_call_device_selector<S, C>(
+    shared: &Shared,
     name: &'static str,
-    options: Vec<String>,
+    placeholder: Option<&'static str>,
+    options: fn(&MediaCallPanelSignature) -> Vec<String>,
     selected_when: S,
     on_change: C,
     reader: &ThemeReader,
-) -> sui::Select
+) -> impl Widget + use<S, C>
 where
-    S: Fn() -> Option<usize> + 'static,
-    C: FnMut(usize, String) + 'static,
+    S: Fn() -> Option<usize> + Clone + 'static,
+    C: Fn(usize) + Clone + 'static,
 {
-    sui::Select::new(name)
-        .options(options)
-        .selected_when(selected_when)
-        .theme_when(clone_reader(reader))
-        .on_change(on_change)
+    let source = chat_projection(shared, name, move |snapshot| {
+        snapshot
+            .map(|snapshot| options(&snapshot.media_panel))
+            .unwrap_or_default()
+    });
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |options| {
+        let selected_when = selected_when.clone();
+        let on_change = on_change.clone();
+        let mut select = sui::Select::new(name)
+            .options(options.clone())
+            .selected_when(selected_when)
+            .theme_when(clone_reader(&r))
+            .on_change(move |index, _| on_change(index));
+        if let Some(placeholder) = placeholder {
+            select = select.placeholder(placeholder);
+        }
+        WidgetPod::new(select)
+    })
 }
 
 fn media_call_mic_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -> sui::Button {
@@ -14019,7 +14110,6 @@ fn media_call_mic_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -
         .semantic_name(semantic_name)
         .description("Toggle audio input for the call")
         .icon(icon)
-        .icon_size(14.0)
         .min_width(0.0)
         .min_height(30.0)
         .padding(media_call_button_padding())
@@ -14043,7 +14133,6 @@ fn media_call_camera_button(shared: &Shared, reader: &ThemeReader, enabled: bool
         .semantic_name(semantic_name)
         .description("Explicitly start or stop the selected video source")
         .icon(icon)
-        .icon_size(14.0)
         .min_width(0.0)
         .min_height(30.0)
         .padding(media_call_button_padding())
@@ -14056,33 +14145,45 @@ fn media_call_camera_button(shared: &Shared, reader: &ThemeReader, enabled: bool
         })
 }
 
-fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader, active: bool) -> sui::Button {
-    let s = shared.clone();
-    let enabled_shared = shared.clone();
-    let (label, semantic_name, icon) = if active {
-        ("End call", "End media call", IconGlyph::PhoneOff)
-    } else {
-        ("Start call", "Start media call", IconGlyph::Phone)
+/// Start or end the realtime call: the two variants are prebuilt and switched by the call state.
+fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let start = {
+        let s = shared.clone();
+        let enabled_shared = shared.clone();
+        sui::Button::new("Start call")
+            .semantic_name("Start media call")
+            .description("Start or end the realtime call")
+            .icon(IconGlyph::Phone)
+            .min_height(36.0)
+            .theme_when(clone_reader(reader))
+            .enabled_when(move || enabled_shared.chat().media_call_start_ready())
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().toggle_media_call();
+                request_chat_window_relayout(ctx);
+            })
     };
-    let button = sui::Button::new(label)
-        .semantic_name(semantic_name)
-        .description("Start or end the realtime call")
-        .icon(icon)
-        .min_height(36.0);
-    let button = if active {
-        button
+    let end = {
+        let s = shared.clone();
+        sui::Button::new("End call")
+            .semantic_name("End media call")
+            .description("Start or end the realtime call")
+            .icon(IconGlyph::PhoneOff)
+            .min_height(36.0)
             .theme_when(clone_reader(reader))
             .appearance(sui::ButtonAppearance::Filled)
             .tone(SemanticTone::Danger)
-    } else {
-        button.theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().toggle_media_call();
+                request_chat_window_relayout(ctx);
+            })
     };
-    button
-        .enabled_when(move || active || enabled_shared.chat().media_call_start_ready())
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_media_call();
-            request_chat_window_relayout(ctx);
-        })
+    media_call_toggle(
+        shared,
+        "media call toggle button",
+        |signature| signature.active,
+        start,
+        end,
+    )
 }
 
 fn media_call_button_padding() -> Insets {
@@ -14205,40 +14306,46 @@ fn activity_popup_header(shared: &Shared, reader: &ThemeReader) -> impl Widget +
         .with_child(activity_close_button(shared, reader))
 }
 
+/// Show or hide the activity detail card. The button stays mounted (and focused) while its
+/// label and chevron follow the expanded state.
 fn activity_detail_toggle_button(
     reader: &ThemeReader,
     detail_expanded: Signal<bool>,
 ) -> impl Widget + use<> {
-    let expanded = detail_expanded.get();
-    let label = if expanded {
-        "Hide detail"
-    } else {
-        "Show detail"
-    };
     let expanded_state = detail_expanded.clone();
-    sui::Button::new(label)
-        .icon(if expanded {
-            IconGlyph::ChevronUp
-        } else {
-            IconGlyph::ChevronDown
-        })
-        .icon_size(13.0)
-        .semantic_name(label)
-        .description("Activity detail")
-        .min_width(108.0)
-        .min_height(24.0)
-        .padding(Insets {
-            left: 8.0,
-            right: 8.0,
-            top: 2.0,
-            bottom: 2.0,
-        })
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press(move || {
-            expanded_state.set(!expanded_state.get());
-        })
+    Restyle::new(
+        sui::Button::new("Show detail")
+            .icon(IconGlyph::ChevronDown)
+            .icon_size(13.0)
+            .description("Activity detail")
+            .min_width(108.0)
+            .min_height(24.0)
+            .padding(Insets {
+                left: 8.0,
+                right: 8.0,
+                top: 2.0,
+                bottom: 2.0,
+            })
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press(move || {
+                expanded_state.set(!expanded_state.get());
+            }),
+        detail_expanded,
+        |mut button, expanded| {
+            button.set_label(if *expanded {
+                "Hide detail"
+            } else {
+                "Show detail"
+            });
+            button.icon(if *expanded {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
+            })
+        },
+    )
 }
 
 fn activity_status_card(
@@ -14365,6 +14472,9 @@ fn activity_item_card(
     .tone(SemanticTone::Neutral)
 }
 
+/// The activity popup's content for the current runtime state. The scroll view and the
+/// expanded-detail state belong to the popup, so this content is the only part replaced when
+/// activity changes, and expanding the detail card never replaces it.
 fn activity_popup_content(
     shared: &Shared,
     reader: &ThemeReader,
@@ -14373,33 +14483,35 @@ fn activity_popup_content(
     let chat = shared.chat();
     let health = chat.runtime_health();
     let detail_entry = activity_detail_entry(&chat, &health);
+    let mut status =
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(activity_status_card(
+                shared,
+                reader,
+                &health,
+                activity_work_summary(&chat),
+                detail_entry.is_some(),
+                detail_expanded.clone(),
+            ));
+    if let Some(entry) = detail_entry {
+        status = status.with_child(revealed(
+            8.0,
+            activity_detail_card(shared, reader, entry),
+            detail_expanded,
+        ));
+    }
     let mut body = Stack::vertical()
         .gap(8.0)
         .alignment(Alignment::Stretch)
-        .with_child(activity_status_card(
-            shared,
-            reader,
-            &health,
-            activity_work_summary(&chat),
-            detail_entry.is_some(),
-            detail_expanded.clone(),
-        ));
-
-    if detail_expanded.get()
-        && let Some(entry) = detail_entry
-    {
-        body = body.with_child(activity_detail_card(shared, reader, entry));
-    }
+        .with_child(status);
 
     if chat.control.tasks.is_empty()
         && chat.current_turn_trace().is_none()
         && chat.activity.is_empty()
         && chat.context.is_none()
     {
-        return ScrollView::vertical(
-            body.with_child(muted_label(shared, "No runtime activity yet")),
-        )
-        .viewport_width_hint(true);
+        return body.with_child(muted_label(shared, "No runtime activity yet"));
     }
 
     if !chat.control.tasks.is_empty() {
@@ -14490,7 +14602,7 @@ fn activity_popup_content(
         }
     }
 
-    ScrollView::vertical(body).viewport_width_hint(true)
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -14618,7 +14730,6 @@ struct RetainedTranscriptDocument {
     source: String,
     model: RichDocumentModel,
     state: RichDocumentViewState,
-    theme: DefaultTheme,
     presentation: TranscriptMessagePresentation,
     attachments: Vec<super::markdown_attachments::MarkdownAttachment>,
     workspaces: Vec<String>,
@@ -14801,7 +14912,6 @@ impl TranscriptView {
     fn rich_document_pod(
         model: &RichDocumentModel,
         state: &RichDocumentViewState,
-        theme: DefaultTheme,
         selection_scope: &SelectionScope,
         shared: &Shared,
         presentation: TranscriptMessagePresentation,
@@ -14809,7 +14919,7 @@ impl TranscriptView {
     ) -> (WidgetPod, sui::WidgetId, Rc<Cell<Option<sui::WidgetId>>>) {
         let view = RichDocumentView::new(model.clone())
             .state(state.clone())
-            .theme(theme);
+            .theme_when(clone_reader(&shared_reader(shared)));
         let document = WidgetPod::new(view);
         let command_target = document.id();
         let selection_owner = Rc::new(Cell::new(None));
@@ -14843,12 +14953,12 @@ impl TranscriptView {
                     transcript_recovery_action_button(shared, action, true),
                     FlexItem::new().align_self(Alignment::Start),
                 );
-            let theme_shared = shared.clone();
             WidgetPod::new(
                 Surface::panel(body)
                     .appearance(SurfaceAppearance::Soft)
                     .tone(SemanticTone::Danger)
-                    .corner_radius(theme.radius._2xl.min(14.0))
+                    // Radius tokens are shared by every theme mode and text scale.
+                    .corner_radius(shared.theme().radius._2xl)
                     .padding(Insets {
                         left: 12.0,
                         top: 10.0,
@@ -14856,7 +14966,7 @@ impl TranscriptView {
                         bottom: 10.0,
                     })
                     .fill_width(true)
-                    .theme_when(move || theme_shared.theme()),
+                    .theme_when(clone_reader(&shared_reader(shared))),
             )
         } else {
             WidgetPod::new(body)
@@ -14873,7 +14983,6 @@ impl TranscriptView {
             .into_iter()
             .map(|workspace| workspace.path)
             .collect::<Vec<_>>();
-        let theme = self.shared.theme();
         let mut live = std::collections::HashSet::new();
         let mut order = Vec::with_capacity(messages.len());
 
@@ -14912,19 +15021,14 @@ impl TranscriptView {
                     }
                     retained.source = source;
                 }
-                if retained.theme != theme
-                    || retained.presentation != presentation
-                    || attachments_changed
-                {
+                if retained.presentation != presentation || attachments_changed {
                     if let Some(owner) = retained.selection_owner.get() {
                         self.selection_scope.clear_owner(owner);
                     }
-                    retained.theme = theme;
                     retained.presentation = presentation;
                     let (pod, command_target, selection_owner) = Self::rich_document_pod(
                         &retained.model,
                         &retained.state,
-                        theme,
                         &self.selection_scope,
                         &self.shared,
                         presentation,
@@ -14947,7 +15051,6 @@ impl TranscriptView {
             let (pod, command_target, selection_owner) = Self::rich_document_pod(
                 &model,
                 &state,
-                theme,
                 &self.selection_scope,
                 &self.shared,
                 presentation,
@@ -14959,7 +15062,6 @@ impl TranscriptView {
                     source,
                     model,
                     state,
-                    theme,
                     presentation,
                     attachments,
                     workspaces: workspaces.clone(),
@@ -15221,7 +15323,7 @@ impl TranscriptView {
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
-        pal: &Palette,
+        pal: &SurfacePalette,
         area: Rect,
         y: f32,
         summary: &str,
@@ -15435,10 +15537,8 @@ impl TranscriptView {
         )
     }
 
-    fn transcript_muted_text_style(pal: &Palette, theme: &DefaultTheme, color: Color) -> TextStyle {
-        let mut style = pal.text_style(theme, theme.text.sm.size, FontWeight::NORMAL, color);
-        style.line_height = theme.text.sm.line_height;
-        style
+    fn transcript_muted_text_style(theme: &DefaultTheme, color: Color) -> TextStyle {
+        crate::theme::token_text_style(theme, theme.text.sm, FontWeight::NORMAL, color)
     }
 
     fn tool_header_height(theme: &DefaultTheme, subtitle: bool) -> f32 {
@@ -15461,7 +15561,7 @@ impl TranscriptView {
     /// Trace rows to draw before each message, indexed like `chat.messages`.
     fn transcript_trace_layouts<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
         inner_w: f32,
@@ -15498,7 +15598,7 @@ impl TranscriptView {
     #[allow(clippy::too_many_arguments)]
     fn tool_trace_layout<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
         trace_key: &str,
@@ -15564,14 +15664,14 @@ impl TranscriptView {
 
     fn layout_trace_narrative<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &DefaultTheme,
         label: &'static str,
         text: String,
         inner_w: f32,
         bubble_w: f32,
     ) -> TranscriptLaidTool {
-        let style = Self::transcript_muted_text_style(pal, theme, pal.text);
+        let style = Self::transcript_muted_text_style(theme, pal.text);
         let measure_style = style.clone();
         let lines = wrap_text_lines(&text, (inner_w - 24.0).max(1.0), |line| {
             ctx.transcript_measure_text_width(line, measure_style.clone())
@@ -15589,7 +15689,7 @@ impl TranscriptView {
     #[allow(clippy::too_many_arguments)]
     fn layout_tool_call<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
         trace_key: &str,
@@ -15633,7 +15733,7 @@ impl TranscriptView {
 
     fn layout_tool_input<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
         trace_key: &str,
@@ -15674,7 +15774,7 @@ impl TranscriptView {
 
     fn layout_tool_output<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         chat: &ChatState,
         trace_key: &str,
@@ -15722,7 +15822,7 @@ impl TranscriptView {
 
     fn layout_tool_detail<C: TranscriptLayoutContext>(
         ctx: &C,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         section: ToolDetailSection,
         title: String,
@@ -15744,7 +15844,7 @@ impl TranscriptView {
         let content_h = if let Some(code) = &visible_code {
             Self::code_block_height(code, theme)
         } else {
-            let style = Self::transcript_muted_text_style(pal, theme, pal.text);
+            let style = Self::transcript_muted_text_style(theme, pal.text);
             let measure_style = style.clone();
             let lines = wrap_text_lines(&visible_text, inner_w, |s| {
                 ctx.transcript_measure_text_width(s, measure_style.clone())
@@ -15822,7 +15922,7 @@ impl TranscriptView {
 
     fn paint_message_surface(
         ctx: &mut PaintCtx,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &DefaultTheme,
         container: Rect,
         is_user: bool,
@@ -15830,7 +15930,7 @@ impl TranscriptView {
         row_mode: bool,
     ) -> Color {
         if row_mode {
-            let radius = theme.radius.md.min(6.0);
+            let radius = theme.radius.md;
             paint_rounded_panel(ctx, container, pal.panel, pal.border_subtle, radius);
             draw_glyph(
                 ctx,
@@ -15841,16 +15941,16 @@ impl TranscriptView {
                     14.0,
                     14.0,
                 ),
-                pal.agent[0],
+                theme.decorative.get(sui::DecorativeHue::Cyan).solid,
             );
             pal.panel
         } else {
-            let bubble_radius = theme.radius._2xl.min(14.0);
+            let bubble_radius = theme.radius._2xl;
             let is_error = kind == ChatMessageKind::Error;
             let (bubble_color, border) = if is_user {
                 (pal.accent_soft, pal.accent_border)
             } else if is_error {
-                (pal.danger_soft, pal.bad)
+                (pal.bad_soft, pal.bad)
             } else {
                 (pal.surface_2, pal.border_subtle)
             };
@@ -15861,7 +15961,7 @@ impl TranscriptView {
 
     fn paint_code_block(
         ctx: &mut PaintCtx,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         rect: Rect,
         code: &ChatCodeBlock,
@@ -15879,11 +15979,15 @@ impl TranscriptView {
             rect,
             label,
             CodePanelPaint::new()
-                .fill(if pal.dark { pal.field } else { pal.bg_subtle })
+                .fill(if pal.dark {
+                    pal.field
+                } else {
+                    pal.window_subtle
+                })
                 .border(pal.border)
                 .header_fill(pal.surface_2)
                 .label_color(pal.text_faint)
-                .corner_radius(theme.radius.md.min(6.0))
+                .corner_radius(theme.radius.md)
                 .header_height(24.0),
         );
         if content.width() <= 0.0 || content.height() <= 0.0 {
@@ -15942,7 +16046,7 @@ impl TranscriptView {
     fn paint_tool_item(
         &self,
         ctx: &mut PaintCtx,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         area: Rect,
         item: &TranscriptLaidTool,
@@ -15976,7 +16080,7 @@ impl TranscriptView {
                     } else {
                         IconGlyph::File
                     }),
-                    Self::tool_card_paint(pal)
+                    Self::tool_card_paint(pal, theme)
                         .icon_color(pal.accent)
                         .trailing_width(chain_trailing_width),
                 );
@@ -16001,7 +16105,7 @@ impl TranscriptView {
                     &title,
                     None,
                     None,
-                    Self::tool_card_paint(pal).trailing_width(chain_trailing_width),
+                    Self::tool_card_paint(pal, theme).trailing_width(chain_trailing_width),
                 );
             }
             TranscriptLaidTool::Narrative {
@@ -16060,7 +16164,7 @@ impl TranscriptView {
                     &title,
                     Some(&subtitle),
                     None,
-                    Self::tool_card_paint(pal)
+                    Self::tool_card_paint(pal, theme)
                         .leading_tone_dot(activity_tone_semantic(tool_status_tone(&call.status)))
                         .leading_width(18.0),
                 );
@@ -16091,7 +16195,7 @@ impl TranscriptView {
         }
     }
 
-    fn tool_card_paint(pal: &Palette) -> ActionTilePaint {
+    fn tool_card_paint(pal: &SurfacePalette, theme: &DefaultTheme) -> ActionTilePaint {
         // Mesh tool-call card: quiet surface, hairline border, r-2 corners.
         ActionTilePaint::neutral()
             .text_overflow(sui::TextOverflow::Ellipsis)
@@ -16099,13 +16203,13 @@ impl TranscriptView {
             .border(pal.border)
             .title_color(pal.text)
             .subtitle_color(pal.text_faint)
-            .corner_radius(6.0)
+            .corner_radius(theme.radius.md)
             .padding_x(12.0)
     }
 
     fn paint_tool_detail(
         ctx: &mut PaintCtx,
-        pal: &Palette,
+        pal: &SurfacePalette,
         theme: &sui::DefaultTheme,
         rect: Rect,
         detail: &TranscriptLaidToolDetail,
@@ -16284,6 +16388,7 @@ impl TranscriptControlSignature {
 
 struct TranscriptControls {
     shared: Shared,
+    reader: ThemeReader,
     tool_chain_trailing_width: Rc<Cell<f32>>,
     rich_message_layouts: Rc<RefCell<Vec<TranscriptRichMessageLayout>>>,
     signature: TranscriptControlSignature,
@@ -16292,6 +16397,9 @@ struct TranscriptControls {
     empty_actions: Vec<WidgetPod>,
     empty_action_rects: Vec<Option<Rect>>,
     runtime_actions: Vec<WidgetPod>,
+    /// The action each runtime toggle performs and the expanded state its label follows,
+    /// index-aligned with `runtime_actions`.
+    runtime_action_states: Vec<(RuntimeTranscriptAction, Signal<bool>)>,
     runtime_action_rects: Vec<Option<Rect>>,
     file_previews: Vec<WidgetPod>,
     file_preview_rects: Vec<Option<Rect>>,
@@ -16304,6 +16412,7 @@ impl TranscriptControls {
         rich_message_layouts: Rc<RefCell<Vec<TranscriptRichMessageLayout>>>,
     ) -> Self {
         Self {
+            reader: shared_reader(&shared),
             shared,
             tool_chain_trailing_width,
             rich_message_layouts,
@@ -16313,15 +16422,11 @@ impl TranscriptControls {
             empty_actions: Vec::new(),
             empty_action_rects: Vec::new(),
             runtime_actions: Vec::new(),
+            runtime_action_states: Vec::new(),
             runtime_action_rects: Vec::new(),
             file_previews: Vec::new(),
             file_preview_rects: Vec::new(),
         }
-    }
-
-    fn button_theme(shared: &Shared) -> impl Fn() -> DefaultTheme + 'static {
-        let shared = shared.clone();
-        move || shared.theme().with_size(ControlSize::Small)
     }
 
     fn refresh_after_activation(ctx: &mut EventCtx) {
@@ -16329,7 +16434,7 @@ impl TranscriptControls {
     }
 
     fn build_standard_empty_body(
-        shared: &Shared,
+        reader: &ThemeReader,
         title: &str,
         hint: &str,
         context: Option<&str>,
@@ -16338,54 +16443,75 @@ impl TranscriptControls {
             .name("Conversation empty state")
             .icon(IconGlyph::Sparkles)
             .transparent()
-            .theme_when({
-                let shared = shared.clone();
-                move || shared.theme()
-            });
+            .theme_when(clone_reader(reader));
         if let Some(context) = context {
             empty = empty.detail(context);
         }
         WidgetPod::new(empty)
     }
 
+    /// Muted recovery copy at one step of the type ramp, styled from the live theme.
+    fn recovery_copy(
+        reader: &ThemeReader,
+        text: &str,
+        token: fn(&DefaultTheme) -> sui::ThemeTextToken,
+    ) -> RichText {
+        let document = {
+            let reader = Rc::clone(reader);
+            let text = text.to_string();
+            move || {
+                let theme = reader();
+                let token = token(&theme);
+                sui::TextDocument::from_plain_text(
+                    text.clone(),
+                    TextStyle {
+                        font_size: token.size,
+                        line_height: token.line_height,
+                        color: theme.palette.text_muted,
+                        ..theme.body_text_style()
+                    },
+                )
+            }
+        };
+        RichText::new(document()).document_when(document)
+    }
+
     fn build_recovery_empty_body(
-        shared: &Shared,
+        reader: &ThemeReader,
         title: &str,
         detail: &str,
         hint: &str,
     ) -> WidgetPod {
-        let theme = shared.theme();
-        let mut title_style = theme.body_text_style();
-        title_style.font_size = theme.text.lg.size;
-        title_style.line_height = theme.text.lg.line_height;
-        title_style.weight = FontWeight::SEMIBOLD;
-        let mut body_style = theme.body_text_style();
-        body_style.font_size = theme.text.sm.size;
-        body_style.line_height = theme.text.sm.line_height;
-        body_style.color = theme.palette.text_muted;
-        let mut hint_style = body_style.clone();
-        hint_style.font_size = theme.text.xs.size;
-        hint_style.line_height = theme.text.xs.line_height;
-        hint_style.color = theme.palette.text_muted;
-
+        let title_style = {
+            let reader = Rc::clone(reader);
+            move || {
+                let theme = reader();
+                TextStyle {
+                    font_size: theme.text.lg.size,
+                    line_height: theme.text.lg.line_height,
+                    weight: FontWeight::SEMIBOLD,
+                    ..theme.body_text_style()
+                }
+            }
+        };
+        let warning = {
+            let reader = Rc::clone(reader);
+            move || reader().palette.warning
+        };
         let header = Flex::horizontal()
             .main_gap(12.0)
             .align_items(Alignment::Center)
-            .with_child(
-                Icon::new(IconGlyph::Alert)
-                    .size(28.0)
-                    .color(theme.palette.warning),
-            )
+            .with_child(Icon::new(IconGlyph::Alert).size(28.0).color_when(warning))
             .with_item(
-                Label::new(title).text_style(title_style),
+                Label::new(title).text_style_when(title_style),
                 FlexItem::flex(1.0).min_width(0.0),
             );
         let body = Flex::vertical()
             .main_gap(8.0)
             .align_items(Alignment::Stretch)
             .with_child(header)
-            .with_child(RichText::from_plain_text(detail, body_style))
-            .with_child(RichText::from_plain_text(hint, hint_style))
+            .with_child(Self::recovery_copy(reader, detail, |theme| theme.text.sm))
+            .with_child(Self::recovery_copy(reader, hint, |theme| theme.text.xs))
             // Room for the action row, which is laid over the card's bottom padding edge.
             .with_child(SizedBox::new().height(RECOVERY_CARD_ACTION_ROW_H));
         WidgetPod::new(
@@ -16399,14 +16525,15 @@ impl TranscriptControls {
                     bottom: RECOVERY_CARD_PAD_BOTTOM,
                 })
                 .fill_width(true)
-                .theme_when({
-                    let shared = shared.clone();
-                    move || shared.theme()
-                }),
+                .theme_when(clone_reader(reader)),
         )
     }
 
-    fn build_quick_action(shared: &Shared, action: ChatQuickAction) -> WidgetPod {
+    fn build_quick_action(
+        shared: &Shared,
+        reader: &ThemeReader,
+        action: ChatQuickAction,
+    ) -> WidgetPod {
         let activation_shared = shared.clone();
         let primary = matches!(
             action,
@@ -16418,7 +16545,7 @@ impl TranscriptControls {
                 .icon(action.icon())
                 .min_width(TranscriptView::quick_action_width(action))
                 .min_height(44.0)
-                .theme_when(Self::button_theme(shared))
+                .theme_when(small_control_reader(reader))
                 .appearance(if primary {
                     sui::ButtonAppearance::Tonal
                 } else {
@@ -16444,130 +16571,172 @@ impl TranscriptControls {
         WidgetPod::new(transcript_recovery_action_button(shared, action, primary))
     }
 
-    fn build_runtime_action(shared: &Shared, spec: &TranscriptRuntimeControlSpec) -> WidgetPod {
+    /// One fold toggle. It stays mounted for its action; the label and chevron follow `expanded`,
+    /// so activating it keeps keyboard focus on it.
+    fn build_runtime_action(
+        shared: &Shared,
+        reader: &ThemeReader,
+        action: &RuntimeTranscriptAction,
+        expanded: Signal<bool>,
+    ) -> WidgetPod {
         let activation_shared = shared.clone();
-        let action = spec.action.clone();
-        let label = match &action {
-            RuntimeTranscriptAction::ToggleToolChain(_) => {
-                if spec.expanded {
-                    "Hide"
-                } else {
-                    "Show"
-                }
-            }
-            RuntimeTranscriptAction::ToggleToolDetail(_) => {
-                if spec.expanded {
-                    "Show less"
-                } else {
-                    "Show more"
-                }
+        let activation = action.clone();
+        let chain = matches!(action, RuntimeTranscriptAction::ToggleToolChain(_));
+        let label = move |expanded: bool| match (chain, expanded) {
+            (true, true) => "Hide",
+            (true, false) => "Show",
+            (false, true) => "Show less",
+            (false, false) => "Show more",
+        };
+        let icon = |expanded: bool| {
+            if expanded {
+                IconGlyph::ChevronUp
+            } else {
+                IconGlyph::ChevronDown
             }
         };
-        let description = match &action {
-            RuntimeTranscriptAction::ToggleToolChain(_) => {
-                "Show or hide provider reasoning, intermediate output, and tool calls"
-            }
-            RuntimeTranscriptAction::ToggleToolDetail(_) => {
-                "Show or hide tool input, output, and file previews"
-            }
+        let description = if chain {
+            "Show or hide provider reasoning, intermediate output, and tool calls"
+        } else {
+            "Show or hide tool input, output, and file previews"
         };
-        WidgetPod::new(
-            sui::Button::new(label)
-                .semantic_name(runtime_action_label(&action))
+        let initial = expanded.get();
+        WidgetPod::new(Restyle::new(
+            sui::Button::new(label(initial))
+                .semantic_name(runtime_action_label(action))
                 .description(description)
-                .icon(if spec.expanded {
-                    IconGlyph::ChevronUp
-                } else {
-                    IconGlyph::ChevronDown
-                })
-                .theme_when(Self::button_theme(shared))
+                .icon(icon(initial))
+                .theme_when(small_control_reader(reader))
                 .appearance(sui::ButtonAppearance::Ghost)
                 .tone(SemanticTone::Neutral)
                 .on_press_with_ctx(move |ctx| {
-                    activate_transcript_runtime_action(&activation_shared, &action);
+                    activate_transcript_runtime_action(&activation_shared, &activation);
                     Self::refresh_after_activation(ctx);
                 }),
-        )
+            expanded,
+            move |mut button, expanded| {
+                button.set_label(label(*expanded));
+                button.icon(icon(*expanded))
+            },
+        ))
     }
 
+    /// Reconcile the overlay controls with the transcript. Each group is replaced only when its
+    /// own part of the signature changes: toggles are matched by action and file previews by
+    /// key, so expanding one call keeps every other control, and loaded preview, mounted.
     fn sync_controls(&mut self) {
         let signature = TranscriptControlSignature::current(&self.shared);
         if signature == self.signature {
             return;
         }
 
-        self.empty_body = None;
-        self.empty_actions.clear();
-        self.runtime_actions.clear();
-        if let Some(empty) = &signature.empty {
-            match empty {
-                TranscriptEmptyControlState::Standard {
-                    title,
-                    hint,
-                    context,
-                    actions,
-                } => {
-                    self.empty_body = Some(Self::build_standard_empty_body(
-                        &self.shared,
+        if signature.empty != self.signature.empty {
+            self.empty_body = None;
+            self.empty_actions.clear();
+            if let Some(empty) = &signature.empty {
+                match empty {
+                    TranscriptEmptyControlState::Standard {
                         title,
                         hint,
-                        context.as_deref(),
-                    ));
-                    self.empty_actions = actions
-                        .iter()
-                        .copied()
-                        .map(|action| Self::build_quick_action(&self.shared, action))
-                        .collect();
-                }
-                TranscriptEmptyControlState::Recovery {
-                    target,
-                    title,
-                    detail,
-                    hint,
-                    actions,
-                } => {
-                    self.empty_body = Some(Self::build_recovery_empty_body(
-                        &self.shared,
+                        context,
+                        actions,
+                    } => {
+                        self.empty_body = Some(Self::build_standard_empty_body(
+                            &self.reader,
+                            title,
+                            hint,
+                            context.as_deref(),
+                        ));
+                        self.empty_actions = actions
+                            .iter()
+                            .copied()
+                            .map(|action| {
+                                Self::build_quick_action(&self.shared, &self.reader, action)
+                            })
+                            .collect();
+                    }
+                    TranscriptEmptyControlState::Recovery {
+                        target,
                         title,
                         detail,
                         hint,
-                    ));
-                    let chat = self.shared.chat();
-                    self.empty_actions = actions
-                        .iter()
-                        .copied()
-                        .map(|action| {
-                            Self::build_recovery_action(
-                                &self.shared,
-                                action,
-                                TranscriptView::recovery_action_is_primary(&chat, *target, action),
-                            )
-                        })
-                        .collect();
+                        actions,
+                    } => {
+                        self.empty_body = Some(Self::build_recovery_empty_body(
+                            &self.reader,
+                            title,
+                            detail,
+                            hint,
+                        ));
+                        let chat = self.shared.chat();
+                        self.empty_actions = actions
+                            .iter()
+                            .copied()
+                            .map(|action| {
+                                Self::build_recovery_action(
+                                    &self.shared,
+                                    action,
+                                    TranscriptView::recovery_action_is_primary(
+                                        &chat, *target, action,
+                                    ),
+                                )
+                            })
+                            .collect();
+                    }
                 }
             }
+            self.empty_action_rects = vec![None; self.empty_actions.len()];
         }
-        self.runtime_actions = signature
-            .runtime_actions
-            .iter()
-            .map(|spec| Self::build_runtime_action(&self.shared, spec))
-            .collect();
-        self.empty_action_rects = vec![None; self.empty_actions.len()];
-        self.runtime_action_rects = vec![None; self.runtime_actions.len()];
-        self.file_previews = signature
-            .files
-            .iter()
-            .map(|(_, file)| {
-                let chat = self.shared.chat();
-                WidgetPod::new(super::tool_output::file_view(
-                    &self.shared,
-                    file,
-                    chat.sifs_daemon.clone(),
-                    chat.ui_waker.clone(),
-                ))
-            })
-            .collect();
-        self.file_preview_rects = vec![None; self.file_previews.len()];
+
+        if signature.runtime_actions != self.signature.runtime_actions {
+            let mut retained = std::mem::take(&mut self.runtime_action_states)
+                .into_iter()
+                .zip(std::mem::take(&mut self.runtime_actions))
+                .collect::<Vec<_>>();
+            for spec in &signature.runtime_actions {
+                let reused = retained
+                    .iter()
+                    .position(|((action, _), _)| *action == spec.action)
+                    .map(|index| retained.swap_remove(index));
+                let ((action, expanded), pod) = reused.unwrap_or_else(|| {
+                    let expanded = Signal::named("chat transcript fold expanded", spec.expanded);
+                    let pod = Self::build_runtime_action(
+                        &self.shared,
+                        &self.reader,
+                        &spec.action,
+                        expanded.clone(),
+                    );
+                    ((spec.action.clone(), expanded), pod)
+                });
+                expanded.set(spec.expanded);
+                self.runtime_action_states.push((action, expanded));
+                self.runtime_actions.push(pod);
+            }
+            self.runtime_action_rects = vec![None; self.runtime_actions.len()];
+        }
+
+        if signature.files != self.signature.files {
+            let mut retained = std::mem::take(&mut self.signature.files)
+                .into_iter()
+                .zip(std::mem::take(&mut self.file_previews))
+                .collect::<Vec<_>>();
+            for entry in &signature.files {
+                let pod = match retained.iter().position(|(previous, _)| previous == entry) {
+                    Some(index) => retained.swap_remove(index).1,
+                    None => {
+                        let chat = self.shared.chat();
+                        WidgetPod::new(super::tool_output::file_view(
+                            &self.shared,
+                            &entry.1,
+                            chat.sifs_daemon.clone(),
+                            chat.ui_waker.clone(),
+                        ))
+                    }
+                };
+                self.file_previews.push(pod);
+            }
+            self.file_preview_rects = vec![None; self.file_previews.len()];
+        }
         self.signature = signature;
     }
 
@@ -17535,7 +17704,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sui::Select::new("chat-provider")
             .options(names)
             .placeholder("Provider")
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().provider_idx)
@@ -17559,7 +17728,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sui::Select::new("chat-model")
             .options(models)
             .placeholder(placeholder)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().model_idx)
@@ -17581,7 +17750,7 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         let effort = sui::Select::new("chat-effort")
             .options(efforts)
             .placeholder("Effort")
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || Some(s.chat().effort_idx)
@@ -17614,7 +17783,7 @@ fn provider_setup_button(shared: &Shared, reader: &ThemeReader) -> SizedBox {
     SizedBox::new().height(SELECTOR_H).child(
         sui::Button::new("Set up provider")
             .icon(IconGlyph::Add)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .on_press(move || open_provider_setup(&s)),
     )
 }
@@ -17627,7 +17796,7 @@ fn runtime_recovery_button(shared: &Shared, reader: &ThemeReader) -> Option<Size
             sui::Button::new(target.footer_label())
                 .icon(IconGlyph::Alert)
                 .min_width(target.footer_min_width())
-                .theme_when(composer_control_reader(reader))
+                .theme_when(small_control_reader(reader))
                 .on_press(move || open_settings_section(&s, target.settings_section())),
         ),
     )
@@ -17648,7 +17817,7 @@ fn retry_chat_list_button(shared: &Shared, reader: &ThemeReader) -> Option<Sized
             sui::Button::new("Retry chat list")
                 .icon(IconGlyph::Redo)
                 .min_width(132.0)
-                .theme_when(composer_control_reader(reader))
+                .theme_when(small_control_reader(reader))
                 .on_press(move || {
                     let waker = { s.borrow().waker.clone() };
                     s.chat_mut().retry_chat_list_with_waker(waker);
@@ -17672,7 +17841,7 @@ fn check_sifs_button(shared: &Shared, reader: &ThemeReader) -> Option<SizedBox> 
             sui::Button::new("Check SIFS")
                 .icon(IconGlyph::Storage)
                 .min_width(120.0)
-                .theme_when(composer_control_reader(reader))
+                .theme_when(small_control_reader(reader))
                 .on_press(move || open_files_tab(&s)),
         ),
     )
@@ -17731,7 +17900,8 @@ fn attachment_drawer_chip(
             )
             .with_child(remove),
     )
-    .corner_radius(999.0)
+    // Radius tokens are shared by every theme mode and text scale.
+    .corner_radius(reader().radius._4xl)
     .padding(Insets {
         left: 8.0,
         top: 0.0,
@@ -17743,57 +17913,82 @@ fn attachment_drawer_chip(
     .tone(SemanticTone::Neutral)
 }
 
-fn attachment_controls(shared: &Shared, reader: &ThemeReader, scroll: &ScrollState) -> WidgetPod {
-    let mut chips = Flex::horizontal()
-        .wrap(FlexWrap::Wrap)
-        .gap(6.0)
-        .align_items(Alignment::Center);
-    for (index, attachment) in shared.chat().attachments.iter().enumerate() {
-        chips = chips.with_child(attachment_drawer_chip(shared, reader, index, attachment));
-    }
+fn attachment_section_gap<W: Widget + 'static>(child: W) -> WidgetPadding {
+    WidgetPadding::new(
+        Insets {
+            left: 0.0,
+            top: 8.0,
+            right: 0.0,
+            bottom: 0.0,
+        },
+        child,
+    )
+}
 
-    let picker_pending = shared.chat().attachment_picker_pending();
-    let picker_lane_pending = shared.chat().attachment_picker_lane_pending();
+/// The attachments popup content. It is built once per popup: the picker and manual-entry
+/// buttons follow the picker state in place, and only the small lists (pending checks, attached
+/// chips) and a programmatically cleared path editor are replaced when their own data changes.
+fn attachment_controls(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll: &ScrollState,
+) -> impl Widget + use<> {
     let choose = {
         let s = shared.clone();
-        sui::Button::new(if picker_pending {
-            "Choosing files…"
-        } else if picker_lane_pending {
-            "Close previous picker…"
-        } else {
-            "Choose files"
-        })
-        .icon(IconGlyph::Attach)
-        .min_height(ATTACHMENT_ENTRY_H)
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Filled)
-        .tone(SemanticTone::Accent)
-        .enabled_when({
-            let s = s.clone();
-            move || !s.chat().attachment_picker_lane_pending()
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().request_attachment_picker();
-            request_chat_window_relayout(ctx);
-        })
+        let label = chat_projection(shared, "attachment picker button label", |snapshot| {
+            let (requested, lane_pending) = snapshot.map_or((false, false), |snapshot| {
+                (
+                    snapshot.attachment_picker_requested,
+                    snapshot.attachment_picker_pending,
+                )
+            });
+            if requested {
+                "Choosing files…"
+            } else if lane_pending {
+                "Close previous picker…"
+            } else {
+                "Choose files"
+            }
+            .to_string()
+        });
+        let available = chat_projection(shared, "attachment picker available", |snapshot| {
+            !snapshot.is_some_and(|snapshot| snapshot.attachment_picker_pending)
+        });
+        label_from(
+            sui::Button::new("Choose files")
+                .icon(IconGlyph::Attach)
+                .min_height(ATTACHMENT_ENTRY_H)
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Filled)
+                .tone(SemanticTone::Accent)
+                .enabled_from(available)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().request_attachment_picker();
+                    request_chat_window_relayout(ctx);
+                }),
+            label,
+        )
     };
-    let manual_path_open = shared.chat().attachment_manual_path_open;
     let manual = {
         let s = shared.clone();
-        sui::Button::new(if manual_path_open {
-            "Hide path entry"
-        } else {
-            "Enter path manually"
-        })
-        .icon(IconGlyph::File)
-        .min_height(ATTACHMENT_ENTRY_H)
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_manual_attachment_path();
-            request_chat_window_relayout(ctx);
-        })
+        let open = shared.clone();
+        sui::Button::new("Enter path manually")
+            .label_when(move || {
+                if open.chat().attachment_manual_path_open {
+                    "Hide path entry".to_string()
+                } else {
+                    "Enter path manually".to_string()
+                }
+            })
+            .icon(IconGlyph::File)
+            .min_height(ATTACHMENT_ENTRY_H)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().toggle_manual_attachment_path();
+                request_chat_window_relayout(ctx);
+            })
     };
     let actions = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
@@ -17810,102 +18005,120 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader, scroll: &ScrollSta
         )
         .color_when(move || palette(&s).text_muted)
     };
-    let mut body = Stack::vertical()
-        .gap(8.0)
-        .alignment(Alignment::Stretch)
-        .with_child(actions)
-        .with_child(hint);
 
-    if shared.chat().attachment_drop_hovered {
-        body = body.with_child(
-            Stack::horizontal().with_child(
-                StatusBadge::new("Drop files to attach")
-                    .icon(IconGlyph::Attach)
-                    .tone(SemanticTone::Info)
-                    .theme_when(clone_reader(reader)),
-            ),
-        );
-    }
+    let drop_badge = revealed(
+        8.0,
+        Stack::horizontal().with_child(
+            StatusBadge::new("Drop files to attach")
+                .icon(IconGlyph::Attach)
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+        ),
+        chat_projection(shared, "attachment drop hovered", |snapshot| {
+            snapshot.is_some_and(|snapshot| snapshot.attachment_drop_hovered)
+        }),
+    );
 
-    let pending_validations = shared.chat().pending_attachment_validations.clone();
-    if !pending_validations.is_empty() {
-        let mut pending_chips = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(6.0)
-            .align_items(Alignment::Center);
-        for pending in pending_validations {
-            let ingress = match pending.ingress {
-                LocalAttachmentIngress::NativePicker => "Checking",
-                LocalAttachmentIngress::ManualPath => "Checking path",
-                LocalAttachmentIngress::OsDrop => "Checking drop",
-            };
-            for path in pending.paths {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or("file");
-                pending_chips = pending_chips.with_child(
-                    StatusBadge::new(format!("{ingress} {}…", compact_line(name, 24)))
-                        .icon(IconGlyph::File)
-                        .tone(SemanticTone::Info)
-                        .theme_when(clone_reader(reader)),
-                );
+    let pending = {
+        let source = chat_projection(shared, "attachment pending checks", |snapshot| {
+            snapshot.map_or(0, |snapshot| snapshot.pending_attachment_validations)
+        });
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(source, move |_count| {
+            let pending_validations = s.chat().pending_attachment_validations.clone();
+            if pending_validations.is_empty() {
+                return WidgetPod::new(SizedBox::new());
             }
-        }
-        body = body.with_child(pending_chips);
-    }
-
-    if manual_path_open {
-        let path_input = {
-            let s = shared.clone();
-            TextInput::new("chat-attachment-path")
-                .value(shared.chat().attachment_path_input.clone())
-                .placeholder("Enter a file path")
-                .leading_icon(IconGlyph::File)
-                .theme_when(composer_control_reader(reader))
-                .on_change(move |value| {
-                    s.chat_mut().set_attachment_path_input(value);
-                })
-        };
-        let add = {
-            let s = shared.clone();
-            sui::Button::new("Add path")
-                .icon(IconGlyph::Add)
-                .min_height(ATTACHMENT_ENTRY_H)
-                .min_width(96.0)
-                .focus_on_press(!cfg!(target_os = "android"))
-                .theme_when(clone_reader(reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .enabled_when({
-                    let s = s.clone();
-                    move || !s.chat().attachment_path_input.trim().is_empty()
-                })
-                .on_press_with_ctx(move |ctx| {
-                    s.chat_mut().add_attachment_from_path_input();
-                    request_chat_window_relayout(ctx);
-                })
-        };
-        body = body.with_child(
-            Flex::horizontal()
+            let mut pending_chips = Flex::horizontal()
                 .wrap(FlexWrap::Wrap)
-                .gap(8.0)
-                .align_items(Alignment::Center)
-                .with_item(path_input, FlexItem::flex(1.0).min_width(180.0))
-                .with_child(add),
-        );
-    }
+                .gap(6.0)
+                .align_items(Alignment::Center);
+            for pending in pending_validations {
+                let ingress = match pending.ingress {
+                    LocalAttachmentIngress::NativePicker => "Checking",
+                    LocalAttachmentIngress::ManualPath => "Checking path",
+                    LocalAttachmentIngress::OsDrop => "Checking drop",
+                };
+                for path in pending.paths {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or("file");
+                    pending_chips = pending_chips.with_child(
+                        StatusBadge::new(format!("{ingress} {}…", compact_line(name, 24)))
+                            .icon(IconGlyph::File)
+                            .tone(SemanticTone::Info)
+                            .theme_when(clone_reader(&r)),
+                    );
+                }
+            }
+            WidgetPod::new(attachment_section_gap(pending_chips))
+        })
+    };
 
-    let feedback_source =
-        shared
-            .signals()
-            .chat_structure
-            .select_named("attachment failure feedback", |key| {
-                key.0
-                    .as_deref()
-                    .and_then(|snapshot| snapshot.attachment_picker_error.clone())
-            });
+    // The path field owns its edit buffer; it is replaced only when the path is cleared
+    // programmatically (after adding it, or when the entry closes).
+    let path_editor = {
+        let source = chat_projection(shared, "attachment path revision", |snapshot| {
+            snapshot.map_or(0, |snapshot| snapshot.attachment_path_revision)
+        });
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        let editor = RebuildOnChange::key_from(source, move |_revision| {
+            let path_input = {
+                let s = s.clone();
+                let value = s.chat().attachment_path_input.clone();
+                TextInput::new("chat-attachment-path")
+                    .value(value)
+                    .placeholder("Enter a file path")
+                    .leading_icon(IconGlyph::File)
+                    .theme_when(small_control_reader(&r))
+                    .on_change(move |value| {
+                        s.chat_mut().set_attachment_path_input(value);
+                    })
+            };
+            let add = {
+                let s = s.clone();
+                sui::Button::new("Add path")
+                    .icon(IconGlyph::Add)
+                    .min_height(ATTACHMENT_ENTRY_H)
+                    .min_width(96.0)
+                    .focus_on_press(!cfg!(target_os = "android"))
+                    .theme_when(clone_reader(&r))
+                    .appearance(sui::ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Neutral)
+                    .enabled_when({
+                        let s = s.clone();
+                        move || !s.chat().attachment_path_input.trim().is_empty()
+                    })
+                    .on_press_with_ctx(move |ctx| {
+                        s.chat_mut().add_attachment_from_path_input();
+                        request_chat_window_relayout(ctx);
+                    })
+            };
+            WidgetPod::new(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Center)
+                    .with_item(path_input, FlexItem::flex(1.0).min_width(180.0))
+                    .with_child(add),
+            )
+        });
+        revealed(
+            8.0,
+            editor,
+            chat_projection(shared, "attachment manual path open", |snapshot| {
+                snapshot.is_some_and(|snapshot| snapshot.attachment_manual_path_open)
+            }),
+        )
+    };
+
+    let feedback_source = chat_projection(shared, "attachment failure feedback", |snapshot| {
+        snapshot.and_then(|snapshot| snapshot.attachment_picker_error.clone())
+    });
     let feedback_shared = shared.clone();
     let feedback_reader = Rc::clone(reader);
     let feedback_scroll = scroll.clone();
@@ -17937,20 +18150,44 @@ fn attachment_controls(shared: &Shared, reader: &ThemeReader, scroll: &ScrollSta
                 )
                 .with_child(
                     small_label(&feedback_shared, error)
-                        .color_when(move || palette(&colors).danger_text),
+                        .color_when(move || palette(&colors).bad_text),
                 ),
         ))
     });
-    body = Stack::vertical()
+
+    let chips = {
+        let source = chat_projection(shared, "attachment drawer chips", |snapshot| {
+            snapshot
+                .map(|snapshot| snapshot.attachments.clone())
+                .unwrap_or_default()
+        });
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(source, move |_attachments| {
+            let attachments = s.chat().attachments.clone();
+            if attachments.is_empty() {
+                return WidgetPod::new(SizedBox::new());
+            }
+            let mut chips = Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
+                .gap(6.0)
+                .align_items(Alignment::Center);
+            for (index, attachment) in attachments.iter().enumerate() {
+                chips = chips.with_child(attachment_drawer_chip(&s, &r, index, attachment));
+            }
+            WidgetPod::new(chips)
+        })
+    };
+
+    Stack::vertical()
         .alignment(Alignment::Stretch)
         .with_child(feedback)
-        .with_child(body);
-
-    if !shared.chat().attachments.is_empty() {
-        body = body.with_child(chips);
-    }
-
-    WidgetPod::new(body)
+        .with_child(actions)
+        .with_child(attachment_section_gap(hint))
+        .with_child(drop_badge)
+        .with_child(pending)
+        .with_child(path_editor)
+        .with_child(chips)
 }
 
 fn model_button_label(chat: &ChatState) -> String {
@@ -18057,33 +18294,28 @@ fn popup_header(
 
 fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let selector_host = {
-        let source =
-            shared
-                .signals()
-                .chat_structure
-                .select_named("chat model selector structure", |key| {
-                    key.0
-                        .as_deref()
-                        .map(ChatStructureSnapshot::model_selector_structure)
-                });
+        let source = chat_projection(shared, "chat model selector structure", |snapshot| {
+            snapshot.map(ChatStructureSnapshot::model_selector_structure)
+        });
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::key_from(source, move |_sig| selectors(&s, &r))
     };
-    let detail = {
-        let chat = shared.chat();
-        if chat.models_loading {
+    let detail = chat_projection(shared, "chat model selector detail", |snapshot| {
+        let Some(snapshot) = snapshot else {
+            return String::new();
+        };
+        if snapshot.models_loading {
             "Refreshing available models from the provider".to_string()
-        } else if let Some(provider) = chat.current_provider() {
+        } else if let Some(provider) = snapshot.providers.get(snapshot.provider_idx) {
             format!(
                 "{} models available for {}",
-                chat.current_models().len(),
-                provider.name
+                snapshot.model_count, provider.name
             )
         } else {
             "Choose a provider before sending.".to_string()
         }
-    };
+    });
     let body = Stack::vertical()
         .gap(8.0)
         .alignment(Alignment::Stretch)
@@ -18094,7 +18326,7 @@ fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
             "Close model selector",
         ))
         .with_child(SizedBox::new().height(SELECTOR_H).child(selector_host))
-        .with_child(muted_label(shared, detail));
+        .with_child(muted_label(shared, detail.get()).text_from(detail));
     WidgetPod::new(
         Surface::new(
             SurfaceRole::Titlebar,
@@ -18107,15 +18339,9 @@ fn composer_model_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
 
 fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let content = {
-        let source =
-            shared
-                .signals()
-                .chat_structure
-                .select_named("chat context popup structure", |key| {
-                    key.0
-                        .as_deref()
-                        .map(|snapshot| (snapshot.theme, snapshot.context.clone()))
-                });
+        let source = chat_projection(shared, "chat context popup structure", |snapshot| {
+            snapshot.and_then(|snapshot| snapshot.context.clone())
+        });
         let s = shared.clone();
         RebuildOnChange::key_from(source, move |_sig| {
             let chat = s.chat();
@@ -18178,24 +18404,11 @@ fn composer_context_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
-fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    let scroll = ScrollState::new();
-    let controls = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat attachment popup structure",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(ChatStructureSnapshot::attachment_structure)
-            },
-        );
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        let controls_scroll = scroll.clone();
-        RebuildOnChange::key_from(source, move |_sig| {
-            attachment_controls(&s, &r, &controls_scroll)
-        })
-    };
+fn composer_attachments_popup(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll: &ScrollState,
+) -> WidgetPod {
     let body = Stack::vertical()
         .gap(8.0)
         .alignment(Alignment::Stretch)
@@ -18207,10 +18420,11 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
         ))
         .with_child(
             SizedBox::new().height(COMPOSER_POPUP_H - 34.0).child(
-                    ScrollView::vertical(controls)
-                        .name("Attachment options")
-                    .state(scroll)
-                    .viewport_width_hint(true),
+                ScrollView::vertical(attachment_controls(shared, reader, scroll))
+                    .name("Attachment options")
+                    .state(scroll.clone())
+                    .viewport_width_hint(true)
+                    .theme_when(clone_reader(reader)),
             ),
         );
     WidgetPod::new(
@@ -18223,22 +18437,22 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     )
 }
 
-fn composer_workspace_popup(
-    shared: &Shared,
-    reader: &ThemeReader,
-    scroll: &ScrollState,
-) -> WidgetPod {
-    let (workspaces, enabled, picker_pending, updating, turn_active, supported, error) = {
+/// The workspace popup's scrolling list: the hint and one row per attached folder.
+fn composer_workspace_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let (workspaces, updating, turn_active, supported, error) = {
         let chat = shared.chat();
         (
             chat.attached_workspaces(),
-            chat.workspace_changes_allowed(),
-            chat.workspace_picker_lane_pending(),
             chat.pending_workspace_update.is_some(),
             chat.streaming || chat.control.active_turn,
             chat.tool_runtime.workspaces.is_some(),
             chat.workspace_error.clone(),
         )
+    };
+    let allowed = || {
+        chat_projection(shared, "chat workspace changes allowed", |snapshot| {
+            snapshot.is_some_and(ChatStructureSnapshot::workspace_changes_allowed)
+        })
     };
     let mut content = Stack::vertical().gap(8.0).alignment(Alignment::Stretch);
     let hint = if let Some(error) = error {
@@ -18263,8 +18477,8 @@ fn composer_workspace_popup(
                 .value(shared.chat().workspace_folder_input.clone())
                 .placeholder("Device folder path")
                 .leading_icon(IconGlyph::Folder)
-                .theme_when(composer_control_reader(reader))
-                .enabled(enabled)
+                .theme_when(small_control_reader(reader))
+                .enabled_from(allowed())
                 .on_change(move |value| {
                     change.chat_mut().workspace_folder_input = value;
                 }),
@@ -18281,7 +18495,7 @@ fn composer_workspace_popup(
             workspace.path.clone(),
             muted_label(shared, compact_line(&workspace.path, 72)),
         )
-        .theme(reader());
+        .theme_when(clone_reader(reader));
         let info = Stack::vertical()
             .gap(2.0)
             .alignment(Alignment::Stretch)
@@ -18295,11 +18509,10 @@ fn composer_workspace_popup(
                 sui::Button::new("Make default")
                     .semantic_name(format!("Use {} as default workspace", workspace.path))
                     .min_width(0.0)
-                    .min_height(28.0)
-                    .theme_when(composer_control_reader(reader))
+                    .theme_when(small_control_reader(reader))
                     .appearance(sui::ButtonAppearance::Ghost)
                     .tone(SemanticTone::Neutral)
-                    .enabled(enabled)
+                    .enabled_from(allowed())
                     .on_press_with_ctx(move |ctx| {
                         s.chat_mut()
                             .update_workspaces(ChatWorkspaceChange::MakeDefault {
@@ -18317,12 +18530,10 @@ fn composer_workspace_popup(
                 format!("Remove workspace {}", workspace.path),
             )
             .description("Remove this folder from the conversation")
-            .size(28.0)
-            .icon_size(14.0)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
-            .enabled(enabled)
+            .enabled_from(allowed())
             .on_press_with_ctx(move |ctx| {
                 s.chat_mut().update_workspaces(ChatWorkspaceChange::Remove {
                     workspace_id: id.clone(),
@@ -18340,6 +18551,23 @@ fn composer_workspace_popup(
                 .theme_when(clone_reader(reader)),
         );
     }
+    content
+}
+
+/// The workspace popup's footer: add a folder, and remove them all once any are attached.
+fn composer_workspace_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let allowed = || {
+        chat_projection(shared, "chat workspace changes allowed", |snapshot| {
+            snapshot.is_some_and(ChatStructureSnapshot::workspace_changes_allowed)
+        })
+    };
+    let (picker_pending, has_workspaces) = {
+        let chat = shared.chat();
+        (
+            chat.workspace_picker_lane_pending(),
+            !chat.attached_workspaces().is_empty(),
+        )
+    };
     let add = shared.clone();
     let mut actions = Flex::horizontal()
         .gap(8.0)
@@ -18352,8 +18580,8 @@ fn composer_workspace_popup(
             })
             .icon(IconGlyph::Add)
             .min_height(30.0)
-            .theme_when(composer_control_reader(reader))
-            .enabled(enabled)
+            .theme_when(small_control_reader(reader))
+            .enabled_from(allowed())
             .focus_on_press(!cfg!(target_os = "android"))
             .on_press_with_ctx(move |ctx| {
                 #[cfg(target_os = "android")]
@@ -18363,23 +18591,66 @@ fn composer_workspace_popup(
                 request_chat_window_relayout(ctx);
             }),
         );
-    if !workspaces.is_empty() {
+    if has_workspaces {
         let clear = shared.clone();
         actions = actions.with_child(
             sui::Button::new("Remove all")
                 .min_height(30.0)
-                .theme_when(composer_control_reader(reader))
+                .theme_when(small_control_reader(reader))
                 .appearance(sui::ButtonAppearance::Ghost)
                 .tone(SemanticTone::Neutral)
-                .enabled(enabled)
+                .enabled_from(allowed())
                 .on_press_with_ctx(move |ctx| {
                     clear.chat_mut().clear_workspace();
                     request_chat_window_relayout(ctx);
                 }),
         );
     }
+    actions
+}
+
+/// The workspace popup. Its frame, header, and scroll view are built once per opening; the
+/// folder list and footer are replaced only when the attached folders or their status change.
+fn composer_workspace_popup(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll: &ScrollState,
+) -> WidgetPod {
+    let list = {
+        let source = chat_projection(shared, "chat workspace list structure", |snapshot| {
+            snapshot.map(|snapshot| {
+                (
+                    snapshot.workspace_path.clone(),
+                    snapshot.workspaces.clone(),
+                    snapshot.workspace_error.clone(),
+                    snapshot.workspace_update_pending,
+                    snapshot.streaming || snapshot.active_turn,
+                )
+            })
+        });
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(source, move |_list| {
+            WidgetPod::new(composer_workspace_list(&s, &r))
+        })
+    };
+    let actions = {
+        let source = chat_projection(shared, "chat workspace actions structure", |snapshot| {
+            snapshot.map(|snapshot| {
+                (
+                    snapshot.workspace_picker_pending,
+                    snapshot.composer_bar.workspace_selected,
+                )
+            })
+        });
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(source, move |_actions| {
+            WidgetPod::new(composer_workspace_actions(&s, &r))
+        })
+    };
     let body = Dock::new(
-        ScrollView::vertical(content)
+        ScrollView::vertical(list)
             .state(scroll.clone())
             .name("Attached workspaces")
             .viewport_width_hint(true)
@@ -18397,78 +18668,63 @@ fn composer_workspace_popup(
     )
 }
 
-fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    if shared.chat().runtime_recovery_target().is_some() {
-        let health = shared.chat().runtime_health();
-        let status = activity_status_summary(&health.detail);
-        let mut actions = Flex::horizontal()
-            .wrap(FlexWrap::Wrap)
-            .gap(8.0)
-            .align_items(Alignment::Center);
-        let mut action_count = 0usize;
-        if let Some(action) = retry_chat_list_button(shared, reader) {
-            actions = actions.with_child(action);
-            action_count += 1;
-        }
-        if let Some(action) = check_sifs_button(shared, reader) {
-            actions = actions.with_child(action);
-            action_count += 1;
-        }
-        if let Some(action) = runtime_recovery_button(shared, reader) {
-            actions = actions.with_child(action);
-            action_count += 1;
-        }
-
-        let mut body = Stack::vertical()
-            .gap(8.0)
-            .alignment(Alignment::Stretch)
-            .with_child(popup_header(shared, reader, "Activity", "Close activity"))
-            .with_child(muted_label(
-                shared,
-                format!("{} · {}", health.label, compact_line(&status, 84)),
-            ))
-            .with_child(muted_label(shared, activity_work_summary(&shared.chat())));
-        if action_count > 0 {
-            body = body.with_child(actions);
-        }
-        return WidgetPod::new(
-            Surface::new(
-                SurfaceRole::Titlebar,
-                WidgetPadding::horizontal(PAD, body).fill_child_height(true),
-            )
-            .fill()
-            .theme_when(clone_reader(reader)),
-        );
+/// The runtime-recovery summary the activity popup shows while the runtime needs attention.
+fn activity_recovery_content(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let health = shared.chat().runtime_health();
+    let status = activity_status_summary(&health.detail);
+    let mut actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center);
+    let mut action_count = 0usize;
+    if let Some(action) = retry_chat_list_button(shared, reader) {
+        actions = actions.with_child(action);
+        action_count += 1;
+    }
+    if let Some(action) = check_sifs_button(shared, reader) {
+        actions = actions.with_child(action);
+        action_count += 1;
+    }
+    if let Some(action) = runtime_recovery_button(shared, reader) {
+        actions = actions.with_child(action);
+        action_count += 1;
     }
 
-    let detail_expanded = Signal::named("chat activity detail expanded", false);
-    let activity_content = {
-        let source =
-            shared
-                .signals()
-                .chat_structure
-                .select_named("chat activity popup structure", |key| {
-                    key.0
-                        .as_deref()
-                        .map(ChatStructureSnapshot::activity_popup_structure)
-                });
+    let mut body = Stack::vertical()
+        .gap(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(muted_label(
+            shared,
+            format!("{} · {}", health.label, compact_line(&status, 84)),
+        ))
+        .with_child(muted_label(shared, activity_work_summary(&shared.chat())));
+    if action_count > 0 {
+        body = body.with_child(actions);
+    }
+    body
+}
+
+/// The activity popup. The frame, header, and scroll view stay mounted; only the content is
+/// replaced when runtime activity changes, and expanding its detail card replaces nothing.
+fn composer_activity_popup(
+    shared: &Shared,
+    reader: &ThemeReader,
+    detail_expanded: &Signal<bool>,
+    scroll: &ScrollState,
+) -> WidgetPod {
+    let content = {
+        let source = chat_projection(shared, "chat activity popup structure", |snapshot| {
+            snapshot.map(ChatStructureSnapshot::activity_popup_structure)
+        });
         let s = shared.clone();
         let r = Rc::clone(reader);
         let expanded = detail_expanded.clone();
-        RebuildOnChange::key_from(source, move |_chat_key| {
-            let content_s = s.clone();
-            let content_r = Rc::clone(&r);
-            let content_expanded = expanded.clone();
-            WidgetPod::new(RebuildOnChange::key_from(
-                expanded.clone(),
-                move |_expanded| {
-                    WidgetPod::new(activity_popup_content(
-                        &content_s,
-                        &content_r,
-                        content_expanded.clone(),
-                    ))
-                },
-            ))
+        RebuildOnChange::key_from(source, move |_activity| {
+            if s.chat().runtime_recovery_target().is_some() {
+                WidgetPod::new(activity_recovery_content(&s, &r))
+            } else {
+                WidgetPod::new(activity_popup_content(&s, &r, expanded.clone()))
+            }
         })
     };
     let body = Stack::vertical()
@@ -18476,9 +18732,12 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         .alignment(Alignment::Stretch)
         .with_child(activity_popup_header(shared, reader))
         .with_child(
-            SizedBox::new()
-                .height(COMPOSER_POPUP_H - 34.0)
-                .child(activity_content),
+            SizedBox::new().height(COMPOSER_POPUP_H - 34.0).child(
+                ScrollView::vertical(content)
+                    .state(scroll.clone())
+                    .viewport_width_hint(true)
+                    .theme_when(clone_reader(reader)),
+            ),
         );
 
     WidgetPod::new(
@@ -18491,54 +18750,75 @@ fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     )
 }
 
+/// Retained state of the composer popups, created once with the composer so it outlives the
+/// popup shells: scroll offsets and whether the activity detail is expanded.
+#[derive(Clone)]
+struct ComposerPopupState {
+    workspace_scroll: ScrollState,
+    attachments_scroll: ScrollState,
+    activity_scroll: ScrollState,
+    activity_detail_expanded: Signal<bool>,
+}
+
+impl ComposerPopupState {
+    fn new() -> Self {
+        Self {
+            workspace_scroll: ScrollState::new(),
+            attachments_scroll: ScrollState::new(),
+            activity_scroll: ScrollState::new(),
+            activity_detail_expanded: Signal::named("chat activity detail expanded", false),
+        }
+    }
+
+    /// A popup that opens again starts at the top of its content.
+    fn reset_scroll(&self) {
+        for scroll in [
+            &self.workspace_scroll,
+            &self.attachments_scroll,
+            &self.activity_scroll,
+        ] {
+            scroll.set_offset(sui::Vector::new(0.0, 0.0));
+        }
+    }
+}
+
 fn composer_popup_panel(
     shared: &Shared,
     reader: &ThemeReader,
-    workspace_scroll: &ScrollState,
+    popup: Option<ComposerPopup>,
+    state: &ComposerPopupState,
 ) -> WidgetPod {
-    match shared.chat().composer_popup() {
+    match popup {
         Some(ComposerPopup::Model) => composer_model_popup(shared, reader),
         Some(ComposerPopup::Context) => composer_context_popup(shared, reader),
         Some(ComposerPopup::Workspace) => {
-            composer_workspace_popup(shared, reader, workspace_scroll)
+            composer_workspace_popup(shared, reader, &state.workspace_scroll)
         }
-        Some(ComposerPopup::Attachments) => composer_attachments_popup(shared, reader),
-        Some(ComposerPopup::Activity) => composer_activity_popup(shared, reader),
+        Some(ComposerPopup::Attachments) => {
+            composer_attachments_popup(shared, reader, &state.attachments_scroll)
+        }
+        Some(ComposerPopup::Activity) => composer_activity_popup(
+            shared,
+            reader,
+            &state.activity_detail_expanded,
+            &state.activity_scroll,
+        ),
         None => WidgetPod::new(SizedBox::new().height(0.0)),
     }
 }
 
+/// The popup above the composer field. The shell is replaced only when a different popup opens;
+/// each popup keeps its frame mounted and updates its own content.
 fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source =
-        shared
-            .signals()
-            .chat_structure
-            .select_named("chat composer popup structure", |key| {
-                key.0.as_deref().map(|snapshot| {
-                    (
-                        snapshot.theme,
-                        snapshot.composer_popup,
-                        snapshot.workspace_path.clone(),
-                        snapshot.workspaces.clone(),
-                        snapshot.workspace_error.clone(),
-                        snapshot.workspace_picker_pending,
-                        snapshot.workspace_update_pending,
-                        snapshot.streaming,
-                        snapshot.active_turn,
-                    )
-                })
-            });
+    let source = chat_projection(shared, "chat composer popup", |snapshot| {
+        snapshot.and_then(|snapshot| snapshot.composer_popup)
+    });
     let s = shared.clone();
     let r = Rc::clone(reader);
-    let workspace_scroll = ScrollState::new();
+    let state = ComposerPopupState::new();
     RebuildOnChange::key_from(source, move |popup| {
-        if popup
-            .as_ref()
-            .is_none_or(|key| key.1 != Some(ComposerPopup::Workspace))
-        {
-            workspace_scroll.set_offset(sui::Vector::new(0.0, 0.0));
-        }
-        composer_popup_panel(&s, &r, &workspace_scroll)
+        state.reset_scroll();
+        composer_popup_panel(&s, &r, *popup, &state)
     })
 }
 
@@ -18567,7 +18847,7 @@ fn composer_context_chip(
         IconButton::new(IconGlyph::Close, remove_label)
             .size(16.0)
             .icon_size(10.0)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
@@ -18585,7 +18865,8 @@ fn composer_context_chip(
                 .with_child(small_label(shared, label).color_when(move || palette(&s).text_muted))
                 .with_child(remove),
         )
-        .corner_radius(999.0)
+        // Radius tokens are shared by every theme mode and text scale.
+        .corner_radius(reader().radius._4xl)
         .padding(Insets {
             left: 7.0,
             top: 0.0,
@@ -18615,14 +18896,14 @@ fn composer_queue_chip(
             .color_when(move || palette(&s).accent_text)
     };
     let kind = {
-        let s = shared.clone();
-        let theme = shared.theme();
+        let style = shared.clone();
+        let colors = shared.clone();
         Label::new(item.kind.label().to_uppercase())
-            .text_style(sui::TextStyle {
+            .text_style_when(move || sui::TextStyle {
                 weight: FontWeight::BOLD,
-                ..small_theme_text_style(&theme)
+                ..small_text_style(&style)
             })
-            .color_when(move || palette(&s).accent_text)
+            .color_when(move || palette(&colors).accent_text)
     };
     let s = shared.clone();
     let text = small_label(shared, compact_line(&item.text, 46))
@@ -18643,7 +18924,7 @@ fn composer_queue_chip(
             )
             .size(16.0)
             .icon_size(10.0)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
@@ -18655,7 +18936,7 @@ fn composer_queue_chip(
     }
     SizedBox::new().height(20.0).child(
         Surface::field(row)
-            .corner_radius(4.0)
+            .corner_radius(reader().radius.sm)
             .padding(Insets {
                 left: 7.0,
                 top: 0.0,
@@ -18719,28 +19000,50 @@ fn composer_context_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     composer_chip_row(row, "Attached context")
 }
 
-/// Current model and workspace on the left, with compact actions grouped on the right.
-/// The groups wrap independently when the writing surface is narrow.
-fn composer_bar(
+/// An action-bar button under a tooltip. Tooltip text has no binding, so the pair is replaced,
+/// as one small leaf, only when the projected tooltip text or button key changes.
+fn composer_tooltip_button<K, S, F>(
     shared: &Shared,
     reader: &ThemeReader,
-    structure: &ComposerBarLayoutStructure,
-) -> WidgetPod {
-    let streaming = structure.streaming;
-    let media_active = structure.media_active;
-    let workspace_label = structure.workspace_label.clone();
-    let workspace_description = structure.workspace_description.clone();
-    let workspace_selected = structure.workspace_selected;
-    let workspace_picker_pending = structure.workspace_picker_pending;
-    let hint = structure.voice_link_hint.clone();
-    let can_reuse = structure.can_reuse_latest_answer;
+    name: &'static str,
+    select: S,
+    build: F,
+) -> impl Widget + use<K, S, F>
+where
+    K: Clone + Default + PartialEq + Send + Sync + 'static,
+    S: Fn(&ComposerBarStructure) -> (String, K) + Send + Sync + 'static,
+    F: Fn(&Shared, &ThemeReader, &K) -> widgets::Boxed + 'static,
+{
+    let source = chat_projection(shared, name, move |snapshot| {
+        snapshot
+            .map(|snapshot| select(&snapshot.composer_bar))
+            .unwrap_or_default()
+    });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::key_from(source, move |(tooltip, key)| {
+        WidgetPod::new(
+            Tooltip::new(tooltip.clone(), build(&s, &r, key))
+                .placement(TooltipPlacement::Above)
+                .theme_when(clone_reader(&r)),
+        )
+    })
+}
+
+/// Current model and workspace on the left, with compact actions grouped on the right.
+/// The groups wrap independently when the writing surface is narrow.
+///
+/// The bar is built once. Send and Interrupt+Cancel, and the idle and live voice buttons, are
+/// prebuilt variants switched by the projected state; hints come and go in place. Only the
+/// tooltip buttons whose tooltip text follows the conversation are replaced, one leaf at a time.
+fn composer_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let small = small_control_reader(reader)();
+    let medium = reader();
 
     let attach = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Attach, "Attach files")
-            .size(COMPOSER_GHOST_BUTTON_SIZE)
-            .icon_size(14.0)
-            .theme_when(composer_control_reader(reader))
+            .theme_when(small_control_reader(reader))
             .appearance(sui::ButtonAppearance::Ghost)
             .tone(SemanticTone::Neutral)
             .on_press_with_ctx(move |ctx| {
@@ -18750,231 +19053,213 @@ fn composer_bar(
             })
     };
 
-    let workspace = {
-        let s = shared.clone();
-        Tooltip::new(
-            workspace_description.clone(),
-            sui::Button::new(workspace_label)
-                .description(workspace_description)
-                .icon(IconGlyph::Folder)
-                .min_width(0.0)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-                .icon_size(14.0)
-                .theme_when(composer_control_reader(reader))
-                .appearance(sui::ButtonAppearance::Ghost)
-                .tone(if workspace_selected {
-                    SemanticTone::Accent
-                } else {
-                    SemanticTone::Neutral
-                })
-                .enabled(!workspace_picker_pending)
-                .on_press_with_ctx(move |ctx| {
-                    s.chat_mut().toggle_composer_popup(ComposerPopup::Workspace);
-                    request_chat_window_relayout(ctx);
-                }),
-        )
-        .placement(TooltipPlacement::Above)
-        .theme(reader())
-    };
+    let workspace = composer_tooltip_button(
+        shared,
+        reader,
+        "chat composer workspace button",
+        |bar| (bar.workspace_description.clone(), bar.workspace_selected),
+        |s, r, selected| {
+            let press = s.clone();
+            let label = s.clone();
+            let enabled = s.clone();
+            widgets::Boxed::new(
+                sui::Button::new(workspace_button_label(&s.chat()))
+                    .label_when(move || workspace_button_label(&label.chat()))
+                    .description(workspace_button_description(&s.chat()))
+                    .icon(IconGlyph::Folder)
+                    .min_width(0.0)
+                    .theme_when(small_control_reader(r))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(if *selected {
+                        SemanticTone::Accent
+                    } else {
+                        SemanticTone::Neutral
+                    })
+                    .enabled_when(move || !enabled.chat().workspace_picker_lane_pending())
+                    .on_press_with_ctx(move |ctx| {
+                        press
+                            .chat_mut()
+                            .toggle_composer_popup(ComposerPopup::Workspace);
+                        request_chat_window_relayout(ctx);
+                    }),
+            )
+        },
+    );
 
     let mic = {
+        let idle = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::Mic, "Set up voice link")
+                .theme_when(small_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().activate_media_call_control();
+                    request_chat_window_relayout(ctx);
+                })
+        };
+        let live = {
+            let s = shared.clone();
+            IconButton::new(IconGlyph::AudioLines, "Voice link on — tap to end")
+                .theme_when(small_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .selected(true)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().activate_media_call_control();
+                    request_chat_window_relayout(ctx);
+                })
+        };
+        SwitchView::new()
+            .selected_from(chat_projection(
+                shared,
+                "chat composer voice link",
+                |snapshot| {
+                    usize::from(snapshot.is_some_and(|snapshot| snapshot.composer_bar.media_active))
+                },
+            ))
+            .with_child(idle)
+            .with_child(live)
+    };
+
+    let model = composer_tooltip_button(
+        shared,
+        reader,
+        "chat composer model button label",
+        |bar| (bar.model_label.clone(), bar.model_label.clone()),
+        |s, r, label| {
+            let press = s.clone();
+            widgets::Boxed::new(
+                sui::Button::new(label.clone())
+                    .icon(IconGlyph::Sparkles)
+                    .min_width(0.0)
+                    .theme_when(small_control_reader(r))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .on_press_with_ctx(move |ctx| {
+                        press.chat_mut().toggle_composer_popup(ComposerPopup::Model);
+                        request_chat_window_relayout(ctx);
+                    }),
+            )
+        },
+    );
+
+    let context = composer_tooltip_button(
+        shared,
+        reader,
+        "chat composer context button label",
+        |bar| (bar.context_label.clone(), bar.context_label.clone()),
+        |s, r, label| {
+            let press = s.clone();
+            widgets::Boxed::new(
+                IconButton::new(IconGlyph::History, label.clone())
+                    .theme_when(small_control_reader(r))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .on_press_with_ctx(move |ctx| {
+                        press
+                            .chat_mut()
+                            .toggle_composer_popup(ComposerPopup::Context);
+                        request_chat_window_relayout(ctx);
+                    }),
+            )
+        },
+    );
+
+    let activity = composer_tooltip_button(
+        shared,
+        reader,
+        "chat composer activity button text",
+        |bar| (bar.activity_description.clone(), bar.activity_label.clone()),
+        |s, r, label| {
+            let press = s.clone();
+            widgets::Boxed::new(
+                IconButton::new(IconGlyph::Hourglass, label.clone())
+                    .theme_when(small_control_reader(r))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .on_press_with_ctx(move |ctx| {
+                        press.chat_mut().toggle_activity_panel();
+                        request_chat_window_relayout(ctx);
+                    }),
+            )
+        },
+    );
+
+    let hint = {
+        let text = chat_projection(shared, "chat composer voice hint", |snapshot| {
+            snapshot
+                .and_then(|snapshot| snapshot.composer_bar.voice_link_hint.clone())
+                .unwrap_or_default()
+        });
+        let shown = chat_projection(shared, "chat composer voice hint shown", |snapshot| {
+            snapshot.is_some_and(|snapshot| snapshot.composer_bar.voice_link_hint.is_some())
+        });
         let s = shared.clone();
-        IconButton::new(
-            if media_active {
-                IconGlyph::AudioLines
-            } else {
-                IconGlyph::Mic
-            },
-            if media_active {
-                "Voice link on — tap to end"
-            } else {
-                "Set up voice link"
-            },
+        Presence::new(
+            small_label(shared, text.get())
+                .text_from(text)
+                .color_when(move || palette(&s).accent_text),
         )
-        .size(COMPOSER_GHOST_BUTTON_SIZE)
-        .icon_size(14.0)
-        .theme_when(composer_control_reader(reader))
-        .appearance(sui::ButtonAppearance::Ghost)
-        .tone(SemanticTone::Neutral)
-        .selected_when({
-            let s = s.clone();
-            move || s.chat().media_call.active
-        })
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().activate_media_call_control();
-            request_chat_window_relayout(ctx);
-        })
+        .shown_from(shown)
+        .transition(crate::ui::widgets::reveal_transition())
+        .collapse(Axis::Horizontal)
     };
 
-    // Keep the model label reactive without rebuilding the rest of the action bar.
-    let model = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat composer model button label",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.theme, snapshot.composer_bar.model_label.clone()))
-                    .unwrap_or((
-                        (AppThemeMode::System, AppTextScale::Standard),
-                        "Model".to_string(),
-                    ))
-            },
-        );
+    let use_answer = {
         let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::key_from(source, move |(_theme, label)| {
-            let press_shared = s.clone();
-            WidgetPod::new(
-                Tooltip::new(
-                    label.clone(),
-                    sui::Button::new(label.clone())
-                        .icon(IconGlyph::Sparkles)
-                        .min_width(0.0)
-                        .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-                        .icon_size(14.0)
-                        .theme_when(composer_control_reader(&r))
-                        .appearance(sui::ButtonAppearance::Ghost)
-                        .tone(SemanticTone::Neutral)
-                        .on_press_with_ctx(move |ctx| {
-                            press_shared
-                                .chat_mut()
-                                .toggle_composer_popup(ComposerPopup::Model);
-                            request_chat_window_relayout(ctx);
-                        }),
-                )
-                .placement(TooltipPlacement::Above)
-                .theme(r()),
-            )
-        })
-    };
-
-    let context = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat composer context button label",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.theme, snapshot.composer_bar.context_label.clone()))
-                    .unwrap_or((
-                        (AppThemeMode::System, AppTextScale::Standard),
-                        String::new(),
-                    ))
-            },
-        );
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::key_from(source, move |(_theme, label)| {
-            let press_shared = s.clone();
-            WidgetPod::new(
-                Tooltip::new(
-                    label.clone(),
-                    IconButton::new(IconGlyph::History, label.clone())
-                        .size(COMPOSER_GHOST_BUTTON_SIZE)
-                        .icon_size(14.0)
-                        .theme_when(composer_control_reader(&r))
-                        .appearance(sui::ButtonAppearance::Ghost)
-                        .tone(SemanticTone::Neutral)
-                        .on_press_with_ctx(move |ctx| {
-                            press_shared
-                                .chat_mut()
-                                .toggle_composer_popup(ComposerPopup::Context);
-                            request_chat_window_relayout(ctx);
-                        }),
-                )
-                .placement(TooltipPlacement::Above)
-                .theme(r()),
-            )
-        })
-    };
-
-    let activity = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat composer activity button text",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| {
-                        (
-                            snapshot.theme,
-                            snapshot.composer_bar.activity_label.clone(),
-                            snapshot.composer_bar.activity_description.clone(),
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            (AppThemeMode::System, AppTextScale::Standard),
-                            "Activity".to_string(),
-                            String::new(),
-                        )
-                    })
-            },
-        );
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::key_from(source, move |(_theme, label, description)| {
-            let press_shared = s.clone();
-            WidgetPod::new(
-                Tooltip::new(
-                    description.clone(),
-                    IconButton::new(IconGlyph::Hourglass, label.clone())
-                        .size(COMPOSER_GHOST_BUTTON_SIZE)
-                        .icon_size(14.0)
-                        .theme_when(composer_control_reader(&r))
-                        .appearance(sui::ButtonAppearance::Ghost)
-                        .tone(SemanticTone::Neutral)
-                        .on_press_with_ctx(move |ctx| {
-                            press_shared.chat_mut().toggle_activity_panel();
-                            request_chat_window_relayout(ctx);
-                        }),
-                )
-                .placement(TooltipPlacement::Above)
-                .theme(r()),
-            )
-        })
-    };
-
-    let mut row = Flex::horizontal()
-        .wrap(FlexWrap::Wrap)
-        .gap(COMPOSER_BAR_GAP)
-        .align_items(Alignment::Center)
-        .spacer()
-        .with_child(attach)
-        .with_child(mic);
-
-    if let Some(hint_text) = hint {
-        let s = shared.clone();
-        row = row
-            .with_child(small_label(shared, hint_text).color_when(move || palette(&s).accent_text));
-    }
-
-    row = row.with_child(context).with_child(activity);
-
-    if can_reuse && !streaming {
-        let s = shared.clone();
-        row = row.with_child(
+        let shown = chat_projection(shared, "chat composer reuse answer", |snapshot| {
+            snapshot.is_some_and(|snapshot| {
+                snapshot.composer_bar.can_reuse_latest_answer && !snapshot.composer_bar.streaming
+            })
+        });
+        Presence::new(
             sui::Button::new("Use answer")
                 .icon(IconGlyph::Redo)
-                .min_height(COMPOSER_GHOST_BUTTON_SIZE)
-                .theme_when(clone_reader(reader))
+                .theme_when(small_control_reader(reader))
                 .appearance(sui::ButtonAppearance::Ghost)
                 .tone(SemanticTone::Neutral)
                 .on_press(move || {
                     s.chat_mut().use_latest_answer_as_draft();
                 }),
-        );
-    }
+        )
+        .shown_from(shown)
+        .transition(crate::ui::widgets::reveal_transition())
+        .collapse(Axis::Horizontal)
+    };
 
     // Interruption is first-class: mid-stream the send button becomes
     // interrupt (pause), with cancel beside it for an immediate full stop.
-    if streaming {
+    // Both variants keep the IME open through touch release: blurring the editor
+    // on touch-down would move this bottom-anchored button out from under the tap.
+    let send = {
         let s = shared.clone();
-        row = row.with_child(
+        Tooltip::new(
+            "Enter sends · Shift+Enter newline",
+            IconButton::new(IconGlyph::ArrowUp, "Send message")
+                .theme_when(clone_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Accent)
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_send()
+                })
+                .focus_on_press(!cfg!(target_os = "android"))
+                .on_press(move || {
+                    s.chat_mut().submit();
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .alignment(TooltipAlignment::End)
+        .theme_when(clone_reader(reader))
+    };
+    let stop = {
+        let cancel = {
+            let s = shared.clone();
             Tooltip::new(
                 "Cancel now: stops running tools and processes; unfinished work may be lost",
                 IconButton::new(IconGlyph::Close, "Cancel response")
-                    .size(COMPOSER_GHOST_BUTTON_SIZE)
-                    .icon_size(13.0)
-                    .theme_when(composer_control_reader(reader))
+                    .theme_when(small_control_reader(reader))
                     .appearance(sui::ButtonAppearance::Ghost)
                     .tone(SemanticTone::Danger)
                     .on_press(move || {
@@ -18983,68 +19268,69 @@ fn composer_bar(
             )
             .placement(TooltipPlacement::Above)
             .alignment(TooltipAlignment::End)
-            .theme(reader()),
-        );
-    }
-    let (action, action_tooltip) = if streaming {
-        let s = shared.clone();
-        (
-            IconButton::new(IconGlyph::Stop, "Interrupt")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(13.0)
-                .theme_when(composer_control_reader(reader))
-                .appearance(sui::ButtonAppearance::Ghost)
-                .tone(SemanticTone::Accent)
-                .on_press(move || {
-                    s.chat_mut().interrupt_turn();
-                }),
-            "Interrupt (Esc): running tools finish, then the agent waits · send a message to continue",
-        )
-    } else {
-        let s = shared.clone();
-        (
-            IconButton::new(IconGlyph::ArrowUp, "Send message")
-                .size(SEND_BUTTON_SIZE)
-                .icon_size(16.0)
-                .theme_when(composer_control_reader(reader))
-                .appearance(sui::ButtonAppearance::Ghost)
-                .tone(SemanticTone::Accent)
-                .enabled_when({
-                    let s = s.clone();
-                    move || s.chat().can_send()
-                })
-                .on_press(move || {
-                    s.chat_mut().submit();
-                }),
-            "Enter sends · Shift+Enter newline",
-        )
-    };
-    row = row.with_child(
-        // Keep the IME open through touch release. Blurring the editor on
-        // touch-down moves this bottom-anchored button out from under the tap.
-        Tooltip::new(
-            action_tooltip,
-            action.focus_on_press(!cfg!(target_os = "android")),
-        )
+            .theme_when(clone_reader(reader))
+        };
+        let interrupt = {
+            let s = shared.clone();
+            Tooltip::new(
+                "Interrupt (Esc): running tools finish, then the agent waits · send a message to continue",
+                IconButton::new(IconGlyph::Stop, "Interrupt")
+                    .theme_when(clone_reader(reader))
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Accent)
+                    .focus_on_press(!cfg!(target_os = "android"))
+                    .on_press(move || {
+                        s.chat_mut().interrupt_turn();
+                    }),
+            )
             .placement(TooltipPlacement::Above)
             .alignment(TooltipAlignment::End)
-            .theme(reader()),
-    );
+            .theme_when(clone_reader(reader))
+        };
+        Flex::horizontal()
+            .gap(COMPOSER_BAR_GAP)
+            .align_items(Alignment::Center)
+            .with_child(cancel)
+            .with_child(interrupt)
+    };
+    let action = SwitchView::new()
+        .selected_from(chat_projection(
+            shared,
+            "chat composer send action",
+            |snapshot| {
+                usize::from(snapshot.is_some_and(|snapshot| snapshot.composer_bar.streaming))
+            },
+        ))
+        .with_child(send)
+        .with_child(stop);
 
+    let row = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(COMPOSER_BAR_GAP)
+        .align_items(Alignment::Center)
+        .spacer()
+        .with_child(attach)
+        .with_child(mic)
+        .with_child(hint)
+        .with_child(context)
+        .with_child(activity)
+        .with_child(use_answer)
+        .with_child(action);
+
+    // Room for the four quiet controls and Send before the action group wraps. Control sizes
+    // come from the theme's size tiers, which no theme mode or text scale changes.
+    let actions_min_width = 4.0 * small.metrics.icon_button_size
+        + medium.metrics.icon_button_size
+        + 4.0 * COMPOSER_BAR_GAP;
     let row = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(12.0)
         .align_items(Alignment::Center)
         .with_item(model, FlexItem::default().max_width(220.0))
         .with_item(workspace, FlexItem::default().max_width(220.0))
-        .with_item(
-            row,
-            FlexItem::flex(1.0).min_width(
-                4.0 * COMPOSER_GHOST_BUTTON_SIZE + SEND_BUTTON_SIZE + 4.0 * COMPOSER_BAR_GAP,
-            ),
-        );
+        .with_item(row, FlexItem::flex(1.0).min_width(actions_min_width));
 
-    WidgetPod::new(WidgetPadding::new(
+    WidgetPadding::new(
         Insets {
             left: COMPOSER_BAR_PAD_X,
             top: COMPOSER_BAR_PAD_Y,
@@ -19052,7 +19338,7 @@ fn composer_bar(
             bottom: COMPOSER_BAR_PAD_Y,
         },
         row,
-    ))
+    )
 }
 
 fn composer_input_min_height() -> f32 {
@@ -19165,83 +19451,40 @@ fn composer_field(
     selection: &SelectionScope,
 ) -> impl Widget + use<> {
     let queue_host = {
-        let source =
-            shared
-                .signals()
-                .chat_structure
-                .select_named("chat queued inputs structure", |key| {
-                    key.0
-                        .as_deref()
-                        .map(|snapshot| (snapshot.theme, snapshot.queued_turn_inputs.clone()))
-                        .unwrap_or(((AppThemeMode::System, AppTextScale::Standard), Vec::new()))
-                });
+        let source = chat_projection(shared, "chat queued inputs structure", |snapshot| {
+            snapshot
+                .map(|snapshot| snapshot.queued_turn_inputs.clone())
+                .unwrap_or_default()
+        });
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::key_from(source, move |_items| composer_queue_row(&s, &r))
     };
 
     let context_host = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat composer attachments structure",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.theme, snapshot.attachments.clone()))
-            },
-        );
+        let source = chat_projection(shared, "chat composer attachments structure", |snapshot| {
+            snapshot
+                .map(|snapshot| snapshot.attachments.clone())
+                .unwrap_or_default()
+        });
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::key_from(source, move |_sig| composer_context_row(&s, &r))
     };
 
+    // The focused editor owns its buffer. It is replaced only when the draft is replaced
+    // programmatically (a sent or queued message, a reused answer, a new conversation) or when
+    // provider availability switches it between editable and read-only.
     let input_host = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat composer input replacement",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| {
-                        (
-                            snapshot.theme,
-                            snapshot.streaming,
-                            snapshot.providers.is_empty(),
-                            snapshot.draft_revision,
-                        )
-                    })
-                    .unwrap_or((
-                        (AppThemeMode::System, AppTextScale::Standard),
-                        false,
-                        true,
-                        0,
-                    ))
-            },
-        );
+        let source = chat_projection(shared, "chat composer input replacement", |snapshot| {
+            snapshot
+                .map(|snapshot| (snapshot.providers.is_empty(), snapshot.draft_revision))
+                .unwrap_or((true, 0))
+        });
         let s = shared.clone();
         let r = Rc::clone(reader);
         let sel = selection.clone();
         RebuildOnChange::key_from(source, move |_sig| composer_input_row(&s, &r, &sel))
-    };
-
-    let bar_host = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat composer action bar structure",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| ComposerBarLayoutStructure::from(&snapshot.composer_bar))
-            },
-        );
-        let s = shared.clone();
-        let r = Rc::clone(reader);
-        RebuildOnChange::key_from(source, move |structure| {
-            composer_bar(
-                &s,
-                &r,
-                structure
-                    .as_ref()
-                    .expect("composer bar is built only after chat is ready"),
-            )
-        })
     };
 
     let rows = Stack::vertical()
@@ -19249,7 +19492,7 @@ fn composer_field(
         .with_child(queue_host)
         .with_child(context_host)
         .with_child(input_host)
-        .with_child(bar_host);
+        .with_child(composer_bar(shared, reader));
 
     FramedField::new(rows)
         .name("Message composer")
@@ -19327,49 +19570,37 @@ fn transcript_with_context_menu(
     })
 }
 
-/// The main column: the transcript fills, with the composer docked at the bottom. Worker-driven
-/// updates arrive through the window controller rather than an invisible overlay widget.
+/// The main column: the transcript fills, with the composer docked at the bottom. The media
+/// panel slides in above the transcript; showing or hiding it never replaces the transcript.
+/// Worker-driven updates arrive through the window controller rather than an invisible overlay
+/// widget.
 fn main_column(
     shared: &Shared,
     reader: &ThemeReader,
     selection: &SelectionScope,
 ) -> impl Widget + use<> {
-    let transcript = {
-        let source = shared.signals().chat_structure.select_named(
-            "chat media presentation structure",
-            |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| {
-                        (
-                            snapshot.theme,
-                            snapshot.media_panel.active || snapshot.media_panel.open,
-                        )
-                    })
-                    .unwrap_or(((AppThemeMode::System, AppTextScale::Standard), false))
-            },
-        );
-        let build_shared = shared.clone();
-        let build_reader = Rc::clone(reader);
-        let build_selection = selection.clone();
-        RebuildOnChange::key_from(source, move |media_sig| {
-            let (_theme, panel_visible) = *media_sig;
-            let transcript = transcript_with_context_menu(
-                &build_shared,
-                &build_reader,
-                &build_selection,
-                TranscriptView::new(build_shared.clone(), build_selection.clone()),
-            );
-            if !panel_visible {
-                return WidgetPod::new(transcript);
-            }
-            WidgetPod::new(
-                Dock::new(transcript)
-                    .top(MEDIA_CALL_H, media_call_panel(&build_shared, &build_reader)),
-            )
-        })
-    };
-    MeasuredBottomDock::new(transcript, composer(shared, reader, selection))
+    let transcript = transcript_with_context_menu(
+        shared,
+        reader,
+        selection,
+        TranscriptView::new(shared.clone(), selection.clone()),
+    );
+    let media_visible = chat_projection(shared, "chat media panel visible", |snapshot| {
+        snapshot.is_some_and(|snapshot| snapshot.media_panel.active || snapshot.media_panel.open)
+    });
+    let media = Presence::new(
+        SizedBox::new()
+            .height(MEDIA_CALL_H)
+            .child(media_call_panel(shared, reader)),
+    )
+    .shown_from(media_visible)
+    .transition(crate::ui::widgets::reveal_transition())
+    .collapse(Axis::Vertical);
+    let body = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .with_child(media)
+        .with_item(transcript, FlexItem::flex(1.0).min_height(0.0));
+    MeasuredBottomDock::new(body, composer(shared, reader, selection))
 }
 
 fn chat_work_area(
@@ -19381,9 +19612,6 @@ fn chat_work_area(
 }
 
 fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let theme = shared.theme();
-    let pal = palette(shared);
-
     let open_drawer = {
         let s = shared.clone();
         IconButton::new(IconGlyph::Chat, "Open conversations and agents")
@@ -19403,7 +19631,7 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
     };
     let title = {
         let s = shared.clone();
-        let colors = shared.clone();
+        let r = Rc::clone(reader);
         Label::new("Conversation")
             .text_when(move || {
                 let chat = s.chat();
@@ -19413,12 +19641,19 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             })
             .semantic_name("Current conversation")
             .single_line(true)
-            .text_style(pal.text_style(&theme, 13.0, FontWeight::SEMIBOLD, pal.text))
-            .color_when(move || palette(&colors).text)
+            .text_style_when(move || {
+                let theme = r();
+                crate::theme::token_text_style(
+                    &theme,
+                    theme.text.sm,
+                    FontWeight::SEMIBOLD,
+                    theme.surfaces.text,
+                )
+            })
     };
     let agent = {
         let s = shared.clone();
-        let colors = shared.clone();
+        let r = Rc::clone(reader);
         Label::new("Agent")
             .text_when(move || {
                 let chat = s.chat();
@@ -19439,8 +19674,15 @@ fn compact_chat_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             })
             .semantic_name("Current agent")
             .single_line(true)
-            .text_style(pal.text_style(&theme, 11.0, FontWeight::NORMAL, pal.text_muted))
-            .color_when(move || palette(&colors).text_muted)
+            .text_style_when(move || {
+                let theme = r();
+                crate::theme::token_text_style(
+                    &theme,
+                    theme.text.xs,
+                    FontWeight::NORMAL,
+                    theme.surfaces.text_muted,
+                )
+            })
     };
     let edit = {
         let s = shared.clone();
@@ -19612,14 +19854,14 @@ pub struct ChatView {
     wide: WidgetPod,
     narrow: WidgetPod,
     use_wide: Cell<bool>,
+    /// The layout last arranged on screen. Parents may probe `measure` with other constraints,
+    /// so only an arranged change refreshes the newly visible editor.
+    arranged_wide: Cell<Option<bool>>,
 }
 
 impl ChatView {
     pub fn new(shared: Shared) -> Self {
-        let theme_reader: ThemeReader = {
-            let s = shared.clone();
-            Rc::new(move || s.theme())
-        };
+        let theme_reader = shared_reader(&shared);
         let sessions_scroll_state = ScrollState::new();
         // One selection registry for the whole chat tab: the composer and the
         // transcript replace each other's selection through it, and the
@@ -19632,6 +19874,7 @@ impl ChatView {
             wide,
             narrow,
             use_wide: Cell::new(true),
+            arranged_wide: Cell::new(None),
         }
     }
 
@@ -19696,20 +19939,25 @@ impl Widget for ChatView {
 
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let use_wide = constraints.max.width >= WIDE_THRESHOLD && constraints.max.height >= 380.0;
-        if use_wide != self.use_wide.get() {
-            let mut chat = self.shared.chat_mut();
-            // The inactive layout has its own retained editor. Refresh it
-            // from the canonical draft before it becomes visible again.
-            chat.draft_revision = chat.draft_revision.wrapping_add(1);
-            if use_wide {
-                chat.compact_drawer_open = false;
-            }
-        }
         self.use_wide.set(use_wide);
         self.active_mut().measure(ctx, constraints)
     }
 
     fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let use_wide = self.use_wide.get();
+        if self
+            .arranged_wide
+            .replace(Some(use_wide))
+            .is_some_and(|arranged| arranged != use_wide)
+        {
+            let mut chat = self.shared.chat_mut();
+            // The inactive layout has its own retained editor. Refresh it
+            // from the canonical draft now that it is visible again.
+            chat.draft_revision = chat.draft_revision.wrapping_add(1);
+            if use_wide {
+                chat.compact_drawer_open = false;
+            }
+        }
         self.active_mut().arrange(ctx, bounds);
     }
 
@@ -19938,10 +20186,7 @@ pub(crate) const CHAT_OFFLINE_SUMMARY: &str =
 /// Build the chat tab content. Chat runs entirely through the daemon, so while it is unreachable
 /// the tab shows the shared offline panel instead of a transcript that cannot load or send.
 pub fn view(shared: Shared) -> impl Widget {
-    let reader: ThemeReader = {
-        let shared = shared.clone();
-        Rc::new(move || shared.theme())
-    };
+    let reader = shared_reader(&shared);
     let offline =
         DaemonOfflinePanel::new(&shared, &reader, "Chat offline", CHAT_OFFLINE_SUMMARY).build();
     daemon_gate(&shared, ChatView::new(shared.clone()), offline)
@@ -21702,9 +21947,9 @@ mod tests {
     }
 
     #[test]
-    fn composer_control_reader_keeps_footer_text_compact() {
+    fn small_control_reader_keeps_footer_text_compact() {
         let reader: ThemeReader = Rc::new(DefaultTheme::default);
-        let theme = composer_control_reader(&reader)();
+        let theme = small_control_reader(&reader)();
         let body = theme.body_text_style();
         let placeholder = theme.placeholder_text_style();
 
@@ -24775,6 +25020,11 @@ mod tests {
             "keyboard guidance should not consume persistent composer space"
         );
         let snapshot = window.snapshot()?;
+        // Quiet bar controls use the Small control size; Send remains a Medium primary action.
+        let ghost_size = shared
+            .theme_sized(ControlSize::Small)
+            .metrics
+            .icon_button_size;
         for name in [
             "Attach files",
             "Context will refresh on the next send",
@@ -24782,16 +25032,15 @@ mod tests {
         ] {
             let bounds = named_node_bounds(&snapshot, SemanticsRole::Button, name);
             assert!(
-                bounds.width() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0
-                    && bounds.height() <= COMPOSER_GHOST_BUTTON_SIZE + 1.0,
+                bounds.width() <= ghost_size + 1.0 && bounds.height() <= ghost_size + 1.0,
                 "{name} should use the compact icon-button footprint, got {bounds:?}"
             );
         }
         let model = named_node_bounds(&snapshot, SemanticsRole::Button, "gpt-5");
         let workspace = named_node_bounds(&snapshot, SemanticsRole::Button, "sinomo");
         let attach = named_node_bounds(&snapshot, SemanticsRole::Button, "Attach files");
-        assert!(model.width() > COMPOSER_GHOST_BUTTON_SIZE + 20.0);
-        assert!(workspace.width() > COMPOSER_GHOST_BUTTON_SIZE + 20.0);
+        assert!(model.width() > ghost_size + 20.0);
+        assert!(workspace.width() > ghost_size + 20.0);
         assert!(model.max_x() <= workspace.x());
         assert!(workspace.max_x() + 12.0 <= attach.x());
 
@@ -27346,7 +27595,9 @@ mod tests {
 
     #[test]
     fn device_selection_index_does_not_replace_the_media_panel_tree() {
-        let fixture = sinomo_testdir::TestDir::new("app-ui-device-selection-index-does-not-replace-the-media-panel-tree");
+        let fixture = sinomo_testdir::TestDir::new(
+            "app-ui-device-selection-index-does-not-replace-the-media-panel-tree",
+        );
         let backend = Backend::local_fallback_for_data_dir(
             sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
         );
@@ -31096,6 +31347,16 @@ mod tests {
             );
         }
 
+        // Long failure feedback can push the manual action below the popup's
+        // viewport. Reveal it through the existing scroller before clicking.
+        let options = named_node_bounds(&snapshot, SemanticsRole::ScrollView, "Attachment options");
+        let manual = named_node_bounds(&snapshot, SemanticsRole::Button, "Enter path manually");
+        if manual.max_y() > options.max_y() {
+            window
+                .get_by_role(SemanticsRole::ScrollView)
+                .with_name("Attachment options")
+                .scroll_pixels(sui::Vector::new(0.0, options.max_y() - manual.max_y()))?;
+        }
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Enter path manually")
@@ -31266,7 +31527,8 @@ mod tests {
 
     #[test]
     fn provider_list_load_applies_async_result() {
-        let fixture = sinomo_testdir::TestDir::new("app-ui-provider-list-load-applies-async-result");
+        let fixture =
+            sinomo_testdir::TestDir::new("app-ui-provider-list-load-applies-async-result");
         let backend = Backend::local_fallback_for_data_dir(
             sinomo_runtime::local::SinomoDataDir::new(fixture.path()),
         );

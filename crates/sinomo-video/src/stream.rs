@@ -203,6 +203,7 @@ pub fn desktop_capture_body(
                 && !cancelled.load(Ordering::Acquire)
                 && !sender.is_closed()
             {
+                capture.check_active().map_err(|error| error.to_string())?;
                 // Native capture keeps its own latest-frame slot. Pull only
                 // when we can encode/send: a provider boundary may copy a full
                 // raw frame, so polling it while backpressured wastes bandwidth.
@@ -369,11 +370,13 @@ impl RemoteVideoSource {
         let terminal = failure.clone();
         let worker = tokio::spawn(async move {
             let mut body = body.cancel_on_drop();
-            let mut previous = 0;
+            let mut previous = None;
             loop {
                 match read_frame(&mut body).await {
-                    Ok(Some(frame)) if frame.0.sequence > previous => {
-                        previous = frame.0.sequence;
+                    Ok(Some(frame))
+                        if previous.is_none_or(|sequence| frame.0.sequence > sequence) =>
+                    {
+                        previous = Some(frame.0.sequence);
                         *output.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
                     }
                     Ok(None) => break,
@@ -416,6 +419,44 @@ impl Drop for RemoteVideoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn remote_source_accepts_a_native_camera_starting_at_sequence_zero() {
+        let sample = NativeVideoSample {
+            sequence: 0,
+            format: NativeVideoSampleFormat::Bgra8,
+            width: 1,
+            height: 1,
+            timestamp_ns: 0,
+            duration_ns: 33_333_333,
+            captured_at_unix_ms: 1,
+            data: Arc::from([0, 0, 0, 255]),
+            planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+                offset: 0,
+                len: 4,
+                width: 1,
+                height: 1,
+                stride: 4,
+            }]),
+        };
+        let (metadata, encoded) =
+            encode_sample(&sample, &RealtimeVideoInputConfig::default()).unwrap();
+        let body = sinomo_runtime::network::ObjectRpcIncomingBody::bytes(
+            record(&metadata, &encoded.image).unwrap(),
+        );
+        let source = RemoteVideoSource::from_body(body);
+        let frame = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(frame) = source.take_latest().unwrap() {
+                    break frame;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(frame.0.sequence, 0);
+    }
+
     #[test]
     fn overview_tiles_preserve_surface_identity_and_source_geometry() {
         let make = |color: [u8; 4], width, height, time| NativeVideoSample {
@@ -458,10 +499,21 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn backpressure_does_not_fetch_unconsumed_native_frames() {
+    async fn backpressure_does_not_fetch_frames_or_delay_revocation() {
         use std::sync::atomic::AtomicUsize;
-        struct Source(Arc<AtomicUsize>);
+        struct Source(Arc<AtomicUsize>, Arc<AtomicBool>);
         impl DesktopFrameSource for Source {
+            fn check_active(&self) -> sinomo_runtime::device::desktop::DesktopResult<()> {
+                if self.1.load(Ordering::Acquire) {
+                    Err(
+                        sinomo_runtime::device::desktop::DesktopError::PermissionDenied(
+                            "revoked".into(),
+                        ),
+                    )
+                } else {
+                    Ok(())
+                }
+            }
             fn next(
                 &self,
                 _: u64,
@@ -489,8 +541,9 @@ mod tests {
             }
         }
         let reads = Arc::new(AtomicUsize::new(0));
+        let revoked = Arc::new(AtomicBool::new(false));
         let (body, worker) = desktop_capture_body(
-            Source(reads.clone()),
+            Source(reads.clone(), revoked.clone()),
             RealtimeVideoInputConfig {
                 frame_format: RealtimeVideoFrameFormat::Png,
                 max_frame_rate_hz: None,
@@ -506,11 +559,14 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(160)).await;
         assert_eq!(reads.load(Ordering::Acquire), 1);
-        drop(body);
+        revoked.store(true, Ordering::Release);
+        // Keep the unread body alive: revocation must release capture even if
+        // the peer never drains the already queued frame.
         tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .unwrap()
             .unwrap();
+        drop(body);
     }
     #[tokio::test]
     async fn bgra_video_uses_the_shared_encoder_and_keeps_capture_metadata() {

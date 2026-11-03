@@ -454,7 +454,22 @@ fn pin_native_module_library_until_process_exit(
 unsafe fn load_native_module_library(
     library_path: &Path,
 ) -> Result<Library, NativeModuleHostError> {
-    unsafe { Library::new(library_path) }.map_err(|source| NativeModuleHostError::Load {
+    // Android's emulated TLS can register pthread-key destructors in the
+    // calling host thread. Dropping the last library handle does not remove
+    // those callbacks; a later blocking-worker exit would jump into unmapped
+    // code. Retain the mapping even for descriptor inspection. Logical shutdown
+    // and route withdrawal still run normally; process exit reclaims the code.
+    #[cfg(target_os = "android")]
+    let library = unsafe {
+        libloading::os::unix::Library::open(
+            Some(library_path),
+            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NODELETE,
+        )
+    }
+    .map(Library::from);
+    #[cfg(not(target_os = "android"))]
+    let library = unsafe { Library::new(library_path) };
+    library.map_err(|source| NativeModuleHostError::Load {
         path: library_path.display().to_string(),
         detail: source.to_string(),
     })

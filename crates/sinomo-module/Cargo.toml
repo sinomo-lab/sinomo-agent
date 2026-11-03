@@ -34,3 +34,6 @@ sinomo-module-api = { path = "../sinomo-module-api" }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+libc.workspace = true

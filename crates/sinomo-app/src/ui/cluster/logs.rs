@@ -29,6 +29,12 @@ pub(super) struct LogKey {
     issues: Arc<[String]>,
 }
 
+impl LogKey {
+    pub(super) fn is_live(&self) -> bool {
+        self.live
+    }
+}
+
 impl Default for LogKey {
     fn default() -> Self {
         Self {
@@ -288,69 +294,80 @@ fn node_options(key: &ClusterStructureKey) -> Vec<(Option<String>, String)> {
 
 pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source = shared.signals().cluster_structure.clone();
-    let controls_shared = shared.clone();
-    let controls_reader = reader.clone();
-    // Sample changes cannot replace focused filter controls.
-    let controls = RebuildOnChange::key_from(
-        source.select_named("log scope controls", |key| {
-            (
-                key.theme,
-                node_options(key),
-                key.logs.node.clone(),
-                key.logs.live,
-            )
-        }),
-        move |(_, nodes, selected, live)| {
-            let action = controls_shared.clone();
+    // The controls stay mounted: the node select follows the log scope and is rebuilt only when
+    // the cluster's node list changes, and the pause button follows the live state.
+    let node_shared = shared.clone();
+    let node_reader = reader.clone();
+    let node = RebuildOnChange::key_from(
+        source.select_named("log node options", node_options),
+        move |nodes| {
+            let selected_shared = node_shared.clone();
+            let selected_nodes = nodes.clone();
+            let action = node_shared.clone();
             let options = nodes.clone();
-            let node = Select::new("Log node scope")
-                .options(nodes.iter().map(|(_, label)| label.clone()))
-                .selected(nodes.iter().position(|(id, _)| id == selected).unwrap_or(0))
-                .theme_when(clone_reader(&controls_reader))
-                .on_change_with_ctx(move |ctx, index, _| {
-                    if let Some((node, _)) = options.get(index) {
-                        {
-                            let mut cluster = action.cluster_mut();
-                            cluster.logs.key.node = node.clone();
-                            cluster.logs.invalidate();
-                        }
-                        request(&action, true);
-                        request_metric_explorer_relayout(ctx);
-                    }
-                });
-            let action = controls_shared.clone();
-            let refresh = Button::new("Refresh logs")
-                .theme_when(clone_reader(&controls_reader))
-                .on_press_with_ctx(move |ctx| {
-                    request(&action, true);
-                    request_metric_explorer_relayout(ctx);
-                });
-            let action = controls_shared.clone();
-            let pause = Button::new(if *live { "Pause logs" } else { "Resume logs" })
-                .theme_when(clone_reader(&controls_reader))
-                .on_press_with_ctx(move |ctx| {
-                    let live = {
-                        let mut cluster = action.cluster_mut();
-                        let state = &mut cluster.logs;
-                        state.key.live = !state.key.live;
-                        state.generation = state.generation.wrapping_add(1);
-                        state.requested = false;
-                        state.key.live
-                    };
-                    if live {
-                        request(&action, true);
-                    }
-                    request_metric_explorer_relayout(ctx);
-                });
             WidgetPod::new(
-                Flex::horizontal()
-                    .gap(8.0)
-                    .with_item(node, FlexItem::fill().min_width(0.0))
-                    .with_child(pause)
-                    .with_child(refresh),
+                Select::new("Log node scope")
+                    .options(nodes.iter().map(|(_, label)| label.clone()))
+                    .selected_when(move || {
+                        let selected = selected_shared.cluster().logs.key.node.clone();
+                        Some(
+                            selected_nodes
+                                .iter()
+                                .position(|(id, _)| *id == selected)
+                                .unwrap_or(0),
+                        )
+                    })
+                    .theme_when(clone_reader(&node_reader))
+                    .on_change_with_ctx(move |ctx, index, _| {
+                        if let Some((node, _)) = options.get(index) {
+                            {
+                                let mut cluster = action.cluster_mut();
+                                cluster.logs.key.node = node.clone();
+                                cluster.logs.invalidate();
+                            }
+                            request(&action, true);
+                            request_metric_explorer_relayout(ctx);
+                        }
+                    }),
             )
         },
     );
+    let action = shared.clone();
+    let refresh = Button::new("Refresh logs")
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            request(&action, true);
+            request_metric_explorer_relayout(ctx);
+        });
+    let action = shared.clone();
+    let pause = widgets::Restyle::new(
+        Button::new("Pause logs")
+            .theme_when(clone_reader(reader))
+            .on_press_with_ctx(move |ctx| {
+                let live = {
+                    let mut cluster = action.cluster_mut();
+                    let state = &mut cluster.logs;
+                    state.key.live = !state.key.live;
+                    state.generation = state.generation.wrapping_add(1);
+                    state.requested = false;
+                    state.key.live
+                };
+                if live {
+                    request(&action, true);
+                }
+                request_metric_explorer_relayout(ctx);
+            }),
+        source.select_named("log live mode", |key| key.logs.live),
+        |mut button, live| {
+            button.set_label(if *live { "Pause logs" } else { "Resume logs" });
+            button
+        },
+    );
+    let controls = Flex::horizontal()
+        .gap(8.0)
+        .with_item(node, FlexItem::fill().min_width(0.0))
+        .with_child(pause)
+        .with_child(refresh);
     let action = shared.clone();
     let search = TextInput::new("Search logs")
         .placeholder("Search messages, components or fields")
@@ -451,7 +468,6 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                         (
                             row.id.clone(),
                             (
-                                key.theme,
                                 row.clone(),
                                 key.snapshot
                                     .nodes
@@ -467,11 +483,8 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             )
         }),
         move |model, state| {
-            VirtualList::new("Collected logs", model, move |_, data| {
-                let reader = row_reader.clone();
-                RebuildOnChange::key_from(data, move |(_, row, node_name)| {
-                    WidgetPod::new(row_view(&reader, row, node_name))
-                })
+            VirtualList::new("Collected logs", model, move |key, data| {
+                row_view(&row_reader, key, data)
             })
             .state(state)
             .selection_mode(VirtualListSelectionMode::None)
@@ -537,9 +550,15 @@ fn entry_text(row: &LogRow, node_name: &str) -> String {
     text
 }
 
-fn row_view(reader: &ThemeReader, row: &LogRow, node_name: &str) -> impl Widget + use<> {
-    log_label(entry_text(row, node_name), reader)
-        .semantic_name(format!("Log entry {}", row.id))
+/// One log entry, built once per entry id. Its text follows the row data (for example a node's
+/// display name arriving later), so a text selection inside it survives updates.
+fn row_view(reader: &ThemeReader, id: &str, data: Signal<(LogRow, String)>) -> Label {
+    let (row, node_name) = data.get();
+    log_label(entry_text(&row, &node_name), reader)
+        .text_from(data.select_named("log entry text", |(row, node_name)| {
+            entry_text(row, node_name)
+        }))
+        .semantic_name(format!("Log entry {id}"))
         .selectable(sui::SelectionScope::new())
         .copy_to_clipboard(true)
 }

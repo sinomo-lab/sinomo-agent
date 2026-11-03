@@ -1004,6 +1004,13 @@ fn enumerate_native_devices_with_camera(
     #[cfg(target_os = "android")]
     {
         enumerate_android_mobile_devices(&node_id, &mut inventory);
+        #[cfg(feature = "native-devices")]
+        inventory.devices.retain(|device| {
+            !matches!(
+                device.profile.kind,
+                DeviceKind::Microphone | DeviceKind::Speaker
+            )
+        });
         if !include_camera {
             inventory
                 .devices
@@ -1418,7 +1425,12 @@ fn enumerate_camera_devices(node_id: &NodeId, inventory: &mut NativeDeviceInvent
 
 #[cfg(all(
     feature = "native-devices",
-    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+    not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "android"
+    ))
 ))]
 fn enumerate_camera_devices(_node_id: &NodeId, inventory: &mut NativeDeviceInventory) {
     inventory
@@ -2321,7 +2333,12 @@ fn start_platform_camera_capture(
 
 #[cfg(all(
     feature = "native-devices",
-    not(any(target_os = "linux", target_os = "windows", target_os = "macos"))
+    not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "android"
+    ))
 ))]
 fn start_platform_camera_capture(
     _config: NativeCameraCaptureConfig,
@@ -2802,4 +2819,67 @@ mod tests {
         assert_eq!(requested_camera_fps(2_000), 1);
         assert_eq!(requested_camera_fps(1), 120);
     }
+}
+
+/// Android embeds its Camera2 host in the application. The device owner controls
+/// stream lifetime; the host adapter never requests consent for remote callers.
+#[cfg(all(target_os = "android", feature = "native-devices"))]
+pub trait AndroidCameraSession: Send {
+    fn next_sample(&mut self) -> Result<Option<NativeVideoSample>, NativeDeviceError>;
+}
+#[cfg(all(target_os = "android", feature = "native-devices"))]
+pub type AndroidCameraFactory =
+    fn(NativeCameraCaptureConfig) -> Result<Box<dyn AndroidCameraSession>, NativeDeviceError>;
+#[cfg(all(target_os = "android", feature = "native-devices"))]
+static ANDROID_CAMERA: std::sync::OnceLock<AndroidCameraFactory> = std::sync::OnceLock::new();
+#[cfg(all(target_os = "android", feature = "native-devices"))]
+pub fn install_android_camera(factory: AndroidCameraFactory) {
+    let _ = ANDROID_CAMERA.set(factory);
+}
+#[cfg(all(target_os = "android", feature = "native-devices"))]
+fn enumerate_camera_devices(_node_id: &NodeId, _inventory: &mut NativeDeviceInventory) {}
+
+#[cfg(all(target_os = "android", feature = "native-devices"))]
+fn start_platform_camera_capture(
+    config: NativeCameraCaptureConfig,
+) -> Result<NativeCameraCapture, NativeDeviceError> {
+    let factory = ANDROID_CAMERA
+        .get()
+        .ok_or_else(|| NativeDeviceError::Unsupported {
+            detail: "Android camera host is not ready".into(),
+        })?;
+    let mut session = factory(config)?;
+    let (tx, rx) = latest_capture_channel();
+    let stream_error = Arc::new(Mutex::new(None));
+    let worker_error = stream_error.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
+    let worker = thread::Builder::new()
+        .name("android-camera".into())
+        .spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match session.next_sample() {
+                    Ok(Some(sample)) => {
+                        if !tx.send_latest(Ok(sample)) {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        record_native_stream_error(&worker_error, error.clone());
+                        let _ = tx.send_latest(Err(error));
+                        break;
+                    }
+                }
+            }
+        })
+        .map_err(|error| NativeDeviceError::Camera {
+            detail: error.to_string(),
+        })?;
+    Ok(NativeCameraCapture {
+        receiver: rx,
+        stream_error,
+        stop,
+        worker: Some(worker),
+    })
 }

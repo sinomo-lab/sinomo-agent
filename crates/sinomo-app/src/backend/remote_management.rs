@@ -32,6 +32,7 @@ pub struct RemoteManagementSettingsSnapshot {
     pub external_integrations_enabled: bool,
     pub permission_error: Option<String>,
     pub resource_exposure_count: usize,
+    pub shared_devices: Vec<String>,
     pub resource_operation_count: usize,
     pub module_loading: bool,
     pub module_node_id: Option<String>,
@@ -52,6 +53,7 @@ impl Default for RemoteManagementSettingsSnapshot {
             external_integrations_enabled: false,
             permission_error: None,
             resource_exposure_count: 0,
+            shared_devices: Vec::new(),
             resource_operation_count: 0,
             module_loading: true,
             module_node_id: None,
@@ -73,6 +75,7 @@ impl RemoteManagementSettingsSnapshot {
         self.external_integrations_enabled = source.external_integrations_enabled;
         self.permission_error.clone_from(&source.permission_error);
         self.resource_exposure_count = source.resource_exposure_count;
+        self.shared_devices.clone_from(&source.shared_devices);
         self.resource_operation_count = source.resource_operation_count;
     }
 
@@ -82,6 +85,20 @@ impl RemoteManagementSettingsSnapshot {
         self.external_integrations_enabled = permissions.external_integrations_enabled();
         self.permission_error = None;
         self.resource_exposure_count = permissions.resource_exposures().len();
+        self.shared_devices = ["microphone", "speaker", "camera", "motion"]
+            .into_iter()
+            .filter(|kind| {
+                permissions.resource_operation_exposed(
+                    &format!("{kind}.default"),
+                    if *kind == "speaker" {
+                        "play"
+                    } else {
+                        "capture"
+                    },
+                )
+            })
+            .map(str::to_string)
+            .collect();
         self.resource_operation_count = permissions
             .resource_exposures()
             .values()
@@ -140,7 +157,7 @@ impl Backend {
         permissions: &LocalNodePermissions,
         module_snapshot: &ModuleConfigSnapshot,
     ) -> RemoteManagementSettingsSnapshot {
-        self.remote_management_snapshot_from_parts(
+        let mut snapshot = self.remote_management_snapshot_from_parts(
             permissions.remote_management_enabled(),
             permissions.external_integrations_enabled(),
             None,
@@ -151,7 +168,40 @@ impl Backend {
                 .map(|exposure| exposure.operations().len())
                 .sum(),
             module_snapshot,
-        )
+        );
+        snapshot.replace_permission_document(permissions);
+        snapshot
+    }
+
+    pub fn set_local_device_exposure(
+        &self,
+        kind: &str,
+        enabled: bool,
+    ) -> Result<RemoteManagementPermissionMutation, String> {
+        if self.settings_node_is_remote() {
+            return Err("Device sharing must be changed locally on the selected node.".into());
+        }
+        if !["microphone", "speaker", "camera", "motion"].contains(&kind) {
+            return Err("Unknown device kind".into());
+        }
+        let operation = if kind == "speaker" { "play" } else { "capture" };
+        let resource = format!("{kind}.default");
+        let store = LocalNodePermissionStore::new(self.data_dir.root());
+        store
+            .mutate(|permissions| {
+                if enabled {
+                    permissions.expose_resource_operation(&resource, operation)
+                } else {
+                    permissions.hide_resource_operation(&resource, operation)
+                }
+            })
+            .map(
+                |(permissions, changed)| RemoteManagementPermissionMutation {
+                    permissions,
+                    changed,
+                },
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub fn set_local_remote_management_permission(
@@ -239,6 +289,7 @@ impl Backend {
             external_integrations_enabled,
             permission_error,
             resource_exposure_count,
+            shared_devices: Vec::new(),
             resource_operation_count,
             module_loading: false,
             module_node_id: selected_node.map(|node| node.summary.node_id.clone()),
@@ -268,6 +319,41 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_sharing_is_independent_of_host_management_and_revocable() {
+        let dir = sinomo_testdir::TestDir::new("app-device-sharing");
+        let backend = Backend::local_fallback_for_data_dir(
+            sinomo_runtime::local::SinomoDataDir::new(dir.path()),
+        );
+        let mutation = backend
+            .set_local_device_exposure("microphone", true)
+            .unwrap();
+        assert!(
+            mutation
+                .permissions
+                .resource_operation_exposed("microphone.default", "capture")
+        );
+        assert!(
+            !mutation
+                .permissions
+                .resource_operation_exposed("camera.default", "capture")
+        );
+        assert!(!mutation.permissions.remote_management_enabled());
+        let mut snapshot = RemoteManagementSettingsSnapshot::default();
+        snapshot.replace_permission_document(&mutation.permissions);
+        assert_eq!(snapshot.shared_devices, vec!["microphone"]);
+        let mutation = backend
+            .set_local_device_exposure("microphone", false)
+            .unwrap();
+        snapshot.replace_permission_document(&mutation.permissions);
+        assert!(snapshot.shared_devices.is_empty());
+        assert!(
+            backend
+                .set_local_device_exposure("arbitrary", true)
+                .is_err()
+        );
+    }
 
     #[test]
     fn local_permission_mutation_is_live_and_preserves_resource_exposures() {

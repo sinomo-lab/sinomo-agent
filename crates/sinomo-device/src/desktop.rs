@@ -355,6 +355,11 @@ fn default_cursor() -> bool {
 
 /// Continuous native samples consumed by the shared media encoder.
 pub trait DesktopFrameSource: Send {
+    /// Recheck authority even while the consumer is backpressured.
+    fn check_active(&self) -> DesktopResult<()> {
+        Ok(())
+    }
+
     fn identity(&self) -> Option<surfaces::DesktopCaptureIdentity> {
         None
     }
@@ -368,6 +373,10 @@ pub trait DesktopFrameSource: Send {
     ) -> DesktopResult<Option<NativeVideoSample>>;
 }
 impl<T: DesktopFrameSource + ?Sized> DesktopFrameSource for Box<T> {
+    fn check_active(&self) -> DesktopResult<()> {
+        (**self).check_active()
+    }
+
     fn identity(&self) -> Option<surfaces::DesktopCaptureIdentity> {
         (**self).identity()
     }
