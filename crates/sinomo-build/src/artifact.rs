@@ -149,18 +149,6 @@ impl BuildArtifactManifest {
             path: source_path.display().to_string(),
             detail: source.to_string(),
         })?;
-        #[cfg(unix)]
-        let metadata = fs::metadata(&source_path).map_err(|source| BuildError::Io {
-            path: source_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode() & 0o777
-        };
-        #[cfg(not(unix))]
-        let mode = 0o755;
         let manifest = Self {
             artifact_id,
             name,
@@ -168,7 +156,7 @@ impl BuildArtifactManifest {
             relative_path,
             size_bytes: bytes.len() as u64,
             content_hash: build_content_hash(&bytes),
-            mode,
+            mode: 0o755,
             provenance,
             native_dylib,
         };
@@ -415,13 +403,13 @@ pub fn extract_artifact_bundle(
             detail: source.to_string(),
         })?;
         #[cfg(unix)]
-        if let Some(artifact) = manifest
+        if manifest
             .artifacts
             .iter()
-            .find(|artifact| artifact.relative_path == relative_path)
+            .any(|artifact| artifact.relative_path == relative_path)
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&output, fs::Permissions::from_mode(artifact.mode)).map_err(
+            fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).map_err(
                 |source| BuildError::Io {
                     path: output.display().to_string(),
                     detail: source.to_string(),

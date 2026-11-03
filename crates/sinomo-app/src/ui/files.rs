@@ -966,7 +966,6 @@ struct LocalFileFingerprint {
     len: u64,
     modified_at_unix_nanos: Option<u64>,
     content_digest: String,
-    readonly: bool,
     symlink: bool,
 }
 
@@ -9542,7 +9541,6 @@ fn local_file_fingerprint(path: &str) -> Result<LocalFileFingerprint, String> {
         len: metadata.len(),
         modified_at_unix_nanos: metadata.modified().ok().and_then(system_time_unix_nanos),
         content_digest: String::new(),
-        readonly: metadata.permissions().readonly(),
         symlink: link_metadata.file_type().is_symlink(),
     })
 }
@@ -9592,8 +9590,6 @@ fn local_document_read_only_reason(fingerprint: &LocalFileFingerprint) -> Option
             "Editing through a symbolic link is disabled because an atomic replacement could change link semantics. Open the target file directly to edit it."
                 .to_string(),
         )
-    } else if fingerprint.readonly {
-        Some("The host filesystem marks this file read-only.".to_string())
     } else {
         None
     }
@@ -9827,9 +9823,6 @@ fn save_local_text_document(
     if expected.symlink {
         return Err("Safe editing through a symbolic link is not supported.".to_string());
     }
-    if expected.readonly {
-        return Err("The file was opened read-only and cannot be saved.".to_string());
-    }
     let mut current = local_file_fingerprint(path)?;
     if current.len != expected.len || current.canonical_path != expected.canonical_path {
         return Err("Save conflict: the file changed on disk after it was opened.".into());
@@ -9848,19 +9841,11 @@ fn save_local_text_document(
                 .to_string(),
         );
     }
-    if current.symlink || current.readonly {
+    if current.symlink {
         return Err(
             "The file is no longer safely writable. Your edits were not saved.".to_string(),
         );
     }
-    let permissions = fs::metadata(&current.canonical_path)
-        .map_err(|error| {
-            format!(
-                "cannot inspect {}: {error}",
-                current.canonical_path.display()
-            )
-        })?
-        .permissions();
     let fallback_name = current
         .canonical_path
         .file_name()
@@ -9877,11 +9862,6 @@ fn save_local_text_document(
     )
     .map_err(|error| format!("cannot safely save {path}: {error}"))?;
     let mut maintenance = Vec::new();
-    if let Err(error) = fs::set_permissions(&current.canonical_path, permissions) {
-        maintenance.push(format!(
-            "could not restore the original permissions: {error}"
-        ));
-    }
     let digest = blake3::hash(bytes).to_hex().to_string();
     let (mut fingerprint, metadata_receipt_missing) = match local_file_fingerprint(path) {
         Ok(fingerprint) => (fingerprint, false),
@@ -9894,7 +9874,7 @@ fn save_local_text_document(
         }
     };
     fingerprint.content_digest = digest;
-    let requires_reload = metadata_receipt_missing || fingerprint.symlink || fingerprint.readonly;
+    let requires_reload = metadata_receipt_missing || fingerprint.symlink;
     Ok(FilesDocumentSave::Local {
         fingerprint,
         maintenance_warning: (!maintenance.is_empty()).then(|| maintenance.join(" ")),
@@ -38310,7 +38290,6 @@ mod tests {
                             content_digest: blake3::hash(saved_text.as_bytes())
                                 .to_hex()
                                 .to_string(),
-                            readonly: false,
                             symlink: false,
                         }),
                         sifs_fingerprint: None,

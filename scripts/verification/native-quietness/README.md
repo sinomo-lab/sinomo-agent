@@ -55,7 +55,7 @@ partial framed-RPC byte substitution is used.
 The original 120-second deadline starts before attachment; sampling uses the
 one-second cadence without skipped tick fabrication. `--samples N` (1..121)
 permits a shorter diagnostic control only; it does not shorten either acceptance
-window or grant PASS. New output paths are required and files use mode 0600.
+window or grant PASS. Output files are created exclusively using the deployment defaults.
 The receipt distinguishes completed reads, errors and remaining coverage gaps;
 exit code 2 and `acceptance: false` remain expected until a complete source is
 qualified. A quiet CPU interval alone cannot establish daemon quietness.
@@ -183,8 +183,7 @@ cannot qualify a host or change any prior failure.
 
 ## Capture protocol and identities
 
-The C collector takes `--raw NEW_LOCAL_NDJSON`, opens it exclusively with mode
-0600, and sends a ready record containing its executable SHA256, boot ID,
+The C collector takes `--raw NEW_LOCAL_NDJSON`, opens it exclusively, and sends a ready record containing its executable SHA256, boot ID,
 PID/start ticks, host, HZ and namespace. It accepts only consecutive
 `SAMPLE sequence nonce` commands, then `QUIT`. Unexpected EOF, malformed/repeated
 commands, raw-write failures or truncation fail closed. Commands never execute

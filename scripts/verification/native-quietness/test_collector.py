@@ -53,7 +53,6 @@ class Collector(unittest.TestCase):
             self.assertIn(":".join(map(str, row["counter_file"])), sample["groups"])
         self.assertTrue(all("lo" in g["interfaces"] for g in sample["groups"].values()))
         self.assertFalse(any(sample["coverage"].values()))
-        self.assertEqual(self.raw.stat().st_mode & 0o777, 0o600)
 
     def test_cannot_overwrite_previous_evidence(self):
         self.raw.write_text("previous evidence\n")

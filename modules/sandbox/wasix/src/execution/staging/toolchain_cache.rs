@@ -591,16 +591,7 @@ fn set_staged_toolchain_command_executable(
 ) -> Result<(), SandboxCommandExecutionError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut permissions = fs::metadata(host_path)
-        .map_err(|source| SandboxFsError::Unavailable {
-            reason: format!(
-                "inspect staged toolchain command {}: {source}",
-                host_path.display()
-            ),
-        })?
-        .permissions();
-    permissions.set_mode(0o555);
-    fs::set_permissions(host_path, permissions).map_err(|source| SandboxFsError::Unavailable {
+    fs::set_permissions(host_path, fs::Permissions::from_mode(0o755)).map_err(|source| SandboxFsError::Unavailable {
         reason: format!(
             "mark staged toolchain command executable {}: {source}",
             host_path.display()

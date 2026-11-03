@@ -1868,7 +1868,7 @@ fn download_cluster_build_artifacts(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(artifact.mode)).map_err(
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).map_err(
                 |source| CliError::Io {
                     path: destination.display().to_string(),
                     detail: source.to_string(),

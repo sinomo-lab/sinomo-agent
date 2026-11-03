@@ -2758,6 +2758,20 @@ fn check_tool_cancellation_boundary_smoke(workspace_root: &Path) -> AgentReadine
 }
 
 #[cfg(unix)]
+fn install_readiness_fixture(name: &str, destination: &std::path::Path) -> std::io::Result<()> {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    match fs::copy(source, destination) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let data = sinomo_runtime::local::SinomoDataDir::from_env_or_home().map_err(std::io::Error::other)?;
+            fs::copy(data.root().join("source/sinomo/crates/sinomo-agent/tests/fixtures").join(name), destination)?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
 fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
     let workspace_root = std::env::temp_dir().join(format!(
         "sinomo-agent-vcs-cancel-readiness-{}",
@@ -2771,30 +2785,8 @@ fn check_version_control_active_cancellation_smoke() -> AgentReadinessCheck {
         );
     }
     let fake_git = workspace_root.join("slow-git");
-    if let Err(error) = fs::write(&fake_git, "#!/bin/sh\nsleep 5\n") {
-        return failed(
-            "version_control_active_cancellation_smoke",
-            "failed to create fake git executable",
-            serde_json::json!({ "error": error.to_string() }),
-        );
-    }
-    let mut permissions = match fs::metadata(&fake_git).map(|metadata| metadata.permissions()) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            return failed(
-                "version_control_active_cancellation_smoke",
-                "failed to inspect fake git executable",
-                serde_json::json!({ "error": error.to_string() }),
-            );
-        }
-    };
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    if let Err(error) = fs::set_permissions(&fake_git, permissions) {
-        return failed(
-            "version_control_active_cancellation_smoke",
-            "failed to mark fake git executable",
-            serde_json::json!({ "error": error.to_string() }),
-        );
+    if let Err(error) = install_readiness_fixture("slow-git.sh", &fake_git) {
+        return failed("version_control_active_cancellation_smoke", "failed to install Git fixture", serde_json::json!({ "error": error.to_string() }));
     }
     let fake_git_program = fake_git.display().to_string();
     let registry = fixed_command_readiness_registry(
@@ -3084,7 +3076,6 @@ pub fn run_agent_simple_sandbox_active_cancellation_readiness() -> AgentReadines
 
 #[cfg(unix)]
 fn check_sandbox_container_active_cancellation_smoke() -> AgentReadinessCheck {
-    use std::os::unix::fs::PermissionsExt;
 
     let workspace_root = std::env::temp_dir().join(format!(
         "sinomo-agent-sandbox-cancel-readiness-{}",
@@ -3099,54 +3090,8 @@ fn check_sandbox_container_active_cancellation_smoke() -> AgentReadinessCheck {
     }
     let fake_runtime = workspace_root.join("fake-container-runtime.sh");
     let cancel_marker = workspace_root.join("container-cancelled");
-    if let Err(error) = fs::write(
-        &fake_runtime,
-        format!(
-            r#"#!/bin/sh
-marker='{}'
-if [ "$1" = "rm" ]; then
-  touch "$marker"
-  exit 0
-fi
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    fake-image) shift; break ;;
-    --name|--network|--cap-drop|--security-opt|--memory|--stop-timeout|--volume|--workdir|--env) shift 2 ;;
-    --rm|--pull=never|--read-only|-i) shift ;;
-    *) shift ;;
-  esac
-done
-while [ ! -f "$marker" ]; do
-  sleep 0.05
-done
-exit 0
-"#,
-            cancel_marker.display()
-        ),
-    ) {
-        return failed(
-            "sandbox_container_active_cancellation_smoke",
-            "failed to create fake sandbox runtime executable",
-            serde_json::json!({ "error": error.to_string() }),
-        );
-    }
-    let mut permissions = match fs::metadata(&fake_runtime).map(|metadata| metadata.permissions()) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            return failed(
-                "sandbox_container_active_cancellation_smoke",
-                "failed to inspect fake sandbox runtime executable",
-                serde_json::json!({ "error": error.to_string() }),
-            );
-        }
-    };
-    permissions.set_mode(0o755);
-    if let Err(error) = fs::set_permissions(&fake_runtime, permissions) {
-        return failed(
-            "sandbox_container_active_cancellation_smoke",
-            "failed to mark fake sandbox runtime executable",
-            serde_json::json!({ "error": error.to_string() }),
-        );
+    if let Err(error) = install_readiness_fixture("cancellation-runtime.sh", &fake_runtime) {
+        return failed("sandbox_container_active_cancellation_smoke", "failed to install runtime fixture", serde_json::json!({ "error": error.to_string() }));
     }
 
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&workspace_root);

@@ -172,8 +172,6 @@ def _copy_regular_file(
     source_root: Path,
     destination_root: Path,
     relative: Path,
-    *,
-    private: bool,
 ) -> bool:
     source = source_root / relative
     if not source.exists():
@@ -187,7 +185,6 @@ def _copy_regular_file(
     destination = destination_root / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination, follow_symlinks=False)
-    destination.chmod(0o600 if private else 0o644)
     return True
 
 
@@ -296,7 +293,6 @@ def _copy_selected_account_config(
         encoding="utf-8",
     )
     # Account configuration may carry the selected account's inline API key.
-    destination.chmod(0o600)
     return destination_relative.as_posix()
 
 
@@ -331,12 +327,12 @@ def copy_selected_provider_state(
             )
         )
     credential_candidates = [
-        (Path("configs/lm/credentials") / f"{provider}.json", True),
-        (Path("providers") / provider / "credentials.json", True),
+        Path("configs/lm/credentials") / f"{provider}.json",
+        Path("providers") / provider / "credentials.json",
     ]
-    for relative, private in credential_candidates:
+    for relative in credential_candidates:
         if _copy_regular_file(
-            source_root, destination_root, relative, private=private
+            source_root, destination_root, relative
         ):
             copied.append(relative.as_posix())
             break
@@ -498,7 +494,6 @@ def isolated_sinomo_case(
             )
         )
         root = root.resolve(strict=True)
-        root.chmod(0o700)
         for path in [source_root, *protected]:
             if paths_overlap(root, path):
                 raise ValueError(f"generated benchmark root {root} overlaps {path}")
@@ -530,7 +525,6 @@ def isolated_sinomo_case(
         }
         for directory in directories.values():
             directory.mkdir(parents=True, exist_ok=True)
-            directory.chmod(0o700)
 
         copied: list[str] = []
         if copy_provider_config:

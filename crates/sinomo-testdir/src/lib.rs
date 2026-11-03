@@ -1,7 +1,7 @@
 //! Self-cleaning temp directories for sinomo tests.
 //!
 //! Tests used to build roots with `env::temp_dir().join(format!("name-{nanos}"))`
-//! and remove them with a trailing `remove_dir_all` — which never runs when the
+//! and remove them with a trailing `remove_dir_all` â€” which never runs when the
 //! test panics earlier or the test process is killed, leaking roots until the
 //! tmpfs fills. [`TestDir`] cleans successful disposable roots on drop:
 //!
@@ -181,4 +181,14 @@ mod tests {
         );
         std::fs::remove_dir_all(retained).expect("reclaim this test's retained sibling");
     }
+}
+
+/// Run a generated shell fixture through the packaged executable launcher.
+#[cfg(unix)]
+pub fn install_shell_fixture(script: &Path) -> std::io::Result<()> {
+    let mut body = script.as_os_str().to_owned();
+    body.push(".body");
+    std::fs::rename(script, body)?;
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/shell-fixture.sh"), script)?;
+    Ok(())
 }

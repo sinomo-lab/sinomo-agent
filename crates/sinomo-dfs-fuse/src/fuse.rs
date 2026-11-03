@@ -16,7 +16,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1283,11 +1283,11 @@ fn preflight_linux_sifs_background_mount_with(
             detail: format!("{} is not a character device", fuse_device.display()),
         });
     }
-    if !is_executable_file(mount_helper) {
+    if !mount_helper.is_file() {
         return Err(DfsFuseError::Mount {
             mount_point: options.mount_point.display().to_string(),
             detail: format!(
-                "background mount lifecycle requires an executable `fusermount3` or `fusermount` helper; {} is not executable",
+                "background mount lifecycle requires an executable `fusermount3` or `fusermount` helper; {} is missing",
                 mount_helper.display()
             ),
         });
@@ -1496,7 +1496,7 @@ fn fuse_mount_helper() -> Option<PathBuf> {
         ]
         .into_iter()
         .map(PathBuf::from)
-        .find(|candidate| is_executable_file(candidate))
+        .find(|candidate| candidate.is_file())
     })
 }
 
@@ -1506,15 +1506,10 @@ fn fuse_mount_helper_on_path(path: Option<&OsStr>) -> Option<PathBuf> {
         ["fusermount3", "fusermount"]
             .into_iter()
             .map(|name| directory.join(name))
-            .find(|candidate| is_executable_file(candidate))
+            .find(|candidate| candidate.is_file())
     })
 }
 
-fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
 
 fn map_mount_error(
     mount_point: &Path,
@@ -6538,17 +6533,11 @@ mod errno_tests {
     }
 
     #[test]
-    fn fuse_mount_helper_lookup_requires_an_executable_helper() {
+    fn fuse_mount_helper_lookup_finds_the_installed_program() {
         let root = sinomo_testdir::TestDir::new("sinomo-fuse-helper-path");
         let helper = root.join("fusermount3");
         std::fs::write(&helper, b"helper").expect("write helper fixture");
 
-        assert!(fuse_mount_helper_on_path(Some(root.as_os_str())).is_none());
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
         assert_eq!(
             fuse_mount_helper_on_path(Some(root.as_os_str())),
             Some(helper)
@@ -6569,11 +6558,7 @@ mod errno_tests {
             ),
         )
         .expect("write helper fixture");
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        sinomo_testdir::install_shell_fixture(&helper).expect("install shell fixture");
         let mount_point = root.join("mount");
         std::fs::create_dir(&mount_point).expect("mount point");
         let cancellation = dfs::DfsCancellationFlag::new();
@@ -6616,11 +6601,7 @@ mod errno_tests {
             ),
         )
         .expect("write delayed helper fixture");
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        sinomo_testdir::install_shell_fixture(&helper).expect("install shell fixture");
         let mount_point = root.join("mount");
         std::fs::create_dir(&mount_point).expect("mount point");
         let cancellation = dfs::DfsCancellationFlag::new();
@@ -6665,11 +6646,7 @@ mod errno_tests {
         let helper = root.join("fusermount3");
         let fuse_config = root.join("fuse.conf");
         std::fs::write(&helper, b"helper").expect("write helper fixture");
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+
         std::fs::write(&fuse_config, b"# user_allow_other\n").expect("fuse config");
         let mut options = DfsFuseMountOptions::new(root.join("mount"));
         options.allow_other = true;
@@ -6711,17 +6688,13 @@ mod errno_tests {
         let helper_error = preflight_linux_sifs_background_mount_with(
             &options,
             Path::new("/dev/null"),
-            &helper,
+            &root.join("missing-helper"),
             root.join("unused-fuse.conf").as_path(),
         )
-        .expect_err("non-executable helper must fail");
-        assert!(helper_error.to_string().contains("not executable"));
+        .expect_err("missing helper must fail");
+        assert!(helper_error.to_string().contains("is missing"));
 
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+
         let device_error = preflight_linux_sifs_background_mount_with(
             &options,
             &missing_device,

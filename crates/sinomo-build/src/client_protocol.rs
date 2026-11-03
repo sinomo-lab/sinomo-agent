@@ -159,7 +159,7 @@ pub async fn receive_build_artifact_rpc_result(
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(source) = tokio::fs::set_permissions(
             &partial,
-            std::fs::Permissions::from_mode(response.artifact.mode),
+            std::fs::Permissions::from_mode(0o755),
         )
         .await
         {

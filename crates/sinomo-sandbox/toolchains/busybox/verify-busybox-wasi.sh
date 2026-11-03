@@ -11,7 +11,6 @@ TOOLCHAIN_ID="${TOOLCHAIN_ID:-086wdctfpphb26n9k2cg751qqs}"
 
 cd "${ROOT}"
 
-chmod -R u+w "${WORKDIR}" "${OUTDIR}" "${DATA_DIR}" 2>/dev/null || true
 rm -rf "${WORKDIR}" "${OUTDIR}" "${DATA_DIR}"
 mkdir -p "${WORKDIR}" "${OUTDIR}" "${DATA_DIR}"
 

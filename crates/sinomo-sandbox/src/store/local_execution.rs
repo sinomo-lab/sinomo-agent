@@ -1184,7 +1184,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recovery_waits_for_late_container_writer_before_releasing_journal() {
-        use std::os::unix::fs::PermissionsExt;
 
         let root = sinomo_testdir::TestDir::new("sandbox-local-execution-late-container");
         let (store, manifest, layout) = create_sandbox(&root, "late_container");
@@ -1223,11 +1222,7 @@ exit 2
             ),
         )
         .expect("write fake engine");
-        let mut permissions = fs::metadata(&runtime_path)
-            .expect("fake engine metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&runtime_path, permissions).expect("fake engine permissions");
+        sinomo_testdir::install_shell_fixture(&runtime_path).expect("install shell fixture");
 
         let (lease, mut journal) = activate_execution_journal(&store, &manifest);
         prepare_sandbox_local_execution_external_owner(

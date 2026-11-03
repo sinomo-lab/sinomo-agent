@@ -67,7 +67,7 @@ use windows::Win32::Storage::CloudFilters::{
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING,
     MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
@@ -3950,7 +3950,6 @@ fn mount_sifs_cloud_files_inner(
         Arc::clone(&mounted_mutation_handoff),
         request.sync_root.clone(),
         request.root_path.clone(),
-        request.read_only,
         provider_population_released.clone(),
         cursor_recovery_marker.is_some(),
         Arc::clone(&materialized_directories),
@@ -4908,7 +4907,6 @@ struct CloudFilesProvider {
     mount_identity: String,
     sync_root: PathBuf,
     root_path: String,
-    read_only: bool,
     population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
     block_root_population_until_released: bool,
     cancelled_requests: Mutex<BTreeSet<i64>>,
@@ -4948,8 +4946,7 @@ impl CloudFilesProvider {
         mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
         sync_root: PathBuf,
         root_path: String,
-        read_only: bool,
-        population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
+            population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
         block_root_population_until_released: bool,
         materialized_directories: Arc<Mutex<BTreeSet<String>>>,
         materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
@@ -4962,7 +4959,6 @@ impl CloudFilesProvider {
             mount_identity,
             sync_root,
             root_path,
-            read_only,
             population_released,
             block_root_population_until_released,
             cancelled_requests: Mutex::new(BTreeSet::new()),
@@ -5144,7 +5140,7 @@ impl CloudFilesProvider {
             }
             let identity = self.placeholder_identity(&stat);
             payloads.push(
-                PlaceholderPayload::new(child.name, identity, stat, self.read_only, disposition)
+                PlaceholderPayload::new(child.name, identity, stat, disposition)
                     .map_err(|_| STATUS_CLOUD_FILE_UNSUCCESSFUL)?,
             );
         }
@@ -5324,7 +5320,6 @@ impl PlaceholderPayload {
         relative_name: String,
         identity: CloudFilesPlaceholderIdentity,
         stat: dfs::DfsStat,
-        read_only: bool,
         disposition: PlaceholderCreateDisposition,
     ) -> Result<Self, CloudFilesModuleError> {
         let projection = cloud_files_object_projection(&stat.kind);
@@ -5341,14 +5336,11 @@ impl PlaceholderPayload {
                 });
             }
         };
-        let mut attributes = if is_directory {
+        let attributes = if is_directory {
             FILE_ATTRIBUTE_DIRECTORY.0
         } else {
             FILE_ATTRIBUTE_NORMAL.0
         };
-        if read_only {
-            attributes |= FILE_ATTRIBUTE_READONLY.0;
-        }
         let size = if is_directory {
             0
         } else {

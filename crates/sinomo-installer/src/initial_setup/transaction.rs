@@ -13,8 +13,6 @@ struct FileBefore {
     path: PathBuf,
     bytes: Option<Vec<u8>>,
     link: Option<PathBuf>,
-    #[serde(default)]
-    mode: Option<u32>,
 }
 #[derive(Serialize, Deserialize)]
 struct Recovery {
@@ -52,7 +50,6 @@ fn capture(path: PathBuf) -> Result<FileBefore> {
                 path,
                 bytes: None,
                 link: None,
-                mode: None,
             });
         }
         Err(e) => return Err(e.into()),
@@ -70,20 +67,10 @@ fn capture(path: PathBuf) -> Result<FileBefore> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && link.is_some() => None,
         Err(e) => return Err(e.into()),
     };
-    #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(&path)
-            .ok()
-            .map(|meta| meta.permissions().mode())
-    };
-    #[cfg(not(unix))]
-    let mode = None;
     Ok(FileBefore {
         path,
         bytes,
         link,
-        mode,
     })
 }
 fn remove(path: &Path) -> Result<()> {
@@ -148,11 +135,6 @@ impl SetupTransaction {
             )
             .sync_all(),
         )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(root.join(JOURNAL), fs::Permissions::from_mode(0o600))?;
-        }
         Ok(Self {
             recovery,
             finished: false,
@@ -231,11 +213,6 @@ fn restore(recovery: &Recovery) -> Result<()> {
         if let Some(bytes) = &file.bytes {
             fs::create_dir_all(file.path.parent().ok_or("recovery parent")?)?;
             fs::write(&file.path, bytes)?;
-            #[cfg(unix)]
-            if let Some(mode) = file.mode {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&file.path, fs::Permissions::from_mode(mode))?;
-            }
         } else if file.link.is_none() {
             remove(&file.path)?;
         }

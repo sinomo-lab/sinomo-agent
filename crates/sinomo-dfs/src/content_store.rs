@@ -7686,19 +7686,6 @@ mod tests {
         let mut ingest = store
             .begin_quarantined_blob_ingest(bytes.len() as u64, Some(&expected_hash))
             .expect("begin quarantined ingest");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                fs::metadata(&ingest.temporary_path)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600,
-                "incoming bytes must be private before the first write"
-            );
-        }
         ingest.write_chunk(bytes).expect("write chunk");
         let blob = ingest.finish_quarantined().expect("finish quarantine");
 

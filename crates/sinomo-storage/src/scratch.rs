@@ -115,8 +115,7 @@ pub fn remove_inactive_scratch_directory(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Remove owner-selected scratch only. Windows Git packs may be read-only;
-/// clear that attribute on files being discarded, never on retained paths.
+/// Remove the operation-owned entry using ordinary filesystem deletion.
 pub fn remove_owned_scratch_path(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -124,22 +123,11 @@ pub fn remove_owned_scratch_path(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     if metadata.is_dir() && !is_reparse_or_symlink(&metadata) {
-        #[cfg(windows)]
-        clear_readonly_files(path)?;
         fs::remove_dir_all(path)
     } else {
         #[cfg(windows)]
         if metadata.is_dir() {
             return fs::remove_dir(path);
-        }
-        #[cfg(windows)]
-        if metadata.is_file()
-            && !is_reparse_or_symlink(&metadata)
-            && metadata.permissions().readonly()
-        {
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(path, permissions)?;
         }
         fs::remove_file(path)
     }
@@ -155,27 +143,6 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     {
         metadata.file_type().is_symlink()
     }
-}
-
-#[cfg(windows)]
-fn clear_readonly_files(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        // Junctions and other reparse points are never traversed or chmodded.
-        if metadata.file_attributes() & 0x400 != 0 {
-            continue;
-        }
-        if metadata.is_dir() {
-            clear_readonly_files(&entry.path())?;
-        } else if metadata.permissions().readonly() {
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(entry.path(), permissions)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

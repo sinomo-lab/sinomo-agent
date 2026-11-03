@@ -28,7 +28,7 @@ disallowed-methods = [
     { path = "std::fs::copy", reason = "copy through the VFS" },
     { path = "std::fs::hard_link", reason = "links are not created by workspace tools" },
     { path = "std::fs::read_link", reason = "links are resolved by the confined VFS" },
-    { path = "std::fs::set_permissions", reason = "the VFS preserves permissions on replace" },
+    { path = "std::fs::set_permissions", reason = "host filesystem permissions belong to the operator" },
     { path = "std::path::Path::exists", reason = "stat through WorkspaceFiles / the VFS" },
     { path = "std::path::Path::try_exists", reason = "stat through WorkspaceFiles / the VFS" },
     { path = "std::path::Path::is_file", reason = "stat through WorkspaceFiles / the VFS" },

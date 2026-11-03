@@ -4545,7 +4545,6 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
                         name,
                         self.identity(&stat),
                         stat,
-                        false,
                         PlaceholderCreateDisposition::CreateAbsent,
                     )
                     .map_err(|error| error.to_string())?,
@@ -5184,7 +5183,6 @@ fn update_placeholder(
         name,
         identity,
         stat,
-        false,
         PlaceholderCreateDisposition::CreateAbsent,
     )
     .map_err(|error| error.to_string())?;

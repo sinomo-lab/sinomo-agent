@@ -9,9 +9,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
-use std::os::unix::fs::{
-    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-};
+use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -1193,18 +1191,17 @@ pub fn write_file_atomic_hint(
     Ok(())
 }
 
-/// Creates a new staging file that is accessible only to its owner (and, on
-/// Windows, the local system account).
-///
-/// Callers should use this helper before streaming sensitive content into a
-/// staged transfer. `install_staged_file` reapplies the final permissions before
-/// publication, but it cannot retroactively protect a broadly accessible file
-/// while that file is being populated.
+/// Exclusively create a stage using the host filesystem defaults.
 pub fn create_private_staged_file(path: &Path) -> Result<File, DurableFileError> {
-    create_private_staged_file_platform(path).map_err(|source| io_error(path.display(), source))
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| io_error(path.display(), source))
 }
 
-/// A private stage whose bytes and final permissions have been synchronized.
+/// A private stage whose bytes have been synchronized.
 ///
 /// The writable file is consumed by `sync_private_staged_file`. Unix retains it
 /// privately for inode validation; other platforms close it before using the
@@ -1231,11 +1228,8 @@ struct SyncedPrivateStageIdentity {
     device: u64,
     inode: u64,
     length: u64,
-    mode: u32,
     modified_seconds: i64,
     modified_nanos: i64,
-    changed_seconds: i64,
-    changed_nanos: i64,
 }
 
 #[cfg(unix)]
@@ -1245,11 +1239,8 @@ impl SyncedPrivateStageIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
             length: metadata.len(),
-            mode: metadata.mode(),
             modified_seconds: metadata.mtime(),
             modified_nanos: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanos: metadata.ctime_nsec(),
         }
     }
 }
@@ -1261,8 +1252,7 @@ impl SyncedPrivateStageIdentity {
 /// publication; ordinary replacements retain `install_staged_file` semantics.
 /// The producer must own the only writer from finalization through publication:
 /// no cloned handle or pathname alias may mutate the stage during that interval.
-/// On Unix, installation checks inode, length, mode, modification time, and
-/// change time to reject a stage whose exclusive-ownership contract was violated.
+/// On Unix, installation checks inode, length, and modification time to reject a stage whose exclusive-ownership contract was violated.
 pub fn sync_private_staged_file(
     path: &Path,
     file: File,
@@ -1300,22 +1290,9 @@ fn sync_private_staged_file_with(
                 ),
             ));
         }
-        // A restrictive umask may remove owner permissions at creation. Make
-        // the final mode durable in the same required sync as the content.
-        if metadata.mode() & 0o7777 != 0o600 {
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|source| io_error(path.display(), source))?;
-        }
     }
-    #[cfg(windows)]
-    windows_file::set_private_permissions(path)
-        .map_err(|source| io_error(path.display(), source))?;
     #[cfg(unix)]
-    let identity_before_sync = SyncedPrivateStageIdentity::from_metadata(
-        &file
-            .metadata()
-            .map_err(|source| io_error(path.display(), source))?,
-    );
+    let identity_before_sync = SyncedPrivateStageIdentity::from_metadata(&metadata);
     sync(&file).map_err(|source| io_error(path.display(), source))?;
     #[cfg(unix)]
     let identity = SyncedPrivateStageIdentity::from_metadata(
@@ -1347,10 +1324,9 @@ fn sync_private_staged_file_with(
 /// Publish a finalized private stage without rewriting its unchanged metadata.
 ///
 /// On Unix, the retained file handle and current pathname must still identify
-/// the exact synchronized inode, size, timestamps, and private mode. Any
-/// mismatch fails before publication. Both directory durability barriers are
-/// identical to the generic installer. Other platforms retain that installer's
-/// permission preparation and additional sync until equivalent checks exist.
+/// the exact synchronized inode, size and modification time. Any
+/// mismatch fails before publication. Both publication paths synchronize
+/// their directory entries.
 pub fn install_synced_private_staged_file(
     staged: &SyncedPrivateStagedFile,
     destination_path: &Path,
@@ -1447,8 +1423,7 @@ fn validate_synced_private_stage(staged: &SyncedPrivateStagedFile) -> Result<(),
         .map_err(|source| io_error(staged.path.display(), source))?;
     let path_metadata = fs::symlink_metadata(&staged.path)
         .map_err(|source| io_error(staged.path.display(), source))?;
-    if metadata.mode() & 0o7777 != 0o600
-        || SyncedPrivateStageIdentity::from_metadata(&metadata) != staged.identity
+    if SyncedPrivateStageIdentity::from_metadata(&metadata) != staged.identity
         || SyncedPrivateStageIdentity::from_metadata(&path_metadata) != staged.identity
     {
         return Err(io_error(
@@ -1465,7 +1440,7 @@ fn validate_synced_private_stage(staged: &SyncedPrivateStagedFile) -> Result<(),
 /// Read a bounded private stage while preserving its opaque synchronization
 /// capability. This grants no new publication authority; a caller copying these
 /// bytes to another durable representation must synchronize that representation.
-/// Unix checks the exact synchronized inode/path/mode before and after reading.
+/// Unix checks the exact synchronized inode/path identity before and after reading.
 /// Other platforms return `None` and retain the existing installer contract.
 pub fn read_synced_private_staged_file_bounded(
     staged: &SyncedPrivateStagedFile,
@@ -1555,49 +1530,8 @@ pub fn ensure_directory(path: &Path) -> Result<(), DurableFileError> {
     sync_directory(path)
 }
 
-/// Atomically creates one new private directory whose parent already exists.
-///
-/// Unlike `ensure_private_directory`, this function never accepts an existing
-/// directory. It is suitable for unique per-session directories where reuse
-/// would cross a security boundary.
-pub fn create_private_directory(path: &Path) -> Result<(), DurableFileError> {
-    let parent = validate_directory_parent(path)?;
-    create_private_directory_platform(path).map_err(|source| io_error(path.display(), source))?;
-    set_private_directory_permissions(path).map_err(|source| io_error(path.display(), source))?;
-    sync_directory(path)?;
-    sync_directory(parent)
-}
-
-/// Creates or tightens one private directory whose parent already exists.
-///
-/// Creation applies owner-only permissions atomically: mode `0700` on Unix and
-/// a protected owner/LocalSystem DACL on Windows. An existing real directory is
-/// tightened to the same policy. Symlinks and other non-directory entries are
-/// rejected. The helper deliberately does not recurse, so it cannot change the
-/// permissions of shared ancestors.
-pub fn ensure_private_directory(path: &Path) -> Result<(), DurableFileError> {
-    validate_directory_parent(path)?;
-
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => validate_directory_metadata(path, &metadata)?,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            match create_private_directory(path) {
-                Ok(()) => return Ok(()),
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                    let metadata = fs::symlink_metadata(path)
-                        .map_err(|source| io_error(path.display(), source))?;
-                    validate_directory_metadata(path, &metadata)?;
-                }
-                Err(source) => return Err(source),
-            }
-        }
-        Err(source) => return Err(io_error(path.display(), source)),
-    }
-
-    set_private_directory_permissions(path).map_err(|source| io_error(path.display(), source))?;
-    sync_directory(path)
-}
-
+pub use create_directory as create_private_directory;
+pub use ensure_directory as ensure_private_directory;
 fn validate_directory_parent(path: &Path) -> Result<&Path, DurableFileError> {
     if path.file_name().is_none() {
         return Err(DurableFileError::Io {
@@ -1635,75 +1569,6 @@ fn validate_directory_metadata(
     })
 }
 
-#[cfg(unix)]
-fn create_private_directory_platform(path: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(path)
-}
-
-#[cfg(windows)]
-fn create_private_directory_platform(path: &Path) -> io::Result<()> {
-    windows_file::create_private_directory(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_private_directory_platform(_path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "private directories are unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    // Reapplying an identical mode still dirties the inode on Unix. Repeated
-    // private-directory checks would turn their required syncs into metadata
-    // writes even when nothing changed. Keep the
-    // caller's durability barrier, but avoid manufacturing a new change.
-    if fs::symlink_metadata(path)?.permissions().mode() & 0o7777 != 0o700 {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    windows_file::set_private_permissions(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "private directories are unsupported on this platform",
-    ))
-}
-
-#[cfg(unix)]
-fn create_private_staged_file_platform(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn create_private_staged_file_platform(path: &Path) -> io::Result<File> {
-    windows_file::create_private_file(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_private_staged_file_platform(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-}
-
 /// Atomically publishes an already-synced staged file on the destination's
 /// filesystem and then makes both namespace updates durable.
 ///
@@ -1727,9 +1592,23 @@ pub fn install_staged_file(
 ) -> Result<(), DurableFileError> {
     let (staged_parent, destination_parent) =
         validate_staged_install_paths(staged_path, destination_path)?;
-    prepare_staged_install_metadata(staged_path, destination_path, overwrite)?;
 
     if overwrite {
+        match fs::symlink_metadata(destination_path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(io_error(
+                    destination_path.display(),
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "destination is not a regular file",
+                    ),
+                ));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(io_error(destination_path.display(), error));
+            }
+            _ => {}
+        }
         replace_file(staged_path, destination_path)?;
         sync_install_directories(&staged_parent, &destination_parent)?;
         return Ok(());
@@ -1817,64 +1696,6 @@ fn validate_staged_install_paths(
     Ok((staged_parent, destination_parent))
 }
 
-fn prepare_staged_install_metadata(
-    staged_path: &Path,
-    destination_path: &Path,
-    overwrite: bool,
-) -> Result<(), DurableFileError> {
-    // Retain a writable handle before adopting destination permissions. This
-    // permits durable replacement of read-only files (including mode 000) while
-    // still syncing the staged inode after its metadata changes.
-    let staged_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(staged_path)
-        .map_err(|source| io_error(staged_path.display(), source))?;
-
-    let destination_metadata = if overwrite {
-        match fs::symlink_metadata(destination_path) {
-            Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
-            Ok(_) => {
-                return Err(DurableFileError::Io {
-                    path: destination_path.display().to_string(),
-                    kind: io::ErrorKind::InvalidInput,
-                    detail: "destination is not a regular file".to_string(),
-                });
-            }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => return Err(io_error(destination_path.display(), source)),
-        }
-    } else {
-        None
-    };
-
-    #[cfg(unix)]
-    {
-        let permissions = destination_metadata
-            .map(|metadata| metadata.permissions())
-            .unwrap_or_else(|| fs::Permissions::from_mode(0o600));
-        fs::set_permissions(staged_path, permissions)
-            .map_err(|source| io_error(staged_path.display(), source))?;
-    }
-
-    #[cfg(windows)]
-    {
-        let _ = destination_metadata;
-        windows_file::set_private_permissions(staged_path)
-            .map_err(|source| io_error(staged_path.display(), source))?;
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    let _ = destination_metadata;
-
-    // The content is already synced by contract. Sync all metadata after the
-    // final mode/DACL update so the published inode cannot regress to broader
-    // staging permissions after a crash.
-    staged_file
-        .sync_all()
-        .map_err(|source| io_error(staged_path.display(), source))
-}
-
 fn install_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1905,13 +1726,10 @@ mod windows_file {
     use super::*;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::FromRawHandle as _;
     use std::ptr;
     use std::sync::{Arc, LazyLock, Weak};
     use std::time::{Duration, Instant};
 
-    const CREATE_NEW: u32 = 1;
-    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_FILE_EXISTS: i32 = 80;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
@@ -1919,73 +1737,17 @@ mod windows_file {
     const ERROR_SHARING_VIOLATION: i32 = 32;
     const ERROR_LOCK_VIOLATION: i32 = 33;
     const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const GENERIC_READ: u32 = 0x8000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
     const REPLACE_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(2);
     const REPLACE_RETRY_MAX_DELAY: Duration = Duration::from_millis(40);
     const REPLACE_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
-    const SDDL_REVISION_1: u32 = 1;
     const WINDOWS_REPLACE_LOCK_CAPACITY: usize = 4096;
 
     static WINDOWS_REPLACE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    #[repr(C)]
-    struct SecurityAttributes {
-        length: u32,
-        security_descriptor: *mut c_void,
-        inherit_handle: i32,
-    }
-
-    struct LocalSecurityDescriptor(*mut c_void);
-
-    impl Drop for LocalSecurityDescriptor {
-        fn drop(&mut self) {
-            // SAFETY: the descriptor was allocated by
-            // ConvertStringSecurityDescriptorToSecurityDescriptorW and has not
-            // otherwise been freed.
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-
-    #[link(name = "advapi32")]
-    unsafe extern "system" {
-        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            string_security_descriptor: *const u16,
-            string_sd_revision: u32,
-            security_descriptor: *mut *mut c_void,
-            security_descriptor_size: *mut u32,
-        ) -> i32;
-        fn SetFileSecurityW(
-            file_name: *const u16,
-            security_information: u32,
-            security_descriptor: *const c_void,
-        ) -> i32;
-    }
-
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn CreateFileW(
-            file_name: *const u16,
-            desired_access: u32,
-            share_mode: u32,
-            security_attributes: *const SecurityAttributes,
-            creation_disposition: u32,
-            flags_and_attributes: u32,
-            template_file: *mut c_void,
-        ) -> *mut c_void;
-        fn CreateDirectoryW(
-            path_name: *const u16,
-            security_attributes: *const SecurityAttributes,
-        ) -> i32;
-        fn LocalFree(memory: *mut c_void) -> *mut c_void;
         fn MoveFileExW(
             existing_file_name: *const u16,
             new_file_name: *const u16,
@@ -1999,58 +1761,6 @@ mod windows_file {
             exclude: *mut c_void,
             reserved: *mut c_void,
         ) -> i32;
-    }
-
-    pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
-        let path = wide_path(path)?;
-        let descriptor = private_security_descriptor()?;
-        let attributes = security_attributes(&descriptor);
-        // SAFETY: the path and protected descriptor remain valid throughout
-        // the call. Ownership of a successful handle is transferred once.
-        let handle = unsafe {
-            CreateFileW(
-                path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                &attributes,
-                CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL,
-                ptr::null_mut(),
-            )
-        };
-        if handle == invalid_handle_value() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: CreateFileW returned one valid owned handle.
-        Ok(unsafe { File::from_raw_handle(handle) })
-    }
-
-    pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
-        let path = wide_path(path)?;
-        let descriptor = private_security_descriptor()?;
-        let attributes = security_attributes(&descriptor);
-        // SAFETY: path and the protected security descriptor remain valid for
-        // the duration of CreateDirectoryW.
-        let created = unsafe { CreateDirectoryW(path.as_ptr(), &attributes) };
-        if created == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn set_private_permissions(path: &Path) -> io::Result<()> {
-        let path = wide_path(path)?;
-        let descriptor = private_security_descriptor()?;
-        // SAFETY: both pointers remain valid for the duration of the call. The
-        // protected DACL grants full access only to the owner and LocalSystem.
-        let result =
-            unsafe { SetFileSecurityW(path.as_ptr(), DACL_SECURITY_INFORMATION, descriptor.0) };
-        if result == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
     }
 
     pub(super) fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
@@ -2170,37 +1880,6 @@ mod windows_file {
         }
     }
 
-    fn private_security_descriptor() -> io::Result<LocalSecurityDescriptor> {
-        // Protected DACL: full access for the object owner and LocalSystem only.
-        let sddl = "D:P(A;;FA;;;OW)(A;;FA;;;SY)\0"
-            .encode_utf16()
-            .collect::<Vec<_>>();
-        let mut descriptor = ptr::null_mut();
-        // SAFETY: sddl is NUL-terminated and descriptor points to writable
-        // storage for the LocalAlloc-owned result.
-        let converted = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                ptr::null_mut(),
-            )
-        };
-        if converted == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(LocalSecurityDescriptor(descriptor))
-        }
-    }
-
-    fn security_attributes(descriptor: &LocalSecurityDescriptor) -> SecurityAttributes {
-        SecurityAttributes {
-            length: std::mem::size_of::<SecurityAttributes>() as u32,
-            security_descriptor: descriptor.0,
-            inherit_handle: 0,
-        }
-    }
-
     fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
         let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
         if wide.contains(&0) {
@@ -2244,10 +1923,6 @@ mod windows_file {
         }
         wide.push(0);
         Ok(wide)
-    }
-
-    fn invalid_handle_value() -> *mut c_void {
-        -1_isize as *mut c_void
     }
 }
 
@@ -2407,6 +2082,8 @@ fn io_error(path: impl std::fmt::Display, source: io::Error) -> DurableFileError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn object_read_open_recovers_only_transient_windows_sharing_errors() {
@@ -2496,6 +2173,17 @@ mod tests {
         sync_private_staged_file(path, file).expect("finalize private stage")
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn operator_mode_change_does_not_invalidate_synced_stage() {
+        let root = sinomo_testdir::TestDir::new("stage-mode-change");
+        let stage = synced_private_stage(&root.join("stage"), b"bytes");
+        fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o640)).unwrap();
+        let destination = root.join("published");
+        install_synced_private_staged_file(&stage, &destination).unwrap();
+        assert_eq!(fs::metadata(destination).unwrap().mode() & 0o777, 0o640);
+    }
+
     #[test]
     fn bounded_private_stage_read_preserves_install_capability() {
         let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-read");
@@ -2549,7 +2237,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_private_stage_rejects_replacement_mode_and_same_size_mutation() {
-        for mutation in ["replacement", "permissions", "same-size-content"] {
+        for mutation in ["replacement", "same-size-content"] {
             let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-mutation");
             let path = root.join("stage");
             let stage = synced_private_stage(&path, b"initial bytes");
@@ -2557,9 +2245,6 @@ mod tests {
                 "replacement" => {
                     fs::rename(&path, root.join("original-inode")).unwrap();
                     write_private_stage(&path, b"initial bytes");
-                }
-                "permissions" => {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
                 }
                 "same-size-content" => {
                     let mut alias = OpenOptions::new().write(true).open(&path).unwrap();
@@ -2605,7 +2290,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounded_private_stage_rejects_mutations_after_open() {
-        for mutation in ["permissions", "same-size-content", "shorter", "longer"] {
+        for mutation in ["same-size-content", "shorter", "longer"] {
             let root = sinomo_testdir::TestDir::new("storage-bounded-private-stage-read-mutation");
             let path = root.join("stage");
             let stage = synced_private_stage(&path, b"initial bytes");
@@ -2613,9 +2298,6 @@ mod tests {
                 read_synced_private_staged_file_bounded_with(&stage, 64, |path, opened, limit| {
                     let mut alias = OpenOptions::new().write(true).open(path).unwrap();
                     match mutation {
-                        "permissions" => alias
-                            .set_permissions(fs::Permissions::from_mode(0o644))
-                            .unwrap(),
                         "same-size-content" => {
                             alias.write_all(b"changed bytes").unwrap();
                             alias.set_modified(SystemTime::UNIX_EPOCH).unwrap();
@@ -2676,8 +2358,6 @@ mod tests {
             b"durable content"
         );
         assert!(!staged.path().exists());
-        #[cfg(unix)]
-        assert_eq!(fs::metadata(&destination).unwrap().mode() & 0o7777, 0o600);
         let losing = synced_private_stage(&staging.join("second"), b"different content");
         let error = install_synced_private_staged_file(&losing, &destination)
             .expect_err("existing destination wins");
@@ -2793,7 +2473,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn synced_private_stage_rejects_identity_mode_and_content_mutation() {
-        for mutation in ["replacement", "permissions", "length", "same-size-content"] {
+        for mutation in ["replacement", "length", "same-size-content"] {
             let root = sinomo_testdir::TestDir::new("storage-synced-private-mutation");
             let path = root.join("staged");
             let stage = synced_private_stage(&path, b"initial bytes");
@@ -2801,9 +2481,6 @@ mod tests {
                 "replacement" => {
                     fs::rename(&path, root.join("original")).unwrap();
                     write_private_stage(&path, b"initial bytes");
-                }
-                "permissions" => {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap()
                 }
                 "length" => {
                     OpenOptions::new()
@@ -2857,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_install_atomically_replaces_content_and_preserves_permissions() {
+    fn staged_install_publishes_content_and_stage_mode() {
         let root = sinomo_testdir::TestDir::new("storage-staged-install-replace");
         let destination = root.join("destination.bin");
         let staged = root.join(".destination.staged");
@@ -2886,8 +2563,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600,
-            "replacement must not widen destination permissions"
+            0o644
         );
     }
 
@@ -2895,9 +2571,8 @@ mod tests {
     #[test]
     fn replace_file_retries_a_transient_destination_sharing_violation() {
         use std::os::windows::fs::OpenOptionsExt as _;
-
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
 
         let root = sinomo_testdir::TestDir::new("storage-replace-sharing-violation");
         let destination = root.join("destination.bin");
@@ -2930,15 +2605,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn staged_install_replaces_read_only_destination_without_widening_mode() {
+    fn staged_install_publishes_stage_with_its_existing_mode() {
         let root = sinomo_testdir::TestDir::new("storage-staged-install-read-only");
         let destination = root.join("destination.bin");
         let staged = root.join(".destination.staged");
         fs::write(&destination, b"old content").expect("write destination");
-        fs::set_permissions(&destination, fs::Permissions::from_mode(0o400))
-            .expect("make destination read-only");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o400)).unwrap();
         write_private_stage(&staged, b"new content");
-
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
         install_staged_file(&staged, &destination, true).expect("replace read-only destination");
 
         assert_eq!(
@@ -2951,7 +2625,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o400
+            0o600
         );
     }
 
@@ -2969,15 +2643,6 @@ mod tests {
             b"new content"
         );
         assert!(!staged.exists(), "successful install consumes staged name");
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&destination)
-                .expect("destination metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
     }
 
     #[test]
@@ -3065,41 +2730,6 @@ mod tests {
         fs::remove_file(&staged).expect("cleanup preserved stage");
     }
 
-    #[test]
-    fn private_directory_create_and_ensure_enforce_owner_only_mode() {
-        let root = sinomo_testdir::TestDir::new("storage-private-directory");
-        let created = root.join("created");
-        ensure_private_directory(&created).expect("create private directory");
-        assert!(fs::metadata(&created).expect("created metadata").is_dir());
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&created)
-                .expect("created metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-
-        let existing = root.join("existing");
-        fs::create_dir(&existing).expect("create existing directory");
-        #[cfg(unix)]
-        fs::set_permissions(&existing, fs::Permissions::from_mode(0o777))
-            .expect("widen existing directory");
-        ensure_private_directory(&existing).expect("tighten existing directory");
-        ensure_private_directory(&existing).expect("idempotent ensure");
-        assert!(fs::metadata(&existing).expect("existing metadata").is_dir());
-        #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&existing)
-                .expect("existing metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn ordinary_directory_preserves_deployment_permissions_and_inheritance() {
@@ -3170,9 +2800,9 @@ mod tests {
         );
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o1700))
-            .expect("set unwanted special mode bit");
-        ensure_private_directory(&path).expect("remove special mode bit");
-        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o700);
+            .expect("set operator-selected special mode bit");
+        ensure_private_directory(&path).expect("retain selected mode");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o1700);
     }
 
     #[test]
@@ -3222,7 +2852,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn private_stage_is_created_with_owner_only_permissions() {
+    fn stage_inherits_creation_defaults() {
         let root = sinomo_testdir::TestDir::new("storage-private-staged-file");
         let staged = root.join("stage.bin");
         let file = create_private_staged_file(&staged).expect("create private stage");
@@ -3232,7 +2862,11 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            {
+                let control = root.join("control");
+                fs::write(&control, []).unwrap();
+                fs::metadata(control).unwrap().mode() & 0o777
+            }
         );
     }
 
