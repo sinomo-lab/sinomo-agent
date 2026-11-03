@@ -244,3 +244,53 @@ fn missing_member_projection_uses_native_identities_and_excludes_unadmitted_rows
     );
     assert_eq!(std::fs::read(wal).unwrap(), before);
 }
+
+#[test]
+fn read_index_adoption_does_not_resurrect_removed_learner_from_bootstrap() {
+    let (_root, paths, mut stale, learner) = admitted_learner_fixture("read_index_removed_learner");
+    stale.members.push(learner.clone());
+    let mut confirmed = stale.clone();
+    confirmed
+        .members
+        .retain(|member| member.node_id != learner.node_id);
+    let config = ClusterKvRaftConfigRecord::from(&confirmed);
+    let mut node = paths
+        .kv_paths()
+        .raft_store()
+        .open_node(&stale.local_node_id)
+        .unwrap();
+    let entry = node
+        .append_local_command(
+            7,
+            KvCommand::Op(
+                KvOp::put_serde(sinomo_kv::cluster_kv_raft_config_key(), &config, None).unwrap(),
+            ),
+        )
+        .unwrap();
+    node.commit_to(entry.index).unwrap();
+    drop(node);
+    let mut storage = LocalClusterRaftCommandStorage::new(&paths, stale.local_node_id.clone());
+    let read_state = storage.read_index_state().unwrap();
+    confirmed.kv_revision = read_state.revision.0;
+    let fence = ClusterRaftReadIndexAuthorityFence {
+        read_state,
+        config_fence: storage
+            .read_index_entry(&sinomo_kv::cluster_kv_raft_config_key())
+            .unwrap(),
+        pending_current_term_barrier: None,
+        confirmed_voters: BTreeSet::from([stale.local_node_id.clone()]),
+        confirmed_state: confirmed.clone(),
+        unresolved_local_node_id: None,
+    };
+    adopt_cluster_raft_read_index_state(&mut stale, &confirmed, &fence).unwrap();
+    assert_eq!(
+        ReadIndexConfigurationFloor::from_state(&stale),
+        ReadIndexConfigurationFloor::from_config(&config)
+    );
+    assert!(
+        !stale
+            .members
+            .iter()
+            .any(|member| member.node_id == learner.node_id)
+    );
+}

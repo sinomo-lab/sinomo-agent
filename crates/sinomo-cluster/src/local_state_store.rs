@@ -503,7 +503,64 @@ fn finish_cluster_state_write(paths: &ClusterPaths, state: &ClusterBootstrapStat
 /// Calling the public writer from such a path would recursively acquire the
 /// advisory lock and can deadlock on platforms where independent file handles
 /// conflict even inside one process.
+// Preserve the local route-hint owner's exact durable selection across all
+// background and committed-state projections, including Raft receive paths.
+fn preserve_operator_route_hints(
+    next: &mut ClusterBootstrapState,
+    existing: &ClusterBootstrapState,
+) {
+    if existing.cluster_id != next.cluster_id || existing.local_node_id != next.local_node_id {
+        return;
+    }
+    for member in &mut next.members {
+        member
+            .endpoints
+            .retain(|endpoint| !crate::route_hint::is_cluster_route_hint_endpoint(endpoint));
+        if !member.state.is_authorized() {
+            continue;
+        }
+        if let Some(previous) = existing.members.iter().find(|previous| {
+            previous.node_id == member.node_id
+                && previous.state.is_authorized()
+                && previous.node_public_key == member.node_public_key
+        }) {
+            for endpoint in previous
+                .endpoints
+                .iter()
+                .filter(|endpoint| crate::route_hint::is_cluster_route_hint_endpoint(endpoint))
+            {
+                if !member
+                    .endpoints
+                    .iter()
+                    .any(|known| known.address == endpoint.address)
+                {
+                    member.endpoints.push(endpoint.clone());
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn write_cluster_state_unlocked(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<(), NetworkError> {
+    let mut next = state.clone();
+    if let Ok(Some(existing)) = read_optional_object_file::<ClusterBootstrapState>(&paths.state) {
+        preserve_operator_route_hints(&mut next, &existing);
+    }
+    write_cluster_state_exact_unlocked(paths, &next)
+}
+
+/// Only the explicit local route-hint owner may replace its hint selection.
+pub(crate) fn write_operator_route_hint_state_unlocked(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<(), NetworkError> {
+    write_cluster_state_exact_unlocked(paths, state)
+}
+
+fn write_cluster_state_exact_unlocked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
@@ -524,6 +581,11 @@ pub(crate) fn write_accepted_cluster_state_unlocked(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), NetworkError> {
+    let mut next = state.clone();
+    if let Ok(Some(existing)) = read_optional_object_file::<ClusterBootstrapState>(&paths.state) {
+        preserve_operator_route_hints(&mut next, &existing);
+    }
+    let state = &next;
     write_object_file_with_semantic_skip(&paths.state, state, |existing| {
         existing.kv_revision == state.kv_revision
             && cluster_bootstrap_state_stable_eq(existing, state)
@@ -542,6 +604,7 @@ pub fn write_cluster_state(
     // generation, that delayed writer must not last-rename the old membership
     // over it. Different cluster identities are intentional bootstrap/join
     // transitions and therefore are not compared on this fence.
+    let mut next = state.clone();
     match read_optional_object_file::<ClusterBootstrapState>(&paths.state) {
         Ok(Some(existing))
             if existing.cluster_id == state.cluster_id
@@ -557,6 +620,12 @@ pub fn write_cluster_state(
             );
             return Ok(());
         }
+        Ok(Some(existing))
+            if existing.cluster_id == state.cluster_id
+                && existing.local_node_id == state.local_node_id =>
+        {
+            preserve_operator_route_hints(&mut next, &existing);
+        }
         Ok(_) => {}
         Err(error) => {
             // The caller is supplying a complete replacement object. A torn
@@ -571,7 +640,7 @@ pub fn write_cluster_state(
             );
         }
     }
-    write_cluster_state_unlocked(paths, state)
+    write_cluster_state_exact_unlocked(paths, &next)
 }
 
 fn remote_endpoint_projection_changed(

@@ -170,3 +170,66 @@ fn hint_survives_the_kv_merge_until_the_peer_publishes_its_address() {
     assert_eq!(at_address.len(), 1, "{at_address:?}");
     assert!(!is_cluster_route_hint_endpoint(at_address[0]));
 }
+
+#[test]
+fn stale_background_writes_preserve_hint_addition_and_removal() {
+    let fixture = fixture("route-hint-background-writer");
+    let address = "127.0.0.1:32353";
+    apply_cluster_route_hint(&fixture.paths, &hint(&fixture, address, false)).unwrap();
+    write_cluster_state(&fixture.paths, &fixture.state).unwrap();
+    assert!(stored_peer_addresses(&fixture).contains(&address.to_string()));
+    let stale_with_hint: ClusterBootstrapState = read_object_file(&fixture.paths.state).unwrap();
+    apply_cluster_route_hint(&fixture.paths, &hint(&fixture, address, true)).unwrap();
+    write_cluster_state(&fixture.paths, &stale_with_hint).unwrap();
+    assert!(!stored_peer_addresses(&fixture).contains(&address.to_string()));
+}
+
+#[test]
+fn background_hint_preservation_does_not_cross_key_rotation_or_removal() {
+    for rotate in [true, false] {
+        let fixture = fixture("route-hint-authority-boundary");
+        let address = "127.0.0.1:32353";
+        apply_cluster_route_hint(&fixture.paths, &hint(&fixture, address, false)).unwrap();
+        let mut updated = fixture.state.clone();
+        let peer = updated
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == fixture.peer)
+            .unwrap();
+        if rotate {
+            peer.node_public_key = "rotated-key".into();
+        } else {
+            peer.state = ClusterMemberState::Removed;
+        }
+        write_cluster_state(&fixture.paths, &updated).unwrap();
+        assert!(!stored_peer_addresses(&fixture).contains(&address.to_string()));
+    }
+}
+
+#[test]
+fn raft_and_accepted_projection_writers_preserve_owned_hints() {
+    for accepted in [false, true] {
+        let fixture = fixture("route-hint-raft-projection");
+        let address = "127.0.0.1:32353";
+        let write = |state: &ClusterBootstrapState| {
+            let _lock = acquire_local_cluster_state_mutation_lock(&fixture.paths).unwrap();
+            if accepted {
+                crate::local_state_store::write_accepted_cluster_state_unlocked(
+                    &fixture.paths,
+                    state,
+                )
+                .unwrap();
+            } else {
+                crate::local_state_store::write_cluster_state_unlocked(&fixture.paths, state)
+                    .unwrap();
+            }
+        };
+        apply_cluster_route_hint(&fixture.paths, &hint(&fixture, address, false)).unwrap();
+        write(&fixture.state);
+        assert!(stored_peer_addresses(&fixture).contains(&address.to_string()));
+        let stale: ClusterBootstrapState = read_object_file(&fixture.paths.state).unwrap();
+        apply_cluster_route_hint(&fixture.paths, &hint(&fixture, address, true)).unwrap();
+        write(&stale);
+        assert!(!stored_peer_addresses(&fixture).contains(&address.to_string()));
+    }
+}

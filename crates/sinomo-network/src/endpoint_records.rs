@@ -1,5 +1,19 @@
 use crate::prelude::*;
+use sinomo_base::Id;
 use sinomo_node::{cluster_endpoint_stable_eq, cluster_has_remote_peers};
+
+/// Stable identity of a caller-local operator dialing hint. This marks address
+/// provenance only; cluster membership and transport proofs still authorize use.
+pub fn cluster_route_hint_endpoint_id(node_id: &NodeId, address: &str) -> Id {
+    Id::derived(
+        "sinomo.cluster.route-hint",
+        format!("{}\0{address}", node_id.as_str()),
+    )
+}
+
+pub fn is_cluster_route_hint_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
+    endpoint.endpoint_id == cluster_route_hint_endpoint_id(&endpoint.node_id, &endpoint.address)
+}
 
 /// True for an endpoint the local node learned over the LAN bridge rather
 /// than from a member advertisement: a TCP-ish observed endpoint whose

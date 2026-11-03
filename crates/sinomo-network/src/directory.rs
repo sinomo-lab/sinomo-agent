@@ -440,6 +440,30 @@ impl BootstrapAwareClusterDirectory {
                 std::collections::btree_map::Entry::Occupied(_) => {}
             }
         }
+        // Membership freshness selects identity and authority, not caller-local
+        // address observations. Retain observed dialing hints only for the same
+        // still-authorized key; they cannot restore a removed or rotated peer.
+        for bootstrap in &self.bootstrap_members {
+            if let Some(member) = members.get_mut(&bootstrap.node_id)
+                && bootstrap.state.is_authorized()
+                && member.state.is_authorized()
+                && member.cluster_id == bootstrap.cluster_id
+                && member.node_public_key == bootstrap.node_public_key
+            {
+                for endpoint in &bootstrap.endpoints {
+                    if endpoint.source == sinomo_base::ClusterEndpointSource::Observed
+                        && crate::is_cluster_route_hint_endpoint(endpoint)
+                        && endpoint.node_id == member.node_id
+                        && !member.endpoints.iter().any(|known| {
+                            known.endpoint_id == endpoint.endpoint_id
+                                || known.address == endpoint.address
+                        })
+                    {
+                        member.endpoints.push(endpoint.clone());
+                    }
+                }
+            }
+        }
         (
             version.max(self.bootstrap_version),
             members.into_values().collect(),
@@ -788,6 +812,63 @@ mod tests {
             initialized_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn committed_membership_keeps_observed_routes_without_restoring_old_authority() {
+        let cluster = id("observed-route-cluster");
+        let local = member(&cluster, "observed-route-local", "local-key");
+        let mut peer = member(&cluster, "observed-route-peer", "peer-key");
+        let mut observed = crate::daemon_lan_endpoint(&peer.node_id, "127.0.0.1:32353".into(), 0);
+        observed.source = sinomo_base::ClusterEndpointSource::Observed;
+        let retired = observed.clone();
+        observed.endpoint_id =
+            crate::cluster_route_hint_endpoint_id(&peer.node_id, &observed.address);
+        peer.endpoints.push(observed.clone());
+        peer.endpoints.push(retired.clone());
+        let state = bootstrap_state(1, vec![local, peer.clone()]);
+        let mut committed = peer.clone();
+        committed.endpoints.clear();
+        committed.updated_at += time::Duration::seconds(1);
+        for changed_key in [false, true] {
+            let mut current = committed.clone();
+            if changed_key {
+                current.node_public_key = "rotated-key".into();
+            }
+            let directory = cluster_directory_with_bootstrap_state(
+                Arc::new(FixedDirectory {
+                    version: DirectoryVersion(2),
+                    members: vec![current],
+                }),
+                &state,
+            );
+            let snapshot = directory.snapshot().unwrap();
+            assert_eq!(
+                snapshot
+                    .node(&peer.node_id)
+                    .unwrap()
+                    .endpoints
+                    .contains(&observed),
+                !changed_key
+            );
+            assert!(
+                !snapshot
+                    .node(&peer.node_id)
+                    .unwrap()
+                    .endpoints
+                    .contains(&retired),
+                "retired advertisements are not operator hints"
+            );
+        }
+        committed.state = sinomo_base::ClusterMemberState::Removed;
+        let directory = cluster_directory_with_bootstrap_state(
+            Arc::new(FixedDirectory {
+                version: DirectoryVersion(3),
+                members: vec![committed],
+            }),
+            &state,
+        );
+        assert!(!directory.snapshot().unwrap().is_authorized(&peer.node_id));
     }
 
     #[test]
