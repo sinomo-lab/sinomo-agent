@@ -1547,3 +1547,61 @@ fn durable_external_edit_reconciles_exact_receipt_and_fences_stale_generations()
     ));
     assert!(!changed);
 }
+
+#[test]
+fn exact_log_range_checks_bounds_and_never_substitutes_a_new_head() {
+    use crate::DaemonDfsBrowserReadObjectRangeRequest as Range;
+    let (native, nodes) = native_browser_runtime("paged-log", 1);
+    let data = Arc::new(native.data_dir(&nodes[0]).clone());
+    let backend =
+        DfsBrowserBackend::for_component_data_dir(data, &native.runtime_handle()).unwrap();
+    let path = "/services/paging/run.log";
+    let bytes = b"first\nsecond\nthird\n";
+    backend
+        .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+            path: path.into(),
+            bytes: bytes.to_vec(),
+        })
+        .unwrap();
+    let stat = backend
+        .stat(crate::DaemonDfsBrowserStatRequest {
+            path: path.into(),
+            max_staleness_millis: 0,
+        })
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let range = Range {
+        object_id: stat.object_id,
+        version: stat.version,
+        content_hash: stat.content_hash.unwrap(),
+        size_bytes: bytes.len() as u64,
+        offset: 6,
+        length: 7,
+    };
+    assert_eq!(
+        backend.read_object_range(range.clone()).unwrap().bytes,
+        b"second\n"
+    );
+    let mut wrong = range.clone();
+    wrong.content_hash = "blake3:wrong".into();
+    assert!(backend.read_object_range(wrong).is_err());
+    let mut wrong = range.clone();
+    wrong.size_bytes += 1;
+    assert!(backend.read_object_range(wrong).is_err());
+    let mut wrong = range.clone();
+    wrong.length = crate::DFS_BROWSER_RANGE_LIMIT + 1;
+    assert!(backend.read_object_range(wrong).is_err());
+    backend
+        .write_file(crate::DaemonDfsBrowserWriteFileRequest {
+            path: path.into(),
+            bytes: b"replacement version".to_vec(),
+        })
+        .unwrap();
+    if let Ok(old) = backend.read_object_range(range) {
+        assert_eq!(
+            old.bytes, b"second\n",
+            "a retained version must still read its original bytes"
+        );
+    }
+}

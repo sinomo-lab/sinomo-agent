@@ -25,6 +25,8 @@ const TABLE_CELL_CHARS: usize = 256;
 pub(super) enum DocumentFormat {
     #[default]
     Text,
+    Log,
+    JsonLines,
     Markdown,
     Json,
     Csv,
@@ -37,12 +39,31 @@ impl DocumentFormat {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Text => "Text",
+            Self::Log => "Log",
+            Self::JsonLines => "JSON Lines",
             Self::Markdown => "Markdown",
             Self::Json => "JSON",
             Self::Csv => "CSV",
             Self::Tsv => "TSV",
             Self::Image => "Image",
             Self::Hex => "Hex",
+        }
+    }
+
+    pub(super) fn paged(self) -> bool {
+        matches!(self, Self::Log | Self::JsonLines)
+    }
+
+    pub(super) fn log_format(path: &str) -> Option<Self> {
+        match Path::new(path)
+            .extension()?
+            .to_str()?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "log" | "out" | "err" => Some(Self::Log),
+            "jsonl" | "ndjson" => Some(Self::JsonLines),
+            _ => None,
         }
     }
 
@@ -60,22 +81,26 @@ pub(super) fn document_from_bytes(path: &str, bytes: &[u8]) -> (DocumentFormat, 
         return (DocumentFormat::Image, encode_hex(bytes));
     }
     if super::preview_bytes_are_text(bytes) {
-        let extension = Path::new(path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let format = match extension.as_str() {
-            "md" | "markdown" | "mdown" => DocumentFormat::Markdown,
-            "json" | "ipynb" => DocumentFormat::Json,
-            "csv" => DocumentFormat::Csv,
-            "tsv" | "tab" => DocumentFormat::Tsv,
-            _ => DocumentFormat::Text,
-        };
+        let format = text_format(path);
         // Classification above validates UTF-8; preserve BOM, CRLF and trailing newlines.
         return (format, std::str::from_utf8(bytes).unwrap().to_string());
     }
     (DocumentFormat::Hex, encode_hex(bytes))
+}
+
+pub(super) fn text_format(path: &str) -> DocumentFormat {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "md" | "markdown" | "mdown" => DocumentFormat::Markdown,
+        "json" | "ipynb" => DocumentFormat::Json,
+        "csv" => DocumentFormat::Csv,
+        "tsv" | "tab" => DocumentFormat::Tsv,
+        _ => DocumentFormat::log_format(path).unwrap_or(DocumentFormat::Text),
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -92,11 +117,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 pub(super) fn document_bytes(format: DocumentFormat, text: &str) -> Result<Vec<u8>, String> {
     let limit = FILE_DOCUMENT_MAX_BYTES as usize;
     if !matches!(format, DocumentFormat::Hex | DocumentFormat::Image) {
-        return if text.len() <= limit {
-            Ok(text.as_bytes().to_vec())
-        } else {
-            Err("The edited document exceeds the 2 MiB document limit.".into())
-        };
+        return Ok(text.as_bytes().to_vec());
     }
     if text.len() > limit.saturating_mul(6) {
         return Err("The hex input exceeds the document editor limit.".into());
@@ -141,7 +162,7 @@ fn text_preview(text: String, reader: &ThemeReader) -> WidgetPod {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum JsonPreviewLimit {
+pub(super) enum JsonPreviewLimit {
     Complete,
     SourcePrefix,
     FormattedPrefix,
@@ -237,7 +258,7 @@ fn write_pretty_json_tokens(text: &str, writer: &mut JsonPreviewWriter) -> std::
     Ok(())
 }
 
-fn json_preview_content(text: &str) -> Result<(String, JsonPreviewLimit), String> {
+pub(super) fn json_preview_content(text: &str) -> Result<(String, JsonPreviewLimit), String> {
     // A large source is never parsed on the UI thread. In particular, parsing a complete
     // document before truncating its formatted output would not bound preview work.
     if text.len() > PREVIEW_TEXT_BYTES {
@@ -296,7 +317,10 @@ pub(super) fn preview_widget(
     reader: &ThemeReader,
 ) -> Option<PreviewWidget> {
     Some(PreviewWidget(match format {
-        DocumentFormat::Text | DocumentFormat::Hex => return None,
+        DocumentFormat::Text
+        | DocumentFormat::Hex
+        | DocumentFormat::Log
+        | DocumentFormat::JsonLines => return None,
         DocumentFormat::Image => match document_bytes(format, text) {
             Ok(bytes) => WidgetPod::new(DocumentImage::new(bytes, reader)),
             Err(error) => note(error, reader),
@@ -828,9 +852,9 @@ mod tests {
     }
 
     #[test]
-    fn encoded_and_text_documents_enforce_the_same_byte_limit() {
+    fn text_can_exceed_the_hex_editor_limit() {
         let over = "x".repeat(FILE_DOCUMENT_MAX_BYTES as usize + 1);
-        assert!(document_bytes(DocumentFormat::Text, &over).is_err());
+        assert_eq!(document_bytes(DocumentFormat::Text, &over).unwrap(), over.as_bytes());
         assert!(
             document_bytes(
                 DocumentFormat::Hex,

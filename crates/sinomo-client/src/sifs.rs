@@ -471,6 +471,27 @@ impl SifsBrowser {
         self.rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE, request)
     }
 
+    pub fn read_object_range(
+        &self,
+        request: &api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        if request.length == 0
+            || request.length > api::DFS_BROWSER_RANGE_LIMIT
+            || request.offset > request.size_bytes
+        {
+            return Err("Invalid immutable file range".into());
+        }
+        let reply: api::DaemonDfsBrowserReadObjectRangeResponse =
+            self.read_rpc(api::DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE, request)?;
+        if reply.request != *request
+            || reply.bytes.len() as u64
+                != (request.size_bytes - request.offset).min(u64::from(request.length))
+        {
+            return Err("SIFS returned a different version or range".into());
+        }
+        Ok(reply.bytes)
+    }
+
     pub fn read_object_version(
         &self,
         object_id: &str,

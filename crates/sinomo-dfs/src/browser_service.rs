@@ -35,6 +35,7 @@ pub const DFS_CORE_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
@@ -1288,6 +1289,30 @@ impl DfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserReadObjectVersionResponse { bytes })
     }
 
+    fn read_object_range(
+        &self,
+        request: crate::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<crate::DaemonDfsBrowserReadObjectRangeResponse, ServiceError> {
+        let identity = crate::DfsFileVersionIdentity {
+            file_system_id: crate::sifs_file_system_id(),
+            object_id: crate::DfsObjectId::new(&request.object_id)
+                .map_err(dfs_browser_service_error)?,
+            version: crate::DfsVersion::new(&request.version).map_err(dfs_browser_service_error)?,
+        };
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        let bytes = service
+            .read_sifs_version_range(
+                &identity,
+                &request.content_hash,
+                request.size_bytes,
+                request.offset,
+                request.length,
+            )
+            .map_err(dfs_browser_service_error)?;
+        Ok(crate::DaemonDfsBrowserReadObjectRangeResponse { request, bytes })
+    }
+
     fn read_file_prefix(
         &self,
         request: crate::DaemonDfsBrowserReadFilePrefixRequest,
@@ -2470,6 +2495,24 @@ impl Service for HostedDfsBrowserService {
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, result)?;
                 }
+                DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE => {
+                    let payload = ctx.decode_request_body(&request).await?;
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser read object version range",
+                        move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .read_object_range(payload)
+                        },
+                    )
+                    .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE, result)?;
+                }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_browser_task(
@@ -3019,6 +3062,7 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
             | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
+            | DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILES_ROUTE
             | DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE

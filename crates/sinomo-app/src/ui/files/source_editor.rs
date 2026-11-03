@@ -146,8 +146,6 @@ struct Source {
     revision: Rc<Cell<u64>>,
     styled: Option<Revision>,
     job: Option<(Revision, mpsc::Receiver<Colors>)>,
-    find_id: WidgetId,
-    line_id: WidgetId,
 }
 impl Source {
     fn update_colors(&mut self, ctx: &mut MeasureCtx) {
@@ -224,23 +222,6 @@ impl Source {
 }
 impl Widget for Source {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if let Event::Keyboard(key) = event
-            && key.state == KeyState::Pressed
-            && (key.modifiers.control || key.modifiers.meta)
-        {
-            let field = if key.key.eq_ignore_ascii_case("f") {
-                Some(self.find_id)
-            } else if key.key.eq_ignore_ascii_case("g") {
-                Some(self.line_id)
-            } else {
-                None
-            };
-            if let Some(field) = field {
-                ctx.request_focus_for(field);
-                ctx.set_handled();
-                return;
-            }
-        }
         self.surface.event(ctx, event);
         if self.job.is_some() && matches!(event, Event::Wake(_)) {
             ctx.request_measure();
@@ -280,6 +261,11 @@ impl Widget for Source {
         ctx.request_semantics();
     }
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        // Flex probes a zero-height editor before assigning its viewport.
+        // TextSurface consumes a pending caret reveal when measured.
+        if constraints.max.height == 0. {
+            return constraints.clamp(Size::ZERO);
+        }
         self.update_colors(ctx);
         self.surface.measure(ctx, constraints)
     }
@@ -341,7 +327,173 @@ impl Widget for Source {
     }
 }
 
-pub(super) fn view(document: &FilesDocument, shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+/// Retains the editor (and its undo history) while the shortcut row opens and closes.
+pub(super) struct SearchFields {
+    mode: Signal<usize>,
+    find: sui::FocusScopeState,
+    line: Option<sui::FocusScopeState>,
+    editor: Option<WidgetId>,
+}
+pub(super) type ActiveSearch = Rc<RefCell<Option<SearchFields>>>;
+
+pub(super) struct SearchHost {
+    child: WidgetPod,
+    active: ActiveSearch,
+}
+impl SearchHost {
+    pub(super) fn new(child: impl Widget + 'static, active: ActiveSearch) -> Self {
+        Self {
+            child: WidgetPod::new(child),
+            active,
+        }
+    }
+    pub(super) fn close_search(active: &ActiveSearch, ctx: &mut EventCtx) -> bool {
+        let fields = active.borrow();
+        let Some(fields) = fields.as_ref() else {
+            return false;
+        };
+        if !fields.mode.set(0) {
+            return false;
+        }
+        if let Some(editor) = fields.editor {
+            ctx.request_focus_for(editor);
+        }
+        ctx.request_measure();
+        true
+    }
+    pub(super) fn editor(
+        active: &ActiveSearch,
+        body: impl Widget + 'static,
+        find: widgets::Boxed,
+        line: Option<widgets::Boxed>,
+        editor: Option<WidgetId>,
+    ) -> WidgetPod {
+        let find_focus = sui::FocusScopeState::new();
+        let mode = Signal::new(0usize);
+        let mut bar = SwitchView::new()
+            .selected_from(mode.clone())
+            .with_child(SizedBox::new().height(0.))
+            .with_child(
+                sui::FocusScope::new(find)
+                    .state(find_focus.clone())
+                    .restore_policy(sui::FocusRestorePolicy::FirstFocusable),
+            );
+        let line = line.map(|row| {
+            let focus = sui::FocusScopeState::new();
+            bar.push(
+                sui::FocusScope::new(row)
+                    .state(focus.clone())
+                    .restore_policy(sui::FocusRestorePolicy::FirstFocusable),
+            );
+            focus
+        });
+        let child = Flex::vertical()
+            .align_items(Alignment::Stretch)
+            .with_child(bar)
+            .with_item(body, FlexItem::fill());
+        *active.borrow_mut() = Some(SearchFields {
+            mode: mode.clone(),
+            find: find_focus,
+            line,
+            editor,
+        });
+        WidgetPod::new(SearchLayout {
+            mode,
+            layout: child,
+        })
+    }
+}
+impl Widget for SearchHost {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() != EventPhase::Capture {
+            return;
+        }
+        let Event::Keyboard(key) = event else {
+            return;
+        };
+        if key.state != KeyState::Pressed || key.is_composing {
+            return;
+        }
+        let active = self.active.borrow();
+        let Some(fields) = active.as_ref() else {
+            return;
+        };
+        let shortcut = key.modifiers.control || key.modifiers.meta;
+        if shortcut && key.key.eq_ignore_ascii_case("f") {
+            fields.mode.set(1);
+            fields.find.request_focus();
+        } else if shortcut
+            && key.key.eq_ignore_ascii_case("g")
+            && let Some(line) = &fields.line
+        {
+            fields.mode.set(2);
+            line.request_focus();
+        } else if key.key == "Escape" && fields.mode.get() != 0 {
+            fields.mode.set(0);
+            if let Some(id) = fields.editor {
+                ctx.request_focus_for(id);
+            }
+        } else {
+            return;
+        }
+        request_files_overlay_rebuild(ctx);
+        ctx.set_handled();
+    }
+    fn measure(&mut self, ctx: &mut MeasureCtx, c: Constraints) -> Size {
+        self.child.measure(ctx, c)
+    }
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, r: Rect) {
+        self.child.arrange(ctx, r);
+    }
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+    fn visit_children(&self, v: &mut dyn WidgetPodVisitor) {
+        v.visit(&self.child);
+    }
+    fn visit_children_mut(&mut self, v: &mut dyn WidgetPodMutVisitor) {
+        v.visit(&mut self.child);
+    }
+}
+
+struct SearchLayout {
+    mode: Signal<usize>,
+    layout: Flex,
+}
+impl Widget for SearchLayout {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let open = ctx.observe(&self.mode) != 0;
+        self.layout
+            .set_flex_item(0, FlexItem::fixed(if open { 36. } else { 0. }));
+        self.layout
+            .measure(ctx, Constraints::tight(constraints.max))
+    }
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, r: Rect) {
+        self.layout.arrange(ctx, r);
+    }
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.layout.paint(ctx);
+    }
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.layout.semantics(ctx);
+    }
+    fn visit_children(&self, v: &mut dyn WidgetPodVisitor) {
+        self.layout.visit_children(v);
+    }
+    fn visit_children_mut(&mut self, v: &mut dyn WidgetPodMutVisitor) {
+        self.layout.visit_children_mut(v);
+    }
+}
+
+pub(super) fn view(
+    document: &FilesDocument,
+    shared: &Shared,
+    reader: &ThemeReader,
+    active: &ActiveSearch,
+) -> WidgetPod {
     let status = Signal::new(TextSurfaceStatus::default());
     let notice = Signal::new(String::new());
     let language = Signal::new("Text".to_string());
@@ -374,7 +526,6 @@ pub(super) fn view(document: &FilesDocument, shared: &Shared, reader: &ThemeRead
         };
     let find = field("Find in file", "Find", Rc::clone(&query), false);
     let line = field("Go to line", "Line", Rc::clone(&number), true);
-    let (find_id, line_id) = (find.child_id(), line.child_id());
     let action = |name: &'static str, icon, kind: usize| {
         let target = Rc::clone(&target);
         let query = Rc::clone(&query);
@@ -398,7 +549,9 @@ pub(super) fn view(document: &FilesDocument, shared: &Shared, reader: &ThemeRead
         .align_items(Alignment::Center)
         .with_item(find, FlexItem::fill().min_width(48.))
         .with_child(action("Previous match", IconGlyph::ChevronUp, 0))
-        .with_child(action("Next match", IconGlyph::ChevronDown, 1))
+        .with_child(action("Next match", IconGlyph::ChevronDown, 1));
+    let jump = Flex::horizontal()
+        .align_items(Alignment::Center)
         .with_item(line, FlexItem::fixed(65.))
         .with_child(action("Jump to line", IconGlyph::Redo, 2));
     let position = sui::combine_named(
@@ -425,7 +578,7 @@ pub(super) fn view(document: &FilesDocument, shared: &Shared, reader: &ThemeRead
     let edited = Rc::new(Cell::new(0u64));
     let signal = Rc::clone(&edited);
     let changed = shared.clone();
-    let surface = TextSurface::new(format!("files-document:{}", document.path))
+    let mut surface = TextSurface::new(format!("files-document:{}", document.path))
         .value(document.text.clone())
         .read_only(!document.editable())
         .wrap(TextWrap::NoWrap)
@@ -442,6 +595,7 @@ pub(super) fn view(document: &FilesDocument, shared: &Shared, reader: &ThemeRead
             changed.files_mut().set_document_text(value);
         })
         .status(status.clone());
+    surface.set_selection(0, 0);
     let editor = widgets::Boxed::new(Source {
         surface,
         path: document.path.clone(),
@@ -455,18 +609,14 @@ pub(super) fn view(document: &FilesDocument, shared: &Shared, reader: &ThemeRead
         revision: edited,
         styled: None,
         job: None,
-        find_id,
-        line_id,
     });
     target.set(Some(editor.child_id()));
-    WidgetPod::new(
-        Dock::new(
-            Surface::field(editor)
-                .theme_when(clone_reader(reader))
-                .fill_width(true),
-        )
-        .top(36., controls)
-        .bottom(24., footer),
+    SearchHost::editor(
+        active,
+        Dock::new(editor).bottom(20., footer),
+        widgets::Boxed::new(controls),
+        Some(widgets::Boxed::new(jump)),
+        target.get(),
     )
 }
 
@@ -574,6 +724,20 @@ mod tests {
         let find = window
             .get_by_role(SemanticsRole::TextInput)
             .with_name("Find in file");
+        assert_eq!(find.count()?, 0);
+        let editor = window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name(&editor_name);
+        let shortcut = |name| {
+            let mut key = sui::KeyboardEvent::new(name, KeyState::Pressed);
+            key.modifiers.control = true;
+            editor.dispatch_event(Event::Keyboard(key))?;
+            app.run_until_idle()
+        };
+        shortcut("f")?;
+        window.advance_time(0.05)?;
+        app.run_until_idle()?;
+        assert_eq!(window.focused().with_name("Find in file").count()?, 1);
         find.fill("match")?;
         window
             .get_by_role(SemanticsRole::Button)
@@ -594,6 +758,10 @@ mod tests {
             .click()?;
         app.run_until_idle()?;
         assert_eq!(state().selection.start, first.start);
+        editor.press("Escape")?;
+        app.run_until_idle()?;
+        assert_eq!(find.count()?, 0);
+        shortcut("g")?;
         window
             .get_by_role(SemanticsRole::TextInput)
             .with_name("Go to line")

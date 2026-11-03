@@ -8906,6 +8906,16 @@ impl SifsBrowser {
     }
 
     /// Read the exact immutable object version described by a prior stat.
+    pub fn read_object_range(
+        &self,
+        request: &sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        match &self.backend {
+            SifsBrowserBackend::Local(backend) => backend.read_object_range(request),
+            SifsBrowserBackend::Remote(remote) => remote.read_object_range(request),
+        }
+    }
+
     pub fn read_object_version(
         &self,
         object_id: &str,
@@ -9516,6 +9526,26 @@ impl RemoteSifsBrowser {
             },
         )?;
         response.into_result().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn read_object_range(
+        &self,
+        request: &sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        let reply: sinomo_runtime::api::DaemonDfsBrowserReadObjectRangeResponse = self.read_rpc(
+            sinomo_runtime::api::DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE,
+            request,
+        )?;
+        if reply.request != *request
+            || reply.bytes.len() as u64
+                != request
+                    .size_bytes
+                    .saturating_sub(request.offset)
+                    .min(u64::from(request.length))
+        {
+            return Err("SIFS returned a different version or range".into());
+        }
+        Ok(reply.bytes)
     }
 
     pub(crate) fn read_object_version(

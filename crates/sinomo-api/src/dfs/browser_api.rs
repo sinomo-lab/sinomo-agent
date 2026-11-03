@@ -16,6 +16,9 @@ pub const DAEMON_DFS_BROWSER_NAMESPACE_LSTAT_ROUTE: &str = "/daemon/dfs/browser/
 pub const DAEMON_DFS_BROWSER_NO_LINKS_ROUTE: &str = "/daemon/dfs/browser/no-links-v1";
 pub const DAEMON_DFS_BROWSER_LIST_ROUTE: &str = "/daemon/dfs/browser/list";
 pub const DAEMON_DFS_BROWSER_READ_FILE_ROUTE: &str = "/daemon/dfs/browser/read-file-v7";
+pub const DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE: &str =
+    "/daemon/dfs/browser/read-object-version-range-v1";
+pub const DFS_BROWSER_RANGE_LIMIT: u32 = 64 * 1024;
 pub const DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE: &str =
     "/daemon/dfs/browser/read-object-version";
 pub const DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE: &str =
@@ -74,6 +77,7 @@ pub const DAEMON_DFS_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_LIST_ROUTE,
     DAEMON_DFS_BROWSER_FILE_HISTORY_READ_ROUTE,
@@ -977,4 +981,20 @@ pub enum DaemonDfsBrowserDurableReplaceOutcome {
     Unknown {
         detail: String,
     },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadObjectRangeRequest {
+    pub object_id: String,
+    pub version: String,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub offset: u64,
+    pub length: u32,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsBrowserReadObjectRangeResponse {
+    pub request: DaemonDfsBrowserReadObjectRangeRequest,
+    pub bytes: Vec<u8>,
 }

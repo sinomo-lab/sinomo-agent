@@ -21,6 +21,7 @@
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
 mod formats;
+mod paged;
 mod source_editor;
 use formats::DocumentFormat;
 
@@ -164,6 +165,7 @@ const CUSTOM_FILE_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
 /// The text/hex surface keeps the entire accepted document resident. Reject larger files explicitly
 /// instead of silently presenting a partial document that could be saved over the original.
+const UNDECODABLE_LOG: &str = "This file contains binary data. Its records can be inspected, but editing them as text could change the original bytes.";
 const FILE_DOCUMENT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Chat attachments may be binary, but still need a bounded read on the Files worker lane.
 const FILE_ATTACHMENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -1055,8 +1057,14 @@ impl FilesDocument {
         !self.loading && self.load_error.is_none() && self.text != self.saved_text
     }
 
+    fn records_only(&self) -> bool {
+        self.format.paged() && self.read_only_reason.as_deref() == Some(UNDECODABLE_LOG)
+    }
+
     fn editable(&self) -> bool {
-        !self.loading && self.load_error.is_none() && self.read_only_reason.is_none()
+        !self.loading
+            && self.load_error.is_none()
+            && self.read_only_reason.is_none()
     }
 }
 
@@ -1829,7 +1837,7 @@ impl FilesStructureKey {
                 revision: state.document_revision,
                 dirty: document.is_some_and(FilesDocument::dirty),
                 saving: document.is_some_and(|document| document.saving),
-                save_error: document.and_then(|document| document.save_error.clone()),
+                save_error: document.and_then(|document| document.save_error.clone()).or_else(|| state.attachment_error.clone()),
                 save_warning: document.and_then(|document| document.save_warning.clone()),
                 external_edit_notice: state.document_external_notice(),
                 confirmation: state.document_close_confirmation,
@@ -1901,7 +1909,15 @@ impl FilesState {
         self.path = snapshot.path;
         self.store_active_path();
         if let Some(mut document) = snapshot.document {
-            if document.loading {
+            if document.loading
+                || (document.format.paged()
+                    && document.saved_text.is_empty()
+                    && document.text.is_empty()
+                    && document
+                        .read_only_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with("Paged, read-only snapshot.")))
+            {
                 self.begin_document_load(document.source, document.path, document.title, waker);
             } else {
                 if document.saving {
@@ -3215,7 +3231,7 @@ impl FilesState {
                     Ok(load) => {
                         self.document = Some(FilesDocument {
                             format: load.format,
-                            preview_open: load.format.has_preview(),
+                            preview_open: (load.format.has_preview() && !load.format.paged()) || load.read_only_reason.as_deref() == Some(UNDECODABLE_LOG),
                             source: load.source,
                             path: load.path,
                             title: load.title,
@@ -4546,7 +4562,19 @@ impl FilesState {
         let Some(document) = self.document.as_ref() else {
             return;
         };
-        if document.loading || document.load_error.is_some() { return; }
+        if document.loading || document.load_error.is_some() {
+            return;
+        }
+        if document.records_only() {
+            self.attachment_error = Some("Attach the original file from the file browser.".into());
+            return;
+        }
+        if document.text.len() as u64 > FILE_ATTACHMENT_MAX_BYTES
+            && !matches!(document.format, DocumentFormat::Image | DocumentFormat::Hex)
+        {
+            self.attachment_error = Some("This file exceeds the attachment size limit.".into());
+            return;
+        }
         self.attachment_error = None;
         let bytes = match formats::document_bytes(document.format, &document.text) {
             Ok(bytes) => bytes,
@@ -4573,8 +4601,7 @@ impl FilesState {
             FilesSourceKind::Sifs => {
                 let Some(fingerprint) = document.sifs_fingerprint.as_ref() else {
                     self.attachment_error = Some(
-                        "The document has no SIFS object version. Reload before attaching."
-                            .to_string(),
+                        "The document has no SIFS object version. Reload before attaching.".to_string(),
                     );
                     return;
                 };
@@ -9572,14 +9599,86 @@ fn local_document_read_only_reason(fingerprint: &LocalFileFingerprint) -> Option
     }
 }
 
+/// Assemble the editable buffer on the Files worker. Keep I/O bounded and
+/// reject binary data before expanding it into a large hex representation.
+fn read_large_text(
+    size: u64,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), String>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut data = Vec::new();
+    let mut validated = 0;
+    while (data.len() as u64) < size {
+        let offset = data.len();
+        let length =
+            (size - offset as u64).min(sinomo_client::api::DFS_BROWSER_RANGE_LIMIT as u64) as usize;
+        data.try_reserve(length)
+            .map_err(|_| "Insufficient memory to open this file")?;
+        data.resize(offset + length, 0);
+        read(offset as u64, &mut data[offset..])?;
+        let end = match std::str::from_utf8(&data[validated..]) {
+            Ok(_) => data.len(),
+            Err(error) if error.error_len().is_none() && (data.len() as u64) < size => {
+                validated + error.valid_up_to()
+            }
+            Err(_) => return Ok(None),
+        };
+        if !preview_bytes_are_text(&data[validated..end]) {
+            return Ok(None);
+        }
+        validated = end;
+    }
+    Ok(Some(data))
+}
+
+fn decode_loaded_document(
+    path: &str,
+    data: Option<Vec<u8>>,
+    binary_limit: u64,
+) -> Result<(DocumentFormat, String, Option<String>), String> {
+    if let Some(data) = data {
+        if data.len() as u64 > binary_limit {
+            return Ok((
+                formats::text_format(path),
+                String::from_utf8(data).map_err(|e| e.to_string())?,
+                None,
+            ));
+        }
+        let (format, text) = formats::document_from_bytes(path, &data);
+        return Ok((format, text, None));
+    }
+    DocumentFormat::log_format(path)
+        .map(|format| (format, String::new(), Some(UNDECODABLE_LOG.into())))
+        .ok_or_else(|| "Binary file exceeds the hex editor size limit.".into())
+}
+
 fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentLoad, String> {
-    let (bytes, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
-    let (format, text) = formats::document_from_bytes(path, &bytes);
+    let before = local_file_fingerprint(path)?;
+    let (content, fingerprint) = if before.len > max_bytes {
+        let mut file = fs::File::open(&before.canonical_path).map_err(|e| e.to_string())?;
+        let bytes = read_large_text(before.len, |_, buffer| {
+            file.read_exact(buffer).map_err(|e| e.to_string())
+        })?;
+        if local_file_fingerprint(path)? != before {
+            return Err(
+                "The file changed while opening. Reopen it to load its current contents.".into(),
+            );
+        }
+        let mut fingerprint = before;
+        if let Some(data) = &bytes {
+            fingerprint.content_digest = blake3::hash(data).to_hex().to_string();
+        }
+        (bytes, fingerprint)
+    } else {
+        let (data, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
+        (Some(data), fingerprint)
+    };
+    let (format, text, encoding_reason) = decode_loaded_document(path, content, max_bytes)?;
     let title = Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
-    let read_only_reason = local_document_read_only_reason(&fingerprint);
+    let read_only_reason =
+        encoding_reason.or_else(|| local_document_read_only_reason(&fingerprint));
     Ok(FilesDocumentLoad {
         format,
         source: FilesSourceKind::Local,
@@ -9615,6 +9714,16 @@ fn read_sifs_file_snapshot(
 ) -> Result<(Vec<u8>, SifsFileFingerprint, u32), String> {
     let details = browser.stat(path)?;
     let fingerprint = sifs_file_fingerprint(&details)?;
+    let bytes = read_sifs_snapshot_bytes(browser, path, &fingerprint, max_bytes)?;
+    Ok((bytes, fingerprint, details.mode))
+}
+
+fn read_sifs_snapshot_bytes(
+    browser: &SifsBrowser,
+    path: &str,
+    fingerprint: &SifsFileFingerprint,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
     let size = fingerprint
         .size_bytes
         .ok_or_else(|| format!("SIFS did not report the size of {path}"))?;
@@ -9643,7 +9752,7 @@ fn read_sifs_file_snapshot(
             bytes.len()
         ));
     }
-    Ok((bytes, fingerprint, details.mode))
+    Ok(bytes)
 }
 
 fn load_sifs_text_document(
@@ -9651,18 +9760,52 @@ fn load_sifs_text_document(
     path: &str,
     max_bytes: u64,
 ) -> Result<FilesDocumentLoad, String> {
-    let (bytes, fingerprint, mode) = read_sifs_file_snapshot(browser, path, max_bytes)?;
-    let (format, text) = formats::document_from_bytes(path, &bytes);
+    let details = browser.stat(path)?;
+    let fingerprint = sifs_file_fingerprint(&details)?;
+    let mode = details.mode;
+    let bytes = if let Some(size) = fingerprint.size_bytes.filter(|&n| n > max_bytes) {
+        let hash = fingerprint
+            .content_hash
+            .as_ref()
+            .ok_or("Missing SIFS content hash")?;
+        read_large_text(size, |offset, out| {
+            let bytes = browser.read_object_range(
+                &sinomo_client::api::DaemonDfsBrowserReadObjectRangeRequest {
+                    object_id: fingerprint.object_id.clone(),
+                    version: fingerprint.version.clone(),
+                    content_hash: hash.clone(),
+                    size_bytes: size,
+                    offset,
+                    length: out.len() as u32,
+                },
+            )?;
+            if bytes.len() != out.len() {
+                return Err("Incomplete SIFS read".into());
+            }
+            out.copy_from_slice(&bytes);
+            Ok(())
+        })?
+    } else {
+        Some(read_sifs_snapshot_bytes(
+            browser,
+            path,
+            &fingerprint,
+            max_bytes,
+        )?)
+    };
+    let (format, text, encoding_reason) = decode_loaded_document(path, bytes, max_bytes)?;
     let title = path
         .rsplit('/')
         .find(|part| !part.is_empty())
         .unwrap_or(path)
         .to_string();
-    let read_only_reason = (mode & 0o222 == 0).then(|| {
-        format!(
-            "SIFS mode {:o} does not grant write permission for this file.",
-            mode
-        )
+    let read_only_reason = encoding_reason.or_else(|| {
+        (mode & 0o222 == 0).then(|| {
+            format!(
+                "SIFS mode {:o} does not grant write permission for this file.",
+                mode
+            )
+        })
     });
     Ok(FilesDocumentLoad {
         format,
@@ -9687,13 +9830,18 @@ fn save_local_text_document(
     if expected.readonly {
         return Err("The file was opened read-only and cannot be saved.".to_string());
     }
-    if bytes.len() as u64 > FILE_DOCUMENT_MAX_BYTES {
-        return Err(format!(
-            "The edited document exceeds the {:.1} MiB text-editor limit.",
-            FILE_DOCUMENT_MAX_BYTES as f64 / (1024.0 * 1024.0),
-        ));
+    let mut current = local_file_fingerprint(path)?;
+    if current.len != expected.len || current.canonical_path != expected.canonical_path {
+        return Err("Save conflict: the file changed on disk after it was opened.".into());
     }
-    let (_current_bytes, current) = read_local_file_snapshot(path, FILE_DOCUMENT_MAX_BYTES)?;
+    let mut file = fs::File::open(&current.canonical_path).map_err(|e| e.to_string())?;
+    let mut digest = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut digest).map_err(|e| e.to_string())?;
+    drop(file);
+    if current != local_file_fingerprint(path)? {
+        return Err("Save conflict: the file changed during verification.".into());
+    }
+    current.content_digest = digest.finalize().to_hex().to_string();
     if &current != expected {
         return Err(
             "Save conflict: the file changed on disk after it was opened. Your edits are still available; reload and merge before saving."
@@ -9760,12 +9908,6 @@ fn save_sifs_text_document(
     expected: &SifsFileFingerprint,
     bytes: &[u8],
 ) -> Result<FilesDocumentSave, String> {
-    if bytes.len() as u64 > FILE_DOCUMENT_MAX_BYTES {
-        return Err(format!(
-            "The edited document exceeds the {:.1} MiB text-editor limit.",
-            FILE_DOCUMENT_MAX_BYTES as f64 / (1024.0 * 1024.0),
-        ));
-    }
     let outcome = browser
         .replace_file_if_version(path, &expected.object_id, &expected.version, bytes)
         .map_err(|error| {
@@ -12782,7 +12924,7 @@ fn preview_from_read_with_line_limit(
 ) -> FilesPreview {
     let native_preview = if !read.truncated && read.bytes.len() as u64 <= FILE_DOCUMENT_MAX_BYTES {
         let (format, text) = formats::document_from_bytes(name, &read.bytes);
-        format.has_preview().then_some((format, text))
+        (format.has_preview() && !format.paged()).then_some((format, text))
     } else { None };
     if read.bytes.is_empty() {
         return FilesPreview {
@@ -22010,97 +22152,28 @@ fn document_status_text(shared: &Shared) -> String {
     let Some(document) = files.document.as_ref() else {
         return "Document closed".to_string();
     };
-    if document.loading {
-        return "Reading a verified snapshot...".to_string();
-    }
-    if document.load_error.is_some() {
-        return "Document unavailable".to_string();
-    }
-    if document.saving {
-        return "Saving safely...".to_string();
-    }
     if document.save_error.is_some() {
-        return "Save needs attention; your edits are still open".to_string();
+        return "Save failed".into();
+    }
+    if files.attachment_error.is_some() {
+        return "Attachment failed".into();
     }
     if document.save_warning.is_some() {
-        return match document.source {
-            FilesSourceKind::Sifs => "Saved; SIFS maintenance needs attention".to_string(),
-            FilesSourceKind::Local => {
-                "Saved; host filesystem follow-up needs attention".to_string()
-            }
-        };
-    }
-    if document.dirty() {
-        return "Unsaved changes".to_string();
-    }
-    if document.read_only_reason.is_some() {
-        return "Read-only verified snapshot".to_string();
-    }
-    match document.source {
-        FilesSourceKind::Sifs => "Saved to SIFS with version protection".to_string(),
-        FilesSourceKind::Local => "Saved".to_string(),
-    }
-}
-
-fn document_detail_text(shared: &Shared) -> String {
-    let files = shared.files();
-    let Some(document) = files.document.as_ref() else {
-        return String::new();
-    };
-    if let Some(error) = &document.load_error {
-        return error.clone();
-    }
-    if let Some(error) = &files.attachment_error {
-        return format!("Attachment unavailable: {error}");
-    }
-    if let Some(error) = &document.save_error {
-        return error.clone();
-    }
-    if let Some(warning) = &document.save_warning {
-        return match document.source {
-            FilesSourceKind::Sifs => format!(
-                "The new SIFS version is visible, but follow-up maintenance warned: {warning}"
-            ),
-            FilesSourceKind::Local => format!(
-                "The local content was committed, but host filesystem follow-up warned: {warning}"
-            ),
-        };
+        return "Saved with warning".into();
     }
     if let Some(notice) = files.document_external_notice() {
-        return notice;
+        return middle_short(&notice, 32);
     }
-    if let Some(reason) = &document.read_only_reason {
-        return reason.clone();
-    }
-    if matches!(document.format, DocumentFormat::Hex | DocumentFormat::Image) && !document.preview_open {
-        return format!("{} · Hex editor: enter two hexadecimal digits per byte, separated by spaces or newlines. Save writes decoded bytes with conflict protection.", document.path);
-    }
-    if cfg!(target_os = "android") {
-        return if document.dirty() {
-            format!(
-                "{} · Tap Save to keep your changes. Attach includes this draft.",
-                document.path
-            )
-        } else {
-            document.path.clone()
-        };
-    }
-    if document.dirty() {
-        return format!(
-            "{} - Attach sends this unsaved editor buffer and labels it as unpersisted; Ctrl+S saves with conflict protection.",
-            document.path
-        );
-    }
-    match document.source {
-        FilesSourceKind::Local => format!(
-            "{} - Ctrl+S saves by atomic same-folder replacement after checking path, size, and modified time.",
-            document.path
-        ),
-        FilesSourceKind::Sifs => format!(
-            "{} - Ctrl+S uses an expected object ID and version, so a concurrent SIFS update cannot be overwritten.",
-            document.path
-        ),
-    }
+    let state = if document.saving {
+        " · Saving…"
+    } else if document.dirty() {
+        " · Modified"
+    } else if document.read_only_reason.is_some() {
+        " · Read-only"
+    } else {
+        ""
+    };
+    format!("{}{state}", document.format.label())
 }
 
 fn document_view_index(files: &FilesState) -> usize {
@@ -22114,30 +22187,44 @@ fn document_view_index(files: &FilesState) -> usize {
 /// The open document's panel. It is mounted once per document; the editor owns its buffer,
 /// caret, and selection and is rebuilt only when a load replaces the text.
 fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
-    let document = shared.files().document.clone()?;
+    let title = {
+        let files = shared.files();
+        let document = files.document.as_ref()?;
+        document.title.clone()
+    };
     let revision = |name: &'static str| {
         shared
             .signals()
             .files_structure
             .select_named(name, |key| key.dialog.revision())
     };
+    let active_search = source_editor::ActiveSearch::default();
     let editor = {
+        let active = active_search.clone();
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::key_from(revision("document editor load"), move |_| {
-            let Some(document) = s.files().document.clone() else {
+            *active.borrow_mut() = None;
+            let files = s.files();
+            let Some(document) = files.document.as_ref() else {
                 return WidgetPod::new(SizedBox::new());
             };
+            if document.format.paged() && document.preview_open {
+                return paged::view(document, &s, &r, &active);
+            }
             if document.preview_open {
-                if let Some(preview) = formats::preview_widget(document.format, &document.text, &r) {
-                    return WidgetPod::new(ScrollView::vertical(preview)
-                        .name("File format preview")
-                        .viewport_width_hint(true)
-                        .theme_when(clone_gray_scrollbar_reader(&r)));
+                if let Some(preview) = formats::preview_widget(document.format, &document.text, &r)
+                {
+                    return WidgetPod::new(
+                        ScrollView::vertical(preview)
+                            .name("File format preview")
+                            .viewport_width_hint(true)
+                            .theme_when(clone_gray_scrollbar_reader(&r)),
+                    );
                 }
             }
             if !matches!(document.format, DocumentFormat::Hex | DocumentFormat::Image) {
-                return source_editor::view(&document, &s, &r);
+                return source_editor::view(document, &s, &r, &active);
             }
             let editor_shared = s.clone();
             let mut editor = TextSurface::new(format!("files-document:{}", document.path))
@@ -22164,56 +22251,49 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             )
         })
     };
-    let status_shared = shared.clone();
-    let detail_shared = shared.clone();
-    let status = Surface::panel(
-        Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .gap(3.0)
-            .with_child(
-                Label::new("Document")
-                    .text_when(move || document_status_text(&status_shared))
-                    .text_style_when(live_text_style(reader, |theme| {
-                        theme.text_style(theme.palette.text)
-                    })),
-            )
-            .with_child(
-                Label::new("Document path")
-                    .text_when(move || document_detail_text(&detail_shared))
-                    .text_style_when(live_text_style(reader, |theme| {
-                        theme.text_style(theme.palette.text_muted)
-                    })),
-            ),
-    )
-    .theme_when(clone_reader(reader))
-    .padding(Insets {
-        left: 12.0,
-        top: 8.0,
-        right: 12.0,
-        bottom: 8.0,
-    })
-    .fill_width(true);
     let modes = {
         let s = shared.clone();
         let r = Rc::clone(reader);
         RebuildOnChange::key_from(revision("document format controls"), move |_| {
-            let Some(document) = s.files().document.clone() else { return WidgetPod::new(SizedBox::new()); };
-            let mut row = Flex::horizontal().gap(8.0).align_items(Alignment::Center)
-                .with_child(Label::new(document.format.label()).theme_when(clone_reader(&r)));
-            if document.format.has_preview() {
+            let files = s.files();
+            let Some(document) = files.document.as_ref() else {
+                return WidgetPod::new(SizedBox::new());
+            };
+            if !document.format.has_preview()
+                && (cfg!(target_os = "android") || document.source != FilesSourceKind::Sifs)
+            {
+                return WidgetPod::new(SizedBox::new().height(0.));
+            }
+            let mut row = Flex::horizontal().gap(8.0).align_items(Alignment::Center);
+            if document.format.has_preview() && !document.records_only() {
                 let change = s.clone();
-                row = row.with_child(SegmentedControl::new("Document view")
-                    .items([SegmentedControlItem::new("Preview"), SegmentedControlItem::new(
-                        if matches!(document.format, DocumentFormat::Image | DocumentFormat::Hex) { "Hex editor" } else { "Source" })])
-                    .selected(if document.preview_open { 0 } else { 1 })
-                    .theme_when(clone_reader(&r))
-                    .on_change_with_ctx(move |ctx, index, _| {
-                        let mut files = change.files_mut();
-                        if let Some(document) = files.document.as_mut() { document.preview_open = index == 0; }
-                        files.document_revision = files.document_revision.wrapping_add(1);
-                        drop(files);
-                        request_files_overlay_rebuild(ctx);
-                    }));
+                row = row.with_child(
+                    SegmentedControl::new("Document view")
+                        .items([
+                            SegmentedControlItem::new("Preview"),
+                            SegmentedControlItem::new(
+                                if matches!(
+                                    document.format,
+                                    DocumentFormat::Image | DocumentFormat::Hex
+                                ) {
+                                    "Hex editor"
+                                } else {
+                                    "Source"
+                                },
+                            ),
+                        ])
+                        .selected(if document.preview_open { 0 } else { 1 })
+                        .theme_when(clone_reader(&r))
+                        .on_change_with_ctx(move |ctx, index, _| {
+                            let mut files = change.files_mut();
+                            if let Some(document) = files.document.as_mut() {
+                                document.preview_open = index == 0;
+                            }
+                            files.document_revision = files.document_revision.wrapping_add(1);
+                            drop(files);
+                            request_files_overlay_rebuild(ctx);
+                        }),
+                );
             }
             if !cfg!(target_os = "android") && document.source == FilesSourceKind::Sifs {
                 let action = s.clone();
@@ -22244,16 +22324,37 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             WidgetPod::new(row)
         })
     };
-    let editor_body = Dock::new(editor)
-        .top(42.0, modes)
-        .bottom(
-            74.0,
-            ScrollView::vertical(status)
-                .name("Document status")
-                .viewport_width_hint(true),
-        )
-        .fallback_width(780.0)
-        .fallback_body_height(520.0);
+    let status_shared = shared.clone();
+    let status_reader = reader.clone();
+    let status = RebuildOnChange::key_from(
+        shared
+            .signals()
+            .files_structure
+            .select_named("file status", |key| key.dialog.clone()),
+        move |_| {
+            let files = status_shared.files();
+            let Some(doc) = files.document.as_ref() else {
+                return WidgetPod::new(SizedBox::new());
+            };
+            let detail = doc
+                .save_error
+                .clone()
+                .or_else(|| files.attachment_error.clone())
+                .or_else(|| doc.save_warning.clone())
+                .or_else(|| files.document_external_notice())
+                .or_else(|| doc.read_only_reason.clone())
+                .unwrap_or_else(|| doc.path.clone());
+            let label = Label::new(document_status_text(&status_shared))
+                .single_line(true)
+                .theme_when(clone_reader(&status_reader));
+            WidgetPod::new(toolbar_tooltip(detail, label, &status_reader))
+        },
+    );
+    let tools = Flex::horizontal()
+        .gap(8.)
+        .align_items(Alignment::Center)
+        .with_child(modes)
+        .with_child(status);
     let load_error = {
         let s = shared.clone();
         let r = Rc::clone(reader);
@@ -22279,10 +22380,10 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             reader,
             IconGlyph::Hourglass,
             "Opening document",
-            "Reading the complete selected version on the Files background worker",
+            "Opening the selected file snapshot",
         ))
         .with_child(load_error)
-        .with_child(editor_body);
+        .with_child(editor);
 
     let close_shared = shared.clone();
     let close = sui::Button::new("Close")
@@ -22308,11 +22409,9 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     .theme_when(clone_reader(reader))
     .enabled_when(move || {
         let files = attach_enabled.files();
-        files
-            .document
-            .as_ref()
-            .is_some_and(|document| !document.loading && document.load_error.is_none())
-            && !files.attachment_loading
+        files.document.as_ref().is_some_and(|document| {
+            !document.records_only() && !document.loading && document.load_error.is_none()
+        }) && !files.attachment_loading
     })
     .on_press_with_ctx(move |ctx| {
         let waker = { attach_shared.borrow().waker.clone() };
@@ -22369,35 +22468,51 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         .select_named("document state", |key| key.dialog.clone());
     if in_tab {
         let header = TrailingSlotRow::new(
-            Label::new(document.title).theme_when(clone_reader(reader)),
+            Flex::horizontal()
+                .align_items(Alignment::Center)
+                .gap(10.)
+                .with_item(
+                    Label::new(title)
+                        .single_line(true)
+                        .theme_when(clone_reader(reader)),
+                    FlexItem::fill(),
+                )
+                .with_child(tools),
             actions,
         )
         .trailing_width(200.0)
         .trailing_height(36.0)
         .gap(8.0);
-        return Some(WidgetPod::new(RefreshOn::new(
-            document_state,
-            Surface::panel(Dock::new(body).top(52.0, WidgetPadding::all(8.0, header)))
-                .theme_when(clone_reader(reader))
-                .fill(),
+        return Some(WidgetPod::new(source_editor::SearchHost::new(
+            RefreshOn::new(
+                document_state,
+                Surface::panel(Dock::new(body).top(52.0, WidgetPadding::all(8.0, header)))
+                    .theme_when(clone_reader(reader))
+                    .fill(),
+            ),
+            active_search,
         )));
     }
     let dismiss_shared = shared.clone();
-    Some(WidgetPod::new(RefreshOn::new(
-        document_state,
-        SideSheet::new(document.title.clone(), body)
-            .theme_when(clone_reader(reader))
-            .description(format!(
-                "Complete {} document - {}",
-                document.source.label(),
-                document.path
-            ))
-            .placement(SideSheetPlacement::Right)
-            .width(920.0)
-            .modal(true)
-            .dismiss_on_scrim(true)
-            .action(actions.with_child(close))
-            .on_dismiss(move || dismiss_shared.files_mut().request_close_document()),
+    let dismiss_search = active_search.clone();
+    Some(WidgetPod::new(source_editor::SearchHost::new(
+        RefreshOn::new(
+            document_state,
+            SideSheet::new(title, body)
+                .header_action(tools)
+                .theme_when(clone_reader(reader))
+                .placement(SideSheetPlacement::Right)
+                .width(920.0)
+                .modal(true)
+                .dismiss_on_scrim(true)
+                .action(actions.with_child(close))
+                .on_dismiss_with_ctx(move |ctx| {
+                    if !source_editor::SearchHost::close_search(&dismiss_search, ctx) {
+                        dismiss_shared.files_mut().request_close_document();
+                    }
+                }),
+        ),
+        active_search,
     )))
 }
 
@@ -37915,7 +38030,7 @@ mod tests {
         let window = app.main_window()?;
         app.run_until_idle()?;
         window.advance_time(1.0)?;
-        assert!(window.get_by_text("Hex").count()? > 0);
+        assert!(window.get_by_text("Hex · Modified").count()? > 0);
         assert_eq!(window.get_by_text("Document unavailable").count()?, 0);
         window.capture_screenshot()?.write_png(std::env::temp_dir().join("sinomo-files-hex-editor.png"))?;
         Ok(())
@@ -38009,10 +38124,30 @@ mod tests {
     }
 
     #[test]
+    fn large_sifs_document_edits_across_ranges_with_version_protection() {
+        let backend = Backend::local_fallback();
+        let browser = SifsBrowser::open(&backend.data_dir).unwrap();
+        let path = "/editor-range-test.log";
+        let block = sinomo_client::api::DFS_BROWSER_RANGE_LIMIT as usize;
+        let mut text = "a".repeat(block - 1);
+        text.push_str("λ\r\n");
+        text.push_str(&"tail\n".repeat(FILE_DOCUMENT_MAX_BYTES as usize / 5));
+        browser.write_file(path, text.as_bytes()).unwrap();
+        let loaded = load_sifs_text_document(&browser, path, FILE_DOCUMENT_MAX_BYTES).unwrap();
+        assert_eq!(loaded.text, text);
+        assert!(loaded.read_only_reason.is_none());
+        let expected = loaded.sifs_fingerprint.unwrap();
+        text.push_str("edited");
+        save_sifs_text_document(&browser, path, &expected, text.as_bytes()).unwrap();
+        assert!(save_sifs_text_document(&browser, path, &expected, b"stale").is_err());
+        assert_eq!(browser.read_file(path).unwrap(), text.as_bytes());
+    }
+
+    #[test]
     fn local_document_rejects_oversize_and_opens_binary_as_hex() {
         let root = files_test_temp_dir("document-bounds");
-        let oversize = root.join("oversize.txt");
-        fs::write(&oversize, vec![b'x'; FILE_DOCUMENT_MAX_BYTES as usize + 1])
+        let oversize = root.join("oversize.dat");
+        fs::write(&oversize, vec![0; FILE_DOCUMENT_MAX_BYTES as usize + 1])
             .expect("write oversize document");
         let error =
             load_local_text_document(oversize.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
@@ -38347,7 +38482,7 @@ mod tests {
                 editor.width() >= width - 80.0,
                 "editor too narrow: {editor:?}"
             );
-            assert!(editor.height() >= 360.0, "editor too short: {editor:?}");
+            assert!(editor.height() >= 520.0, "editor too short: {editor:?}");
 
             let mut actions = ["Attach to current chat", "Save", "Close"].map(|name| {
                 let bounds = named_bounds(&snapshot, sui::SemanticsRole::Button, name);
