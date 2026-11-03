@@ -683,6 +683,8 @@ impl NativeModuleObjectRpcRoute {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NativeModuleAgentDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<crate::sessions::SessionWorkerProfile>,
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -709,6 +711,7 @@ impl NativeModuleAgentDefinition {
         system_prompt: impl Into<String>,
     ) -> Self {
         Self {
+            worker: None,
             id: id.into(),
             name: name.into(),
             description: String::new(),

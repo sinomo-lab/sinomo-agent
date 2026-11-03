@@ -75,11 +75,11 @@ fn execute(
     );
     result.output
 }
-fn wait(manager: &AgentSubagents, parent: &SessionId, id: &TaskId) {
+fn wait(manager: &AgentSessionHost, parent: &SessionId, id: &TaskId) {
     let result = manager
         .wait(parent, id, 5000, &AgentCancellationToken::new())
         .unwrap();
-    assert_eq!(result.status, AgentSubagentStatus::Completed, "{result:?}");
+    assert_eq!(result.status, ManagedSessionStatus::Completed, "{result:?}");
 }
 
 #[test]
@@ -192,8 +192,9 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
         &parent_input,
         serde_json::json!({"action":"spawn","task":"specific delegated work","prompt":"SPECIALIZED CHILD PROMPT"}),
     );
-    let child: AgentSubagentSnapshot = serde_json::from_value(spawned["subagent"].clone()).unwrap();
-    let manager = runtime.subagents();
+    let child: ManagedSessionSnapshot =
+        serde_json::from_value(spawned["subagent"].clone()).unwrap();
+    let manager = runtime.sessions();
     wait(&manager, &parent_input.session.session_id, &child.id);
     assert_eq!(child.idle_timeout_secs, 86400);
     assert!(requests.lock().unwrap().iter().any(|r| {
@@ -208,7 +209,7 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
         &data_dir,
     );
     assert!(
-        Arc::ptr_eq(&manager, &reattached.subagents()),
+        Arc::ptr_eq(&manager, &reattached.sessions()),
         "reattach must reuse the live registry"
     );
     drop(runtime);
@@ -268,7 +269,7 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
     );
     let store = FileAgentSessionStore::for_data_dir(&data_dir);
     let archived = store.load_session(&child.session_id).unwrap().unwrap();
-    assert!(archived.subagent.unwrap().archived);
+    assert!(archived.managed.unwrap().archived);
     assert!(!archived.transcript.is_empty());
     let released_registry = Arc::downgrade(&manager);
     drop(registry);
@@ -292,14 +293,14 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
     restored.join_active_turn().unwrap();
     assert_eq!(
         restored
-            .subagents()
+            .sessions()
             .search(&parent_input.session.session_id, true)
             .len(),
         1
     );
     assert!(
         restored
-            .subagents()
+            .sessions()
             .list(&parent_input.session.session_id)
             .is_empty()
     );
@@ -346,7 +347,7 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
     assert_ne!(unavailable_call.status, AgentToolStatus::Succeeded);
     assert!(
         plain
-            .subagents()
+            .sessions()
             .list(&plain.session_snapshot().unwrap().session_id)
             .is_empty()
     );

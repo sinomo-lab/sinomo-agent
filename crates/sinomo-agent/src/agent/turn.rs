@@ -69,7 +69,7 @@ impl<M: InteractionModel> Agent<M> {
         progress: &mut AgentTurnProgress,
     ) -> Result<AgentRun, AgentError> {
         let _usage_scope = sinomo_lm::usage::enter_attribution(self.usage_attribution(input));
-        if let Some(subagents) = self.subagents.get() {
+        if let Some(subagents) = self.session_host.get() {
             subagents.set_input(input);
         }
         if let Some(update) = &input.async_update

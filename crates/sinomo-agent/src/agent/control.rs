@@ -1,6 +1,6 @@
 //! Session control, worker ownership, cancellation, and live-input reconciliation.
 
-use super::subagents::{AgentSubagentScope, AgentSubagents};
+use super::managed_sessions::{AgentSessionHost, AgentSessionScope};
 use super::{
     Agent, AgentAbortRecord, AgentCancellationToken, AgentCompactionSummary, AgentError,
     AgentFollowUpMessage, AgentLoopDecision, AgentLoopInput, AgentModelEvent, AgentRole, AgentRun,
@@ -1171,7 +1171,7 @@ where
 {
     pub(super) agent: Arc<Agent<M>>,
     pub(super) state: Arc<Mutex<AgentSessionRuntimeState>>,
-    pub(super) subagent_scope: Arc<AgentSubagentScope>,
+    pub(super) session_scope: Arc<AgentSessionScope>,
 }
 
 impl<M> Clone for AgentSessionRuntime<M>
@@ -1182,7 +1182,7 @@ where
         Self {
             agent: Arc::clone(&self.agent),
             state: Arc::clone(&self.state),
-            subagent_scope: Arc::clone(&self.subagent_scope),
+            session_scope: Arc::clone(&self.session_scope),
         }
     }
 }
@@ -1239,7 +1239,7 @@ impl AgentRuntimeStorage {
         store.load_session(session_id)
     }
 
-    pub(super) fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
+    pub(crate) fn apply_to_agent<M>(&self, mut agent: Agent<M>, _session_id: &SessionId) -> Agent<M>
     where
         M: InteractionModel,
     {
@@ -1320,10 +1320,10 @@ where
     }
 
     pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
-        let subagent_scope = agent.subagent_scope(session.clone());
+        let session_scope = agent.session_scope(session.clone());
         let runtime = Self {
             agent,
-            subagent_scope,
+            session_scope,
             state: Arc::new(Mutex::new(AgentSessionRuntimeState {
                 control: AgentSessionControlPlane::new(session),
                 in_flight_input_ids: BTreeSet::new(),
@@ -1389,7 +1389,7 @@ where
             self.agent.save_session(&staged.session)?;
         }
         if result.accepted && cancelling_children {
-            self.subagent_scope.cancel_children();
+            self.session_scope.cancel_children();
         }
         if result.accepted
             && let Some(token) = cancellation
@@ -1408,10 +1408,10 @@ where
                     token.unpause();
                 }
             }
-            self.subagent_scope.set_children_paused(pause);
+            self.session_scope.set_children_paused(pause);
         }
         state.control = staged;
-        self.subagent_scope
+        self.session_scope
             .manager
             .set_session(&state.control.session);
         state.append_control_runtime_events(&result.events);
@@ -1453,8 +1453,8 @@ where
         Ok(self.lock_state()?.control.session.clone())
     }
 
-    pub fn subagents(&self) -> Arc<AgentSubagents> {
-        Arc::clone(&self.subagent_scope.manager)
+    pub fn sessions(&self) -> Arc<AgentSessionHost> {
+        Arc::clone(&self.session_scope.manager)
     }
 
     pub fn load_explicit_skill_context(
@@ -1472,7 +1472,7 @@ where
                 detail: "cannot replace agent session while a turn is active".to_string(),
             });
         }
-        self.subagent_scope.replace_session(&session);
+        self.session_scope.replace_session(&session);
         if state.control.session.session_id != session.session_id {
             // Another session's detached calls keep reporting to that
             // session; this one's are restored from its records on attach.
@@ -1645,10 +1645,10 @@ where
             state.control.session.session_id.clone()
         };
         Ok(self
-            .subagents()
+            .sessions()
             .list(&session_id)
             .iter()
-            .any(|child| matches!(child.status, super::AgentSubagentStatus::Running)))
+            .any(|child| matches!(child.status, super::ManagedSessionStatus::Running)))
     }
 
     pub fn event_cursor(&self) -> Result<AgentSessionControlEventCursor, AgentError> {
@@ -1927,7 +1927,7 @@ where
             return Err(error);
         }
         state.turn_worker_running = true;
-        self.subagent_scope.manager.set_session(&session_for_turn);
+        self.session_scope.manager.set_session(&session_for_turn);
 
         let worker_state = Arc::clone(&self.state);
         let progress_state = Arc::clone(&self.state);
@@ -2335,7 +2335,7 @@ impl AgentSessionRuntimeState {
         completed_session.pause = live_pause;
         // Lifecycle metadata is host-owned and can be archived during a turn.
         // A late turn snapshot must not resurrect a discarded child.
-        completed_session.subagent = live_session.subagent.clone();
+        completed_session.managed = live_session.managed.clone();
         if live_state_revision > base_state_revision {
             completed_session.state_revision = completed_session
                 .state_revision
@@ -2592,7 +2592,7 @@ mod shutdown_tests {
     fn session_notifications_do_not_complete_unrelated_detached_tools() {
         let id = SessionId::generate();
         let update = AsyncTaskUpdate {
-            kind: "agent.subagent.completed".into(),
+            kind: "agent.managed.completed".into(),
             task_id: TaskId::generate(),
             tool_call_id: None,
             status: AsyncTaskStatus::Completed,

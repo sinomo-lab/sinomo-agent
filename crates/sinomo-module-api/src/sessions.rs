@@ -8,6 +8,9 @@ pub const MAX_SESSION_PAGE: usize = 256;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum SessionRequest {
+    Start {
+        worker: SessionWorkerRequest,
+    },
     List {
         #[serde(default)]
         include_archived: bool,
@@ -57,6 +60,9 @@ pub enum SessionCommand {
         timeout_ms: u64,
     },
     Cancel {
+        id: String,
+    },
+    Result {
         id: String,
     },
     Archive {
@@ -137,4 +143,37 @@ pub struct SessionCommandReceipt {
     pub status: Option<String>,
     #[serde(default)]
     pub archived: bool,
+}
+
+/// A module requests its own exported agent package. The host supplies identity,
+/// storage and executors; no runtime implementation crosses the native ABI.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionWorkerRequest {
+    pub agent_id: String,
+    pub provider: String,
+    pub model: String,
+    pub workspace: String,
+    pub instructions: String,
+    #[serde(default)]
+    pub context: Vec<serde_json::Value>,
+    pub max_steps: Option<usize>,
+}
+
+/// Object-safe request interface shared by native clients and host fixtures.
+pub trait SessionService {
+    fn request(&self, request: &SessionRequest) -> Result<serde_json::Value, String>;
+}
+impl SessionService for SessionClient<'_> {
+    fn request(&self, request: &SessionRequest) -> Result<serde_json::Value, String> {
+        SessionClient::request(self, request).map_err(|e| e.to_string())
+    }
+}
+
+/// Declared by the activated module, never supplied by an agent's request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionWorkerProfile {
+    /// Paths relative to SinomoDataDir; workspace admission remains host-owned.
+    pub workspace_roots: Vec<String>,
 }

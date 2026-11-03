@@ -1078,6 +1078,9 @@ fn start_in_process_daemon(
                         .map_err(|error| {
                             format!("build embedded product component profile: {error}")
                         })?;
+                let base_catalog =
+                    sinomo_agent::module_sessions::with_session_host(&base_catalog, &data_dir)
+                        .map_err(|error| error.to_string())?;
                 let hooks = vec![
                     sinomo_cli::audio_component_factory().map_err(|error| error.to_string())?,
                     sinomo_cli::hosted_agent_chat_component_factory(daemon_address)

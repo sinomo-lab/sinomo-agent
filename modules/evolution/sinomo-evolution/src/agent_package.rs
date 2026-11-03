@@ -201,6 +201,9 @@ fn agent_export(
     for toolset in EVOLUTION_DEFAULT_TOOLSETS {
         export = export.with_visible_toolset(*toolset);
     }
+    export.worker = Some(sinomo_module_api::sessions::SessionWorkerProfile {
+        workspace_roots: vec!["evolution/jobs".into()],
+    });
     export
 }
 

@@ -44,7 +44,10 @@ pub fn app_evolution_dashboard(data_dir: &SinomoDataDir) -> contract::EvolutionD
     }
 }
 
-pub fn run_app_evolution_job(request: contract::EvolutionStartRequest) -> Result<(), CliError> {
+pub fn run_app_evolution_job(
+    request: contract::EvolutionStartRequest,
+    sessions: crate::SessionServices<'_>,
+) -> Result<(), CliError> {
     let mut args = vec![
         "propose".to_string(),
         request.objective,
@@ -55,7 +58,7 @@ pub fn run_app_evolution_job(request: contract::EvolutionStartRequest) -> Result
         args.push("--allow".to_string());
         args.push(path);
     }
-    run_evolve_command_captured(&args).map(|_| ())
+    run_evolve_command_captured(&args, sessions).map(|_| ())
 }
 
 fn summarize_graph(graph: EvolutionGoalGraph) -> contract::EvolutionGoalSummary {
@@ -219,11 +222,14 @@ fn metric_value_label(value: &EvolutionMetricValue) -> String {
 pub fn run_app_evolution_decision(
     request: contract::EvolutionDecisionRequest,
 ) -> Result<(), CliError> {
-    run_evolve_command_captured(&[
-        request.action.command().to_string(),
-        "--job".to_string(),
-        request.job_id,
-    ])
+    run_evolve_command_captured(
+        &[
+            request.action.command().to_string(),
+            "--job".to_string(),
+            request.job_id,
+        ],
+        None,
+    )
     .map(|_| ())
 }
 

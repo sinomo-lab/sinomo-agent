@@ -1,4 +1,4 @@
-//! Host-owned child sessions. Native providers supply tool policy, never a model loop.
+//! Host-owned managed sessions. Native providers supply tool policy, never a model loop.
 use super::*;
 use crate::{AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate};
 use sinomo_runtime::module_api::agent::SessionCommand;
@@ -15,7 +15,7 @@ fn now() -> i64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentSubagentStatus {
+pub enum ManagedSessionStatus {
     Running,
     Completed,
     Failed,
@@ -23,15 +23,19 @@ pub enum AgentSubagentStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AgentSubagentSnapshot {
+pub struct ManagedSessionSnapshot {
     pub id: TaskId,
-    pub parent_session_id: SessionId,
+    pub parent_session_id: Option<SessionId>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub operation_id: Option<TaskId>,
     pub session_id: SessionId,
     pub root_session_id: SessionId,
     pub name: String,
     pub task: String,
     pub prompt: String,
-    pub status: AgentSubagentStatus,
+    pub status: ManagedSessionStatus,
     pub cancel_requested: bool,
     pub result: Option<String>,
     pub result_truncated: bool,
@@ -55,7 +59,7 @@ trait ChildRuntime: Send + Sync {
     fn join(&self) -> Result<(), AgentError>;
     fn session(&self) -> Result<AgentSession, AgentError>;
     fn result(&self, id: &TaskId) -> Result<Option<AgentOpOutcome>, AgentError>;
-    fn save_metadata(&self, snapshot: &AgentSubagentSnapshot) -> Result<(), AgentError>;
+    fn save_metadata(&self, snapshot: &ManagedSessionSnapshot) -> Result<(), AgentError>;
 }
 impl<M: InteractionModel + Send + Sync + 'static> ChildRuntime for AgentSessionRuntime<M> {
     fn submit(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError> {
@@ -87,13 +91,15 @@ impl<M: InteractionModel + Send + Sync + 'static> ChildRuntime for AgentSessionR
     fn result(&self, id: &TaskId) -> Result<Option<AgentOpOutcome>, AgentError> {
         self.turn_result(id)
     }
-    fn save_metadata(&self, snapshot: &AgentSubagentSnapshot) -> Result<(), AgentError> {
+    fn save_metadata(&self, snapshot: &ManagedSessionSnapshot) -> Result<(), AgentError> {
         let mut state = self.lock_state()?;
         let mut session = state.control.session().clone();
-        session.subagent = Some(snapshot.clone());
-        session.relationship = Some(sinomo_runtime::module_api::sessions::SessionRelationship {
-            parent_session_id: snapshot.parent_session_id.to_string(),
-            kind: "delegation".into(),
+        session.managed = Some(snapshot.clone());
+        session.relationship = snapshot.parent_session_id.as_ref().map(|parent| {
+            sinomo_runtime::module_api::sessions::SessionRelationship {
+                parent_session_id: parent.to_string(),
+                kind: "delegation".into(),
+            }
         });
         session.state_revision = session.state_revision.saturating_add(1);
         self.agent.save_session(&session)?;
@@ -115,7 +121,7 @@ struct Parent {
     cancellation_generation: u64,
 }
 struct ChildState {
-    snapshot: AgentSubagentSnapshot,
+    snapshot: ManagedSessionSnapshot,
     session: AgentSession,
     runtime: Option<Arc<dyn ChildRuntime>>,
     input: AgentLoopInput,
@@ -129,17 +135,169 @@ struct Child {
     changed: Condvar,
 }
 #[derive(Default)]
-struct SubagentState {
+struct SessionHostState {
+    closing: bool,
     restored: BTreeSet<SessionId>,
     parents: BTreeMap<SessionId, Parent>,
     children: BTreeMap<TaskId, Arc<Child>>,
 }
-pub struct AgentSubagents {
-    state: Mutex<SubagentState>,
+pub struct AgentSessionHost {
+    state: Mutex<SessionHostState>,
     store: Arc<dyn AgentSessionStore>,
 }
-impl AgentSubagents {
-    fn lock(&self) -> std::sync::MutexGuard<'_, SubagentState> {
+impl AgentSessionHost {
+    pub fn shutdown(&self, deadline: Instant) -> Result<(), String> {
+        let children: Vec<_> = {
+            let mut state = self.lock();
+            state.closing = true;
+            state.children.values().cloned().collect()
+        };
+        for child in &children {
+            let runtime = {
+                let mut state = child.state.lock().unwrap();
+                state.snapshot.archived = true;
+                state.admission.cancel();
+                state.runtime.clone()
+            };
+            if let Some(runtime) = runtime {
+                runtime.cancel_detached();
+                let _ = runtime.submit(AgentOp::cancel_active_turn("session host stopped"));
+            }
+            child.changed.notify_all();
+        }
+        for child in children {
+            let mut state = child.state.lock().unwrap();
+            while state.driver {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("managed sessions are still draining".into());
+                }
+                state = child.changed.wait_timeout(state, remaining).unwrap().0;
+            }
+        }
+        Ok(())
+    }
+    pub fn new(store: Arc<dyn AgentSessionStore>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SessionHostState::default()),
+            store,
+        })
+    }
+
+    /// Adopt a host-created root using the same driver and lifecycle as delegated sessions.
+    pub fn start<M: InteractionModel + Send + Sync + 'static>(
+        self: &Arc<Self>,
+        owner: &str,
+        mut agent: Agent<M>,
+        input: AgentLoopInput,
+        cancellation: AgentCancellationToken,
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
+        if self.lock().closing || cancellation.is_cancelled() {
+            return Err(session_error("session admission stopped"));
+        }
+        let session_id = input.session.session_id.clone();
+        let snapshot = ManagedSessionSnapshot {
+            id: TaskId::generate(),
+            parent_session_id: None,
+            owner: Some(owner.into()),
+            operation_id: None,
+            session_id: session_id.clone(),
+            root_session_id: session_id.clone(),
+            name: agent.config.definition.id.clone(),
+            task: input.latest_event.payload.to_string(),
+            prompt: String::new(),
+            status: ManagedSessionStatus::Running,
+            cancel_requested: false,
+            result: None,
+            result_truncated: false,
+            stop_reason: None,
+            error: None,
+            archived: false,
+            last_activity_unix: now(),
+            idle_timeout_secs: IDLE_SECONDS,
+        };
+        let mut session = AgentSession::new(session_id, agent.config.definition.role.clone());
+        session.managed = Some(snapshot.clone());
+        agent.session_store = self.store.clone();
+        agent.session_store_configured = true;
+        agent.session_host = OnceLock::from(self.clone());
+        let runtime = Arc::new(AgentSessionRuntime::new(agent, session.clone()));
+        let child = Arc::new(Child {
+            state: Mutex::new(ChildState {
+                snapshot: snapshot.clone(),
+                session: session.clone(),
+                runtime: Some(runtime),
+                input,
+                pending: true,
+                updates: VecDeque::new(),
+                admission: cancellation,
+                driver: false,
+            }),
+            changed: Condvar::new(),
+        });
+        {
+            let mut state = self.lock();
+            if state.closing {
+                return Err(session_error("session host is stopping"));
+            }
+            self.store
+                .save_session(&session)
+                .map_err(|e| session_error(e.to_string()))?;
+            state.children.insert(snapshot.id.clone(), child.clone());
+            self.start_driver(child)?;
+        }
+        Ok(snapshot)
+    }
+
+    pub fn owned_roots(&self, owner: &str) -> Result<BTreeMap<String, String>, AgentError> {
+        Ok(self
+            .store
+            .list_sessions()
+            .map_err(|e| session_error(e.to_string()))?
+            .into_iter()
+            .filter_map(|s| {
+                s.managed
+                    .filter(|m| m.owner.as_deref() == Some(owner) && m.parent_session_id.is_none())
+                    .map(|m| (m.session_id.to_string(), m.name))
+            })
+            .collect())
+    }
+
+    pub fn owned_command(
+        self: &Arc<Self>,
+        owner: &str,
+        command: SessionCommand,
+    ) -> Result<serde_json::Value, AgentError> {
+        let id = match &command {
+            SessionCommand::Inspect { id, .. }
+            | SessionCommand::Message { id, .. }
+            | SessionCommand::Wait { id, .. }
+            | SessionCommand::Cancel { id }
+            | SessionCommand::Archive { id }
+            | SessionCommand::Result { id } => id,
+            _ => return Err(session_error("module commands require a session identity")),
+        };
+        let session_id: SessionId = id
+            .parse()
+            .map_err(|_| session_error("invalid session id"))?;
+        let session = self
+            .store
+            .load_session(&session_id)
+            .map_err(|e| session_error(e.to_string()))?
+            .ok_or_else(|| session_error("session unavailable"))?;
+        let root = session
+            .managed
+            .as_ref()
+            .ok_or_else(|| session_error("unmanaged session"))?
+            .root_session_id
+            .clone();
+        if !self.owned_roots(owner)?.contains_key(root.as_str()) {
+            return Err(session_error("session outside module grant"));
+        }
+        self.execute_command(&root, command, &AgentCancellationToken::new())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionHostState> {
         self.state.lock().expect("session registry poisoned")
     }
     pub(super) fn set_session(&self, session: &AgentSession) {
@@ -164,32 +322,33 @@ impl AgentSubagents {
         let sessions = self
             .store
             .list_sessions()
-            .map_err(|e| subagent_error(e.to_string()))?;
+            .map_err(|e| session_error(e.to_string()))?;
         let factory = self.lock().parents.get(caller).unwrap().factory.clone();
         for mut session in sessions {
-            let Some(mut snapshot) = session.subagent.clone() else {
+            let Some(mut snapshot) = session.managed.clone() else {
                 continue;
             };
             if snapshot.root_session_id != root || self.lock().children.contains_key(&snapshot.id) {
                 continue;
             }
-            if snapshot.status == AgentSubagentStatus::Running {
-                snapshot.status = AgentSubagentStatus::Failed;
+            if snapshot.status == ManagedSessionStatus::Running {
+                snapshot.status = ManagedSessionStatus::Failed;
                 snapshot.error =
                     Some("execution interrupted by process restart; work was not replayed".into());
             }
             if now() >= snapshot.last_activity_unix + snapshot.idle_timeout_secs as i64 {
                 snapshot.archived = true;
             }
-            session.subagent = Some(snapshot.clone());
-            session.relationship =
-                Some(sinomo_runtime::module_api::sessions::SessionRelationship {
-                    parent_session_id: snapshot.parent_session_id.to_string(),
+            session.managed = Some(snapshot.clone());
+            session.relationship = snapshot.parent_session_id.as_ref().map(|parent| {
+                sinomo_runtime::module_api::sessions::SessionRelationship {
+                    parent_session_id: parent.to_string(),
                     kind: "delegation".into(),
-                });
+                }
+            });
             self.store
                 .save_session(&session)
-                .map_err(|e| subagent_error(e.to_string()))?;
+                .map_err(|e| session_error(e.to_string()))?;
             let runtime = if snapshot.archived {
                 None
             } else {
@@ -233,10 +392,10 @@ impl AgentSubagents {
         let parent = state
             .parents
             .get(caller)
-            .ok_or_else(|| subagent_error("caller session is not live"))?;
+            .ok_or_else(|| session_error("caller session is not live"))?;
         Ok(parent
             .session
-            .subagent
+            .managed
             .as_ref()
             .map(|s| s.root_session_id.clone())
             .unwrap_or_else(|| caller.clone()))
@@ -248,9 +407,9 @@ impl AgentSubagents {
             .children
             .get(id)
             .cloned()
-            .ok_or_else(|| subagent_error("unknown agent id"))?;
+            .ok_or_else(|| session_error("unknown agent id"))?;
         if child.state.lock().unwrap().snapshot.root_session_id != root {
-            return Err(subagent_error("agent belongs to another session tree"));
+            return Err(session_error("agent belongs to another session tree"));
         }
         Ok(child)
     }
@@ -260,7 +419,7 @@ impl AgentSubagents {
         name: &str,
         task: &str,
         cancellation: &AgentCancellationToken,
-    ) -> Result<AgentSubagentSnapshot, AgentError> {
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
         self.spawn_with_prompt(caller, name, task, "", IDLE_SECONDS, cancellation)
     }
     fn spawn_with_prompt(
@@ -271,16 +430,16 @@ impl AgentSubagents {
         prompt: &str,
         idle_timeout_secs: u64,
         cancellation: &AgentCancellationToken,
-    ) -> Result<AgentSubagentSnapshot, AgentError> {
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
         if task.trim().is_empty()
             || task.len() > 128 * 1024
             || prompt.len() > 64 * 1024
             || name.len() > 1024
         {
-            return Err(subagent_error("invalid child instructions, prompt or name"));
+            return Err(session_error("invalid child instructions, prompt or name"));
         }
         if cancellation.is_cancelled() {
-            return Err(subagent_error("parent operation is cancelled"));
+            return Err(session_error("parent operation is cancelled"));
         }
         let root = self.root(caller)?;
         let (mut input, mut session, factory, inherited_prompt, cancellation_generation) = {
@@ -288,35 +447,37 @@ impl AgentSubagents {
             let parent = state
                 .parents
                 .get(caller)
-                .ok_or_else(|| subagent_error("parent session was released"))?;
+                .ok_or_else(|| session_error("parent session was released"))?;
             if parent.session.is_aborted() {
-                return Err(subagent_error("parent session is aborted"));
+                return Err(session_error("parent session is aborted"));
             }
             (
                 parent
                     .input
                     .clone()
-                    .ok_or_else(|| subagent_error("parent session has no turn context"))?,
+                    .ok_or_else(|| session_error("parent session has no turn context"))?,
                 inherited_session(&parent.session, SessionId::generate()),
                 parent.factory.clone(),
                 parent
                     .session
-                    .subagent
+                    .managed
                     .as_ref()
                     .map(|s| s.prompt.clone())
                     .unwrap_or_default(),
                 parent.cancellation_generation,
             )
         };
-        let snapshot = AgentSubagentSnapshot {
+        let snapshot = ManagedSessionSnapshot {
             id: TaskId::generate(),
-            parent_session_id: caller.clone(),
+            parent_session_id: Some(caller.clone()),
+            owner: None,
+            operation_id: None,
             session_id: session.session_id.clone(),
             root_session_id: root,
             name: name.into(),
             task: task.into(),
             prompt: format!("{inherited_prompt}\n{prompt}"),
-            status: AgentSubagentStatus::Running,
+            status: ManagedSessionStatus::Running,
             cancel_requested: false,
             result: None,
             result_truncated: false,
@@ -326,10 +487,12 @@ impl AgentSubagents {
             last_activity_unix: now(),
             idle_timeout_secs: idle_timeout_secs.clamp(1, IDLE_SECONDS),
         };
-        session.subagent = Some(snapshot.clone());
-        session.relationship = Some(sinomo_runtime::module_api::sessions::SessionRelationship {
-            parent_session_id: snapshot.parent_session_id.to_string(),
-            kind: "delegation".into(),
+        session.managed = Some(snapshot.clone());
+        session.relationship = snapshot.parent_session_id.as_ref().map(|parent| {
+            sinomo_runtime::module_api::sessions::SessionRelationship {
+                parent_session_id: parent.to_string(),
+                kind: "delegation".into(),
+            }
         });
         input.session.session_id = session.session_id.clone();
         let mut event = crate::user_interaction_input_event(&input.session, task);
@@ -348,7 +511,7 @@ impl AgentSubagents {
         input.async_update = None;
         self.store
             .save_session(&session)
-            .map_err(|e| subagent_error(e.to_string()))?;
+            .map_err(|e| session_error(e.to_string()))?;
         let runtime = factory(session.clone(), prompt)?;
         let child = Arc::new(Child {
             state: Mutex::new(ChildState {
@@ -365,20 +528,22 @@ impl AgentSubagents {
         });
         {
             let mut registry = self.lock();
-            if registry.parents.get(caller).is_none_or(|parent| {
-                parent.cancellation_generation != cancellation_generation
-                    || parent.session.is_aborted()
-            }) {
+            if registry.closing
+                || registry.parents.get(caller).is_none_or(|parent| {
+                    parent.cancellation_generation != cancellation_generation
+                        || parent.session.is_aborted()
+                })
+            {
                 drop(registry);
                 let mut state = child.state.lock().unwrap();
-                state.snapshot.status = AgentSubagentStatus::Cancelled;
+                state.snapshot.status = ManagedSessionStatus::Cancelled;
                 state.snapshot.archived = true;
                 state.snapshot.cancel_requested = true;
-                state.session.subagent = Some(state.snapshot.clone());
+                state.session.managed = Some(state.snapshot.clone());
                 self.store
                     .save_session(&state.session)
-                    .map_err(|e| subagent_error(e.to_string()))?;
-                return Err(subagent_error("parent cancelled child admission"));
+                    .map_err(|e| session_error(e.to_string()))?;
+                return Err(session_error("parent cancelled child admission"));
             }
             registry.children.insert(snapshot.id.clone(), child.clone());
         }
@@ -400,7 +565,7 @@ impl AgentSubagents {
             })
         {
             state.driver = false;
-            return Err(subagent_error(e.to_string()));
+            return Err(session_error(e.to_string()));
         }
         Ok(())
     }
@@ -439,7 +604,7 @@ impl AgentSubagents {
                     {
                         state.session = session;
                     }
-                    state.session.subagent = Some(state.snapshot.clone());
+                    state.session.managed = Some(state.snapshot.clone());
                     if let Some(manager) = manager.upgrade()
                         && let Err(error) = manager.store.save_session(&state.session)
                     {
@@ -461,7 +626,7 @@ impl AgentSubagents {
                 }
                 let update = state.updates.pop_front();
                 state.pending = !state.updates.is_empty();
-                state.snapshot.status = AgentSubagentStatus::Running;
+                state.snapshot.status = ManagedSessionStatus::Running;
                 state.snapshot.cancel_requested = false;
                 state.snapshot.last_activity_unix = now();
                 let mut input = state.input.clone();
@@ -483,10 +648,11 @@ impl AgentSubagents {
             };
             let op = AgentOp::continue_turn(input);
             let id = op.op_id.clone();
+            child.state.lock().unwrap().snapshot.operation_id = Some(id.clone());
             let result = (|| {
                 let accepted = runtime.start(op, admission.clone())?;
                 if !accepted.accepted {
-                    return Err(subagent_error("child turn admission rejected"));
+                    return Err(session_error("child turn admission rejected"));
                 }
                 runtime.join()?;
                 runtime.result(&id)
@@ -519,34 +685,34 @@ impl AgentSubagents {
                             state.snapshot.stop_reason = Some(run.stop_reason);
                         }
                         state.snapshot.status = if state.snapshot.cancel_requested {
-                            AgentSubagentStatus::Cancelled
+                            ManagedSessionStatus::Cancelled
                         } else if state.snapshot.stop_reason
                             == Some(AgentStopReason::MaxStepsReached)
                         {
                             state.snapshot.error =
                                 Some("subagent reached its step limit before completing".into());
-                            AgentSubagentStatus::Failed
+                            ManagedSessionStatus::Failed
                         } else {
-                            AgentSubagentStatus::Completed
+                            ManagedSessionStatus::Completed
                         };
                     }
                     Ok(None) => {
-                        state.snapshot.status = AgentSubagentStatus::Failed;
+                        state.snapshot.status = ManagedSessionStatus::Failed;
                         state.snapshot.error = Some("child completed without a turn result".into());
                     }
                     Err(error) => {
                         state.snapshot.status = if state.snapshot.cancel_requested {
-                            AgentSubagentStatus::Cancelled
+                            ManagedSessionStatus::Cancelled
                         } else {
-                            AgentSubagentStatus::Failed
+                            ManagedSessionStatus::Failed
                         };
                         state.snapshot.error = Some(error.to_string());
                     }
                 }
-                if state.snapshot.status == AgentSubagentStatus::Completed
+                if state.snapshot.status == ManagedSessionStatus::Completed
                     && runtime.detached_work()
                 {
-                    state.snapshot.status = AgentSubagentStatus::Running;
+                    state.snapshot.status = ManagedSessionStatus::Running;
                 }
                 if !state.session.follow_up_queue.is_empty()
                     || !state.session.steering_queue.is_empty()
@@ -555,13 +721,13 @@ impl AgentSubagents {
                 }
                 if let Err(error) = runtime.save_metadata(&state.snapshot) {
                     state.snapshot.error = Some(error.to_string());
-                    state.snapshot.status = AgentSubagentStatus::Failed;
+                    state.snapshot.status = ManagedSessionStatus::Failed;
                 }
-                state.session.subagent = Some(state.snapshot.clone());
+                state.session.managed = Some(state.snapshot.clone());
                 child.changed.notify_all();
                 state.snapshot.clone()
             };
-            if snapshot.status != AgentSubagentStatus::Running
+            if snapshot.status != ManagedSessionStatus::Running
                 && let Some(manager) = manager.upgrade()
                 && let Err(error) = manager.notify_parent(&snapshot)
             {
@@ -570,14 +736,17 @@ impl AgentSubagents {
             }
         }
     }
-    fn notify_parent(&self, snapshot: &AgentSubagentSnapshot) -> Result<(), AgentError> {
+    fn notify_parent(&self, snapshot: &ManagedSessionSnapshot) -> Result<(), AgentError> {
+        let Some(parent_id) = &snapshot.parent_session_id else {
+            return Ok(());
+        };
         let update = AsyncTaskUpdate {
-            kind: "agent.subagent.completed".into(),
+            kind: "agent.managed.completed".into(),
             task_id: TaskId::generate(),
             tool_call_id: None,
             status: match snapshot.status {
-                AgentSubagentStatus::Completed => AsyncTaskStatus::Completed,
-                AgentSubagentStatus::Cancelled => AsyncTaskStatus::Cancelled,
+                ManagedSessionStatus::Completed => AsyncTaskStatus::Completed,
+                ManagedSessionStatus::Cancelled => AsyncTaskStatus::Cancelled,
                 _ => AsyncTaskStatus::Failed,
             },
             summary: format!(
@@ -596,27 +765,27 @@ impl AgentSubagents {
         };
         self.store
             .append_record(&AgentSessionStoreRecord::new(
-                snapshot.parent_session_id.clone(),
+                parent_id.clone(),
                 AgentSessionStoreRecordKind::DetachedCallStarted {
                     task_id: update.task_id.clone(),
                     tool_call_id: update.task_id.clone(),
-                    tool: "agent.subagent".into(),
+                    tool: "agent.managed".into(),
                 },
             ))
-            .map_err(|e| subagent_error(e.to_string()))?;
+            .map_err(|e| session_error(e.to_string()))?;
         self.store
             .append_record(&AgentSessionStoreRecord::new(
-                snapshot.parent_session_id.clone(),
+                parent_id.clone(),
                 AgentSessionStoreRecordKind::DetachedCallCompleted {
                     update: update.clone(),
                 },
             ))
-            .map_err(|e| subagent_error(e.to_string()))?;
-        super::control::queue_session_update(&snapshot.parent_session_id, update.clone());
+            .map_err(|e| session_error(e.to_string()))?;
+        super::control::queue_session_update(parent_id, update.clone());
         let children: Vec<_> = self.lock().children.values().cloned().collect();
         for parent in children {
             let mut state = parent.state.lock().unwrap();
-            if state.snapshot.session_id == snapshot.parent_session_id && !state.snapshot.archived {
+            if &state.snapshot.session_id == parent_id && !state.snapshot.archived {
                 // The existing runtime completion queue owns delivery and
                 // replay. Wake the driver without copying or overwriting it.
                 state.pending = true;
@@ -630,7 +799,7 @@ impl AgentSubagents {
         &self,
         caller: &SessionId,
         id: &TaskId,
-    ) -> Result<AgentSubagentSnapshot, AgentError> {
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
         Ok(self
             .child(caller, id)?
             .state
@@ -651,10 +820,10 @@ impl AgentSubagents {
             None => Ok(state.session.clone()),
         }
     }
-    pub fn list(&self, caller: &SessionId) -> Vec<AgentSubagentSnapshot> {
+    pub fn list(&self, caller: &SessionId) -> Vec<ManagedSessionSnapshot> {
         self.search(caller, false)
     }
-    pub fn search(&self, caller: &SessionId, archived: bool) -> Vec<AgentSubagentSnapshot> {
+    pub fn search(&self, caller: &SessionId, archived: bool) -> Vec<ManagedSessionSnapshot> {
         let Ok(root) = self.root(caller) else {
             return vec![];
         };
@@ -674,11 +843,11 @@ impl AgentSubagents {
         id: &TaskId,
         timeout_ms: u64,
         cancellation: &AgentCancellationToken,
-    ) -> Result<AgentSubagentSnapshot, AgentError> {
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
         let child = self.child(caller, id)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
         let mut state = child.state.lock().unwrap();
-        while state.snapshot.status == AgentSubagentStatus::Running && !cancellation.is_cancelled()
+        while state.snapshot.status == ManagedSessionStatus::Running && !cancellation.is_cancelled()
         {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -696,12 +865,18 @@ impl AgentSubagents {
         &self,
         caller: &SessionId,
         id: &TaskId,
-    ) -> Result<AgentSubagentSnapshot, AgentError> {
+    ) -> Result<ManagedSessionSnapshot, AgentError> {
         let child = self.child(caller, id)?;
         let runtime = {
             let mut state = child.state.lock().unwrap();
-            if state.snapshot.parent_session_id != *caller {
-                return Err(subagent_error("only the parent can cancel a child"));
+            if state
+                .snapshot
+                .parent_session_id
+                .as_ref()
+                .unwrap_or(&state.snapshot.session_id)
+                != caller
+            {
+                return Err(session_error("only the parent can cancel a child"));
             }
             state.snapshot.cancel_requested = true;
             state.admission.cancel();
@@ -724,10 +899,10 @@ impl AgentSubagents {
         if let Some(runtime) = &state.runtime {
             runtime.save_metadata(&state.snapshot)?;
         } else {
-            state.session.subagent = Some(state.snapshot.clone());
+            state.session.managed = Some(state.snapshot.clone());
             self.store
                 .save_session(&state.session)
-                .map_err(|e| subagent_error(e.to_string()))?;
+                .map_err(|e| session_error(e.to_string()))?;
         }
         child.changed.notify_all();
         Ok(())
@@ -739,20 +914,20 @@ impl AgentSubagents {
         message: &str,
     ) -> Result<(), AgentError> {
         if message.trim().is_empty() || message.len() > 128 * 1024 {
-            return Err(subagent_error("invalid message"));
+            return Err(session_error("invalid message"));
         }
         let parent_target = {
             let state = self.lock();
             let parent = state
                 .parents
                 .get(caller)
-                .ok_or_else(|| subagent_error("caller session is not live"))?;
+                .ok_or_else(|| session_error("caller session is not live"))?;
             if id == "parent" {
                 parent
                     .session
-                    .subagent
+                    .managed
                     .as_ref()
-                    .map(|s| s.parent_session_id.clone())
+                    .and_then(|s| s.parent_session_id.clone())
             } else {
                 None
             }
@@ -763,7 +938,7 @@ impl AgentSubagents {
                 .lock()
                 .parents
                 .get(&target)
-                .and_then(|p| p.session.subagent.as_ref())
+                .and_then(|p| p.session.managed.as_ref())
                 .map(|s| s.id.clone());
             if let Some(id) = parent_id {
                 return self.message(caller, id.as_str(), message);
@@ -773,35 +948,35 @@ impl AgentSubagents {
                 .parents
                 .get(&target)
                 .and_then(|p| p.message.clone())
-                .ok_or_else(|| subagent_error("parent session is unavailable"))?;
+                .ok_or_else(|| session_error("parent session is unavailable"))?;
             if send(&text)? {
                 return Ok(());
             }
             let mut session = self
                 .store
                 .load_session(&target)
-                .map_err(|e| subagent_error(e.to_string()))?
-                .ok_or_else(|| subagent_error("parent session is unavailable"))?;
+                .map_err(|e| session_error(e.to_string()))?
+                .ok_or_else(|| session_error("parent session is unavailable"))?;
             session
                 .follow_up_queue
                 .push(AgentFollowUpMessage::new(text));
             session.state_revision = session.state_revision.saturating_add(1);
             self.store
                 .save_session(&session)
-                .map_err(|e| subagent_error(e.to_string()))?;
+                .map_err(|e| session_error(e.to_string()))?;
             return Ok(());
         }
-        let id: TaskId = id.parse().map_err(|_| subagent_error("invalid agent id"))?;
+        let id: TaskId = id.parse().map_err(|_| session_error("invalid agent id"))?;
         let child = self.child(caller, &id)?;
         let runtime = {
             let state = child.state.lock().unwrap();
             if state.snapshot.archived {
-                return Err(subagent_error("agent is archived"));
+                return Err(session_error("agent is archived"));
             }
             state
                 .runtime
                 .clone()
-                .ok_or_else(|| subagent_error("agent runtime is unavailable"))?
+                .ok_or_else(|| session_error("agent runtime is unavailable"))?
         };
         // Runtime control can propagate to descendants. Never hold a child
         // registry lock while entering that control plane.
@@ -812,13 +987,13 @@ impl AgentSubagents {
         {
             let mut state = child.state.lock().unwrap();
             if state.snapshot.archived {
-                return Err(subagent_error("agent archived during message admission"));
+                return Err(session_error("agent archived during message admission"));
             }
-            if state.snapshot.status != AgentSubagentStatus::Running {
+            if state.snapshot.status != ManagedSessionStatus::Running {
                 state.admission = AgentCancellationToken::new();
             }
             state.pending = true;
-            state.snapshot.status = AgentSubagentStatus::Running;
+            state.snapshot.status = ManagedSessionStatus::Running;
             state.snapshot.last_activity_unix = now();
             child.changed.notify_all();
         }
@@ -829,7 +1004,7 @@ impl AgentSubagents {
             parent.cancellation_generation = parent.cancellation_generation.wrapping_add(1);
         }
         for child in self.list(caller) {
-            if child.parent_session_id == *caller {
+            if child.parent_session_id.as_ref() == Some(caller) {
                 let _ = self.cancel(caller, &child.id);
             }
         }
@@ -839,7 +1014,7 @@ impl AgentSubagents {
         for child in children {
             let runtime = {
                 let state = child.state.lock().unwrap();
-                (state.snapshot.parent_session_id == *caller)
+                (state.snapshot.parent_session_id.as_ref() == Some(caller))
                     .then(|| state.runtime.clone())
                     .flatten()
             };
@@ -853,7 +1028,7 @@ impl AgentSubagents {
         }
     }
 }
-fn subagent_error(detail: impl Into<String>) -> AgentError {
+fn session_error(detail: impl Into<String>) -> AgentError {
     AgentError::Runtime {
         detail: detail.into(),
     }
@@ -868,11 +1043,11 @@ fn inherited_session(parent: &AgentSession, id: SessionId) -> AgentSession {
     child
 }
 
-pub(super) struct AgentSubagentScope {
-    pub(super) manager: Arc<AgentSubagents>,
+pub(super) struct AgentSessionScope {
+    pub(super) manager: Arc<AgentSessionHost>,
     session_id: Mutex<SessionId>,
 }
-impl AgentSubagentScope {
+impl AgentSessionScope {
     pub(super) fn cancel_children(&self) {
         self.manager
             .cancel_children(&self.session_id.lock().unwrap());
@@ -916,8 +1091,8 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
             session_store: self.session_store.clone(),
             trace_store_configured: self.trace_store_configured,
             session_store_configured: self.session_store_configured,
-            subagents: self
-                .subagents
+            session_host: self
+                .session_host
                 .get()
                 .cloned()
                 .map(OnceLock::from)
@@ -926,15 +1101,12 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
             item_journals: Mutex::new(BTreeMap::new()),
         }
     }
-    pub(super) fn subagent_scope(
-        self: &Arc<Self>,
-        session: AgentSession,
-    ) -> Arc<AgentSubagentScope> {
+    pub(super) fn session_scope(self: &Arc<Self>, session: AgentSession) -> Arc<AgentSessionScope> {
         type RegistryKey = (PathBuf, SessionId);
-        static REGISTRIES: OnceLock<Mutex<BTreeMap<RegistryKey, Weak<AgentSubagents>>>> =
+        static REGISTRIES: OnceLock<Mutex<BTreeMap<RegistryKey, Weak<AgentSessionHost>>>> =
             OnceLock::new();
         let root_id = session
-            .subagent
+            .managed
             .as_ref()
             .map(|s| s.root_session_id.clone())
             .unwrap_or_else(|| session.session_id.clone());
@@ -948,14 +1120,14 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
             .expect("session registries poisoned");
         registries.retain(|_, manager| manager.strong_count() > 0);
         let manager = self
-            .subagents
+            .session_host
             .get_or_init(|| {
                 key.as_ref()
                     .and_then(|key| registries.get(key))
                     .and_then(Weak::upgrade)
                     .unwrap_or_else(|| {
-                        Arc::new(AgentSubagents {
-                            state: Mutex::new(SubagentState::default()),
+                        Arc::new(AgentSessionHost {
+                            state: Mutex::new(SessionHostState::default()),
                             store: self.session_store.clone(),
                         })
                     })
@@ -972,14 +1144,14 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
                   -> Result<Arc<dyn ChildRuntime>, AgentError> {
                 let parent = agent
                     .upgrade()
-                    .ok_or_else(|| subagent_error("parent agent was released"))?;
+                    .ok_or_else(|| session_error("parent agent was released"))?;
                 let mut child = parent.fork_subagent();
                 child
                     .config
                     .definition
                     .system_prompt
                     .push_str(&format!("\n\n{prompt}"));
-                if let Some(snapshot) = &session.subagent {
+                if let Some(snapshot) = &session.managed {
                     let mut task = AgentTaskRef::new("subagent", &snapshot.task);
                     task.task_id = snapshot.id.clone();
                     task.parent_task_id = parent
@@ -1001,8 +1173,8 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
                     move |caller, cancellation| {
                         sessions
                             .upgrade()
-                            .ok_or_else(|| subagent_error("session runtime released"))?
-                            .tool_session_access(caller, cancellation)
+                            .ok_or_else(|| session_error("session runtime released"))?
+                            .session_access(caller, cancellation)
                     },
                 ));
         }
@@ -1020,7 +1192,7 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
             parent.session = session;
             parent.factory = factory;
         }
-        Arc::new(AgentSubagentScope {
+        Arc::new(AgentSessionScope {
             manager,
             session_id: Mutex::new(id),
         })
@@ -1031,9 +1203,9 @@ impl<M: InteractionModel + Send + Sync + 'static> AgentSessionRuntime<M> {
     pub(super) fn bind_session_messages(&self) {
         let weak_state = Arc::downgrade(&self.state);
         let weak_agent = Arc::downgrade(&self.agent);
-        let weak_scope = Arc::downgrade(&self.subagent_scope);
+        let weak_scope = Arc::downgrade(&self.session_scope);
         let message = Arc::new(move |text: &str| {
-            let (Some(state), Some(agent), Some(subagent_scope)) = (
+            let (Some(state), Some(agent), Some(session_scope)) = (
                 weak_state.upgrade(),
                 weak_agent.upgrade(),
                 weak_scope.upgrade(),
@@ -1043,7 +1215,7 @@ impl<M: InteractionModel + Send + Sync + 'static> AgentSessionRuntime<M> {
             let runtime = AgentSessionRuntime {
                 state,
                 agent,
-                subagent_scope,
+                session_scope,
             };
             runtime.submit_op(AgentOp::follow_up(text))?;
             Ok(true)
@@ -1052,25 +1224,25 @@ impl<M: InteractionModel + Send + Sync + 'static> AgentSessionRuntime<M> {
         let inspect = Arc::new(move || {
             let state = weak_state
                 .upgrade()
-                .ok_or_else(|| subagent_error("parent session detached"))?;
+                .ok_or_else(|| session_error("parent session detached"))?;
             let session = state
                 .lock()
-                .map_err(|_| subagent_error("parent session poisoned"))?
+                .map_err(|_| session_error("parent session poisoned"))?
                 .control
                 .session()
                 .clone();
             Ok(session)
         });
         let id = self.session_snapshot().expect("session").session_id;
-        if let Some(parent) = self.subagents().lock().parents.get_mut(&id) {
+        if let Some(parent) = self.sessions().lock().parents.get_mut(&id) {
             parent.message = Some(message);
             parent.inspect = Some(inspect);
         }
     }
 }
 
-impl AgentSubagents {
-    fn tool_session_access(
+impl AgentSessionHost {
+    pub fn session_access(
         self: &Arc<Self>,
         caller: &SessionId,
         cancellation: AgentCancellationToken,
@@ -1091,7 +1263,7 @@ impl AgentSubagents {
         Ok(Arc::new(access))
     }
 
-    fn execute_command(
+    pub(crate) fn execute_command(
         self: &Arc<Self>,
         caller: &SessionId,
         command: SessionCommand,
@@ -1100,7 +1272,7 @@ impl AgentSubagents {
         let parse = |id: String| -> Result<TaskId, AgentError> {
             let id = id
                 .parse::<TaskId>()
-                .map_err(|_| subagent_error("invalid session or agent id"))?;
+                .map_err(|_| session_error("invalid session or agent id"))?;
             if self.lock().children.contains_key(&id) {
                 return Ok(id);
             }
@@ -1142,14 +1314,14 @@ impl AgentSubagents {
                         let parent_id = state
                             .parents
                             .get(caller)
-                            .and_then(|p| p.session.subagent.as_ref())
-                            .map(|s| &s.parent_session_id)
-                            .ok_or_else(|| subagent_error("no parent"))?;
+                            .and_then(|p| p.session.managed.as_ref())
+                            .and_then(|s| s.parent_session_id.as_ref())
+                            .ok_or_else(|| session_error("no parent"))?;
                         state
                             .parents
                             .get(parent_id)
                             .and_then(|p| p.inspect.clone())
-                            .ok_or_else(|| subagent_error("parent unavailable"))?
+                            .ok_or_else(|| session_error("parent unavailable"))?
                     };
                     return Ok(serde_json::json!({"session": inspect()?}));
                 }
@@ -1164,8 +1336,8 @@ impl AgentSubagents {
                     .lock()
                     .parents
                     .get(caller)
-                    .and_then(|parent| parent.session.subagent.as_ref())
-                    .map(|child| child.parent_session_id.to_string());
+                    .and_then(|parent| parent.session.managed.as_ref())
+                    .and_then(|child| child.parent_session_id.as_ref().map(ToString::to_string));
                 let (target, session_id) = if id == "parent" || parent.as_ref() == Some(&id) {
                     ("parent".to_string(), parent)
                 } else {
@@ -1178,6 +1350,15 @@ impl AgentSubagents {
             }
             SessionCommand::Wait { id, timeout_ms } => {
                 self.wait(caller, &parse(id)?, timeout_ms, cancellation)?
+            }
+            SessionCommand::Result { id } => {
+                let child = self.child(caller, &parse(id)?)?;
+                let state = child.state.lock().unwrap();
+                let result = match (&state.runtime, &state.snapshot.operation_id) {
+                    (Some(runtime), Some(id)) => runtime.result(id)?,
+                    _ => None,
+                };
+                return serde_json::to_value(result).map_err(|e| session_error(e.to_string()));
             }
             SessionCommand::Cancel { id } => self.cancel(caller, &parse(id)?)?,
             SessionCommand::Archive { id } => {

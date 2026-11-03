@@ -149,7 +149,7 @@ impl AgentSessionAccess {
                         .cloned()
                         .or_else(|| {
                             session
-                                .subagent
+                                .managed
                                 .as_ref()
                                 .map(|s| s.name.clone())
                                 .filter(|s| !s.is_empty())
@@ -157,13 +157,13 @@ impl AgentSessionAccess {
                         .or(session.agent_definition_key)
                         .unwrap_or_else(|| "Agent".into()),
                     aliases: session
-                        .subagent
+                        .managed
                         .as_ref()
                         .map(|s| vec![s.id.to_string()])
                         .unwrap_or_default(),
                     session_id: id,
                     relationship,
-                    archived: session.subagent.as_ref().is_some_and(|s| s.archived),
+                    archived: session.managed.as_ref().is_some_and(|s| s.archived),
                 },
             );
         }
@@ -206,6 +206,7 @@ impl SessionAccess for AgentSessionAccess {
         }
         let members = self.members()?;
         match request {
+            SessionRequest::Start { .. } => Err("this session grant cannot launch workers".into()),
             SessionRequest::Messages {
                 after_sequence,
                 limit,
@@ -337,9 +338,14 @@ fn bound_payload(value: &mut serde_json::Value) -> bool {
 // their authoritative typed parent record without rewriting history.
 fn session_relationship(session: &crate::AgentSession) -> Option<SessionRelationship> {
     session.relationship.clone().or_else(|| {
-        session.subagent.as_ref().map(|child| SessionRelationship {
-            parent_session_id: child.parent_session_id.to_string(),
-            kind: "delegation".into(),
+        session.managed.as_ref().and_then(|child| {
+            child
+                .parent_session_id
+                .as_ref()
+                .map(|parent| SessionRelationship {
+                    parent_session_id: parent.to_string(),
+                    kind: "delegation".into(),
+                })
         })
     })
 }

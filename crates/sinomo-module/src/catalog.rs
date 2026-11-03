@@ -229,6 +229,30 @@ impl ComponentCatalog {
 }
 
 impl crate::NativeModuleRequestPreparer for ComponentCatalog {
+    fn host_services(
+        &self,
+        data_dir_root: &std::path::Path,
+        descriptor: &sinomo_module_api::NativeModuleDescriptor,
+        cancellation: &crate::NativeModuleOperationCancellationToken,
+    ) -> Result<
+        BTreeMap<String, Arc<dyn crate::NativeModuleHostCallbacks>>,
+        sinomo_core::network::NetworkError,
+    > {
+        let mut services = BTreeMap::new();
+        for preparer in self.native_request_preparers.values() {
+            for (interface, service) in
+                preparer.host_services(data_dir_root, descriptor, cancellation)?
+            {
+                if services.insert(interface.clone(), service).is_some() {
+                    return Err(sinomo_core::network::NetworkError::Serialization {
+                        detail: format!("duplicate host service {interface}"),
+                    });
+                }
+            }
+        }
+        Ok(services)
+    }
+
     fn id(&self) -> &'static str {
         "component-catalog"
     }

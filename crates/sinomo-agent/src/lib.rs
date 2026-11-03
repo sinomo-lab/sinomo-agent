@@ -6,6 +6,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 pub mod cli;
+pub mod module_sessions;
 pub mod session_access;
 pub mod session_panels;
 
@@ -67,6 +68,11 @@ pub struct AgentCancellationToken {
 }
 
 impl AgentCancellationToken {
+    pub(crate) fn from_parent_signal(signal: Arc<AtomicBool>) -> Self {
+        let mut parent = Self::new();
+        parent.cancelled = signal;
+        parent.child_token()
+    }
     pub fn new() -> Self {
         Self::default()
     }

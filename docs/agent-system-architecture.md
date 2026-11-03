@@ -788,8 +788,11 @@ session is saved. A paused session holds its completions until it resumes.
 
 Subagents are reusable temporary agents exposed by the native `module.subagents`
 module through tools and skills. The module owns the tool contract and subagent
-prompt. The existing agent runtime owns execution, session state, inherited
-authority, cancellation and persistence. A missing or disabled provider leaves
+prompt. The host session service owns execution, session state, inherited authority,
+cancellation and persistence for both delegated children and module-owned workers.
+Native modules receive scoped access to that service; they do not retain runtime
+implementations or borrowed invocation handles. Evolution uses the service
+independently of the interactive subagents module. A missing or disabled provider leaves
 ordinary agent chat available without the delegation tool.
 
 Subagents inherit the parent's model, package identity, tool surface, runtime

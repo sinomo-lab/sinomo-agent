@@ -49,3 +49,5 @@ pub fn evolution_module_id() -> sinomo_runtime::module::ModuleId {
     )
     .expect("valid evolution module id")
 }
+
+pub type SessionServices<'a> = Option<&'a dyn sinomo_module_api::sessions::SessionService>;

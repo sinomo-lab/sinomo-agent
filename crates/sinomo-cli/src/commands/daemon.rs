@@ -423,6 +423,10 @@ fn run_daemon_with_paths_and_profile(
                 detail: format!("build daemon product component profile: {error}"),
             }
         })?;
+    let base_catalog = sinomo_agent::module_sessions::with_session_host(&base_catalog, &data_dir)
+        .map_err(|error| CliError::Parse {
+        detail: error.to_string(),
+    })?;
     let mut component_factories = vec![
         cli_agent_component_factory(&options)?,
         audio_component_factory()?,

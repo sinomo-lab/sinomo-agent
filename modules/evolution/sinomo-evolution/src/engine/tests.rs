@@ -6901,3 +6901,86 @@ fn failing_verification_command() -> &'static str {
 fn failing_verification_command() -> &'static str {
     "printf failure-details >&2; exit 7"
 }
+
+#[test]
+fn candidate_execution_uses_host_sessions_without_the_subagent_module() {
+    use sinomo_agent::{AgentSessionHost, FileAgentSessionStore};
+    use sinomo_module_api::sessions::{SessionRequest, SessionService};
+    struct Host {
+        sessions: Arc<AgentSessionHost>,
+    }
+    impl SessionService for Host {
+        fn request(&self, request: &SessionRequest) -> Result<serde_json::Value, String> {
+            match request {
+                SessionRequest::Start { worker } => {
+                    assert_eq!(worker.agent_id, crate::EVOLUTION_IMPLEMENTER_AGENT_ID);
+                    assert!(worker.instructions.contains("Candidate Workspace"));
+                    let model = FakeInteractionModel::new([
+                        r#"{"response_mode":"answer","text":"host completed candidate","tool_calls":[],"next_state":"listening"}"#,
+                    ]);
+                    let agent = Agent::new(model, &worker.provider, &worker.model);
+                    let session = InteractionSession::new(
+                        SessionId::generate(),
+                        NodeId::generate(),
+                        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+                    );
+                    let input = AgentLoopInput {
+                        latest_event: user_interaction_input_event(&session, &worker.instructions),
+                        session,
+                        transient_system_context: None,
+                        async_update: None,
+                        context_attachments: vec![],
+                        tool_specs: vec![],
+                    };
+                    serde_json::to_value(
+                        self.sessions
+                            .start(
+                                "module.evolution",
+                                agent,
+                                input,
+                                sinomo_agent::AgentCancellationToken::new(),
+                            )
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                SessionRequest::Command { command } => self
+                    .sessions
+                    .owned_command("module.evolution", command.clone())
+                    .map_err(|e| e.to_string()),
+                _ => Err("unexpected request".into()),
+            }
+        }
+    }
+    let root = temp_dir("hosted-candidate");
+    let data = SinomoDataDir::new(root.join("data"));
+    let host = Host {
+        sessions: AgentSessionHost::new(Arc::new(FileAgentSessionStore::for_data_dir(&data))),
+    };
+    let workspace = candidate_workspace(&root);
+    let packet = bridge_permission_test_packet(&workspace);
+    let mut model = EvolutionAgentMutationModel {
+        provider: "fake".into(),
+        model: "fake".into(),
+        max_steps: Some(2),
+        sessions: Some(&host),
+    };
+    let result = model.mutate(&packet, &workspace, None).unwrap();
+    assert_eq!(result.raw_output, "host completed candidate");
+    assert!(result.agent_run.is_some());
+    assert_eq!(
+        host.sessions.owned_roots("module.evolution").unwrap().len(),
+        1
+    );
+    host.sessions
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    model.sessions = None;
+    assert!(
+        model
+            .mutate(&packet, &workspace, None)
+            .unwrap_err()
+            .to_string()
+            .contains("host session service is required")
+    );
+}

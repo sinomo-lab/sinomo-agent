@@ -23,8 +23,9 @@ use std::collections::BTreeSet;
 pub struct AgentSession {
     pub session_id: SessionId,
     pub role: AgentRole,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagent: Option<super::AgentSubagentSnapshot>,
+    // Read existing persisted child history while writing only the common field.
+    #[serde(default, alias = "subagent", skip_serializing_if = "Option::is_none")]
+    pub managed: Option<super::ManagedSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<sinomo_runtime::module_api::sessions::SessionRelationship>,
     /// Monotonic logical revision of private/model execution state. This lets
@@ -69,7 +70,7 @@ impl AgentSession {
         Self {
             session_id,
             role,
-            subagent: None,
+            managed: None,
             relationship: None,
             state_revision: 0,
             agent_definition_key: None,

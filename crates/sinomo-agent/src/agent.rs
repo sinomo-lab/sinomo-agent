@@ -4,10 +4,10 @@ mod coding;
 mod compaction;
 mod context;
 mod control;
+mod managed_sessions;
 mod model;
 mod session;
 mod session_tools;
-mod subagents;
 mod tool_execution;
 mod tool_output;
 mod trace;
@@ -17,10 +17,10 @@ pub use coding::*;
 pub use compaction::*;
 pub use context::*;
 pub use control::*;
+pub use managed_sessions::*;
 pub use model::*;
 pub use session::*;
 pub use session_tools::*;
-pub use subagents::*;
 pub use tool_execution::*;
 use tool_output::*;
 pub use trace::*;
@@ -987,7 +987,7 @@ pub struct Agent<M> {
     session_store: Arc<dyn AgentSessionStore>,
     trace_store_configured: bool,
     session_store_configured: bool,
-    subagents: OnceLock<Arc<AgentSubagents>>,
+    session_host: OnceLock<Arc<AgentSessionHost>>,
     session_tools: Option<Arc<dyn AgentSessionToolProvider>>,
     /// Active session turns whose items are journaled to the session store as
     /// they are produced, keyed by the interaction session the turn traces
@@ -1024,7 +1024,7 @@ impl<M: InteractionModel> Agent<M> {
             session_store: Arc::new(NoopAgentSessionStore),
             trace_store_configured: false,
             session_store_configured: false,
-            subagents: OnceLock::new(),
+            session_host: OnceLock::new(),
             session_tools: None,
             item_journals: Mutex::new(BTreeMap::new()),
         }

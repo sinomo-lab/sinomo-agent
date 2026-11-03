@@ -350,9 +350,9 @@ fn setup(behavior: Behavior) -> Harness {
     )
 }
 
-fn spawn(h: &Harness) -> AgentSubagentSnapshot {
+fn spawn(h: &Harness) -> ManagedSessionSnapshot {
     h.runtime
-        .subagents()
+        .sessions()
         .spawn(
             &h.input.session.session_id,
             "worker",
@@ -362,10 +362,10 @@ fn spawn(h: &Harness) -> AgentSubagentSnapshot {
         .unwrap()
 }
 
-fn wait(h: &Harness, id: &TaskId) -> AgentSubagentSnapshot {
+fn wait(h: &Harness, id: &TaskId) -> ManagedSessionSnapshot {
     let result = h
         .runtime
-        .subagents()
+        .sessions()
         .wait(
             &h.input.session.session_id,
             id,
@@ -375,7 +375,7 @@ fn wait(h: &Harness, id: &TaskId) -> AgentSubagentSnapshot {
         .unwrap();
     assert_ne!(
         result.status,
-        AgentSubagentStatus::Running,
+        ManagedSessionStatus::Running,
         "child did not finish"
     );
     result
@@ -392,7 +392,7 @@ fn model_spawns_parallel_children_through_the_registered_tool() {
     let first = h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     let second = h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_ne!(first, second);
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     let children = manager.list(&h.input.session.session_id);
     assert_eq!(children.len(), 2);
     let parent = h.runtime.session_snapshot().unwrap();
@@ -410,7 +410,7 @@ fn model_spawns_parallel_children_through_the_registered_tool() {
     h.release.store(true, Ordering::SeqCst);
     for child in &children {
         let result = wait(&h, &child.id);
-        assert_eq!(result.status, AgentSubagentStatus::Completed);
+        assert_eq!(result.status, ManagedSessionStatus::Completed);
         assert_eq!(result.result.as_deref(), Some("child answer"));
     }
     let usage = h
@@ -556,7 +556,7 @@ fn child_resources_survive_parent_registry_reconfiguration() {
         "idle reusable child keeps inherited resources"
     );
     h.runtime
-        .subagents()
+        .sessions()
         .dispose(&h.input.session.session_id, &child.id)
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -571,7 +571,7 @@ fn child_handles_are_owned_and_disposable() {
     let h = setup(Behavior::Block);
     let child = spawn(&h);
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     let foreign = SessionId::generate();
     assert!(manager.inspect(&foreign, &child.id).is_err());
     assert!(manager.cancel(&foreign, &child.id).is_err());
@@ -584,7 +584,7 @@ fn child_handles_are_owned_and_disposable() {
             &AgentCancellationToken::new(),
         )
         .unwrap();
-    assert_eq!(quick.status, AgentSubagentStatus::Running);
+    assert_eq!(quick.status, ManagedSessionStatus::Running);
     manager
         .dispose(&h.input.session.session_id, &child.id)
         .unwrap();
@@ -602,7 +602,7 @@ fn child_handles_are_owned_and_disposable() {
 fn cancellation_is_one_way_and_does_not_cancel_siblings() {
     let h = setup(Behavior::Block);
     let parent_token = AgentCancellationToken::new();
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     let first = manager
         .spawn(&h.input.session.session_id, "one", "task", &parent_token)
         .unwrap();
@@ -614,17 +614,17 @@ fn cancellation_is_one_way_and_does_not_cancel_siblings() {
     manager
         .cancel(&h.input.session.session_id, &first.id)
         .unwrap();
-    assert_eq!(wait(&h, &first.id).status, AgentSubagentStatus::Cancelled);
+    assert_eq!(wait(&h, &first.id).status, ManagedSessionStatus::Cancelled);
     assert!(!parent_token.is_cancelled());
     assert_eq!(
         manager
             .inspect(&h.input.session.session_id, &second.id)
             .unwrap()
             .status,
-        AgentSubagentStatus::Running
+        ManagedSessionStatus::Running
     );
     parent_token.cancel();
-    assert_eq!(wait(&h, &second.id).status, AgentSubagentStatus::Cancelled);
+    assert_eq!(wait(&h, &second.id).status, ManagedSessionStatus::Cancelled);
 }
 
 #[test]
@@ -632,7 +632,7 @@ fn detaching_parent_retains_children_until_discard_or_expiry() {
     let h = setup(Behavior::Block);
     let child = spawn(&h);
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     let clone = h.runtime.clone();
     drop(h.runtime);
     assert_eq!(
@@ -640,7 +640,7 @@ fn detaching_parent_retains_children_until_discard_or_expiry() {
             .inspect(&h.input.session.session_id, &child.id)
             .unwrap()
             .status,
-        AgentSubagentStatus::Running
+        ManagedSessionStatus::Running
     );
     drop(clone);
     assert_eq!(manager.list(&h.input.session.session_id).len(), 1);
@@ -668,7 +668,7 @@ fn child_failure_and_panic_are_reported_without_failing_parent() {
         let h = setup(behavior);
         let child = spawn(&h);
         let result = wait(&h, &child.id);
-        assert_eq!(result.status, AgentSubagentStatus::Failed);
+        assert_eq!(result.status, ManagedSessionStatus::Failed);
         assert!(result.error.is_some());
         assert!(h.runtime.active_turn().unwrap().is_none());
     }
@@ -689,7 +689,7 @@ fn tool_rejects_permission_overrides_and_bounds_utf8_results() {
     assert_eq!(rejected.status, AgentToolStatus::Failed);
     assert!(
         h.runtime
-            .subagents()
+            .sessions()
             .list(&h.input.session.session_id)
             .is_empty()
     );
@@ -709,10 +709,10 @@ fn aborting_parent_cancels_children_between_turns() {
         .submit_op(AgentOp::abort("stop the task"))
         .unwrap();
     assert!(result.accepted);
-    assert_eq!(wait(&h, &child.id).status, AgentSubagentStatus::Cancelled);
+    assert_eq!(wait(&h, &child.id).status, ManagedSessionStatus::Cancelled);
     assert!(
         h.runtime
-            .subagents()
+            .sessions()
             .spawn(
                 &h.input.session.session_id,
                 "late",
@@ -731,11 +731,11 @@ fn children_can_spawn_descendants_with_inherited_parent_identity() {
     let leaf = h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(first, branch.session_id);
     assert_ne!(leaf, branch.session_id);
-    assert_eq!(wait(&h, &branch.id).status, AgentSubagentStatus::Completed);
+    assert_eq!(wait(&h, &branch.id).status, ManagedSessionStatus::Completed);
     h.release.store(true, Ordering::SeqCst);
     assert!(!h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
     h.runtime
-        .subagents()
+        .sessions()
         .dispose(&h.input.session.session_id, &branch.id)
         .unwrap();
     let requests = h.requests.lock().unwrap();
@@ -759,7 +759,7 @@ fn parent_turn_deadline_reaches_children_after_parent_answer() {
     );
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     let original = manager.list(&h.input.session.session_id);
     h.runtime
         .submit_op(AgentOp::start_turn(h.input.clone()).with_timeout_ms(100))
@@ -773,7 +773,7 @@ fn parent_turn_deadline_reaches_children_after_parent_answer() {
         .iter()
         .filter(|child| !original.iter().any(|old| old.id == child.id))
     {
-        assert_eq!(wait(&h, &child.id).status, AgentSubagentStatus::Cancelled);
+        assert_eq!(wait(&h, &child.id).status, ManagedSessionStatus::Cancelled);
     }
     for child in original {
         assert_eq!(
@@ -781,7 +781,7 @@ fn parent_turn_deadline_reaches_children_after_parent_answer() {
                 .inspect(&h.input.session.session_id, &child.id)
                 .unwrap()
                 .status,
-            AgentSubagentStatus::Running
+            ManagedSessionStatus::Running
         );
     }
 }
@@ -798,8 +798,8 @@ fn replacing_parent_session_isolates_old_children_and_rebinds_tool() {
     assert!(!h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
     assert!(
         h.runtime
-            .subagents()
-            .inspect(&old.parent_session_id, &old.id)
+            .sessions()
+            .inspect(old.parent_session_id.as_ref().unwrap(), &old.id)
             .is_err()
     );
     h.input.session.session_id = replacement.session_id;
@@ -811,7 +811,7 @@ fn replacing_parent_session_isolates_old_children_and_rebinds_tool() {
     let child = spawn(&h);
     h.started.recv_timeout(Duration::from_secs(2)).unwrap();
     h.release.store(true, Ordering::SeqCst);
-    assert_eq!(wait(&h, &child.id).status, AgentSubagentStatus::Completed);
+    assert_eq!(wait(&h, &child.id).status, ManagedSessionStatus::Completed);
 }
 
 #[test]
@@ -843,7 +843,7 @@ fn registered_tool_supports_inspect_wait_cancel_and_dispose() {
     assert!(h.finished.recv_timeout(Duration::from_secs(2)).unwrap());
     assert!(
         h.runtime
-            .subagents()
+            .sessions()
             .list(&h.input.session.session_id)
             .is_empty()
     );
@@ -868,7 +868,7 @@ fn interrupting_parent_cancels_children_from_previous_turns() {
             .unwrap()
             .accepted
     );
-    assert_eq!(wait(&h, &child.id).status, AgentSubagentStatus::Cancelled);
+    assert_eq!(wait(&h, &child.id).status, ManagedSessionStatus::Cancelled);
     h.runtime.join_active_turn().unwrap();
 }
 
@@ -879,7 +879,7 @@ fn message_reuses_the_child_session_and_notifies_parent_each_turn() {
     wait(&h, &child.id);
     let before = h
         .runtime
-        .subagents()
+        .sessions()
         .session_snapshot(&h.input.session.session_id, &child.id)
         .unwrap();
     assert!(!before.transcript.is_empty());
@@ -894,10 +894,10 @@ fn message_reuses_the_child_session_and_notifies_parent_each_turn() {
     );
     let after = wait(&h, &child.id);
     assert_eq!(after.session_id, child.session_id);
-    assert_eq!(after.status, AgentSubagentStatus::Completed);
+    assert_eq!(after.status, ManagedSessionStatus::Completed);
     let session = h
         .runtime
-        .subagents()
+        .sessions()
         .session_snapshot(&h.input.session.session_id, &child.id)
         .unwrap();
     assert!(session.transcript.items.len() > before.transcript.items.len());
@@ -924,34 +924,34 @@ fn message_reuses_the_child_session_and_notifies_parent_each_turn() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(updates.len(), 2);
-    assert!(updates.iter().all(|u| u.kind == "agent.subagent.completed"
+    assert!(updates.iter().all(|u| u.kind == "agent.managed.completed"
         && u.result_ref.as_deref() == Some(child.session_id.as_str())));
     h.runtime
-        .subagents()
+        .sessions()
         .dispose(&h.input.session.session_id, &child.id)
         .unwrap();
     assert!(
         h.runtime
-            .subagents()
+            .sessions()
             .list(&h.input.session.session_id)
             .is_empty()
     );
     assert_eq!(
         h.runtime
-            .subagents()
+            .sessions()
             .search(&h.input.session.session_id, true)
             .len(),
         1
     );
     assert!(
         h.runtime
-            .subagents()
+            .sessions()
             .message(&h.input.session.session_id, child.id.as_str(), "revive")
             .is_err()
     );
     assert!(
         !h.runtime
-            .subagents()
+            .sessions()
             .session_snapshot(&h.input.session.session_id, &child.id)
             .unwrap()
             .transcript
@@ -966,7 +966,7 @@ fn children_message_parent_and_siblings_but_cannot_cancel_siblings() {
     let second = spawn(&h);
     wait(&h, &first.id);
     wait(&h, &second.id);
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     manager
         .message(&first.session_id, "parent", "findings for parent")
         .unwrap();
@@ -985,7 +985,7 @@ fn children_message_parent_and_siblings_but_cannot_cancel_siblings() {
             "findings for sibling",
         )
         .unwrap();
-    assert_eq!(wait(&h, &second.id).status, AgentSubagentStatus::Completed);
+    assert_eq!(wait(&h, &second.id).status, ManagedSessionStatus::Completed);
     assert!(manager.cancel(&first.session_id, &second.id).is_err());
     assert!(
         manager
@@ -1013,11 +1013,11 @@ fn idle_expiry_archives_without_a_list_or_inspect_call() {
         ),
     );
     assert_eq!(result.status, AgentToolStatus::Succeeded);
-    let child: AgentSubagentSnapshot =
+    let child: ManagedSessionSnapshot =
         serde_json::from_value(result.output["subagent"].clone()).unwrap();
     wait(&h, &child.id);
     std::thread::sleep(Duration::from_millis(1300));
-    let manager = h.runtime.subagents();
+    let manager = h.runtime.sessions();
     assert!(
         manager
             .inspect(&h.input.session.session_id, &child.id)
@@ -1086,7 +1086,7 @@ fn child_runtime_continues_after_its_detached_tool_finishes() {
     );
     wait(&h, &child.id);
     h.runtime
-        .subagents()
+        .sessions()
         .dispose(&h.input.session.session_id, &child.id)
         .unwrap();
 }
@@ -1102,7 +1102,7 @@ fn module_capability_denial_blocks_subagent_tool_execution() {
     );
     assert!(
         h.runtime
-            .subagents()
+            .sessions()
             .list(&h.input.session.session_id)
             .is_empty()
     );

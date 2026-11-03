@@ -30,16 +30,17 @@ use sinomo_agent::{
     InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
     user_interaction_input_event,
 };
+#[cfg(test)]
+use sinomo_lm::LanguageModelResponse;
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
     CODEX_PROVIDER_ID, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig, CodexCliProvider,
     GeminiConfig, GeminiProvider, GitHubCopilotCliConfig, GitHubCopilotCliProvider,
     GitHubCopilotConfig, GitHubCopilotProvider, LanguageModelError, LanguageModelInvocation,
     LanguageModelMessage, LanguageModelProvider, LanguageModelProviderInfo, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig,
-    NvidiaProvider, OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL, codex_provider_for_model,
-    complete_configured_model_request, model_or_default, normalize_model_id_for_provider,
-    normalize_model_provider,
+    LanguageModelResponseFormat, LanguageModelRole, NvidiaConfig, NvidiaProvider, OpenAiConfig,
+    OpenAiProvider, PROVIDER_DEFAULT_MODEL, codex_provider_for_model, model_or_default,
+    normalize_model_id_for_provider, normalize_model_provider,
 };
 use sinomo_runtime::core::{
     EvaluationGate, EvaluationMetric, EvaluationOutcome, EvaluationScorecard, MetricValue,
@@ -4553,31 +4554,76 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct EvolutionAgentMutationModel {
+#[derive(Clone)]
+pub struct EvolutionAgentMutationModel<'a> {
     pub provider: String,
     pub model: String,
-    pub data_dir: SinomoDataDir,
     pub max_steps: Option<usize>,
+    pub sessions: crate::SessionServices<'a>,
 }
 
-impl MutationModel for EvolutionAgentMutationModel {
+impl MutationModel for EvolutionAgentMutationModel<'_> {
     fn mutate(
         &self,
         packet: &MutationPacket,
         workspace: &CandidateWorkspace,
         bundle: Option<&CandidateBundleManifest>,
     ) -> Result<ModelMutationResult, MutationModelError> {
-        let model = ConfiguredEvolutionAgentModel {
-            data_dir: self.data_dir.clone(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            working_dir: workspace.path.clone(),
+        use sinomo_module_api::sessions::*;
+        let sessions = self.sessions.ok_or_else(|| MutationModelError::Agent {
+            detail: "host session service is required for candidate execution".into(),
+        })?;
+        let call = |request| {
+            sessions
+                .request(&request)
+                .map_err(|detail| MutationModelError::Agent { detail })
         };
-        AgentMutationWorker::new(model, self.provider.clone(), self.model.clone())
-            .with_local_permission_data_dir(self.data_dir.clone())
-            .with_max_steps(self.max_steps)
-            .mutate(packet, workspace, bundle)
+        let started = call(SessionRequest::Start {
+            worker: SessionWorkerRequest {
+                agent_id: crate::EVOLUTION_IMPLEMENTER_AGENT_ID.into(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                workspace: workspace.path.to_string_lossy().into_owned(),
+                instructions: render_agent_mutation_prompt(packet, workspace),
+                context: vec![
+                    serde_json::to_value(evolution_agent_context_attachment(packet, bundle))
+                        .map_err(|e| MutationModelError::Serialization {
+                            detail: e.to_string(),
+                        })?,
+                ],
+                max_steps: self.max_steps,
+            },
+        })?;
+        let id = started["session_id"]
+            .as_str()
+            .ok_or_else(|| MutationModelError::Agent {
+                detail: "host omitted session identity".into(),
+            })?
+            .to_string();
+        loop {
+            let state = call(SessionRequest::Command {
+                command: SessionCommand::Wait {
+                    id: id.clone(),
+                    timeout_ms: 100,
+                },
+            })?;
+            if state["subagent"]["status"] != "running" {
+                break;
+            }
+        }
+        let result = call(SessionRequest::Command {
+            command: SessionCommand::Result { id },
+        })?;
+        let outcome: Option<sinomo_agent::AgentOpOutcome> = serde_json::from_value(result)
+            .map_err(|e| MutationModelError::Serialization {
+                detail: e.to_string(),
+            })?;
+        let run = outcome
+            .and_then(|o| o.run)
+            .ok_or_else(|| MutationModelError::Agent {
+                detail: "host session finished without a run".into(),
+            })?;
+        agent_mutation_result(packet, &self.provider, &self.model, run)
     }
 }
 
@@ -4749,114 +4795,100 @@ where
             .ok_or_else(|| MutationModelError::Agent {
                 detail: format!("agent runtime turn `{op_id}` completed without a run"),
             })?;
-        let final_text = run.final_decision.text.clone();
-        let (input_tokens, output_tokens) = agent_model_usage_totals(&run.model_events);
-        let agent_summary = AgentMutationSummary {
-            stop_reason: agent_stop_reason_label(&run.stop_reason),
-            model_turns: run.model_turns.len(),
-            tool_results: run.tool_results.len(),
-            input_tokens,
-            output_tokens,
-            model_metrics: Some(serde_json::to_value(&run.model_metrics).map_err(|source| {
-                MutationModelError::Serialization {
-                    detail: source.to_string(),
-                }
-            })?),
-            tool_pair_integrity: Some(run.tool_pair_integrity()),
-            final_text: final_text.clone(),
-        };
-        let agent_resource_usage = agent_resource_usage_summary(
-            packet.job_id.clone(),
-            input_tokens,
-            output_tokens,
-            run.model_turns.len(),
-            run.tool_results.len(),
-        );
-        let agent_run =
-            serde_json::to_value(&run).map_err(|source| MutationModelError::Serialization {
+        agent_mutation_result(packet, &self.provider, &self.model, run)
+    }
+}
+
+fn agent_mutation_result(
+    packet: &MutationPacket,
+    provider: &str,
+    model: &str,
+    run: sinomo_agent::AgentRun,
+) -> Result<ModelMutationResult, MutationModelError> {
+    let final_text = run.final_decision.text.clone();
+    let (input_tokens, output_tokens) = agent_model_usage_totals(&run.model_events);
+    let agent_summary = AgentMutationSummary {
+        stop_reason: agent_stop_reason_label(&run.stop_reason),
+        model_turns: run.model_turns.len(),
+        tool_results: run.tool_results.len(),
+        input_tokens,
+        output_tokens,
+        model_metrics: Some(serde_json::to_value(&run.model_metrics).map_err(|source| {
+            MutationModelError::Serialization {
                 detail: source.to_string(),
-            })?;
-        let agent_events = run
-            .events
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| MutationModelError::Serialization {
-                detail: source.to_string(),
-            })?;
-        let coding_run_state = run
-            .coding_state
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|source| MutationModelError::Serialization {
-                detail: source.to_string(),
-            })?;
-        let patch_snapshots = run
-            .items
-            .iter()
-            .filter(|item| matches!(item, AgentItem::PatchSnapshot { .. }))
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| MutationModelError::Serialization {
-                detail: source.to_string(),
-            })?;
-        let validation_records = run
-            .coding_state
-            .as_ref()
-            .map(|state| {
-                state
-                    .validation_attempts
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .map_err(|source| MutationModelError::Serialization {
-                detail: source.to_string(),
-            })?
-            .unwrap_or_default();
-        Ok(ModelMutationResult {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-            raw_output: final_text.clone(),
-            parsed_patch: None,
-            summary: non_empty_string(final_text),
-            structured_output: None,
-            tool_results: Vec::new(),
-            model_turns: Vec::new(),
-            agent_summary: Some(agent_summary),
-            agent_resource_usage: Some(agent_resource_usage),
-            agent_run: Some(agent_run),
-            agent_events,
-            coding_run_state,
-            patch_snapshots,
-            validation_records,
+            }
+        })?),
+        tool_pair_integrity: Some(run.tool_pair_integrity()),
+        final_text: final_text.clone(),
+    };
+    let agent_resource_usage = agent_resource_usage_summary(
+        packet.job_id.clone(),
+        input_tokens,
+        output_tokens,
+        run.model_turns.len(),
+        run.tool_results.len(),
+    );
+    let agent_run =
+        serde_json::to_value(&run).map_err(|source| MutationModelError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let agent_events = run
+        .events
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| MutationModelError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let coding_run_state = run
+        .coding_state
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|source| MutationModelError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let patch_snapshots = run
+        .items
+        .iter()
+        .filter(|item| matches!(item, AgentItem::PatchSnapshot { .. }))
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| MutationModelError::Serialization {
+            detail: source.to_string(),
+        })?;
+    let validation_records = run
+        .coding_state
+        .as_ref()
+        .map(|state| {
+            state
+                .validation_attempts
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
         })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ConfiguredEvolutionAgentModel {
-    data_dir: SinomoDataDir,
-    provider: String,
-    model: String,
-    working_dir: PathBuf,
-}
-
-impl InteractionModel for ConfiguredEvolutionAgentModel {
-    fn complete(
-        &self,
-        request: &LanguageModelRequest,
-    ) -> Result<LanguageModelResponse, LanguageModelError> {
-        complete_configured_model_request(
-            &self.data_dir,
-            &self.provider,
-            &self.model,
-            Some(self.working_dir.clone()),
-            request,
-        )
-    }
+        .transpose()
+        .map_err(|source| MutationModelError::Serialization {
+            detail: source.to_string(),
+        })?
+        .unwrap_or_default();
+    Ok(ModelMutationResult {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        raw_output: final_text.clone(),
+        parsed_patch: None,
+        summary: non_empty_string(final_text),
+        structured_output: None,
+        tool_results: Vec::new(),
+        model_turns: Vec::new(),
+        agent_summary: Some(agent_summary),
+        agent_resource_usage: Some(agent_resource_usage),
+        agent_run: Some(agent_run),
+        agent_events,
+        coding_run_state,
+        patch_snapshots,
+        validation_records,
+    })
 }
 
 fn agent_storage_root(

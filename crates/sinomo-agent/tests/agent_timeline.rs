@@ -338,15 +338,15 @@ fn native_timeline_reads_channel_sessions_and_optional_related_sessions() {
         "{}",
         result.summary
     );
-    let child: AgentSubagentSnapshot =
+    let child: ManagedSessionSnapshot =
         serde_json::from_value(result.output["subagent"].clone()).unwrap();
     assert_eq!(
         runtime
-            .subagents()
+            .sessions()
             .wait(&parent_id, &child.id, 5000, &AgentCancellationToken::new())
             .unwrap()
             .status,
-        AgentSubagentStatus::Completed
+        ManagedSessionStatus::Completed
     );
     assert_eq!(
         sessions
@@ -392,7 +392,7 @@ fn native_timeline_reads_channel_sessions_and_optional_related_sessions() {
             .unwrap_or("")
             .contains("Reviewer"))
     );
-    runtime.subagents().dispose(&parent_id, &child.id).unwrap();
+    runtime.sessions().dispose(&parent_id, &child.id).unwrap();
     let registrations = active_native_dylib_module_registrations(root.path()).unwrap();
     let mut catalog = ComponentCatalog::builder();
     for registration in registrations {

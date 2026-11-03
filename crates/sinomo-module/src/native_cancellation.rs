@@ -16,6 +16,10 @@ impl NativeModuleOperationCancellationToken {
         Self::default()
     }
 
+    pub fn signal(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
