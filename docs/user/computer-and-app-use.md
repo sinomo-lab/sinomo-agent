@@ -32,8 +32,11 @@ Build and activate the OS provider with the ordinary native-module lifecycle:
 
 ```powershell
 cargo build -p sinomo-app-use-module
-sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v1 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
+sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v2 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
 ```
+
+Upgrade the app/daemon and provider together; their capture interface versions
+must match.
 
 On Linux the artifact is `target/debug/libsinomo_app_use_module.so`. The daemon
 needs access to the user's desktop session. X11 uses `DISPLAY` and `XAUTHORITY`;

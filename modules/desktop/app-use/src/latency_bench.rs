@@ -19,6 +19,7 @@ fn measure_native_frame_transfer_stages() {
         let swizzle_us = started.elapsed().as_micros();
         let len = pixels.len();
         let sample = NativeVideoSample {
+            native_dimensions: None,
             sequence: 1,
             format: NativeVideoSampleFormat::Bgra8,
             width,

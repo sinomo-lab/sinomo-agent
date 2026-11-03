@@ -2045,17 +2045,6 @@ impl LocalShardedMetadataBackend {
         Self::open_with(root, shards, true, Some(local_node_id), true)
     }
 
-    /// Defer initial table decoding for a caller which routes namespace
-    /// authority through its actual Main. The slot modes and first-use native
-    /// opens are identical to `new_with_replica_repair`.
-    pub(crate) fn new_with_replica_repair_deferred(
-        root: impl Into<PathBuf>,
-        shards: Vec<DfsMetadataShardConfig>,
-        local_node_id: &NodeId,
-    ) -> Result<Self> {
-        Self::open_with(root.into(), shards, true, Some(local_node_id), false)
-    }
-
     pub(crate) fn new_with_replica_repair_and_layout(
         root: PathBuf,
         shards: Vec<DfsMetadataShardConfig>,
@@ -2097,19 +2086,9 @@ impl LocalShardedMetadataBackend {
         Self::open_with(root, shards, false, Some(local_node_id), true)
     }
 
-    /// Keep the ordinary inspection modes and complete lookup semantics, but
-    /// decode each shard only when a caller actually queries it. This grants
-    /// no native writer or publication authority.
-    pub fn open_for_inspection_at_node_deferred(
-        root: impl Into<PathBuf>,
-        shards: Vec<DfsMetadataShardConfig>,
-        local_node_id: &NodeId,
-    ) -> Result<Self> {
-        Self::open_with(root.into(), shards, false, Some(local_node_id), false)
-    }
-
     /// Inspect the exact owner-selected original layout without initializing or
     /// repairing it. The existing layout and per-shard checks still fence reads.
+    #[cfg(test)]
     pub(crate) fn open_for_inspection_at_node_with_layout(
         root: PathBuf,
         shards: Vec<DfsMetadataShardConfig>,
@@ -3247,62 +3226,6 @@ mod lazy_replica_slot_tests {
         )
         .expect("open inspection sharded backend");
         assert_eq!(inspection.opened_shard_ids(), expected);
-    }
-
-    #[test]
-    fn deferred_client_routers_preserve_modes_and_open_only_on_query() {
-        let root = sinomo_testdir::TestDir::new("dfs-deferred-client-shard-slots");
-        let metadata_root = root.path().join("metadata");
-        let local = node("deferred-client-local");
-        let configs = configs(&local);
-        let prepared = LocalShardedMetadataBackend::new(&metadata_root, configs.clone())
-            .expect("ordinary strict initialization");
-        let expected = prepared.list_file_systems().unwrap();
-        drop(prepared);
-
-        let deferred = LocalShardedMetadataBackend::new_with_replica_repair_deferred(
-            &metadata_root,
-            configs.clone(),
-            &local,
-        )
-        .unwrap();
-        assert!(deferred.opened_shard_ids().is_empty());
-        for slot in deferred.shards.values() {
-            assert_eq!(
-                slot.open_mode,
-                if slot.config.primary_node_id == local {
-                    LocalMetadataShardOpenMode::Strict
-                } else {
-                    LocalMetadataShardOpenMode::ReplicaRepair
-                }
-            );
-        }
-        assert_eq!(deferred.list_file_systems().unwrap(), expected);
-        assert_eq!(
-            deferred.opened_shard_ids().len(),
-            configs.len(),
-            "an explicit complete catalogue query still opens all shards"
-        );
-        drop(deferred);
-
-        let inspected = LocalShardedMetadataBackend::open_for_inspection_at_node_deferred(
-            &metadata_root,
-            configs.clone(),
-            &local,
-        )
-        .unwrap();
-        assert!(inspected.opened_shard_ids().is_empty());
-        assert!(
-            inspected
-                .shards
-                .values()
-                .all(|slot| slot.open_mode == LocalMetadataShardOpenMode::Inspection)
-        );
-        let first = DfsMetadataShardId::new(configs[0].shard_id.clone());
-        inspected
-            .get_file_system_on_shard(&first, &configs[0].file_system_id)
-            .unwrap();
-        assert_eq!(inspected.opened_shard_ids(), BTreeSet::from([first]));
     }
 
     #[test]

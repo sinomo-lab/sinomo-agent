@@ -111,9 +111,10 @@ fn embedded_runtime_journal_and_snapshot_roundtrip_survive_receiver_reopen() {
     let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
     let mut file_system = runtime.file_system();
     file_system.display_name = "embedded journal roundtrip".to_string();
-    let mut primary_client = runtime.client(&primary).unwrap();
-    // This normal service method performs the accepted primary config commit
-    // and ensures the filesystem in the SAME client's durable metadata backend.
+    // Filesystem publication belongs to the store-backed owning service. This
+    // normal service method performs the accepted primary config commit and
+    // ensures the filesystem in the primary's durable metadata backend.
+    let mut primary_client = runtime.metadata_primary_service("/").unwrap();
     primary_client.add_file_system(file_system.clone()).unwrap();
 
     // Export the actual native Root cut, not a mounted requester's private image.

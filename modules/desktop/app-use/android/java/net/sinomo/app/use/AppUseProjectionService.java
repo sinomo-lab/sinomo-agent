@@ -7,11 +7,8 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
-import android.media.Image;
-import android.media.ImageReader;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
@@ -21,32 +18,35 @@ import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
-import java.nio.ByteBuffer;
 
-/** MediaProjection pushes frames into one bounded slot; Rust selects cadence. */
+/** MediaProjection owns one GPU texture; each consumer negotiates its output. */
 public final class AppUseProjectionService extends Service {
     static final Object LOCK = new Object();
     static AppUseProjectionService current;
-    static Frame latest;
     static String target;
     static int width, height, rotation, clients, inputClients;
-    static boolean frameRequested;
     private MediaProjection projection;
     private VirtualDisplay display;
-    private ImageReader reader;
+    private AppUseGpuCapture gpu;
+    private static volatile java.util.function.Function<String,Object> encoderFactory;
+    public static void installEncoderFactory(java.util.function.Function<String,Object> factory) { encoderFactory=factory; }
+    static boolean hasEncoder() { return encoderFactory!=null; }
     private HandlerThread thread;
     private Handler handler;
-    private long sequence, started;
+
     private boolean closing;
 
     static final class Frame {
         final byte[] bytes;
-        final int width, height;
-        final long sequence, timestamp, capturedAt;
-        Frame(byte[] bytes, int width, int height, long sequence, long timestamp, long capturedAt) {
+        final int width, height, nativeWidth, nativeHeight;
+        final String format;
+        final long sequence, timestamp, capturedAt, copyUs, publishedAtNs;
+        Frame(byte[] bytes, int width, int height, int nativeWidth, int nativeHeight, String format, long sequence, long timestamp, long capturedAt, long copyUs) {
+            this.nativeWidth=nativeWidth;this.nativeHeight=nativeHeight;this.format=format;
             this.bytes = bytes; this.width = width; this.height = height;
             this.sequence = sequence; this.timestamp = timestamp;
             this.capturedAt = capturedAt;
+            this.copyUs = copyUs; this.publishedAtNs = SystemClock.elapsedRealtimeNanos();
         }
     }
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -69,7 +69,6 @@ public final class AppUseProjectionService extends Service {
             thread = new HandlerThread("app-use-projection"); thread.start(); handler = new Handler(thread.getLooper());
             projection = getSystemService(MediaProjectionManager.class).getMediaProjection(
                     intent.getIntExtra("result", 0), intent.getParcelableExtra("consent"));
-            started = SystemClock.elapsedRealtimeNanos();
             projection.registerCallback(new MediaProjection.Callback() {
                 @Override public void onStop() { stopSelf(); }
                 @Override public void onCapturedContentResize(int w, int h) {
@@ -78,7 +77,7 @@ public final class AppUseProjectionService extends Service {
                             android.util.Log.i("SinomoAppUse", "Shared content geometry changed from " + width + "x" + height + " to " + w + "x" + h);
                             // Rotation/app-only selection invalidates coordinates. Do
                             // not keep input alive against a stale raw display grant.
-                            target = null; latest = null; stopSelf();
+                            target = null; LOCK.notifyAll(); stopSelf();
                         }
                     }
                 }
@@ -87,63 +86,44 @@ public final class AppUseProjectionService extends Service {
             getSystemService(WindowManager.class).getDefaultDisplay().getRealMetrics(metrics);
             if (metrics.widthPixels <= 0 || metrics.heightPixels <= 0 || (long) metrics.widthPixels * metrics.heightPixels * 4 > 128 * 1024 * 1024) throw new IllegalArgumentException("display is too large");
             synchronized (LOCK) {
-                width = metrics.widthPixels; height = metrics.heightPixels; clients = 0; inputClients = 0; latest = null; frameRequested = false;
+                width = metrics.widthPixels; height = metrics.heightPixels; clients = 0; inputClients = 0;
                 rotation = getSystemService(WindowManager.class).getDefaultDisplay().getRotation();
                 target = "android:display:0:" + java.util.UUID.randomUUID() + ":" + width + "x" + height;
                 current = this;
             }
-            reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-            reader.setOnImageAvailableListener(source -> receive(source), handler);
+            gpu = invoke(() -> new AppUseGpuCapture(width,height,handler,() -> {
+                synchronized(LOCK) { LOCK.notifyAll(); }
+            }));
             display = projection.createVirtualDisplay("Sinomo App Use", width, height, metrics.densityDpi,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, handler);
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, gpu.surface, null, handler);
             // Consent cannot leave an unattended projection running indefinitely.
             handler.postDelayed(() -> { synchronized (LOCK) { if (clients == 0 && inputClients == 0) stopSelf(); } }, 30_000);
-        } catch (RuntimeException error) {
+        } catch (Exception error) {
             android.util.Log.e("SinomoAppUse", "Unable to start screen sharing", error);
             stopSelf();
         }
         return START_NOT_STICKY;
     }
-    private void receive(ImageReader source) {
-        // Timestamp acquisition before row copies and native/codec transfer.
-        long capturedAt = System.currentTimeMillis();
-        long captureTimestamp = SystemClock.elapsedRealtimeNanos() - started;
-        try (Image image = source.acquireLatestImage()) {
-            if (image == null) return;
-            synchronized (LOCK) {
-                if (closing || clients == 0 || target == null || !frameRequested) return;
-                // Drain OS frames continuously but copy only on consumer demand.
-                // Multiple requests coalesce instead of creating a frame queue.
-                frameRequested = false;
-            }
-            int w = image.getWidth(), h = image.getHeight();
-            Image.Plane plane = image.getPlanes()[0];
-            ByteBuffer buffer = plane.getBuffer();
-            int row = plane.getRowStride(), pixel = plane.getPixelStride();
-            if (pixel < 4 || w <= 0 || h <= 0 || (long) w * h * 4 > 128 * 1024 * 1024
-                    || (long) (h - 1) * row + (long) (w - 1) * pixel + 4 > buffer.limit()) return;
-            byte[] bytes = new byte[w * h * 4];
-            for (int y = 0; y < h; y++) {
-                if (pixel == 4) { buffer.position(y * row); buffer.get(bytes, y * w * 4, w * 4); }
-                else for (int x = 0; x < w; x++) {
-                    int src = y * row + x * pixel, dst = (y * w + x) * 4;
-                    for (int channel = 0; channel < 4; channel++) bytes[dst + channel] = buffer.get(src + channel);
-                }
-            }
-            synchronized (LOCK) {
-                if (!closing && clients > 0 && target != null && width == w && height == h)
-                    latest = new Frame(bytes, w, h, ++sequence, captureTimestamp, capturedAt);
-            }
-        } catch (RuntimeException error) {
-            android.util.Log.e("SinomoAppUse", "Native frame delivery failed", error);
-            stopSelf();
-        }
+    private <T> T invoke(java.util.concurrent.Callable<T> operation) throws Exception {
+        java.util.concurrent.FutureTask<T> task=new java.util.concurrent.FutureTask<>(operation);
+        if(!handler.post(task))throw new IllegalStateException("projection thread stopped");
+        // The socket timeout bounds the native caller. Let this operation finish
+        // so serve() retains ownership of any newly allocated client and closes
+        // it when the disconnected socket is observed; abandoning the Future
+        // here could orphan a codec Surface on a slow driver initialization.
+        return task.get();
+    }
+    AppUseGpuCapture.Client openCapture(org.json.JSONObject request) throws Exception {
+        return invoke(() -> {if(closing||gpu==null)throw new IllegalStateException("projection closed");return gpu.open(request,encoderFactory);});
+    }
+    Frame frame(AppUseGpuCapture.Client client,long after) throws Exception { return invoke(() -> client.frame(after)); }
+    void closeCapture(AppUseGpuCapture.Client client) {
+        if(client!=null&&handler!=null)handler.post(client::close);
     }
     static void releaseCapture(AppUseProjectionService owner) {
         synchronized (LOCK) {
             if (owner != current) return;
             clients = Math.max(0, clients - 1);
-            if (clients == 0) latest = null;
             if (clients == 0 && inputClients == 0 && current != null) current.stopSelf();
         }
     }
@@ -155,10 +135,9 @@ public final class AppUseProjectionService extends Service {
         }
     }
     @Override public void onDestroy() {
-        synchronized (LOCK) { closing = true; if (current == this) { current = null; target = null; latest = null; clients = 0; inputClients = 0; } }
-        if (reader != null) reader.setOnImageAvailableListener(null, null);
+        synchronized (LOCK) { closing = true; if (current == this) { current = null; target = null; clients = 0; inputClients = 0; LOCK.notifyAll(); } }
         if (display != null) display.release();
-        if (reader != null) reader.close();
+        if (gpu != null) { try { invoke(() -> { gpu.close();return null; }); } catch(Exception error) { android.util.Log.w("SinomoAppUse","GPU shutdown failed",error); } }
         if (projection != null) projection.stop();
         if (thread != null) {
             thread.quitSafely();

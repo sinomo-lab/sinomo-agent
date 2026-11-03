@@ -86,6 +86,25 @@ fn warm_genesis_foreground_releases_actual_routine_checkout_before_admission() {
     writer
         .posix_sync_file(PATH, crate::DfsPosixSyncKind::File)
         .unwrap();
+    // The base write commits at W=2 and Main promptly repairs its third
+    // replica. Finish that committed work, and the maintenance turn carrying
+    // it, before capturing the warm owner or installing any test-owned gate.
+    let settle_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let budget = settle_deadline.saturating_duration_since(Instant::now());
+        assert!(!budget.is_zero(), "setup maintenance did not settle");
+        let tick = native.maintenance_tick(&primary, budget).unwrap();
+        let settled = matches!(
+            tick.outcome,
+            Ok(crate::DfsMaintenanceTickOutcome::Completed {
+                reached_limit: false
+            })
+        ) && matches!(&tick.queue_after,
+            Ok(crate::DfsRepairQueueBoundedStatus::Hydrated(view)) if view.record_count == 0);
+        if settled {
+            break;
+        }
+    }
     let data = native.data_dir(&primary).clone();
     let scheduler = daemon_dfs_mutation_scheduler(&data).unwrap();
     let slot = daemon_dfs_message_service_cache()
@@ -254,11 +273,25 @@ fn warm_genesis_foreground_releases_actual_routine_checkout_before_admission() {
         .node_resources()
         .unwrap()
         .latest();
+    // Whichever ordinary pass recovers the hidden prepare reaches the held
+    // ACK carrier. A Routine pass may first finish a turn an automatic pass
+    // checkpointed past namespace recovery, so keep running normal Routine
+    // passes until the wait for the real recovery carrier ends.
+    let cut_wait_ended = Arc::new(AtomicBool::new(false));
+    let maintenance_cut_wait_ended = Arc::clone(&cut_wait_ended);
     armed.store(true, Ordering::Release);
     let maintenance = std::thread::spawn(move || {
-        runtime.block_on(
+        loop {
+            let outcome = runtime.block_on(
         crate::runtime_host::maintenance_runtime::run_daemon_dfs_maintenance_tick_kind_on_runtime(
-            &paths, &runtime, crate::runtime_host::maintenance_runtime::DaemonDfsMaintenanceKind::Routine, resources))
+            &paths, &runtime, crate::runtime_host::maintenance_runtime::DaemonDfsMaintenanceKind::Routine, resources));
+            if maintenance_cut_wait_ended.load(Ordering::Acquire)
+                || outcome.is_err()
+                || Instant::now() >= deadline
+            {
+                break outcome;
+            }
+        }
     });
     // Observe the live physical checkout before doing a full trace export:
     // the existing direct authority RPC has its own shorter bounded deadline.
@@ -296,6 +329,7 @@ fn warm_genesis_foreground_releases_actual_routine_checkout_before_admission() {
         }
         std::thread::yield_now();
     };
+    cut_wait_ended.store(true, Ordering::Release);
     while retired_pause_selectors < 2 && Instant::now() < deadline {
         retired_pause_selectors += fault_cleanup.retire_consumed();
         if retired_pause_selectors < 2 {
@@ -484,7 +518,7 @@ fn warm_genesis_foreground_releases_actual_routine_checkout_before_admission() {
     let bytes = native
         .client(&requester)
         .unwrap()
-        .posix_read_file(PATH)
+        .posix_read_file_distributed(PATH)
         .unwrap();
     drop(owner);
     drop(trace);

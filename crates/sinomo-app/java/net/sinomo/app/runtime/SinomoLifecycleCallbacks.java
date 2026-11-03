@@ -48,6 +48,19 @@ public final class SinomoLifecycleCallbacks implements
         if (registered) {
             return;
         }
+        // The OS capture package only receives an opaque media-owned Surface sink.
+        try {
+            Class<?> bridge=activity.getClassLoader().loadClass("net.sinomo.app.use.AppUseProjectionService");
+            java.util.function.Function<String,Object> factory=config -> {
+                try {
+                    org.json.JSONObject value=new org.json.JSONObject(config);
+                    return new SinomoVideoEncoder(value.getInt("width"),value.getInt("height"),value.getInt("fps"),true);
+                } catch(Exception error) { throw new IllegalStateException(error); }
+            };
+            bridge.getMethod("installEncoderFactory",java.util.function.Function.class).invoke(null,factory);
+        } catch(Exception error) {
+            android.util.Log.w("SinomoMedia","Surface capture encoder unavailable",error);
+        }
         activity.getApplication().registerActivityLifecycleCallbacks(this);
         View decor = activity.getWindow().getDecorView();
         decor.setOnApplyWindowInsetsListener(this);

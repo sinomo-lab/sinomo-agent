@@ -121,8 +121,8 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
     drop(source);
     let mut service = runtime.client(&coordinator).unwrap();
     assert_eq!(
-        service
-            .metadata_backend()
+        runtime
+            .node_metadata(&coordinator)
             .unwrap()
             .get_object(&object.object_id)
             .unwrap(),
@@ -207,7 +207,11 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
         remaining_hits: 1,
         action: FaultAction::PauseBeforeDispatch(gate.clone()),
     });
-    let mut page = Box::pin(service.run_placement_reconciliation_bounded_async(1));
+    // Placement reconciliation is Main-side work on the coordinator's
+    // store-backed service; the delegating client keeps no store.
+    let mut worker = runtime.metadata_primary_service("/").unwrap();
+    assert_eq!(worker.node_id(), &coordinator);
+    let mut page = Box::pin(worker.run_placement_reconciliation_bounded_async(1));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {
@@ -256,24 +260,39 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
         .is_some_and(|next| next.job_id == job.job_id)
         && after_coalescing.state == DfsPlacementReconciliationState::Scanning
     {
-        let scanned = service
-            .run_placement_reconciliation_bounded_async(1)
-            .await
-            .unwrap()
-            .unwrap();
-        let completed = service
-            .run_placement_reconciliation_bounded_async(1)
-            .await
-            .unwrap()
-            .unwrap();
-        Some((scanned, completed))
+        // Planning reads the object's durable W/N from the coordinator's own
+        // metadata replica, which only its Main owns. Release the held owner
+        // admission and let that Main resume the original job through its
+        // ordinary maintenance within the existing native budget.
+        drop(worker);
+        drop(admission);
+        let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+        loop {
+            let current = read_original();
+            if current.state.is_terminal() {
+                break Some(current);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the original job did not resume within its native budget: {current:?}"
+            );
+            let tick =
+                tokio::task::block_in_place(|| runtime.maintenance_tick(&coordinator, remaining))
+                    .unwrap();
+            assert!(tick.outcome.is_ok(), "{:?}", tick.outcome);
+        }
     } else {
+        drop(worker);
+        drop(admission);
         None
     };
-    let final_object = service
-        .current_read_object_metadata(&object.object_id)
+    let final_object = runtime
+        .node_metadata(&coordinator)
+        .unwrap()
+        .get_object(&object.object_id)
+        .unwrap()
         .unwrap();
-    drop(admission);
     drop(service);
     drop(control);
     runtime.close().unwrap();
@@ -304,12 +323,10 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
         "new Pending work cannot retire the started job"
     );
     assert_eq!(selected.unwrap().job_id, job.job_id);
-    let (scanned, completed) =
-        recovered.expect("the original cancelled job must remain executable");
-    assert_eq!(scanned.job_id, job.job_id);
-    assert_eq!(scanned.scanned_object_count, 1);
-    assert!(scanned.last_error.is_none());
+    let completed = recovered.expect("the original cancelled job must remain executable");
     assert_eq!(completed.job_id, job.job_id);
+    assert_eq!(completed.scanned_object_count, 1);
+    assert!(completed.last_error.is_none());
     assert_eq!(completed.state, DfsPlacementReconciliationState::Completed);
     assert_eq!(completed.pending_repair_count, 0);
     assert_eq!(final_object, object);

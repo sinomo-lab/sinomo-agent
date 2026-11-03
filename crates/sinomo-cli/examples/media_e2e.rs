@@ -104,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         response_attachment_bytes: 0,
                     },
                 )?;
+                let sent_unix_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
                 let started = Instant::now();
                 let response: cluster::ClusterNetworkPingResponse = client
                     .object_rpc_call_to_target_async(&node, call, Duration::from_secs(5), true)
@@ -111,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .decode_body()
                     .await?;
                 let elapsed_us = started.elapsed().as_micros();
+                let completed_unix_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
                 if response.nonce != nonce
                     || response.responder_node_id != node
                     || response.response_payload.len() != response_bytes
@@ -119,7 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 emit(
                     json!({"kind":if mode == "loopback-ping" {"local_object_rpc_control"} else {"cross_node_object_rpc_control"},"response_bytes":response_bytes,
-                    "iteration":iteration,"warmup":iteration<5,"elapsed_us":elapsed_us,"verified":true}),
+                    "iteration":iteration,"warmup":iteration<5,"elapsed_us":elapsed_us,"verified":true,
+                    "sent_unix_ns":sent_unix_ns,"completed_unix_ns":completed_unix_ns,
+                    "remote_observed_unix_ns":response.observed_at.unix_timestamp_nanos()}),
                 );
             }
         }
@@ -262,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json!({"sample":sample,"warmup":sample<5,"elapsed_ms":now.duration_since(started).as_secs_f64()*1000.0,
                 "gap_ms":now.duration_since(previous).as_secs_f64()*1000.0,
                 "received_unix_us":received,"ready_unix_us":ready,"metadata":metadata,
+                "wire_received_unix_us":decoder.last_received_unix_us,
                 "wire_bytes":decoder.last_wire_bytes,"video_decode_us":decoder.last_decode_us,
                 "image_decode_us":decode_image.elapsed().as_micros(),"decoded_width":width,"decoded_height":height}),
             );

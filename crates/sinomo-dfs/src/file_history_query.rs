@@ -1523,8 +1523,11 @@ mod metadata_query_graph_tests {
         let authorities = service
             .metadata_shard_authorities(&object.file_system_id)
             .unwrap();
-        let before = service
-            .metadata_backend()
+        // The client keeps no store; the node's durable metadata must stay
+        // unchanged by the query.
+        let node = service.node_id().clone();
+        let before = runtime
+            .node_metadata(&node)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap();
@@ -1544,8 +1547,8 @@ mod metadata_query_graph_tests {
             }
         }
         assert!(found);
-        let after = service
-            .metadata_backend()
+        let after = runtime
+            .node_metadata(&node)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap();

@@ -3851,11 +3851,14 @@ mod causal_time_tests {
             max_entries: 256,
         };
         let scan_cut = content.begin_content_root_catalog_scan().unwrap();
-        let page = service
+        // The primary page comes from the store-backed owning service.
+        let mut primary = runtime.metadata_primary_service("/").unwrap();
+        let page = primary
             .metadata_backend_mut()
             .unwrap()
             .content_root_catalog_page(&request)
             .expect("capture primary root cut");
+        drop(primary);
         let captured_at = page.generated_at_unix_nanos;
         let fragment = DfsContentRootCatalogFragment::from_pages(&request, &[page]).unwrap();
         let captured = DfsContentRootCatalog::from_fragments(

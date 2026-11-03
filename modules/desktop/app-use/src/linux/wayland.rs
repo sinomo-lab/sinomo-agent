@@ -73,7 +73,7 @@ fn unsupported(detail: &str) -> DesktopError {
 }
 
 pub fn capabilities() -> DesktopCapabilities {
-    let mut caps = DesktopCapabilities {
+    let mut caps = DesktopCapabilities { capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8],
         platform: "linux".into(), capture: false, keyboard_mouse: false, background_window_input: false,
         gamepad: "unsupported".into(), limitations: vec![
             "Wayland uses explicit raw mode through RemoteDesktop/ScreenCast portals; background window messages and gamepads are unavailable".into(),

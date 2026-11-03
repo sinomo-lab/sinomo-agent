@@ -1194,6 +1194,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .map(drop)
                 }
             }
+            DfsNamespaceOperation::RecordAccess { path, object_id } => {
+                self.record_posix_access_local(object_id, path)
+            }
             DfsNamespaceOperation::TouchDirectoryModified { path } => {
                 self.touch_directory_modified(path)
             }

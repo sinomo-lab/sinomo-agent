@@ -53,9 +53,17 @@ fn native_remote_write_retains_its_actual_canonical_binding_on_the_requester() {
     runtime.stop_node(&requester).unwrap();
     runtime.reopen_node(requester.clone()).unwrap();
     let mut reopened = runtime.client(&requester).unwrap();
+    // The reopened requester still holds its canonical local copy, and the
+    // caller reads the committed bytes through the distributed read.
+    let (manifest, stored) = reopened
+        .content
+        .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+        .unwrap();
+    assert_eq!(stored, bytes);
+    assert_eq!(Some(manifest.content_hash), stat.content_hash);
     assert_eq!(
         reopened
-            .posix_read_file("/users/requester-native.bin")
+            .posix_read_file_distributed("/users/requester-native.bin")
             .unwrap(),
         bytes
     );

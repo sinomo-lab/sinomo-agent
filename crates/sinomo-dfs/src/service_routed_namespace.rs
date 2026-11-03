@@ -170,6 +170,11 @@ mod tests {
         let mut service = runtime.client(&node).unwrap();
         let mut paths = Vec::new();
         for index in 0..128 {
+            // Delegated writes resolve through Main; seal each bounded RPC
+            // observation window so close still verifies complete coverage.
+            if index % 16 == 0 {
+                runtime.checkpoint_rpc_observation_window().unwrap();
+            }
             let path = format!("/services/pinned-{index:03}.txt");
             service
                 .posix_write_file(
@@ -180,6 +185,9 @@ mod tests {
                 .unwrap();
             paths.push(path);
         }
+        drop(service);
+        // The shard authority answers the lookup from its own store.
+        let mut service = runtime.metadata_primary_service("/services").unwrap();
         crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
         let objects = service
             .synced_namespace_objects_for_operation(
@@ -793,6 +801,10 @@ fn namespace_transaction_proves_operation_completed(
         | DfsNamespaceOperation::SetOwner { .. }
         | DfsNamespaceOperation::SetSymlinkOwner { .. }
         | DfsNamespaceOperation::SetTimes { .. } => !transaction.objects.is_empty(),
+        DfsNamespaceOperation::RecordAccess { object_id, .. } => transaction
+            .objects
+            .iter()
+            .any(|object| &object.object_id == object_id),
         DfsNamespaceOperation::TouchDirectoryModified { path } => {
             transaction_has_object_at(transaction, path, |object| {
                 object.kind == DfsObjectKind::Directory

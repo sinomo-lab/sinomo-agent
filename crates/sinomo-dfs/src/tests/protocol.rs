@@ -1396,11 +1396,11 @@ fn installed_catalog_reconciliation_only_releases_positively_covered_reservation
         .posix_write_file(
             "/services/catalog-covered",
             b"catalog-covered bytes",
-            DfsWriteOptions::replicated_eventual(vec![config.primary_node_id]),
+            DfsWriteOptions::replicated_eventual(vec![config.primary_node_id.clone()]),
         )
         .unwrap();
-    let covered_record = dfs
-        .metadata_backend()
+    let covered_record = runtime
+        .node_metadata(&config.primary_node_id)
         .unwrap()
         .get_version(&covered.object_id, &covered.version)
         .unwrap()
@@ -1491,7 +1491,9 @@ fn add_object_metadata_batch_rejects_unsealed_file_bytes() {
         crate::test_support::DfsTestRuntime::new("native-unsealed-metadata-batch", node.clone())
             .unwrap();
     runtime.start_nodes().unwrap();
-    let mut service = runtime.client(&node).unwrap();
+    // Metadata-only publication is Main-side store work: use the root shard's
+    // store-backed opener, not a caller delegating to its Main.
+    let mut service = runtime.metadata_primary_service("/").unwrap();
     let fs_id = runtime.file_system().file_system_id;
     let shard = DfsMetadataShardId::new("root");
     let before = service
@@ -2066,8 +2068,8 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
             DfsWriteOptions::replicated_eventual(vec![server.clone()]),
         )
         .unwrap();
-    let before = dfs
-        .metadata_backend()
+    let before = runtime
+        .node_metadata(&server)
         .unwrap()
         .metadata_shard_statuses()
         .unwrap()
@@ -2087,7 +2089,8 @@ fn malformed_dfs_object_rpc_message_does_not_block_following_valid_message() {
         )
         .expect_err("real endpoint rejects malformed SOBJ");
     assert_eq!(
-        dfs.metadata_backend()
+        runtime
+            .node_metadata(&server)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap()
@@ -2150,10 +2153,13 @@ fn object_metadata_normalizes_duplicate_current_locations() {
     let root = temp_root("metadata-normalizes-duplicate-locations");
     let owner = NodeId::from_legacy_named("node_location_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_location_replica").expect("node");
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (_runtime, client) = native_sifs_service(
         "object_metadata_normalizes_duplicate_current_locations",
         owner.clone(),
     );
+    drop(client);
+    // Metadata publication is Main-side store work on the store-backed opener.
+    let mut dfs = _runtime.metadata_primary_service("/").unwrap();
     let mut object = file_metadata(owner.clone());
     object.object_id = DfsObjectId::from_legacy_named("obj_duplicate_locations").expect("object");
     object.policy = DfsObjectPolicy::ReplicatedEventual;
@@ -2265,16 +2271,14 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
     let owner = others[0].clone();
     let replica = others[1].clone();
     let path = "/services/native-transient-stage.bin";
-    let before_replica = runtime.client(&replica).unwrap();
     assert!(
-        before_replica
-            .metadata_backend()
+        runtime
+            .node_metadata(&replica)
             .unwrap()
             .get_object_by_path(&sifs_file_system_id(), path)
             .unwrap()
             .is_none()
     );
-    drop(before_replica);
     let mut policy = DfsSubtreePolicy::new(path, DfsObjectPolicy::ReplicatedConfirmed, 2, 2);
     policy.required_node_ids = vec![owner.clone(), replica.clone()];
     let mut requested =
@@ -2327,17 +2331,10 @@ fn stage_command_accepts_metadata_shard_primary_for_transient_object() {
         &stage_observations[before..],
         &runtime.rpc_observations()[before..]
     );
-    let publisher = runtime.client(&primary).unwrap();
-    let metadata = publisher
-        .metadata_backend()
-        .unwrap()
-        .get_object(&stat.object_id)
-        .unwrap()
-        .unwrap();
+    let publisher = runtime.node_metadata(&primary).unwrap();
+    let metadata = publisher.get_object(&stat.object_id).unwrap().unwrap();
     assert_eq!(metadata.owner_node_id, owner);
     let receipts = publisher
-        .metadata_backend()
-        .unwrap()
         .receipts_for_version(&stat.object_id, &stat.version)
         .unwrap();
     assert_eq!(
@@ -2372,19 +2369,23 @@ fn visible_metadata_publication_is_idempotent() {
     let node_id = NodeId::from_legacy_named("node_visible_metadata_idempotent").expect("node");
     let file_path = "/services/sandbox/instances/sandbox_meta/work/site.py";
 
-    let (runtime, mut dfs) = native_sifs_service(
+    let (runtime, mut client) = native_sifs_service(
         "visible_metadata_publication_is_idempotent",
         node_id.clone(),
     );
-    dfs.posix_mkdir_all("/services/sandbox/instances/sandbox_meta/work")
+    client
+        .posix_mkdir_all("/services/sandbox/instances/sandbox_meta/work")
         .expect("mkdir");
-    let stat = dfs
+    let stat = client
         .posix_write_file(
             file_path,
             b"print('metadata')\n",
             DfsWriteOptions::replicated_eventual(vec![node_id]),
         )
         .expect("write");
+    drop(client);
+    // Republication is Main-side store work on the store-backed opener.
+    let mut dfs = runtime.metadata_primary_service(file_path).unwrap();
     let object = dfs
         .current_read_object_metadata(&stat.object_id)
         .expect("current object");
@@ -2451,10 +2452,12 @@ fn canonical_catalog_visible_without_local_payload() {
     let expected_hash = content_hash(catalog);
 
     sifs_cluster_publish_metadata_until(&mut cluster, "catalog metadata catch-up", |cluster| {
-        cluster
-            .observer
-            .posix_stat(catalog_path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+        super::cross_shard::node_store_object_at(
+            &cluster._runtime,
+            &cluster.observer_node,
+            catalog_path,
+        )
+        .is_some_and(|object| object.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
     assert!(
         !cluster
@@ -2465,15 +2468,21 @@ fn canonical_catalog_visible_without_local_payload() {
         "the fixture must keep catalog bytes exclusively on another online node"
     );
 
-    let visible =
-        sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, catalog_path);
+    let before = cluster._runtime.rpc_observations().len();
+    let visible = cluster
+        .observer
+        .posix_read_file_distributed(catalog_path)
+        .expect("observer catalog read");
     assert_eq!(visible, catalog);
+    // A caller delegating to its Main returns the payload without populating a
+    // local mirror; the actual remote object read is the fetch evidence.
     assert!(
-        cluster
-            .observer
-            .content()
-            .has_blob(&expected_hash)
-            .expect("inspect fetched catalog"),
+        cluster._runtime.rpc_observations()[before..]
+            .iter()
+            .any(|event| event.source == cluster.observer_node
+                && event.target != cluster.observer_node
+                && event.route == crate::DFS_DIRECT_READ_ROUTE
+                && event.phase == crate::test_runtime::RpcPhase::Completed),
         "a canonical SIFS read should fetch the payload instead of treating the local mirror as authoritative"
     );
     drop(cluster);
@@ -2757,7 +2766,7 @@ fn bulk_local_eventual_splits_distinct_shards_owned_by_the_same_primary() {
         ])
     );
     for (path, bytes) in files {
-        assert_eq!(dfs.posix_read_file(path).unwrap(), bytes);
+        assert_eq!(dfs.posix_read_file_distributed(path).unwrap(), bytes);
     }
     drop(dfs);
     runtime.close().unwrap();
@@ -2772,6 +2781,7 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
     )
     .unwrap();
     let owner = config.primary_node_id;
+    let config_owner = owner.clone();
     let options = DfsWriteOptions::replicated_eventual(vec![owner.clone()]);
     let a = dfs
         .posix_write_file(
@@ -2787,7 +2797,7 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
             options,
         )
         .unwrap();
-    let backend = dfs.metadata_backend().unwrap();
+    let backend = runtime.node_metadata(&owner).unwrap();
     let objects = [&a, &b].map(|stat| backend.get_object(&stat.object_id).unwrap().unwrap());
     let versions = [&a, &b].map(|stat| {
         backend
@@ -2836,9 +2846,11 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
             expected_base_version: Some(stat.version.clone()),
             expected_parent_object_id: None,
             expected_parent_version: None,
-            receipt: dfs
-                .backend_receipt_for_replica(&stat.object_id, &stat.version, &owner)
+            receipt: backend
+                .receipts_for_version(&stat.object_id, &stat.version)
                 .unwrap()
+                .into_iter()
+                .find(|receipt| receipt.replica_node_id == owner)
                 .unwrap(),
         })
         .collect();
@@ -2846,7 +2858,11 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
         transaction,
         writes,
     };
-    let authority_shards = dfs
+    drop(backend);
+    // Serving a namespace request is Main-side store work: use the store-backed
+    // opener rather than a caller delegating to its Main.
+    let mut author = runtime.metadata_primary_service("/services").unwrap();
+    let authority_shards = author
         .affected_namespace_shards(&a.file_system_id, &operation)
         .unwrap();
     assert_eq!(authority_shards.len(), 2);
@@ -2855,7 +2871,7 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
             .iter()
             .all(|shard| shard.primary_node_id == owner)
     );
-    let event = dfs
+    let event = author
         .handle_namespace_request(
             owner.clone(),
             DfsNamespaceCommand {
@@ -2875,19 +2891,15 @@ fn local_eventual_batch_rejects_multiple_shards_with_the_same_local_primary() {
     } if reason.contains("must resolve to exactly one metadata shard")),
         "{event:?}"
     );
+    drop(author);
     assert_eq!(actual_snapshots(), before);
+    let backend = runtime.node_metadata(&config_owner).unwrap();
     assert_eq!(
-        dfs.metadata_backend()
-            .unwrap()
-            .get_object(&a.object_id)
-            .unwrap(),
+        backend.get_object(&a.object_id).unwrap(),
         Some(objects[0].clone())
     );
     assert_eq!(
-        dfs.metadata_backend()
-            .unwrap()
-            .get_object(&b.object_id)
-            .unwrap(),
+        backend.get_object(&b.object_id).unwrap(),
         Some(objects[1].clone())
     );
     drop(dfs);

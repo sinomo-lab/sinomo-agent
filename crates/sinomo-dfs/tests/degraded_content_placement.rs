@@ -262,8 +262,14 @@ fn native_degraded_write_rejects_unadmitted_targets_without_erasing_recorded_cop
     assert_eq!(replay.object_id, current.object_id);
     assert_eq!(replay.version, current.version);
     assert_eq!(replay.content_hash, current.content_hash);
-    assert_eq!(caller.posix_stat(path).unwrap().version, current.version);
-    let prepared_after = caller
+    assert_eq!(
+        caller.posix_stat_distributed(path).unwrap().version,
+        current.version
+    );
+    // The owning primary's store holds the sealed outcome; the delegating
+    // caller keeps no local store.
+    let owner = runtime.metadata_primary_service(path).unwrap();
+    let prepared_after = owner
         .metadata_backend()
         .unwrap()
         .prepared_operation_record(&prepared_id)
@@ -278,7 +284,7 @@ fn native_degraded_write_rejects_unadmitted_targets_without_erasing_recorded_cop
         prepared_before.committed_entry
     );
     assert_eq!(
-        caller
+        owner
             .metadata_backend()
             .unwrap()
             .object_write_intent_history(&current.object_id)
@@ -289,6 +295,7 @@ fn native_degraded_write_rejects_unadmitted_targets_without_erasing_recorded_cop
             .count(),
         1
     );
+    drop(owner);
     drop(caller);
     for node in &nodes {
         let reader = runtime.client(node).unwrap();

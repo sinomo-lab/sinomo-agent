@@ -75,7 +75,7 @@ fn sifs_sandbox_instance_store_creates_loads_and_saves_manifest() {
     store.save_manifest(&manifest).expect("save");
     assert_eq!(store.load(&sandbox_id).expect("load saved"), manifest);
 
-    let dfs = store.into_inner();
+    let mut dfs = store.into_inner();
     for path in [
         sandbox_manifest_path(&sandbox_id),
         format!("{}/root", sandbox_instance_root(&sandbox_id)),
@@ -86,7 +86,7 @@ fn sifs_sandbox_instance_store_creates_loads_and_saves_manifest() {
         format!("{}/logs", sandbox_instance_root(&sandbox_id)),
         format!("{}/artifacts", sandbox_instance_root(&sandbox_id)),
     ] {
-        dfs.posix_stat(&path).unwrap_or_else(|error| {
+        dfs.posix_stat_distributed(&path).unwrap_or_else(|error| {
             panic!("{path} should exist after create: {error}");
         });
     }
@@ -535,7 +535,7 @@ fn sifs_sandbox_instance_reboot_applies_tmp_policy_without_clearing_work() {
     assert_eq!(
         store
             .dfs
-            .posix_read_file(&format!("{}/tmp/0/cache.txt", manifest.workspace_root))
+            .posix_read_file_distributed(&format!("{}/tmp/0/cache.txt", manifest.workspace_root))
             .expect("prior temp generation remains immutable"),
         b"tmp"
     );
@@ -552,15 +552,15 @@ fn sifs_sandbox_instance_reboot_applies_tmp_policy_without_clearing_work() {
             OffsetDateTime::now_utc(),
         )
         .expect("finalize reboot");
-    let sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &rebooted);
+    let mut sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &rebooted);
     assert_eq!(
         sandbox_fs
-            .read(&SandboxPath::new("/work/state.txt").expect("work"), None)
+            .read_mut(&SandboxPath::new("/work/state.txt").expect("work"), None)
             .expect("read work"),
         b"work"
     );
     assert!(matches!(
-        sandbox_fs.read(&SandboxPath::new("/tmp/cache.txt").expect("tmp"), None),
+        sandbox_fs.read_mut(&SandboxPath::new("/tmp/cache.txt").expect("tmp"), None),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -592,10 +592,10 @@ fn sifs_sandbox_instance_reboot_applies_tmp_policy_without_clearing_work() {
             OffsetDateTime::now_utc(),
         )
         .expect("finalize retained reboot");
-    let sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &retained);
+    let mut sandbox_fs = SifsSandboxFileSystem::new(store.into_inner(), &retained);
     assert_eq!(
         sandbox_fs
-            .read(&SandboxPath::new("/tmp/keep.txt").expect("tmp"), None)
+            .read_mut(&SandboxPath::new("/tmp/keep.txt").expect("tmp"), None)
             .expect("read retained tmp"),
         b"keep"
     );
@@ -1067,7 +1067,7 @@ fn sifs_sandbox_filesystem_maps_virtual_paths_to_sifs_workspace() {
     let file = SandboxPath::new("/work/main.rs").expect("file");
     fs.write(&file, b"fn main() {}\n").expect("write");
     assert_eq!(
-        fs.read(
+        fs.read_mut(
             &file,
             Some(ByteRange {
                 start: 3,
@@ -1077,16 +1077,16 @@ fn sifs_sandbox_filesystem_maps_virtual_paths_to_sifs_workspace() {
         .expect("read range"),
         b"main"
     );
-    assert_eq!(fs.stat(&file).expect("stat").len, 13);
-    assert_eq!(fs.stat(&file).expect("file link count").link_count, 1);
+    assert_eq!(fs.stat_mut(&file).expect("stat").len, 13);
+    assert_eq!(fs.stat_mut(&file).expect("file link count").link_count, 1);
     assert!(
-        fs.list(&SandboxPath::new("/work").expect("work"))
+        fs.list_mut(&SandboxPath::new("/work").expect("work"))
             .expect("list")
             .iter()
             .any(|entry| entry.path == file)
     );
     assert!(
-        fs.list(&SandboxPath::new("/").expect("root"))
+        fs.list_mut(&SandboxPath::new("/").expect("root"))
             .expect("root list")
             .iter()
             .any(|entry| entry.path.as_str() == "/dev" && entry.metadata.is_dir)
@@ -1098,29 +1098,29 @@ fn sifs_sandbox_filesystem_maps_virtual_paths_to_sifs_workspace() {
         Err(SandboxFsError::NotFound { .. })
     ));
     assert_eq!(
-        fs.read(&file, None).expect("source remains"),
+        fs.read_mut(&file, None).expect("source remains"),
         b"fn main() {}\n"
     );
     fs.create_dir(&SandboxPath::new("/work/src").expect("src dir"))
         .expect("mkdir src");
     fs.rename(&file, &moved).expect("rename");
     assert_eq!(
-        fs.stat(&SandboxPath::new("/work").expect("work"))
+        fs.stat_mut(&SandboxPath::new("/work").expect("work"))
             .expect("work stat")
             .link_count,
         3
     );
     assert!(matches!(
-        fs.read(&file, None).expect_err("old missing"),
+        fs.read_mut(&file, None).expect_err("old missing"),
         SandboxFsError::NotFound { .. }
     ));
     assert_eq!(
-        fs.read(&moved, None).expect("moved read"),
+        fs.read_mut(&moved, None).expect("moved read"),
         b"fn main() {}\n"
     );
     fs.unlink(&moved).expect("unlink");
     assert!(matches!(
-        fs.read(&moved, None).expect_err("removed"),
+        fs.read_mut(&moved, None).expect_err("removed"),
         SandboxFsError::NotFound { .. }
     ));
 
@@ -1160,7 +1160,7 @@ fn sifs_sandbox_filesystem_lists_manifest_mount_points() {
 
     fs.ensure_workspace().expect("workspace");
     let root_entries = fs
-        .list(&SandboxPath::new("/").expect("root"))
+        .list_mut(&SandboxPath::new("/").expect("root"))
         .expect("root list");
     assert!(
         root_entries
@@ -1169,7 +1169,7 @@ fn sifs_sandbox_filesystem_lists_manifest_mount_points() {
         "manifest mount point should be visible in root listing: {root_entries:?}"
     );
     let mounted_entries = fs
-        .list(&SandboxPath::new("/readonly").expect("readonly"))
+        .list_mut(&SandboxPath::new("/readonly").expect("readonly"))
         .expect("mounted list");
     assert!(
         mounted_entries
@@ -1215,7 +1215,7 @@ fn sifs_sandbox_filesystem_lists_nested_manifest_mount_ancestors() {
 
     fs.ensure_workspace().expect("workspace");
     let root_entries = fs
-        .list(&SandboxPath::new("/").expect("root"))
+        .list_mut(&SandboxPath::new("/").expect("root"))
         .expect("root list");
     assert!(
         root_entries
@@ -1224,14 +1224,14 @@ fn sifs_sandbox_filesystem_lists_nested_manifest_mount_ancestors() {
         "nested mount ancestor should be visible in root listing: {root_entries:?}"
     );
     let opt_metadata = fs
-        .stat(&SandboxPath::new("/opt").expect("opt"))
+        .stat_mut(&SandboxPath::new("/opt").expect("opt"))
         .expect("synthetic opt stat");
     assert!(opt_metadata.is_dir);
     assert_eq!(opt_metadata.mode & 0o222, 0);
     fs.create_dir_all(&SandboxPath::new("/opt").expect("opt"))
         .expect("mkdir -p synthetic ancestor is a no-op");
     let opt_entries = fs
-        .list(&SandboxPath::new("/opt").expect("opt"))
+        .list_mut(&SandboxPath::new("/opt").expect("opt"))
         .expect("opt list");
     assert!(
         opt_entries
@@ -1282,13 +1282,13 @@ fn sifs_sandbox_filesystem_lists_nested_manifest_mount_ancestors() {
         Err(SandboxFsError::ReadOnly { .. })
     ));
     assert_eq!(
-        fs.read(&SandboxPath::new("/work/source.txt").expect("source"), None)
+        fs.read_mut(&SandboxPath::new("/work/source.txt").expect("source"), None)
             .expect("source remains"),
         b"source"
     );
-    assert!(fs.stat(&SandboxPath::new("/opt").expect("opt")).is_ok());
+    assert!(fs.stat_mut(&SandboxPath::new("/opt").expect("opt")).is_ok());
     let mounted_entries = fs
-        .list(&SandboxPath::new("/opt/pkg").expect("pkg"))
+        .list_mut(&SandboxPath::new("/opt/pkg").expect("pkg"))
         .expect("mounted list");
     assert!(
         mounted_entries
@@ -1360,18 +1360,18 @@ fn sifs_sandbox_filesystem_treats_mount_roots_and_ancestors_as_busy() {
         Err(SandboxFsError::ReadOnly { .. })
     ));
     assert!(
-        fs.stat(&vendor).expect("vendor still present").is_dir,
+        fs.stat_mut(&vendor).expect("vendor still present").is_dir,
         "failed namespace operations must leave the mount ancestor in place"
     );
     assert!(
-        fs.stat(&mount_root)
+        fs.stat_mut(&mount_root)
             .expect("mount root still present")
             .is_dir,
         "failed namespace operations must leave the mount root in place"
     );
-    let dfs = fs.into_inner();
+    let mut dfs = fs.into_inner();
     assert!(
-        dfs.posix_stat(shared_dir)
+        dfs.posix_stat_distributed(shared_dir)
             .expect("shared mount source")
             .kind
             == DfsObjectKind::Directory,
@@ -1406,7 +1406,7 @@ fn sifs_sandbox_filesystem_clamps_absolute_parent_components_to_sandbox_root() {
     assert_eq!(normalized.as_str(), "/work/file.txt");
     fs.write(&normalized, b"root-clamped").expect("write");
     assert_eq!(
-        fs.read(
+        fs.read_mut(
             &SandboxPath::new("/work/file.txt").expect("canonical"),
             None
         )
@@ -1414,7 +1414,7 @@ fn sifs_sandbox_filesystem_clamps_absolute_parent_components_to_sandbox_root() {
         b"root-clamped"
     );
     assert!(matches!(
-        fs.read(
+        fs.read_mut(
             &SandboxPath::new("/work/parent/file.txt").expect("unresolved parent"),
             None
         ),
@@ -1447,12 +1447,12 @@ fn sifs_sandbox_filesystem_preserves_symlink_targets() {
     fs.symlink(Path::new("../shared/lib"), &link)
         .expect("symlink");
 
-    let metadata = fs.stat(&link).expect("stat link");
+    let metadata = fs.stat_mut(&link).expect("stat link");
     assert!(!metadata.is_dir);
     assert!(metadata.is_symlink);
     assert_eq!(metadata.len, "../shared/lib".len() as u64);
     assert_eq!(
-        fs.readlink(&link).expect("readlink"),
+        fs.readlink_mut(&link).expect("readlink"),
         PathBuf::from("../shared/lib")
     );
 
@@ -1460,24 +1460,24 @@ fn sifs_sandbox_filesystem_preserves_symlink_targets() {
     fs.write(&link, b"linked content")
         .expect("write through link");
     assert_eq!(
-        fs.read(&target, None).expect("read target"),
+        fs.read_mut(&target, None).expect("read target"),
         b"linked content"
     );
     assert_eq!(
-        fs.read(&link, None).expect("read through link"),
+        fs.read_mut(&link, None).expect("read through link"),
         b"linked content"
     );
-    assert_eq!(fs.stat_follow(&link).expect("stat follow").path, link);
+    assert_eq!(fs.stat_follow_mut(&link).expect("stat follow").path, link);
     fs.set_times(&link, Some(12_345), Some(67_890))
         .expect("set times follows symlink target");
     assert_eq!(
-        fs.stat_follow(&link)
+        fs.stat_follow_mut(&link)
             .expect("target atime through link")
             .accessed_at_unix_nanos,
         12_345
     );
     assert_ne!(
-        fs.stat(&link)
+        fs.stat_mut(&link)
             .expect("link atime remains independent")
             .accessed_at_unix_nanos,
         12_345
@@ -1485,11 +1485,13 @@ fn sifs_sandbox_filesystem_preserves_symlink_targets() {
     fs.set_symlink_times(&link, Some(22_222), Some(88_888))
         .expect("set symlink times updates link");
     assert_eq!(
-        fs.stat(&link).expect("link atime").accessed_at_unix_nanos,
+        fs.stat_mut(&link)
+            .expect("link atime")
+            .accessed_at_unix_nanos,
         22_222
     );
     assert_eq!(
-        fs.stat_follow(&link)
+        fs.stat_follow_mut(&link)
             .expect("target atime unchanged by symlink times")
             .accessed_at_unix_nanos,
         12_345
@@ -1500,11 +1502,12 @@ fn sifs_sandbox_filesystem_preserves_symlink_targets() {
     ));
     fs.unlink(&link).expect("unlink symlink");
     assert!(matches!(
-        fs.stat(&link),
+        fs.stat_mut(&link),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert_eq!(
-        fs.read(&target, None).expect("target survives link unlink"),
+        fs.read_mut(&target, None)
+            .expect("target survives link unlink"),
         b"linked content"
     );
 
@@ -1537,17 +1540,21 @@ fn sifs_sandbox_filesystem_unlinks_symlink_to_directory_without_removing_target(
     fs.symlink(Path::new("target-dir"), &link)
         .expect("create directory symlink");
 
-    assert!(fs.stat_follow(&link).expect("stat follows dir link").is_dir);
+    assert!(
+        fs.stat_follow_mut(&link)
+            .expect("stat follows dir link")
+            .is_dir
+    );
     assert!(matches!(
         fs.remove_dir(&link),
         Err(SandboxFsError::NotDirectory { .. })
     ));
     fs.unlink(&link).expect("unlink directory symlink");
     assert!(matches!(
-        fs.stat(&link),
+        fs.stat_mut(&link),
         Err(SandboxFsError::NotFound { .. })
     ));
-    assert!(fs.stat(&target).expect("target survives unlink").is_dir);
+    assert!(fs.stat_mut(&target).expect("target survives unlink").is_dir);
 
     drop(fs);
     native.close().expect("normal native DFS shutdown");
@@ -1624,37 +1631,42 @@ fn sifs_sandbox_filesystem_hardlink_shares_content_and_unlink_state() {
     fs.write(&original, b"original").expect("write original");
     fs.hard_link(&original, &link).expect("hardlink");
 
-    let original_metadata = fs.stat(&original).expect("original stat");
-    let link_metadata = fs.stat(&link).expect("link stat");
+    let original_metadata = fs.stat_mut(&original).expect("original stat");
+    let link_metadata = fs.stat_mut(&link).expect("link stat");
     assert_eq!(original_metadata.link_count, 2);
     assert_eq!(link_metadata.link_count, 2);
     assert_eq!(original_metadata.inode, link_metadata.inode);
     fs.set_mode(&link, 0o750)
         .expect("set mode through hardlink");
-    assert_eq!(fs.stat(&original).expect("original mode").mode, 0o750);
-    assert_eq!(fs.stat(&link).expect("link mode").mode, 0o750);
+    assert_eq!(fs.stat_mut(&original).expect("original mode").mode, 0o750);
+    assert_eq!(fs.stat_mut(&link).expect("link mode").mode, 0o750);
     fs.set_owner(&link, 1001, 1002)
         .expect("set owner through hardlink");
-    assert_eq!(fs.stat(&original).expect("original uid").uid, 1001);
-    assert_eq!(fs.stat(&original).expect("original gid").gid, 1002);
-    assert_eq!(fs.stat(&link).expect("link uid").uid, 1001);
-    assert_eq!(fs.stat(&link).expect("link gid").gid, 1002);
+    assert_eq!(fs.stat_mut(&original).expect("original uid").uid, 1001);
+    assert_eq!(fs.stat_mut(&original).expect("original gid").gid, 1002);
+    assert_eq!(fs.stat_mut(&link).expect("link uid").uid, 1001);
+    assert_eq!(fs.stat_mut(&link).expect("link gid").gid, 1002);
     fs.set_times(&link, Some(12_345), Some(67_890))
         .expect("set times through hardlink");
     assert_eq!(
-        fs.stat(&original)
+        fs.stat_mut(&original)
             .expect("original times")
             .accessed_at_unix_nanos,
         12_345
     );
     assert_eq!(
-        fs.stat(&link).expect("link times").modified_at_unix_nanos,
+        fs.stat_mut(&link)
+            .expect("link times")
+            .modified_at_unix_nanos,
         67_890
     );
     fs.write(&link, b"updated").expect("write link");
-    assert_eq!(fs.read(&original, None).expect("read original"), b"updated");
-    assert_eq!(fs.read(&link, None).expect("read link"), b"updated");
-    let updated_metadata = fs.stat(&original).expect("updated stat");
+    assert_eq!(
+        fs.read_mut(&original, None).expect("read original"),
+        b"updated"
+    );
+    assert_eq!(fs.read_mut(&link, None).expect("read link"), b"updated");
+    let updated_metadata = fs.stat_mut(&original).expect("updated stat");
     assert_eq!(updated_metadata.accessed_at_unix_nanos, 12_345);
     assert!(updated_metadata.modified_at_unix_nanos > 67_890);
     fs.set_times(&link, Some(22_222), Some(88_888))
@@ -1663,17 +1675,17 @@ fn sifs_sandbox_filesystem_hardlink_shares_content_and_unlink_state() {
         fs.read_file(&original, None).expect("mutating read"),
         b"updated"
     );
-    let read_metadata = fs.stat(&link).expect("read stat");
+    let read_metadata = fs.stat_mut(&link).expect("read stat");
     assert!(read_metadata.accessed_at_unix_nanos > 22_222);
     assert_eq!(read_metadata.modified_at_unix_nanos, 88_888);
 
     fs.unlink(&original).expect("unlink original");
     assert!(matches!(
-        fs.read(&original, None),
+        fs.read_mut(&original, None),
         Err(SandboxFsError::NotFound { .. })
     ));
-    assert_eq!(fs.read(&link, None).expect("link remains"), b"updated");
-    assert_eq!(fs.stat(&link).expect("remaining stat").link_count, 1);
+    assert_eq!(fs.read_mut(&link, None).expect("link remains"), b"updated");
+    assert_eq!(fs.stat_mut(&link).expect("remaining stat").link_count, 1);
 
     drop(fs);
     native.close().expect("normal native DFS shutdown");
@@ -1707,32 +1719,36 @@ fn sifs_sandbox_filesystem_hardlink_preserves_symlink_object() {
     fs.hard_link(&symlink, &hardlink)
         .expect("hardlink symlink object");
 
-    let symlink_metadata = fs.stat(&symlink).expect("symlink stat");
-    let hardlink_metadata = fs.stat(&hardlink).expect("hardlink stat");
+    let symlink_metadata = fs.stat_mut(&symlink).expect("symlink stat");
+    let hardlink_metadata = fs.stat_mut(&hardlink).expect("hardlink stat");
     assert!(symlink_metadata.is_symlink);
     assert!(hardlink_metadata.is_symlink);
     assert_eq!(symlink_metadata.inode, hardlink_metadata.inode);
     assert_eq!(symlink_metadata.link_count, 2);
     assert_eq!(hardlink_metadata.link_count, 2);
     assert_eq!(
-        fs.readlink(&hardlink).expect("readlink alias"),
+        fs.readlink_mut(&hardlink).expect("readlink alias"),
         PathBuf::from("target.txt")
     );
     assert_eq!(
-        fs.read(&hardlink, None).expect("read through alias"),
+        fs.read_mut(&hardlink, None).expect("read through alias"),
         b"target"
     );
 
     fs.unlink(&symlink).expect("unlink original symlink");
     assert!(matches!(
-        fs.stat(&symlink),
+        fs.stat_mut(&symlink),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert_eq!(
-        fs.readlink(&hardlink).expect("remaining alias readlink"),
+        fs.readlink_mut(&hardlink)
+            .expect("remaining alias readlink"),
         PathBuf::from("target.txt")
     );
-    assert_eq!(fs.stat(&hardlink).expect("remaining alias").link_count, 1);
+    assert_eq!(
+        fs.stat_mut(&hardlink).expect("remaining alias").link_count,
+        1
+    );
 
     drop(fs);
     native.close().expect("normal native DFS shutdown");
@@ -1768,7 +1784,7 @@ fn sifs_sandbox_filesystem_link_operations_do_not_create_missing_parents() {
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        fs.stat(&missing_parent),
+        fs.stat_mut(&missing_parent),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
@@ -1776,11 +1792,11 @@ fn sifs_sandbox_filesystem_link_operations_do_not_create_missing_parents() {
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        fs.stat(&missing_parent),
+        fs.stat_mut(&missing_parent),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert_eq!(
-        fs.read(&original, None).expect("original remains"),
+        fs.read_mut(&original, None).expect("original remains"),
         b"content"
     );
 
@@ -1812,26 +1828,29 @@ fn sifs_sandbox_filesystem_rename_over_canonical_preserves_other_hardlinks() {
     let canonical = SandboxPath::new("/work/canonical.txt").expect("canonical");
     let alias = SandboxPath::new("/work/alias.txt").expect("alias");
     fs.write(&canonical, b"old").expect("write canonical");
-    let old_inode = fs.stat(&canonical).expect("canonical stat").inode;
+    let old_inode = fs.stat_mut(&canonical).expect("canonical stat").inode;
     fs.hard_link(&canonical, &alias).expect("hardlink");
     fs.write(&source, b"new").expect("write source");
-    let source_inode = fs.stat(&source).expect("source stat").inode;
+    let source_inode = fs.stat_mut(&source).expect("source stat").inode;
 
     fs.rename(&source, &canonical)
         .expect("rename source over canonical");
 
     assert!(matches!(
-        fs.stat(&source),
+        fs.stat_mut(&source),
         Err(SandboxFsError::NotFound { .. })
     ));
-    let canonical_stat = fs.stat(&canonical).expect("canonical after rename");
-    let alias_stat = fs.stat(&alias).expect("alias after rename");
+    let canonical_stat = fs.stat_mut(&canonical).expect("canonical after rename");
+    let alias_stat = fs.stat_mut(&alias).expect("alias after rename");
     assert_eq!(canonical_stat.inode, source_inode);
     assert_eq!(canonical_stat.link_count, 1);
     assert_eq!(alias_stat.inode, old_inode);
     assert_eq!(alias_stat.link_count, 1);
-    assert_eq!(fs.read(&canonical, None).expect("read canonical"), b"new");
-    assert_eq!(fs.read(&alias, None).expect("read alias"), b"old");
+    assert_eq!(
+        fs.read_mut(&canonical, None).expect("read canonical"),
+        b"new"
+    );
+    assert_eq!(fs.read_mut(&alias, None).expect("read alias"), b"old");
 
     drop(fs);
     native.close().expect("normal native DFS shutdown");
@@ -1864,31 +1883,31 @@ fn sifs_sandbox_filesystem_rename_hardlink_over_canonical_preserves_both_targets
     fs.write(&source, b"source").expect("write source");
     fs.hard_link(&source, &source_alias)
         .expect("source hardlink");
-    let source_inode = fs.stat(&source).expect("source stat").inode;
+    let source_inode = fs.stat_mut(&source).expect("source stat").inode;
     fs.write(&dest, b"dest").expect("write dest");
     fs.hard_link(&dest, &dest_alias).expect("dest hardlink");
-    let dest_inode = fs.stat(&dest).expect("dest stat").inode;
+    let dest_inode = fs.stat_mut(&dest).expect("dest stat").inode;
 
     fs.rename(&source_alias, &dest)
         .expect("rename source alias over dest");
 
     assert!(matches!(
-        fs.stat(&source_alias),
+        fs.stat_mut(&source_alias),
         Err(SandboxFsError::NotFound { .. })
     ));
-    let source_stat = fs.stat(&source).expect("source remains");
-    let renamed_stat = fs.stat(&dest).expect("renamed source alias");
-    let dest_alias_stat = fs.stat(&dest_alias).expect("dest alias remains");
+    let source_stat = fs.stat_mut(&source).expect("source remains");
+    let renamed_stat = fs.stat_mut(&dest).expect("renamed source alias");
+    let dest_alias_stat = fs.stat_mut(&dest_alias).expect("dest alias remains");
     assert_eq!(source_stat.inode, source_inode);
     assert_eq!(renamed_stat.inode, source_inode);
     assert_eq!(source_stat.link_count, 2);
     assert_eq!(renamed_stat.link_count, 2);
     assert_eq!(dest_alias_stat.inode, dest_inode);
     assert_eq!(dest_alias_stat.link_count, 1);
-    assert_eq!(fs.read(&source, None).expect("read source"), b"source");
-    assert_eq!(fs.read(&dest, None).expect("read renamed"), b"source");
+    assert_eq!(fs.read_mut(&source, None).expect("read source"), b"source");
+    assert_eq!(fs.read_mut(&dest, None).expect("read renamed"), b"source");
     assert_eq!(
-        fs.read(&dest_alias, None).expect("read dest alias"),
+        fs.read_mut(&dest_alias, None).expect("read dest alias"),
         b"dest"
     );
 
@@ -1920,13 +1939,13 @@ fn sifs_sandbox_filesystem_create_dir_is_not_recursive() {
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/work/missing").expect("missing")),
+        fs.stat_mut(&SandboxPath::new("/work/missing").expect("missing")),
         Err(SandboxFsError::NotFound { .. })
     ));
 
     let parent = SandboxPath::new("/work/parent").expect("parent");
     fs.create_dir(&parent).expect("mkdir parent");
-    assert!(fs.stat(&parent).expect("parent stat").is_dir);
+    assert!(fs.stat_mut(&parent).expect("parent stat").is_dir);
     assert!(matches!(
         fs.create_dir(&parent),
         Err(SandboxFsError::AlreadyExists { .. })
@@ -1965,7 +1984,7 @@ fn sifs_sandbox_filesystem_create_dir_all_respects_parent_permissions() {
         Err(SandboxFsError::ReadOnly { .. })
     ));
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/work/locked/a").expect("missing")),
+        fs.stat_mut(&SandboxPath::new("/work/locked/a").expect("missing")),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -2014,12 +2033,14 @@ fn sifs_sandbox_filesystem_denies_hardlink_from_read_only_mount() {
         Err(SandboxFsError::ReadOnly { .. })
     ));
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/work/alias.txt").expect("alias")),
+        fs.stat_mut(&SandboxPath::new("/work/alias.txt").expect("alias")),
         Err(SandboxFsError::NotFound { .. })
     ));
-    let dfs = fs.into_inner();
+    let mut dfs = fs.into_inner();
     assert_eq!(
-        dfs.posix_stat(shared_file).expect("source stat").link_count,
+        dfs.posix_stat_distributed(shared_file)
+            .expect("source stat")
+            .link_count,
         1
     );
 
@@ -2064,12 +2085,12 @@ fn sifs_sandbox_filesystem_denies_rename_across_mount_boundary() {
         Err(SandboxFsError::Unsupported { .. })
     ));
     assert_eq!(
-        fs.read(&workspace_file, None)
+        fs.read_mut(&workspace_file, None)
             .expect("workspace file remains"),
         b"workspace"
     );
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/shared/source.txt").expect("shared destination")),
+        fs.stat_mut(&SandboxPath::new("/shared/source.txt").expect("shared destination")),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -2119,12 +2140,14 @@ fn sifs_sandbox_filesystem_denies_hardlink_across_mount_boundary() {
         Err(SandboxFsError::Unsupported { .. })
     ));
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/work/alias.txt").expect("alias")),
+        fs.stat_mut(&SandboxPath::new("/work/alias.txt").expect("alias")),
         Err(SandboxFsError::NotFound { .. })
     ));
-    let dfs = fs.into_inner();
+    let mut dfs = fs.into_inner();
     assert_eq!(
-        dfs.posix_stat(shared_file).expect("source stat").link_count,
+        dfs.posix_stat_distributed(shared_file)
+            .expect("source stat")
+            .link_count,
         1
     );
 
@@ -2156,12 +2179,12 @@ fn sifs_sandbox_filesystem_write_file_is_not_recursive() {
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/work/missing").expect("missing")),
+        fs.stat_mut(&SandboxPath::new("/work/missing").expect("missing")),
         Err(SandboxFsError::NotFound { .. })
     ));
     fs.write(&nested, b"content")
         .expect("convenience write still creates parents");
-    assert_eq!(fs.read(&nested, None).expect("read"), b"content");
+    assert_eq!(fs.read_mut(&nested, None).expect("read"), b"content");
 
     drop(fs);
     native.close().expect("normal native DFS shutdown");
@@ -2196,7 +2219,7 @@ fn sifs_sandbox_filesystem_follows_intermediate_symlinks_for_mutations() {
     fs.create_dir_all(&nested_via_link)
         .expect("mkdir through symlink parent");
     assert!(
-        fs.stat(&SandboxPath::new("/work/real/nested").unwrap())
+        fs.stat_mut(&SandboxPath::new("/work/real/nested").unwrap())
             .unwrap()
             .is_dir
     );
@@ -2205,19 +2228,22 @@ fn sifs_sandbox_filesystem_follows_intermediate_symlinks_for_mutations() {
     let file_real = SandboxPath::new("/work/real/file.txt").expect("file real");
     fs.write(&file_via_link, b"via link")
         .expect("write via link");
-    assert_eq!(fs.read(&file_real, None).expect("read real"), b"via link");
+    assert_eq!(
+        fs.read_mut(&file_real, None).expect("read real"),
+        b"via link"
+    );
 
     let child_link_via_link = SandboxPath::new("/work/link/child-link").expect("child link");
     fs.symlink(Path::new("file.txt"), &child_link_via_link)
         .expect("create symlink through symlink parent");
     let child_link_real = SandboxPath::new("/work/real/child-link").expect("child link real");
     assert_eq!(
-        fs.readlink(&child_link_via_link)
+        fs.readlink_mut(&child_link_via_link)
             .expect("readlink via link"),
         PathBuf::from("file.txt")
     );
     assert!(
-        fs.stat(&child_link_real)
+        fs.stat_mut(&child_link_real)
             .expect("stat real child link")
             .is_symlink
     );
@@ -2227,27 +2253,31 @@ fn sifs_sandbox_filesystem_follows_intermediate_symlinks_for_mutations() {
     fs.rename(&file_via_link, &renamed_via_link)
         .expect("rename through symlink parent");
     assert!(matches!(
-        fs.stat(&file_real),
+        fs.stat_mut(&file_real),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert_eq!(
-        fs.read(&renamed_real, None).expect("read renamed"),
+        fs.read_mut(&renamed_real, None).expect("read renamed"),
         b"via link"
     );
 
     fs.unlink(&renamed_via_link)
         .expect("unlink through symlink parent");
     assert!(matches!(
-        fs.stat(&renamed_real),
+        fs.stat_mut(&renamed_real),
         Err(SandboxFsError::NotFound { .. })
     ));
     fs.remove_dir(&nested_via_link)
         .expect("remove dir through symlink parent");
     assert!(matches!(
-        fs.stat(&SandboxPath::new("/work/real/nested").unwrap()),
+        fs.stat_mut(&SandboxPath::new("/work/real/nested").unwrap()),
         Err(SandboxFsError::NotFound { .. })
     ));
-    assert!(fs.stat(&link_dir).expect("link still exists").is_symlink);
+    assert!(
+        fs.stat_mut(&link_dir)
+            .expect("link still exists")
+            .is_symlink
+    );
 
     drop(fs);
     native.close().expect("normal native DFS shutdown");
@@ -2276,14 +2306,17 @@ fn sifs_sandbox_filesystem_exposes_virtual_devices_without_persisting_them() {
     let zero = SandboxPath::new("/dev/zero").expect("zero");
     let random = SandboxPath::new("/dev/random").expect("random");
     let urandom = SandboxPath::new("/dev/urandom").expect("urandom");
-    assert!(fs.stat(&dev).expect("dev stat").is_dir);
-    assert_eq!(fs.read(&null, None).expect("read null"), Vec::<u8>::new());
+    assert!(fs.stat_mut(&dev).expect("dev stat").is_dir);
+    assert_eq!(
+        fs.read_mut(&null, None).expect("read null"),
+        Vec::<u8>::new()
+    );
     fs.write(&null, b"discard").expect("write null");
     fs.write(&zero, b"discard").expect("write zero");
     fs.write(&random, b"discard").expect("write random");
     fs.write(&urandom, b"discard").expect("write urandom");
     assert_eq!(
-        fs.read(
+        fs.read_mut(
             &zero,
             Some(ByteRange {
                 start: 0,
@@ -2294,7 +2327,7 @@ fn sifs_sandbox_filesystem_exposes_virtual_devices_without_persisting_them() {
         vec![0; 4]
     );
     assert_eq!(
-        fs.list(&dev)
+        fs.list_mut(&dev)
             .expect("list dev")
             .into_iter()
             .map(|entry| entry.path)
@@ -2331,7 +2364,7 @@ fn sifs_sandbox_filesystem_exposes_virtual_devices_without_persisting_them() {
     ));
     assert!(matches!(
         fs.dfs
-            .posix_stat(&format!("{}/dev", manifest.workspace_root)),
+            .posix_stat_distributed(&format!("{}/dev", manifest.workspace_root)),
         Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. })
     ));
 

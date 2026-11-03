@@ -695,12 +695,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
     ) -> Result<String> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
-        let path =
-            self.resolve_posix_path_distributed(&path, follow_final || requires_directory)?;
-        if requires_directory {
-            self.ensure_resolved_path_is_directory(&path)?;
+        if !requires_directory {
+            return self.resolve_posix_path_distributed(&path, follow_final);
         }
-        Ok(path)
+        // The walk follows the final component and already holds its
+        // authoritative record; a local lookup may not answer this path.
+        let resolved = self.resolve_posix_path_distributed_walk(&path, true, false, None)?;
+        match resolved.terminal_object {
+            Some(object) if object.kind == DfsObjectKind::Directory => Ok(resolved.path),
+            Some(object) if object.kind != DfsObjectKind::Tombstone => {
+                Err(DfsPosixError::NotDirectory {
+                    path: resolved.path,
+                })
+            }
+            _ => Err(DfsPosixError::NotFound {
+                path: resolved.path,
+            }),
+        }
     }
 
     fn symlink_target_for_object(&self, path: &str, object: &DfsObjectMetadata) -> Result<String> {

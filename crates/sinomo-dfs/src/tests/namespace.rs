@@ -44,7 +44,10 @@ fn posix_remote_stream_returns_before_body_collection() {
     // Warm the ordinary metadata-only lookup before measuring the body-open
     // boundary; this changes no read deadline or producer behavior.
     assert_eq!(
-        service.posix_stat(&stat.path).unwrap().object_id,
+        service
+            .posix_stat_distributed(&stat.path)
+            .unwrap()
+            .object_id,
         stat.object_id
     );
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -127,17 +130,17 @@ fn sifs_recursive_clear_follows_directory_symlink_argument() {
         .expect("clear via directory symlink");
 
     assert!(matches!(
-        dfs.posix_read_file(&file_path),
+        dfs.posix_read_file_distributed(&file_path),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
-        dfs.posix_lstat(&link_dir)
+        dfs.posix_lstat_distributed(&link_dir)
             .expect("link survives clear")
             .kind,
         DfsObjectKind::Symlink
     );
     assert!(
-        dfs.posix_list_dir(&real_dir)
+        dfs.posix_list_dir_distributed(&real_dir)
             .expect("real dir survives")
             .is_empty()
     );
@@ -178,15 +181,16 @@ fn sifs_recursive_clear_is_scoped_to_target_subtree() {
         .expect("clear target subtree");
 
     assert!(matches!(
-        dfs.posix_read_file(target_file),
+        dfs.posix_read_file_distributed(target_file),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
-        dfs.posix_read_file(sibling_file).expect("sibling survives"),
+        dfs.posix_read_file_distributed(sibling_file)
+            .expect("sibling survives"),
         sibling_file.as_bytes()
     );
     assert_eq!(
-        dfs.posix_read_file(unrelated_file)
+        dfs.posix_read_file_distributed(unrelated_file)
             .expect("unrelated survives"),
         unrelated_file.as_bytes()
     );
@@ -231,10 +235,15 @@ fn sifs_posix_nonexclusive_create_follows_a_dangling_symlink() {
         (0o640, 7001, 7002)
     );
     assert_eq!(
-        dfs.posix_lstat(link).expect("link remains").kind,
+        dfs.posix_lstat_distributed(link)
+            .expect("link remains")
+            .kind,
         DfsObjectKind::Symlink
     );
-    assert_eq!(dfs.posix_readlink(link).expect("read link"), "target");
+    assert_eq!(
+        dfs.posix_readlink_distributed(link).expect("read link"),
+        "target"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -460,7 +469,9 @@ fn native_mounted_symlink_recreate_with_held_replica_materialization() {
     )
     .expect("initial real symlink is materialized before the hold");
     assert_eq!(
-        writer.lookup_sifs_path(link).unwrap().unwrap().version,
+        node_store_object(&runtime, &writer_node, link)
+            .expect("the writer node's store holds the initial symlink")
+            .version,
         original.version
     );
     let pause = Arc::new(
@@ -699,9 +710,15 @@ fn sifs_posix_create_attrs_are_installed_atomically_and_only_on_create() {
     assert_eq!((link.mode, link.uid, link.gid), (0o777, 1003, 2001));
     assert_eq!(
         (
-            dfs.posix_lstat(link_path).expect("lstat link").mode,
-            dfs.posix_lstat(link_path).expect("lstat link").uid,
-            dfs.posix_lstat(link_path).expect("lstat link").gid,
+            dfs.posix_lstat_distributed(link_path)
+                .expect("lstat link")
+                .mode,
+            dfs.posix_lstat_distributed(link_path)
+                .expect("lstat link")
+                .uid,
+            dfs.posix_lstat_distributed(link_path)
+                .expect("lstat link")
+                .gid,
         ),
         (0o777, 1003, 2001)
     );
@@ -733,7 +750,7 @@ fn sifs_posix_symlink_preserves_target_as_object_content() {
     assert_eq!(stat.kind, DfsObjectKind::Symlink);
     assert_eq!(stat.size_bytes, Some("../shared/lib".len() as u64));
     assert_eq!(
-        dfs.posix_readlink(link_path).expect("readlink"),
+        dfs.posix_readlink_distributed(link_path).expect("readlink"),
         "../shared/lib"
     );
     let owned_link = dfs
@@ -742,20 +759,28 @@ fn sifs_posix_symlink_preserves_target_as_object_content() {
     assert_eq!((owned_link.uid, owned_link.gid), (1001, 1002));
     assert_eq!(
         (
-            dfs.posix_lstat(link_path).expect("owned link lstat").uid,
-            dfs.posix_lstat(link_path).expect("owned link lstat").gid,
+            dfs.posix_lstat_distributed(link_path)
+                .expect("owned link lstat")
+                .uid,
+            dfs.posix_lstat_distributed(link_path)
+                .expect("owned link lstat")
+                .gid,
         ),
         (1001, 1002)
     );
     dfs.posix_set_symlink_times(link_path, Some(12_345), Some(67_890))
         .expect("old symlink times");
-    let before_readlink = dfs.posix_lstat(link_path).expect("before readlink lstat");
+    let before_readlink = dfs
+        .posix_lstat_distributed(link_path)
+        .expect("before readlink lstat");
     assert_eq!(
         dfs.posix_readlink_update_access(link_path)
             .expect("readlink update access"),
         "../shared/lib"
     );
-    let stat = dfs.posix_lstat(link_path).expect("symlink lstat");
+    let stat = dfs
+        .posix_lstat_distributed(link_path)
+        .expect("symlink lstat");
     assert!(stat.accessed_at_unix_nanos > 12_345);
     assert_eq!(stat.modified_at_unix_nanos, 67_890);
     assert_eq!(
@@ -813,25 +838,27 @@ fn sifs_posix_trailing_slash_requires_directory() {
     .expect("symlink file");
 
     assert_eq!(
-        dfs.posix_lstat(link_dir).expect("plain lstat").kind,
+        dfs.posix_lstat_distributed(link_dir)
+            .expect("plain lstat")
+            .kind,
         DfsObjectKind::Symlink
     );
     assert_eq!(
-        dfs.posix_lstat(&format!("{link_dir}/"))
+        dfs.posix_lstat_distributed(&format!("{link_dir}/"))
             .expect("trailing slash lstat follows directory symlink")
             .kind,
         DfsObjectKind::Directory
     );
     assert!(matches!(
-        dfs.posix_read_file(&format!("{file_path}/")),
+        dfs.posix_read_file_distributed(&format!("{file_path}/")),
         Err(DfsPosixError::NotDirectory { .. })
     ));
     assert!(matches!(
-        dfs.posix_read_file(&format!("{link_file}/")),
+        dfs.posix_read_file_distributed(&format!("{link_file}/")),
         Err(DfsPosixError::NotDirectory { .. })
     ));
     assert!(matches!(
-        dfs.posix_readlink(&format!("{link_dir}/")),
+        dfs.posix_readlink_distributed(&format!("{link_dir}/")),
         Err(DfsPosixError::NotSymlink { .. })
     ));
     assert!(matches!(
@@ -871,17 +898,19 @@ fn sifs_posix_trailing_slash_requires_directory() {
         Err(DfsPosixError::IsDirectory { .. })
     ));
     assert_eq!(
-        dfs.posix_lstat(link_dir)
+        dfs.posix_lstat_distributed(link_dir)
             .expect("symlink survives failed unlink")
             .kind,
         DfsObjectKind::Symlink
     );
     assert_eq!(
-        dfs.posix_stat(real_dir).expect("target survives").kind,
+        dfs.posix_stat_distributed(real_dir)
+            .expect("target survives")
+            .kind,
         DfsObjectKind::Directory
     );
     assert_eq!(
-        dfs.posix_list_dir(&format!("{work}/"))
+        dfs.posix_list_dir_distributed(&format!("{work}/"))
             .expect("list with trailing slash")
             .len(),
         4
@@ -894,7 +923,7 @@ fn sifs_posix_trailing_slash_requires_directory() {
     )
     .expect("rename directory to trailing slash missing path");
     assert_eq!(
-        dfs.posix_stat(&format!("{work}/renamed-dir"))
+        dfs.posix_stat_distributed(&format!("{work}/renamed-dir"))
             .expect("renamed directory")
             .kind,
         DfsObjectKind::Directory
@@ -983,7 +1012,7 @@ fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
         0,
         "rename destination checks must stay on the bounded dentry page path with an overlay"
     );
-    assert!(dfs.posix_stat(source).is_ok());
+    assert!(dfs.posix_stat_distributed(source).is_ok());
 
     assert_eq!(runtime.observation_dropped_count(), 0);
     drop(dfs);
@@ -1013,10 +1042,22 @@ fn sifs_posix_stat_reports_directory_link_counts() {
     )
     .expect("write");
 
-    assert_eq!(dfs.posix_stat(parent).expect("parent stat").link_count, 3);
-    assert_eq!(dfs.posix_stat(child_dir).expect("child stat").link_count, 2);
     assert_eq!(
-        dfs.posix_stat(nested_file).expect("file stat").link_count,
+        dfs.posix_stat_distributed(parent)
+            .expect("parent stat")
+            .link_count,
+        3
+    );
+    assert_eq!(
+        dfs.posix_stat_distributed(child_dir)
+            .expect("child stat")
+            .link_count,
+        2
+    );
+    assert_eq!(
+        dfs.posix_stat_distributed(nested_file)
+            .expect("file stat")
+            .link_count,
         1
     );
 
@@ -1048,7 +1089,11 @@ fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
             DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
         )
         .expect("write child");
-        child_object_ids.insert(dfs.posix_stat(&old_path).expect("child stat").object_id);
+        child_object_ids.insert(
+            dfs.posix_stat_distributed(&old_path)
+                .expect("child stat")
+                .object_id,
+        );
         old_paths.push(old_path);
         new_paths.push(new_path);
     }
@@ -1141,10 +1186,13 @@ fn sifs_posix_rename_directory_batches_child_moves_per_job_batch() {
     drop(dfs);
     runtime.stop_node(&node_id).unwrap();
     runtime.reopen_node(node_id.clone()).unwrap();
-    let reopened = runtime.client(&node_id).unwrap();
+    let mut reopened = runtime.client(&node_id).unwrap();
     for new_path in &new_paths {
         assert_eq!(
-            reopened.posix_stat(new_path).expect("reopened child").kind,
+            reopened
+                .posix_stat_distributed(new_path)
+                .expect("reopened child")
+                .kind,
             DfsObjectKind::File
         );
     }
@@ -1178,15 +1226,16 @@ fn sifs_posix_rename_directory_caps_child_move_transactions_above_step_budget() 
         .iter()
         .map(|object| object.object_id.clone())
         .collect::<BTreeSet<_>>();
-    dfs.add_object_metadata_batch(children)
-        .expect("populate child metadata");
     // The bounded producer runs inside its actual owning Core. Fixture setup
-    // above used normal Main routing; that delegating shell cannot run the
-    // private directory-job algorithm or supply its current journal baseline.
+    // above used normal Main routing; that delegating shell keeps no store,
+    // so it can neither publish the child rows directly, run the private
+    // directory-job algorithm nor supply its current journal baseline.
     drop(dfs);
     let mut dfs = runtime
         .metadata_primary_service(old_dir)
         .expect("actual owning Core for the bounded directory rename");
+    dfs.add_object_metadata_batch(children)
+        .expect("populate child metadata");
     let journal_after_sequence = dfs
         .metadata_backend()
         .expect("metadata backend")
@@ -1291,11 +1340,11 @@ fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
         dfs.posix_rename(old_dir, new_dir).expect("rename dir");
 
         assert!(matches!(
-            dfs.posix_read_file(&new_child),
+            dfs.posix_read_file_distributed(&new_child),
             Err(DfsPosixError::NotFound { .. })
         ));
         assert!(
-            dfs.posix_list_dir(new_dir)
+            dfs.posix_list_dir_distributed(new_dir)
                 .expect("new dir listing")
                 .is_empty()
         );
@@ -1303,14 +1352,14 @@ fn sifs_posix_rename_directory_does_not_resurrect_deleted_children() {
 
     runtime.stop_node(&node_id).unwrap();
     runtime.reopen_node(node_id.clone()).unwrap();
-    let reloaded = runtime.client(&node_id).unwrap();
+    let mut reloaded = runtime.client(&node_id).unwrap();
     assert!(matches!(
-        reloaded.posix_read_file(&new_child),
+        reloaded.posix_read_file_distributed(&new_child),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert!(
         reloaded
-            .posix_list_dir(new_dir)
+            .posix_list_dir_distributed(new_dir)
             .expect("reloaded new dir listing")
             .is_empty()
     );
@@ -1334,7 +1383,10 @@ fn sifs_posix_rename_over_existing_file_survives_reload() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("write source");
-    let source_object_id = dfs.posix_stat(source).expect("source stat").object_id;
+    let source_object_id = dfs
+        .posix_stat_distributed(source)
+        .expect("source stat")
+        .object_id;
     dfs.posix_write_file(
         dest,
         b"dest",
@@ -1345,27 +1397,34 @@ fn sifs_posix_rename_over_existing_file_survives_reload() {
     dfs.posix_rename(source, dest).expect("rename over dest");
 
     assert!(matches!(
-        dfs.posix_stat(source),
+        dfs.posix_stat_distributed(source),
         Err(DfsPosixError::NotFound { .. })
     ));
-    assert_eq!(dfs.posix_read_file(dest).expect("read dest"), b"source");
     assert_eq!(
-        dfs.posix_stat(dest).expect("dest stat").object_id,
+        dfs.posix_read_file_distributed(dest).expect("read dest"),
+        b"source"
+    );
+    assert_eq!(
+        dfs.posix_stat_distributed(dest)
+            .expect("dest stat")
+            .object_id,
         source_object_id
     );
 
-    let reloaded = runtime.client(&node_id).unwrap();
+    let mut reloaded = runtime.client(&node_id).unwrap();
     assert!(matches!(
-        reloaded.posix_stat(source),
+        reloaded.posix_stat_distributed(source),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert_eq!(
-        reloaded.posix_read_file(dest).expect("reloaded read dest"),
+        reloaded
+            .posix_read_file_distributed(dest)
+            .expect("reloaded read dest"),
         b"source"
     );
     assert_eq!(
         reloaded
-            .posix_stat(dest)
+            .posix_stat_distributed(dest)
             .expect("reloaded dest stat")
             .object_id,
         source_object_id
@@ -1392,7 +1451,7 @@ fn sifs_posix_set_times_without_fields_is_noop() {
     .expect("write file");
     dfs.posix_set_times(file, Some(12_345), Some(67_890))
         .expect("set baseline times");
-    let before = dfs.posix_stat(file).expect("before stat");
+    let before = dfs.posix_stat_distributed(file).expect("before stat");
 
     let after = dfs
         .posix_set_times(file, None, None)
@@ -1430,9 +1489,12 @@ fn sifs_posix_set_mode_zero_is_reported_as_zero() {
 
     let changed = dfs.posix_set_mode(file, 0).expect("chmod 0000");
     assert_eq!(changed.mode, 0);
-    assert_eq!(dfs.posix_stat(file).expect("stat").mode, 0);
+    assert_eq!(dfs.posix_stat_distributed(file).expect("stat").mode, 0);
     assert!(
-        dfs.posix_stat(file).expect("stat").changed_at_unix_nanos >= changed.changed_at_unix_nanos
+        dfs.posix_stat_distributed(file)
+            .expect("stat")
+            .changed_at_unix_nanos
+            >= changed.changed_at_unix_nanos
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -1653,7 +1715,10 @@ fn sifs_posix_recreate_file_refreshes_creation_metadata() {
     assert!(recreated.accessed_at_unix_nanos > 12_345);
     assert!(recreated.modified_at_unix_nanos > 67_890);
     assert!(recreated.created_at_unix_nanos > 67_890);
-    assert_eq!(dfs.posix_read_file(file_path).expect("read"), b"new");
+    assert_eq!(
+        dfs.posix_read_file_distributed(file_path).expect("read"),
+        b"new"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -1694,7 +1759,9 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
         node_id.clone(),
     );
     dfs.posix_mkdir_all(work).expect("mkdir");
-    let parent_before = dfs.posix_stat(work).expect("parent before bulk create");
+    let parent_before = dfs
+        .posix_stat_distributed(work)
+        .expect("parent before bulk create");
     let stats = dfs
         .posix_create_files_local_eventual_with_known_parents(vec![
             (path_a, b"bulk create alpha".as_slice()),
@@ -1708,14 +1775,16 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
     assert_eq!(stats[1].path, path_b);
     assert_eq!(stats[1].current_locations, vec![node_id]);
     assert_eq!(
-        dfs.posix_read_file(path_a).expect("read a"),
+        dfs.posix_read_file_distributed(path_a).expect("read a"),
         b"bulk create alpha"
     );
     assert_eq!(
-        dfs.posix_read_file(path_b).expect("read b"),
+        dfs.posix_read_file_distributed(path_b).expect("read b"),
         b"bulk create beta"
     );
-    let parent_after = dfs.posix_stat(work).expect("parent after bulk create");
+    let parent_after = dfs
+        .posix_stat_distributed(work)
+        .expect("parent after bulk create");
     assert_ne!(
         parent_after.version, parent_before.version,
         "bulk create should advance the parent directory metadata version"
@@ -1736,7 +1805,8 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
         "create-only batch must reject existing paths"
     );
     assert_eq!(
-        dfs.posix_read_file(path_a).expect("read unchanged a"),
+        dfs.posix_read_file_distributed(path_a)
+            .expect("read unchanged a"),
         b"bulk create alpha"
     );
 
@@ -1749,7 +1819,8 @@ fn sifs_posix_create_bulk_local_eventual_rejects_existing_paths() {
         .expect("bulk recreate tombstoned path");
     assert_eq!(recreated.len(), 1);
     assert_eq!(
-        dfs.posix_read_file(path_a).expect("read recreated a"),
+        dfs.posix_read_file_distributed(path_a)
+            .expect("read recreated a"),
         b"bulk recreate alpha"
     );
 
@@ -1788,7 +1859,7 @@ fn sifs_posix_list_updates_directory_atime_without_changing_mtime() {
         vec!["file.txt"]
     );
 
-    let stat = dfs.posix_stat(dir_path).expect("stat");
+    let stat = dfs.posix_stat_distributed(dir_path).expect("stat");
     assert!(stat.accessed_at_unix_nanos > 12_345);
     assert_eq!(stat.modified_at_unix_nanos, 67_890);
 
@@ -1816,7 +1887,9 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
 
     dfs.posix_set_times(work, Some(12_345), Some(67_890))
         .expect("old work times");
-    let before_create = dfs.posix_stat(work).expect("work before create");
+    let before_create = dfs
+        .posix_stat_distributed(work)
+        .expect("work before create");
     std::thread::sleep(std::time::Duration::from_millis(1));
     dfs.posix_write_file(
         file,
@@ -1824,7 +1897,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
         DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("create file");
-    let after_create = dfs.posix_stat(work).expect("work after create");
+    let after_create = dfs.posix_stat_distributed(work).expect("work after create");
     assert!(after_create.modified_at_unix_nanos > 67_890);
     assert!(
         after_create.changed_at_unix_nanos > before_create.changed_at_unix_nanos,
@@ -1840,7 +1913,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
     )
     .expect("overwrite file");
     assert_eq!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after overwrite")
             .modified_at_unix_nanos,
         67_890,
@@ -1849,7 +1922,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
 
     dfs.posix_hardlink(file, alias).expect("hardlink");
     assert!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after hardlink")
             .modified_at_unix_nanos
             > 67_890
@@ -1864,7 +1937,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
     )
     .expect("symlink");
     assert!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after symlink")
             .modified_at_unix_nanos
             > 67_890
@@ -1874,7 +1947,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
         .expect("reset work times");
     dfs.posix_mkdir(dir).expect("mkdir child");
     assert!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after mkdir")
             .modified_at_unix_nanos
             > 67_890
@@ -1884,7 +1957,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
         .expect("reset work times");
     dfs.posix_rmdir(dir).expect("rmdir child");
     assert!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after rmdir")
             .modified_at_unix_nanos
             > 67_890
@@ -1894,7 +1967,7 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
         .expect("reset work times");
     dfs.posix_unlink(alias).expect("unlink alias");
     assert!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after unlink")
             .modified_at_unix_nanos
             > 67_890
@@ -1906,13 +1979,13 @@ fn sifs_posix_namespace_mutations_update_parent_directory_mtime() {
         .expect("old other times");
     dfs.posix_rename(file, renamed).expect("rename across dirs");
     assert!(
-        dfs.posix_stat(work)
+        dfs.posix_stat_distributed(work)
             .expect("work after rename")
             .modified_at_unix_nanos
             > 67_890
     );
     assert!(
-        dfs.posix_stat(other)
+        dfs.posix_stat_distributed(other)
             .expect("other after rename")
             .modified_at_unix_nanos
             > 88_888
@@ -1943,9 +2016,9 @@ fn sifs_posix_rename_updates_moved_object_ctime_without_changing_mtime() {
     dfs.posix_set_times(source, Some(12_345), Some(67_890))
         .expect("old source times");
 
-    let before = dfs.posix_stat(source).expect("before stat");
+    let before = dfs.posix_stat_distributed(source).expect("before stat");
     dfs.posix_rename(source, renamed).expect("rename");
-    let after = dfs.posix_stat(renamed).expect("after stat");
+    let after = dfs.posix_stat_distributed(renamed).expect("after stat");
 
     assert_eq!(after.object_id, before.object_id);
     assert_eq!(after.created_at_unix_nanos, before.created_at_unix_nanos);
@@ -2055,7 +2128,7 @@ fn sifs_cluster_posix_contract_create_unlink_same_path_race() {
             )
         })
     });
-    let final_stat = cluster.primary.posix_stat(path);
+    let final_stat = cluster.primary.posix_stat_distributed(path);
     match final_stat {
         Ok(stat) => assert_eq!(
             stat.content_hash.as_deref(),
@@ -2069,13 +2142,10 @@ fn sifs_cluster_posix_contract_create_unlink_same_path_race() {
         &mut cluster,
         "create/unlink replica convergence",
         |cluster| {
-            matches!(
-                cluster.primary.posix_stat(path),
-                Err(DfsPosixError::NotFound { .. })
-            ) == matches!(
-                cluster.observer.posix_stat(path),
-                Err(DfsPosixError::NotFound { .. })
-            )
+            // The observer node's store converges to the primary's outcome.
+            let runtime = &cluster._runtime;
+            node_store_object(runtime, &cluster.primary_node, path).is_none()
+                == node_store_object(runtime, &cluster.observer_node, path).is_none()
         },
     );
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
@@ -2094,10 +2164,15 @@ fn sifs_cluster_posix_contract_same_directory_concurrent_creates() {
         &mut cluster,
         "same-directory parent catch-up",
         |cluster| {
-            cluster.writer.posix_stat(dir).is_ok() && cluster.observer.posix_stat(dir).is_ok()
+            let runtime = &cluster._runtime;
+            node_store_object(runtime, &cluster.writer_node, dir).is_some()
+                && node_store_object(runtime, &cluster.observer_node, dir).is_some()
         },
     );
-    let before = cluster.primary.posix_stat(dir).expect("parent before");
+    let before = cluster
+        .primary
+        .posix_stat_distributed(dir)
+        .expect("parent before");
 
     let mut requests = Vec::new();
     for (index, node, service) in [
@@ -2136,11 +2211,14 @@ fn sifs_cluster_posix_contract_same_directory_concurrent_creates() {
         (0..2).all(|index| {
             cluster
                 .primary
-                .posix_stat(&format!("{dir}/child-{index}.txt"))
+                .posix_stat_distributed(&format!("{dir}/child-{index}.txt"))
                 .is_ok()
         }) && requests_settled
     });
-    let after = cluster.primary.posix_stat(dir).expect("parent after");
+    let after = cluster
+        .primary
+        .posix_stat_distributed(dir)
+        .expect("parent after");
     assert!(
         after.modified_at_unix_nanos >= before.modified_at_unix_nanos
             && after.changed_at_unix_nanos >= before.changed_at_unix_nanos
@@ -2152,10 +2230,12 @@ fn sifs_cluster_posix_contract_same_directory_concurrent_creates() {
         "same-directory creates publish",
         |cluster| {
             (0..2).all(|index| {
-                cluster
-                    .observer
-                    .posix_stat(&format!("{dir}/child-{index}.txt"))
-                    .is_ok()
+                node_store_object(
+                    &cluster._runtime,
+                    &cluster.observer_node,
+                    &format!("{dir}/child-{index}.txt"),
+                )
+                .is_some()
             })
         },
     );
@@ -2223,18 +2303,22 @@ fn sifs_cluster_posix_contract_same_path_concurrent_creates() {
                 Ok(NetworkedDfsWriteOutcome::Pending { .. })
             )
         });
-        writer_settled && observer_settled && cluster.primary.posix_stat(path).is_ok()
+        writer_settled && observer_settled && cluster.primary.posix_stat_distributed(path).is_ok()
     });
-    let entries = cluster
-        .primary
-        .posix_list_dir("/users")
-        .expect("primary list");
+    // The primary's own store holds exactly one live dentry for the path.
+    let entries = node_store_children(&cluster._runtime, &cluster.primary_node, "/users");
     assert_eq!(
-        entries.iter().filter(|entry| entry.path == path).count(),
+        entries
+            .iter()
+            .filter(|(name, _, _)| format!("/users/{name}") == path)
+            .count(),
         1,
         "same-path create race must leave one dentry: {entries:?}"
     );
-    let stat = cluster.primary.posix_stat(path).expect("winner stat");
+    let stat = cluster
+        .primary
+        .posix_stat_distributed(path)
+        .expect("winner stat");
     assert!(
         [content_hash(&writer_bytes), content_hash(&observer_bytes)]
             .contains(stat.content_hash.as_ref().expect("winner hash")),
@@ -2283,8 +2367,8 @@ fn sifs_cluster_posix_contract_rmdir_vs_child_create() {
     sifs_posix_cluster_pump_until(&mut cluster, "rmdir/create settle", |cluster| {
         sifs_routed_writes_settled(&cluster.writer)
     });
-    let dir_present = cluster.primary.posix_stat(dir).is_ok();
-    let child_present = cluster.primary.posix_stat(child).is_ok();
+    let dir_present = cluster.primary.posix_stat_distributed(dir).is_ok();
+    let child_present = cluster.primary.posix_stat_distributed(child).is_ok();
     assert!(
         (dir_present && child_present) || (!dir_present && !child_present),
         "must not leave an orphan child under a removed directory"
@@ -2333,9 +2417,9 @@ fn sifs_posix_rmdir_rejects_child_from_fresh_shared_metadata_handle() {
         Err(DfsPosixError::DirectoryNotEmpty { .. })
     ));
 
-    let verifier = runtime.client(&node).unwrap();
-    assert!(verifier.posix_stat(dir).is_ok());
-    assert!(verifier.posix_stat(child).is_ok());
+    let mut verifier = runtime.client(&node).unwrap();
+    assert!(verifier.posix_stat_distributed(dir).is_ok());
+    assert!(verifier.posix_stat_distributed(child).is_ok());
 }
 
 #[test]
@@ -2360,7 +2444,7 @@ fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handl
     let mut remover = runtime.client(&node).unwrap();
 
     let live_changed_at = remover
-        .posix_lstat(dir)
+        .posix_lstat_distributed(dir)
         .expect("live directory stat")
         .changed_at_unix_nanos;
     let removed = remover.posix_rmdir(dir).expect("rmdir commits first");
@@ -2379,14 +2463,14 @@ fn sifs_posix_child_create_rejects_parent_removed_by_fresh_shared_metadata_handl
             | Err(DfsPosixError::Dfs(_))
     ));
 
-    let verifier = runtime.client(&node).unwrap();
-    let verifier_dir = verifier.posix_stat(dir);
+    let mut verifier = runtime.client(&node).unwrap();
+    let verifier_dir = verifier.posix_stat_distributed(dir);
     assert!(
         matches!(verifier_dir, Err(DfsPosixError::NotFound { .. })),
         "removed parent resurrected after rejected child create: {verifier_dir:?}"
     );
     assert!(matches!(
-        verifier.posix_stat(child),
+        verifier.posix_stat_distributed(child),
         Err(DfsPosixError::NotFound { .. })
     ));
 }
@@ -2448,11 +2532,11 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
         "directory rename should serialize with child mutation: {rename:?}"
     );
     assert!(matches!(
-        replica.posix_stat("/users/contract-proj"),
+        replica.posix_stat_distributed("/users/contract-proj"),
         Err(DfsPosixError::NotFound { .. })
     ));
-    let old_child = replica.posix_stat("/users/contract-proj/during.txt");
-    let new_child = replica.posix_stat("/services/contract-proj/during.txt");
+    let old_child = replica.posix_stat_distributed("/users/contract-proj/during.txt");
+    let new_child = replica.posix_stat_distributed("/services/contract-proj/during.txt");
     assert!(
         old_child.is_ok() ^ new_child.is_ok(),
         "child mutation must resolve under exactly one subtree"
@@ -2462,8 +2546,7 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
         _runtime,
         root,
         users_primary_node,
-        services_primary_node: NodeId::from_legacy_named("node_contract_dir_services")
-            .expect("node"),
+        services_primary_node,
         replica_node,
         shared_kv,
         users_primary,
@@ -2472,14 +2555,9 @@ fn sifs_cluster_posix_contract_directory_rename_while_child_mutations_run() {
         rejections: Vec::new(),
     };
     sifs_two_primary_publish_until(&mut cluster, "dir rename child convergence", |cluster| {
-        cluster
-            .replica
-            .posix_stat("/services/contract-proj")
-            .is_ok()
-            && matches!(
-                cluster.replica.posix_stat("/users/contract-proj"),
-                Err(DfsPosixError::NotFound { .. })
-            )
+        let runtime = &cluster._runtime;
+        node_store_object(runtime, &cluster.replica_node, "/services/contract-proj").is_some()
+            && node_store_object(runtime, &cluster.replica_node, "/users/contract-proj").is_none()
     });
     assert_two_primary_no_posix_leaks(&cluster, scenario);
     finish_posix_observations(&observations);
@@ -2500,10 +2578,14 @@ fn sifs_cluster_posix_contract_paged_list_while_directory_mutates() {
             format!("payload {index}").as_bytes(),
         );
     }
-    let first = cluster
-        .primary
-        .posix_list_dir_page(dir, None, 5)
-        .expect("first page");
+    // Paged listing reads the primary's own store; its delegating client
+    // keeps no local view to page through.
+    let pager = cluster
+        ._runtime
+        .metadata_primary_service(dir)
+        .expect("store-backed primary for the paged walk");
+    assert_eq!(pager.node_id(), &cluster.primary_node);
+    let first = pager.posix_list_dir_page(dir, None, 5).expect("first page");
     record_posix_observation(
         &mut observations,
         scenario,
@@ -2526,8 +2608,7 @@ fn sifs_cluster_posix_contract_paged_list_while_directory_mutates() {
         assert!(seen.insert(entry.path), "duplicate entry in first page");
     }
     while let Some(after) = cursor {
-        let page = cluster
-            .primary
+        let page = pager
             .posix_list_dir_page(dir, Some(&after), 5)
             .expect("next page");
         for entry in &page.entries {
@@ -2543,7 +2624,11 @@ fn sifs_cluster_posix_contract_paged_list_while_directory_mutates() {
         }
         cursor = page.next_cursor;
     }
-    let final_entries = cluster.primary.posix_list_dir(dir).expect("final list");
+    drop(pager);
+    let final_entries = cluster
+        .primary
+        .posix_list_dir_distributed(dir)
+        .expect("final list");
     assert!(
         final_entries
             .iter()
@@ -2650,7 +2735,7 @@ fn exact_namespace_projection_collapse_keeps_only_shard_runtime_state() {
         )
         .expect("publish through the normal service");
     let object = service
-        .current_read_object_metadata(&stat.object_id)
+        .current_read_object_metadata_distributed(&stat.object_id)
         .expect("actual committed object");
     let resident = {
         let cache_slot = crate::runtime_message::dfs_runtime_message_cache()
@@ -2833,7 +2918,10 @@ fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
     );
 
     // The primary's visible metadata must reference the winner's bytes.
-    let primary_stat = cluster.primary.posix_stat(path).expect("primary stat");
+    let primary_stat = cluster
+        .primary
+        .posix_stat_distributed(path)
+        .expect("primary stat");
     assert_eq!(
         primary_stat.content_hash.as_deref(),
         Some(winner_hash.as_str())
@@ -2888,7 +2976,7 @@ fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
     sifs_posix_cluster_pump_until(&mut cluster, "truncate shrink commit", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(shrunk_hash.as_str()))
     });
     assert_eq!(
@@ -2901,7 +2989,7 @@ fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
     assert_eq!(
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .expect("shrunk stat")
             .size_bytes,
         Some(8)
@@ -2919,7 +3007,7 @@ fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
     sifs_posix_cluster_pump_until(&mut cluster, "truncate extend commit", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(extended_hash.as_str()))
     });
     assert_eq!(
@@ -2954,8 +3042,9 @@ fn sifs_cluster_posix_rename_replicates_atomically_to_observers() {
     // replay has to move/replace existing replica records rather than start
     // from an empty namespace.
     sifs_cluster_publish_metadata_until(&mut cluster, "pre-rename catch-up", |cluster| {
-        cluster.observer.posix_stat(source).is_ok()
-            && cluster.observer.posix_stat(destination).is_ok()
+        let runtime = &cluster._runtime;
+        node_store_object(runtime, &cluster.observer_node, source).is_some()
+            && node_store_object(runtime, &cluster.observer_node, destination).is_some()
     });
 
     let renamed_stat = cluster
@@ -2972,39 +3061,36 @@ fn sifs_cluster_posix_rename_replicates_atomically_to_observers() {
     assert_eq!(
         cluster
             .primary
-            .posix_stat(destination)
+            .posix_stat_distributed(destination)
             .expect("primary destination stat")
             .content_hash
             .as_deref(),
         Some(source_hash.as_str())
     );
     assert!(matches!(
-        cluster.primary.posix_stat(source),
+        cluster.primary.posix_stat_distributed(source),
         Err(DfsPosixError::NotFound { .. })
     ));
 
-    // Replicas converge to the same post-rename namespace.
+    // Replica stores converge to the same post-rename namespace.
     sifs_cluster_publish_metadata_until(&mut cluster, "post-rename catch-up", |cluster| {
-        let destination_current = cluster
-            .observer
-            .posix_stat(destination)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(source_hash.as_str()));
-        let source_gone = matches!(
-            cluster.observer.posix_stat(source),
-            Err(DfsPosixError::NotFound { .. })
-        );
+        let runtime = &cluster._runtime;
+        let destination_current =
+            node_store_content_hash(runtime, &cluster.observer_node, destination)
+                .is_some_and(|hash| hash == source_hash);
+        let source_gone = node_store_object(runtime, &cluster.observer_node, source).is_none();
         destination_current && source_gone
     });
-    let entries = cluster
-        .observer
-        .posix_list_dir("/users")
-        .expect("observer list after rename");
+    let entries = node_store_children(&cluster._runtime, &cluster.observer_node, "/users")
+        .into_iter()
+        .map(|(name, _, _)| format!("/users/{name}"))
+        .collect::<Vec<_>>();
     assert!(
-        entries.iter().any(|entry| entry.path == destination),
+        entries.iter().any(|entry| entry == destination),
         "observer must list the rename destination: {entries:?}"
     );
     assert!(
-        !entries.iter().any(|entry| entry.path == source),
+        !entries.iter().any(|entry| entry == source),
         "observer must not list the rename source after replay: {entries:?}"
     );
 
@@ -3024,10 +3110,12 @@ fn sifs_cluster_posix_directory_rename_moves_children_on_observers() {
     sifs_cluster_primary_posix_write(&mut cluster, "/users/project-a/notes.txt", &child_bytes);
 
     sifs_cluster_publish_metadata_until(&mut cluster, "pre-dir-rename catch-up", |cluster| {
-        cluster
-            .observer
-            .posix_stat("/users/project-a/notes.txt")
-            .is_ok()
+        node_store_object(
+            &cluster._runtime,
+            &cluster.observer_node,
+            "/users/project-a/notes.txt",
+        )
+        .is_some()
     });
 
     cluster
@@ -3037,36 +3125,43 @@ fn sifs_cluster_posix_directory_rename_moves_children_on_observers() {
     assert_eq!(
         cluster
             .primary
-            .posix_stat("/users/project-b/notes.txt")
+            .posix_stat_distributed("/users/project-b/notes.txt")
             .expect("primary child stat")
             .content_hash
             .as_deref(),
         Some(child_hash.as_str())
     );
     assert!(matches!(
-        cluster.primary.posix_stat("/users/project-a"),
+        cluster.primary.posix_stat_distributed("/users/project-a"),
         Err(DfsPosixError::NotFound { .. })
     ));
 
     sifs_cluster_publish_metadata_until(&mut cluster, "post-dir-rename catch-up", |cluster| {
-        let child_moved = cluster
-            .observer
-            .posix_stat("/users/project-b/notes.txt")
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(child_hash.as_str()));
-        let old_dir_gone = matches!(
-            cluster.observer.posix_stat("/users/project-a"),
-            Err(DfsPosixError::NotFound { .. })
-        );
+        let runtime = &cluster._runtime;
+        let child_moved = node_store_content_hash(
+            runtime,
+            &cluster.observer_node,
+            "/users/project-b/notes.txt",
+        )
+        .is_some_and(|hash| hash == child_hash);
+        let old_dir_gone =
+            node_store_object(runtime, &cluster.observer_node, "/users/project-a").is_none();
         child_moved && old_dir_gone
     });
-    assert!(matches!(
-        cluster.observer.posix_stat("/users/project-a/notes.txt"),
-        Err(DfsPosixError::NotFound { .. })
-    ));
-    let stat = cluster
-        .observer
-        .posix_stat("/users/project-b")
-        .expect("observer renamed dir stat");
+    assert!(
+        node_store_object(
+            &cluster._runtime,
+            &cluster.observer_node,
+            "/users/project-a/notes.txt"
+        )
+        .is_none()
+    );
+    let stat = node_store_object(
+        &cluster._runtime,
+        &cluster.observer_node,
+        "/users/project-b",
+    )
+    .expect("observer renamed dir stat");
     assert_eq!(stat.kind, DfsObjectKind::Directory);
 
     drop(cluster);
@@ -3093,32 +3188,46 @@ fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
         .expect("primary symlink");
 
     sifs_cluster_publish_metadata_until(&mut cluster, "namespace agreement", |cluster| {
-        cluster.observer.posix_lstat(link).is_ok()
-            && cluster.writer.posix_lstat(link).is_ok()
-            && cluster.observer.posix_stat(file_b).is_ok()
-            && cluster.writer.posix_stat(file_b).is_ok()
+        let runtime = &cluster._runtime;
+        node_store_object(runtime, &cluster.observer_node, link).is_some()
+            && node_store_object(runtime, &cluster.writer_node, link).is_some()
+            && node_store_object(runtime, &cluster.observer_node, file_b).is_some()
+            && node_store_object(runtime, &cluster.writer_node, file_b).is_some()
     });
 
-    let primary_entries = cluster.primary.posix_list_dir(dir).expect("primary list");
-    let writer_entries = cluster.writer.posix_list_dir(dir).expect("writer list");
-    let observer_entries = cluster.observer.posix_list_dir(dir).expect("observer list");
-    let names = |entries: &[DfsDirEntry]| {
-        entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.name.clone(),
-                    entry.kind.clone(),
-                    entry.object_id.clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(names(&primary_entries), names(&writer_entries));
-    assert_eq!(names(&primary_entries), names(&observer_entries));
+    // Every node's store holds the same namespace identity as the primary's,
+    // and the primary caller's listing projects that same identity.
+    let primary_entries = cluster
+        .primary
+        .posix_list_dir_distributed(dir)
+        .expect("primary list");
+    let mut names = primary_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.clone(),
+                entry.kind.clone(),
+                entry.object_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    names.sort_by(|left, right| left.0.cmp(&right.0));
+    let primary_store = node_store_children(&cluster._runtime, &cluster.primary_node, dir);
+    assert_eq!(names, primary_store);
+    assert_eq!(
+        primary_store,
+        node_store_children(&cluster._runtime, &cluster.writer_node, dir)
+    );
+    assert_eq!(
+        primary_store,
+        node_store_children(&cluster._runtime, &cluster.observer_node, dir)
+    );
 
     for path in [file_a, file_b] {
-        let primary_stat = cluster.primary.posix_stat(path).expect("primary stat");
+        let primary_stat = cluster
+            .primary
+            .posix_stat_distributed(path)
+            .expect("primary stat");
         let listed = primary_entries
             .iter()
             .find(|entry| entry.path == path)
@@ -3140,19 +3249,18 @@ fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
             listed.current_locations, primary_stat.current_locations,
             "listed placement {path}"
         );
-        for (label, stat) in [
-            (
-                "writer",
-                cluster.writer.posix_stat(path).expect("writer stat"),
-            ),
-            (
-                "observer",
-                cluster.observer.posix_stat(path).expect("observer stat"),
-            ),
+        for (label, node) in [
+            ("writer", &cluster.writer_node),
+            ("observer", &cluster.observer_node),
         ] {
+            let stat = node_store_object(&cluster._runtime, node, path)
+                .unwrap_or_else(|| panic!("{label} stat"));
             assert_eq!(stat.object_id, primary_stat.object_id, "{label} {path}");
             assert_eq!(stat.kind, primary_stat.kind, "{label} {path}");
-            assert_eq!(stat.size_bytes, primary_stat.size_bytes, "{label} {path}");
+            assert_eq!(
+                stat.content_size_bytes, primary_stat.size_bytes,
+                "{label} {path}"
+            );
             assert_eq!(
                 stat.content_hash, primary_stat.content_hash,
                 "{label} {path}"
@@ -3162,25 +3270,25 @@ fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
     }
 
     // lstat reports the symlink itself without needing its content.
-    let observer_lstat = cluster.observer.posix_lstat(link).expect("observer lstat");
+    let observer_lstat = cluster
+        .observer
+        .posix_lstat_distributed(link)
+        .expect("observer lstat");
     assert_eq!(observer_lstat.kind, DfsObjectKind::Symlink);
 
-    // Following the symlink requires its content (the target string); fetch
-    // it to the observer before follow-the-link assertions.
-    cluster
-        .observer
-        .posix_request_remote_read_no_follow(link)
-        .expect("observer symlink remote read");
-    sifs_posix_cluster_pump_until(&mut cluster, "symlink content fetch", |cluster| {
-        cluster.observer.posix_readlink(link).is_ok()
-    });
+    // The observer's caller keeps no local view; its distributed reads fetch
+    // the link content to read the target and to follow the link.
     assert_eq!(
-        cluster.observer.posix_readlink(link).expect("readlink"),
+        cluster
+            .observer
+            .posix_readlink_distributed(link)
+            .expect("readlink"),
         "a.txt"
     );
-
-    // With the link content local, stat follows it to the target file.
-    let observer_stat = cluster.observer.posix_stat(link).expect("observer stat");
+    let observer_stat = cluster
+        .observer
+        .posix_stat_distributed(link)
+        .expect("observer stat");
     assert_eq!(observer_stat.kind, DfsObjectKind::File);
     assert_eq!(observer_stat.size_bytes, Some(a_bytes.len() as u64));
 
@@ -3226,7 +3334,9 @@ fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
         Err(DfsPosixError::NotDirectory { .. })
     ));
     assert!(matches!(
-        cluster.primary.posix_stat("/users/errno-file.txt/"),
+        cluster
+            .primary
+            .posix_stat_distributed("/users/errno-file.txt/"),
         Err(DfsPosixError::NotDirectory { .. })
     ));
 
@@ -3239,7 +3349,9 @@ fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
 
     // ENOENT: reading/statting a missing path; writing under a missing parent.
     assert!(matches!(
-        cluster.primary.posix_read_file("/users/errno-missing.txt"),
+        cluster
+            .primary
+            .posix_read_file_distributed("/users/errno-missing.txt"),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert!(matches!(
@@ -3259,7 +3371,7 @@ fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
         Err(DfsPosixError::InvalidPath { .. })
     ));
     assert!(matches!(
-        cluster.primary.posix_stat("relative/path.txt"),
+        cluster.primary.posix_stat_distributed("relative/path.txt"),
         Err(DfsPosixError::InvalidPath { .. })
     ));
 
@@ -3537,7 +3649,6 @@ fn sifs_non_replica_directory_listing_reads_the_owner_without_ingest() {
     let cluster = sifs_outsider_cluster("sifs-outsider-directory-pull-capture");
     let SifsPosixCluster {
         primary_node,
-        writer_node,
         observer_node,
         mut primary,
         mut observer,
@@ -3565,27 +3676,19 @@ fn sifs_non_replica_directory_listing_reads_the_owner_without_ingest() {
     assert_eq!(config.primary_node_id, primary_node);
     assert!(!config.replica_node_ids.contains(&observer_node));
     assert_ne!(observer_node, primary_node);
-    // Exercise the ordinary embedded Core listing with the same native
-    // backend, owner, provider and daemon peer transport a Main uses.
-    observer.transport = crate::runtime_host::daemon_dfs_node_transport_on_runtime(
-        observer_node.clone(),
-        [primary_node.clone(), writer_node],
-        _runtime.data_dir(&observer_node),
-        crate::test_runtime::executor().handle(),
-    );
+    // The outsider's ordinary caller delegates to its Main and keeps no
+    // store; the node's own store is inspected directly.
+    assert!(observer.transport.delegates_local_namespace_authority());
+    assert!(observer.metadata_backend().is_none());
     let shard = DfsMetadataShardId::new(config.shard_id.clone());
-    let before = observer
-        .metadata_backend()
-        .unwrap()
-        .metadata_prefix_proof(&shard)
-        .unwrap();
-    let progress = observer
-        .metadata_backend()
-        .unwrap()
-        .subscribe_metadata_replica_progress(&shard)
-        .unwrap()
-        .unwrap();
-    let before_generation = progress.latest().map_or(0, |row| row.generation);
+    let node_prefix = || {
+        _runtime
+            .node_metadata(&observer_node)
+            .unwrap()
+            .metadata_prefix_proof(&shard)
+            .unwrap()
+    };
+    let before = node_prefix();
     let listed =
         observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
     let entries = listed
@@ -3597,17 +3700,9 @@ fn sifs_non_replica_directory_listing_reads_the_owner_without_ingest() {
         "a non-replica listing reads its owner and applies no journal"
     );
     assert_eq!(
-        observer
-            .metadata_backend()
-            .unwrap()
-            .metadata_prefix_proof(&shard)
-            .unwrap(),
+        node_prefix(),
         before,
-        "a non-replica listing leaves the local copy of the shard untouched"
-    );
-    assert_eq!(
-        progress.latest().map_or(0, |row| row.generation),
-        before_generation
+        "a non-replica listing leaves the node's copy of the shard untouched"
     );
     drop(observer);
     drop(primary);

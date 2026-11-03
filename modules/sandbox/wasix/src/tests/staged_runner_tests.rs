@@ -1760,7 +1760,7 @@ fn sifs_staged_runner_executes_directly_on_sifs_and_persists_records() {
     let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &sandbox_command_stdout_log_path(&command.response.command_id).expect("stdout"),
                 None,
             )
@@ -1838,17 +1838,17 @@ fn sifs_staged_wasix_path_link_preserves_symlink_object() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let link = SandboxPath::new("/work/link.txt").expect("link");
     let alias = SandboxPath::new("/work/link-alias.txt").expect("alias");
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
-    let alias_metadata = sifs_fs.stat(&alias).expect("alias stat");
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
+    let alias_metadata = sifs_fs.stat_mut(&alias).expect("alias stat");
     assert!(link_metadata.is_symlink);
     assert!(alias_metadata.is_symlink);
     assert_eq!(link_metadata.inode, alias_metadata.inode);
     assert_eq!(alias_metadata.link_count, 2);
     assert_eq!(
-        sifs_fs.readlink(&alias).expect("alias readlink"),
+        sifs_fs.readlink_mut(&alias).expect("alias readlink"),
         PathBuf::from("target.txt")
     );
 
@@ -1915,17 +1915,17 @@ fn sifs_staged_wasix_path_link_follow_symlink_links_target_object() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target).expect("target stat");
-    let alias_metadata = sifs_fs.stat(&alias).expect("alias stat");
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target).expect("target stat");
+    let alias_metadata = sifs_fs.stat_mut(&alias).expect("alias stat");
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
     assert!(!alias_metadata.is_symlink);
     assert_eq!(target_metadata.inode, alias_metadata.inode);
     assert_eq!(target_metadata.link_count, 2);
     assert_eq!(alias_metadata.link_count, 2);
     assert!(link_metadata.is_symlink);
     assert_eq!(link_metadata.link_count, 1);
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias read"), b"target");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias read"), b"target");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -2059,14 +2059,14 @@ fn sifs_staged_wasix_path_link_across_mount_boundary_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&SandboxPath::new("/work/alias.txt").expect("alias")),
+        sifs_fs.stat_mut(&SandboxPath::new("/work/alias.txt").expect("alias")),
         Err(SandboxFsError::NotFound { .. })
     ));
-    let dfs = sifs_fs.into_inner();
+    let mut dfs = sifs_fs.into_inner();
     assert_eq!(
-        dfs.posix_stat(shared_file).expect("source stat").link_count,
+        dfs.posix_stat_distributed(shared_file).expect("source stat").link_count,
         1
     );
 
@@ -2161,8 +2161,8 @@ fn sifs_staged_wasix_readlink_and_lstat_work_on_hardlinked_symlink() {
     assert_eq!(command.response.exit_status, 0);
     let mut sifs_store = SifsSandboxInstanceStore::new(lstat_outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let metadata = sifs_fs.stat_unchecked(&alias).expect("alias stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let metadata = sifs_fs.stat_unchecked_mut(&alias).expect("alias stat");
     assert!(metadata.accessed_at_unix_nanos > 12_345);
     assert_eq!(metadata.modified_at_unix_nanos, 67_890);
 
@@ -2326,9 +2326,9 @@ fn sifs_staged_wasix_fd_filestat_reports_sifs_ctime() {
     sifs_fs.ensure_workspace().expect("workspace");
     let path = SandboxPath::new("/work/ctime.txt").expect("path");
     sifs_fs.write(&path, b"metadata").expect("write file");
-    let before = sifs_fs.stat(&path).expect("before stat");
+    let before = sifs_fs.stat_mut(&path).expect("before stat");
     sifs_fs.set_mode(&path, 0o600).expect("chmod changes ctime");
-    let after = sifs_fs.stat(&path).expect("after stat");
+    let after = sifs_fs.stat_mut(&path).expect("after stat");
     assert_eq!(
         after.created_at_unix_nanos, before.created_at_unix_nanos,
         "chmod must not change birth time"
@@ -2401,8 +2401,8 @@ fn sifs_staged_wasix_fd_filestat_reports_link_added_after_open() {
     sifs_fs
         .set_times(&original, Some(23_456), Some(78_901))
         .expect("old original times");
-    let work_before = sifs_fs.stat(&work).expect("work before link");
-    let original_before = sifs_fs.stat(&original).expect("original before link");
+    let work_before = sifs_fs.stat_mut(&work).expect("work before link");
+    let original_before = sifs_fs.stat_mut(&original).expect("original before link");
     std::thread::sleep(std::time::Duration::from_millis(1));
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -2430,10 +2430,10 @@ fn sifs_staged_wasix_fd_filestat_reports_link_added_after_open() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let alias = SandboxPath::new("/work/alias.txt").expect("alias");
-    let work_after = sifs_fs.stat(&work).expect("work after link");
-    let original_after = sifs_fs.stat(&original).expect("original after link");
+    let work_after = sifs_fs.stat_mut(&work).expect("work after link");
+    let original_after = sifs_fs.stat_mut(&original).expect("original after link");
     assert_eq!(
         original_after.modified_at_unix_nanos, original_before.modified_at_unix_nanos,
         "adding a hardlink must not change file content mtime"
@@ -2443,7 +2443,7 @@ fn sifs_staged_wasix_fd_filestat_reports_link_added_after_open() {
         "adding a hardlink must advance the target inode ctime"
     );
     assert_eq!(original_after.link_count, 2);
-    assert_eq!(sifs_fs.stat(&alias).expect("alias stat").link_count, 2);
+    assert_eq!(sifs_fs.stat_mut(&alias).expect("alias stat").link_count, 2);
     assert!(
         work_after.modified_at_unix_nanos > work_before.modified_at_unix_nanos,
         "adding a directory entry must advance parent directory mtime"
@@ -2499,9 +2499,9 @@ fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
     sifs_fs
         .set_times(&source, Some(32_345), Some(87_890))
         .expect("old source times");
-    let source_dir_before = sifs_fs.stat(&source_dir).expect("source dir before link");
-    let target_dir_before = sifs_fs.stat(&target_dir).expect("target dir before link");
-    let source_before = sifs_fs.stat(&source).expect("source before link");
+    let source_dir_before = sifs_fs.stat_mut(&source_dir).expect("source dir before link");
+    let target_dir_before = sifs_fs.stat_mut(&target_dir).expect("target dir before link");
+    let source_before = sifs_fs.stat_mut(&source).expect("source before link");
     std::thread::sleep(std::time::Duration::from_millis(1));
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -2530,10 +2530,10 @@ fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let source_after = sifs_fs.stat(&source).expect("source after link");
-    let alias_after = sifs_fs.stat(&alias).expect("alias after link");
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias read"), b"shared");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let source_after = sifs_fs.stat_mut(&source).expect("source after link");
+    let alias_after = sifs_fs.stat_mut(&alias).expect("alias after link");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias read"), b"shared");
     assert_eq!(source_after.inode, alias_after.inode);
     assert_eq!(source_after.link_count, 2);
     assert_eq!(alias_after.link_count, 2);
@@ -2545,7 +2545,7 @@ fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
         source_after.changed_at_unix_nanos > source_before.changed_at_unix_nanos,
         "relative hardlink must advance source inode ctime"
     );
-    let source_dir_after = sifs_fs.stat(&source_dir).expect("source dir after link");
+    let source_dir_after = sifs_fs.stat_mut(&source_dir).expect("source dir after link");
     assert_eq!(
         source_dir_after.modified_at_unix_nanos, source_dir_before.modified_at_unix_nanos,
         "hardlink creation must not mutate the source directory mtime"
@@ -2554,7 +2554,7 @@ fn sifs_staged_wasix_relative_hardlink_between_directory_fds_updates_sifs() {
         source_dir_after.changed_at_unix_nanos, source_dir_before.changed_at_unix_nanos,
         "hardlink creation must not mutate the source directory ctime"
     );
-    let target_dir_after = sifs_fs.stat(&target_dir).expect("target dir after link");
+    let target_dir_after = sifs_fs.stat_mut(&target_dir).expect("target dir after link");
     assert!(
         target_dir_after.modified_at_unix_nanos > target_dir_before.modified_at_unix_nanos,
         "relative hardlink must advance target directory mtime"
@@ -2625,12 +2625,12 @@ fn sifs_staged_wasix_fd_filestat_refreshes_size_after_alias_write() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&original, None).expect("original"),
+        sifs_fs.read_mut(&original, None).expect("original"),
         b"expanded"
     );
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"expanded");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias"), b"expanded");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -2696,18 +2696,18 @@ fn sifs_staged_wasix_write_through_hardlink_updates_shared_sifs_object() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let original = SandboxPath::new("/work/original.txt").expect("original");
     let alias = SandboxPath::new("/work/alias.txt").expect("alias");
-    assert_eq!(sifs_fs.read(&original, None).expect("original"), b"created");
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"created");
+    assert_eq!(sifs_fs.read_mut(&original, None).expect("original"), b"created");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias"), b"created");
     assert_eq!(
-        sifs_fs.stat(&original).expect("original stat").link_count,
+        sifs_fs.stat_mut(&original).expect("original stat").link_count,
         2
     );
     assert_eq!(
-        sifs_fs.stat(&original).expect("original inode").inode,
-        sifs_fs.stat(&alias).expect("alias inode").inode
+        sifs_fs.stat_mut(&original).expect("original inode").inode,
+        sifs_fs.stat_mut(&alias).expect("alias inode").inode
     );
 
     fs::remove_dir_all(sifs_root).ok();
@@ -2784,10 +2784,10 @@ fn sifs_staged_wasix_resource_failure_preserves_live_hardlink_write() {
     let record =
         load_command_record(&mut sifs_fs, &manifest.command_history[0]).expect("resource record");
     assert_eq!(record.status, SandboxCommandRecordStatus::ResourceExhausted);
-    assert_eq!(sifs_fs.read(&original, None).expect("original"), b"created");
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"created");
-    let original_stat = sifs_fs.stat(&original).expect("original stat");
-    let alias_stat = sifs_fs.stat(&alias).expect("alias stat");
+    assert_eq!(sifs_fs.read_mut(&original, None).expect("original"), b"created");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias"), b"created");
+    let original_stat = sifs_fs.stat_mut(&original).expect("original stat");
+    let alias_stat = sifs_fs.stat_mut(&alias).expect("alias stat");
     assert_eq!(original_stat.inode, alias_stat.inode);
     assert_eq!(original_stat.link_count, 2);
     assert_eq!(alias_stat.link_count, 2);
@@ -2857,13 +2857,13 @@ fn sifs_staged_wasix_resource_failure_preserves_created_directories() {
     let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/generated").expect("generated"))
+            .stat_mut(&SandboxPath::new("/work/generated").expect("generated"))
             .expect("generated directory remains visible")
             .is_dir
     );
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/generated/out.txt").expect("generated file"),
                 None,
             )
@@ -2943,10 +2943,10 @@ fn sifs_staged_wasix_resource_failure_preserves_replaced_directory() {
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
     let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let replaced_metadata = sifs_fs.stat(&replaced_path).expect("replaced path remains");
+    let replaced_metadata = sifs_fs.stat_mut(&replaced_path).expect("replaced path remains");
     assert!(replaced_metadata.is_dir);
     assert_eq!(
-        sifs_fs.read(&child_path, None).expect("replacement child"),
+        sifs_fs.read_mut(&child_path, None).expect("replacement child"),
         b"created"
     );
     assert_eq!(manifest.command_history.len(), 1);
@@ -3121,23 +3121,23 @@ fn sifs_staged_wasix_hardlink_write_replicates_shared_object_to_candidate_node()
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     let original = SandboxPath::new("/work/original.txt").expect("original");
     let alias = SandboxPath::new("/work/alias.txt").expect("alias");
 
     assert_eq!(
-        replica_fs.read(&original, None).expect("replica original"),
+        replica_fs.read_mut(&original, None).expect("replica original"),
         b"created"
     );
     assert_eq!(
-        replica_fs.read(&alias, None).expect("replica alias"),
+        replica_fs.read_mut(&alias, None).expect("replica alias"),
         b"created"
     );
     assert_eq!(
-        replica_fs.stat(&original).expect("original stat").inode,
-        replica_fs.stat(&alias).expect("alias stat").inode
+        replica_fs.stat_mut(&original).expect("original stat").inode,
+        replica_fs.stat_mut(&alias).expect("alias stat").inode
     );
-    assert_eq!(replica_fs.stat(&alias).expect("alias nlink").link_count, 2);
+    assert_eq!(replica_fs.stat_mut(&alias).expect("alias nlink").link_count, 2);
 
     fs::remove_dir_all(runtime_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3200,15 +3200,15 @@ fn sifs_staged_wasix_append_through_hardlink_preserves_existing_shared_content()
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let original = SandboxPath::new("/work/original.txt").expect("original");
     let alias = SandboxPath::new("/work/alias.txt").expect("alias");
     assert_eq!(
-        sifs_fs.read(&original, None).expect("original"),
+        sifs_fs.read_mut(&original, None).expect("original"),
         b"base-appended"
     );
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"base-appended");
-    assert_eq!(sifs_fs.stat(&alias).expect("alias nlink").link_count, 2);
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias"), b"base-appended");
+    assert_eq!(sifs_fs.stat_mut(&alias).expect("alias nlink").link_count, 2);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3277,9 +3277,9 @@ fn sifs_staged_wasix_metadata_changes_through_hardlink_update_shared_object() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let original_stat = sifs_fs.stat(&original).expect("original stat");
-    let alias_stat = sifs_fs.stat(&alias).expect("alias stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let original_stat = sifs_fs.stat_mut(&original).expect("original stat");
+    let alias_stat = sifs_fs.stat_mut(&alias).expect("alias stat");
     assert_eq!(original_stat.inode, alias_stat.inode);
     assert_eq!(original_stat.link_count, 2);
     assert_eq!(original_stat.mode, 0o750);
@@ -3397,15 +3397,15 @@ fn sifs_staged_wasix_metadata_changes_replicate_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
-    let stat = replica_fs.stat(&file).expect("replica stat");
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let stat = replica_fs.stat_mut(&file).expect("replica stat");
     assert_eq!(stat.mode, 0o640);
     assert_eq!(stat.uid, 1001);
     assert_eq!(stat.gid, 1002);
     assert_eq!(stat.accessed_at_unix_nanos, 12_345);
     assert_eq!(stat.modified_at_unix_nanos, 67_890);
     assert_eq!(
-        replica_fs.read(&file, None).expect("replica read"),
+        replica_fs.read_mut(&file, None).expect("replica read"),
         b"content"
     );
 
@@ -3464,12 +3464,12 @@ fn sifs_staged_wasix_chmod_read_only_file_denies_write() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("file content"),
+        sifs_fs.read_mut(&file, None).expect("file content"),
         b"original"
     );
-    assert_eq!(sifs_fs.stat(&file).expect("stat").mode, 0o444);
+    assert_eq!(sifs_fs.stat_mut(&file).expect("stat").mode, 0o444);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3529,14 +3529,14 @@ fn sifs_staged_wasix_write_only_file_allows_write() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read_unchecked(&file, None)
+            .read_unchecked_mut(&file, None)
             .expect("file content after write"),
         b"created"
     );
-    assert_eq!(sifs_fs.stat_unchecked(&file).expect("stat").mode, 0o222);
+    assert_eq!(sifs_fs.stat_unchecked_mut(&file).expect("stat").mode, 0o222);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3596,14 +3596,14 @@ fn sifs_staged_wasix_write_only_file_allows_append() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read_unchecked(&file, None)
+            .read_unchecked_mut(&file, None)
             .expect("file content after append"),
         b"original-appended"
     );
-    assert_eq!(sifs_fs.stat_unchecked(&file).expect("stat").mode, 0o222);
+    assert_eq!(sifs_fs.stat_unchecked_mut(&file).expect("stat").mode, 0o222);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3658,9 +3658,9 @@ fn sifs_staged_wasix_seek_end_observes_second_descriptor_append() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("file content"),
+        sifs_fs.read_mut(&file, None).expect("file content"),
         b"oldBC",
         "SEEK_END must use the current SIFS object length, not the descriptor's stale cached length"
     );
@@ -3719,9 +3719,9 @@ fn sifs_staged_wasix_append_tell_uses_current_backing_size() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&path, None).expect("read append tell result"),
+        sifs_fs.read_mut(&path, None).expect("read append tell result"),
         b"abc\0\0\0\0\0\0ZA",
         "append writes must use the current SIFS EOF even after another descriptor extends the file"
     );
@@ -3783,9 +3783,9 @@ fn sifs_staged_wasix_open_descriptor_keeps_write_right_after_chmod() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.read_unchecked(&file, None).expect("file"), b"oldX");
-    assert_eq!(sifs_fs.stat_unchecked(&file).expect("stat").mode, 0);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.read_unchecked_mut(&file, None).expect("file"), b"oldX");
+    assert_eq!(sifs_fs.stat_unchecked_mut(&file).expect("stat").mode, 0);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3844,8 +3844,8 @@ fn sifs_staged_wasix_open_descriptor_keeps_read_right_after_chmod() {
     assert_eq!(command.stdout, b"readable");
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.stat_unchecked(&file).expect("stat").mode, 0);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.stat_unchecked_mut(&file).expect("stat").mode, 0);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3905,12 +3905,12 @@ fn sifs_staged_wasix_chmod_read_only_directory_denies_create() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&child).expect_err("child must not exist"),
+        sifs_fs.stat_mut(&child).expect_err("child must not exist"),
         SandboxFsError::NotFound { .. }
     ));
-    assert_eq!(sifs_fs.stat(&dir).expect("dir stat").mode, 0o555);
+    assert_eq!(sifs_fs.stat_mut(&dir).expect("dir stat").mode, 0o555);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -3974,10 +3974,10 @@ fn sifs_staged_wasix_directory_without_execute_denies_child_open() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.stat(&dir).expect("dir stat").mode, 0o666);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.stat_mut(&dir).expect("dir stat").mode, 0o666);
     assert_eq!(
-        sifs_fs.stat_unchecked(&child).expect("child stat").mode,
+        sifs_fs.stat_unchecked_mut(&child).expect("child stat").mode,
         0o644,
         "denied open must not change child metadata"
     );
@@ -4040,8 +4040,8 @@ fn sifs_staged_wasix_fd_read_updates_sifs_atime() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let metadata = sifs_fs.stat_unchecked(&path).expect("stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let metadata = sifs_fs.stat_unchecked_mut(&path).expect("stat");
     assert!(metadata.accessed_at_unix_nanos > 12_345);
     assert_eq!(metadata.modified_at_unix_nanos, 67_890);
 
@@ -4080,7 +4080,7 @@ fn sifs_staged_wasix_path_set_times_without_flags_is_noop() {
     sifs_fs
         .set_times(&path, Some(12_345), Some(67_890))
         .expect("set baseline times");
-    let before = sifs_fs.stat_unchecked(&path).expect("before stat");
+    let before = sifs_fs.stat_unchecked_mut(&path).expect("before stat");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -4108,8 +4108,8 @@ fn sifs_staged_wasix_path_set_times_without_flags_is_noop() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let after = sifs_fs.stat_unchecked(&path).expect("after stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let after = sifs_fs.stat_unchecked_mut(&path).expect("after stat");
     assert_eq!(after.accessed_at_unix_nanos, before.accessed_at_unix_nanos);
     assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
     assert_eq!(
@@ -4152,7 +4152,7 @@ fn sifs_staged_wasix_fd_set_times_without_flags_is_noop() {
     sifs_fs
         .set_times(&path, Some(12_345), Some(67_890))
         .expect("set baseline times");
-    let before = sifs_fs.stat_unchecked(&path).expect("before stat");
+    let before = sifs_fs.stat_unchecked_mut(&path).expect("before stat");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -4175,8 +4175,8 @@ fn sifs_staged_wasix_fd_set_times_without_flags_is_noop() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let after = sifs_fs.stat_unchecked(&path).expect("after stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let after = sifs_fs.stat_unchecked_mut(&path).expect("after stat");
     assert_eq!(after.accessed_at_unix_nanos, before.accessed_at_unix_nanos);
     assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
     assert_eq!(
@@ -4240,8 +4240,8 @@ fn sifs_staged_wasix_create_updates_parent_directory_mtime() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let metadata = sifs_fs.stat_unchecked(&work).expect("stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let metadata = sifs_fs.stat_unchecked_mut(&work).expect("stat");
     assert!(metadata.modified_at_unix_nanos > 67_890);
 
     fs::remove_dir_all(sifs_root).ok();
@@ -4303,8 +4303,8 @@ fn sifs_staged_wasix_readdir_updates_sifs_atime() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let metadata = sifs_fs.stat_unchecked(&dir).expect("stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let metadata = sifs_fs.stat_unchecked_mut(&dir).expect("stat");
     assert!(metadata.accessed_at_unix_nanos > 12_345);
     assert_eq!(metadata.modified_at_unix_nanos, 67_890);
 
@@ -4344,7 +4344,7 @@ fn sifs_staged_wasix_readdir_reports_sifs_entry_inodes() {
         .write(&original, b"same object")
         .expect("write original");
     sifs_fs.hard_link(&original, &alias).expect("hardlink");
-    let expected_inode = sifs_fs.stat(&original).expect("original stat").inode;
+    let expected_inode = sifs_fs.stat_mut(&original).expect("original stat").inode;
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -4430,12 +4430,12 @@ fn sifs_staged_wasix_readdir_does_not_report_unlinked_cached_child() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&stale),
+        sifs_fs.stat_mut(&stale),
         Err(SandboxFsError::NotFound { .. })
     ));
-    assert_eq!(sifs_fs.read(&kept, None).expect("kept"), b"kept");
+    assert_eq!(sifs_fs.read_mut(&kept, None).expect("kept"), b"kept");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -4479,7 +4479,7 @@ fn sifs_staged_wasix_unlinks_file_through_nested_manifest_mount() {
         .write(&original, b"mounted")
         .expect("write original");
     assert_eq!(
-        sifs_fs.read(&mirror, None).expect("mirror read"),
+        sifs_fs.read_mut(&mirror, None).expect("mirror read"),
         b"mounted"
     );
 
@@ -4504,13 +4504,13 @@ fn sifs_staged_wasix_unlinks_file_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&original),
+        sifs_fs.stat_mut(&original),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        sifs_fs.stat(&mirror),
+        sifs_fs.stat_mut(&mirror),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -4558,7 +4558,7 @@ fn sifs_staged_wasix_renames_file_through_nested_manifest_mount() {
         .write(&original, b"mounted")
         .expect("write original");
     assert_eq!(
-        sifs_fs.read(&mirror_source, None).expect("mirror read"),
+        sifs_fs.read_mut(&mirror_source, None).expect("mirror read"),
         b"mounted"
     );
 
@@ -4583,18 +4583,18 @@ fn sifs_staged_wasix_renames_file_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&original),
+        sifs_fs.stat_mut(&original),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        sifs_fs.stat(&mirror_source),
+        sifs_fs.stat_mut(&mirror_source),
         Err(SandboxFsError::NotFound { .. })
     ));
-    assert_eq!(sifs_fs.read(&renamed, None).expect("renamed"), b"mounted");
+    assert_eq!(sifs_fs.read_mut(&renamed, None).expect("renamed"), b"mounted");
     assert_eq!(
-        sifs_fs.read(&mirror_renamed, None).expect("mirror renamed"),
+        sifs_fs.read_mut(&mirror_renamed, None).expect("mirror renamed"),
         b"mounted"
     );
 
@@ -4663,19 +4663,19 @@ fn sifs_staged_wasix_hardlinks_file_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let original_stat = sifs_fs.stat(&original).expect("original stat");
-    let alias_stat = sifs_fs.stat(&alias).expect("alias stat");
-    let mirror_source_stat = sifs_fs.stat(&mirror_source).expect("mirror source stat");
-    let mirror_alias_stat = sifs_fs.stat(&mirror_alias).expect("mirror alias stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let original_stat = sifs_fs.stat_mut(&original).expect("original stat");
+    let alias_stat = sifs_fs.stat_mut(&alias).expect("alias stat");
+    let mirror_source_stat = sifs_fs.stat_mut(&mirror_source).expect("mirror source stat");
+    let mirror_alias_stat = sifs_fs.stat_mut(&mirror_alias).expect("mirror alias stat");
     assert_eq!(original_stat.inode, alias_stat.inode);
     assert_eq!(original_stat.inode, mirror_source_stat.inode);
     assert_eq!(original_stat.inode, mirror_alias_stat.inode);
     assert_eq!(original_stat.link_count, 2);
     assert_eq!(alias_stat.link_count, 2);
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"mounted");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias"), b"mounted");
     assert_eq!(
-        sifs_fs.read(&mirror_alias, None).expect("mirror alias"),
+        sifs_fs.read_mut(&mirror_alias, None).expect("mirror alias"),
         b"mounted"
     );
 
@@ -4737,16 +4737,16 @@ fn sifs_staged_wasix_creates_directory_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/created-dir").expect("work dir"))
+            .stat_mut(&SandboxPath::new("/work/created-dir").expect("work dir"))
             .expect("work dir stat")
             .is_dir
     );
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/opt/mirror/created-dir").expect("mirror dir"))
+            .stat_mut(&SandboxPath::new("/opt/mirror/created-dir").expect("mirror dir"))
             .expect("mirror dir stat")
             .is_dir
     );
@@ -4790,7 +4790,7 @@ fn sifs_staged_wasix_removes_directory_through_nested_manifest_mount() {
     let dir = SandboxPath::new("/work/empty-dir").expect("dir");
     let mirror = SandboxPath::new("/opt/mirror/empty-dir").expect("mirror");
     sifs_fs.create_dir(&dir).expect("create dir");
-    assert!(sifs_fs.stat(&mirror).expect("mirror stat").is_dir);
+    assert!(sifs_fs.stat_mut(&mirror).expect("mirror stat").is_dir);
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -4813,13 +4813,13 @@ fn sifs_staged_wasix_removes_directory_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&dir),
+        sifs_fs.stat_mut(&dir),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert!(matches!(
-        sifs_fs.stat(&mirror),
+        sifs_fs.stat_mut(&mirror),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -4863,7 +4863,7 @@ fn sifs_staged_wasix_updates_metadata_through_nested_manifest_mount() {
     let mirror = SandboxPath::new("/opt/mirror/metadata.txt").expect("mirror");
     sifs_fs.write(&original, b"metadata").expect("write file");
     assert_eq!(
-        sifs_fs.read(&mirror, None).expect("mirror read"),
+        sifs_fs.read_mut(&mirror, None).expect("mirror read"),
         b"metadata"
     );
 
@@ -4895,9 +4895,9 @@ fn sifs_staged_wasix_updates_metadata_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let original_stat = sifs_fs.stat(&original).expect("original stat");
-    let mirror_stat = sifs_fs.stat(&mirror).expect("mirror stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let original_stat = sifs_fs.stat_mut(&original).expect("original stat");
+    let mirror_stat = sifs_fs.stat_mut(&mirror).expect("mirror stat");
     assert_eq!(original_stat.mode & 0o777, 0o640);
     assert_eq!(mirror_stat.mode & 0o777, 0o640);
     assert_eq!(original_stat.uid, 1001);
@@ -4989,18 +4989,18 @@ fn sifs_staged_wasix_symlink_and_readlink_through_nested_manifest_mount() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(readlink_outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
-    let mirror_metadata = sifs_fs.stat(&mirror_link).expect("mirror link stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
+    let mirror_metadata = sifs_fs.stat_mut(&mirror_link).expect("mirror link stat");
     assert!(link_metadata.is_symlink);
     assert!(mirror_metadata.is_symlink);
     assert_eq!(link_metadata.inode, mirror_metadata.inode);
     assert_eq!(
-        sifs_fs.readlink(&link).expect("link readlink"),
+        sifs_fs.readlink_mut(&link).expect("link readlink"),
         PathBuf::from("target.txt")
     );
     assert_eq!(
-        sifs_fs.readlink(&mirror_link).expect("mirror readlink"),
+        sifs_fs.readlink_mut(&mirror_link).expect("mirror readlink"),
         PathBuf::from("target.txt")
     );
 
@@ -5040,7 +5040,7 @@ fn sifs_staged_wasix_fd_filestat_refreshes_open_directory_after_mkdir() {
     sifs_fs
         .set_times(&dir, Some(12_345), Some(67_890))
         .expect("old dir times");
-    let before = sifs_fs.stat(&dir).expect("dir before");
+    let before = sifs_fs.stat_mut(&dir).expect("dir before");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -5063,9 +5063,9 @@ fn sifs_staged_wasix_fd_filestat_refreshes_open_directory_after_mkdir() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert!(sifs_fs.stat(&child).expect("child stat").is_dir);
-    let after = sifs_fs.stat(&dir).expect("dir after");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert!(sifs_fs.stat_mut(&child).expect("child stat").is_dir);
+    let after = sifs_fs.stat_mut(&dir).expect("dir after");
     assert!(
         after.modified_at_unix_nanos > before.modified_at_unix_nanos,
         "creating a child must advance directory mtime in SIFS"
@@ -5250,7 +5250,7 @@ fn sifs_staged_wasix_nested_system_mount_keeps_read_only_mode() {
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module_with_stdin_limits_output_sink_and_abi(
             sifs_store.into_inner(),
             &local_store,
@@ -5269,7 +5269,7 @@ fn sifs_staged_wasix_nested_system_mount_keeps_read_only_mode() {
     assert_eq!(
         outcome
             .dfs
-            .posix_read_file("/services/sandbox/toolchains/pkg/tool.txt")
+            .posix_read_file_distributed("/services/sandbox/toolchains/pkg/tool.txt")
             .expect("tool file"),
         b"tool",
         "read-only nested SIFS mount must not be modified through its generated system parent"
@@ -5308,8 +5308,8 @@ fn sifs_staged_wasix_readdir_reports_sifs_dot_and_parent_inodes() {
     let work = SandboxPath::new("/work").expect("work");
     let dir = SandboxPath::new("/work/listed").expect("dir");
     sifs_fs.create_dir(&dir).expect("create dir");
-    let expected_dir_inode = sifs_fs.stat(&dir).expect("dir stat").inode;
-    let expected_parent_inode = sifs_fs.stat(&work).expect("work stat").inode;
+    let expected_dir_inode = sifs_fs.stat_mut(&dir).expect("dir stat").inode;
+    let expected_parent_inode = sifs_fs.stat_mut(&work).expect("work stat").inode;
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -5395,10 +5395,10 @@ fn sifs_staged_wasix_directory_without_read_denies_readdir() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.stat(&dir).expect("dir stat").mode, 0o111);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.stat_mut(&dir).expect("dir stat").mode, 0o111);
     assert_eq!(
-        sifs_fs.stat(&child).expect("child stat").mode,
+        sifs_fs.stat_mut(&child).expect("child stat").mode,
         0o644,
         "search-only directory should still permit child lookup"
     );
@@ -5439,7 +5439,7 @@ fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
     sifs_fs
         .write(&original, b"canonical-content")
         .expect("write original");
-    let original_inode = sifs_fs.stat(&original).expect("original stat").inode;
+    let original_inode = sifs_fs.stat_mut(&original).expect("original stat").inode;
     sifs_fs
         .hard_link(&original, &alias)
         .expect("hardlink alias");
@@ -5449,8 +5449,8 @@ fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
     sifs_fs
         .set_times(&original, Some(23_456), Some(78_901))
         .expect("old original times");
-    let work_before = sifs_fs.stat(&work).expect("work before unlink");
-    let object_before = sifs_fs.stat(&alias).expect("alias before unlink");
+    let work_before = sifs_fs.stat_mut(&work).expect("work before unlink");
+    let object_before = sifs_fs.stat_mut(&alias).expect("alias before unlink");
     std::thread::sleep(std::time::Duration::from_millis(1));
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -5474,16 +5474,16 @@ fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&original),
+        sifs_fs.stat_mut(&original),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
     assert_eq!(
-        sifs_fs.read(&alias, None).expect("read promoted alias"),
+        sifs_fs.read_mut(&alias, None).expect("read promoted alias"),
         b"canonical-content"
     );
-    let alias_stat = sifs_fs.stat(&alias).expect("alias stat");
+    let alias_stat = sifs_fs.stat_mut(&alias).expect("alias stat");
     assert_eq!(alias_stat.inode, original_inode);
     assert_eq!(alias_stat.link_count, 1);
     assert_eq!(
@@ -5494,7 +5494,7 @@ fn sifs_staged_wasix_unlink_canonical_hardlink_promotes_remaining_alias() {
         alias_stat.changed_at_unix_nanos > object_before.changed_at_unix_nanos,
         "removing a hardlink must advance the surviving inode ctime"
     );
-    let work_after = sifs_fs.stat(&work).expect("work after unlink");
+    let work_after = sifs_fs.stat_mut(&work).expect("work after unlink");
     assert!(
         work_after.modified_at_unix_nanos > work_before.modified_at_unix_nanos,
         "removing a directory entry must advance parent directory mtime"
@@ -5539,7 +5539,7 @@ fn sifs_staged_wasix_rename_hardlink_alias_over_canonical_preserves_target() {
     sifs_fs
         .write(&canonical, b"canonical-content")
         .expect("write canonical");
-    let canonical_inode = sifs_fs.stat(&canonical).expect("canonical stat").inode;
+    let canonical_inode = sifs_fs.stat_mut(&canonical).expect("canonical stat").inode;
     sifs_fs
         .hard_link(&canonical, &alias)
         .expect("hardlink alias");
@@ -5565,17 +5565,17 @@ fn sifs_staged_wasix_rename_hardlink_alias_over_canonical_preserves_target() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let alias_stat = sifs_fs.stat(&alias).expect("alias remains");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let alias_stat = sifs_fs.stat_mut(&alias).expect("alias remains");
     assert_eq!(
-        sifs_fs.read(&canonical, None).expect("canonical remains"),
+        sifs_fs.read_mut(&canonical, None).expect("canonical remains"),
         b"canonical-content"
     );
     assert_eq!(
-        sifs_fs.read(&alias, None).expect("alias remains"),
+        sifs_fs.read_mut(&alias, None).expect("alias remains"),
         b"canonical-content"
     );
-    let canonical_stat = sifs_fs.stat(&canonical).expect("canonical stat");
+    let canonical_stat = sifs_fs.stat_mut(&canonical).expect("canonical stat");
     assert_eq!(canonical_stat.inode, canonical_inode);
     assert_eq!(alias_stat.inode, canonical_inode);
     assert_eq!(canonical_stat.link_count, 2);
@@ -5619,12 +5619,12 @@ fn sifs_staged_wasix_rename_hardlink_over_other_canonical_preserves_both_targets
     sifs_fs
         .hard_link(&source, &source_alias)
         .expect("source hardlink");
-    let source_inode = sifs_fs.stat(&source).expect("source stat").inode;
+    let source_inode = sifs_fs.stat_mut(&source).expect("source stat").inode;
     sifs_fs.write(&dest, b"dest").expect("write dest");
     sifs_fs
         .hard_link(&dest, &dest_alias)
         .expect("dest hardlink");
-    let dest_inode = sifs_fs.stat(&dest).expect("dest stat").inode;
+    let dest_inode = sifs_fs.stat_mut(&dest).expect("dest stat").inode;
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -5647,24 +5647,24 @@ fn sifs_staged_wasix_rename_hardlink_over_other_canonical_preserves_both_targets
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&source_alias),
+        sifs_fs.stat_mut(&source_alias),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
-    let source_stat = sifs_fs.stat(&source).expect("source remains");
-    let renamed_stat = sifs_fs.stat(&dest).expect("renamed source alias");
-    let dest_alias_stat = sifs_fs.stat(&dest_alias).expect("dest alias remains");
+    let source_stat = sifs_fs.stat_mut(&source).expect("source remains");
+    let renamed_stat = sifs_fs.stat_mut(&dest).expect("renamed source alias");
+    let dest_alias_stat = sifs_fs.stat_mut(&dest_alias).expect("dest alias remains");
     assert_eq!(source_stat.inode, source_inode);
     assert_eq!(renamed_stat.inode, source_inode);
     assert_eq!(source_stat.link_count, 2);
     assert_eq!(renamed_stat.link_count, 2);
     assert_eq!(dest_alias_stat.inode, dest_inode);
     assert_eq!(dest_alias_stat.link_count, 1);
-    assert_eq!(sifs_fs.read(&source, None).expect("read source"), b"source");
-    assert_eq!(sifs_fs.read(&dest, None).expect("read renamed"), b"source");
+    assert_eq!(sifs_fs.read_mut(&source, None).expect("read source"), b"source");
+    assert_eq!(sifs_fs.read_mut(&dest, None).expect("read renamed"), b"source");
     assert_eq!(
-        sifs_fs.read(&dest_alias, None).expect("read dest alias"),
+        sifs_fs.read_mut(&dest_alias, None).expect("read dest alias"),
         b"dest"
     );
 
@@ -5701,7 +5701,7 @@ fn sifs_staged_wasix_rename_over_existing_file_survives_sifs_reload() {
     let source = SandboxPath::new("/work/source.txt").expect("source");
     let dest = SandboxPath::new("/work/dest.txt").expect("dest");
     sifs_fs.write(&source, b"source").expect("write source");
-    let source_inode = sifs_fs.stat(&source).expect("source stat").inode;
+    let source_inode = sifs_fs.stat_mut(&source).expect("source stat").inode;
     sifs_fs.write(&dest, b"dest").expect("write dest");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -5725,15 +5725,15 @@ fn sifs_staged_wasix_rename_over_existing_file_survives_sifs_reload() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&source),
+        sifs_fs.stat_mut(&source),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
-    let dest_stat = sifs_fs.stat(&dest).expect("dest survives reload");
+    let dest_stat = sifs_fs.stat_mut(&dest).expect("dest survives reload");
     assert_eq!(dest_stat.inode, source_inode);
     assert_eq!(dest_stat.link_count, 1);
-    assert_eq!(sifs_fs.read(&dest, None).expect("read dest"), b"source");
+    assert_eq!(sifs_fs.read_mut(&dest, None).expect("read dest"), b"source");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -5768,7 +5768,7 @@ fn sifs_staged_wasix_open_descriptor_write_follows_rename() {
     let old_path = SandboxPath::new("/work/old.txt").expect("old");
     let new_path = SandboxPath::new("/work/new.txt").expect("new");
     sifs_fs.write(&old_path, b"old").expect("write file");
-    let old_inode = sifs_fs.stat(&old_path).expect("old stat").inode;
+    let old_inode = sifs_fs.stat_mut(&old_path).expect("old stat").inode;
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -5791,16 +5791,16 @@ fn sifs_staged_wasix_open_descriptor_write_follows_rename() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&old_path),
+        sifs_fs.stat_mut(&old_path),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
     assert_eq!(
-        sifs_fs.read(&new_path, None).expect("new file"),
+        sifs_fs.read_mut(&new_path, None).expect("new file"),
         b"old-renamed"
     );
-    assert_eq!(sifs_fs.stat(&new_path).expect("new stat").inode, old_inode);
+    assert_eq!(sifs_fs.stat_mut(&new_path).expect("new stat").inode, old_inode);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -5840,7 +5840,7 @@ fn sifs_staged_wasix_open_replaced_destination_reads_original_file() {
     sifs_fs
         .write(&target_path, b"target")
         .expect("write target");
-    let target_inode = sifs_fs.stat(&target_path).expect("target stat").inode;
+    let target_inode = sifs_fs.stat_mut(&target_path).expect("target stat").inode;
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -5868,17 +5868,17 @@ fn sifs_staged_wasix_open_replaced_destination_reads_original_file() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&source_path),
+        sifs_fs.stat_mut(&source_path),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
     assert_eq!(
-        sifs_fs.read(&target_path, None).expect("replacement"),
+        sifs_fs.read_mut(&target_path, None).expect("replacement"),
         b"source"
     );
     assert_ne!(
-        sifs_fs.stat(&target_path).expect("replacement stat").inode,
+        sifs_fs.stat_mut(&target_path).expect("replacement stat").inode,
         target_inode
     );
 
@@ -5947,9 +5947,9 @@ fn sifs_staged_wasix_fd_set_times_after_replacement_does_not_touch_new_path() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target_path).expect("target stat");
-    assert_eq!(sifs_fs.read(&target_path, None).expect("target"), b"source");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target_path).expect("target stat");
+    assert_eq!(sifs_fs.read_mut(&target_path, None).expect("target"), b"source");
     assert_ne!(
         target_metadata.modified_at_unix_nanos, 67_890,
         "fd set_times for the replaced destination must not mutate the replacement path"
@@ -6021,9 +6021,9 @@ fn sifs_staged_wasix_fd_touch_after_replacement_does_not_touch_new_path() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target_path).expect("target stat");
-    assert_eq!(sifs_fs.read(&target_path, None).expect("target"), b"source");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target_path).expect("target stat");
+    assert_eq!(sifs_fs.read_mut(&target_path, None).expect("target"), b"source");
     assert_eq!(
         target_metadata.modified_at_unix_nanos, 22_222,
         "fd_touch for the replaced destination must not mutate the replacement path"
@@ -6160,11 +6160,11 @@ fn sifs_staged_wasix_fd_chmod_chown_after_replacement_do_not_touch_new_path() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target_path).expect("target stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target_path).expect("target stat");
     assert_ne!(target_metadata.mode, 0o600);
     assert_ne!((target_metadata.uid, target_metadata.gid), (1234, 5678));
-    assert_eq!(sifs_fs.read(&target_path, None).expect("target"), b"source");
+    assert_eq!(sifs_fs.read_mut(&target_path, None).expect("target"), b"source");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -6222,7 +6222,7 @@ fn sifs_staged_wasix_hardlink_unlink_promotion_replicates_to_candidate_node() {
     owner_fs
         .write(&original, b"canonical-content")
         .expect("write original");
-    let original_inode = owner_fs.stat(&original).expect("original stat").inode;
+    let original_inode = owner_fs.stat_mut(&original).expect("original stat").inode;
     owner_fs
         .hard_link(&original, &alias)
         .expect("hardlink alias");
@@ -6264,19 +6264,19 @@ fn sifs_staged_wasix_hardlink_unlink_promotion_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
 
     assert!(matches!(
-        replica_fs.stat(&original),
+        replica_fs.stat_mut(&original),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
     assert_eq!(
         replica_fs
-            .read(&alias, None)
+            .read_mut(&alias, None)
             .expect("replica promoted alias"),
         b"canonical-content"
     );
-    let alias_stat = replica_fs.stat(&alias).expect("replica alias stat");
+    let alias_stat = replica_fs.stat_mut(&alias).expect("replica alias stat");
     assert_eq!(alias_stat.inode, original_inode);
     assert_eq!(alias_stat.link_count, 1);
 
@@ -6334,7 +6334,7 @@ fn sifs_staged_wasix_hardlink_rename_replacement_replicates_to_candidate_node() 
     owner_fs
         .write(&canonical, b"canonical-content")
         .expect("write canonical");
-    let canonical_inode = owner_fs.stat(&canonical).expect("canonical stat").inode;
+    let canonical_inode = owner_fs.stat_mut(&canonical).expect("canonical stat").inode;
     owner_fs
         .hard_link(&canonical, &alias)
         .expect("hardlink alias");
@@ -6376,20 +6376,20 @@ fn sifs_staged_wasix_hardlink_rename_replacement_replicates_to_candidate_node() 
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
 
-    let alias_stat = replica_fs.stat(&alias).expect("replica alias remains");
+    let alias_stat = replica_fs.stat_mut(&alias).expect("replica alias remains");
     assert_eq!(
         replica_fs
-            .read(&canonical, None)
+            .read_mut(&canonical, None)
             .expect("replica canonical"),
         b"canonical-content"
     );
     assert_eq!(
-        replica_fs.read(&alias, None).expect("replica alias"),
+        replica_fs.read_mut(&alias, None).expect("replica alias"),
         b"canonical-content"
     );
-    let canonical_stat = replica_fs.stat(&canonical).expect("replica canonical stat");
+    let canonical_stat = replica_fs.stat_mut(&canonical).expect("replica canonical stat");
     assert_eq!(canonical_stat.inode, canonical_inode);
     assert_eq!(alias_stat.inode, canonical_inode);
     assert_eq!(canonical_stat.link_count, 2);
@@ -6457,12 +6457,12 @@ fn sifs_staged_wasix_truncate_through_hardlink_updates_shared_sifs_object() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let original = SandboxPath::new("/work/original.txt").expect("original");
     let alias = SandboxPath::new("/work/alias.txt").expect("alias");
-    assert_eq!(sifs_fs.read(&original, None).expect("original"), b"abc");
-    assert_eq!(sifs_fs.read(&alias, None).expect("alias"), b"abc");
-    assert_eq!(sifs_fs.stat(&alias).expect("alias stat").link_count, 2);
+    assert_eq!(sifs_fs.read_mut(&original, None).expect("original"), b"abc");
+    assert_eq!(sifs_fs.read_mut(&alias, None).expect("alias"), b"abc");
+    assert_eq!(sifs_fs.stat_mut(&alias).expect("alias stat").link_count, 2);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -6523,9 +6523,9 @@ fn sifs_staged_wasix_open_file_survives_unlink_without_resurrection() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.read(&SandboxPath::new("/work/unlinked.txt").expect("file"), None),
+        sifs_fs.read_mut(&SandboxPath::new("/work/unlinked.txt").expect("file"), None),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
 
@@ -6617,7 +6617,7 @@ fn sifs_staged_wasix_open_file_survives_unlink_and_recreate() {
     sifs_fs.ensure_workspace().expect("workspace");
     let file = SandboxPath::new("/work/recreated.txt").expect("file");
     sifs_fs.write(&file, b"old").expect("write file");
-    let old_inode = sifs_fs.stat(&file).expect("old stat").inode;
+    let old_inode = sifs_fs.stat_mut(&file).expect("old stat").inode;
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -6641,9 +6641,9 @@ fn sifs_staged_wasix_open_file_survives_unlink_and_recreate() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.read(&file, None).expect("new file"), b"new");
-    assert_ne!(sifs_fs.stat(&file).expect("new stat").inode, old_inode);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.read_mut(&file, None).expect("new file"), b"new");
+    assert_ne!(sifs_fs.stat_mut(&file).expect("new stat").inode, old_inode);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -6709,12 +6709,12 @@ fn sifs_staged_wasix_path_unlink_removes_symlink_from_sifs() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let link = SandboxPath::new("/work/link.txt").expect("link");
-    assert!(sifs_fs.stat(&link).is_err());
+    assert!(sifs_fs.stat_mut(&link).is_err());
     assert_eq!(
         sifs_fs
-            .read(&SandboxPath::new("/work/target.txt").expect("target"), None,)
+            .read_mut(&SandboxPath::new("/work/target.txt").expect("target"), None,)
             .expect("target"),
         b"target"
     );
@@ -6777,16 +6777,16 @@ fn sifs_staged_wasix_path_symlink_creates_sifs_symlink() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let link = SandboxPath::new("/work/link.txt").expect("link");
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(
-        sifs_fs.readlink(&link).expect("link readlink"),
+        sifs_fs.readlink_mut(&link).expect("link readlink"),
         PathBuf::from("target.txt")
     );
     assert_eq!(
-        sifs_fs.read(&link, None).expect("read through link"),
+        sifs_fs.read_mut(&link, None).expect("read through link"),
         b"target"
     );
 
@@ -6848,10 +6848,10 @@ fn sifs_staged_wasix_exclusive_create_rejects_existing_symlink() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
     assert!(link_metadata.is_symlink);
-    assert_eq!(sifs_fs.read(&target, None).expect("target"), b"target");
+    assert_eq!(sifs_fs.read_mut(&target, None).expect("target"), b"target");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -6910,15 +6910,15 @@ fn sifs_staged_wasix_exclusive_create_rejects_dangling_symlink() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(
-        sifs_fs.readlink(&link).expect("link target"),
+        sifs_fs.readlink_mut(&link).expect("link target"),
         PathBuf::from("missing.txt")
     );
     assert!(matches!(
-        sifs_fs.stat(&missing),
+        sifs_fs.stat_mut(&missing),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
 
@@ -6980,9 +6980,9 @@ fn sifs_staged_wasix_link_operations_do_not_create_missing_parents() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(symlink_outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&SandboxPath::new("/work/missing").expect("missing parent")),
+        sifs_fs.stat_mut(&SandboxPath::new("/work/missing").expect("missing parent")),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -7005,14 +7005,14 @@ fn sifs_staged_wasix_link_operations_do_not_create_missing_parents() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(link_outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&SandboxPath::new("/work/missing").expect("missing parent")),
+        sifs_fs.stat_mut(&SandboxPath::new("/work/missing").expect("missing parent")),
         Err(SandboxFsError::NotFound { .. })
     ));
     assert_eq!(
         sifs_fs
-            .read(&SandboxPath::new("/work/target.txt").expect("target"), None,)
+            .read_mut(&SandboxPath::new("/work/target.txt").expect("target"), None,)
             .expect("target remains"),
         b"target"
     );
@@ -7072,13 +7072,13 @@ fn sifs_staged_wasix_link_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("original remains"),
+        sifs_fs.read_mut(&file, None).expect("original remains"),
         b"content"
     );
     assert!(matches!(
-        sifs_fs.stat(&alias),
+        sifs_fs.stat_mut(&alias),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -7137,13 +7137,13 @@ fn sifs_staged_wasix_link_target_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("original remains"),
+        sifs_fs.read_mut(&file, None).expect("original remains"),
         b"content"
     );
     assert!(matches!(
-        sifs_fs.stat(&alias),
+        sifs_fs.stat_mut(&alias),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -7200,9 +7200,9 @@ fn sifs_staged_wasix_symlink_with_trailing_destination_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&link),
+        sifs_fs.stat_mut(&link),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -7260,9 +7260,9 @@ fn sifs_staged_wasix_unlink_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("original remains"),
+        sifs_fs.read_mut(&file, None).expect("original remains"),
         b"content"
     );
 
@@ -7324,12 +7324,12 @@ fn sifs_staged_wasix_readlink_symlink_with_trailing_slash_fails() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.readlink(&link_dir).expect("link remains"),
+        sifs_fs.readlink_mut(&link_dir).expect("link remains"),
         PathBuf::from("target-dir")
     );
-    assert!(sifs_fs.stat(&target_dir).expect("target remains").is_dir);
+    assert!(sifs_fs.stat_mut(&target_dir).expect("target remains").is_dir);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -7385,9 +7385,9 @@ fn sifs_staged_wasix_lstat_file_with_trailing_slash_fails() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("original remains"),
+        sifs_fs.read_mut(&file, None).expect("original remains"),
         b"content"
     );
 
@@ -7480,7 +7480,7 @@ fn sifs_staged_wasix_set_times_file_with_trailing_slash_is_atomic_failure() {
     sifs_fs.ensure_workspace().expect("workspace");
     let file = SandboxPath::new("/work/file.txt").expect("file");
     sifs_fs.write(&file, b"content").expect("write file");
-    let before = sifs_fs.stat(&file).expect("initial stat");
+    let before = sifs_fs.stat_mut(&file).expect("initial stat");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -7503,12 +7503,12 @@ fn sifs_staged_wasix_set_times_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let after = sifs_fs.stat(&file).expect("file remains");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let after = sifs_fs.stat_mut(&file).expect("file remains");
     assert_eq!(after.accessed_at_unix_nanos, before.accessed_at_unix_nanos);
     assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("content remains"),
+        sifs_fs.read_mut(&file, None).expect("content remains"),
         b"content"
     );
 
@@ -7544,7 +7544,7 @@ fn sifs_staged_wasix_chmod_file_with_trailing_slash_is_atomic_failure() {
     sifs_fs.ensure_workspace().expect("workspace");
     let file = SandboxPath::new("/work/file.txt").expect("file");
     sifs_fs.write(&file, b"content").expect("write file");
-    let before = sifs_fs.stat(&file).expect("initial stat");
+    let before = sifs_fs.stat_mut(&file).expect("initial stat");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -7567,11 +7567,11 @@ fn sifs_staged_wasix_chmod_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let after = sifs_fs.stat(&file).expect("file remains");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let after = sifs_fs.stat_mut(&file).expect("file remains");
     assert_eq!(after.mode, before.mode);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("content remains"),
+        sifs_fs.read_mut(&file, None).expect("content remains"),
         b"content"
     );
 
@@ -7615,7 +7615,7 @@ fn sifs_staged_wasix_chmod_symlink_to_directory_with_trailing_slash_updates_targ
     sifs_fs
         .symlink(Path::new("target-dir"), &link_dir)
         .expect("symlink");
-    let link_before = sifs_fs.stat(&link_dir).expect("link before");
+    let link_before = sifs_fs.stat_mut(&link_dir).expect("link before");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -7638,9 +7638,9 @@ fn sifs_staged_wasix_chmod_symlink_to_directory_with_trailing_slash_updates_targ
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.stat(&target_dir).expect("target stat").mode, 0o700);
-    let link_after = sifs_fs.stat(&link_dir).expect("link after");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.stat_mut(&target_dir).expect("target stat").mode, 0o700);
+    let link_after = sifs_fs.stat_mut(&link_dir).expect("link after");
     assert!(link_after.is_symlink);
     assert_eq!(link_after.mode, link_before.mode);
 
@@ -7676,7 +7676,7 @@ fn sifs_staged_wasix_chown_file_with_trailing_slash_is_atomic_failure() {
     sifs_fs.ensure_workspace().expect("workspace");
     let file = SandboxPath::new("/work/file.txt").expect("file");
     sifs_fs.write(&file, b"content").expect("write file");
-    let before = sifs_fs.stat(&file).expect("initial stat");
+    let before = sifs_fs.stat_mut(&file).expect("initial stat");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -7699,12 +7699,12 @@ fn sifs_staged_wasix_chown_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let after = sifs_fs.stat(&file).expect("file remains");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let after = sifs_fs.stat_mut(&file).expect("file remains");
     assert_eq!(after.uid, before.uid);
     assert_eq!(after.gid, before.gid);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("content remains"),
+        sifs_fs.read_mut(&file, None).expect("content remains"),
         b"content"
     );
 
@@ -7748,7 +7748,7 @@ fn sifs_staged_wasix_chown_symlink_to_directory_with_trailing_slash_updates_targ
     sifs_fs
         .symlink(Path::new("target-dir"), &link_dir)
         .expect("symlink");
-    let link_before = sifs_fs.stat(&link_dir).expect("link before");
+    let link_before = sifs_fs.stat_mut(&link_dir).expect("link before");
     assert!(link_before.is_symlink);
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -7772,10 +7772,10 @@ fn sifs_staged_wasix_chown_symlink_to_directory_with_trailing_slash_updates_targ
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target_dir).expect("target stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target_dir).expect("target stat");
     assert_eq!((target_metadata.uid, target_metadata.gid), (500, 600));
-    let link_metadata = sifs_fs.stat(&link_dir).expect("link stat");
+    let link_metadata = sifs_fs.stat_mut(&link_dir).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(
         (link_metadata.uid, link_metadata.gid),
@@ -7814,7 +7814,7 @@ fn sifs_staged_wasix_touch_file_with_trailing_slash_is_atomic_failure() {
     sifs_fs.ensure_workspace().expect("workspace");
     let file = SandboxPath::new("/work/file.txt").expect("file");
     sifs_fs.write(&file, b"content").expect("write file");
-    let before = sifs_fs.stat(&file).expect("initial stat");
+    let before = sifs_fs.stat_mut(&file).expect("initial stat");
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
@@ -7837,12 +7837,12 @@ fn sifs_staged_wasix_touch_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let after = sifs_fs.stat(&file).expect("file remains");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let after = sifs_fs.stat_mut(&file).expect("file remains");
     assert_eq!(after.accessed_at_unix_nanos, before.accessed_at_unix_nanos);
     assert_eq!(after.modified_at_unix_nanos, before.modified_at_unix_nanos);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("content remains"),
+        sifs_fs.read_mut(&file, None).expect("content remains"),
         b"content"
     );
 
@@ -7911,11 +7911,11 @@ fn sifs_staged_wasix_touch_symlink_to_directory_with_trailing_slash_updates_targ
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target_dir).expect("target stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target_dir).expect("target stat");
     assert!(target_metadata.accessed_at_unix_nanos > 11_111);
     assert!(target_metadata.modified_at_unix_nanos > 22_222);
-    let link_metadata = sifs_fs.stat(&link_dir).expect("link stat");
+    let link_metadata = sifs_fs.stat_mut(&link_dir).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(link_metadata.accessed_at_unix_nanos, 33_333);
     assert_eq!(link_metadata.modified_at_unix_nanos, 44_444);
@@ -7974,8 +7974,8 @@ fn sifs_staged_wasix_mkdir_file_with_trailing_slash_reports_not_directory() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.read(&file, None).expect("file remains"), b"content");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.read_mut(&file, None).expect("file remains"), b"content");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -8083,8 +8083,8 @@ fn sifs_staged_wasix_create_file_with_trailing_slash_reports_is_directory() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert_eq!(sifs_fs.read(&file, None).expect("file remains"), b"content");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert_eq!(sifs_fs.read_mut(&file, None).expect("file remains"), b"content");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -8145,10 +8145,10 @@ fn sifs_staged_wasix_mkdir_symlink_to_directory_with_trailing_slash_reports_exis
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    assert!(sifs_fs.stat(&target_dir).expect("target remains").is_dir);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    assert!(sifs_fs.stat_mut(&target_dir).expect("target remains").is_dir);
     assert_eq!(
-        sifs_fs.readlink(&link_dir).expect("link remains"),
+        sifs_fs.readlink_mut(&link_dir).expect("link remains"),
         PathBuf::from("target-dir")
     );
 
@@ -8217,11 +8217,11 @@ fn sifs_staged_wasix_set_times_symlink_to_directory_with_trailing_slash_updates_
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let target_metadata = sifs_fs.stat(&target_dir).expect("target stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let target_metadata = sifs_fs.stat_mut(&target_dir).expect("target stat");
     assert_eq!(target_metadata.accessed_at_unix_nanos, 55_555);
     assert_eq!(target_metadata.modified_at_unix_nanos, 66_666);
-    let link_metadata = sifs_fs.stat(&link_dir).expect("link stat");
+    let link_metadata = sifs_fs.stat_mut(&link_dir).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(link_metadata.accessed_at_unix_nanos, 33_333);
     assert_eq!(link_metadata.modified_at_unix_nanos, 44_444);
@@ -8287,12 +8287,12 @@ fn sifs_staged_wasix_path_set_times_without_follow_updates_symlink_metadata() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(link_metadata.accessed_at_unix_nanos, 33_333);
     assert_eq!(link_metadata.modified_at_unix_nanos, 44_444);
-    let target_metadata = sifs_fs.stat(&target).expect("target stat");
+    let target_metadata = sifs_fs.stat_mut(&target).expect("target stat");
     assert_eq!(target_metadata.accessed_at_unix_nanos, 11_111);
     assert_eq!(target_metadata.modified_at_unix_nanos, 22_222);
 
@@ -8354,16 +8354,16 @@ fn sifs_staged_wasix_path_symlink_relative_to_directory_fd_creates_sifs_symlink(
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let link = SandboxPath::new("/work/link.txt").expect("link");
-    let link_metadata = sifs_fs.stat(&link).expect("link stat");
+    let link_metadata = sifs_fs.stat_mut(&link).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(
-        sifs_fs.readlink(&link).expect("link readlink"),
+        sifs_fs.readlink_mut(&link).expect("link readlink"),
         PathBuf::from("target.txt")
     );
     assert_eq!(
-        sifs_fs.read(&link, None).expect("read through link"),
+        sifs_fs.read_mut(&link, None).expect("read through link"),
         b"target"
     );
 
@@ -8404,7 +8404,7 @@ fn sifs_staged_wasix_relative_file_namespace_ops_use_directory_fd() {
     sifs_fs
         .set_times(&dir, Some(12_345), Some(67_890))
         .expect("old dir times");
-    let dir_before = sifs_fs.stat(&dir).expect("dir before ops");
+    let dir_before = sifs_fs.stat_mut(&dir).expect("dir before ops");
     std::thread::sleep(std::time::Duration::from_millis(1));
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -8432,16 +8432,16 @@ fn sifs_staged_wasix_relative_file_namespace_ops_use_directory_fd() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&created),
+        sifs_fs.stat_mut(&created),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
     assert!(matches!(
-        sifs_fs.stat(&renamed),
+        sifs_fs.stat_mut(&renamed),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
-    let dir_after = sifs_fs.stat(&dir).expect("dir after ops");
+    let dir_after = sifs_fs.stat_mut(&dir).expect("dir after ops");
     assert!(
         dir_after.modified_at_unix_nanos > dir_before.modified_at_unix_nanos,
         "relative namespace mutations must advance directory mtime"
@@ -8487,7 +8487,7 @@ fn sifs_staged_wasix_relative_directory_namespace_ops_use_directory_fd() {
     sifs_fs
         .set_times(&base, Some(12_345), Some(67_890))
         .expect("old base times");
-    let base_before = sifs_fs.stat(&base).expect("base before ops");
+    let base_before = sifs_fs.stat_mut(&base).expect("base before ops");
     std::thread::sleep(std::time::Duration::from_millis(1));
 
     let local_store = LocalSandboxInstanceStore::new(&local_root);
@@ -8511,12 +8511,12 @@ fn sifs_staged_wasix_relative_directory_namespace_ops_use_directory_fd() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(matches!(
-        sifs_fs.stat(&child),
+        sifs_fs.stat_mut(&child),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
-    let base_after = sifs_fs.stat(&base).expect("base after ops");
+    let base_after = sifs_fs.stat_mut(&base).expect("base after ops");
     assert!(
         base_after.modified_at_unix_nanos > base_before.modified_at_unix_nanos,
         "relative directory namespace mutations must advance parent mtime"
@@ -8615,9 +8615,9 @@ fn sifs_staged_wasix_mkdir_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     let generated = SandboxPath::new("/work/generated").expect("generated");
-    let metadata = replica_fs.stat(&generated).expect("replica mkdir stat");
+    let metadata = replica_fs.stat_mut(&generated).expect("replica mkdir stat");
     assert!(metadata.is_dir);
 
     drop(outcome.dfs);
@@ -8713,15 +8713,15 @@ fn sifs_staged_wasix_symlink_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     let link = SandboxPath::new("/work/link.txt").expect("link");
-    let link_metadata = replica_fs.stat(&link).expect("replica link stat");
+    let link_metadata = replica_fs.stat_mut(&link).expect("replica link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(
-        replica_fs.readlink(&link).expect("replica readlink"),
+        replica_fs.readlink_mut(&link).expect("replica readlink"),
         PathBuf::from("target.txt")
     );
-    assert_eq!(replica_fs.read(&link, None).expect("read link"), b"target");
+    assert_eq!(replica_fs.read_mut(&link, None).expect("read link"), b"target");
 
     drop(outcome.dfs);
     fs::remove_dir_all(runtime_root).ok();
@@ -8823,15 +8823,15 @@ fn sifs_staged_wasix_metadata_updates_replicate_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     let metadata_path = SandboxPath::new("/work/metadata.txt").expect("metadata");
     assert_eq!(
         replica_fs
-            .read(&metadata_path, None)
+            .read_mut(&metadata_path, None)
             .expect("replica read metadata file"),
         b"metadata"
     );
-    let metadata = replica_fs.stat(&metadata_path).expect("replica stat");
+    let metadata = replica_fs.stat_mut(&metadata_path).expect("replica stat");
     assert_eq!(metadata.mode & 0o777, 0o640);
     assert_eq!(metadata.uid, 1001);
     assert_eq!(metadata.gid, 1002);
@@ -8931,13 +8931,13 @@ fn sifs_staged_wasix_truncate_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     let path = SandboxPath::new("/work/truncate.txt").expect("truncate");
     assert_eq!(
-        replica_fs.read(&path, None).expect("replica read truncate"),
+        replica_fs.read_mut(&path, None).expect("replica read truncate"),
         b"trun"
     );
-    assert_eq!(replica_fs.stat(&path).expect("replica stat").len, 4);
+    assert_eq!(replica_fs.stat_mut(&path).expect("replica stat").len, 4);
 
     drop(outcome.dfs);
     fs::remove_dir_all(runtime_root).ok();
@@ -9032,13 +9032,13 @@ fn sifs_staged_wasix_sparse_pwrite_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     let path = SandboxPath::new("/work/sparse.txt").expect("sparse");
     assert_eq!(
-        replica_fs.read(&path, None).expect("replica read sparse"),
+        replica_fs.read_mut(&path, None).expect("replica read sparse"),
         b"base\0\0\0Z"
     );
-    assert_eq!(replica_fs.stat(&path).expect("replica stat").len, 8);
+    assert_eq!(replica_fs.stat_mut(&path).expect("replica stat").len, 8);
 
     drop(outcome.dfs);
     fs::remove_dir_all(runtime_root).ok();
@@ -9097,13 +9097,13 @@ fn sifs_staged_wasix_ftruncate_preserves_fd_offset_for_sparse_write() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&path, None).expect("read ftruncate result"),
+        sifs_fs.read_mut(&path, None).expect("read ftruncate result"),
         b"\0\0\0\0\0\0\0\0Z",
         "ftruncate must not move the open file descriptor offset"
     );
-    assert_eq!(sifs_fs.stat(&path).expect("stat ftruncate result").len, 9);
+    assert_eq!(sifs_fs.stat_mut(&path).expect("stat ftruncate result").len, 9);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -9159,13 +9159,13 @@ fn sifs_staged_wasix_fd_allocate_inside_file_does_not_shrink() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&path, None).expect("read allocate result"),
+        sifs_fs.read_mut(&path, None).expect("read allocate result"),
         b"abcdef",
         "fd_allocate inside current EOF must not truncate existing content"
     );
-    assert_eq!(sifs_fs.stat(&path).expect("stat allocate result").len, 6);
+    assert_eq!(sifs_fs.stat_mut(&path).expect("stat allocate result").len, 6);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -9221,13 +9221,13 @@ fn sifs_staged_wasix_fd_allocate_beyond_eof_extends_with_zeroes() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&path, None).expect("read allocate result"),
+        sifs_fs.read_mut(&path, None).expect("read allocate result"),
         b"abc\0\0\0\0\0",
         "fd_allocate beyond EOF should extend with zeroes"
     );
-    assert_eq!(sifs_fs.stat(&path).expect("stat allocate result").len, 8);
+    assert_eq!(sifs_fs.stat_mut(&path).expect("stat allocate result").len, 8);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -9289,13 +9289,13 @@ fn sifs_staged_wasix_fd_allocate_refreshes_stale_handle_before_no_shrink_check()
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&path, None).expect("read allocate result"),
+        sifs_fs.read_mut(&path, None).expect("read allocate result"),
         b"abc\0\0\0\0\0\0Z",
         "fd_allocate must compare against the current backing SIFS size, not a stale descriptor cache"
     );
-    assert_eq!(sifs_fs.stat(&path).expect("stat allocate result").len, 10);
+    assert_eq!(sifs_fs.stat_mut(&path).expect("stat allocate result").len, 10);
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -9395,16 +9395,16 @@ fn sifs_staged_wasix_directory_rename_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     assert!(matches!(
-        replica_fs.stat(&SandboxPath::new("/work/src").expect("src")),
+        replica_fs.stat_mut(&SandboxPath::new("/work/src").expect("src")),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
     let dst = SandboxPath::new("/work/dst").expect("dst");
-    assert!(replica_fs.stat(&dst).expect("dst stat").is_dir);
+    assert!(replica_fs.stat_mut(&dst).expect("dst stat").is_dir);
     assert_eq!(
         replica_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/dst/nested.txt").expect("nested"),
                 None,
             )
@@ -9502,9 +9502,9 @@ fn sifs_staged_wasix_rmdir_replicates_to_candidate_node() {
     .expect("replica metadata backend reload");
     let mut replica_store = SifsSandboxInstanceStore::new(replica_dfs);
     let replica_manifest = replica_store.load(&sandbox_id).expect("replica manifest");
-    let replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
+    let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &replica_manifest);
     assert!(matches!(
-        replica_fs.stat(&SandboxPath::new("/work/empty").expect("empty")),
+        replica_fs.stat_mut(&SandboxPath::new("/work/empty").expect("empty")),
         Err(SandboxFsError::NotFound { .. }) | Err(SandboxFsError::Unavailable { .. })
     ));
 
@@ -9567,16 +9567,16 @@ fn sifs_staged_wasix_rmdir_rejects_non_empty_directory() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/non-empty").expect("dir"))
+            .stat_mut(&SandboxPath::new("/work/non-empty").expect("dir"))
             .expect("dir stat")
             .is_dir
     );
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/non-empty/file.txt").expect("file"),
                 None,
             )
@@ -9654,16 +9654,16 @@ fn sifs_staged_wasix_rename_directory_over_non_empty_directory_is_atomic_failure
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/source").expect("source"))
+            .stat_mut(&SandboxPath::new("/work/source").expect("source"))
             .expect("source stat")
             .is_dir
     );
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/source/source.txt").expect("source file"),
                 None,
             )
@@ -9672,13 +9672,13 @@ fn sifs_staged_wasix_rename_directory_over_non_empty_directory_is_atomic_failure
     );
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/target").expect("target"))
+            .stat_mut(&SandboxPath::new("/work/target").expect("target"))
             .expect("target stat")
             .is_dir
     );
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/target/target.txt").expect("target file"),
                 None,
             )
@@ -9752,15 +9752,15 @@ fn sifs_staged_wasix_rename_across_mount_boundary_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(&SandboxPath::new("/work/source.txt").expect("source"), None)
+            .read_mut(&SandboxPath::new("/work/source.txt").expect("source"), None)
             .expect("source remains"),
         b"source"
     );
     assert!(matches!(
-        sifs_fs.stat(&SandboxPath::new("/shared/source.txt").expect("shared")),
+        sifs_fs.stat_mut(&SandboxPath::new("/shared/source.txt").expect("shared")),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -9822,16 +9822,16 @@ fn sifs_staged_wasix_rename_file_over_directory_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(&SandboxPath::new("/work/file.txt").expect("file"), None)
+            .read_mut(&SandboxPath::new("/work/file.txt").expect("file"), None)
             .expect("file content"),
         b"file"
     );
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/dir").expect("dir"))
+            .stat_mut(&SandboxPath::new("/work/dir").expect("dir"))
             .expect("dir stat")
             .is_dir
     );
@@ -9900,16 +9900,16 @@ fn sifs_staged_wasix_rename_directory_over_file_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert!(
         sifs_fs
-            .stat(&SandboxPath::new("/work/dir").expect("dir"))
+            .stat_mut(&SandboxPath::new("/work/dir").expect("dir"))
             .expect("dir stat")
             .is_dir
     );
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/dir/child.txt").expect("child"),
                 None
             )
@@ -9918,7 +9918,7 @@ fn sifs_staged_wasix_rename_directory_over_file_is_atomic_failure() {
     );
     assert_eq!(
         sifs_fs
-            .read(&SandboxPath::new("/work/file.txt").expect("file"), None)
+            .read_mut(&SandboxPath::new("/work/file.txt").expect("file"), None)
             .expect("file content"),
         b"file"
     );
@@ -9987,19 +9987,19 @@ fn sifs_staged_wasix_path_rename_preserves_symlink_object() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let old_link = SandboxPath::new("/work/link.txt").expect("old link");
     let renamed_link = SandboxPath::new("/work/renamed-link.txt").expect("renamed link");
-    assert!(sifs_fs.stat(&old_link).is_err());
-    let renamed_metadata = sifs_fs.stat(&renamed_link).expect("renamed stat");
+    assert!(sifs_fs.stat_mut(&old_link).is_err());
+    let renamed_metadata = sifs_fs.stat_mut(&renamed_link).expect("renamed stat");
     assert!(renamed_metadata.is_symlink);
     assert_eq!(
-        sifs_fs.readlink(&renamed_link).expect("renamed readlink"),
+        sifs_fs.readlink_mut(&renamed_link).expect("renamed readlink"),
         PathBuf::from("target.txt")
     );
     assert_eq!(
         sifs_fs
-            .read(&SandboxPath::new("/work/target.txt").expect("target"), None,)
+            .read_mut(&SandboxPath::new("/work/target.txt").expect("target"), None,)
             .expect("target"),
         b"target"
     );
@@ -10059,13 +10059,13 @@ fn sifs_staged_wasix_rename_file_with_trailing_slash_is_atomic_failure() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
-        sifs_fs.read(&file, None).expect("original remains"),
+        sifs_fs.read_mut(&file, None).expect("original remains"),
         b"content"
     );
     assert!(matches!(
-        sifs_fs.stat(&renamed),
+        sifs_fs.stat_mut(&renamed),
         Err(SandboxFsError::NotFound { .. })
     ));
 
@@ -10130,14 +10130,14 @@ fn sifs_staged_wasix_rmdir_rejects_symlink_to_directory() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     let target_dir = SandboxPath::new("/work/target-dir").expect("target dir");
     let link_dir = SandboxPath::new("/work/link-dir").expect("link dir");
-    assert!(sifs_fs.stat(&target_dir).expect("target stat").is_dir);
-    let link_metadata = sifs_fs.stat(&link_dir).expect("link stat");
+    assert!(sifs_fs.stat_mut(&target_dir).expect("target stat").is_dir);
+    let link_metadata = sifs_fs.stat_mut(&link_dir).expect("link stat");
     assert!(link_metadata.is_symlink);
     assert_eq!(
-        sifs_fs.readlink(&link_dir).expect("link readlink"),
+        sifs_fs.readlink_mut(&link_dir).expect("link readlink"),
         PathBuf::from("target-dir")
     );
 
@@ -10201,10 +10201,10 @@ fn sifs_staged_wasix_readdir_follows_symlink_to_directory() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
-    let link_metadata = sifs_fs.stat(&link_dir).expect("link dir stat");
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let link_metadata = sifs_fs.stat_mut(&link_dir).expect("link dir stat");
     assert!(link_metadata.is_symlink);
-    assert_eq!(sifs_fs.read(&child, None).expect("child"), b"child");
+    assert_eq!(sifs_fs.read_mut(&child, None).expect("child"), b"child");
 
     fs::remove_dir_all(sifs_root).ok();
     fs::remove_dir_all(local_root).ok();
@@ -10257,10 +10257,10 @@ fn sifs_staged_wasix_var_is_sifs_backed_workspace() {
 
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/var/package-state.txt").expect("var file"),
                 None,
             )
@@ -10538,10 +10538,10 @@ fn sifs_staged_wasix_toolchain_does_not_create_local_staging_instance() {
     );
     let mut sifs_store = SifsSandboxInstanceStore::new(outcome.dfs);
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/no-staging.txt").expect("output path"),
                 None,
             )
@@ -10846,10 +10846,10 @@ fn sifs_staged_runner_executes_process_plan_and_syncs_command_history() {
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
     assert_eq!(manifest.command_history.len(), 2);
     let final_command_id = manifest.command_history[1].clone();
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &sandbox_command_stdout_log_path(&final_command_id).expect("stdout"),
                 None,
             )
@@ -10875,7 +10875,7 @@ fn sifs_staged_runner_executes_process_plan_and_syncs_command_history() {
     let mut replica_fs = SifsSandboxFileSystem::new(replica_store.into_inner(), &resumed_manifest);
     assert_eq!(
         replica_fs
-            .read(
+            .read_mut(
                 &sandbox_command_stdout_log_path(&final_command_id).expect("stdout"),
                 None,
             )
@@ -10981,10 +10981,10 @@ fn sifs_staged_runner_executes_wasix_process_plan_with_concurrent_fd_pipe() {
     let manifest = sifs_store.load(&sandbox_id).expect("manifest");
     assert_eq!(manifest.command_history.len(), 2);
     let final_command_id = manifest.command_history[1].clone();
-    let sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
+    let mut sifs_fs = SifsSandboxFileSystem::new(sifs_store.into_inner(), &manifest);
     assert_eq!(
         sifs_fs
-            .read(
+            .read_mut(
                 &sandbox_command_stdout_log_path(&final_command_id).expect("stdout"),
                 None,
             )
@@ -11862,7 +11862,7 @@ fn sifs_staged_runner_command_progress_resumes_from_replica_node() {
     );
     assert_eq!(
         replica_fs
-            .read(
+            .read_mut(
                 &SandboxPath::new("/work/target/progress.txt").expect("progress"),
                 None,
             )
@@ -11915,7 +11915,7 @@ fn sifs_staged_runner_writes_live_read_write_sifs_mounts() {
     sifs_store.save_manifest(&manifest).expect("save manifest");
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module(
             sifs_store.into_inner(),
             &local_store,
@@ -11938,7 +11938,7 @@ fn sifs_staged_runner_writes_live_read_write_sifs_mounts() {
     assert_eq!(
         outcome
             .dfs
-            .posix_read_file("/services/sandbox/shared/target/out.txt")
+            .posix_read_file_distributed("/services/sandbox/shared/target/out.txt")
             .expect("mounted output"),
         b"created"
     );
@@ -11982,7 +11982,7 @@ fn sifs_staged_runner_preserves_rw_mount_write_on_resource_failure() {
     limits.max_written_bytes_per_command = 3;
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module_with_stdin_and_limits(
             sifs_store.into_inner(),
             &local_store,
@@ -12003,7 +12003,7 @@ fn sifs_staged_runner_preserves_rw_mount_write_on_resource_failure() {
     assert_eq!(
         outcome
             .dfs
-            .posix_read_file("/services/sandbox/shared/target/out.txt")
+            .posix_read_file_distributed("/services/sandbox/shared/target/out.txt")
             .expect("completed mount write remains visible"),
         b"created"
     );
@@ -12151,7 +12151,7 @@ fn sifs_staged_runner_keeps_read_only_mounts_read_only() {
     sifs_store.save_manifest(&manifest).expect("save manifest");
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module(
             sifs_store.into_inner(),
             &local_store,
@@ -12166,7 +12166,7 @@ fn sifs_staged_runner_keeps_read_only_mounts_read_only() {
     assert!(matches!(
         outcome
             .dfs
-            .posix_read_file("/services/sandbox/shared/target/out.txt"),
+            .posix_read_file_distributed("/services/sandbox/shared/target/out.txt"),
         Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. })
     ));
     fs::remove_dir_all(sifs_root).ok();
@@ -12205,7 +12205,7 @@ fn sifs_staged_runner_denies_mkdir_in_read_only_mount() {
     sifs_store.save_manifest(&manifest).expect("save manifest");
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module(
             sifs_store.into_inner(),
             &local_store,
@@ -12220,7 +12220,7 @@ fn sifs_staged_runner_denies_mkdir_in_read_only_mount() {
     assert!(matches!(
         outcome
             .dfs
-            .posix_stat("/services/sandbox/shared/target/new-dir"),
+            .posix_stat_distributed("/services/sandbox/shared/target/new-dir"),
         Err(DfsPosixError::NotFound { .. }) | Err(DfsPosixError::MissingParent { .. })
     ));
     fs::remove_dir_all(sifs_root).ok();
@@ -12250,7 +12250,7 @@ fn sifs_staged_runner_denies_timestamp_update_in_read_only_mount() {
     )
     .expect("mount target file");
     let before = dfs
-        .posix_stat("/services/sandbox/shared/target/file.txt")
+        .posix_stat_distributed("/services/sandbox/shared/target/file.txt")
         .expect("before stat");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_ro_times").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -12269,7 +12269,7 @@ fn sifs_staged_runner_denies_timestamp_update_in_read_only_mount() {
     sifs_store.save_manifest(&manifest).expect("save manifest");
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module(
             sifs_store.into_inner(),
             &local_store,
@@ -12283,7 +12283,7 @@ fn sifs_staged_runner_denies_timestamp_update_in_read_only_mount() {
     assert_ne!(command.response.exit_status, 0);
     let after = outcome
         .dfs
-        .posix_stat("/services/sandbox/shared/target/file.txt")
+        .posix_stat_distributed("/services/sandbox/shared/target/file.txt")
         .expect("after stat");
     assert_eq!(
         after.accessed_at_unix_nanos, before.accessed_at_unix_nanos,
@@ -12321,7 +12321,7 @@ fn sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount() {
     )
     .expect("mount target file");
     let before = dfs
-        .posix_stat("/services/sandbox/shared/target/file.txt")
+        .posix_stat_distributed("/services/sandbox/shared/target/file.txt")
         .expect("before stat");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_ro_fd_times").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -12340,7 +12340,7 @@ fn sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount() {
     sifs_store.save_manifest(&manifest).expect("save manifest");
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module(
             sifs_store.into_inner(),
             &local_store,
@@ -12354,7 +12354,7 @@ fn sifs_staged_runner_denies_fd_timestamp_update_in_read_only_mount() {
     assert_ne!(command.response.exit_status, 0);
     let after = outcome
         .dfs
-        .posix_stat("/services/sandbox/shared/target/file.txt")
+        .posix_stat_distributed("/services/sandbox/shared/target/file.txt")
         .expect("after stat");
     assert_eq!(
         after.accessed_at_unix_nanos, before.accessed_at_unix_nanos,
@@ -12392,7 +12392,7 @@ fn sifs_staged_runner_denies_touch_in_read_only_mount() {
     )
     .expect("mount target file");
     let before = dfs
-        .posix_stat("/services/sandbox/shared/target/file.txt")
+        .posix_stat_distributed("/services/sandbox/shared/target/file.txt")
         .expect("before stat");
     let sandbox_id = SandboxId::from_legacy_named("sandbox_sifs_ro_touch").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
@@ -12411,7 +12411,7 @@ fn sifs_staged_runner_denies_touch_in_read_only_mount() {
     sifs_store.save_manifest(&manifest).expect("save manifest");
     let local_store = LocalSandboxInstanceStore::new(&local_root);
     let runner = SifsStagedSandboxCommandRunner::new().expect("runner");
-    let outcome = runner
+    let mut outcome = runner
         .run_module(
             sifs_store.into_inner(),
             &local_store,
@@ -12425,7 +12425,7 @@ fn sifs_staged_runner_denies_touch_in_read_only_mount() {
     assert_ne!(command.response.exit_status, 0);
     let after = outcome
         .dfs
-        .posix_stat("/services/sandbox/shared/target/file.txt")
+        .posix_stat_distributed("/services/sandbox/shared/target/file.txt")
         .expect("after stat");
     assert_eq!(
         after.accessed_at_unix_nanos, before.accessed_at_unix_nanos,

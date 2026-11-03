@@ -1,4 +1,6 @@
-use sinomo_dfs::{DfsReplicationPolicy, DfsWriteOptions, test_support::DfsTestRuntime};
+use sinomo_dfs::{
+    DfsMetadataBackend, DfsReplicationPolicy, DfsWriteOptions, test_support::DfsTestRuntime,
+};
 
 #[test]
 fn metadata_changes_preserve_the_committed_data_generation_after_restart() {
@@ -23,8 +25,10 @@ fn metadata_changes_preserve_the_committed_data_generation_after_restart() {
     let winner = writer
         .posix_write_file(path, b"committed winner", options)
         .unwrap();
-    let recorded = writer
-        .metadata_backend()
+    // The owning primary's durable store; the delegating writer keeps none.
+    let primary = runtime.root_shard().unwrap().primary_node_id;
+    let recorded = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_version(&winner.object_id, &winner.version)
         .unwrap()
@@ -32,8 +36,8 @@ fn metadata_changes_preserve_the_committed_data_generation_after_restart() {
     let changed = writer.posix_set_mode(path, 0o600).unwrap();
     assert_eq!(changed.object_id, winner.object_id);
     assert_ne!(changed.version, winner.version);
-    let metadata_version = writer
-        .metadata_backend()
+    let metadata_version = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_version(&changed.object_id, &changed.version)
         .unwrap()
@@ -43,16 +47,19 @@ fn metadata_changes_preserve_the_committed_data_generation_after_restart() {
         recorded.content_durability
     );
     assert_eq!(metadata_version.content_hash, recorded.content_hash);
-    assert_eq!(writer.posix_read_file(path).unwrap(), b"committed winner");
+    assert_eq!(
+        writer.posix_read_file_distributed(path).unwrap(),
+        b"committed winner"
+    );
     drop(writer);
     runtime.stop_node(&nodes[0]).unwrap();
     runtime.reopen_node(nodes[0].clone()).unwrap();
     let mut recovered = runtime.client(&nodes[0]).unwrap();
-    let actual = recovered.posix_stat(path).unwrap();
+    let actual = recovered.posix_stat_distributed(path).unwrap();
     assert_eq!(actual.version, changed.version);
     assert_eq!(actual.mode, 0o600);
     assert_eq!(
-        recovered.posix_read_file(path).unwrap(),
+        recovered.posix_read_file_distributed(path).unwrap(),
         b"committed winner"
     );
     drop(recovered);

@@ -66,7 +66,7 @@ pub fn descriptor() -> NativeModuleDescriptor {
         owner: "sinomo-app-use-module".into(),
         native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
         backend: NativeModuleBackend::NativeDylib,
-        interface_version: "sinomo.app-use.os.v1".into(),
+        interface_version: "sinomo.app-use.os.v2".into(),
         platform_triple: format!(
             "{}-{}-{}",
             std::env::consts::ARCH,
@@ -395,20 +395,32 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
             same_owner(&entry.owner, &owner)?;
             let capture = entry.capture.clone();
             drop(state);
-            let frame = capture
-                .next(after_sequence, Duration::from_millis(timeout_ms.min(100)))?
-                .map(DesktopRawFrame::from_sample)
-                .transpose()?;
+            #[cfg(target_os = "android")]
+            let started = Instant::now();
+            let sample = capture.next(after_sequence, Duration::from_millis(timeout_ms.min(100)))?;
+            #[cfg(target_os = "android")]
+            let next_us = started.elapsed().as_micros();
+            #[cfg(target_os = "android")]
+            let returned_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
+            let frame = sample.map(DesktopRawFrame::from_sample).transpose()?;
+            #[cfg(target_os = "android")]
+            let prepare_us = started.elapsed().as_micros() - next_us;
             let available = frame.is_some();
             if let Some(frame) = frame {
                 // The stable output callback carries a single SOBJ byte blob.
                 // Nesting a 4K frame inside InvocationResponse.payload_sobj
                 // makes the generic envelope serialize millions of integers.
+                #[cfg(target_os = "android")]
+                let identity = (frame.sequence, frame.captured_at_unix_ms);
+                #[cfg(target_os = "android")]
+                let serialize_started = Instant::now();
                 let bytes = encode_sobj(&DesktopFrameDelivery {
                     capture_id: id,
                     frame,
                 })
                 .map_err(|e| DesktopError::Platform(e.to_string()))?;
+                #[cfg(target_os = "android")]
+                let serialize_us = serialize_started.elapsed().as_micros();
                 let host = HOST
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -418,8 +430,17 @@ fn dispatch(request: DesktopProviderRequest) -> DesktopResult<DesktopProviderRes
                 let output = host.0.output_chunk.ok_or_else(|| {
                     DesktopError::Closed("capture output callback unavailable".into())
                 })?;
+                #[cfg(target_os = "android")]
+                let callback_started = Instant::now();
                 let status =
                     unsafe { output(host.0.user_data, SinomoModuleByteSlice::from_slice(&bytes)) };
+                #[cfg(target_os = "android")]
+                if device::frame_trace_enabled() {
+                    device::trace_frame(serde_json::json!({"kind":"module", "sequence":identity.0,
+                        "captured_at_unix_ms":identity.1, "call_next_us":next_us,
+                        "returned_unix_us":returned_us, "prepare_us":prepare_us, "serialize_us":serialize_us,
+                        "host_callback_us":callback_started.elapsed().as_micros(), "bytes":bytes.len()}));
+                }
                 if status != SINOMO_MODULE_STATUS_OK {
                     return Err(DesktopError::Closed(
                         "host rejected raw capture frame".into(),
@@ -558,6 +579,9 @@ mod tests {
     #[test]
     fn raw_video_roundtrips_the_native_sobj_boundary() {
         let frame = DesktopRawFrame {
+            pixel_format: sinomo_device::NativeVideoSampleFormat::Bgra8,
+            native_width: 2048,
+            native_height: 1024,
             sequence: 7,
             width: 2048,
             height: 1024,
@@ -565,7 +589,7 @@ mod tests {
             timestamp_ns: 42,
             duration_ns: 30,
             captured_at_unix_ms: 123,
-            pixels: vec![15; 8 * 1024 * 1024],
+            pixels: vec![15; 8 * 1024 * 1024].into(),
         };
         let encoded = encode_sobj(&DesktopFrameDelivery {
             capture_id: "capture".into(),

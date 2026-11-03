@@ -2,6 +2,31 @@
 
 use super::*;
 
+/// `node`'s durable metadata for `object_id` with the receipt locations of its
+/// current version, as a store-backed read projects it. Callers delegating to
+/// their Main keep no store, so replica convergence is observed here.
+fn node_store_object_with_receipts(
+    runtime: &crate::test_support::DfsTestRuntime,
+    node: &NodeId,
+    object_id: &DfsObjectId,
+) -> Option<DfsObjectMetadata> {
+    let store = runtime.node_metadata(node).expect("node metadata store");
+    let mut object = store.get_object(object_id).expect("node object lookup")?;
+    if let Some(hash) = object.content_hash.clone() {
+        for receipt in store
+            .receipts_for_version(object_id, &object.version)
+            .expect("node receipt lookup")
+        {
+            if receipt.content_hash.as_deref() == Some(hash.as_str())
+                && !object.current_locations.contains(&receipt.replica_node_id)
+            {
+                object.current_locations.push(receipt.replica_node_id);
+            }
+        }
+    }
+    Some(object)
+}
+
 #[test]
 fn sifs_posix_write_at_self_only_uses_extent_patch_manifest() {
     let root = temp_root("sifs-posix-write-at-extent-patch");
@@ -64,9 +89,12 @@ fn sifs_posix_write_at_self_only_uses_extent_patch_manifest() {
             .expect("logical blob check"),
         "patched write_at should not materialize a full replacement blob"
     );
-    assert_eq!(dfs.posix_read_file(file).expect("read patched"), expected);
     assert_eq!(
-        dfs.posix_read_file_range(file, patch_offset as u64 - 8, patch.len() + 16)
+        dfs.posix_read_file_distributed(file).expect("read patched"),
+        expected
+    );
+    assert_eq!(
+        dfs.posix_read_file_range_distributed(file, patch_offset as u64 - 8, patch.len() + 16)
             .expect("read patched range"),
         expected[patch_offset - 8..patch_offset + patch.len() + 8]
     );
@@ -142,7 +170,7 @@ fn sifs_posix_write_at_from_reader_uses_extent_patch_manifest() {
         "streamed write_at should not materialize a full replacement blob"
     );
     assert_eq!(
-        dfs.posix_read_file_range(file, patch_offset as u64 - 8, patch.len() + 16)
+        dfs.posix_read_file_range_distributed(file, patch_offset as u64 - 8, patch.len() + 16)
             .expect("read patched range"),
         expected[patch_offset - 8..patch_offset + patch.len() + 8]
     );
@@ -186,7 +214,7 @@ fn sifs_patch_reader_failure_preserves_head_without_replaying_consumed_input() {
         let node_id = NodeId::from_legacy_named("node_patch_reader_failure").expect("node");
         let path = "/users/patch-reader-failure.bin";
         let initial = vec![0x31; 160 * 1024];
-        let (_runtime, mut dfs) = native_sifs_service(
+        let (runtime, mut dfs) = native_sifs_service(
             "sifs_patch_reader_failure_preserves_head_without_replaying_consumed_input",
             node_id.clone(),
         );
@@ -197,13 +225,18 @@ fn sifs_patch_reader_failure_preserves_head_without_replaying_consumed_input() {
                 DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
             )
             .expect("initial write");
-        let mut object = dfs
-            .metadata
-            .object(&before.object_id)
-            .expect("object")
-            .clone();
+        // The caller delegating to its Main keeps no store; the policy change
+        // is published by the shard's store-backed opener.
+        let mut object = runtime
+            .node_metadata(&node_id)
+            .unwrap()
+            .get_object(&before.object_id)
+            .unwrap()
+            .expect("object");
         object.policy = policy;
-        dfs.add_object_metadata(object).expect("policy");
+        let mut owner = runtime.metadata_primary_service(path).unwrap();
+        owner.add_object_metadata(object).expect("policy");
+        drop(owner);
         let reads_after_failure = std::rc::Rc::new(std::cell::Cell::new(0));
         let error = dfs
             .posix_write_file_at_from_reader(
@@ -226,12 +259,13 @@ fn sifs_patch_reader_failure_preserves_head_without_replaying_consumed_input() {
             0,
             "failed input must not be replayed"
         );
-        let after = dfs.posix_stat(path).expect("unchanged head");
+        let after = dfs.posix_stat_distributed(path).expect("unchanged head");
         assert_eq!(after.version, before.version);
         assert_eq!(after.content_hash, before.content_hash);
         assert_eq!(after.size_bytes, before.size_bytes);
         assert_eq!(
-            dfs.posix_read_file(path).expect("unchanged content"),
+            dfs.posix_read_file_distributed(path)
+                .expect("unchanged content"),
             initial
         );
         std::fs::remove_dir_all(root).ok();
@@ -343,7 +377,8 @@ fn sifs_posix_write_at_from_reader_streams_sparse_extension_as_extent_patch() {
         "sparse write_at should not materialize the full logical object"
     );
     assert_eq!(
-        dfs.posix_read_file(file).expect("read sparse file"),
+        dfs.posix_read_file_distributed(file)
+            .expect("read sparse file"),
         expected
     );
 
@@ -410,11 +445,9 @@ fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
         replica_dfs
             .process_incoming()
             .expect("replica commit incoming");
-        let owner_object = owner_dfs
-            .current_read_object_metadata(&object_id)
-            .expect("owner object");
-        let replica_object = replica_dfs
-            .current_read_object_metadata(&object_id)
+        let owner_object =
+            node_store_object_with_receipts(&runtime, &owner, &object_id).expect("owner object");
+        let replica_object = node_store_object_with_receipts(&runtime, &replica, &object_id)
             .expect("replica object");
         if owner_object.content_hash.as_deref() == Some(expected_hash.as_str())
             && replica_object.content_hash.as_deref() == Some(expected_hash.as_str())
@@ -425,20 +458,20 @@ fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
     }
     assert!(committed, "replicated patch write did not commit");
 
-    let committed_owner = owner_dfs
-        .current_read_object_metadata(&object_id)
+    let committed_owner = node_store_object_with_receipts(&runtime, &owner, &object_id)
         .expect("committed owner metadata");
     assert_eq!(
         committed_owner.content_hash.as_deref(),
         Some(expected_hash.as_str())
     );
     assert_eq!(
-        owner_dfs.posix_read_file(path).expect("owner read"),
+        owner_dfs
+            .posix_read_file_distributed(path)
+            .expect("owner read"),
         expected
     );
     assert_eq!(
-        replica_dfs
-            .current_read_object_metadata(&object_id)
+        node_store_object_with_receipts(&runtime, &replica, &object_id)
             .expect("replica metadata")
             .current_locations
             .into_iter()
@@ -543,11 +576,9 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
         replica_dfs
             .process_incoming()
             .expect("replica commit incoming");
-        let owner_object = owner_dfs
-            .current_read_object_metadata(&object_id)
-            .expect("owner object");
-        let replica_object = replica_dfs
-            .current_read_object_metadata(&object_id)
+        let owner_object =
+            node_store_object_with_receipts(&runtime, &owner, &object_id).expect("owner object");
+        let replica_object = node_store_object_with_receipts(&runtime, &replica, &object_id)
             .expect("replica object");
         if owner_object.content_hash.as_deref() == Some(expected_hash.as_str())
             && replica_object.content_hash.as_deref() == Some(expected_hash.as_str())
@@ -558,12 +589,11 @@ fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob
     }
     assert!(committed, "chunked replicated patch write did not commit");
 
-    let committed_owner = owner_dfs
-        .current_read_object_metadata(&object_id)
+    let committed_owner = node_store_object_with_receipts(&runtime, &owner, &object_id)
         .expect("committed owner metadata");
     assert_eq!(
         owner_dfs
-            .posix_read_file_range(path, patch_offset as u64, patch.len())
+            .posix_read_file_range_distributed(path, patch_offset as u64, patch.len())
             .expect("owner patched range"),
         patch
     );
@@ -834,9 +864,13 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
 
     sifs_cluster_routed_posix_write(&mut cluster, path, &base);
     sifs_cluster_publish_metadata_until(&mut cluster, "range race replica catch-up", |cluster| {
-        cluster.observer.posix_stat(path).is_ok()
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.observer_node, path)
+            .is_some()
     });
-    let base_stat = cluster.writer.posix_stat(path).expect("base stat");
+    let base_stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("base stat");
     record_posix_observation(
         &mut observations,
         scenario,
@@ -908,12 +942,15 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
         }
     }
     sifs_posix_cluster_pump_until(&mut cluster, "write-at/truncate race settle", |cluster| {
-        cluster.primary.posix_stat(path).is_ok()
+        cluster.primary.posix_stat_distributed(path).is_ok()
             && sifs_routed_writes_settled(&cluster.writer)
             && sifs_routed_writes_settled(&cluster.observer)
     });
 
-    let final_bytes = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    let final_bytes = cluster
+        .primary
+        .posix_read_file_distributed(path)
+        .expect("primary read after race");
     let mut patched = base.clone();
     patched.splice(4..7, patch);
     let shrunk = base[..6].to_vec();
@@ -942,7 +979,7 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
     sifs_posix_cluster_pump_until(&mut cluster, "post-race truncate extension", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.size_bytes == Some(12))
     });
     let extended = cluster
@@ -1010,7 +1047,10 @@ fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
     assert_eq!(range, expected[base.len()..].to_vec());
 
     // The primary agrees on the patched content.
-    let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    let read = cluster
+        .primary
+        .posix_read_file_distributed(path)
+        .expect("primary read");
     assert_eq!(read, expected);
 
     drop(cluster);
@@ -1116,7 +1156,7 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
         sifs_routed_writes_settled(&cluster.writer)
             && cluster
                 .writer
-                .posix_stat(path)
+                .posix_stat_distributed(path)
                 .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
 
@@ -1135,10 +1175,16 @@ fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
         "the caller's ranged-write input should be consumed incrementally"
     );
     assert_eq!(
-        cluster.writer.posix_read_file(path).expect("writer read"),
+        cluster
+            .writer
+            .posix_read_file_distributed(path)
+            .expect("writer read"),
         expected
     );
-    let primary = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    let primary = cluster
+        .primary
+        .posix_read_file_distributed(path)
+        .expect("primary read");
     assert_eq!(primary, expected);
 
     drop(cluster);

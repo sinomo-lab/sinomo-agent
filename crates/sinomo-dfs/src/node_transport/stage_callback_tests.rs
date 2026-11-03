@@ -38,6 +38,23 @@ fn finish_apply(native: &crate::test_runtime::DfsTestRuntime,
     }
 }
 
+// Main serves committed setup repairs promptly. Finish that work, and the
+// maintenance turns carrying it, before the cut: the Stage's own committed
+// wake then starts its automatic Routine from a completed turn.
+fn settle_maintenance(native: &crate::test_runtime::DfsTestRuntime, nodes: &[&sinomo_core::node::NodeId]) {
+    let deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    for node in nodes {
+        loop {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            assert!(!budget.is_zero(), "setup maintenance on {node} did not settle");
+            let tick = native.maintenance_tick(node, budget).unwrap();
+            if matches!(tick.outcome, Ok(crate::DfsMaintenanceTickOutcome::Completed { reached_limit: false }))
+                && matches!(&tick.queue_after,
+                    Ok(crate::DfsRepairQueueBoundedStatus::Hydrated(view)) if view.record_count == 0) { break; }
+        }
+    }
+}
+
 // One genuine Fetch response is produced by the SAME cached Main lane before
 // an unrelated Root Stage arrives. No response, prepare or queue row is seeded.
 fn native_stage_case(name: &str, negative: Negative) {
@@ -86,6 +103,7 @@ fn native_stage_case(name: &str, negative: Negative) {
     let root_base = writer.posix_write_file(root_path, b"Root native predecessor", root_options).unwrap();
     writer.posix_sync_file(root_path, crate::DfsPosixSyncKind::File).unwrap();
     drop(writer);
+    settle_maintenance(&native, &[&source, &receiver, &other]);
     let mut source_core = native.metadata_primary_service(root_path).unwrap();
     let old_reader = native.metadata_primary_service(old_path).unwrap();
     let old_bytes = vec![0x73; 4096];

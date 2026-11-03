@@ -2569,6 +2569,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .get_mut(&(response.intent_id.clone(), response.replica_node_id.clone()))
                 .expect("strict current row retained through terminal checkpoint")
                 .next_retry_unix_nanos = due;
+            if due == 0 {
+                // An accepted reply leaves its row due: the repair pass closes
+                // it now instead of at the next scheduled probe.
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    repair_maintenance: true,
+                    ..Default::default()
+                });
+            }
         }
         Ok(())
     }

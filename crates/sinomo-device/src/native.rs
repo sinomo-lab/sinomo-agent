@@ -282,10 +282,13 @@ impl Default for NativeCameraCaptureConfig {
 }
 
 /// Native camera sample formats preserved by the capture layer. Compressed
-/// MJPEG is passed through unchanged; every other variant is raw pixel data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Encoded samples are passed through unchanged; decoding belongs to the media layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NativeVideoSampleFormat {
     Mjpeg,
+    H264,
+    Rgba8,
     Nv12,
     Yuyv,
     Rgb8,
@@ -297,7 +300,7 @@ pub enum NativeVideoSampleFormat {
 impl NativeVideoSampleFormat {
     #[must_use]
     pub const fn is_encoded(self) -> bool {
-        matches!(self, Self::Mjpeg)
+        matches!(self, Self::Mjpeg | Self::H264)
     }
 }
 
@@ -320,6 +323,8 @@ pub struct NativeVideoPlane {
 /// the native format and never performs an implicit JPEG re-encode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeVideoSample {
+    /// Original capture geometry before scaling; absent means the delivered dimensions.
+    pub native_dimensions: Option<[u32; 2]>,
     pub sequence: u64,
     pub format: NativeVideoSampleFormat,
     pub width: u32,
@@ -332,6 +337,10 @@ pub struct NativeVideoSample {
 }
 
 impl NativeVideoSample {
+    pub fn native_dimensions(&self) -> [u32; 2] {
+        self.native_dimensions.unwrap_or([self.width, self.height])
+    }
+
     pub fn validate(&self) -> Result<(), NativeDeviceError> {
         validate_native_video_sample(self)
     }
@@ -716,6 +725,15 @@ fn validate_native_video_sample(sample: &NativeVideoSample) -> Result<(), Native
             detail: "native video sample dimensions must be non-zero".to_string(),
         });
     }
+    let [native_width, native_height] = sample.native_dimensions();
+    if native_width == 0
+        || native_height == 0
+        || u64::from(native_width) * u64::from(native_height) > 32 * 1024 * 1024
+    {
+        return Err(NativeDeviceError::Camera {
+            detail: "invalid native capture geometry".into(),
+        });
+    }
     let expected_planes = usize::from(matches!(sample.format, NativeVideoSampleFormat::Nv12)) + 1;
     if sample.planes.len() != expected_planes {
         return Err(NativeDeviceError::Camera {
@@ -727,7 +745,7 @@ fn validate_native_video_sample(sample: &NativeVideoSample) -> Result<(), Native
         });
     }
     match sample.format {
-        NativeVideoSampleFormat::Mjpeg => {
+        NativeVideoSampleFormat::Mjpeg | NativeVideoSampleFormat::H264 => {
             let plane = &sample.planes[0];
             validate_native_video_plane_bounds(plane, sample.data.len())?;
             if plane.len == 0 {
@@ -768,13 +786,15 @@ fn validate_native_video_sample(sample: &NativeVideoSample) -> Result<(), Native
                 sample.width.saturating_mul(3),
             )?;
         }
-        NativeVideoSampleFormat::Bgra8 => validate_native_video_plane(
-            &sample.planes[0],
-            sample.data.len(),
-            sample.width,
-            sample.height,
-            sample.width.saturating_mul(4),
-        )?,
+        NativeVideoSampleFormat::Bgra8 | NativeVideoSampleFormat::Rgba8 => {
+            validate_native_video_plane(
+                &sample.planes[0],
+                sample.data.len(),
+                sample.width,
+                sample.height,
+                sample.width.saturating_mul(4),
+            )?
+        }
         NativeVideoSampleFormat::Gray8 => validate_native_video_plane(
             &sample.planes[0],
             sample.data.len(),
@@ -863,7 +883,7 @@ fn native_video_sample_from_contiguous(
 ) -> Result<NativeVideoSample, NativeDeviceError> {
     let data: Arc<[u8]> = data.into();
     let planes: Arc<[NativeVideoPlane]> = match format {
-        NativeVideoSampleFormat::Mjpeg => vec![NativeVideoPlane {
+        NativeVideoSampleFormat::Mjpeg | NativeVideoSampleFormat::H264 => vec![NativeVideoPlane {
             offset: 0,
             len: data.len(),
             width,
@@ -919,15 +939,20 @@ fn native_video_sample_from_contiguous(
         | NativeVideoSampleFormat::Rgb8
         | NativeVideoSampleFormat::Bgr8
         | NativeVideoSampleFormat::Bgra8
+        | NativeVideoSampleFormat::Rgba8
         | NativeVideoSampleFormat::Gray8 => {
             let minimum_stride = match format {
                 NativeVideoSampleFormat::Yuyv => width.div_ceil(2).saturating_mul(4),
                 NativeVideoSampleFormat::Rgb8 | NativeVideoSampleFormat::Bgr8 => {
                     width.saturating_mul(3)
                 }
-                NativeVideoSampleFormat::Bgra8 => width.saturating_mul(4),
+                NativeVideoSampleFormat::Bgra8 | NativeVideoSampleFormat::Rgba8 => {
+                    width.saturating_mul(4)
+                }
                 NativeVideoSampleFormat::Gray8 => width,
-                NativeVideoSampleFormat::Mjpeg | NativeVideoSampleFormat::Nv12 => unreachable!(),
+                NativeVideoSampleFormat::Mjpeg
+                | NativeVideoSampleFormat::H264
+                | NativeVideoSampleFormat::Nv12 => unreachable!(),
             };
             vec![NativeVideoPlane {
                 offset: 0,
@@ -940,6 +965,7 @@ fn native_video_sample_from_contiguous(
         }
     };
     let sample = NativeVideoSample {
+        native_dimensions: None,
         sequence,
         format,
         width,

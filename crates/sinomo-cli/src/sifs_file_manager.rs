@@ -3478,17 +3478,15 @@ fn open_sifs_service_with_catalog_until(
         read_sifs_metadata_shard_configs(&cluster_paths)?
     };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let service = if let Some(metadata) = open_sifs_sharded_metadata_backend(
-        data_dir,
-        metadata_shards,
-        &local_node_id,
-        registered_main_namespace_dispatch,
-    )? {
-        if registered_main_namespace_dispatch {
-            service
-                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
-                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
-        } else if hydrate_metadata {
+    // A caller delegating to its Main keeps no local metadata store.
+    let service = if registered_main_namespace_dispatch {
+        service
+            .into_main_sifs_client()
+            .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
+    } else if let Some(metadata) =
+        open_sifs_sharded_metadata_backend(data_dir, metadata_shards, &local_node_id)?
+    {
+        if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
@@ -3503,11 +3501,7 @@ fn open_sifs_service_with_catalog_until(
             default_dfs_metadata_root(data_dir),
         )
         .map_err(|error| format!("cannot inspect local SIFS metadata: {error}"))?;
-        if registered_main_namespace_dispatch {
-            service
-                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
-                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
-        } else if hydrate_metadata {
+        if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
@@ -5128,28 +5122,18 @@ fn open_sifs_sharded_metadata_backend(
     data_dir: &SinomoDataDir,
     shards: Vec<DfsMetadataShardConfig>,
     local_node_id: &NodeId,
-    registered_main_namespace_dispatch: bool,
 ) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, String> {
     if shards.is_empty() {
         return Ok(None);
     }
     let metadata_root = default_dfs_metadata_shards_root(data_dir);
-    let backend = if registered_main_namespace_dispatch {
-        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node_deferred(
-            metadata_root,
-            shards,
-            local_node_id,
-        )
-    } else {
-        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
-            metadata_root,
-            shards,
-            local_node_id,
-        )
-    };
-    backend
-        .map(Some)
-        .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
+    sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
+        metadata_root,
+        shards,
+        local_node_id,
+    )
+    .map(Some)
+    .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
 }
 
 fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> Vec<NodeId> {
@@ -5611,12 +5595,6 @@ fn ensure_sifs_parent_directory_for_write(
     service: &mut NetworkedDfsService<DfsNodeTransport>,
     parent: &str,
 ) -> Result<(), String> {
-    if service
-        .posix_stat(parent)
-        .is_ok_and(|stat| stat.kind == DfsObjectKind::Directory)
-    {
-        return Ok(());
-    }
     match service.posix_stat_distributed(parent) {
         Ok(stat) if stat.kind == DfsObjectKind::Directory => Ok(()),
         Ok(stat) => Err(format!(
@@ -7148,18 +7126,30 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sifs_backend_open_always_attaches_metadata() {
+    fn ordinary_sifs_backend_delegating_to_main_keeps_no_metadata_store() {
         let root = temp_sifs_data_dir("ordinary-open-metadata");
         let data_dir = SinomoDataDir::new(&root);
         let _native_data_dir = crate::native_test_fixture::NativeCliFixture::start(&data_dir);
         let backend = SifsFileManagerBackend::open(&data_dir).expect("ordinary SIFS backend");
+        let mut service = backend.lock_service().expect("ordinary SIFS service");
         assert!(
-            backend
-                .lock_service()
-                .expect("ordinary SIFS service")
-                .metadata_backend()
-                .is_some(),
-            "ordinary TUI/app/general backends must never use the metadata-less one-shot lane"
+            service.metadata_backend().is_none(),
+            "a backend delegating to its Main keeps no local metadata store"
+        );
+        // This bare fixture publishes no materialized catalog; read the
+        // authoritative one that routes the caller.
+        assert!(
+            !service
+                .metadata_shard_authorities(&sifs_file_system_id())
+                .expect("authoritative shard catalog")
+                .is_empty()
+        );
+        assert_eq!(
+            service
+                .posix_stat_distributed("/services")
+                .expect("directory through its authority")
+                .kind,
+            DfsObjectKind::Directory
         );
     }
 
@@ -7532,24 +7522,25 @@ mod tests {
             live_replica_cli_fixture("cli-cold-actual-authority");
         let paths = ClusterPaths::new(&data_dir);
         let runtime = SifsRpcRuntime::new().unwrap();
-        let cold = open_sifs_service_with_hydration(&data_dir, &runtime, false).unwrap();
-        let cold_statuses = cold
-            .metadata_backend()
-            .unwrap()
-            .metadata_shard_statuses()
+        let mut cold = open_sifs_service_with_hydration(&data_dir, &runtime, false).unwrap();
+        // A caller delegating to its Main keeps no metadata store; its
+        // routing view is the authoritative shard catalog.
+        assert!(cold.metadata_backend().is_none());
+        let cold_authorities = cold
+            .metadata_shard_authorities(&sifs_file_system_id())
             .unwrap();
         evidence(
             &data_dir,
             "cold-actual-catalog-before.json",
             serde_json::json!({
-                "actual_assignments":stale,"cold_statuses":cold_statuses,
+                "actual_assignments":stale,"cold_authorities":cold_authorities,
             }),
         );
         for shard in &stale {
             assert!(
-                cold_statuses
+                cold_authorities
                     .iter()
-                    .any(|s| s.shard_id.0 == shard.shard_id && s.epoch == Some(shard.epoch))
+                    .any(|s| s.shard_id == shard.shard_id && s.epoch == shard.epoch)
             );
         }
         drop(cold);
@@ -7583,35 +7574,30 @@ mod tests {
             .unwrap()
             .0;
         let client = SifsControlPlaneKvClient::new(&data_dir, &paths).with_peer_transport(peer);
-        let result =
+        let mut result =
             open_sifs_service_with_authoritative_catalog_until(&data_dir, &runtime, client, None);
-        let statuses = result.as_ref().map(|s| {
-            s.metadata_backend()
-                .unwrap()
-                .metadata_shard_statuses()
-                .unwrap()
-        });
+        let authorities = result
+            .as_mut()
+            .map(|s| s.metadata_shard_authorities(&sifs_file_system_id()).unwrap())
+            .map_err(|error| error.to_string());
         evidence(
             &data_dir,
             "cold-actual-catalog-after.json",
             serde_json::json!({
                 "qualification":"real same3-owner handoffs + actual current range read; old file is prior real captured DATA, no row/proof synthesis",
-                "stale":stale,"current":current,"result":statuses.as_ref().map(|v| serde_json::to_value(v).unwrap()).map_err(ToString::to_string),
+                "stale":stale,"current":current,"result":authorities.as_ref().map(|v| serde_json::to_value(v).unwrap()).map_err(ToString::to_string),
                 "checkpoint_unchanged":fs::read(&paths.kv_paths().snapshot).unwrap()==before_checkpoint,
                 "heads_before":before,"heads_after":metadata_journal_heads(&data_dir,&current),
             }),
         );
         let service = result.unwrap();
-        let statuses = service
-            .metadata_backend()
-            .unwrap()
-            .metadata_shard_statuses()
-            .unwrap();
+        assert!(service.metadata_backend().is_none());
+        let authorities = authorities.unwrap();
         for shard in &current {
             assert!(
-                statuses
+                authorities
                     .iter()
-                    .any(|s| s.shard_id.0 == shard.shard_id && s.epoch == Some(shard.epoch))
+                    .any(|s| s.shard_id == shard.shard_id && s.epoch == shard.epoch)
             );
         }
         assert_eq!(read_sifs_metadata_shard_configs(&paths).unwrap(), stale);

@@ -2645,55 +2645,57 @@ mod tests {
             .unwrap();
         drop(control);
         let shards = native.metadata_shards().unwrap();
-        let mut owner = native.client(&nodes[0]).unwrap();
         let mut deleted = 0;
         // Each pass obtains a new real complete catalog. The first releases
         // the now-unreferenced reservation and records durable absence; the
         // second may collect the version under that later catalog observation.
+        // The catalog spans every shard copy on the node, which only Main holds.
         for _ in 0..2 {
-            let catalog = owner
-                .refresh_content_root_catalog(
-                    std::slice::from_ref(&config),
-                    &shards,
-                    &[],
-                    &root,
-                    &[],
-                    32,
-                )
-                .unwrap();
-            let validation = catalog
-                .validate_for_collection_with_head_watermark_policy(
-                    std::slice::from_ref(&config),
-                    &shards,
-                    &[],
-                    &[],
-                    false,
-                    time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64,
-                    std::time::Duration::from_secs(30),
-                )
-                .unwrap();
-            assert!(
-                validation.is_collection_authorized(),
-                "normal catalog denied collection: {:?}",
-                validation.reasons()
-            );
-            let report = owner
-                .run_lifecycle_maintenance(sinomo_dfs::DfsLifecycleMaintenanceOptions {
-                    content_root_catalog_validation: Some(validation),
-                    content_reservation_reconciliation: Some(
-                        sinomo_dfs::ContentStoreReservationReconciliationOptions::bounded(
-                            time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64,
-                            std::time::Duration::ZERO,
-                            32,
-                        ),
-                    ),
-                    version_gc: Some(sinomo_dfs::ContentStoreVersionGcOptions::delete_eligible(
-                        std::time::Duration::ZERO,
-                        1,
-                    )),
-                    ..Default::default()
+            let (authorized, reasons, report) = native
+                .with_main_maintenance_service(&nodes[0], |owner| {
+                    let catalog = owner.refresh_content_root_catalog(
+                        std::slice::from_ref(&config),
+                        &shards,
+                        &[],
+                        &root,
+                        &[],
+                        32,
+                    )?;
+                    let validation = catalog.validate_for_collection_with_head_watermark_policy(
+                        std::slice::from_ref(&config),
+                        &shards,
+                        &[],
+                        &[],
+                        false,
+                        time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64,
+                        std::time::Duration::from_secs(30),
+                    )?;
+                    let authorized = validation.is_collection_authorized();
+                    let reasons = format!("{:?}", validation.reasons());
+                    let report =
+                        owner
+                            .run_lifecycle_maintenance(sinomo_dfs::DfsLifecycleMaintenanceOptions {
+                            content_root_catalog_validation: Some(validation),
+                            content_reservation_reconciliation: Some(
+                                sinomo_dfs::ContentStoreReservationReconciliationOptions::bounded(
+                                    time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64,
+                                    std::time::Duration::ZERO,
+                                    32,
+                                ),
+                            ),
+                            version_gc: Some(
+                                sinomo_dfs::ContentStoreVersionGcOptions::delete_eligible(
+                                    std::time::Duration::ZERO,
+                                    1,
+                                ),
+                            ),
+                            ..Default::default()
+                        })?;
+                    Ok::<_, sinomo_dfs::DfsError>((authorized, reasons, report))
                 })
+                .unwrap()
                 .unwrap();
+            assert!(authorized, "normal catalog denied collection: {reasons}");
             assert!(!report.content_gc_metadata_protection_unavailable);
             deleted += report.version_gc.unwrap().deleted_version_count;
         }
@@ -2763,7 +2765,6 @@ mod tests {
                 .is_err()
         );
         drop(reader);
-        drop(owner);
         drop(content);
         native.close().unwrap();
     }

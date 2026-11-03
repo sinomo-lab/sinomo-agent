@@ -12,12 +12,16 @@ use crate::*;
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The journal position a routed request advertises for `shard`, so its
     /// primary returns the entries this node's replica is missing. A node that
-    /// does not replicate the shard advertises nothing and receives no batches.
+    /// does not replicate the shard, and a caller delegating to its Main,
+    /// advertise nothing and receive no batches: only Main ingests the shard's
+    /// journal into the node's store.
     pub(crate) fn local_metadata_journal_after_sequence_for_shard(
         &mut self,
         shard: &DfsMetadataShardConfig,
     ) -> Result<Option<u64>, DfsError> {
-        if !shard_lists_node(shard, &self.node_id) {
+        if !shard_lists_node(shard, &self.node_id)
+            || self.transport.delegates_local_namespace_authority()
+        {
             return Ok(None);
         }
         let shard_id = &DfsMetadataShardId::new(shard.shard_id.clone());
@@ -295,9 +299,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         validated_authority_shard: &DfsMetadataShardConfig,
         frames: &DfsMetadataJournalFrameBatch,
     ) -> Result<(), DfsError> {
-        if !shard_lists_node(validated_authority_shard, &self.node_id) {
-            // Response batches feed only the shard's replicas; any other node
-            // reads the shard through its primary.
+        if !shard_lists_node(validated_authority_shard, &self.node_id)
+            || self.transport.delegates_local_namespace_authority()
+        {
+            // Response batches feed only the shard's replicas, through their
+            // Main; any other node or delegating caller reads the shard
+            // through its primary.
             return Ok(());
         }
         let batch = frames.decoded()?;

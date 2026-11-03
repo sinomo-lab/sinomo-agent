@@ -401,8 +401,8 @@ fn read_only_backend_attachment_skips_bootstrap_scans_and_serves_targeted_reads(
             DfsWriteOptions::replicated_eventual(vec![node.clone()]),
         )
         .unwrap();
-    let expected = writer
-        .metadata_backend()
+    let expected = runtime
+        .node_metadata(&node)
         .unwrap()
         .get_object(&stat.object_id)
         .unwrap()
@@ -856,6 +856,22 @@ fn native_current_read_fixture(
     )
 }
 
+/// The read engine plans cached reads, location prunes and retries from the
+/// reader node's own store. The fixture's authoritative reader is the shard
+/// primary, so its store-backed owner runs those reads; a delegating client
+/// keeps no local object view to plan from.
+fn primary_store_reader(
+    runtime: &crate::test_runtime::DfsTestRuntime,
+    reader_node: &NodeId,
+    stat: &DfsStat,
+) -> NetworkedDfsService<DfsNodeTransport> {
+    let reader = runtime
+        .metadata_primary_service(&stat.path)
+        .expect("store-backed reader on the shard primary");
+    assert_eq!(reader.node_id(), reader_node);
+    reader
+}
+
 fn wait_for_actual_read_retry(reader: &NetworkedDfsService<DfsNodeTransport>, request: &str) {
     let deadline = reader
         .reads
@@ -888,14 +904,14 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
         .content()
         .put_object_version(object_id.as_str(), version.as_str(), &bytes)
         .unwrap();
-    assert!(
-        server
-            .metadata_backend()
+    let server_store_row = || {
+        runtime
+            .node_metadata(&server_node)
             .unwrap()
             .get_object(&object_id)
             .unwrap()
-            .is_none()
-    );
+    };
+    assert!(server_store_row().is_none());
     let mut requester = runtime.client(&requester_node).unwrap();
     let request = DfsDirectReadRequest {
         request_id: requester.next_request_id(),
@@ -923,14 +939,7 @@ fn hinted_remote_read_serves_blob_without_local_metadata() {
         matches!(response.result, DfsReadResult::Found(DfsReadData { version: actual_version, bytes: actual, .. })
         if actual_version == version && actual == bytes)
     );
-    assert!(
-        server
-            .metadata_backend()
-            .unwrap()
-            .get_object(&object_id)
-            .unwrap()
-            .is_none()
-    );
+    assert!(server_store_row().is_none());
     assert!(
         runtime.rpc_observations()[before..]
             .iter()
@@ -952,8 +961,13 @@ fn uncached_remote_read_arbitrary_size_uses_reader_response() {
     let hash = stat.content_hash.as_ref().unwrap();
     assert!(!reader.content().has_blob(hash).unwrap());
     let before = runtime.rpc_observations().len();
+    // A delegating caller reads the object from its authority and requests
+    // the uncached body for that metadata, as its distributed reads do.
+    let object = reader
+        .current_read_object_metadata_distributed(&stat.object_id)
+        .unwrap();
     let targets = reader
-        .request_remote_object_read_without_cache(&stat.object_id)
+        .request_remote_object_read_for_metadata_without_cache(&object)
         .unwrap();
     assert_eq!(targets.len(), 1);
     assert!(stat.current_locations.contains(&targets[0]));
@@ -983,8 +997,13 @@ fn uncached_remote_read_direct_transport_completes_without_protocol_frame() {
         native_current_read_fixture("native-direct-read-no-frame");
     let mut reader = runtime.client(&reader_node).unwrap();
     let before = runtime.rpc_observations().len();
+    // A delegating caller reads the object from its authority and requests
+    // the uncached body for that metadata, as its distributed reads do.
+    let object = reader
+        .current_read_object_metadata_distributed(&stat.object_id)
+        .unwrap();
     let targets = reader
-        .request_remote_object_read_without_cache(&stat.object_id)
+        .request_remote_object_read_for_metadata_without_cache(&object)
         .unwrap();
     assert_eq!(targets.len(), 1);
     assert!(
@@ -1022,10 +1041,12 @@ fn failed_uncached_remote_direct_read_cleans_pending_state() {
     let (runtime, _, _, reader_node, stat, _) =
         native_current_read_fixture("native-direct-read-error-cleanup");
     let mut reader = runtime.client(&reader_node).unwrap();
+    // A delegating caller reads the object from its authority and requests
+    // the uncached body for that metadata, as its distributed reads do.
     let object = reader
-        .current_read_object_metadata(&stat.object_id)
+        .current_read_object_metadata_distributed(&stat.object_id)
         .unwrap();
-    let targets = reader.ranked_transfer_sources(object.current_locations);
+    let targets = reader.ranked_transfer_sources(object.current_locations.clone());
     let target = targets
         .into_iter()
         .find(|node| *node != reader_node)
@@ -1041,7 +1062,7 @@ fn failed_uncached_remote_direct_read_cleans_pending_state() {
     });
     let before = runtime.rpc_observations().len();
     let error = reader
-        .request_remote_object_read_without_cache(&stat.object_id)
+        .request_remote_object_read_for_metadata_without_cache(&object)
         .unwrap_err();
     assert!(
         error
@@ -1078,8 +1099,8 @@ fn failed_uncached_remote_direct_read_cleans_pending_state() {
 #[test]
 fn stale_pending_remote_read_can_be_retried() {
     let (runtime, owner, _, reader_node, stat, bytes) =
-        native_read_fixture("native-read-stale-pending", 1, false, vec![0x41; 4096]);
-    let mut reader = runtime.client(&reader_node).unwrap();
+        native_read_fixture("native-read-stale-pending", 1, true, vec![0x41; 4096]);
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     let before = runtime.rpc_observations().len();
     assert_eq!(
         reader.request_remote_object_read(&stat.object_id).unwrap(),
@@ -1132,13 +1153,9 @@ fn stale_pending_remote_read_can_be_retried() {
 
 #[test]
 fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
-    let (runtime, owner, _, reader_node, stat, bytes) = native_read_fixture(
-        "native-read-queued-before-prune",
-        1,
-        false,
-        vec![0x61; 4096],
-    );
-    let mut reader = runtime.client(&reader_node).unwrap();
+    let (runtime, owner, _, reader_node, stat, bytes) =
+        native_read_fixture("native-read-queued-before-prune", 1, true, vec![0x61; 4096]);
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     assert_eq!(
         reader.request_remote_object_read(&stat.object_id).unwrap(),
         vec![owner.clone()]
@@ -1216,12 +1233,16 @@ fn native_read_fixture_observes_actual_publication_before_queued_read_setup() {
                     return;
                 }
                 wait_for_publication();
-                let mut reader = runtime.client(reader_node).unwrap();
+                // The reader node's own store genuinely lacks the object
+                // while its publication is held.
                 assert!(
-                    matches!(reader.request_remote_object_read(&published.object_id),
-                Err(DfsError::UnknownObject { object_id }) if object_id == published.object_id)
+                    runtime
+                        .node_metadata(reader_node)
+                        .unwrap()
+                        .get_object(&published.object_id)
+                        .unwrap()
+                        .is_none()
                 );
-                assert!(reader.reads.pending_reads.is_empty());
                 let command = captured.lock().unwrap()[0].clone();
                 assert!(
                     observed.materialized_sequence.unwrap() < command.batch.next_after_sequence
@@ -1252,23 +1273,38 @@ fn native_read_fixture_observes_actual_publication_before_queued_read_setup() {
             },
         );
     wait_for_publication();
-    let mut reader = runtime.client(&reader_node).unwrap();
-    let request = reader.request_remote_object_read(&stat.object_id);
+    let view = runtime
+        .node_metadata(&reader_node)
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap();
     // Always release actual paused ingress before asserting the old failure.
     runtime.clear_faults();
     if !saw_gap.get() {
         gate.add_permits(1);
     }
-    if request.is_err() {
+    if view
+        .as_ref()
+        .is_none_or(|object| object.version != stat.version)
+    {
         eprintln!(
-            "QUEUED-READ controlled premature fixture: stat={stat:?} result={request:?} held={:#?}",
+            "QUEUED-READ controlled premature fixture: stat={stat:?} view={view:?} held={:#?}",
             captured.lock().unwrap()[0].batch.decoded()
         );
-        drop(reader);
         runtime.close().unwrap();
-        panic!("fixture returned before its exact reader view was published: {request:?}");
+        panic!("fixture returned before its exact reader view was published: {view:?}");
     }
-    assert_eq!(request.unwrap(), vec![owner.clone()]);
+    // The reader's caller plans the queued read from the published object,
+    // as a delegating caller's distributed read does.
+    let mut reader = runtime.client(&reader_node).unwrap();
+    let object = reader
+        .current_read_object_metadata_distributed(&stat.object_id)
+        .unwrap();
+    assert_eq!(object.version, stat.version);
+    let request = reader
+        .request_remote_object_read_for_metadata_without_cache(&object)
+        .unwrap();
+    assert_eq!(request, vec![owner.clone()]);
     assert!(
         saw_gap.get(),
         "the actual reader view must be missing before releasing publication"
@@ -1298,8 +1334,17 @@ fn remote_read_planning_deduplicates_duplicate_locations() {
     );
     let mut reader = runtime.client(&reader_node).unwrap();
     let actual = reader
-        .current_read_object_metadata(&stat.object_id)
+        .current_read_object_metadata_distributed(&stat.object_id)
         .unwrap();
+    let reader_store_row = || {
+        runtime
+            .node_metadata(&reader_node)
+            .unwrap()
+            .get_object(&stat.object_id)
+            .unwrap()
+            .unwrap()
+    };
+    let stored = reader_store_row();
     let mut duplicate_hint = actual.clone();
     // Repeat only an existing real holder in a read-only caller descriptor.
     // No authoritative row or source identity is installed or widened.
@@ -1323,15 +1368,8 @@ fn remote_read_planning_deduplicates_duplicate_locations() {
             .count(),
         1
     );
-    assert_eq!(
-        reader
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap()
-            .unwrap(),
-        actual
-    );
+    // The reader node's store row is neither installed nor widened.
+    assert_eq!(reader_store_row(), stored);
     let events = reader.process_incoming().unwrap();
     assert!(events.iter().any(
         |event| matches!(event, NetworkedDfsServiceEvent::RemoteReadCompleted {
@@ -1346,7 +1384,7 @@ fn remote_read_planning_deduplicates_duplicate_locations() {
 fn remote_read_planning_uses_single_active_source_and_falls_back_after_miss() {
     let (runtime, _, _, reader_node, stat, bytes) =
         native_read_fixture("native-read-real-miss-fallback", 2, true, vec![0x4e; 4096]);
-    let mut reader = runtime.client(&reader_node).unwrap();
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     let before = runtime.rpc_observations().len();
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
@@ -1437,7 +1475,16 @@ fn prune_actual_read_source_with_second_read(
     missing: &NodeId,
 ) {
     deny_native_read_repair(runtime, primary, missing);
-    let mut second = runtime.client(primary).unwrap();
+    // A second store-backed reader on the primary authors the prune.
+    let path = runtime
+        .node_metadata(primary)
+        .unwrap()
+        .get_object(object_id)
+        .unwrap()
+        .expect("the primary's store holds the object")
+        .path;
+    let mut second = runtime.metadata_primary_service(&path).unwrap();
+    assert_eq!(second.node_id(), primary);
     let mut hint = second.current_read_object_metadata(object_id).unwrap();
     assert!(hint.current_locations.contains(missing));
     // Restrict a genuine read-only source hint to one already-known holder.
@@ -1481,7 +1528,7 @@ fn pending_remote_read_to_removed_location_does_not_block_fallback() {
         true,
         vec![0x51; 4096],
     );
-    let mut reader = runtime.client(&primary).unwrap();
+    let mut reader = primary_store_reader(&runtime, &primary, &stat);
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
     let old_request = reader.reads.pending_reads.keys().next().unwrap().clone();
@@ -1524,8 +1571,8 @@ fn pending_remote_read_to_removed_location_does_not_block_fallback() {
 #[test]
 fn expired_remote_read_attempt_rotates_to_next_location_before_retrying_same_source() {
     let (runtime, _, _, reader_node, stat, bytes) =
-        native_read_fixture("native-read-expiry-rotation", 2, false, vec![0x45; 4096]);
-    let mut reader = runtime.client(&reader_node).unwrap();
+        native_read_fixture("native-read-expiry-rotation", 2, true, vec![0x45; 4096]);
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
     let request = reader.reads.pending_reads.keys().next().unwrap().clone();
@@ -1564,7 +1611,7 @@ fn late_remote_read_from_removed_location_does_not_clear_fallback_request() {
         true,
         vec![0x52; 4096],
     );
-    let mut reader = runtime.client(&primary).unwrap();
+    let mut reader = primary_store_reader(&runtime, &primary, &stat);
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
     let old_request = reader.reads.pending_reads.keys().next().unwrap().clone();
@@ -1630,7 +1677,7 @@ fn remote_read_rejection_from_stale_location_falls_back_to_next_source() {
         true,
         vec![0x4e; 4096],
     );
-    let mut reader = runtime.client(&reader_node).unwrap();
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     let before = runtime.rpc_observations().len();
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
@@ -1708,7 +1755,7 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
         true,
         vec![0x4e; 4096],
     );
-    let mut reader = runtime.client(&reader_node).unwrap();
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     let before = runtime.rpc_observations().len();
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
@@ -1786,7 +1833,7 @@ fn inline_remote_read_wrong_payload_object_is_isolated_and_falls_back() {
         true,
         vec![0x4e; 4096],
     );
-    let mut reader = runtime.client(&reader_node).unwrap();
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     let before = runtime.rpc_observations().len();
     let first = reader.request_remote_object_read(&stat.object_id).unwrap();
     assert_eq!(first.len(), 1);
@@ -1862,7 +1909,7 @@ fn remote_read_content_identity_mismatch_prunes_stale_location() {
         true,
         vec![0x62; 4096],
     );
-    let mut reader = runtime.client(&reader_node).unwrap();
+    let mut reader = primary_store_reader(&runtime, &reader_node, &stat);
     assert_eq!(
         reader.request_remote_object_read(&stat.object_id).unwrap(),
         vec![owner.clone()]
@@ -1928,7 +1975,11 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
         )
         .unwrap();
     dfs.posix_sync_file(path, DfsPosixSyncKind::File).unwrap();
-    let backend = dfs.metadata_backend().unwrap();
+    // The prune is authored on the primary's store; the delegating client
+    // keeps none.
+    let mut owner = runtime.metadata_primary_service(path).unwrap();
+    assert_eq!(owner.node_id(), &assignment.primary_node_id);
+    let backend = owner.metadata_backend().unwrap();
     let before = backend.get_object(&stat.object_id).unwrap().unwrap();
     let version = backend
         .get_version(&stat.object_id, &stat.version)
@@ -1945,14 +1996,15 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
         .clone();
     assert!(before.current_locations.contains(&missing));
     assert!(version.locations.contains(&missing));
-    dfs.mark_remote_read_location_missing(
-        &stat.object_id,
-        &stat.version,
-        &stat.content_hash,
-        &missing,
-    )
-    .unwrap();
-    let backend = dfs.metadata_backend().unwrap();
+    owner
+        .mark_remote_read_location_missing(
+            &stat.object_id,
+            &stat.version,
+            &stat.content_hash,
+            &missing,
+        )
+        .unwrap();
+    let backend = owner.metadata_backend().unwrap();
     let object = backend.get_object(&stat.object_id).unwrap().unwrap();
     let after = backend
         .get_version(&stat.object_id, &stat.version)
@@ -1985,6 +2037,7 @@ fn remote_read_location_prune_updates_stale_backend_version_record() {
             .iter()
             .any(|receipt| receipt.replica_node_id == missing)
     );
+    drop(owner);
     assert_eq!(
         dfs.posix_read_file_distributed(path).unwrap(),
         b"actual durable prune bytes"
@@ -2020,15 +2073,14 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
     let mut reader = runtime.client(&nodes[1]).unwrap();
     reader.posix_stat_distributed(path).unwrap();
     let shard = DfsMetadataShardId::new(runtime.root_shard().unwrap().shard_id);
-    let before = reader
-        .metadata_backend()
-        .unwrap()
+    // The replica node's own store is inspected directly; the delegating
+    // reader keeps none.
+    let replica_store = || runtime.node_metadata(&nodes[1]).unwrap();
+    let before = replica_store()
         .export_shard_table_snapshot(&shard)
         .unwrap()
         .unwrap();
-    let before_object = reader
-        .metadata_backend()
-        .unwrap()
+    let before_object = replica_store()
         .get_object(&stat.object_id)
         .unwrap()
         .unwrap();
@@ -2040,9 +2092,7 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
             &nodes[0],
         )
         .unwrap();
-    let after = reader
-        .metadata_backend()
-        .unwrap()
+    let after = replica_store()
         .export_shard_table_snapshot(&shard)
         .unwrap()
         .unwrap();
@@ -2052,9 +2102,7 @@ fn replica_remote_read_cache_and_prune_do_not_append_authoritative_metadata() {
         before.semantic_state_fingerprint
     );
     assert_eq!(
-        reader
-            .metadata_backend()
-            .unwrap()
+        replica_store()
             .get_object(&stat.object_id)
             .unwrap()
             .unwrap(),
@@ -2094,6 +2142,12 @@ fn read_current_object_uses_hash_addressed_blob_without_manifest_scan() {
         "normal Main publication uses hash-addressed content without an object manifest"
     );
 
+    // Local object reads resolve through the node's store; the delegating
+    // client keeps none, so the store-backed owner reads.
+    drop(dfs);
+    let dfs = _runtime
+        .metadata_primary_service("/services/hash-addressed.txt")
+        .unwrap();
     let outcome = dfs
         .read_local_object_with_state(&object_id, false)
         .expect("read");
@@ -2144,6 +2198,12 @@ fn read_current_object_range_uses_bounded_hash_addressed_blob_slice() {
         "normal Main publication uses hash-addressed content without an object manifest"
     );
 
+    // Local object reads resolve through the node's store; the delegating
+    // client keeps none, so the store-backed owner reads.
+    drop(dfs);
+    let dfs = _runtime
+        .metadata_primary_service("/services/hash-range.txt")
+        .unwrap();
     let outcome = dfs
         .read_local_object_range_with_state(&object_id, 6, 8, false)
         .expect("range read");
@@ -2356,7 +2416,7 @@ fn sifs_posix_read_updates_atime_without_changing_mtime() {
     .expect("write");
     dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
         .expect("old times");
-    let before = dfs.posix_stat(file_path).expect("before stat");
+    let before = dfs.posix_stat_distributed(file_path).expect("before stat");
 
     assert_eq!(
         dfs.posix_read_file_update_access(file_path)
@@ -2364,7 +2424,7 @@ fn sifs_posix_read_updates_atime_without_changing_mtime() {
         b"content"
     );
 
-    let stat = dfs.posix_stat(file_path).expect("stat");
+    let stat = dfs.posix_stat_distributed(file_path).expect("stat");
     assert!(stat.accessed_at_unix_nanos > 12_345);
     assert_eq!(stat.modified_at_unix_nanos, 67_890);
     assert_ne!(
@@ -2372,7 +2432,7 @@ fn sifs_posix_read_updates_atime_without_changing_mtime() {
         "atime update must advance the DFS metadata version so it persists across distributed reconciliation"
     );
     assert_eq!(
-        dfs.posix_read_file(file_path)
+        dfs.posix_read_file_distributed(file_path)
             .expect("metadata-only version remains content-readable"),
         b"content"
     );
@@ -2639,18 +2699,18 @@ fn sifs_cluster_posix_contract_rename_atomicity_with_active_readers() {
 
     sifs_cluster_primary_posix_write(&mut cluster, source, &bytes);
     sifs_cluster_publish_metadata_until(&mut cluster, "pre-rename observer", |cluster| {
-        cluster.observer.posix_stat(source).is_ok()
+        node_store_object(&cluster._runtime, &cluster.observer_node, source).is_some()
     });
     for (op, node, result) in [
         (
             "pre-source",
             cluster.observer_node.clone(),
-            cluster.observer.posix_stat(source),
+            cluster.observer.posix_stat_distributed(source),
         ),
         (
             "pre-destination",
             cluster.observer_node.clone(),
-            cluster.observer.posix_stat(destination),
+            cluster.observer.posix_stat_distributed(destination),
         ),
     ] {
         record_posix_observation(
@@ -2673,25 +2733,24 @@ fn sifs_cluster_posix_contract_rename_atomicity_with_active_readers() {
         .primary
         .posix_rename(source, destination)
         .expect("rename");
-    let primary_source = cluster.primary.posix_stat(source);
-    let primary_destination = cluster.primary.posix_stat(destination);
+    let primary_source = cluster.primary.posix_stat_distributed(source);
+    let primary_destination = cluster.primary.posix_stat_distributed(destination);
     assert!(
         primary_source.is_err() && primary_destination.is_ok(),
         "primary must expose the rename atomically"
     );
     sifs_cluster_publish_metadata_until(&mut cluster, "post-rename observer", |cluster| {
-        matches!(
-            cluster.observer.posix_stat(source),
-            Err(DfsPosixError::NotFound { .. })
-        ) && cluster.observer.posix_stat(destination).is_ok()
+        let runtime = &cluster._runtime;
+        node_store_object(runtime, &cluster.observer_node, source).is_none()
+            && node_store_object(runtime, &cluster.observer_node, destination).is_some()
     });
-    let entries = cluster
-        .observer
-        .posix_list_dir("/users")
-        .expect("observer list");
+    let entries = node_store_children(&cluster._runtime, &cluster.observer_node, "/users")
+        .into_iter()
+        .map(|(name, _, _)| format!("/users/{name}"))
+        .collect::<Vec<_>>();
     assert!(
-        !entries.iter().any(|entry| entry.path == source)
-            && entries.iter().any(|entry| entry.path == destination),
+        !entries.iter().any(|entry| entry == source)
+            && entries.iter().any(|entry| entry == destination),
         "observer must not see both source and destination as live entries: {entries:?}"
     );
     assert_sifs_cluster_no_posix_leaks(&cluster, scenario);
@@ -2743,10 +2802,8 @@ fn sifs_cluster_posix_contract_stale_cache_current_read_invalidation() {
         )
         .expect("primary overwrite");
     sifs_cluster_publish_metadata_until(&mut cluster, "writer learns new version", |cluster| {
-        cluster
-            .writer
-            .posix_stat(path)
-            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(content_hash(&new).as_str()))
+        node_store_content_hash(&cluster._runtime, &cluster.writer_node, path)
+            .is_some_and(|hash| hash == content_hash(&new))
     });
     let read = {
         let primary = &mut cluster.primary;
@@ -2762,7 +2819,7 @@ fn sifs_cluster_posix_contract_stale_cache_current_read_invalidation() {
     };
     let stat = cluster
         .writer
-        .posix_stat(path)
+        .posix_stat_distributed(path)
         .expect("writer current stat");
     record_posix_observation(
         &mut observations,
@@ -2864,8 +2921,8 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
         root.posix_rename_with_operation_id(root_path, root_target, &root_operation)
             .is_err()
     );
-    let root_job = root
-        .metadata_backend()
+    let root_job = runtime
+        .node_metadata(&root_primary)
         .unwrap()
         .list_namespace_jobs()
         .unwrap()
@@ -2944,8 +3001,8 @@ fn exact_resident_hydration_replaces_only_its_shard_namespace_guards() {
             .posix_rename_with_operation_id(services_path, services_target, &services_operation)
             .is_err()
     );
-    let services_job = services
-        .metadata_backend()
+    let services_job = runtime
+        .node_metadata(&services_primary)
         .unwrap()
         .list_namespace_jobs()
         .unwrap()
@@ -3169,14 +3226,15 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
                 )
             }) && cluster
                 .writer
-                .posix_stat(path)
+                .posix_stat_distributed(path)
                 .is_ok_and(|stat| stat.content_hash.as_deref() == Some(old_hash.as_str()))
         },
     );
     sifs_posix_cluster_pump_until(&mut cluster, "primary gets old replica", |cluster| {
         cluster
             .primary
-            .posix_read_file(path)
+            .content()
+            .read_blob(&old_hash)
             .is_ok_and(|bytes| bytes == old)
     });
     // W1 makes the write visible before N2 necessarily has two physical copies.
@@ -3350,8 +3408,8 @@ fn sifs_cluster_posix_contract_damaged_replica_under_concurrent_reads() {
     })();
     if let Err(original_panic) = convergence {
         eprintln!(
-            "damaged-read convergence failure DATA: primary_return={new_head:?}; local_client_stat={:?}; fresh_physical_head={physical_head:?}",
-            cluster.writer.posix_stat(path)
+            "damaged-read convergence failure DATA: primary_return={new_head:?}; writer_node_store={:?}; fresh_physical_head={physical_head:?}",
+            node_store_object(&cluster._runtime, &cluster.writer_node, path)
         );
         std::panic::resume_unwind(original_panic);
     }
@@ -3438,7 +3496,7 @@ fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune()
     sifs_posix_cluster_pump_until(&mut cluster, "writer observes async write", |cluster| {
         cluster
             .writer
-            .posix_stat(path)
+            .posix_stat_distributed(path)
             .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
     });
     sifs_posix_cluster_pump_until(&mut cluster, "primary async repair", |cluster| {
@@ -3446,22 +3504,29 @@ fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune()
             .primary
             .retry_pending_repairs()
             .expect("primary repair tick");
-        cluster
-            .primary
-            .posix_read_file(path)
-            .is_ok_and(|read| read == bytes)
+        // The primary node's store and content store hold the repaired copy.
+        node_store_content_hash(&cluster._runtime, &cluster.primary_node, path)
+            .is_some_and(|hash| hash == expected_hash)
+            && cluster
+                .primary
+                .content()
+                .read_blob(&expected_hash)
+                .is_ok_and(|read| read == bytes)
     });
     sifs_cluster_publish_metadata_until(
         &mut cluster,
         "writer learns repaired primary location",
         |cluster| {
-            cluster.writer.posix_stat(path).is_ok_and(|stat| {
-                stat.current_locations.contains(&cluster.writer_node)
-                    && stat.current_locations.contains(&cluster.primary_node)
+            node_store_object(&cluster._runtime, &cluster.writer_node, path).is_some_and(|row| {
+                row.current_locations.contains(&cluster.writer_node)
+                    && row.current_locations.contains(&cluster.primary_node)
             })
         },
     );
-    let stale_stat = cluster.writer.posix_stat(path).expect("writer stale stat");
+    let stale_stat = cluster
+        .writer
+        .posix_stat_distributed(path)
+        .expect("writer stale stat");
 
     cluster
         .writer
@@ -3469,15 +3534,15 @@ fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune()
         .debug_remove_loose_blob(&expected_hash)
         .expect("remove writer loose blob");
     assert!(
-        matches!(
-            cluster.writer.posix_read_file(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
+        !cluster.writer.content.has_blob(&expected_hash).unwrap(),
         "fault injection must remove the writer's local readable content"
     );
 
+    // The primary authors the prune on its own store.
     cluster
-        .primary
+        ._runtime
+        .metadata_primary_service(path)
+        .unwrap()
         .mark_remote_read_location_missing(
             &stale_stat.object_id,
             &stale_stat.version,
@@ -3656,8 +3721,10 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
         .expect("outsider authoritative prefix read");
     assert_eq!(prefix.bytes, bytes[..23]);
     assert!(prefix.truncated);
+    // The observer's caller keeps no local view, so the observer node's
+    // content store is the witness that nothing was materialized.
     assert!(
-        observer.posix_read_file(path).is_err(),
+        !observer.content().has_blob(&content_hash(&bytes)).unwrap(),
         "an uncached prefix read must not materialize the full remote object locally"
     );
 
@@ -3669,7 +3736,7 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
         .expect("outsider opened-object remote range read");
     assert_eq!(opened_range, bytes[17..48]);
     assert!(
-        observer.posix_read_file(path).is_err(),
+        !observer.content().has_blob(&content_hash(&bytes)).unwrap(),
         "an opened-object range read must not materialize the full remote object locally"
     );
 
@@ -3822,7 +3889,7 @@ fn sifs_replica_distributed_read_prefers_primary_over_stale_local_hit() {
     assert_eq!(
         cluster
             .primary
-            .posix_read_file(path)
+            .posix_read_file_distributed(path)
             .expect("primary new read"),
         new
     );
@@ -3874,6 +3941,12 @@ fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
     let path = "/users/replica-read-no-sync.txt";
     let bytes = b"replica reads query primary without local metadata writes".to_vec();
     sifs_cluster_primary_posix_write(&mut cluster, path, &bytes);
+    // Let ordinary publication settle on the reader node first, so its store
+    // can only change during the read if the read itself replays metadata.
+    sifs_cluster_publish_metadata_until(&mut cluster, "reader node store settles", |cluster| {
+        node_store_content_hash(&cluster._runtime, &cluster.observer_node, path)
+            .is_some_and(|hash| hash == content_hash(&bytes))
+    });
     let SifsPosixCluster {
         _runtime,
         primary_node,
@@ -3895,25 +3968,21 @@ fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
     assert_eq!(selected.primary_node_id, primary_node);
     assert!(selected.replica_node_ids.contains(&observer_node));
     assert!(
-        matches!(
-            observer.posix_read_file(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
+        !observer.content().has_blob(&content_hash(&bytes)).unwrap(),
         "the reader must genuinely miss local content before the distributed read"
     );
+    assert!(observer.metadata_backend().is_none());
     let shard = DfsMetadataShardId::new(selected.shard_id.clone());
-    // Normal read-only lookup loads the exact physical scope. The held capture
-    // below performs no IO and cannot initialize another shard.
-    observer
-        .metadata_backend()
-        .expect("actual reader backend")
-        .get_object_by_path_on_shard(&shard, &selected.file_system_id, path)
-        .expect("actual replica path lookup");
-    let before = observer
-        .metadata_backend()
-        .expect("actual reader backend")
-        .native_held_snapshot_for_scope(&selected.file_system_id, &shard)
-        .expect("the local read loaded the actual assigned shard");
+    // The reader node's own store, which only its Main writes.
+    let node_store = || {
+        _runtime
+            .node_metadata(&observer_node)
+            .expect("actual reader node store")
+            .export_shard_table_snapshot(&shard)
+            .expect("actual replica shard export")
+            .expect("the reader node replicates the assigned shard")
+    };
+    let before = node_store();
     let capture = _runtime
         .capture_namespace_requests(&primary_node, 32)
         .expect("actual primary namespace request window");
@@ -3924,15 +3993,11 @@ fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
             .expect("replica miss queries primary and fetches content"),
         bytes
     );
-    let after = observer
-        .metadata_backend()
-        .expect("same reader backend")
-        .native_held_snapshot_for_scope(&selected.file_system_id, &shard)
-        .expect("same held assigned shard after the read");
+    let after = node_store();
     assert_eq!(
-        serde_json::to_value(&after).expect("actual after held view"),
-        serde_json::to_value(&before).expect("actual before held view"),
-        "distributed reads must not replay metadata into the reader's backend"
+        (after.prefix_proof, after.semantic_state_fingerprint),
+        (before.prefix_proof, before.semantic_state_fingerprint),
+        "distributed reads must not replay metadata into the reader node's store"
     );
     assert_fresh_replica_lookup(
         &_runtime,
@@ -4044,19 +4109,18 @@ fn native_replica_read_recovers_after_an_actual_content_location_is_lost() {
         "the reader starts without a local copy"
     );
     let shard = DfsMetadataShardId::new(runtime.root_shard().unwrap().shard_id);
-    let before = observer
-        .metadata_backend()
-        .unwrap()
-        .export_shard_table_snapshot(&shard)
-        .unwrap()
-        .unwrap();
+    // The reader node's own store; the delegating reader keeps none.
+    let node_store = || {
+        runtime
+            .node_metadata(&nodes[2])
+            .unwrap()
+            .export_shard_table_snapshot(&shard)
+            .unwrap()
+            .unwrap()
+    };
+    let before = node_store();
     assert_eq!(observer.posix_read_file_distributed(path).unwrap(), bytes);
-    let after = observer
-        .metadata_backend()
-        .unwrap()
-        .export_shard_table_snapshot(&shard)
-        .unwrap()
-        .unwrap();
+    let after = node_store();
     assert_eq!(after.prefix_proof, before.prefix_proof);
     assert_eq!(
         after.semantic_state_fingerprint,

@@ -2942,13 +2942,13 @@ fn distributed_write_uses_path_selected_metadata_shard_epoch() {
             b"path shard bytes",
             DfsWriteOptions {
                 policy: DfsReplicationPolicy::new(1, 2).unwrap(),
-                replica_candidates: vec![services_primary_node, replica_node],
+                replica_candidates: vec![services_primary_node.clone(), replica_node],
                 wait_for_commit: true,
                 foreground_replica_repair: true,
             },
         )
         .unwrap();
-    let backend = services_primary.metadata_backend().unwrap();
+    let backend = runtime.node_metadata(&services_primary_node).unwrap();
     let intent = backend
         .intents_for_object(&written.object_id)
         .unwrap()
@@ -2963,6 +2963,7 @@ fn distributed_write_uses_path_selected_metadata_shard_epoch() {
     assert_eq!(record.digest.shard_id, DfsMetadataShardId::new("services"));
     assert_eq!(record.digest.owner_epoch, config.epoch);
     assert_eq!(record.status, DfsPreparedOperationStatus::Committed);
+    drop(backend);
     drop(services_primary);
     runtime.close().unwrap();
 }
@@ -3092,23 +3093,13 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
     ));
     assert!(old.writes.pending_writes.contains_key(&job.intent_id));
     drop(old);
-    // Reopen the same former primary through its current runtime, and restore
-    // only the actual pre-handoff row through the ordinary restart path.
-    let mut old = runtime.client(&owner).unwrap();
-    assert_eq!(old.node_id(), &owner);
-    assert!(
-        old.retry_pending_repairs_bounded_with_attempts(0, &captured)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(old.coordinator().repair_jobs().iter().any(|restored| {
-        restored.intent_id == job.intent_id
-            && restored.object_id == job.object_id
-            && restored.version == job.version
-            && restored.missing_replica_node_id == replica
-    }));
-    assert!(old.retry_pending_repairs_bounded(1).unwrap().is_empty());
-    assert!(!old.writes.pending_writes.contains_key(&job.intent_id));
+    // The former primary's node now acts only through its Main: a caller
+    // delegating to it keeps no store or repair state to restore. Drive the
+    // retired Main's ordinary maintenance over its retained pre-handoff row.
+    let tick = runtime
+        .maintenance_tick(&owner, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        .unwrap();
+    assert!(tick.outcome.is_ok(), "{:?}", tick.outcome);
     assert!(
         !runtime.rpc_observations()[before..]
             .iter()
@@ -3122,7 +3113,6 @@ fn retry_pending_repairs_skips_sender_that_lost_metadata_primary_authority() {
                 && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch),
         "an actual retired metadata primary never dispatches repair after the normal handoff"
     );
-    drop(old);
     runtime.clear_faults();
     runtime.close().unwrap();
 }
@@ -3802,7 +3792,12 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
         .posix_mkdir_all(parent_path)
         .expect("authoritative bulk parent");
     sifs_two_primary_publish_until(&mut cluster, "initial bulk parent", |cluster| {
-        cluster.replica.posix_stat(parent_path).is_ok()
+        super::cross_shard::node_store_object_at(
+            &cluster._runtime,
+            &cluster.replica_node,
+            parent_path,
+        )
+        .is_some()
     });
     let replica_delivery = Arc::new(tokio::sync::Semaphore::new(0));
     cluster
@@ -3825,26 +3820,32 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
         .services_primary
         .posix_mkdir_all(&format!("{parent_path}/authority-advance"))
         .expect("real authoritative parent advance");
-    let stale_parent_version = cluster
-        .replica
-        .posix_stat(parent_path)
-        .expect("replica bulk parent")
-        .version;
+    // The requester delegates to its Main and keeps no store: the stale parent
+    // is its node's replica, whose journal delivery is paused.
+    let stale_parent_version = super::cross_shard::node_store_object_at(
+        &cluster._runtime,
+        &cluster.replica_node,
+        parent_path,
+    )
+    .expect("replica bulk parent")
+    .version;
 
     let authority_parent_before = cluster
         .services_primary
-        .posix_stat(parent_path)
+        .posix_stat_distributed(parent_path)
         .expect("advanced authoritative bulk parent");
     assert_ne!(
         authority_parent_before.version, stale_parent_version,
         "test must retain a stale requester parent"
     );
     assert_eq!(
-        cluster
-            .replica
-            .posix_stat(parent_path)
-            .expect("still-stale replica bulk parent")
-            .version,
+        super::cross_shard::node_store_object_at(
+            &cluster._runtime,
+            &cluster.replica_node,
+            parent_path
+        )
+        .expect("still-stale replica bulk parent")
+        .version,
         stale_parent_version,
         "requester must not process the queued parent advances before preparing the batch"
     );
@@ -3876,9 +3877,9 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
     assert_eq!(stats.len(), 1);
 
     stop.store(true, Ordering::SeqCst);
-    let services_primary = services_thread.join().expect("services primary thread");
+    let mut services_primary = services_thread.join().expect("services primary thread");
     let authority_parent_after = services_primary
-        .posix_stat(parent_path)
+        .posix_stat_distributed(parent_path)
         .expect("authoritative parent after bulk create");
     assert_ne!(
         authority_parent_after.version, authority_parent_before.version,
@@ -3886,7 +3887,7 @@ fn sifs_cluster_bulk_create_refreshes_stale_parent_before_publication() {
     );
     assert_eq!(
         services_primary
-            .posix_stat(child_path)
+            .posix_stat_distributed(child_path)
             .expect("authoritative bulk child")
             .content_hash
             .as_deref(),
@@ -3967,23 +3968,28 @@ fn routed_namespace_rejects_stale_authority_stamp_before_mutation() {
         _runtime,
         root,
         replica_node,
-        mut services_primary,
+        services_primary,
         replica,
         ..
     } = cluster;
     let file_system_id = sifs_file_system_id();
     let path = "/services/stale-authority-stamp";
-    let current_primary = services_primary.node_id().clone();
+    // Serving a namespace request is Main-side store work: the shard's
+    // store-backed opener stands in for the authority, not a caller
+    // delegating to its Main.
+    let mut author = _runtime.metadata_primary_service(path).unwrap();
+    let current_primary = author.node_id().clone();
+    assert_eq!(current_primary, services_primary_node);
     let operation = DfsNamespaceOperation::MkdirAll {
         path: path.to_string(),
     };
-    let mut authority_shards = services_primary
+    let mut authority_shards = author
         .affected_namespace_shards(&file_system_id, &operation)
         .expect("current namespace authority shards");
     assert_eq!(authority_shards.len(), 1, "test path must be single-shard");
     authority_shards[0].epoch = authority_shards[0].epoch.saturating_sub(1);
 
-    let event = services_primary
+    let event = author
         .handle_namespace_request(
             replica_node.clone(),
             DfsNamespaceCommand {
@@ -4008,14 +4014,13 @@ fn routed_namespace_rejects_stale_authority_stamp_before_mutation() {
             ..
         } if reason.contains("authority shard stamp") && primary == &current_primary
     ));
+    drop(author);
     assert!(
-        matches!(
-            services_primary.posix_stat(path),
-            Err(DfsPosixError::NotFound { .. })
-        ),
+        super::cross_shard::node_store_object_at(&_runtime, &services_primary_node, path).is_none(),
         "a stale admission stamp must be rejected before namespace mutation"
     );
 
+    drop(services_primary);
     drop(replica);
     std::fs::remove_dir_all(&root).ok();
 }
@@ -4039,15 +4044,15 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
         .unwrap();
     let mut primary = runtime.client(&primary_node).unwrap();
     let mut follower = runtime.client(&follower_node).unwrap();
-    let before_bootstrap = follower
-        .metadata_backend()
+    let before_bootstrap = runtime
+        .node_metadata(&follower_node)
         .unwrap()
         .metadata_shard_statuses()
         .unwrap();
     follower.bootstrap_distributed_sifs().unwrap();
     assert_eq!(
-        follower
-            .metadata_backend()
+        runtime
+            .node_metadata(&follower_node)
             .unwrap()
             .metadata_shard_statuses()
             .unwrap(),
@@ -4089,7 +4094,16 @@ fn sifs_cluster_authority_local_follower_bootstrap_stays_on_incremental_stream()
             |_| {},
         )
         .unwrap();
-        assert_eq!(follower.posix_stat(&file).unwrap().version, stat.version);
+        assert_eq!(
+            runtime
+                .node_metadata(&follower_node)
+                .unwrap()
+                .get_object_by_path(&sifs_file_system_id(), &file)
+                .unwrap()
+                .expect("materialized follower row")
+                .version,
+            stat.version
+        );
         assert_eq!(follower.posix_read_file_distributed(&file).unwrap(), bytes);
     }
     let calls = runtime.rpc_observations()[before..].to_vec();
@@ -4207,10 +4221,16 @@ fn native_follower_observation_waits_for_actual_published_prefix_materialization
         .unwrap();
     assert!(capture.unavailable.is_none(), "{capture:?}");
     assert!(capture.durable_sequence.unwrap() > capture.materialized_sequence.unwrap());
-    assert!(matches!(
-        follower.posix_stat(path),
-        Err(DfsPosixError::NotFound { .. })
-    ));
+    // The follower client delegates to its Main and keeps no store; the
+    // node's materialized tables have not yet reached the durable cut.
+    assert!(
+        runtime
+            .node_metadata(&follower_node)
+            .unwrap()
+            .get_object_by_path(&sifs_file_system_id(), path)
+            .unwrap()
+            .is_none()
+    );
     let published =
         captured_native_publication_prefix(&runtime, &config.primary_node_id, &shard, &original);
     assert!(published > capture.materialized_sequence.unwrap());
@@ -4245,7 +4265,12 @@ fn native_follower_observation_waits_for_actual_published_prefix_materialization
         "the actual materialization owner must expose its pending cut"
     );
     observed.expect("durable ingress must be observed as materialized before local stat");
-    let actual = follower.posix_stat(path).unwrap();
+    let actual = runtime
+        .node_metadata(&follower_node)
+        .unwrap()
+        .get_object_by_path(&sifs_file_system_id(), path)
+        .unwrap()
+        .expect("materialized follower row");
     assert_eq!(actual.object_id, original.object_id);
     assert_eq!(actual.version, original.version);
     assert_eq!(
@@ -4303,7 +4328,7 @@ fn served_routed_write_committed_work_tracks_only_authority_owned_repairs() {
             )
             .unwrap();
         assert_eq!(
-            seed.current_read_object_metadata(&base.object_id)
+            seed.current_read_object_metadata_distributed(&base.object_id)
                 .unwrap()
                 .policy,
             DfsObjectPolicy::ReplicatedEventual
@@ -4555,7 +4580,12 @@ fn served_requester_completion_does_not_claim_authority_repair_work() {
         "observing another node's actual repair backlog does not grant requester ownership"
     );
     assert!(client.coordinator().repair_jobs().is_empty());
-    let mut authority = runtime.client(&primary).unwrap();
+    // Repair ownership is Main-side store state: hydrate the authority's
+    // store-backed opener, not a caller delegating to its Main.
+    let mut authority = runtime
+        .metadata_primary_service("/services/native-requester-work-completion.bin")
+        .unwrap();
+    assert_eq!(authority.node_id(), &primary);
     authority.hydrate_from_metadata_backend().unwrap();
     assert!(authority.coordinator().repair_jobs().iter().any(|job|
         job.object_id == request.object_id && job.missing_replica_node_id == replica));
@@ -5114,6 +5144,70 @@ fn routed_create_cleanup_preserves_the_original_unpublished_opening() {
         foreground_replica_repair: false,
     };
     let mut client = runtime.client(&primary).unwrap();
+    // Main is the only publisher behind its delegating caller, and it serves
+    // committed work promptly: each setup pass publishes, then confirms its
+    // replicas with journal batches after the pass returns. Drive that work to
+    // completion first, so the first-call faults below meet the original
+    // write's opening quorum rather than earlier work. A round runs ordinary
+    // passes until one reports no further work, then lets the publication they
+    // scheduled land; the setup is finished once a whole round sends no journal
+    // batch to the faulted peer.
+    let discovery = crate::runtime_host::daemon_dfs_metadata_publish_discovery_scheduler(
+        runtime.data_dir(&primary),
+    )
+    .unwrap();
+    let lane = crate::runtime_host::daemon_dfs_metadata_publish_lane_scheduler(
+        runtime.data_dir(&primary),
+        &shard.file_system_id,
+        &DfsMetadataShardId::new(&shard.shard_id),
+    )
+    .unwrap();
+    let peer_journal_batches = || {
+        runtime
+            .rpc_observations()
+            .iter()
+            .filter(|call| {
+                call.source == primary
+                    && call.target == metadata_peer
+                    && (call.route == DFS_METADATA_JOURNAL_BATCH_ROUTE
+                        || call.route == DFS_DATA_METADATA_JOURNAL_BATCH_ROUTE)
+            })
+            .count()
+    };
+    let setup_deadline = Instant::now() + sinomo_core::network::DEFAULT_NETWORK_TIMEOUT;
+    loop {
+        let round_start = peer_journal_batches();
+        loop {
+            let remaining = setup_deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "Main's setup work must finish inside its normal budget"
+            );
+            let settled = runtime.maintenance_tick(&primary, remaining).unwrap();
+            assert!(settled.outcome.is_ok(), "{:?}", settled.outcome);
+            if settled.outcome
+                == Ok(crate::DfsMaintenanceTickOutcome::Completed {
+                    reached_limit: false,
+                })
+            {
+                break;
+            }
+        }
+        while !(discovery.is_idle_while_producers_excluded()
+            && lane.is_idle_while_producers_excluded())
+        {
+            assert!(
+                Instant::now() < setup_deadline,
+                "Main's setup publication must land inside its normal budget"
+            );
+            std::thread::yield_now();
+        }
+        if peer_journal_batches() == round_start {
+            break;
+        }
+    }
+    drop(lane);
+    drop(discovery);
     runtime.checkpoint_rpc_observation_window().unwrap();
     for route in [
         DFS_METADATA_JOURNAL_BATCH_ROUTE,

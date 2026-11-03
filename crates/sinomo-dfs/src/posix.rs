@@ -3795,12 +3795,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 content_hash,
                 repair_jobs,
             } => {
-                if self.transport.delegates_local_namespace_authority() && !remote_metadata_primary
+                if self.transport.delegates_local_namespace_authority()
+                    && (!remote_metadata_primary || self.metadata_backend.is_none())
                 {
                     // Main owns the committed object and parent update. Its
                     // validated reply retired the planning overlay; use the
                     // actual durable head rather than rebuilding that overlay.
+                    // A caller without a metadata store keeps no overlay of a
+                    // committed write either: the authority holds the head, and
+                    // nothing would retire an overlay once the object changes.
                     if self.metadata_backend.is_none() {
+                        self.remove_transient_object_metadata(&object.object_id);
                         return self.with_stat_deadline(|service| {
                             let authoritative = service
                                 .current_object_from_authority(

@@ -45,8 +45,9 @@ fn native_history_restore_replans_only_before_the_original_job_is_admitted() {
     };
     let job_id = crate::validation::file_restore_job_id(&nodes[0], &request.operation_id);
     let original_request = request.clone();
-    let before = writer
-        .metadata_backend()
+    // The node's durable store; the delegating writer keeps none.
+    let before = native
+        .node_metadata(&nodes[0])
         .unwrap()
         .journal_last_sequence()
         .unwrap();
@@ -121,8 +122,7 @@ fn native_history_restore_replans_only_before_the_original_job_is_admitted() {
         ).await.unwrap().unwrap();
         drop(fifo);
         {
-            let writer = writer.lock().unwrap();
-            let metadata = writer.metadata_backend().unwrap();
+            let metadata = native.node_metadata(&nodes[0]).unwrap();
             assert_eq!(metadata.journal_last_sequence().unwrap(), before);
             assert!(metadata.get_namespace_job(&job_id).unwrap().is_none());
             assert!(metadata.get_namespace_job_receipt(&job_id).unwrap().is_none());
@@ -133,7 +133,7 @@ fn native_history_restore_replans_only_before_the_original_job_is_admitted() {
         assert_eq!(response.path, original_request.destination_path);
         let mut writer = writer.lock().unwrap();
         assert_eq!(writer.posix_read_file_distributed(&response.path).unwrap(), b"retained source bytes");
-        let intents = writer.metadata_backend().unwrap().intents_for_object_version_page(
+        let intents = native.node_metadata(&nodes[0]).unwrap().intents_for_object_version_page(
             &response.committed.object_id, &response.committed.version, None, 16,
         ).unwrap();
         assert_eq!(intents.intents.iter().filter(|intent| intent.status == sinomo_dfs::DfsWriteIntentStatus::Committed).count(), 1);

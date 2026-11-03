@@ -35,62 +35,79 @@ fn native_lifecycle_catalog_keeps_current_content_and_rejects_replayed_authority
         .map(|entry| entry.decode::<DfsMetadataShardConfig>().unwrap())
         .collect::<Vec<_>>();
     let root = runtime.data_dir(&node).dfs_dir().join("content");
-    let catalog = dfs
-        .refresh_content_root_catalog(std::slice::from_ref(&config), &shards, &[], &root, &[], 32)
-        .unwrap();
-    let validation = catalog
-        .validate_for_collection_with_head_watermark_policy(
-            std::slice::from_ref(&config),
-            &shards,
-            &[],
-            &[],
-            false,
-            dfs_now_unix_nanos(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
-    assert!(validation.is_collection_authorized());
-    let replayed: DfsContentRootCatalogCollectionValidation = sinomo_object_serde::from_bytes(
-        &sinomo_object_serde::to_bytes(&validation, 1, sinomo_core::object::LengthMode::U32)
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(!replayed.is_collection_authorized());
-    let denied = dfs
-        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
-            content_root_catalog_validation: Some(replayed),
-            version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::ZERO,
-                1,
-            )),
-            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(Duration::ZERO)),
-            ..Default::default()
+    // The content-root catalog spans every shard copy on the node; only Main
+    // holds them. Return the results so the lane is restored before asserting.
+    let (authorized, replayed_authorized, denied, admitted) = runtime
+        .with_main_maintenance_service(&node, |main| {
+            let catalog = main.refresh_content_root_catalog(
+                std::slice::from_ref(&config),
+                &shards,
+                &[],
+                &root,
+                &[],
+                32,
+            )?;
+            let validation = catalog.validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&config),
+                &shards,
+                &[],
+                &[],
+                false,
+                dfs_now_unix_nanos(),
+                Duration::from_secs(30),
+            )?;
+            let replayed: DfsContentRootCatalogCollectionValidation =
+                sinomo_object_serde::from_bytes(
+                    &sinomo_object_serde::to_bytes(
+                        &validation,
+                        1,
+                        sinomo_core::object::LengthMode::U32,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let replayed_authorized = replayed.is_collection_authorized();
+            let authorized = validation.is_collection_authorized();
+            let denied = main.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+                content_root_catalog_validation: Some(replayed),
+                version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
+                    Duration::ZERO,
+                    1,
+                )),
+                orphan_gc: Some(ContentStoreGcOptions::delete_eligible(Duration::ZERO)),
+                ..Default::default()
+            })?;
+            let admitted = main.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+                scrub_content: true,
+                content_root_catalog_validation: Some(validation),
+                content_reservation_reconciliation: Some(
+                    ContentStoreReservationReconciliationOptions::bounded(
+                        64,
+                        Duration::ZERO,
+                        dfs_now_unix_nanos(),
+                    ),
+                ),
+                version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
+                    Duration::ZERO,
+                    1,
+                )),
+                orphan_gc: Some(ContentStoreGcOptions::delete_eligible(Duration::ZERO)),
+                ..Default::default()
+            })?;
+            Ok::<_, DfsError>((authorized, replayed_authorized, denied, admitted))
         })
+        .unwrap()
         .unwrap();
+    assert!(authorized);
+    assert!(!replayed_authorized);
     assert!(denied.content_gc_metadata_protection_unavailable);
     assert!(denied.version_gc.is_none() && denied.orphan_gc.is_none());
-    let admitted = dfs
-        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
-            scrub_content: true,
-            content_root_catalog_validation: Some(validation),
-            content_reservation_reconciliation: Some(
-                ContentStoreReservationReconciliationOptions::bounded(
-                    64,
-                    Duration::ZERO,
-                    dfs_now_unix_nanos(),
-                ),
-            ),
-            version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
-                Duration::ZERO,
-                1,
-            )),
-            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(Duration::ZERO)),
-            ..Default::default()
-        })
-        .unwrap();
     assert!(admitted.content_scrub.is_some());
     assert!(admitted.version_gc.is_some() && admitted.orphan_gc.is_some());
-    assert_eq!(dfs.posix_read_file("/gc-current").unwrap(), b"current");
+    assert_eq!(
+        dfs.posix_read_file_distributed("/gc-current").unwrap(),
+        b"current"
+    );
     assert!(
         dfs.content
             .read_manifest(current.object_id.as_str(), current.version.as_str())
@@ -193,10 +210,14 @@ fn stat_prefers_backend_tombstone_over_stale_memory_file() {
     let owner = NodeId::from_legacy_named("node_stat_tombstone_owner").expect("owner");
     let object_id = DfsObjectId::from_legacy_named("obj_stat_tombstone").expect("object");
     let path = "/stat-tombstone.txt";
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (_runtime, client) = native_sifs_service(
         "stat_prefers_backend_tombstone_over_stale_memory_file",
         owner.clone(),
     );
+    drop(client);
+    // Only a store-backed service merges a backend row with its memory view; a
+    // caller delegating to its Main keeps neither.
+    let mut dfs = _runtime.metadata_primary_service(path).unwrap();
     let mut tombstone = file_metadata(owner.clone());
     tombstone.object_id = object_id.clone();
     tombstone.path = path.to_string();
@@ -346,7 +367,11 @@ fn restart_preserves_current_create_after_compacted_tombstone() {
         .posix_write_file(path, b"old bytes", options.clone())
         .unwrap();
     service.posix_unlink(path).unwrap();
-    service
+    // Tombstone compaction is Main-side store maintenance on the store-backed
+    // opener; a caller delegating to its Main has no store to compact.
+    runtime
+        .metadata_primary_service(path)
+        .unwrap()
         .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
             tombstone_compaction: Some(
                 DfsTombstoneCompactionOptions::compact_eligible(Duration::ZERO)
@@ -364,10 +389,13 @@ fn restart_preserves_current_create_after_compacted_tombstone() {
     runtime.reopen_node(node.clone()).unwrap();
     let mut service = runtime.client(&node).unwrap();
     assert_eq!(
-        service.posix_stat(path).unwrap().object_id,
+        service.posix_stat_distributed(path).unwrap().object_id,
         current.object_id
     );
-    assert_eq!(service.posix_read_file(path).unwrap(), b"replacement bytes");
+    assert_eq!(
+        service.posix_read_file_distributed(path).unwrap(),
+        b"replacement bytes"
+    );
     drop(service);
     runtime.close().unwrap();
 }
@@ -387,7 +415,11 @@ fn restart_does_not_resurrect_deleted_generation_after_path_reuse() {
         .posix_write_file(path, b"new bytes", options)
         .unwrap();
     service.posix_unlink(path).unwrap();
-    service
+    // Tombstone compaction is Main-side store maintenance on the store-backed
+    // opener; a caller delegating to its Main has no store to compact.
+    runtime
+        .metadata_primary_service(path)
+        .unwrap()
         .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
             tombstone_compaction: Some(
                 DfsTombstoneCompactionOptions::compact_eligible(Duration::ZERO)
@@ -401,23 +433,20 @@ fn restart_does_not_resurrect_deleted_generation_after_path_reuse() {
     runtime.reopen_node(node.clone()).unwrap();
     let mut service = runtime.client(&node).unwrap();
     assert!(matches!(
-        service.posix_stat(path),
+        service.posix_stat_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
     assert!(matches!(
-        service.posix_read_file(path),
+        service.posix_read_file_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
+    let store = runtime.node_metadata(&node).unwrap();
     for object in [old, replacement] {
-        if let Some(head) = service
-            .metadata_backend()
-            .unwrap()
-            .get_object(&object.object_id)
-            .unwrap()
-        {
+        if let Some(head) = store.get_object(&object.object_id).unwrap() {
             assert_eq!(head.kind, DfsObjectKind::Tombstone);
         }
     }
+    drop(store);
     drop(service);
     runtime.close().unwrap();
 }
@@ -526,10 +555,14 @@ fn sifs_posix_list_dir_page_prefers_newer_durable_child_over_stale_memory_tombst
     let node_id = NodeId::from_legacy_named("node_sifs_list_page_stale_tombstone").expect("node");
     let dir_path = "/services/sandbox/instances/sandbox_list_page_stale_tombstone/work";
 
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (_runtime, client) = native_sifs_service(
         "sifs_posix_list_dir_page_prefers_newer_durable_child_over_stale_memory_tombstone",
         node_id.clone(),
     );
+    drop(client);
+    // Only a store-backed service keeps a memory view to go stale against its
+    // durable rows; a caller delegating to its Main keeps neither.
+    let mut dfs = _runtime.metadata_primary_service(dir_path).unwrap();
     dfs.posix_mkdir_all(dir_path).expect("mkdir");
     let mut persisted = Vec::new();
     for index in 0..3 {
@@ -567,9 +600,8 @@ fn sifs_posix_list_dir_page_prefers_newer_durable_child_over_stale_memory_tombst
             DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
         )
         .expect("normal durable live publication");
-    durable_live = writer
-        .metadata_backend
-        .as_ref()
+    durable_live = _runtime
+        .node_metadata(&node_id)
         .unwrap()
         .get_object(&written.object_id)
         .unwrap()
@@ -628,8 +660,8 @@ fn cold_lazy_sync_path_includes_durable_direct_child_tombstones() {
         )
         .unwrap();
     writer.posix_unlink(path).unwrap();
-    let source = writer
-        .metadata_backend()
+    let source = runtime
+        .node_metadata(&owner)
         .unwrap()
         .get_object_by_path(&original.file_system_id, path)
         .unwrap()
@@ -643,14 +675,19 @@ fn cold_lazy_sync_path_includes_durable_direct_child_tombstones() {
         reader.posix_stat_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
-    let actual = reader
-        .metadata_backend()
+    let actual = runtime
+        .node_metadata(&owner)
         .unwrap()
         .get_object_by_path(&original.file_system_id, path)
         .unwrap()
         .unwrap();
     assert_eq!(actual, source);
-    assert!(reader.posix_list_dir(directory).unwrap().is_empty());
+    assert!(
+        reader
+            .posix_list_dir_distributed(directory)
+            .unwrap()
+            .is_empty()
+    );
     drop(reader);
     runtime.close().unwrap();
 }
@@ -663,29 +700,29 @@ fn sifs_cluster_posix_unlink_replicates_tombstone_to_observers() {
 
     sifs_cluster_primary_posix_write(&mut cluster, path, &bytes);
     sifs_cluster_publish_metadata_until(&mut cluster, "pre-unlink catch-up", |cluster| {
-        cluster.observer.posix_stat(path).is_ok()
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.observer_node, path)
+            .is_some()
     });
 
     cluster.primary.posix_unlink(path).expect("primary unlink");
     assert!(matches!(
-        cluster.primary.posix_stat(path),
+        cluster.primary.posix_stat_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
 
     sifs_cluster_publish_metadata_until(&mut cluster, "post-unlink catch-up", |cluster| {
-        matches!(
-            cluster.observer.posix_stat(path),
-            Err(DfsPosixError::NotFound { .. })
-        )
+        super::cross_shard::node_store_object_at(&cluster._runtime, &cluster.observer_node, path)
+            .is_none()
     });
     assert!(matches!(
-        cluster.observer.posix_read_file(path),
+        cluster.observer.posix_read_file_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
-    let entries = cluster
-        .observer
-        .posix_list_dir("/users")
-        .expect("observer list after unlink");
+    let entries = super::cross_shard::node_store_child_objects(
+        &cluster._runtime,
+        &cluster.observer_node,
+        "/users",
+    );
     assert!(
         !entries.iter().any(|entry| entry.path == path),
         "observer must not list an unlinked path: {entries:?}"
@@ -710,8 +747,8 @@ fn routed_mkdir_all_prefers_live_path_shard_over_late_source_tombstone() {
         .posix_rename("/users/moved-tree", "/services/moved-tree")
         .unwrap();
     let eviction = cluster
-        .users_primary
-        .metadata_backend()
+        ._runtime
+        .node_metadata(&cluster.users_primary_node)
         .unwrap()
         .get_object_on_shard(&DfsMetadataShardId::new("users"), &old.object_id)
         .unwrap()
@@ -789,44 +826,33 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
         "the stale-local fixture owns an actual committed writer copy"
     );
     assert_eq!(
-        cluster.writer.posix_read_file(path).expect("writer read"),
+        cluster
+            .writer
+            .posix_read_file_distributed(path)
+            .expect("writer read"),
         bytes
     );
-    assert!(cluster.writer.posix_stat(path).is_ok());
 
-    // Pin an actual old read image in this browser only. Its mounted native
-    // replica stays available for every full-shard prepare and commit.
-    let root = default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.writer_node));
-    let mut inspection = LocalShardedMetadataBackend::open_for_inspection(
-        &root,
-        cluster._runtime.metadata_shards().unwrap(),
-    )
-    .unwrap();
-    inspection
-        .shard_backend_mut(&DfsMetadataShardId::new("users"))
-        .unwrap()
-        .begin_inspection_snapshot()
-        .unwrap();
-    let writer = cluster
-        ._runtime
-        .client(&cluster.writer_node)
-        .unwrap()
-        .with_boxed_metadata_backend_lazy(Box::new(inspection))
-        .unwrap();
-    let original_writer = std::mem::replace(&mut cluster.writer, writer);
-    drop(original_writer);
-    assert!(
-        cluster.writer.posix_stat(path).is_ok(),
-        "actual pinned live predecessor"
-    );
+    // The writer delegates to its Main and keeps no local metadata view, so it
+    // has no stale live hit to prefer: its local POSIX view fails closed and
+    // its stat is answered by the shard primary.
+    assert!(matches!(
+        cluster.writer.posix_stat(path),
+        Err(DfsPosixError::Dfs(DfsError::Distributed { ref message }))
+            if message.contains("no local metadata view")
+    ));
     cluster.primary.posix_unlink(path).expect("primary unlink");
     assert!(matches!(
-        cluster.primary.posix_stat(path),
+        cluster.primary.posix_stat_distributed(path),
         Err(DfsPosixError::NotFound { .. })
     ));
-    assert!(
-        cluster.writer.posix_stat(path).is_ok(),
-        "test setup must leave a stale local live entry on the writer"
+    assert_eq!(
+        cluster
+            .writer
+            .content()
+            .read_blob(&content_hash(&bytes))
+            .expect("the writer still holds its committed local copy when it stats"),
+        bytes
     );
 
     let SifsPosixCluster {
@@ -851,7 +877,7 @@ fn sifs_replica_distributed_stat_prefers_primary_tombstone_over_stale_local_hit(
     primary_thread.join().expect("primary thread");
     assert!(
         matches!(distributed_stat, Err(DfsPosixError::NotFound { .. })),
-        "distributed stat must prefer the shard primary tombstone over a stale replica-local hit, got {distributed_stat:?}"
+        "distributed stat must answer from the shard primary tombstone, not the writer's local copy, got {distributed_stat:?}"
     );
 
     drop(_runtime);

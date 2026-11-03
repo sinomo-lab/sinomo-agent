@@ -10934,7 +10934,7 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
     let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
-    assert_eq!(fs.read(&output_path, None).expect("body"), b"hello world");
+    assert_eq!(fs.read_mut(&output_path, None).expect("body"), b"hello world");
     let audit = sinomo_runtime::sandbox::load_http_exchange_record(
         &mut fs,
         &result.record.command_id,
@@ -11075,9 +11075,9 @@ fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
     assert!(format!("{error:?}").contains("written-bytes-per-command"));
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
-    let fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
+    let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
     assert!(matches!(
-        fs.read(&output_path, None),
+        fs.read_mut(&output_path, None),
         Err(sinomo_runtime::sandbox::SandboxFsError::NotFound { .. })
     ));
 
@@ -11157,16 +11157,16 @@ fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() 
 
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
-    let fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
+    let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
     assert!(
         matches!(
-            fs.read(&output_path, None),
+            fs.read_mut(&output_path, None),
             Err(sinomo_runtime::sandbox::SandboxFsError::NotFound { .. })
         ),
         "denied fetch should not write the requested output"
     );
     assert!(
-        fs.list(&sinomo_runtime::sandbox::SandboxPath::new("/logs").expect("logs"))
+        fs.list_mut(&sinomo_runtime::sandbox::SandboxPath::new("/logs").expect("logs"))
             .expect("logs")
             .iter()
             .all(|entry| !entry.path.as_str().ends_with(".http.sobj")),
@@ -11266,16 +11266,16 @@ fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
 
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
-    let fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
+    let mut fs = sinomo_runtime::sandbox::SifsSandboxFileSystem::new(dfs, &manifest);
     assert!(
         matches!(
-            fs.read(&output_path, None),
+            fs.read_mut(&output_path, None),
             Err(sinomo_runtime::sandbox::SandboxFsError::NotFound { .. })
         ),
         "failed fetch should not write the requested output"
     );
     let log_entries = fs
-        .list(&sinomo_runtime::sandbox::SandboxPath::new("/logs").expect("logs"))
+        .list_mut(&sinomo_runtime::sandbox::SandboxPath::new("/logs").expect("logs"))
         .expect("logs");
     let audit_path = log_entries
         .iter()
@@ -11284,7 +11284,7 @@ fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
         .path
         .clone();
     let record = sinomo_runtime::sandbox::decode_http_exchange_record(
-        &fs.read(&audit_path, None).expect("audit bytes"),
+        &fs.read_mut(&audit_path, None).expect("audit bytes"),
     )
     .expect("decode audit");
     assert_eq!(record.sandbox_id, sandbox_id);
@@ -11347,9 +11347,9 @@ fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
     let denied = format!("{denied:?}");
     assert!(denied.contains("toolchain-provenance-denied"), "{denied}");
 
-    let dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
+    let mut dfs = super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("open dfs");
     let missing_toolchains = dfs
-        .posix_stat("/services/sandbox/toolchains")
+        .posix_stat_distributed("/services/sandbox/toolchains")
         .expect_err("busybox denial did not create toolchain subtree");
     let missing_toolchains = format!("{missing_toolchains:?}");
     assert!(
@@ -11870,10 +11870,10 @@ fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
         ) if path == &sinomo_runtime::sandbox::SandboxPath::new("/host/out.txt").expect("path")
     ));
 
-    let dfs =
+    let mut dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
     let missing_mount_write = dfs
-        .posix_read_file("/services/sandbox-shared/shared/out.txt")
+        .posix_read_file_distributed("/services/sandbox-shared/shared/out.txt")
         .expect_err("denied write must not mutate the read-only mount source");
     assert!(format!("{missing_mount_write:?}").contains("NotFound"));
     let event_store =

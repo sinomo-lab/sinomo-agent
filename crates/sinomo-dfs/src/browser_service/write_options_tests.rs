@@ -427,10 +427,13 @@ fn browser_parent_hint_deletion_control(hint_before_deletion: bool) {
             .get_object_by_path(&sifs_file_system_id(), parent).unwrap().unwrap()
     };
     assert_eq!(old_parent.kind, DfsObjectKind::Directory);
+    // A browser delegating to its Main keeps no store, so it never catches
+    // up from a backend: an observed row stays a transient advisory overlay.
+    assert!(browser.metadata_backend().is_none());
     if hint_before_deletion {
         browser.add_transient_object_metadata(old_parent.clone()).unwrap();
-        assert!(!browser.transient_metadata_object_ids.contains(&old_parent.object_id),
-            "the genuinely current backend row initially needs no pagination overlay");
+        assert!(browser.transient_metadata_object_ids.contains(&old_parent.object_id),
+            "a store-less browser keeps the genuinely current row only as an advisory overlay");
     }
     let mut remover = runtime.client(&local).unwrap();
     remover.posix_rmdir(parent).unwrap();
@@ -443,8 +446,6 @@ fn browser_parent_hint_deletion_control(hint_before_deletion: bool) {
     };
     assert_eq!(deleted_parent.kind, DfsObjectKind::Tombstone);
     assert_ne!(deleted_parent.version, old_parent.version);
-    assert_eq!(browser.metadata_backend().unwrap().get_object(&old_parent.object_id).unwrap(),
-        Some(deleted_parent.clone()), "actual backend catchup, not a supplied tombstone");
     // The sole private hint is the genuinely observed old row. It grants no
     // authority and does not recreate its ancestors or overwrite the tombstone.
     if !hint_before_deletion {
@@ -509,6 +510,15 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
         .expect("directory symlink");
     dfs.posix_symlink("missing", "/documents/dangling", options)
         .expect("dangling symlink");
+    // The metadata hint resolves a local metadata view. A browser delegating
+    // to its Main has none and fails closed; the projection contract belongs
+    // to the store-backed owner.
+    assert!(matches!(
+        dfs.posix_object_metadata_hint("/documents/dir/file"),
+        Err(DfsPosixError::Dfs(crate::DfsError::Distributed { .. }))
+    ));
+    drop(dfs);
+    let mut dfs = runtime.metadata_primary_service("/documents").unwrap();
     let mut object = dfs
         .metadata_backend()
         .unwrap()
@@ -592,6 +602,10 @@ fn browser_parent_hints_skip_directory_counts_and_preserve_namespace_checks() {
         .unwrap();
     dfs.posix_symlink("missing", "/documents/dangling", options)
         .unwrap();
+    // Parent hints resolve a local metadata view, which only the store-backed
+    // owner has; a delegating browser fails closed and routes MkdirAll.
+    drop(dfs);
+    let mut dfs = runtime.metadata_primary_service("/documents").unwrap();
 
     crate::posix::reset_posix_directory_link_count_calls();
     assert_eq!(dfs.posix_stat("/documents/dir").unwrap().link_count, 3);
@@ -646,6 +660,10 @@ fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
         .unwrap();
     dfs.posix_symlink("target/file", "/documents/link", options)
         .unwrap();
+    // Flight fences on the local projection apply to the store-backed owner;
+    // a delegating browser has no local view and fails closed.
+    drop(dfs);
+    let dfs = runtime.metadata_primary_service("/documents").unwrap();
     let registry = dfs.cross_shard_namespace_lock_registry();
     for locked_path in ["/documents/link", "/documents/target"] {
         registry.upsert_job(
@@ -766,7 +784,9 @@ fn browser_options_preserve_policy_and_candidates_without_metadata_advertisement
             candidates.as_slice()
         );
         assert!(actual.replica_candidates.contains(&nodes[1]));
-        assert_eq!(probe.point_read_calls(), 0);
+        // A store-less browser routes its lookups; each routed response is
+        // checked against the shard's current committed assignment only.
+        assert_only_shard_assignment_point_reads(&probe);
         assert_eq!(probe.prefix_read_calls(), 0);
         assert_eq!(probe.txn_calls(), 0);
         let selected = [nodes[0].clone(), nodes[1].clone()];
@@ -849,7 +869,10 @@ fn browser_options_keep_confirmed_and_missing_path_defaults() {
         .posix_write_file("/documents/file", b"actual confirmed bytes", options)
         .unwrap();
     assert_eq!(
-        service.posix_stat("/documents/file").unwrap().policy,
+        service
+            .posix_stat_distributed("/documents/file")
+            .unwrap()
+            .policy,
         sinomo_core::DfsObjectPolicy::ReplicatedConfirmed
     );
     for path in ["/documents/file", "/documents/missing"] {
@@ -873,7 +896,7 @@ fn browser_options_preserve_local_one_replica_and_reject_local_constraints() {
     let mut service = runtime.client(&nodes[0]).unwrap();
     let path = crate::sifs_node_files_path(&nodes[0]);
     assert_eq!(
-        service.posix_object_metadata_hint(&path).unwrap().policy,
+        service.posix_stat_distributed(&path).unwrap().policy,
         sinomo_core::DfsObjectPolicy::LocalOwned
     );
     let observed_zones = native_browser_observed_zones(&service);
@@ -916,8 +939,9 @@ fn browser_options_replay_committed_operation_after_actual_reopen_without_changi
         .posix_create_file_with_operation_id(path, b"exact bytes", options, operation)
         .unwrap();
     let intent_id = crate::intent::stable_write_intent_id(&nodes[0], &created.object_id, operation);
-    let original = service
-        .metadata_backend()
+    // The node's durable store; the delegating browser keeps no store.
+    let original = runtime
+        .node_metadata(&nodes[0])
         .unwrap()
         .get_intent(&created.object_id, &intent_id)
         .unwrap()
@@ -936,8 +960,8 @@ fn browser_options_replay_committed_operation_after_actual_reopen_without_changi
         (created.object_id.clone(), created.version)
     );
     assert_eq!(
-        service
-            .metadata_backend()
+        runtime
+            .node_metadata(&nodes[0])
             .unwrap()
             .get_intent(&created.object_id, &intent_id)
             .unwrap()
@@ -949,7 +973,10 @@ fn browser_options_replay_committed_operation_after_actual_reopen_without_changi
             .posix_create_file_with_operation_id(path, b"changed", options, operation)
             .is_err()
     );
-    assert_eq!(service.posix_read_file(path).unwrap(), b"exact bytes");
+    assert_eq!(
+        service.posix_read_file_distributed(path).unwrap(),
+        b"exact bytes"
+    );
     drop(service);
     runtime.close().unwrap();
 }
@@ -1083,7 +1110,9 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
             assert_eq!(actual.policy, implicit_options.policy);
             assert_eq!(actual.desired_replica_node_ids.len(), node_count.min(2));
         }
-        assert_eq!(probe.point_read_calls(), 0);
+        // A store-less browser routes its lookups; each routed response is
+        // checked against the shard's current committed assignment only.
+        assert_only_shard_assignment_point_reads(&probe);
         assert_eq!(probe.prefix_read_calls(), 0);
         assert_eq!(probe.txn_calls(), 0);
         drop(service);
@@ -1149,7 +1178,9 @@ fn write_configuration_browser_warm_options_and_committed_writes_keep_full_zero_
                 expected
             );
         }
-        assert_eq!(probe.point_read_calls(), 0);
+        // A store-less browser routes its lookups; each routed response is
+        // checked against the shard's current committed assignment only.
+        assert_only_shard_assignment_point_reads(&probe);
         assert_eq!(probe.prefix_read_calls(), 0);
         assert_eq!(probe.txn_calls(), 0);
         assert_eq!(expected.policy.min_distinct_zones, 0);
@@ -1259,7 +1290,9 @@ fn write_configuration_browser_coherent_updates_keep_retained_view_and_current_p
         "retained unknown or shared native zones cannot satisfy a two-zone rule"
     );
     assert_ne!(actual.policy, old_options.policy);
-    assert_eq!(probe.point_read_calls(), 0);
+    // A store-less browser routes its lookups; each routed response is
+    // checked against the shard's current committed assignment only.
+    assert_only_shard_assignment_point_reads(&probe);
     assert_eq!(probe.prefix_read_calls(), 0);
     drop(current);
     drop(service);
@@ -1604,4 +1637,13 @@ fn exact_log_range_checks_bounds_and_never_substitutes_a_new_head() {
             "a retained version must still read its original bytes"
         );
     }
+}
+
+fn assert_only_shard_assignment_point_reads(probe: &crate::test_runtime::DfsTestControlPlaneProbe) {
+    let keys = probe.point_read_keys();
+    assert!(
+        keys.iter()
+            .all(|key| crate::dfs_metadata_shard_config_key_is_exact(key)),
+        "browser write options read non-assignment keys: {keys:?}"
+    );
 }

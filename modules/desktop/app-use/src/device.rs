@@ -316,16 +316,43 @@ struct CaptureState {
     sample: Option<NativeVideoSample>,
     error: Option<DesktopError>,
     closed: bool,
+    requested: bool,
 }
 #[derive(Default)]
 pub(super) struct CaptureMailbox {
     state: Mutex<CaptureState>,
     changed: Condvar,
+    resolution: Option<CaptureResolution>,
 }
 impl CaptureMailbox {
     pub(super) fn publish(&self, sample: NativeVideoSample) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).sample = Some(sample);
+        let sample = if let Some(bounds) = self.resolution {
+            match fit_capture_sample(sample, bounds) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    self.close(Some(error));
+                    return;
+                }
+            }
+        } else {
+            sample
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return;
+        }
+        state.sample = Some(sample);
+        state.requested = false;
         self.changed.notify_all();
+    }
+    #[cfg(target_os = "android")]
+    pub(super) fn wait_for_request(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |s| !s.closed && !s.requested)
+            .unwrap_or_else(|e| e.into_inner());
+        !state.closed && state.requested
     }
     fn close(&self, error: Option<DesktopError>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,7 +388,22 @@ impl DesktopCapture {
         }
         permissions.check(&config.target, "capture")?;
         platform::validate_target(&config.target)?;
-        let mailbox = Arc::new(CaptureMailbox::default());
+        if let Some(bounds) = config.resolution {
+            bounds.validate()?;
+        }
+        #[cfg(not(target_os = "android"))]
+        if config
+            .pixel_format
+            .is_some_and(|format| format != sinomo_device::NativeVideoSampleFormat::Bgra8)
+        {
+            return Err(DesktopError::Unsupported(
+                "requested native capture format is unavailable on this backend".into(),
+            ));
+        }
+        let mailbox = Arc::new(CaptureMailbox {
+            resolution: config.resolution,
+            ..Default::default()
+        });
         let output = mailbox.clone();
         let authority = permissions.clone();
         let target = config.target.clone();
@@ -405,7 +447,16 @@ impl DesktopCapture {
         self.permissions.check(&self.target, "capture")?;
         #[cfg(target_os = "linux")]
         platform::validate_capture_target(&self.target)?;
-        let state = self.mailbox.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.mailbox.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.closed
+            && state
+                .sample
+                .as_ref()
+                .is_none_or(|sample| sample.sequence <= after_sequence)
+        {
+            state.requested = true;
+            self.mailbox.changed.notify_all();
+        }
         let (state, _) = self
             .mailbox
             .changed
@@ -446,3 +497,6 @@ impl Drop for DesktopCapture {
         self.stop();
     }
 }
+
+#[cfg(target_os = "android")]
+pub(super) use platform::{frame_trace_enabled, trace_frame};

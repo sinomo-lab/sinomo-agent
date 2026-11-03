@@ -20,7 +20,7 @@ pub fn install(root: &Path) -> NativeDylibModuleInstallResult {
         NativeDylibModuleInstallRequest {
             expected_module_id: Some(ModuleId::from_legacy_named(APP_USE_OS_MODULE_ID).unwrap()),
             artifact_id: None,
-            expected_interface_version: Some("sinomo.app-use.os.v1".into()),
+            expected_interface_version: Some("sinomo.app-use.os.v2".into()),
             cache_key: Some(APP_USE_OS_CACHE_KEY.into()),
             library_name: None,
             source: "native app-use acceptance artifact".into(),

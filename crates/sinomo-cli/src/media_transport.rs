@@ -34,6 +34,8 @@ pub(crate) async fn open_desktop_video_source(
     let kind = DesktopModule::AppUse;
     let client = media_daemon_client(data_dir, node_id).await?;
     let request = DesktopStreamRequest {
+        resolution: None,
+        capture_path: Default::default(),
         transport: sinomo_video::codec::VideoTransport::Auto,
         session_id,
         frames_per_second: 30,

@@ -239,6 +239,11 @@ pub fn native_video_sample_to_surface_frame(
     validate_native_video_sample(sample)?;
 
     let (width, height, rgba) = match sample.format {
+        NativeVideoSampleFormat::H264 => {
+            return Err(NativeVideoError::Decode {
+                detail: "H264 requires the ordered stream decoder".into(),
+            });
+        }
         NativeVideoSampleFormat::Mjpeg => decode_mjpeg_sample(sample)?,
         NativeVideoSampleFormat::Nv12 => {
             (sample.width, sample.height, convert_nv12_to_rgba(sample)?)
@@ -249,6 +254,7 @@ pub fn native_video_sample_to_surface_frame(
         NativeVideoSampleFormat::Rgb8
         | NativeVideoSampleFormat::Bgr8
         | NativeVideoSampleFormat::Bgra8
+        | NativeVideoSampleFormat::Rgba8
         | NativeVideoSampleFormat::Gray8 => {
             (sample.width, sample.height, convert_packed_to_rgba(sample)?)
         }
@@ -307,6 +313,10 @@ fn convert_packed_to_rgba(sample: &NativeVideoSample) -> Result<Vec<u8>, NativeV
                 NativeVideoSampleFormat::Gray8 => {
                     let value = row[x];
                     rgba.extend_from_slice(&[value, value, value, 255]);
+                }
+                NativeVideoSampleFormat::Rgba8 => {
+                    let offset = x * 4;
+                    rgba.extend_from_slice(&row[offset..offset + 4]);
                 }
                 NativeVideoSampleFormat::Bgra8 => {
                     let offset = x * 4;
@@ -580,6 +590,7 @@ mod tests {
         planes: Vec<NativeVideoPlane>,
     ) -> NativeVideoSample {
         let sample = NativeVideoSample {
+            native_dimensions: None,
             sequence: 7,
             format,
             width,

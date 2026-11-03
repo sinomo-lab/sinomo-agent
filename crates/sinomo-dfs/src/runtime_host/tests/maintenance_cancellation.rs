@@ -421,7 +421,10 @@ fn native_routine_authority_wait_yields_to_reciprocal_foreground_authority() {
         .unwrap();
     root_record.validate().unwrap();
     drop(root_owner);
-    let bytes = native.client(&requester).unwrap().posix_read_file(PATH);
+    let bytes = native
+        .client(&requester)
+        .unwrap()
+        .posix_read_file_distributed(PATH);
     drop(owner);
     let omitted = native.observation_dropped_count();
     users_trace.close();
