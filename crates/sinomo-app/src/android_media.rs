@@ -11,6 +11,7 @@ static BRIDGE: OnceLock<(jni::JavaVM, Global<JObject<'static>>)> = OnceLock::new
 pub(crate) fn install(vm: jni::JavaVM, callback: Global<JObject<'static>>) {
     let _ = BRIDGE.set((vm, callback));
     sinomo_runtime::device::install_android_camera(open_camera);
+    sinomo_video::codec::install_h264_encoder(open_video_encoder);
     sinomo_runtime::device::sensors::install_sensor_reader(read_sensors);
 }
 
@@ -178,4 +179,92 @@ fn read_sensors() -> Result<Vec<sinomo_runtime::device::sensors::SensorReading>,
         })
         .map_err(|error| error.to_string())?;
     serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn open_video_encoder(
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<Box<dyn sinomo_video::codec::VideoEncoder>, String> {
+    let (vm, callback) = BRIDGE.get().ok_or("Android media host unavailable")?;
+    let object = vm
+        .attach_current_thread(|env| -> jni::errors::Result<_> {
+            let object = env
+                .call_method(
+                    callback,
+                    jni_str!("openVideoEncoder"),
+                    jni_sig!("(III)Lnet/sinomo/app/runtime/SinomoVideoEncoder;"),
+                    &[
+                        (width as i32).into(),
+                        (height as i32).into(),
+                        (fps as i32).into(),
+                    ],
+                )?
+                .l()?;
+            env.new_global_ref(object)
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(Box::new(VideoEncoder { object }))
+}
+struct VideoEncoder {
+    object: Global<JObject<'static>>,
+}
+impl sinomo_video::codec::VideoEncoder for VideoEncoder {
+    fn encode(&mut self, frame: &sinomo_lm::RealtimeVideoFrameInput) -> Result<Vec<u8>, String> {
+        use sinomo_lm::RealtimeVideoPixelFormat;
+        let (vm, _) = BRIDGE.get().ok_or("Android media host unavailable")?;
+        let pixel_format = match frame.pixel_format {
+            RealtimeVideoPixelFormat::Rgb8 => 0,
+            RealtimeVideoPixelFormat::Rgba8 => 1,
+            RealtimeVideoPixelFormat::Bgra8 => 2,
+        };
+        let row = frame.width as usize * frame.pixel_format.bytes_per_pixel();
+        if frame.stride < row || frame.pixels.len() < frame.stride * frame.height as usize {
+            return Err("invalid native video stride/length".into());
+        }
+        let packed;
+        let pixels = if frame.stride == row {
+            &frame.pixels[..row * frame.height as usize]
+        } else {
+            packed = frame
+                .pixels
+                .chunks(frame.stride)
+                .take(frame.height as usize)
+                .flat_map(|row_bytes| row_bytes[..row].iter().copied())
+                .collect::<Vec<_>>();
+            &packed
+        };
+        vm.attach_current_thread(|env| -> jni::errors::Result<_> {
+            // Java only reads this buffer synchronously during texture upload;
+            // the immutable source stays alive until the call returns.
+            let buffer =
+                unsafe { env.new_direct_byte_buffer(pixels.as_ptr() as *mut u8, pixels.len())? };
+            let result = env
+                .call_method(
+                    &self.object,
+                    jni_str!("encode"),
+                    jni_sig!("(Ljava/nio/ByteBuffer;III)[B"),
+                    &[
+                        (&buffer).into(),
+                        (frame.width as i32).into(),
+                        (frame.height as i32).into(),
+                        pixel_format.into(),
+                    ],
+                )?
+                .l()?;
+            let bytes = jni::objects::JByteArray::cast_local(env, result)?;
+            env.convert_byte_array(&bytes)
+        })
+        .map_err(|e| e.to_string())
+    }
+}
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        if let Some((vm, _)) = BRIDGE.get() {
+            let _ = vm.attach_current_thread(|env| {
+                env.call_method(&self.object, jni_str!("close"), jni_sig!("()V"), &[])
+                    .map(|_| ())
+            });
+        }
+    }
 }

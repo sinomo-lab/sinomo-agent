@@ -16,6 +16,8 @@ default = []
 native-devices = ["sinomo-runtime/native-devices"]
 
 [dependencies]
+openh264.workspace = true
+h264-reader.workspace = true
 sinomo-lm.workspace = true
 tokio.workspace = true
 image = { workspace = true, features = ["jpeg"] }

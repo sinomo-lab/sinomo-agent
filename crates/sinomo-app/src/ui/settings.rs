@@ -8961,7 +8961,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         ("motion", "Motion and environment sensors"),
     ] {
         let s = shared.clone();
-        let checked = settings_projection(shared, "settings shared device", move |snapshot| {
+        let checked = settings_projection(shared, "settings device exposure", move |snapshot| {
             snapshot
                 .remote_management
                 .snapshot
@@ -8983,7 +8983,7 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
                                 kind: kind.into(),
                                 enabled,
                             },
-                            );
+                        );
                     },
                 ))
                 .build(shared),

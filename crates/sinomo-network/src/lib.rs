@@ -160,6 +160,7 @@ pub use endpoint_advertisement::{
     daemon_loopback_endpoint,
 };
 pub use endpoint_records::apply_cluster_endpoint_advertisement;
+pub use endpoint_records::{cluster_route_hint_endpoint_id, is_cluster_route_hint_endpoint};
 pub use endpoint_records::cleanup_cluster_endpoint_duplicates;
 pub use endpoint_records::cleanup_member_endpoint_duplicates;
 pub use endpoint_records::cluster_endpoint_duplicate_identity_eq;

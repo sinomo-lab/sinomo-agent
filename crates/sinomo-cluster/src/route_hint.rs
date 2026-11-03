@@ -9,11 +9,15 @@
 //! address the peer publishes is dropped as redundant.
 
 use crate::local_state_store::{
-    acquire_local_cluster_state_mutation_lock, write_cluster_state_unlocked,
+    acquire_local_cluster_state_mutation_lock, write_operator_route_hint_state_unlocked,
 };
 use serde::{Deserialize, Serialize};
-use sinomo_base::{ClusterBootstrapState, ClusterEndpointRecord, Id};
-use sinomo_network::{ClusterPaths, NetworkError, read_object_file};
+use sinomo_base::{ClusterBootstrapState, ClusterEndpointRecord};
+pub(crate) use sinomo_network::is_cluster_route_hint_endpoint;
+use sinomo_network::{
+    ClusterPaths, NetworkError, cluster_route_hint_endpoint_id as route_hint_endpoint_id,
+    read_object_file,
+};
 use sinomo_node::{NodeId, cluster_node_is_local_process};
 
 pub const CLUSTER_CONTROL_ROUTE_HINT_ROUTE: &str = "/cluster/control/route-hint";
@@ -34,19 +38,6 @@ pub struct ClusterRouteHintResponse {
     /// an address the peer already publishes, or removing an absent hint is a
     /// no-op.
     pub changed: bool,
-}
-
-fn route_hint_endpoint_id(node_id: &NodeId, address: &str) -> Id {
-    Id::derived(
-        "sinomo.cluster.route-hint",
-        format!("{}\0{address}", node_id.as_str()),
-    )
-}
-
-/// Whether `endpoint` is an operator route hint rather than a published or
-/// discovered endpoint.
-pub(crate) fn is_cluster_route_hint_endpoint(endpoint: &ClusterEndpointRecord) -> bool {
-    endpoint.endpoint_id == route_hint_endpoint_id(&endpoint.node_id, &endpoint.address)
 }
 
 fn cluster_route_hint_endpoint(
@@ -108,7 +99,7 @@ pub fn apply_cluster_route_hint(
         true
     };
     if changed {
-        write_cluster_state_unlocked(paths, &state)?;
+        write_operator_route_hint_state_unlocked(paths, &state)?;
         crate::kv_read_model::invalidate_cluster_directory_projection(paths);
         sinomo_network::invalidate_cluster_route_graph_cache(paths);
     }

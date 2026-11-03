@@ -222,6 +222,8 @@ pub struct DesktopStreamRequest {
     pub include_cursor: bool,
     #[serde(default)]
     pub encoding: sinomo_lm::RealtimeVideoInputConfig,
+    #[serde(default)]
+    pub transport: sinomo_video::codec::VideoTransport,
 }
 fn default_fps() -> u32 {
     30
@@ -605,6 +607,16 @@ impl Service for DesktopService {
             } else {
                 let capture_request: DesktopStreamRequest =
                     ctx.decode_request_body_bounded(&request, 16 * 1024).await?;
+                let transport = sinomo_video::codec::select(
+                    capture_request.transport,
+                    capture_request.encoding.coordinate_grid,
+                )
+                .map_err(service_error)?;
+                let version = if transport == sinomo_video::codec::VideoTransport::H264 {
+                    sinomo_video::stream::H264_STREAM_VERSION
+                } else {
+                    sinomo_video::stream::VIDEO_STREAM_VERSION
+                };
                 let state = self.state.clone();
                 let capture_options = capture_request.clone();
                 let actor = owner.clone();
@@ -615,11 +627,12 @@ impl Service for DesktopService {
                     .await
                     .map_err(service_error)?
                     .map_err(service_error)?;
-                let (body, worker) = sinomo_video::stream::desktop_capture_body(
+                let (body, worker) = sinomo_video::stream::desktop_capture_body_with_transport(
                     capture,
                     capture_request.encoding,
                     duration,
                     cancelled,
+                    transport,
                 );
                 let worker = tokio::spawn(async move {
                     let _guard = active_guard;
@@ -640,7 +653,7 @@ impl Service for DesktopService {
                 }
                 self.publish_operation(&request, &owner, "capture", true, serde_json::json!({"session_id":capture_request.session_id, "stream_version":sinomo_video::stream::VIDEO_STREAM_VERSION}))
                     .await?;
-                ctx.respond_with_body(ObjectRpcResponse::encode_body(self.kind.capture_route(), &serde_json::json!({ "version": sinomo_video::stream::VIDEO_STREAM_VERSION, "session_id": capture_request.session_id, "content_type": "application/vnd.sinomo.video-stream", "max_duration_ms": duration.as_millis() }))?, body)?;
+                ctx.respond_with_body(ObjectRpcResponse::encode_body(self.kind.capture_route(), &serde_json::json!({ "version": version, "transport":transport, "session_id": capture_request.session_id, "content_type": "application/vnd.sinomo.video-stream", "max_duration_ms": duration.as_millis() }))?, body)?;
             }
             Ok(ServiceDisposition::Continue)
         })

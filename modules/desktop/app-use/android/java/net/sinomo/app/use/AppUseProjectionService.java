@@ -43,10 +43,10 @@ public final class AppUseProjectionService extends Service {
         final byte[] bytes;
         final int width, height;
         final long sequence, timestamp, capturedAt;
-        Frame(byte[] bytes, int width, int height, long sequence, long timestamp) {
+        Frame(byte[] bytes, int width, int height, long sequence, long timestamp, long capturedAt) {
             this.bytes = bytes; this.width = width; this.height = height;
             this.sequence = sequence; this.timestamp = timestamp;
-            this.capturedAt = System.currentTimeMillis();
+            this.capturedAt = capturedAt;
         }
     }
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -105,6 +105,9 @@ public final class AppUseProjectionService extends Service {
         return START_NOT_STICKY;
     }
     private void receive(ImageReader source) {
+        // Timestamp acquisition before row copies and native/codec transfer.
+        long capturedAt = System.currentTimeMillis();
+        long captureTimestamp = SystemClock.elapsedRealtimeNanos() - started;
         try (Image image = source.acquireLatestImage()) {
             if (image == null) return;
             synchronized (LOCK) {
@@ -129,7 +132,7 @@ public final class AppUseProjectionService extends Service {
             }
             synchronized (LOCK) {
                 if (!closing && clients > 0 && target != null && width == w && height == h)
-                    latest = new Frame(bytes, w, h, ++sequence, SystemClock.elapsedRealtimeNanos() - started);
+                    latest = new Frame(bytes, w, h, ++sequence, captureTimestamp, capturedAt);
             }
         } catch (RuntimeException error) {
             android.util.Log.e("SinomoAppUse", "Native frame delivery failed", error);

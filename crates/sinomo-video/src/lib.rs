@@ -1,5 +1,6 @@
 //! Video and screen perception event producer skeleton.
 
+pub mod codec;
 pub mod stream;
 
 use serde::{Deserialize, Serialize};

@@ -176,8 +176,9 @@ certificate. Direct `cargo apk build` does not package these services. The
 packager needs the existing signing keystore and password environment variable;
 it never generates a replacement signing identity.
 
-Build `sinomo-app-use-module` for `aarch64-linux-android` with the Android NDK and
-activate its `.so` through the ordinary native-module lifecycle on the Android
+Build `sinomo-app-use-module` for `aarch64-linux-android` with the Android NDK
+and `--profile android-debug` (or `android-debug-small`) so its pixel conversion
+uses the Android media optimization settings. Activate its `.so` through the ordinary native-module lifecycle on the Android
 node. The Android embedded profile exposes the same App Use tools as desktop;
 there is no linked provider fallback.
 

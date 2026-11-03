@@ -1887,6 +1887,17 @@ fn validate_routed_session_descriptor(
     directory: &DirectorySnapshot,
     descriptor: &RoutedSessionDescriptor,
 ) -> Result<(), NetworkError> {
+    validate_routed_session_shape(directory, descriptor)?;
+    for index in 0..descriptor.endpoint_ids.len() {
+        validate_routed_session_endpoint(directory, descriptor, index)?;
+    }
+    Ok(())
+}
+
+fn validate_routed_session_shape(
+    directory: &DirectorySnapshot,
+    descriptor: &RoutedSessionDescriptor,
+) -> Result<(), NetworkError> {
     let hop_count = descriptor.path.len().saturating_sub(1);
     let key_configuration_valid = match descriptor.protection {
         RoutedSessionProtection::Plaintext => descriptor.source_ephemeral_public_key.is_none(),
@@ -1921,15 +1932,21 @@ fn validate_routed_session_descriptor(
             });
         }
     }
-    for (index, endpoint_id) in descriptor.endpoint_ids.iter().enumerate() {
-        let target = &descriptor.path[index + 1];
-        if !directory.node(target).is_some_and(|node| {
-            node.endpoints
-                .iter()
-                .any(|endpoint| endpoint.endpoint_id == *endpoint_id)
-        }) {
-            return Err(NetworkError::AuthDenied);
-        }
+    Ok(())
+}
+
+fn validate_routed_session_endpoint(
+    directory: &DirectorySnapshot,
+    descriptor: &RoutedSessionDescriptor,
+    index: usize,
+) -> Result<(), NetworkError> {
+    let target = &descriptor.path[index + 1];
+    if !directory.node(target).is_some_and(|node| {
+        node.endpoints
+            .iter()
+            .any(|endpoint| endpoint.endpoint_id == descriptor.endpoint_ids[index])
+    }) {
+        return Err(NetworkError::AuthDenied);
     }
     Ok(())
 }
@@ -1967,8 +1984,15 @@ fn incoming_routed_session_position(
 fn verify_routed_session_open(
     directory: &DirectorySnapshot,
     open: &RoutedSessionOpen,
+    position: usize,
 ) -> Result<Vec<u8>, NetworkError> {
-    validate_routed_session_descriptor(directory, &open.descriptor)?;
+    validate_routed_session_shape(directory, &open.descriptor)?;
+    // The authenticated incoming link has already realized earlier edges.
+    // Their endpoint IDs can be private caller-side NAT/route hints. Only a
+    // relay's own outbound edge must be executable in this node's directory.
+    if position < open.descriptor.endpoint_ids.len() {
+        validate_routed_session_endpoint(directory, &open.descriptor, position)?;
+    }
     routed_session_encode(&open.descriptor)
 }
 
@@ -2307,11 +2331,12 @@ pub async fn accept_direct_routed_session(
     }
     let open_frame = read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME).await?;
     let open: RoutedSessionOpen = routed_session_decode(&open_frame)?;
-    let descriptor_transcript = verify_routed_session_open(directory, &open)?;
+
     if open.descriptor.path.len() != 2 {
         return Err(NetworkError::AuthDenied);
     }
     let position = incoming_routed_session_position(&stream, &open.descriptor)?;
+    let descriptor_transcript = verify_routed_session_open(directory, &open, position)?;
     if position + 1 != open.descriptor.path.len() {
         return Err(NetworkError::FrameTargetMismatch {
             requested_target_node_id: stream.local_node_id,
@@ -2912,8 +2937,9 @@ async fn accept_or_relay_routed_session_inner(
     }
     let open_frame = read_routed_session_frame(&mut *stream.io, ROUTED_SESSION_OPEN_FRAME).await?;
     let open: RoutedSessionOpen = routed_session_decode(&open_frame)?;
-    let descriptor_transcript = verify_routed_session_open(directory, &open)?;
+
     let position = incoming_routed_session_position(&stream, &open.descriptor)?;
+    let descriptor_transcript = verify_routed_session_open(directory, &open, position)?;
     if position + 1 == open.descriptor.path.len() {
         return accept_routed_session_destination(stream, open, descriptor_transcript)
             .await
@@ -7028,6 +7054,65 @@ mod tests {
                 .all(|write| !write
                     .windows(TEST_ROUTED_PAYLOAD.len())
                     .any(|window| window == TEST_ROUTED_PAYLOAD))
+        );
+    }
+
+    #[test]
+    fn ingress_validates_only_its_outbound_endpoint_after_authenticated_arrival() {
+        let (nodes, directory, connectivity) =
+            topology_fixture("private_hint", 61, 3, &[(0, 1), (1, 2)]);
+        let path = plan_routes(
+            &directory,
+            &connectivity,
+            &nodes[0],
+            &nodes[2],
+            RouteConstraints::default(),
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let mut open = RoutedSessionOpen {
+            descriptor: RoutedSessionDescriptor {
+                protocol: ROUTED_SESSION_PROTOCOL.into(),
+                source_node_id: nodes[0].clone(),
+                destination_node_id: nodes[2].clone(),
+                session_id: Id::generate(),
+                path: path.nodes,
+                endpoint_ids: path
+                    .hops
+                    .iter()
+                    .map(|hop| hop.endpoint.endpoint_id.clone())
+                    .collect(),
+                protection: RoutedSessionProtection::Plaintext,
+                source_ephemeral_public_key: None,
+                reverse_process_affinity: None,
+                hop_limit: 2,
+                deadline_unix_millis: routed_session_deadline_unix_millis(Duration::from_secs(5)),
+            },
+        };
+        open.descriptor.endpoint_ids[0] = Id::generate();
+        assert!(
+            validate_routed_session_descriptor(&directory, &open.descriptor).is_err(),
+            "sender must resolve its selected endpoints"
+        );
+        assert!(
+            verify_routed_session_open(&directory, &open, 1).is_ok(),
+            "relay must not reject an already authenticated private incoming endpoint"
+        );
+        open.descriptor.endpoint_ids[1] = Id::generate();
+        assert!(
+            verify_routed_session_open(&directory, &open, 1).is_err(),
+            "relay still requires its next endpoint"
+        );
+        assert!(
+            verify_routed_session_open(&directory, &open, 2).is_ok(),
+            "destination does not dial either endpoint"
+        );
+        open.descriptor.path[0] = Id::generate();
+        open.descriptor.source_node_id = open.descriptor.path[0].clone();
+        assert!(
+            verify_routed_session_open(&directory, &open, 2).is_err(),
+            "unknown source must remain denied"
         );
     }
 
