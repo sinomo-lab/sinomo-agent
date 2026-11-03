@@ -5,7 +5,7 @@
 //! integrity metadata, while found content uses the stream-native object-RPC
 //! attachment carried by `sinomo-network`.
 
-use crate::content_store::LocalContentStore;
+use crate::content_store::{LocalContentStore, ObjectVersionReader};
 use crate::protocol::{
     DfsDirectReadRequest, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
     DfsReadResult,
@@ -524,9 +524,15 @@ fn serve_dfs_direct_read_request(
             range_offset,
             range_size_bytes,
         ) {
-            Ok(reader) if reader.remaining_bytes() == range_size_bytes_u64 => reader,
+            Ok(reader) if reader.remaining_bytes() == range_size_bytes_u64 => {
+                ObjectVersionReader::from_blob_range(reader)
+            }
             Ok(_) | Err(_) => {
-                return direct_read_terminal_response(request, DfsReadResult::NotFound);
+                match direct_read_object_content(content, &request, range_offset, range_size_bytes)
+                {
+                    Some(reader) => reader,
+                    None => return direct_read_terminal_response(request, DfsReadResult::NotFound),
+                }
             }
         };
         let mut response = direct_read_found_response_head(
@@ -548,26 +554,49 @@ fn serve_dfs_direct_read_request(
         });
     }
 
-    let reader = match content.open_blob_stream(&request.content_hash) {
-        Ok(reader) if reader.size_bytes() == request.content_size_bytes => reader,
-        Ok(_) | Err(_) => {
-            return direct_read_terminal_response(request, DfsReadResult::NotFound);
-        }
-    };
-    let response = direct_read_found_response_head(
-        &request,
-        DFS_DIRECT_READ_STATUS_FOUND,
+    let size_bytes =
         usize::try_from(request.content_size_bytes).map_err(|_| DfsError::Network {
             message: format!(
                 "DFS direct read is too large for this platform: {}",
                 request.content_size_bytes
             ),
-        })?,
-    );
+        })?;
+    let reader = match content.open_blob_stream(&request.content_hash) {
+        Ok(reader) if reader.size_bytes() == request.content_size_bytes => {
+            ObjectVersionReader::from_blob(reader)
+        }
+        Ok(_) | Err(_) => match direct_read_object_content(content, &request, 0, size_bytes) {
+            Some(reader) => reader,
+            None => return direct_read_terminal_response(request, DfsReadResult::NotFound),
+        },
+    };
+    let response =
+        direct_read_found_response_head(&request, DFS_DIRECT_READ_STATUS_FOUND, size_bytes);
     Ok(DfsDirectReadAttachmentResponse {
         response,
         attachment: ObjectRpcBodySource::from_reader(reader, Some(request.content_size_bytes)),
     })
+}
+
+/// The requested range of the object version's stored content when no whole
+/// blob exists for its content hash, as for a version written by a patch.
+fn direct_read_object_content(
+    content: &LocalContentStore,
+    request: &DfsDirectReadRequest,
+    offset: u64,
+    max_bytes: usize,
+) -> Option<ObjectVersionReader> {
+    content
+        .open_object_content_range_stream(
+            request.object_id.as_str(),
+            &request.content_hash,
+            request.content_size_bytes,
+            offset,
+            max_bytes,
+        )
+        .ok()
+        .flatten()
+        .map(|(_, reader)| reader)
 }
 
 fn direct_read_found_response_head(

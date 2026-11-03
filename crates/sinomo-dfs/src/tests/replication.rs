@@ -576,6 +576,37 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 }
 
 #[test]
+fn delegating_client_truncates_right_after_its_own_write_at() {
+    let name = "native-delegating-write-at-then-truncate";
+    let (runtime, mut primary_service, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    let primary = config.primary_node_id.clone();
+    let replica = config.replica_node_ids[0].clone();
+    let path = "/services/patch-then-truncate.txt";
+    let created = primary_service
+        .posix_write_file(
+            path,
+            b"0123456789",
+            DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
+        )
+        .unwrap();
+    drop(primary_service);
+    let mut client = runtime.client(&replica).unwrap();
+    assert!(client.transport.delegates_local_namespace_authority());
+    let options = DfsWriteOptions::replicated_eventual(vec![primary.clone()]);
+    client
+        .posix_write_file_at(path, 2, b"ab", options.clone())
+        .unwrap();
+    let truncated = client
+        .posix_truncate_file_for_object(&created.object_id, 4, options)
+        .expect("the patched version is readable for the rewrite");
+    assert_eq!(truncated.size_bytes, Some(4));
+    assert_eq!(client.posix_read_file_distributed(path).unwrap(), b"01ab");
+    drop(client);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn outsider_patches_symlinks_and_stats_through_the_primary() {
     let name = "native-outsider-patch-through-primary";
     let (runtime, mut primary_service, config) =
