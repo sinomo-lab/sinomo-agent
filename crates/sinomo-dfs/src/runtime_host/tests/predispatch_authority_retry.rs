@@ -2323,15 +2323,16 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
     let mut client = runtime.client(&primary).unwrap();
     let options = DfsWriteOptions::replicated_eventual(vec![primary.clone()]);
     let path = "/same-node-main-write";
-    let parent_before = client.posix_stat("/").unwrap();
+    // The caller observes through its authorities; the durable rows are read
+    // from the primary node's own store, reopened for each observation.
+    let primary_store = || runtime.node_metadata(&primary).unwrap();
+    let parent_before = client.posix_stat_distributed("/").unwrap();
     let base = client
         .posix_write_file(path, b"byte-source", options.clone())
         .unwrap();
-    let parent_after = client.posix_stat("/").unwrap();
+    let parent_after = client.posix_stat_distributed("/").unwrap();
     assert_ne!(parent_before.version, parent_after.version);
-    let durable_parent = client
-        .metadata_backend()
-        .unwrap()
+    let durable_parent = primary_store()
         .get_object_by_path(&parent_after.file_system_id, "/")
         .unwrap()
         .unwrap();
@@ -2340,9 +2341,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         parent_after.modified_at_unix_nanos,
         durable_parent.modified_at_unix_nanos
     );
-    let durable_base = client
-        .metadata_backend()
-        .unwrap()
+    let durable_base = primary_store()
         .get_object_by_path(&base.file_system_id, path)
         .unwrap()
         .unwrap();
@@ -2358,17 +2357,18 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         .unwrap();
     assert_eq!(link.kind, crate::DfsObjectKind::Symlink);
     assert!(!link.current_locations.is_empty());
-    let durable_link = client
-        .metadata_backend()
-        .unwrap()
+    let durable_link = primary_store()
         .get_object_by_path(&link.file_system_id, link_path)
         .unwrap()
         .unwrap();
     assert_eq!(link.object_id, durable_link.object_id);
     assert_eq!(link.version, durable_link.version);
     assert_eq!(link.content_hash, durable_link.content_hash);
-    assert_eq!(client.posix_readlink(link_path).unwrap(), path);
-    assert_eq!(client.posix_read_file(link_path).unwrap(), b"byte-source");
+    assert_eq!(client.posix_readlink_distributed(link_path).unwrap(), path);
+    assert_eq!(
+        client.posix_read_file_distributed(link_path).unwrap(),
+        b"byte-source"
+    );
     let manifest_bytes = vec![0x45; 32 * 1024 + 7];
     let manifest_version = DfsVersion::generate();
     let manifest = client
@@ -2403,7 +2403,10 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
     assert!(
         matches!(client.settle_ready_write_outcome(outcome, false).unwrap(), crate::NetworkedDfsWriteOutcome::Committed { version, .. } if version == manifest_version)
     );
-    assert_eq!(client.posix_read_file(path).unwrap(), manifest_bytes);
+    assert_eq!(
+        client.posix_read_file_distributed(path).unwrap(),
+        manifest_bytes
+    );
     let reader_bytes = vec![0x53; 32 * 1024 + 11];
     client
         .posix_write_file_from_reader(
@@ -2412,7 +2415,10 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
             options.clone(),
         )
         .unwrap();
-    assert_eq!(client.posix_read_file(path).unwrap(), reader_bytes);
+    assert_eq!(
+        client.posix_read_file_distributed(path).unwrap(),
+        reader_bytes
+    );
     let byte_exclusive_operation = sinomo_core::Id::generate().to_string();
     let byte_exclusive = client
         .posix_create_file_with_contents_and_attrs_and_operation_id(
@@ -2439,9 +2445,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
     assert_eq!(byte_replay.object_id, byte_exclusive.object_id);
     assert_eq!(byte_replay.version, byte_exclusive.version);
     let byte_shard = crate::DfsMetadataShardId::new(shard.shard_id.clone());
-    let before_rejection = client
-        .metadata_backend()
-        .unwrap()
+    let before_rejection = primary_store()
         .metadata_prefix_proof(&byte_shard)
         .unwrap()
         .unwrap();
@@ -2459,9 +2463,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         before_journal.len() < journal_bound,
         "the bounded actual journal suffix must be complete before claiming no append"
     );
-    let original = client
-        .metadata_backend()
-        .unwrap()
+    let original = primary_store()
         .get_object(&byte_exclusive.object_id)
         .unwrap()
         .unwrap();
@@ -2479,9 +2481,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         crate::DfsPosixError::AlreadyExists { .. }
     ));
     assert_eq!(
-        client
-            .metadata_backend()
-            .unwrap()
+        primary_store()
             .metadata_prefix_proof(&byte_shard)
             .unwrap()
             .unwrap(),
@@ -2501,9 +2501,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
     );
     drop(journal_reader);
     assert_eq!(
-        client
-            .metadata_backend()
-            .unwrap()
+        primary_store()
             .get_object(&byte_exclusive.object_id)
             .unwrap()
             .unwrap(),
@@ -2511,7 +2509,9 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         "rejected exclusive byte creation must preserve the exact visible head and attributes"
     );
     assert_eq!(
-        client.posix_read_file("/same-node-byte-exclusive").unwrap(),
+        client
+            .posix_read_file_distributed("/same-node-byte-exclusive")
+            .unwrap(),
         b"byte-exclusive-source"
     );
     let exclusive_operation = sinomo_core::Id::generate().to_string();
@@ -2533,7 +2533,7 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         .unwrap();
     assert_eq!(exclusive.object_id, replay.object_id);
     assert_eq!(exclusive.version, replay.version);
-    let before_retained = client.posix_stat(path).unwrap();
+    let before_retained = client.posix_stat_distributed(path).unwrap();
     let retained = client
         .preserve_content_revision(
             crate::DfsPreservedContentRequest {
@@ -2555,9 +2555,12 @@ fn native_same_node_main_executes_byte_manifest_reader_exclusive_and_retained_wr
         retained,
         crate::DfsPreservedContentOutcome::Retained { .. }
     ));
-    let after_retained = client.posix_stat(path).unwrap();
+    let after_retained = client.posix_stat_distributed(path).unwrap();
     assert_eq!(before_retained.version, after_retained.version);
-    assert_eq!(client.posix_read_file(path).unwrap(), reader_bytes);
+    assert_eq!(
+        client.posix_read_file_distributed(path).unwrap(),
+        reader_bytes
+    );
     assert_eq!(
         seen.load(std::sync::atomic::Ordering::SeqCst),
         7,

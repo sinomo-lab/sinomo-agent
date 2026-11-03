@@ -2145,7 +2145,12 @@ pub fn open_dfs_runtime_service_with_content(
     runtime: Option<&tokio::runtime::Handle>,
     content: LocalContentStore,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    open_dfs_runtime_service_for_effect(data_dir, runtime, content, None)
+    open_dfs_runtime_service_for_use(
+        data_dir,
+        runtime,
+        content,
+        DfsRuntimeServiceScope::Caller { read_only: false },
+    )
 }
 
 /// Open only the exact current owning physical shard for a bounded effect.
@@ -2156,7 +2161,30 @@ pub fn open_dfs_runtime_service_on_shard(
     expected: &crate::DfsMetadataShardConfig,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
     let content = open_dfs_runtime_content_store(data_dir)?;
-    open_dfs_runtime_service_for_effect(data_dir, runtime, content, Some(expected))
+    open_dfs_runtime_service_for_use(
+        data_dir,
+        runtime,
+        content,
+        DfsRuntimeServiceScope::OwnedShard(expected),
+    )
+}
+
+/// Open this node's own copy of `shard` for selected local recovery. The node
+/// holds the shard as a replica and need not be its primary; the service
+/// writes only that copy and does not delegate to Main.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn open_dfs_runtime_service_on_local_shard_copy(
+    data_dir: &SinomoDataDir,
+    runtime: Option<&tokio::runtime::Handle>,
+    shard: &crate::DfsMetadataShardConfig,
+) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
+    let content = open_dfs_runtime_content_store(data_dir)?;
+    open_dfs_runtime_service_for_use(
+        data_dir,
+        runtime,
+        content,
+        DfsRuntimeServiceScope::LocalShardCopy(shard),
+    )
 }
 
 /// Open an observational client using the existing native configuration and
@@ -2168,26 +2196,39 @@ pub fn open_dfs_runtime_inspection_service_with_content(
     runtime: Option<&tokio::runtime::Handle>,
     content: LocalContentStore,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    open_dfs_runtime_service_for_use(data_dir, runtime, content, None, true)
+    open_dfs_runtime_service_for_use(
+        data_dir,
+        runtime,
+        content,
+        DfsRuntimeServiceScope::Caller { read_only: true },
+    )
 }
 
-fn open_dfs_runtime_service_for_effect(
-    data_dir: &SinomoDataDir,
-    runtime: Option<&tokio::runtime::Handle>,
-    content: LocalContentStore,
-    effect: Option<&crate::DfsMetadataShardConfig>,
-) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    open_dfs_runtime_service_for_use(data_dir, runtime, content, effect, false)
+/// The metadata a runtime service opens.
+#[derive(Clone, Copy)]
+enum DfsRuntimeServiceScope<'a> {
+    /// A caller delegating to its Main keeps no local metadata store.
+    Caller { read_only: bool },
+    /// A bounded Core effect on the exact locally owned primary shard.
+    OwnedShard(&'a crate::DfsMetadataShardConfig),
+    /// Selected local recovery of this node's own copy of a shard.
+    #[cfg(any(test, feature = "test-support"))]
+    LocalShardCopy(&'a crate::DfsMetadataShardConfig),
 }
 
 fn open_dfs_runtime_service_for_use(
     data_dir: &SinomoDataDir,
     runtime: Option<&tokio::runtime::Handle>,
     content: LocalContentStore,
-    effect: Option<&crate::DfsMetadataShardConfig>,
-    read_only: bool,
+    scope: DfsRuntimeServiceScope<'_>,
 ) -> Result<NetworkedDfsService<DfsNodeTransport>, DfsRuntimeError> {
-    debug_assert!(!read_only || effect.is_none());
+    let read_only = matches!(scope, DfsRuntimeServiceScope::Caller { read_only: true });
+    let effect = match scope {
+        DfsRuntimeServiceScope::Caller { .. } => None,
+        DfsRuntimeServiceScope::OwnedShard(shard) => Some(shard),
+        #[cfg(any(test, feature = "test-support"))]
+        DfsRuntimeServiceScope::LocalShardCopy(shard) => Some(shard),
+    };
     let cluster_paths = ClusterPaths::new(data_dir);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let provider_runtime = runtime
@@ -2256,80 +2297,45 @@ fn open_dfs_runtime_service_for_use(
         .map(|entry| entry.decode::<crate::DfsMetadataShardConfig>())
         .collect::<Result<Vec<_>, _>>()?;
     shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
-    // Only a fresh ordinary shell needs local bindings here. This precedes
-    // request-local writes/reads; rebuilding an active producer would lose custody.
-    let cold_local_shards = if effect.is_none() && !read_only {
-        shards
-            .iter()
-            .filter(|shard| shard.primary_node_id == state.local_node_id)
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    // The client view owns no resident ingress checkout across a remote RPC.
-    // Each effect still acquires its normal admission and physical writer;
-    // replicas keep their actual per-shard resident ingress sessions available.
+    // A shell delegating to its Main keeps no local metadata store; only an
+    // exact Core effect or a selected local recovery opens its shard.
     let selected_layout = owner.selected_original_data_layout()?;
-    let metadata: Box<dyn crate::DfsMetadataBackend> = if read_only {
-        Box::new(
-            (if let Some(layout) = &selected_layout {
-                crate::LocalShardedMetadataBackend::open_for_inspection_at_node_with_layout(
-                    crate::default_dfs_metadata_shards_root(data_dir),
-                    shards,
-                    &state.local_node_id,
-                    Arc::clone(layout),
-                )
-            } else {
-                crate::local_state::open_local_sharded_metadata_backend_for_inspection_at_node(
-                    crate::default_dfs_metadata_shards_root(data_dir),
-                    shards,
-                    &state.local_node_id,
-                )
-            })
-            .map_err(|error| DfsRuntimeError::Parse {
-                detail: error.to_string(),
-            })?,
-        )
-    } else if let Some(expected) = effect {
-        if expected.primary_node_id != state.local_node_id || !shards.contains(expected) {
-            return Err(DfsRuntimeError::Parse {
-                detail: "effect opener has no exact current locally owned shard".into(),
-            });
+    let metadata: Option<Box<dyn crate::DfsMetadataBackend>> = match effect {
+        Some(expected) => {
+            let held = match scope {
+                #[cfg(any(test, feature = "test-support"))]
+                DfsRuntimeServiceScope::LocalShardCopy(_) => {
+                    crate::service_routed_journal::shard_lists_node(expected, &state.local_node_id)
+                }
+                _ => expected.primary_node_id == state.local_node_id,
+            };
+            if !held || !shards.contains(expected) {
+                return Err(DfsRuntimeError::Parse {
+                    detail: "effect opener has no exact current locally held shard".into(),
+                });
+            }
+            let root = crate::default_dfs_metadata_shards_root(data_dir)
+                .join(crate::metadata_keys::key_segment(&expected.shard_id));
+            Some(Box::new(
+                (if let Some(layout) = &selected_layout {
+                    crate::LocalSobjMetadataBackend::new_with_selected_layout(
+                        expected.file_system_id.clone(),
+                        crate::DfsMetadataShardId::new(expected.shard_id.clone()),
+                        root,
+                        Arc::clone(layout),
+                    )
+                } else {
+                    crate::LocalSobjMetadataBackend::new(
+                        crate::DfsMetadataShardId::new(expected.shard_id.clone()),
+                        root,
+                    )
+                })
+                .map_err(|error| DfsRuntimeError::Parse {
+                    detail: error.to_string(),
+                })?,
+            ))
         }
-        let root = crate::default_dfs_metadata_shards_root(data_dir)
-            .join(crate::metadata_keys::key_segment(&expected.shard_id));
-        Box::new(
-            (if let Some(layout) = &selected_layout {
-                crate::LocalSobjMetadataBackend::new_with_selected_layout(
-                    expected.file_system_id.clone(),
-                    crate::DfsMetadataShardId::new(expected.shard_id.clone()), root, Arc::clone(layout),
-                )
-            } else {
-                crate::LocalSobjMetadataBackend::new(
-                    crate::DfsMetadataShardId::new(expected.shard_id.clone()), root,
-                )
-            })
-            .map_err(|error| DfsRuntimeError::Parse {
-                detail: error.to_string(),
-            })?,
-        )
-    } else {
-        Box::new(
-            (if let Some(layout) = selected_layout {
-                crate::LocalShardedMetadataBackend::new_with_replica_repair_and_layout(
-                    crate::default_dfs_metadata_shards_root(data_dir), shards,
-                    &state.local_node_id, layout,
-                )
-            } else {
-                crate::open_local_sharded_metadata_backend_for_replica_repair(
-                    crate::default_dfs_metadata_shards_root(data_dir), shards, &state.local_node_id,
-                )
-            })
-            .map_err(|error| DfsRuntimeError::Parse {
-                detail: error.to_string(),
-            })?,
-        )
+        None => None,
     };
     let publication_provider = if read_only {
         None
@@ -2377,56 +2383,26 @@ fn open_dfs_runtime_service_for_use(
             .retain_runtime_provider(publication_provider);
     }
     let service = service.with_boxed_control_plane(control_plane);
+    let (Some(metadata), Some(expected)) = (metadata, effect) else {
+        // Main alone owns, recovers and rebinds the node's shards.
+        return service.into_main_sifs_client().map_err(DfsRuntimeError::from);
+    };
     let mut service = service
         .with_boxed_metadata_backend_lazy(metadata)
         .map_err(DfsRuntimeError::from)?;
-    if read_only {
-        // Keep the catalog used by outgoing POSIX reads.
+    #[cfg(any(test, feature = "test-support"))]
+    if matches!(scope, DfsRuntimeServiceScope::LocalShardCopy(_)) {
+        // Recovery fences this replica copy; it binds no primary writer.
         return Ok(service);
     }
-    if let Some(expected) = effect {
-        // A fresh physical shard instance does not inherit another lane's
-        // completed membership-handoff binding. Reuse normal mutation admission's
-        // exact active-assignment, completion-proof and durable-prefix checks
-        // before this bounded effect can acquire its authoritative writer.
-        // This newly created lazy shell has no operational projection to
-        // rehydrate. Clear/bind only its exact certified physical instance;
-        // ordinary mutation/hydration retains all participant recovery checks.
-        service.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
-    } else {
-        let mut rebound = false;
-        for expected in cold_local_shards {
-            let shard_id = crate::DfsMetadataShardId::new(expected.shard_id.clone());
-            if !service
-                .metadata_backend
-                .as_deref()
-                .expect("cold backend installed")
-                .metadata_shard_instance_writes_frozen(&shard_id)?
-            {
-                continue;
-            }
-            // Recovery can append. Keep the actual effect admission and native
-            // data owner until this exact shard's physical rebind finishes.
-            let _execution =
-                service.acquire_prepared_execution(&crate::DfsPreparedOperationScope {
-                    file_system_id: expected.file_system_id.clone(),
-                    shard_id,
-                    owner_epoch: expected.epoch,
-                    operation_id: format!(
-                        "cold-open-rebind:{}:{}",
-                        expected.shard_id, expected.epoch
-                    ),
-                })?;
-            rebound |=
-                service.rebind_completed_local_metadata_shard_instance_if_frozen(&expected)?;
-        }
-        if rebound {
-            // This newly opened shell stays lazy. Refresh only its read-only
-            // filesystem catalog after all exact-shard admissions are released.
-            service.hydrate_file_systems_from_metadata_backend()?;
-        }
-        service.bootstrap_distributed_sifs()?;
-    }
+    // A fresh physical shard instance does not inherit another lane's
+    // completed membership-handoff binding. Reuse normal mutation admission's
+    // exact active-assignment, completion-proof and durable-prefix checks
+    // before this bounded effect can acquire its authoritative writer.
+    // This newly created lazy shell has no operational projection to
+    // rehydrate. Clear/bind only its exact certified physical instance;
+    // ordinary mutation/hydration retains all participant recovery checks.
+    service.rebind_completed_local_metadata_shard_instance_if_frozen(expected)?;
     Ok(service)
 }
 
@@ -3049,6 +3025,7 @@ static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
     sinomo_dfs::DfsMetadataAuthorityRuntimeRegistry<DaemonDfsMetadataAuthorityGenerationKey>,
 > = OnceLock::new();
 static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
+static DAEMON_DFS_REPAIR_MAINTENANCE_REQUESTS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<
     Mutex<BTreeMap<PathBuf, maintenance_host::DaemonDfsReconciliationRequest>>,
 > = OnceLock::new();
@@ -3404,8 +3381,10 @@ pub(crate) use maintenance_host::daemon_dfs_maintenance_wake_count;
 use maintenance_host::*;
 use maintenance_host::{
     complete_daemon_dfs_maintenance_reconciliation, daemon_dfs_maintenance_execution_exclusions,
-    daemon_dfs_offline_node_ids, persist_daemon_dfs_repair_queue_records,
-    record_daemon_dfs_repair_queue_nonempty, refresh_daemon_dfs_repair_queue_nonempty,
+    daemon_dfs_offline_node_ids, daemon_dfs_repair_maintenance_requested,
+    persist_daemon_dfs_repair_queue_records, record_daemon_dfs_repair_queue_nonempty,
+    refresh_daemon_dfs_repair_queue_nonempty, request_daemon_dfs_repair_maintenance,
+    restore_daemon_dfs_repair_maintenance_request,
 };
 pub(crate) use maintenance_host::{
     daemon_dfs_maintenance_notify, daemon_dfs_maintenance_reconciliation_generation,

@@ -904,9 +904,9 @@ fn sifs_sandbox_toolchain_store_persists_manifest_and_verifies_modules() {
             .expect("load artifact"),
         b"support archive"
     );
-    let dfs = store.into_inner();
+    let mut dfs = store.into_inner();
     assert!(
-        !dfs.posix_read_file(&sandbox_toolchain_manifest_path(&toolchain_id))
+        !dfs.posix_read_file_distributed(&sandbox_toolchain_manifest_path(&toolchain_id))
             .expect("manifest exists")
             .is_empty()
     );

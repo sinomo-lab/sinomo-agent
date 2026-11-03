@@ -199,7 +199,7 @@ fn exercise_remote_source_placement_progress(restart_on_ready: bool) {
             },
         )
         .unwrap();
-    assert_eq!(writer.posix_read_file(path).unwrap(), bytes);
+    assert_eq!(writer.posix_read_file_distributed(path).unwrap(), bytes);
     drop(writer);
     let owner = native.metadata_primary_service(path).unwrap();
     assert!(
@@ -343,7 +343,13 @@ fn exercise_remote_source_placement_progress(restart_on_ready: bool) {
     let reads = if completed {
         desired
             .iter()
-            .map(|node| native.client(node).unwrap().posix_read_file(path).unwrap())
+            .map(|node| {
+                native
+                    .client(node)
+                    .unwrap()
+                    .posix_read_file_distributed(path)
+                    .unwrap()
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()

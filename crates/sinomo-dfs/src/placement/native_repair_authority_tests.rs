@@ -356,7 +356,7 @@ fn native_stale_placement_custody(recover: bool) {
         for index in 0..4 {
             let path = format!("/native-managed-{index}");
             assert_eq!(
-                client.posix_read_file(&path).unwrap(),
+                client.posix_read_file_distributed(&path).unwrap(),
                 vec![index as u8; 64]
             );
             let current = client.posix_stat_distributed(&path).unwrap();
@@ -451,7 +451,7 @@ pub(super) fn native_managed_setup(
             "the later eight-repair assertion requires four real sole local replicas"
         );
         assert_eq!(
-            client.posix_read_file(&stat.path).unwrap(),
+            client.posix_read_file_distributed(&stat.path).unwrap(),
             vec![index as u8; 64]
         );
     }
@@ -817,7 +817,7 @@ fn native_old_dispatched_repair_cannot_replace_a_real_newer_write() {
         &[("/", DfsPlacementScope::Subtree)],
     );
     let mut client = runtime.client(&nodes[0]).unwrap();
-    let before = client.posix_stat("/native-managed-0").unwrap();
+    let before = client.posix_stat_distributed("/native-managed-0").unwrap();
     let newer = client
         .posix_write_file(
             "/native-managed-0",
@@ -835,11 +835,16 @@ fn native_old_dispatched_repair_cannot_replace_a_real_newer_write() {
     runtime.clear_faults();
     client.flush_detached_transport_sends().unwrap();
     assert_eq!(
-        client.posix_stat("/native-managed-0").unwrap().version,
+        client
+            .posix_stat_distributed("/native-managed-0")
+            .unwrap()
+            .version,
         newer.version
     );
     assert_eq!(
-        client.posix_read_file("/native-managed-0").unwrap(),
+        client
+            .posix_read_file_distributed("/native-managed-0")
+            .unwrap(),
         b"actual newer durable content"
     );
     drop(client);
@@ -1385,12 +1390,15 @@ fn native_served_repair_revalidates_the_actual_newer_content_generation() {
     );
     let mut current = runtime.client(&nodes[0]).unwrap();
     assert_eq!(
-        current.posix_stat("/native-repair").unwrap().version,
+        current
+            .posix_stat_distributed("/native-repair")
+            .unwrap()
+            .version,
         newer.version
     );
     assert_eq!(
-        current
-            .metadata_backend()
+        runtime
+            .node_metadata(&nodes[0])
             .unwrap()
             .get_intent(&original.object_id, &old_id)
             .unwrap(),

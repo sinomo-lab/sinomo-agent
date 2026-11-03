@@ -13,7 +13,7 @@ fn native_stat_pin_keeps_its_exact_proof_after_read_cache_eviction() {
     let mut reader = LocalSobjMetadataBackend::open_for_inspection(shard, root).unwrap();
     let before = reader.materialized_through_sequence;
     writer.posix_mkdir("/stat-proof-after").unwrap();
-    let expected = writer.posix_stat("/stat-proof-after").unwrap();
+    let expected = writer.posix_stat_distributed("/stat-proof-after").unwrap();
     let cache = Arc::clone(&reader.read_snapshot_cache);
     let captured = Arc::new(Mutex::new(None));
     let capture = Arc::clone(&captured);

@@ -2314,6 +2314,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .and_then(|command| command.object_metadata.as_ref())
                     .map(|object| object.path.clone()),
             });
+        let target_version = self
+            .writes
+            .pending_routed_writes
+            .get(&canonical_request_id)
+            .and_then(|pending| pending.command.as_ref())
+            .map(|command| command.request.target_version.clone());
         for pending in self
             .writes
             .pending_routed_writes
@@ -2328,6 +2334,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.transport
             .release_routed_write_response_owner(&canonical_request_id);
+        // A caller without a metadata store retires the overlay of this write
+        // once its authority committed it; nothing else would retire it after
+        // the object later changes or moves.
+        if self.metadata_backend.is_none()
+            && self.transport.delegates_local_namespace_authority()
+            && let (Some(receipt), Ok(NetworkedDfsWriteOutcome::Committed { version, .. })) =
+                (&publication, &result)
+            && self
+                .transient_metadata_object_ids
+                .contains(&receipt.object_id)
+            && self.metadata.object(&receipt.object_id).is_some_and(|overlay| {
+                overlay.version == *version || Some(&overlay.version) == target_version.as_ref()
+            })
+        {
+            self.remove_transient_object_metadata(&receipt.object_id);
+        }
         publication
     }
 

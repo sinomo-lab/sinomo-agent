@@ -252,7 +252,7 @@ pub(super) fn native_routed_committed_backlog(
         )
         .unwrap();
     assert_eq!(
-        seed.current_read_object_metadata(&base.object_id)
+        seed.current_read_object_metadata_distributed(&base.object_id)
             .unwrap()
             .policy,
         DfsObjectPolicy::ReplicatedEventual
@@ -960,7 +960,10 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
     let intent_id = ack.intent_id.clone();
     let receipt_rpc_id = ack.request_id.clone();
     assert!(client.writes.pending_routed_writes.contains_key(&operation));
-    let mut authority = runtime.client(&primary).unwrap();
+    // Hydration of pending writes is Main-side work on the primary's
+    // store-backed owner; the delegating client keeps no store.
+    let mut authority = runtime.metadata_primary_service(&base.path).unwrap();
+    assert_eq!(authority.node_id(), &primary);
     authority.hydrate_from_metadata_backend().unwrap();
     assert_ne!(
         authority
@@ -1002,7 +1005,7 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
     );
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
-    let mut restored = runtime.client(&primary).unwrap();
+    let mut restored = runtime.metadata_primary_service(&base.path).unwrap();
     restored.hydrate_from_metadata_backend().unwrap();
     assert!(
         !queue
@@ -1199,11 +1202,9 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
         matches!(outcome, NetworkedDfsWriteOutcome::Committed { version, content_hash: hash, .. }
         if version == request.target_version && hash == content_hash(&bytes))
     );
-    let authority = runtime.client(&primary).unwrap();
+    let authority = runtime.node_metadata(&primary).unwrap();
     assert_eq!(
         authority
-            .metadata_backend()
-            .unwrap()
             .get_object(&request.object_id)
             .unwrap()
             .unwrap()
@@ -1211,8 +1212,6 @@ fn served_receipt_returns_before_unrelated_completed_write_response_rpc() {
         request.target_version
     );
     let receipts = authority
-        .metadata_backend()
-        .unwrap()
         .receipts_for_version(&request.object_id, &request.target_version)
         .unwrap();
     assert!(
@@ -1287,7 +1286,10 @@ fn assert_native_served_write_defers_repair(name: &str, foreground: bool) {
     client
         .handle_distributed_write_response(primary.clone(), response)
         .unwrap();
-    let mut authority = runtime.client(&primary).unwrap();
+    // Repair hydration is Main-side work on the primary's store-backed
+    // owner; the delegating client keeps no store.
+    let mut authority = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(authority.node_id(), &primary);
     authority.hydrate_from_metadata_backend().unwrap();
     assert!(authority.coordinator().repair_jobs().iter().any(|job|
         job.object_id == request.object_id && job.missing_replica_node_id == replica));
@@ -1366,7 +1368,10 @@ fn served_lookup_path_does_not_retry_repairs_inline() {
                 && event.phase == crate::test_runtime::RpcPhase::BeforeDispatch)),
         "the actual namespace endpoint must not perform inline repair retries"
     );
-    let mut authority = runtime.client(&primary).unwrap();
+    // Repair hydration is Main-side work on the primary's store-backed
+    // owner; the delegating client keeps no store.
+    let mut authority = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(authority.node_id(), &primary);
     authority.hydrate_from_metadata_backend().unwrap();
     let retained = authority
         .metadata_backend()
@@ -1411,11 +1416,15 @@ fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
             .debug_remove_loose_blob(object.content_hash.as_deref().unwrap())
             .unwrap();
     }
+    // Local content anti-entropy is Main-side maintenance over the node's
+    // store-backed metadata owner; the delegating client keeps no store.
+    let mut owner = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(owner.node_id(), &node);
     let mut cursor = None;
     let mut issues = 0;
     let mut repaired = 0;
     for _ in 0..128 {
-        let report = service
+        let report = owner
             .run_local_content_anti_entropy(DfsAntiEntropyOptions {
                 file_system_id: sifs_file_system_id(),
                 after: cursor.clone(),
@@ -1439,20 +1448,15 @@ fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
     );
     assert_eq!(issues, 2);
     assert_eq!(repaired, 2);
+    drop(owner);
+    let store = runtime.node_metadata(&node).unwrap();
     for object in &objects[..2] {
-        let current = service
-            .metadata_backend()
-            .unwrap()
-            .get_object(&object.object_id)
-            .unwrap()
-            .unwrap();
+        let current = store.get_object(&object.object_id).unwrap().unwrap();
         assert!(!current.current_locations.contains(&node));
     }
     let healthy = &objects[2];
     assert!(
-        service
-            .metadata_backend()
-            .unwrap()
+        store
             .get_object(&healthy.object_id)
             .unwrap()
             .unwrap()
@@ -1460,7 +1464,7 @@ fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
             .contains(&node)
     );
     assert_eq!(
-        service.posix_read_file(&healthy.path).unwrap(),
+        service.posix_read_file_distributed(&healthy.path).unwrap(),
         vec![3; 512 * 1024]
     );
     drop(service);
@@ -1480,13 +1484,16 @@ fn current_anti_entropy_preserves_verified_content_generation_and_size() {
             DfsWriteOptions::replicated_eventual(vec![node]),
         )
         .unwrap();
-    let before = service
+    // Local content anti-entropy is Main-side maintenance over the node's
+    // store-backed metadata owner; the delegating client keeps no store.
+    let mut owner = runtime.metadata_primary_service(&object.path).unwrap();
+    let before = owner
         .metadata_backend()
         .unwrap()
         .get_version(&object.object_id, &object.version)
         .unwrap()
         .unwrap();
-    let report = service
+    let report = owner
         .run_local_content_anti_entropy(DfsAntiEntropyOptions {
             file_system_id: object.file_system_id.clone(),
             after: None,
@@ -1497,7 +1504,7 @@ fn current_anti_entropy_preserves_verified_content_generation_and_size() {
         .unwrap();
     assert_eq!(report.issue_count, 0);
     assert_eq!(
-        service
+        owner
             .metadata_backend()
             .unwrap()
             .get_version(&object.object_id, &object.version)
@@ -1505,11 +1512,15 @@ fn current_anti_entropy_preserves_verified_content_generation_and_size() {
             .unwrap(),
         before
     );
+    drop(owner);
     assert_eq!(
-        service.posix_stat(&object.path).unwrap().size_bytes,
+        service
+            .posix_stat_distributed(&object.path)
+            .unwrap()
+            .size_bytes,
         Some(bytes.len() as u64)
     );
-    assert_eq!(service.posix_read_file(&object.path).unwrap(), bytes);
+    assert_eq!(service.posix_read_file_distributed(&object.path).unwrap(), bytes);
     drop(service);
     runtime.close().unwrap();
 }
@@ -1545,10 +1556,10 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
     else {
         panic!("actual canonical W2 progress: {pending:?}");
     };
-    let mut inspect = runtime.client(&primary).unwrap();
-    let native_intent = inspect
-        .metadata_backend()
-        .unwrap()
+    let inspect = runtime.client(&primary).unwrap();
+    // The primary's durable store; the delegating client keeps no store.
+    let store = runtime.node_metadata(&primary).unwrap();
+    let native_intent = store
         .get_intent(&request.object_id, intent_id)
         .unwrap()
         .unwrap();
@@ -1564,9 +1575,7 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             .is_err()
     );
     assert_eq!(
-        inspect
-            .metadata_backend()
-            .unwrap()
+        store
             .receipts_for_version(&request.object_id, &request.target_version)
             .unwrap()
             .iter()
@@ -1574,6 +1583,7 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([requester.clone()])
     );
+    drop(store);
     drop(inspect);
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
@@ -1647,8 +1657,8 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
             }, .. } if object_id == &request.object_id && primary_node_id == &primary
                 && version == &request.target_version && content_hash == &manifest.content_hash)));
     let published = runtime.client(&primary).unwrap();
-    let receipts = published
-        .metadata_backend()
+    let receipts = runtime
+        .node_metadata(&primary)
         .unwrap()
         .receipts_for_version(&request.object_id, &request.target_version)
         .unwrap();
@@ -1948,8 +1958,9 @@ fn routed_inline_blob_records_requester_receipt_without_restaging() {
         "normal primary never retransfers inline bytes to the actual durable requester"
     );
     let published = runtime.client(&primary).unwrap();
-    let receipts = published
-        .metadata_backend()
+    // The primary's durable store; the delegating client keeps no store.
+    let receipts = runtime
+        .node_metadata(&primary)
         .unwrap()
         .receipts_for_version(&stat.object_id, &stat.version)
         .unwrap();
@@ -2002,12 +2013,15 @@ fn committed_remote_manifest_repair_fetches_from_durable_requester() {
             false,
         );
     writer.settle_ready_write_outcome(outcome, true).unwrap();
-    let mut inspect = runtime.client(&primary).unwrap();
+    // Repair hydration is Main-side work on the primary's store-backed
+    // owner; the delegating client keeps no store.
+    let mut inspect = runtime.metadata_primary_service("/services").unwrap();
+    assert_eq!(inspect.node_id(), &primary);
     let native_intent = assert_native_manifest_repair_pending(&mut inspect, &request, &replica);
     drop(inspect);
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
-    let mut restored = runtime.client(&primary).unwrap();
+    let mut restored = runtime.metadata_primary_service("/services").unwrap();
     assert_eq!(
         assert_native_manifest_repair_pending(&mut restored, &request, &replica),
         native_intent
@@ -2020,8 +2034,8 @@ fn committed_remote_manifest_repair_fetches_from_durable_requester() {
         .outcome
         .unwrap();
     let mut final_primary = runtime.client(&primary).unwrap();
-    let current = final_primary
-        .metadata_backend()
+    let current = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_object(&request.object_id)
         .unwrap()
@@ -4010,9 +4024,11 @@ fn stat_derives_current_locations_from_matching_receipts_without_writing() {
             },
         )
         .unwrap();
+    // The primary's durable store; the delegating client keeps no store.
+    let primary = config.primary_node_id.clone();
     let shard = DfsMetadataShardId::new(config.shard_id);
-    let before = service
-        .metadata_backend()
+    let before = runtime
+        .node_metadata(&primary)
         .unwrap()
         .export_shard_table_snapshot(&shard)
         .unwrap()
@@ -4027,8 +4043,8 @@ fn stat_derives_current_locations_from_matching_receipts_without_writing() {
             replicas.iter().cloned().collect()
         );
     }
-    let after = service
-        .metadata_backend()
+    let after = runtime
+        .node_metadata(&primary)
         .unwrap()
         .export_shard_table_snapshot(&shard)
         .unwrap()
@@ -4155,10 +4171,12 @@ fn queued_repair_restore_rebuilds_once_and_preserves_inactive_history() {
         )
         .unwrap();
     drop(service);
-    let mut restored = runtime.client(&owner).unwrap();
+    // Repair retry is Main-side work on the owner's store-backed service.
+    let mut restored = runtime.metadata_primary_service(&first_path).unwrap();
+    assert_eq!(restored.node_id(), &owner);
     assert!(
         restored.writes.pending_writes.is_empty(),
-        "ordinary client begins lazy, with no installed fake coordinator state"
+        "a freshly opened owner begins lazy, with no installed fake coordinator state"
     );
     assert!(
         restored
@@ -4330,14 +4348,26 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
         )
         .unwrap();
     drop(primary);
+    // The observer node's durable replica genuinely holds the committed
+    // repair obligation.
+    let observed_intent = runtime
+        .node_metadata(&observer)
+        .unwrap()
+        .get_intent(&stat.object_id, &intent_id)
+        .unwrap()
+        .expect("the observer's replica store holds the committed intent");
+    assert_eq!(observed_intent.status, DfsWriteIntentStatus::Committed);
+    // A caller delegating to the observer's Main keeps no store: hydration
+    // installs neither observed repair jobs nor a repair sender role.
     let mut observed = runtime.client(&observer).unwrap();
+    assert!(observed.metadata_backend().is_none());
     observed.hydrate_from_metadata_backend().unwrap();
     assert!(
         observed
             .coordinator()
             .repair_jobs()
             .iter()
-            .any(|job| job.intent_id == intent_id)
+            .all(|job| job.intent_id != intent_id)
     );
     assert!(
         !observed.writes.pending_writes.contains_key(&intent_id),
@@ -4345,6 +4375,14 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
     );
     let before = runtime.rpc_observations().len();
     assert!(observed.retry_pending_repairs().unwrap().is_empty());
+    drop(observed);
+    // Nor does the observer's Main, which owns that replica store, send the
+    // primary's repair work during its ordinary maintenance.
+    runtime
+        .maintenance_tick(&observer, Duration::from_secs(5))
+        .unwrap()
+        .outcome
+        .unwrap();
     assert!(!runtime.rpc_observations()[before..].iter().any(|event| {
         event.source == observer
             && [
@@ -4355,7 +4393,6 @@ fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
             .contains(&event.route.as_str())
             && event.phase == crate::test_support::DfsTestRpcPhase::BeforeDispatch
     }));
-    drop(observed);
     runtime.clear_faults();
     runtime.close().unwrap();
 }
@@ -4709,13 +4746,15 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
         )
         .unwrap();
     assert_eq!(
-        seed.current_read_object_metadata(&base.object_id)
+        seed.current_read_object_metadata_distributed(&base.object_id)
             .unwrap()
             .policy,
         DfsObjectPolicy::ReplicatedEventual
     );
     drop(seed);
-    let mut stale = runtime.client(&primary).unwrap();
+    // Repair source selection is Main-side work on the store-backed owner;
+    // a delegating client keeps neither a store nor a hydrated projection.
+    let mut stale = runtime.metadata_primary_service(&path).unwrap();
     stale.hydrate_from_metadata_backend().unwrap();
     let old_memory = stale.metadata().object(&base.object_id).unwrap().clone();
     assert_eq!(old_memory.version, base.version);
@@ -4768,7 +4807,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
     assert_eq!(
         stale.metadata().object(&request.object_id).unwrap().version,
         old_memory.version,
-        "this is an actual retained old client projection across a normal new publication"
+        "this is an actual retained old owner projection across a normal new publication"
     );
     let mut restored = runtime.metadata_primary_service(&path).unwrap();
     // Reconstruct the actual missing-target owner from Main's durable queue.
@@ -4813,12 +4852,15 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
 
 #[test]
 fn retry_pending_repairs_is_idle_noop_without_distributed_work() {
-    let (runtime, mut dfs, _) = crate::test_support::current_native_metadata_service(
+    let (runtime, client, _) = crate::test_support::current_native_metadata_service(
         "native-idle-repair-noop",
         1,
         "/services",
     )
     .unwrap();
+    drop(client);
+    // Repair retry is Main-side work on the store-backed owner.
+    let mut dfs = runtime.metadata_primary_service("/services").unwrap();
     dfs.repair_retry_tick = 41;
     let before = dfs
         .metadata_backend()
@@ -6623,10 +6665,15 @@ fn repair_command_conflicting_receipt_does_not_commit_visible_metadata() {
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = b"repair command should not commit after receipt conflict";
     let content_hash = content_hash(bytes);
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, client) = native_sifs_service(
         "repair_command_conflicting_receipt_does_not_commit_visible_metadata",
         replica.clone(),
     );
+    drop(client);
+    // Metadata seeding and the receiver handler are Main-side work on the
+    // node's store-backed owner; the delegating client keeps no store.
+    let mut dfs = runtime.metadata_primary_service("/").unwrap();
+    assert_eq!(dfs.node_id(), &replica);
     let mut metadata = file_metadata(owner.clone());
     metadata.object_id = object_id.clone();
     metadata.version = version_1.clone();
@@ -6798,8 +6845,9 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
             .read_object_version(stat.object_id.as_str(), stat.version.as_str())
             .is_err()
     );
-    let current = inspect
-        .metadata_backend()
+    // The new primary's durable store; the delegating client keeps no store.
+    let current = runtime
+        .node_metadata(&target)
         .unwrap()
         .get_object(&stat.object_id)
         .unwrap()
@@ -6880,18 +6928,12 @@ fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
         .read_manifest(stat.object_id.as_str(), stat.version.as_str())
         .unwrap();
     assert_eq!(manifest.content_hash, content_hash);
-    let current = repaired
-        .metadata_backend()
-        .unwrap()
-        .get_object(&stat.object_id)
-        .unwrap()
-        .unwrap();
+    let store = runtime.node_metadata(&target).unwrap();
+    let current = store.get_object(&stat.object_id).unwrap().unwrap();
     assert_eq!(current.version, stat.version);
     assert!(current.current_locations.contains(&target));
     assert!(
-        repaired
-            .metadata_backend()
-            .unwrap()
+        store
             .receipts_for_version(&stat.object_id, &stat.version)
             .unwrap()
             .iter()
@@ -6939,9 +6981,9 @@ fn assert_repair_hint_cannot_authorize_unknown_foreign_object(background_repair:
         )
         .unwrap();
     drop(source_service);
-    let publisher = runtime.client(&primary).unwrap();
-    let mut untrusted_hint = publisher
-        .metadata_backend()
+    // Durable rows are read from the nodes' stores; clients keep none.
+    let mut untrusted_hint = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_object(&current.object_id)
         .unwrap()
@@ -6951,22 +6993,14 @@ fn assert_repair_hint_cannot_authorize_unknown_foreign_object(background_repair:
     untrusted_hint.object_id = unknown.clone();
     untrusted_hint.path = "/services/unknown-hinted-repair".into();
     untrusted_hint.version = version.clone();
-    drop(publisher);
     let receiver = runtime.client(&target).unwrap();
-    let before = receiver
-        .metadata_backend()
-        .unwrap()
+    let receiver_store = runtime.node_metadata(&target).unwrap();
+    let before = receiver_store
         .export_shard_table_snapshot(&DfsMetadataShardId::new(config.shard_id.clone()))
         .unwrap()
         .unwrap();
-    assert!(
-        receiver
-            .metadata_backend()
-            .unwrap()
-            .get_object(&unknown)
-            .unwrap()
-            .is_none()
-    );
+    assert!(receiver_store.get_object(&unknown).unwrap().is_none());
+    drop(receiver_store);
     let before_blob = receiver
         .content()
         .has_blob(&current.content_hash.clone().unwrap())
@@ -7012,9 +7046,8 @@ fn assert_repair_hint_cannot_authorize_unknown_foreign_object(background_repair:
         }
     }
     let receiver = runtime.client(&target).unwrap();
-    let after = receiver
-        .metadata_backend()
-        .unwrap()
+    let receiver_store = runtime.node_metadata(&target).unwrap();
+    let after = receiver_store
         .export_shard_table_snapshot(&DfsMetadataShardId::new(config.shard_id))
         .unwrap()
         .unwrap();
@@ -7023,14 +7056,8 @@ fn assert_repair_hint_cannot_authorize_unknown_foreign_object(background_repair:
         after.semantic_state_fingerprint,
         before.semantic_state_fingerprint
     );
-    assert!(
-        receiver
-            .metadata_backend()
-            .unwrap()
-            .get_object(&unknown)
-            .unwrap()
-            .is_none()
-    );
+    assert!(receiver_store.get_object(&unknown).unwrap().is_none());
+    drop(receiver_store);
     assert!(
         receiver
             .content()
@@ -7058,10 +7085,15 @@ fn stage_command_conflicting_receipt_does_not_store_orphan_content() {
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = b"stage command should reject before storing orphan content";
     let content_hash = content_hash(bytes);
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, client) = native_sifs_service(
         "stage_command_conflicting_receipt_does_not_store_orphan_content",
         replica.clone(),
     );
+    drop(client);
+    // Metadata seeding and the receiver handler are Main-side work on the
+    // node's store-backed owner; the delegating client keeps no store.
+    let mut dfs = runtime.metadata_primary_service("/").unwrap();
+    assert_eq!(dfs.node_id(), &replica);
     let mut metadata = file_metadata(owner.clone());
     metadata.object_id = object_id.clone();
     metadata.version = version_1.clone();
@@ -7174,67 +7206,109 @@ fn assert_native_repair_receiver(name: &str, bytes: &[u8], advance_metadata: boo
         .sync_metadata_shard_to_quorum(&sync, sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
         .unwrap();
     assert_eq!(certificate.acknowledged_node_ids.len(), 2);
-    let mut receiver = runtime.client(&replica).unwrap();
-    assert!(
-        !receiver
-            .content()
-            .has_blob(stat.content_hash.as_deref().unwrap())
-            .unwrap()
+    let mut reader = runtime.client(&replica).unwrap();
+    let content_hash = stat.content_hash.clone().unwrap();
+    assert!(!reader.content().has_blob(&content_hash).unwrap());
+    // The replica's Main receives the command over the normal DFS transport,
+    // as in production, but has no return route to the owner. The accepted
+    // bytes must survive the missing notification.
+    runtime.install_fault(crate::test_support::DfsTestFaultRule {
+        source: Some(replica.clone()),
+        target: Some(owner.clone()),
+        route: None,
+        call_id: None,
+        origin: None,
+        remaining_hits: 32,
+        action: crate::test_support::DfsTestFaultAction::BudgetExhausted,
+    });
+    let request_id = format!("native-receiver-{}", sinomo_core::Id::generate());
+    let command = test_dfs_message_command_from_message(
+        &owner,
+        &replica,
+        1,
+        DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+            background_repair: false,
+            request_id: request_id.clone(),
+            intent_id: intent.intent_id.clone(),
+            file_system_id: stat.file_system_id.clone(),
+            object_id: stat.object_id.clone(),
+            expected_base_version: intent.base_version,
+            version: stat.version.clone(),
+            content_hash: content_hash.clone(),
+            bytes: bytes.to_vec(),
+            object_metadata: Some(metadata),
+            authority_shard: Some(shard),
+        }),
     );
-    // This receiver has no return route; its normal native storage/configuration
-    // remain intact. The accepted bytes must survive the missing notification.
-    receiver.refresh_peer_targets(Vec::new());
     let before = runtime.rpc_observations().len();
-    let event = receiver
-        .handle_repair_replica(
-            owner.clone(),
-            DfsRepairReplicaCommand {
-                background_repair: false,
-                request_id: format!("native-receiver-{}", sinomo_core::Id::generate()),
-                intent_id: intent.intent_id,
-                file_system_id: stat.file_system_id.clone(),
-                object_id: stat.object_id.clone(),
-                expected_base_version: intent.base_version,
-                version: stat.version.clone(),
-                content_hash: stat.content_hash.clone().unwrap(),
-                bytes: bytes.to_vec(),
-                object_metadata: Some(metadata),
-                authority_shard: Some(shard),
-            },
+    let reply = runtime
+        .rpc_request(
+            &owner,
+            &replica,
+            dfs_message_rpc_request(&command).unwrap(),
+            sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
         )
         .unwrap();
+    let decoded = decode_dfs_message_rpc_response(&reply).unwrap();
     assert!(
-        matches!(&event, NetworkedDfsServiceEvent::ReplicaRepaired {
-        object_id, version, replica_node_id, ..
-    } if object_id == &stat.object_id && version == &stat.version && replica_node_id == &replica),
-        "actual receiver repair: {event:?}"
+        decoded.outbound_messages.iter().any(|message| matches!(&message.message,
+            DfsNetworkMessage::RepairReplicaResponse(response)
+                if response.request_id == request_id
+                    && response.object_id == stat.object_id
+                    && response.version == stat.version
+                    && response.replica_node_id == replica
+                    && matches!(&response.result,
+                        DfsBlobTransferResult::Committed { content_hash: actual }
+                        | DfsBlobTransferResult::Durable { content_hash: actual }
+                            if actual == &content_hash))),
+        "actual receiver repair: {decoded:?}"
     );
     assert!(
         !runtime.rpc_observations()[before..]
             .iter()
             .any(|call| call.source == replica
                 && call.target == owner
-                && call.phase == crate::test_runtime::RpcPhase::BeforeDispatch),
+                && matches!(
+                    call.phase,
+                    crate::test_runtime::RpcPhase::AfterDispatch
+                        | crate::test_runtime::RpcPhase::Decoded
+                        | crate::test_runtime::RpcPhase::Completed
+                )),
         "the receiver cannot deliver its notification over the absent return route"
     );
-    let read = receiver
-        .read_local_object_with_state(&stat.object_id, false)
+    // The replica's durable state: its current metadata row is the visible
+    // version, whose content its own store now holds.
+    let current = runtime
+        .node_metadata(&replica)
+        .unwrap()
+        .get_object(&stat.object_id)
+        .unwrap()
         .unwrap();
-    assert!(
-        matches!(read, NetworkedDfsReadOutcome::Found {
-        data, freshness: NetworkedDfsReadFreshness::Current,
-    } if data.bytes == bytes && data.version == visible_version),
-        "the actual current metadata version must read the repaired bytes"
-    );
+    assert_eq!(current.version, visible_version);
+    assert_eq!(current.content_hash.as_deref(), Some(content_hash.as_str()));
+    assert_eq!(reader.content().read_blob(&content_hash).unwrap(), bytes);
     assert_eq!(
-        receiver
+        reader
             .content()
             .read_object_version(stat.object_id.as_str(), stat.version.as_str(),)
             .unwrap()
             .1,
         bytes
     );
-    drop(receiver);
+    // Callers on the replica read the repaired bytes at the current metadata
+    // version once its route to the metadata primary returns.
+    runtime.remove_faults_matching(|rule| {
+        rule.source.as_ref() == Some(&replica)
+            && rule.target.as_ref() == Some(&owner)
+            && rule.route.is_none()
+    });
+    assert_eq!(
+        reader.posix_stat_distributed(&path).unwrap().version,
+        visible_version,
+        "the actual current metadata version must read the repaired bytes"
+    );
+    assert_eq!(reader.posix_read_file_distributed(&path).unwrap(), bytes);
+    drop(reader);
     drop(source);
     runtime.clear_faults();
     runtime.close().unwrap();
@@ -7390,10 +7464,15 @@ fn commit_version_conflicting_receipt_does_not_advance_visible_metadata() {
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let bytes = b"commit must not advance over conflicting durable receipt";
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, client) = native_sifs_service(
         "commit_version_conflicting_receipt_does_not_advance_visible_metadata",
         replica.clone(),
     );
+    drop(client);
+    // Metadata seeding and the receiver handler are Main-side work on the
+    // node's store-backed owner; the delegating client keeps no store.
+    let mut dfs = runtime.metadata_primary_service("/").unwrap();
+    assert_eq!(dfs.node_id(), &replica);
     let mut metadata = file_metadata(owner.clone());
     metadata.object_id = object_id.clone();
     metadata.version = version_1.clone();
@@ -8008,7 +8087,7 @@ fn sifs_cluster_routes_bounded_directory_rename_and_resume_receipts() {
         }
         assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
         assert!(matches!(
-            writer.posix_stat(from),
+            writer.posix_stat_distributed(from),
             Err(DfsPosixError::NotFound { .. })
         ));
         for index in 0..4 {
@@ -8058,13 +8137,20 @@ fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
         .add_transient_object_metadata(stale)
         .expect("seed stale local chain");
     replica.transient_metadata_object_ids.remove(&stale_id);
+    // A delegating replica keeps no store; its stale chain is the in-memory
+    // namespace projection that routed mkdir_all must not trust.
     assert!(
-        replica.posix_stat(base).is_ok(),
+        replica
+            .metadata()
+            .object_by_normalized_posix_path(&sifs_file_system_id(), base)
+            .is_some_and(|object| object.object_id == stale_id
+                && object.kind == DfsObjectKind::Directory),
         "replica precondition should have local parent"
     );
+    let mut services_primary = services_primary;
     assert!(
         matches!(
-            services_primary.posix_stat(base),
+            services_primary.posix_stat_distributed(base),
             Err(DfsPosixError::NotFound { .. })
         ),
         "services primary precondition should lack the parent"
@@ -8091,9 +8177,9 @@ fn sifs_cluster_routed_mkdir_all_repairs_primary_when_local_chain_exists() {
         .expect("child write after authoritative mkdir_all");
 
     stop.store(true, Ordering::SeqCst);
-    let services_primary = services_thread.join().expect("services thread");
-    assert!(services_primary.posix_stat(base).is_ok());
-    assert!(services_primary.posix_stat(path).is_ok());
+    let mut services_primary = services_thread.join().expect("services thread");
+    assert!(services_primary.posix_stat_distributed(base).is_ok());
+    assert!(services_primary.posix_stat_distributed(path).is_ok());
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -10366,9 +10452,34 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
         let generation_store = queue.clone();
         let cas_basis = Arc::new(std::sync::Mutex::new(None));
         let captured_cas_basis = Arc::clone(&cas_basis);
+        // Main serves committed repair work promptly, so a routine pass can
+        // change the queue (retiring the released original's row) as soon as
+        // the failed Release returns. Read the queue where the operation
+        // carrying the cut reports: it still holds its admission, so no later
+        // pass has run.
+        let release_operation = sinomo_core::Id::generate().to_string();
+        let reported_operation = release_operation.clone();
+        let report_store = queue.clone();
+        let report_after_cut = Arc::clone(&reached);
+        let reported_cut = Arc::new(std::sync::Mutex::new(None));
+        let captured_report = Arc::clone(&reported_cut);
         let hook = crate::runtime_host::install_daemon_dfs_pre_dispatch_test_hook(
             runtime.data_dir(&owner),
             Arc::new(move |point, command, context| {
+                if matches!(point, DaemonDfsPreDispatchTestPoint::AfterReport { .. }) {
+                    let release = command.is_some_and(|command| {
+                        matches!(&command.routed_message.message,
+                            crate::DfsNetworkMessage::NamespaceRequest(namespace)
+                                if matches!(&namespace.operation,
+                                    crate::DfsNamespaceOperation::ContentReference { request }
+                                        if request.operation_id == reported_operation))
+                    });
+                    let mut captured = captured_report.lock().unwrap();
+                    if release && captured.is_none() && report_after_cut.load(Ordering::SeqCst) >= 1 {
+                        *captured = Some(report_store.view()?);
+                    }
+                    return Ok(());
+                }
                 let matching = if interrupted {
                     matches!(point, DaemonDfsPreDispatchTestPoint::AfterRetainedRepairQueueEnrollment { owner_id_digest } if owner_id_digest == expected)
                 } else {
@@ -10417,7 +10528,7 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
             operation: DfsContentReferenceOperation::Release {
                 reference_id: reference_id.into(),
             },
-            operation_id: sinomo_core::Id::generate().to_string(),
+            operation_id: release_operation,
         });
         drop(release);
         assert!(release_result.is_err(), "the first owner publication must hit the armed fault: {release_result:?}");
@@ -10488,7 +10599,11 @@ fn native_retained_owner_prepublication_interruption_and_queue_cas_recover_witho
                 .iter()
                 .any(|receipt| receipt.intent_id == new_id)
         );
-        let cut = queue.view().unwrap();
+        let cut = reported_cut
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the failed Release reports its queue facts after its actual cut");
         if interrupted {
             let dormant = cut
                 .records
@@ -11020,11 +11135,18 @@ fn native_connectivity_park_returns_through_actual_main_repair() {
     );
     drop(control);
     let mut reader = runtime.client(&replica).unwrap();
+    let expected = (0..256 * 1024 + 31)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(reader.posix_read_file_distributed(&stat.path).unwrap(), expected);
+    // The repaired replica holds the exact bytes in its own content store.
     assert_eq!(
-        reader.posix_read_file(&stat.path).unwrap(),
-        (0..256 * 1024 + 31)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>()
+        reader
+            .content()
+            .read_object_version(stat.object_id.as_str(), stat.version.as_str())
+            .unwrap()
+            .1,
+        expected
     );
     drop(reader);
     let core = runtime.metadata_primary_service(&stat.path).unwrap();

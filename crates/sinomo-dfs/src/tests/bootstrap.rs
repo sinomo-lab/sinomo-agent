@@ -12,21 +12,28 @@ fn delegated_bootstrap_seeds_only_configuration_without_a_client_metadata_backen
     let (runtime, mut client) =
         native_sifs_service("native-client-bootstrap-projection", node.clone());
     assert!(client.transport.delegates_local_namespace_authority());
+    assert!(
+        client.metadata_backend.is_none(),
+        "a delegating client keeps no metadata store"
+    );
     let expected_file_system = client.metadata.filesystems[&sifs_file_system_id()].clone();
     let shards = runtime.metadata_shards().unwrap();
-    let private_backend = client.metadata_backend.take().unwrap();
-    let before = shards
-        .iter()
-        .map(|shard| {
-            private_backend
-                .export_shard_table_snapshot(&DfsMetadataShardId::new(shard.shard_id.clone()))
-                .unwrap()
-                .unwrap()
-                .prefix_proof
-        })
-        .collect::<Vec<_>>();
-    // Removing a client's optional private mirror cannot transfer Main's
-    // bootstrap ownership into this unadmitted service handle.
+    let node_prefixes = || {
+        let store = runtime.node_metadata(&node).unwrap();
+        shards
+            .iter()
+            .map(|shard| {
+                store
+                    .export_shard_table_snapshot(&DfsMetadataShardId::new(shard.shard_id.clone()))
+                    .unwrap()
+                    .unwrap()
+                    .prefix_proof
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = node_prefixes();
+    // Re-bootstrapping a client cannot transfer Main's bootstrap ownership
+    // into this unadmitted service handle.
     client.metadata = DfsMetadataStore::new();
     client
         .bootstrap_distributed_sifs()
@@ -43,20 +50,12 @@ fn delegated_bootstrap_seeds_only_configuration_without_a_client_metadata_backen
         client.metadata_backend.is_none(),
         "client bootstrap must not open an authority backend"
     );
+    assert_eq!(
+        node_prefixes(),
+        before,
+        "only Main may author bootstrap metadata"
+    );
     let mut owner_client = runtime.client(&node).unwrap();
-    let after = shards
-        .iter()
-        .map(|shard| {
-            owner_client
-                .metadata_backend()
-                .unwrap()
-                .export_shard_table_snapshot(&DfsMetadataShardId::new(shard.shard_id.clone()))
-                .unwrap()
-                .unwrap()
-                .prefix_proof
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(after, before, "only Main may author bootstrap metadata");
     let path = "/users/client-bootstrap-owner.bin";
     owner_client
         .posix_write_file(
@@ -66,22 +65,22 @@ fn delegated_bootstrap_seeds_only_configuration_without_a_client_metadata_backen
         )
         .expect("normal Main still owns admission and publication");
     assert_eq!(
-        owner_client.posix_read_file(path).unwrap(),
+        owner_client.posix_read_file_distributed(path).unwrap(),
         b"resident owner bytes"
     );
     drop(owner_client);
     drop(client);
-    drop(private_backend);
     runtime.close().unwrap();
 }
 
 #[test]
-fn main_sifs_client_attachment_uses_configuration_without_native_table_snapshots() {
+fn main_sifs_client_keeps_no_store_and_reads_through_the_authorities() {
     let node =
         crate::test_runtime::DfsTestRuntime::ordered_node_ids("native-client-lazy-projection", 1)
             .remove(0);
     let (runtime, mut client) = native_sifs_service("native-client-lazy-projection", node.clone());
     assert!(client.transport.delegates_local_namespace_authority());
+    assert!(client.metadata_backend().is_none());
     let paths = [
         "/lazy-root.bin",
         "/services/lazy-services.bin",
@@ -97,75 +96,34 @@ fn main_sifs_client_attachment_uses_configuration_without_native_table_snapshots
             .unwrap();
     }
     let expected = client.metadata.filesystems[&sifs_file_system_id()].clone();
-    let configs = runtime.metadata_shards().unwrap();
-    let owner = client.metadata_backend.take().unwrap();
-    let crate::service_state::DfsMetadataBackendOwner::Owned(backend) = owner else {
-        panic!("ordinary client owns its private metadata backend");
-    };
-    let before = configs
-        .iter()
-        .map(|config| {
-            backend
-                .export_shard_table_snapshot(&DfsMetadataShardId::new(config.shard_id.clone()))
-                .unwrap()
-                .unwrap()
-                .prefix_proof
-        })
-        .collect::<Vec<_>>();
-    // The producer already hydrated replay cursors. Exercise attachment on a
-    // fresh requester while retaining its actual transport, content and control plane.
+    // A fresh requester projects the filesystem from configuration and opens
+    // no author tables, journal cursors or store of its own.
     let transport = client.transport.clone();
     let content = client.content.clone();
     let control_plane = client.control_plane.take().unwrap();
     drop(client);
-    let mut client =
-        NetworkedDfsService::new(transport, content).with_boxed_control_plane(control_plane);
     crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
-    client = client
-        .with_boxed_metadata_backend_for_main_sifs_client(backend)
+    let mut client = NetworkedDfsService::new(transport, content)
+        .with_boxed_control_plane(control_plane)
+        .into_main_sifs_client()
         .unwrap();
     assert_eq!(
         crate::metadata_backend::metadata_current_tables_snapshot_calls(),
         0,
-        "delegated attachment must not query the author tables for bootstrap projections"
+        "a delegated client must not query the author tables"
     );
+    assert!(client.metadata_backend().is_none());
     assert!(crate::placement::dfs_file_system_semantically_eq(
         &client.metadata.filesystems[&sifs_file_system_id()],
         &expected,
     ));
     assert!(client.replication.local_metadata_journal_cursors.is_empty());
-    let after = configs
-        .iter()
-        .map(|config| {
-            client
-                .metadata_backend()
-                .unwrap()
-                .export_shard_table_snapshot(&DfsMetadataShardId::new(config.shard_id.clone()))
-                .unwrap()
-                .unwrap()
-                .prefix_proof
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        after, before,
-        "client attachment grants no native publication"
-    );
     for path in paths {
         assert_eq!(
-            client.posix_read_file(path).unwrap(),
+            client.posix_read_file_distributed(path).unwrap(),
             b"actual native metadata"
         );
     }
-    // The generic delegated constructor still has its complete native
-    // catalogue, floor, job-guard and replay-cursor contract.
-    let owner = client.metadata_backend.take().unwrap();
-    let crate::service_state::DfsMetadataBackendOwner::Owned(backend) = owner else {
-        panic!("ordinary client owns its private metadata backend");
-    };
-    crate::metadata_backend::reset_metadata_current_tables_snapshot_calls();
-    client = client.with_boxed_metadata_backend_lazy(backend).unwrap();
-    assert!(crate::metadata_backend::metadata_current_tables_snapshot_calls() > 0);
-    assert!(!client.replication.local_metadata_journal_cursors.is_empty());
     drop(client);
     let mut author = runtime.metadata_primary_service("/services").unwrap();
     assert!(!author.transport.delegates_local_namespace_authority());
@@ -321,7 +279,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
     let (runtime, mut service) = native_sifs_service("native-default-bootstrap", node.clone());
     for path in ["/", "/services", "/users"] {
         assert_eq!(
-            service.posix_stat(path).unwrap().kind,
+            service.posix_stat_distributed(path).unwrap().kind,
             DfsObjectKind::Directory
         );
     }
@@ -333,7 +291,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
         )
         .unwrap();
     assert_eq!(
-        service.posix_read_file(&written.path).unwrap(),
+        service.posix_read_file_distributed(&written.path).unwrap(),
         b"normal startup bytes"
     );
     drop(service);
@@ -463,14 +421,16 @@ fn sifs_opened_object_ranges_allow_one_atime_update_for_many_chunks() {
         .expect("write");
     dfs.posix_set_times(file_path, Some(12_345), Some(67_890))
         .expect("old times");
-    let before = dfs.posix_stat(file_path).expect("before stat");
+    let before = dfs.posix_stat_distributed(file_path).expect("before stat");
 
     assert_eq!(
         dfs.posix_read_file_range_for_object(&written.object_id, 0, 7)
             .expect("first no-atime range"),
         &bytes[..7]
     );
-    let after_no_atime = dfs.posix_stat(file_path).expect("no-atime stat");
+    let after_no_atime = dfs
+        .posix_stat_distributed(file_path)
+        .expect("no-atime stat");
     assert_eq!(after_no_atime.version, before.version);
     assert_eq!(after_no_atime.accessed_at_unix_nanos, 12_345);
 
@@ -479,7 +439,9 @@ fn sifs_opened_object_ranges_allow_one_atime_update_for_many_chunks() {
             .expect("first handle range updates atime"),
         &bytes[7..16]
     );
-    let after_access = dfs.posix_stat(file_path).expect("updated atime stat");
+    let after_access = dfs
+        .posix_stat_distributed(file_path)
+        .expect("updated atime stat");
     assert_ne!(after_access.version, before.version);
     assert!(after_access.accessed_at_unix_nanos > 12_345);
     assert_eq!(after_access.modified_at_unix_nanos, 67_890);
@@ -489,7 +451,9 @@ fn sifs_opened_object_ranges_allow_one_atime_update_for_many_chunks() {
             .expect("subsequent no-atime range"),
         &bytes[16..24]
     );
-    let after_next_chunk = dfs.posix_stat(file_path).expect("next chunk stat");
+    let after_next_chunk = dfs
+        .posix_stat_distributed(file_path)
+        .expect("next chunk stat");
     assert_eq!(
         after_next_chunk.version, after_access.version,
         "subsequent chunks must not append authoritative atime metadata"
@@ -543,10 +507,11 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
         .posix_mkdir_all(remote_dir)
         .expect("remote bulk parent");
     sifs_two_primary_publish_until(&mut cluster, "mixed bulk parents", |cluster| {
-        cluster.users_primary.posix_stat(remote_dir).is_ok()
-            && cluster.services_primary.posix_stat(local_dir).is_ok()
-            && cluster.replica.posix_stat(local_dir).is_ok()
-            && cluster.replica.posix_stat(remote_dir).is_ok()
+        let runtime = &cluster._runtime;
+        node_store_object(runtime, &cluster.users_primary_node, remote_dir).is_some()
+            && node_store_object(runtime, &cluster.services_primary_node, local_dir).is_some()
+            && node_store_object(runtime, &cluster.replica_node, local_dir).is_some()
+            && node_store_object(runtime, &cluster.replica_node, remote_dir).is_some()
     });
 
     let SifsTwoPrimaryCluster {
@@ -628,7 +593,7 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
     );
     assert_eq!(
         users_primary
-            .posix_read_file(local_path)
+            .posix_read_file_distributed(local_path)
             .expect("read local bulk file"),
         local_bytes
     );
@@ -643,21 +608,16 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
 
     stop.store(true, Ordering::SeqCst);
     let services_primary = services_thread.join().expect("services thread");
+    // Each owning primary's own store holds its group of the batch.
     assert_eq!(
-        services_primary
-            .posix_stat(remote_path)
-            .expect("remote primary stat")
-            .content_hash
-            .as_deref(),
-        Some(content_hash(remote_bytes).as_str())
+        node_store_content_hash(&_runtime, &services_primary_node, remote_path)
+            .expect("remote primary stat"),
+        content_hash(remote_bytes)
     );
     assert_eq!(
-        users_primary
-            .posix_stat(local_path)
-            .expect("local primary stat")
-            .content_hash
-            .as_deref(),
-        Some(content_hash(local_bytes).as_str())
+        node_store_content_hash(&_runtime, &users_primary_node, local_path)
+            .expect("local primary stat"),
+        content_hash(local_bytes)
     );
 
     let mut cluster = SifsTwoPrimaryCluster {
@@ -673,11 +633,11 @@ fn sifs_cluster_bulk_local_eventual_splits_mixed_primary_batch() {
         rejections,
     };
     sifs_two_primary_publish_until(&mut cluster, "mixed bulk convergence", |cluster| {
-        cluster.replica.posix_stat(local_path).is_ok_and(|stat| {
-            stat.content_hash.as_deref() == Some(content_hash(local_bytes).as_str())
-        }) && cluster.replica.posix_stat(remote_path).is_ok_and(|stat| {
-            stat.content_hash.as_deref() == Some(content_hash(remote_bytes).as_str())
-        })
+        let runtime = &cluster._runtime;
+        node_store_content_hash(runtime, &cluster.replica_node, local_path)
+            == Some(content_hash(local_bytes))
+            && node_store_content_hash(runtime, &cluster.replica_node, remote_path)
+                == Some(content_hash(remote_bytes))
     });
     assert!(
         cluster.rejections.is_empty(),
@@ -693,19 +653,29 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
     let mut cluster = sifs_two_primary_cluster("filesystem-ensure-exact-authoritative-shard");
     let root_id = DfsMetadataShardId::new("root");
     let services_id = DfsMetadataShardId::new("services");
+    // Bootstrap is Main-side work on the services primary's own store; its
+    // delegating client keeps no store and bootstraps configuration only.
     let before_root = cluster
-        .services_primary
-        .metadata_backend()
+        ._runtime
+        .node_metadata(&cluster.services_primary_node)
         .unwrap()
         .export_shard_table_snapshot(&root_id)
         .unwrap()
         .unwrap()
         .prefix_proof;
-    cluster
-        .services_primary
+    let mut services_owner = cluster
+        ._runtime
+        .metadata_primary_service("/services")
+        .unwrap();
+    assert_eq!(services_owner.node_id(), &cluster.services_primary_node);
+    services_owner
         .bootstrap_distributed_sifs()
         .expect("bootstrap only locally authoritative namespace");
-    let backend = cluster.services_primary.metadata_backend().unwrap();
+    drop(services_owner);
+    let backend = cluster
+        ._runtime
+        .node_metadata(&cluster.services_primary_node)
+        .unwrap();
     let after_root = backend
         .export_shard_table_snapshot(&root_id)
         .unwrap()
@@ -795,16 +765,16 @@ fn clustered_bootstrap_ensures_filesystem_only_on_authoritative_shard_and_probe_
     let expected_prefix = services.prefix_proof;
     sifs_two_primary_publish_until(&mut cluster, "complete bootstrap prefix", |cluster| {
         cluster
-            .replica
-            .metadata_backend()
+            ._runtime
+            .node_metadata(&cluster.replica_node)
             .unwrap()
             .export_shard_table_snapshot(&services_id)
             .unwrap()
             .is_some_and(|snapshot| snapshot.prefix_proof == expected_prefix)
     });
     let replicated = cluster
-        .replica
-        .metadata_backend()
+        ._runtime
+        .node_metadata(&cluster.replica_node)
         .unwrap()
         .prepared_operation_record(&operation_id)
         .unwrap()

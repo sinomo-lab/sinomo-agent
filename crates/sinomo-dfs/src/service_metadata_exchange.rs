@@ -2146,9 +2146,7 @@ mod response_bookkeeping_tests {
             .clone();
         let shard_id = DfsMetadataShardId::new(source.shard_id.clone());
         let before = runtime
-            .client(&target)
-            .unwrap()
-            .metadata_backend()
+            .node_metadata(&target)
             .unwrap()
             .export_shard_table_snapshot(&shard_id)
             .unwrap()
@@ -2188,9 +2186,7 @@ mod response_bookkeeping_tests {
         assert_eq!(response.request_id, command.request_id);
         assert_eq!(response.shard_id, shard_id);
         let after = runtime
-            .client(&target)
-            .unwrap()
-            .metadata_backend()
+            .node_metadata(&target)
             .unwrap()
             .export_shard_table_snapshot(&shard_id)
             .unwrap()

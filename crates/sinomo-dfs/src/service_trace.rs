@@ -153,6 +153,7 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::SetOwner { .. } => "set-owner",
         DfsNamespaceOperation::SetSymlinkOwner { .. } => "set-symlink-owner",
         DfsNamespaceOperation::SetTimes { .. } => "set-times",
+        DfsNamespaceOperation::RecordAccess { .. } => "record-access",
         DfsNamespaceOperation::TouchDirectoryModified { .. } => "touch-directory-modified",
         DfsNamespaceOperation::ClearDirRecursive { .. } => "clear-dir-recursive",
         DfsNamespaceOperation::LookupPath { .. } => "lookup-path",

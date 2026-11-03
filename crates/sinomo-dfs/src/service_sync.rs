@@ -3875,12 +3875,13 @@ mod tests {
             .start_nodes()
             .expect("ready real Embedded receivers");
         let shard = runtime.root_shard().expect("normal planned root shard");
+        // A delegating caller's open performs the normal filesystem bootstrap
+        // through Main. Sync, fencing and publication belong to the
+        // store-backed owner.
+        drop(runtime.client(&owner).expect("normal filesystem bootstrap"));
         let (mut service, control_plane_probe) = runtime
-            .client_with_control_plane_probe(&owner)
-            .expect("normal observed primary client");
-        service
-            .bootstrap_distributed_sifs()
-            .expect("normal filesystem bootstrap");
+            .metadata_primary_service_with_control_plane_probe("/")
+            .expect("normal observed primary service");
         let object = service
             .metadata_backend()
             .expect("normal metadata backend")
@@ -4846,7 +4847,7 @@ mod tests {
         let mut promoted = fixture.runtime.client(&nodes[1]).unwrap();
         assert_eq!(
             promoted
-                .posix_stat("/native-before-primary-handoff")
+                .posix_stat_distributed("/native-before-primary-handoff")
                 .unwrap()
                 .object_id,
             stat.object_id
@@ -4860,8 +4861,8 @@ mod tests {
         fixture.runtime.reopen_node(nodes[0].clone()).unwrap();
         fixture.service = fixture.runtime.client(&nodes[0]).unwrap();
         let retired_marker = fixture
-            .service
-            .metadata_backend()
+            .runtime
+            .node_metadata(&nodes[0])
             .unwrap()
             .metadata_shard_write_freeze(&shard_id)
             .unwrap()
@@ -4881,7 +4882,7 @@ mod tests {
         assert_eq!(
             fixture
                 .service
-                .posix_stat("/native-before-primary-handoff")
+                .posix_stat_distributed("/native-before-primary-handoff")
                 .unwrap()
                 .object_id,
             stat.object_id
@@ -4966,8 +4967,6 @@ mod tests {
             )
             .unwrap();
         }
-        let existing_replica =
-            delayed_after_reopen.then(|| fixture.runtime.client(&nodes[1]).unwrap());
         let pause = delayed_after_reopen.then(|| {
             fixture
                 .runtime
@@ -5001,8 +5000,15 @@ mod tests {
             fixture.runtime.stop_node(&nodes[1]).unwrap();
             fixture.runtime.reopen_node(nodes[1].clone()).unwrap();
         }
-        let mut replica =
-            existing_replica.unwrap_or_else(|| fixture.runtime.client(&nodes[1]).unwrap());
+        // The replica's own durable store shows what its materializer applied.
+        let replica_row = || {
+            fixture
+                .runtime
+                .node_metadata(&nodes[1])
+                .unwrap()
+                .get_object_by_path(&active.file_system_id, "/native-after-two-handoffs")
+                .unwrap()
+        };
         if let Some(pause) = pause.as_ref() {
             let captured = fixture
                 .runtime
@@ -5015,10 +5021,7 @@ mod tests {
                 captured.materialized_sequence.unwrap() < target,
                 "{captured:?}"
             );
-            assert!(matches!(
-                replica.posix_stat("/native-after-two-handoffs"),
-                Err(DfsPosixError::NotFound { .. })
-            ));
+            assert!(replica_row().is_none());
             assert!(
                 wait_for_existing_materialization(
                     fixture.runtime.data_dir(&nodes[1]),
@@ -5054,15 +5057,11 @@ mod tests {
                 "the actual materializer was paused below the published cut"
             );
         }
-        assert_eq!(
-            replica.posix_stat("/native-after-two-handoffs").unwrap(),
-            expected
-        );
+        assert_eq!(replica_row(), Some(object));
         assert!(
             Instant::now() < deadline,
             "replica stat exceeded the original network deadline"
         );
-        drop(replica);
         drop(pause);
         fixture.finish();
     }

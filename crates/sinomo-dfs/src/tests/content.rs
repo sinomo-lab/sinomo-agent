@@ -254,8 +254,13 @@ fn dfs_smoke_content_nodes_prefer_fresh_remote_advertisements() {
 #[test]
 fn add_object_metadata_batch_rejects_unrecorded_content_generation() {
     let owner = NodeId::from_legacy_named("node_batch_size_owner").expect("node");
-    let (runtime, mut dfs) =
+    let (runtime, client) =
         native_sifs_service("native-metadata-batch-trusted-size", owner.clone());
+    drop(client);
+    // Backend publication is Main-side work on the owning shard's store.
+    let mut dfs = runtime
+        .metadata_primary_service("/services/batch-visible/trusted-size.txt")
+        .unwrap();
     let object_id = DfsObjectId::generate();
     let version = DfsVersion::generate();
     let manifest = dfs
@@ -296,7 +301,10 @@ fn complete_remote_range_content_mismatch_prunes_stale_location() {
         true,
         b"actual complete ranged read payload".to_vec(),
     );
-    let mut reader = runtime.client(&reader_node).unwrap();
+    // The authoritative reader runs the read engine over its node's store;
+    // a delegating client has no local object view to plan from.
+    let mut reader = runtime.metadata_primary_service(&stat.path).unwrap();
+    assert_eq!(reader.node_id(), &reader_node);
     assert_eq!(
         reader
             .request_remote_object_range_read(&stat.object_id, 0, bytes.len())

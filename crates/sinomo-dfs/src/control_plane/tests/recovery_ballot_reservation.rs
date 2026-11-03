@@ -602,9 +602,7 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
     with_native("native-reservation-no-serving-freeze", |fixture| {
         let shard_id = crate::DfsMetadataShardId::new(&fixture.shard.shard_id);
         let freeze = fixture
-            .service
-            .metadata_backend()
-            .unwrap()
+            .primary_store()
             .metadata_shard_write_freeze(&shard_id)
             .unwrap();
         let requested = request(fixture, 0, 0);
@@ -618,9 +616,7 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
         let pending = read_one(fixture.control.as_mut(), &key(&fixture.shard)).unwrap();
         assert_eq!(
             fixture
-                .service
-                .metadata_backend()
-                .unwrap()
+                .primary_store()
                 .metadata_shard_write_freeze(&shard_id)
                 .unwrap(),
             freeze
@@ -661,7 +657,7 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
             created.object_id,
             fixture
                 .service
-                .posix_stat("/native-floor-a.bin")
+                .posix_stat_distributed("/native-floor-a.bin")
                 .unwrap()
                 .object_id
         );
@@ -688,9 +684,7 @@ fn native_pending_reservation_does_not_freeze_create_or_maintenance() {
         );
         assert_eq!(
             fixture
-                .service
-                .metadata_backend()
-                .unwrap()
+                .primary_store()
                 .metadata_shard_write_freeze(&shard_id)
                 .unwrap(),
             freeze

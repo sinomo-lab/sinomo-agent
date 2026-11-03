@@ -888,7 +888,12 @@ fn install_selected_local_recovery_rpc_owned(
         Err(error) => return Ok(refused(error.to_string())),
     };
     drop(control);
-    let mut service = match open_dfs_runtime_service(data_dir, Some(runtime)) {
+    // The fence is written to this node's own copy of the serving shard.
+    let mut service = match super::open_dfs_runtime_service_on_local_shard_copy(
+        data_dir,
+        Some(runtime),
+        &authoritative.serving_shard,
+    ) {
         Ok(service) => service,
         Err(error) => return Ok(refused(error.to_string())),
     };

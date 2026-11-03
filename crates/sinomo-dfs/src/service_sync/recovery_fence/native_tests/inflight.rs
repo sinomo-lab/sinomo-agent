@@ -72,17 +72,17 @@ fn native_local_recovery_fence_refuses_original_inflight_carrier_after_install()
             crate::service_replica::metadata_authority_probe_confirmation_id(&probe)
         );
 
-        let mut receiver = crate::runtime_host::open_dfs_runtime_service(
-            fixture.runtime.data_dir(&target),
-            Some(&fixture.runtime.runtime_handle()),
-        )
-        .unwrap();
+        let mut receiver = fixture
+            .runtime
+            .local_shard_copy_service(&target, &fixture.shard)
+            .unwrap();
         assert!(
             receiver
                 .native_publication_owner_for_observation()
                 .is_some()
         );
-        let backend = receiver.metadata_backend().unwrap();
+        let target_store = fixture.node_store(&target);
+        let backend: &dyn DfsMetadataBackend = &target_store;
         assert!(
             backend
                 .metadata_shard_write_freeze(&shard_id)
@@ -97,6 +97,7 @@ fn native_local_recovery_fence_refuses_original_inflight_carrier_after_install()
             .metadata_authority_ack_floor(&shard_id)
             .unwrap()
             .unwrap();
+        drop(target_store);
         assert_eq!(prefix_floor.durable_prefix_proof, prefix);
         assert_eq!(authority_floor.durable_prefix_proof, prefix);
         let retained_frames = exact_frames(&fixture.runtime, &target, &fixture.shard);

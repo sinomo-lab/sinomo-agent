@@ -821,8 +821,11 @@ mod tests {
             )
             .expect("second write");
 
+        // Local file-sync validation runs on the store-backed metadata owner.
         let certificate = fixture
-            .service
+            ._runtime
+            .metadata_primary_service("/services/sync-prefix.txt")
+            .unwrap()
             .posix_sync_file_local(&target, Duration::ZERO)
             .expect("the captured historical version remains independently certifiable");
         assert_eq!(certificate.target, target);
@@ -846,14 +849,17 @@ mod tests {
         assert_ne!(
             fixture
                 .service
-                .posix_stat("/services")
+                .posix_stat_distributed("/services")
                 .expect("current directory")
                 .version,
             target.version
         );
 
+        // Local directory-sync validation runs on the store-backed owner.
         let certificate = fixture
-            .service
+            ._runtime
+            .metadata_primary_service("/services")
+            .unwrap()
             .posix_sync_directory_local(&target, Duration::ZERO)
             .expect("the captured directory generation remains independently certifiable");
         assert_eq!(certificate.target, target);
@@ -866,7 +872,8 @@ mod tests {
             crate::test_runtime::DfsTestRuntime::new("pending_write", nodes[0].clone()).unwrap();
         runtime.define_node(nodes[1].clone()).unwrap();
         runtime.start_nodes().unwrap();
-        let mut configuration = runtime.client(&nodes[0]).unwrap();
+        // Filesystem publication is Main-side work on a store-backed owner.
+        let mut configuration = runtime.metadata_primary_service("/").unwrap();
         let mut file_system = runtime.file_system();
         let mut policy = crate::DfsSubtreePolicy::new(
             "/services/pending-sync.txt",

@@ -70,7 +70,9 @@ impl NativePromotions {
                     },
                 )
                 .unwrap();
-            let backend = service.metadata_backend().unwrap();
+            // The source node's durable store holds the committed rows.
+            let store = runtime.node_metadata(&source).unwrap();
+            let backend: &dyn crate::DfsMetadataBackend = &store;
             let object = backend.get_object(&stat.object_id).unwrap().unwrap();
             let intent = backend
                 .intents_for_object(&stat.object_id)
@@ -418,7 +420,9 @@ fn native_shared_drains_limit_inflight_promotions_and_yield_to_readers() {
     }
     let mut foreground = case.runtime.client(&case.source).unwrap();
     assert_eq!(
-        foreground.posix_read_file("/promotion-0").unwrap(),
+        foreground
+            .posix_read_file_distributed("/promotion-0")
+            .unwrap(),
         b"native promotion body 0"
     );
     drop(foreground);

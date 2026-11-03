@@ -305,7 +305,7 @@ fn command_outputs_persist_through_sifs_sandbox_filesystem() {
 
     assert_eq!(
         sandbox_fs
-            .read(
+            .read_mut(
                 &sandbox_command_stdout_log_path(&record.command_id).expect("stdout"),
                 None
             )
@@ -314,7 +314,7 @@ fn command_outputs_persist_through_sifs_sandbox_filesystem() {
     );
     assert_eq!(
         sandbox_fs
-            .read(
+            .read_mut(
                 &sandbox_command_stderr_log_path(&record.command_id).expect("stderr"),
                 None
             )

@@ -110,11 +110,12 @@ fn posix_conditional_replace_rejects_a_stale_editor_snapshot() {
         .expect_err("stale editor save must fail");
     assert!(matches!(error, DfsPosixError::Conflict { .. }));
     assert_eq!(
-        dfs.posix_read_file(path).expect("read newer version"),
+        dfs.posix_read_file_distributed(path)
+            .expect("read newer version"),
         b"newer"
     );
 
-    let current = dfs.posix_stat(path).expect("current stat");
+    let current = dfs.posix_stat_distributed(path).expect("current stat");
     let saved = dfs
         .posix_replace_file_if_version(
             path,
@@ -126,7 +127,8 @@ fn posix_conditional_replace_rejects_a_stale_editor_snapshot() {
         .expect("matching conditional save");
     assert_ne!(saved.version, current.version);
     assert_eq!(
-        dfs.posix_read_file(path).expect("read saved version"),
+        dfs.posix_read_file_distributed(path)
+            .expect("read saved version"),
         b"saved safely"
     );
 
@@ -261,10 +263,8 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
             },
         )
         .unwrap();
-    assert!(matches!(
-        cluster.observer.posix_stat(path),
-        Err(DfsPosixError::NotFound { .. })
-    ));
+    // The unassigned observer's own store must not hold the path; its
+    // delegating client keeps no local view to ask.
     let observer_root =
         crate::default_dfs_metadata_shards_root(cluster._runtime.data_dir(&cluster.observer_node))
             .join(crate::metadata_keys::key_segment(&original.shard_id));
@@ -305,15 +305,16 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
     drop(cluster.observer);
     cluster.observer = cluster._runtime.client(&cluster.observer_node).unwrap();
     let expected_hash = content_hash(bytes);
-    let stat = cluster
-        .observer
-        .posix_stat(path)
+    // The joined observer node's own store caught up.
+    let stat = node_store_object(&cluster._runtime, &cluster.observer_node, path)
         .expect("actual caught-up replica stat");
     assert_eq!(stat.kind, DfsObjectKind::File);
     assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
-    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
-    let entries = cluster.observer.posix_list_dir("/users").unwrap();
-    assert!(entries.iter().any(|entry| entry.path == path));
+    assert_eq!(stat.content_size_bytes, Some(bytes.len() as u64));
+    let entries = node_store_children(&cluster._runtime, &cluster.observer_node, "/users");
+    assert!(entries.iter().any(
+        |(name, _, object_id)| *object_id == stat.object_id && format!("/users/{name}") == path
+    ));
     assert!(
         !cluster.observer.content().has_blob(&expected_hash).unwrap(),
         "metadata catch-up must not invent a content replica"
@@ -331,13 +332,8 @@ fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
     assert_eq!(publication.omitted_kv_event_count, 0);
     sifs_posix_cluster_pump_round(&mut cluster);
     assert_eq!(
-        cluster
-            .observer
-            .posix_stat(path)
-            .unwrap()
-            .content_hash
-            .as_deref(),
-        Some(expected_hash.as_str()),
+        node_store_content_hash(&cluster._runtime, &cluster.observer_node, path),
+        Some(expected_hash.clone()),
         "idempotent publication must not regress the actual replica"
     );
     assert_eq!(
@@ -481,14 +477,18 @@ fn durable_namespace_exact_retry_replays_completed_rename_and_rejects_id_reuse()
 }
 
 #[test]
-fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
+fn delegating_replica_cursor_snapshot_advertises_nothing_without_backend_status() {
+    // Only Main ingests a shard's journal into the node's store, so a caller
+    // delegating to it advertises no routed cursor even after genuine progress
+    // on a shard its node replicates, and never scans backend shard status.
     let mut cluster = sifs_two_primary_cluster("sifs-namespace-cached-cursors");
     let shard = DfsMetadataShardId::new("services");
-    cluster
-        .replica
-        .replication
-        .local_metadata_journal_cursors
-        .clear();
+    assert!(
+        cluster
+            .replica
+            .transport
+            .delegates_local_namespace_authority()
+    );
     crate::metadata_sharded_backend::take_sharded_metadata_status_query_count();
     assert!(
         cluster
@@ -518,22 +518,45 @@ fn routed_namespace_cursor_snapshot_uses_cached_state_not_backend_status() {
         .into_iter()
         .find(|cfg| cfg.shard_id == shard.0)
         .unwrap();
-    // Consume genuine native progress before testing the quiet cached read.
-    let initial = cluster
-        .replica
-        .local_metadata_shard_cursors_for(Some(&[cfg]))
-        .unwrap();
-    assert_eq!(initial.len(), 1);
-    assert_eq!(initial[0].after_sequence, actual);
+    assert!(cfg.replica_node_ids.contains(&cluster.replica_node));
     crate::metadata_sharded_backend::take_sharded_metadata_status_query_count();
-    let cached = cluster.replica.local_metadata_shard_cursors().unwrap();
-    assert_eq!(cached, initial);
-    assert_eq!(cached[0].shard_id, shard);
+    assert!(
+        cluster
+            .replica
+            .local_metadata_shard_cursors_for(Some(std::slice::from_ref(&cfg)))
+            .unwrap()
+            .is_empty(),
+        "a delegating caller advertises no journal position"
+    );
+    assert_eq!(
+        cluster
+            .replica
+            .local_metadata_journal_after_sequence_for_shard(&cfg)
+            .unwrap(),
+        None
+    );
+    assert!(
+        cluster
+            .replica
+            .local_metadata_shard_cursors()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         crate::metadata_sharded_backend::take_sharded_metadata_status_query_count(),
         0,
         "quiet routed cursor reads must not scan backend shard status"
     );
+    // The progress itself reached the replica node's store through its Main.
+    sifs_two_primary_publish_until(&mut cluster, "replica store progress", |cluster| {
+        cluster
+            ._runtime
+            .node_metadata(&cluster.replica_node)
+            .unwrap()
+            .metadata_prefix_proof(&shard)
+            .unwrap()
+            .is_some_and(|proof| proof.journal_sequence >= actual)
+    });
     cluster.close();
 }
 
@@ -573,6 +596,26 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 
     drop(dfs);
     runtime.close().expect("ordinary native close");
+}
+
+#[test]
+fn delegating_caller_on_a_replica_advertises_no_journal_position() {
+    let name = "native-delegating-caller-no-journal-position";
+    let (runtime, primary_service, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    drop(primary_service);
+    let replica = config.replica_node_ids[0].clone();
+    let mut delegating = runtime.client(&replica).unwrap();
+    assert!(delegating.transport.delegates_local_namespace_authority());
+    assert_eq!(
+        delegating
+            .local_metadata_journal_after_sequence_for_shard(&config)
+            .unwrap(),
+        None,
+        "only Main ingests response batches into the node's store"
+    );
+    drop(delegating);
+    runtime.close().unwrap();
 }
 
 #[test]

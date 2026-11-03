@@ -28,8 +28,8 @@ fn run_private_requester_custody(terminal_before_drain: bool) {
             crate::DfsWriteOptions::replicated_eventual(vec![primary.clone()]),
         )
         .unwrap();
-    let object = primary_view
-        .metadata_backend()
+    let object = runtime
+        .node_metadata(&primary)
         .unwrap()
         .get_object(&original.object_id)
         .unwrap()

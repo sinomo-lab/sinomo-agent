@@ -645,6 +645,12 @@ pub enum DfsNamespaceOperation {
         modified_at_unix_nanos: Option<u64>,
         follow_symlink: bool,
     },
+    /// Record a completed read's access time on the object's metadata
+    /// authority. Unlike `SetTimes`, it leaves the change time unchanged.
+    RecordAccess {
+        path: String,
+        object_id: DfsObjectId,
+    },
     TouchDirectoryModified {
         path: String,
     },
@@ -848,6 +854,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SetOwner { path, .. }
             | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
             | DfsNamespaceOperation::SetTimes { path, .. }
+            | DfsNamespaceOperation::RecordAccess { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::LookupPath { path, .. }
@@ -912,6 +919,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::SetOwner { path, .. }
             | DfsNamespaceOperation::SetSymlinkOwner { path, .. }
             | DfsNamespaceOperation::SetTimes { path, .. }
+            | DfsNamespaceOperation::RecordAccess { path, .. }
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::LookupPath { path, .. }

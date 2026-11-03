@@ -232,6 +232,11 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     };
     let mut observation =
         crate::background_observation::DfsBackgroundObservation::new("maintenance", kind);
+    // A routine pass runs the repairs committed effects requested; restore the
+    // request unless this pass finished its whole turn, since a bounded pass
+    // can stop before its repair phase.
+    let repair_requested = maintenance_kind == DaemonDfsMaintenanceKind::Routine
+        && daemon_dfs_repair_maintenance_requested(paths, true);
     let result = run_daemon_dfs_maintenance_tick_kind_inner(
         paths,
         runtime,
@@ -239,6 +244,16 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         node_resources,
     )
     .await;
+    if repair_requested
+        && !matches!(
+            result,
+            Ok(DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false
+            })
+        )
+    {
+        restore_daemon_dfs_repair_maintenance_request(paths);
+    }
     observation.finish(match &result {
         Ok(DaemonDfsMaintenanceTickOutcome::Completed {
             reached_limit: false,

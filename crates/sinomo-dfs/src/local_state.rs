@@ -2077,7 +2077,8 @@ mod tests {
         .unwrap();
         let mut changed = original.clone();
         changed.display_name = "native changed configuration".into();
-        let mut writer = runtime.client(&owner).unwrap();
+        // Filesystem publication belongs to the store-backed owning service.
+        let mut writer = runtime.metadata_primary_service("/").unwrap();
         writer.add_file_system(changed.clone()).unwrap();
         for _ in 0..2 {
             let actual =

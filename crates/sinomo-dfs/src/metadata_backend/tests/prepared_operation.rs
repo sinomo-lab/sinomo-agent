@@ -574,7 +574,8 @@ fn prepared_v7_namespace_commit_and_exact_retry_use_one_digest_marker() {
     }
     runtime.stop_node(&config.primary_node_id).unwrap();
     runtime.reopen_node(config.primary_node_id.clone()).unwrap();
-    let reopened = runtime.client(&config.primary_node_id).unwrap();
+    // The reopened owner's store-backed service, not a delegating client.
+    let reopened = runtime.metadata_primary_service("/services").unwrap();
     assert_eq!(
         reopened
             .metadata_backend()
@@ -1172,19 +1173,10 @@ fn prepared_v7_content_seals_terminal_intent_and_enforces_receipts_and_head() {
     let mut runtime = runtime;
     runtime.stop_node(&primary).unwrap();
     runtime.reopen_node(primary.clone()).unwrap();
-    let reopened = runtime.client(&primary).unwrap();
-    assert_eq!(
-        reopened
-            .metadata_backend()
-            .unwrap()
-            .get_object(&stat.object_id)
-            .unwrap(),
-        Some(current)
-    );
+    let reopened = runtime.node_metadata(&primary).unwrap();
+    assert_eq!(reopened.get_object(&stat.object_id).unwrap(), Some(current));
     assert!(
         reopened
-            .metadata_backend()
-            .unwrap()
             .committed_prepared_operation(&digest)
             .unwrap()
             .is_some()
@@ -1273,13 +1265,9 @@ fn collected_operation_keeps_exact_outcome_and_rejects_changed_newer_body() {
     drop(service);
     runtime.stop_node(&config.primary_node_id).unwrap();
     runtime.reopen_node(config.primary_node_id.clone()).unwrap();
-    let reopened = runtime.client(&config.primary_node_id).unwrap();
+    let reopened = runtime.node_metadata(&config.primary_node_id).unwrap();
     assert_eq!(
-        reopened
-            .metadata_backend()
-            .unwrap()
-            .committed_prepared_operation(&digest)
-            .unwrap(),
+        reopened.committed_prepared_operation(&digest).unwrap(),
         Some(entry)
     );
     drop(reopened);
@@ -2322,23 +2310,13 @@ fn native_owned_recovery_starts_at_exact_tables_despite_a_lagging_cursor_hint() 
     let mut reopened = runtime
         .client(&node)
         .expect("ordinary current native reopen");
-    assert_eq!(
-        reopened
-            .metadata_backend()
-            .unwrap()
-            .metadata_prefix_proof(&shard)
-            .unwrap(),
-        Some(exact)
-    );
-    let current = reopened
-        .metadata_backend()
-        .unwrap()
-        .get_object(&written.object_id)
-        .unwrap()
-        .unwrap();
+    let node_store = runtime.node_metadata(&node).unwrap();
+    assert_eq!(node_store.metadata_prefix_proof(&shard).unwrap(), Some(exact));
+    let current = node_store.get_object(&written.object_id).unwrap().unwrap();
+    drop(node_store);
     assert_eq!(current.version, written.version);
     assert_eq!(
-        reopened.posix_read_file(path).unwrap(),
+        reopened.posix_read_file_distributed(path).unwrap(),
         b"actual native bytes"
     );
     drop(reopened);

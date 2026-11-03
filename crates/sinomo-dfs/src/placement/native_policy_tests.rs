@@ -1,4 +1,5 @@
 use super::*;
+use crate::DfsMetadataBackend;
 
 #[test]
 fn native_fresh_adaptive_fetch_reaches_first_repair_and_independent_ready_target() {
@@ -39,7 +40,7 @@ fn native_fresh_adaptive_fetch_reaches_first_repair_and_independent_ready_target
             )
             .unwrap();
         let object = writer
-            .current_read_object_metadata(&written.object_id)
+            .current_read_object_metadata_distributed(&written.object_id)
             .unwrap();
         let setup_deadline = Instant::now() + crate::DEFAULT_DFS_POSIX_SYNC_TIMEOUT;
         let receipts = loop {
@@ -123,8 +124,11 @@ fn native_fresh_adaptive_fetch_reaches_first_repair_and_independent_ready_target
         dfs_now_unix_nanos(),
     )
     .unwrap();
+    // Adaptive planning reads each version's durable W/N from the actual
+    // metadata owner; the delegating writer keeps no store.
+    let planner = runtime.metadata_primary_service(prefix).unwrap();
     for object in &objects {
-        let (_, policy, plan) = writer
+        let (_, policy, plan) = planner
             .reconciliation_placement_for_object_with_pins(&config, &job, object, &[])
             .unwrap();
         assert_eq!(
@@ -139,6 +143,7 @@ fn native_fresh_adaptive_fetch_reaches_first_repair_and_independent_ready_target
             BTreeSet::from([primary.clone(), target.clone()])
         );
     }
+    drop(planner);
     drop(writer);
     // Remove only actual local bytes using the existing physical fault. The
     // independently verified source copy and all authoritative rows are intact.
@@ -463,8 +468,12 @@ fn native_current_policy_fixture_with_nodes(
         )
         .unwrap();
     let object = service
-        .current_read_object_metadata(&written.object_id)
+        .current_read_object_metadata_distributed(&written.object_id)
         .unwrap();
+    // Placement planning reads the written version's durable W/N from the
+    // actual metadata owner; the delegating writer keeps no store.
+    drop(service);
+    let mut service = runtime.metadata_primary_service(path).unwrap();
     let version = service
         .metadata_backend()
         .unwrap()
@@ -1104,7 +1113,8 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
             );
         }
     }
-    let mut service = runtime.client(&primary).unwrap();
+    let mut service = runtime.metadata_primary_service(&object.path).unwrap();
+    assert_eq!(service.node_id(), &primary);
     let current = service
         .current_read_object_metadata(&object.object_id)
         .unwrap();
@@ -1205,8 +1215,8 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
     );
     // The captured rows came from the actual author at PutIntent, before its
     // old-owner retirement. Neither an observation nor this hook grants replay.
-    service = runtime.client(&primary).unwrap();
-    let wrong_job = service.route_namespace_operation(
+    let mut caller = runtime.client(&primary).unwrap();
+    let wrong_job = caller.route_namespace_operation(
         primary.clone(),
         DfsNamespaceOperation::ReconcilePlacement {
             job_id: sinomo_core::Id::generate().to_string(),
@@ -1222,6 +1232,8 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
         wrong_job.is_err(),
         "another job cannot borrow the committed owner"
     );
+    drop(caller);
+    service = runtime.metadata_primary_service(&object.path).unwrap();
     let mut wrong_config = job.accepted_config.clone();
     upsert_placement_rule(
         &mut wrong_config.subtree_policies,
@@ -1289,9 +1301,10 @@ fn native_two_current_owners_resume_the_exact_adaptive_job_after_interrupted_bir
     }
     let mut service = runtime.client(&primary).unwrap();
     let current = service
-        .current_read_object_metadata(&object.object_id)
+        .current_read_object_metadata_distributed(&object.object_id)
         .unwrap();
-    let backend = service.metadata_backend().unwrap();
+    let store = runtime.node_metadata(&primary).unwrap();
+    let backend = &store;
     assert!(
         backend
             .get_intent_receipt(&object.object_id, &prior_intent_id)

@@ -45,14 +45,10 @@ fn with_rpc(
             .unwrap()
             .is_none()
         );
+        // The receiver delegates to its Main and keeps no store; its node's
+        // durable fence is inspected directly. Tests never follow a
+        // remote_reported path or assert cold Main readiness.
         let mut receiver = fixture.runtime.client(&target).unwrap();
-        // Open/retain this actual local scope BEFORE it becomes fenced. Tests
-        // never follow a remote_reported path or assert cold Main readiness.
-        receiver
-            .metadata_backend()
-            .unwrap()
-            .publication_owner_scope(&fixture.shard.file_system_id, &fixture.shard_id())
-            .unwrap();
         let reservation = fixture.request();
         fixture.reserve(&reservation);
         let request = RpcRequest {
@@ -89,9 +85,8 @@ fn local_data(
     receiver: &Service,
     fixture: &NativeFenceFixture,
 ) -> Option<DfsSelectedLocalRecoveryFenceData> {
-    receiver
-        .metadata_backend()
-        .unwrap()
+    fixture
+        .node_store(receiver.node_id())
         .selected_local_recovery_fence(&fixture.shard_id())
         .unwrap()
 }
@@ -650,9 +645,8 @@ fn native_local_fence_rpc_default_and_cooperative_refusals_preserve_ordinary_con
             };
             assert!(reason.contains("default"));
             assert!(
-                receiver
-                    .metadata_backend()
-                    .unwrap()
+                fixture
+                    .node_store(receiver.node_id())
                     .selected_local_recovery_fence(&fixture.shard_id())
                     .is_err()
             );

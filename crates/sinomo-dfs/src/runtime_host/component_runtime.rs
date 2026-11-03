@@ -479,6 +479,8 @@ async fn run_component_maintenance(
     let mut next_probe = Some(not_before);
     let mut triggered = false;
     let mut immediate = false;
+    // A committed repair request whose tick yielded to foreground work.
+    let mut repair_retry_at = None::<Instant>;
     let mut resources = node_resources.take_latest();
     let notify =
         match daemon_dfs_maintenance_notify(&paths.data_dir().expect("validated data root")) {
@@ -498,6 +500,10 @@ async fn run_component_maintenance(
             crate::dfs_maintenance_due_in(now, not_before, last_maintenance, triggered, immediate)
         } else {
             next_probe.map(|deadline| deadline.saturating_duration_since(now))
+        };
+        let due = match repair_retry_at.map(|at| at.saturating_duration_since(now)) {
+            Some(retry) => Some(due.map_or(retry, |due| due.min(retry))),
+            None => due,
         };
         tokio::select! {
             _ = async {
@@ -574,6 +580,11 @@ async fn run_component_maintenance(
             next_probe = decision.next_probe_at;
         }
 
+        if repair_retry_at.is_some_and(|at| Instant::now() >= at) {
+            repair_retry_at = None;
+            triggered = true;
+            immediate = true;
+        }
         let launch = crate::dfs_maintenance_due_in(
             Instant::now(),
             not_before,
@@ -605,6 +616,18 @@ async fn run_component_maintenance(
                     .ok()
                     .and_then(Result::ok);
                     let work_for_policy = work.clone();
+                    // Committed effects requested the routine repair pass. A
+                    // completed reconciliation or recovery tick dispatches no
+                    // repairs, so continue straight into the routine pass; a
+                    // tick that yielded to foreground work retries the request
+                    // after the poll interval.
+                    let repair_requested = daemon_dfs_repair_maintenance_requested(&paths, false);
+                    let unserved_repair_edge = repair_requested
+                        && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. });
+                    if repair_requested && outcome == DaemonDfsMaintenanceTickOutcome::Deferred {
+                        repair_retry_at =
+                            completed.checked_add(DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL);
+                    }
                     let decision = retain_requested_reconciliation(
                         &paths,
                         resource_adjusted_decision(
@@ -615,7 +638,7 @@ async fn run_component_maintenance(
                                 completed,
                                 daemon_dfs_now_unix_nanos(),
                                 work,
-                                false,
+                                unserved_repair_edge,
                             ),
                         ),
                     );

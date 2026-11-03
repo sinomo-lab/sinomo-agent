@@ -3927,7 +3927,9 @@ mod tests {
             Err(DfsPosixError::NotDirectory { .. })
         ));
         assert_eq!(
-            service.posix_read_file(path).expect("preserved file"),
+            service
+                .posix_read_file_distributed(path)
+                .expect("preserved file"),
             b"replacement"
         );
 

@@ -172,10 +172,13 @@ fn lifecycle_maintenance_content_only_dry_run_marks_projection_unprotected() {
 fn lifecycle_maintenance_host_clears_completed_anti_entropy_cursor() {
     let root = temp_root("lifecycle-maintenance-host-clears-cursor");
     let node_id = NodeId::from_legacy_named("node_lifecycle_host_clear").expect("node");
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, client) = native_sifs_service(
         "lifecycle_maintenance_host_clears_completed_anti_entropy_cursor",
         node_id,
     );
+    drop(client);
+    // Lifecycle maintenance is Main-side work over the node's own store.
+    let mut dfs = runtime.metadata_primary_service("/").unwrap();
     let mut host = RecordingMaintenanceHost::default();
 
     let reports = run_dfs_lifecycle_maintenance_with_host(
@@ -197,10 +200,13 @@ fn lifecycle_maintenance_host_clears_completed_anti_entropy_cursor() {
 fn lifecycle_maintenance_host_rejects_mismatched_cursor() {
     let root = temp_root("lifecycle-maintenance-host-mismatched-cursor");
     let node_id = NodeId::from_legacy_named("node_lifecycle_host_mismatch").expect("node");
-    let (_runtime, mut dfs) = native_sifs_service(
+    let (runtime, client) = native_sifs_service(
         "lifecycle_maintenance_host_rejects_mismatched_cursor",
         node_id,
     );
+    drop(client);
+    // Lifecycle maintenance is Main-side work over the node's own store.
+    let mut dfs = runtime.metadata_primary_service("/").unwrap();
     let mut host = RecordingMaintenanceHost::default();
     host.cursors.push((
         sifs_file_system_id(),
@@ -464,60 +470,47 @@ fn native_sifs_bootstrap_keeps_one_complete_current_image_after_restart() {
         .unwrap();
     for path in ["/", SIFS_SERVICES_PATH, SIFS_USERS_PATH] {
         assert_eq!(
-            service.posix_stat(path).unwrap().kind,
+            service.posix_stat_distributed(path).unwrap().kind,
             DfsObjectKind::Directory
         );
     }
     let configs = runtime.metadata_shards().unwrap();
-    // Pin a fresh complete cut after the routed write, not the browser handle's
-    // earlier exported snapshot. The whole image comparison remains exact.
-    service
-        .metadata_backend_mut()
-        .unwrap()
-        .begin_consistent_read_snapshot()
-        .unwrap();
+    // Pin a fresh complete cut of the node's store after the routed write.
+    // The whole image comparison remains exact.
+    let mut store = runtime.node_metadata(&node).unwrap();
+    store.begin_consistent_read_snapshot().unwrap();
     let mut initial = BTreeMap::new();
     for shard in &configs {
         let id = DfsMetadataShardId::new(shard.shard_id.clone());
         initial.insert(
             id.clone(),
-            service
-                .metadata_backend()
-                .unwrap()
-                .export_shard_table_snapshot(&id)
-                .unwrap()
-                .unwrap(),
+            store.export_shard_table_snapshot(&id).unwrap().unwrap(),
         );
     }
-    service
-        .metadata_backend_mut()
-        .unwrap()
-        .end_consistent_read_snapshot();
+    store.end_consistent_read_snapshot();
+    drop(store);
     drop(service);
     runtime.stop_node(&node).unwrap();
     runtime.reopen_node(node.clone()).unwrap();
     let mut service = runtime.client(&node).unwrap();
+    let store = runtime.node_metadata(&node).unwrap();
     for (id, before) in initial {
         assert_eq!(
-            service
-                .metadata_backend()
-                .unwrap()
-                .export_shard_table_snapshot(&id)
-                .unwrap()
-                .unwrap(),
+            store.export_shard_table_snapshot(&id).unwrap().unwrap(),
             before,
             "normal startup does not re-seed retained current data"
         );
     }
+    drop(store);
     assert_eq!(
         service
-            .posix_read_file("/services/native-bootstrap-restart.bin")
+            .posix_read_file_distributed("/services/native-bootstrap-restart.bin")
             .unwrap(),
         b"retained current bytes"
     );
     assert_eq!(
         service
-            .posix_stat("/services/native-bootstrap-restart.bin")
+            .posix_stat_distributed("/services/native-bootstrap-restart.bin")
             .unwrap()
             .object_id,
         file.object_id
@@ -556,10 +549,16 @@ fn sifs_cluster_async_commit_fetches_missing_local_desired_copy_without_maintena
         &mut cluster,
         "primary fetches missing local desired copy after async commit",
         |cluster| {
-            cluster
-                .primary
-                .posix_read_file(path)
-                .is_ok_and(|read| read == bytes)
+            // The primary node's store commits the object and its own content
+            // store holds the desired local copy.
+            let expected = content_hash(&bytes);
+            node_store_content_hash(&cluster._runtime, &cluster.primary_node, path)
+                .is_some_and(|hash| hash == expected)
+                && cluster
+                    .primary
+                    .content()
+                    .read_blob(&expected)
+                    .is_ok_and(|read| read == bytes)
         },
     );
 

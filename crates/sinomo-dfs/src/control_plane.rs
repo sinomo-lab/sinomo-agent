@@ -9855,13 +9855,16 @@ mod tests {
 
     #[test]
     fn primary_handoff_request_is_idempotent_and_does_not_activate_without_proof() {
-        let (mut runtime, mut source, current) =
+        let (runtime, requester, current) =
             crate::test_support::current_native_metadata_service(
                 "native-cp-idempotent-role-request",
                 3,
                 "/",
             )
             .unwrap();
+        drop(requester);
+        // The shard fence guard belongs to the store-backed owning service.
+        let mut source = runtime.metadata_primary_service("/").unwrap();
         // SAME normal source serialization gate: pause background freeze while
         // observing the request producer. This guard grants no publication.
         let gate = source
@@ -9958,13 +9961,16 @@ mod tests {
 
     #[test]
     fn metadata_shard_primary_role_handoff_requires_exact_existing_member_rotation() {
-        let (mut runtime, mut source, current) =
+        let (runtime, requester, current) =
             crate::test_support::current_native_metadata_service(
                 "native-cp-exact-role-rotation",
                 3,
                 "/",
             )
             .unwrap();
+        drop(requester);
+        // The shard fence guard belongs to the store-backed owning service.
+        let mut source = runtime.metadata_primary_service("/").unwrap();
         let desired =
             metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0]).unwrap();
         let mut wrong_order = desired.clone();
@@ -10026,7 +10032,7 @@ mod tests {
 
     #[test]
     fn metadata_shard_primary_handoff_joint_quorum_tolerates_one_offline_replica() {
-        let (mut runtime, mut source, current) =
+        let (mut runtime, mut requester, current) =
             crate::test_support::current_native_metadata_service(
                 "native-cp-offline-joint-handoff",
                 4,
@@ -10035,12 +10041,15 @@ mod tests {
             .unwrap();
         assert_eq!(metadata_shard_configured_node_ids(&current).len(), 4);
         assert_eq!(current.replica_node_ids.len(), 3);
-        source
+        requester
             .posix_mkdir("/native-cp-before-offline-joint")
             .unwrap();
-        let before = source
-            .posix_stat("/native-cp-before-offline-joint")
+        let before = requester
+            .posix_stat_distributed("/native-cp-before-offline-joint")
             .unwrap();
+        drop(requester);
+        // Fencing and handoff reconciliation belong to the store-backed owner.
+        let mut source = runtime.metadata_primary_service("/").unwrap();
         let promoted = current.replica_node_ids[0].clone();
         let offline = current.replica_node_ids.last().unwrap().clone();
         assert_ne!(offline, promoted);
@@ -10157,7 +10166,7 @@ mod tests {
         ), Err(KvError::Serialization { detail }) if detail.contains("both primaries")));
         let mut reader = runtime.client(&promoted).unwrap();
         let after = reader
-            .posix_stat("/native-cp-before-offline-joint")
+            .posix_stat_distributed("/native-cp-before-offline-joint")
             .unwrap();
         assert_eq!(
             (after.object_id, after.version),
@@ -10171,12 +10180,15 @@ mod tests {
 
     #[test]
     fn async_metadata_shard_primary_role_handoff_accepts_exact_rotation() {
-        let (runtime, mut source, current) = crate::test_support::current_native_metadata_service(
+        let (runtime, requester, current) = crate::test_support::current_native_metadata_service(
             "native-cp-async-role-rotation",
             2,
             "/",
         )
         .unwrap();
+        drop(requester);
+        // The shard fence guard belongs to the store-backed owning service.
+        let mut source = runtime.metadata_primary_service("/").unwrap();
         let desired =
             metadata_shard_primary_handoff_target(&current, &current.replica_node_ids[0]).unwrap();
         let gate = source
@@ -10758,6 +10770,14 @@ mod tests {
         fn floor_key(&self) -> String {
             metadata_shard_operation_floor_key(&self.shard.file_system_id, &self.shard.shard_id)
         }
+        /// The primary node's durable store; the delegating writer keeps none.
+        fn primary_store(&self) -> Box<dyn crate::DfsMetadataBackend> {
+            Box::new(
+                self.runtime
+                    .node_metadata(&self.shard.primary_node_id)
+                    .unwrap(),
+            )
+        }
         fn floor(&mut self) -> DfsMetadataShardOperationFloor {
             let key = self.floor_key();
             let entries = self.control.get_authoritative_consistent(&[key]).unwrap();
@@ -10875,9 +10895,7 @@ mod tests {
             let record = self.record_for_payload(path, &payload);
             assert_eq!(record.status, crate::DfsPreparedOperationStatus::Committed);
             assert!(
-                self.service
-                    .metadata_backend()
-                    .unwrap()
+                self.primary_store()
                     .committed_prepared_operation(&record.digest)
                     .unwrap()
                     .is_some(),
@@ -10915,7 +10933,8 @@ mod tests {
             assert!(floor.prepared_sequence > 0);
             assert!(!floor.permit_id.is_empty());
             let shard_id = crate::DfsMetadataShardId::new(self.shard.shard_id.clone());
-            let backend = self.service.metadata_backend().unwrap();
+            let store = self.primary_store();
+            let backend: &dyn crate::DfsMetadataBackend = &*store;
             let batch = backend
                 .journal_batch_for_shard_since_limited(
                     &shard_id,
@@ -10983,9 +11002,7 @@ mod tests {
             // Select this producer's exact immutable identity, including its
             // committed row, without inventing a record from an observed head.
             let record = self
-                .service
-                .metadata_backend()
-                .unwrap()
+                .primary_store()
                 .prepared_operation_record(&captured.operation_id)
                 .unwrap()
                 .expect("actual operation-bound prepared body");
@@ -11049,12 +11066,7 @@ mod tests {
                 .expect("actual denied-create payload");
             let record = self.record_for_payload(path, &payload);
             assert_eq!(record.status, crate::DfsPreparedOperationStatus::Prepared);
-            let pending = self
-                .service
-                .metadata_backend()
-                .unwrap()
-                .list_prepared_operations()
-                .unwrap();
+            let pending = self.primary_store().list_prepared_operations().unwrap();
             assert!(
                 pending
                     .iter()
@@ -11070,9 +11082,7 @@ mod tests {
                 "an authority-read failure must not prepare an automatic abort of the sealed write"
             );
             assert!(
-                self.service
-                    .metadata_backend()
-                    .unwrap()
+                self.primary_store()
                     .get_object_by_path(&self.shard.file_system_id, path)
                     .unwrap()
                     .is_none()
@@ -11107,9 +11117,12 @@ mod tests {
                 "the actual Main recovery invocation remains deferred: {outcome:?}"
             );
             let mut recovered = self.runtime.client(&self.shard.primary_node_id).unwrap();
-            let actual = recovered
-                .metadata_backend()
-                .unwrap()
+            let recovered_store: Box<dyn crate::DfsMetadataBackend> = Box::new(
+                self.runtime
+                    .node_metadata(&self.shard.primary_node_id)
+                    .unwrap(),
+            );
+            let actual = recovered_store
                 .prepared_operation_record(&record.digest.operation_id)
                 .unwrap()
                 .expect("normal Main restart must retain this exact prepared operation");
@@ -11118,17 +11131,19 @@ mod tests {
             assert_eq!(actual.payload, record.payload);
             assert_eq!(actual.status, crate::DfsPreparedOperationStatus::Committed);
             assert!(
-                recovered
-                    .metadata_backend()
-                    .unwrap()
+                recovered_store
                     .committed_prepared_operation(&record.digest)
                     .unwrap()
                     .is_some()
             );
-            let stat = recovered.posix_stat(path).unwrap();
+            drop(recovered_store);
+            let stat = recovered.posix_stat_distributed(path).unwrap();
             assert_eq!(stat.object_id, expected.object_id);
             assert_eq!(stat.version, expected.version);
-            assert_eq!(recovered.posix_read_file(path).unwrap(), Vec::<u8>::new());
+            assert_eq!(
+                recovered.posix_read_file_distributed(path).unwrap(),
+                Vec::<u8>::new()
+            );
             drop(recovered);
             self.runtime.close().unwrap();
         }
@@ -11270,9 +11285,7 @@ mod tests {
                 )
         )), "original pending claim must reject the unrelated target collision");
         let retained = fixture
-            .service
-            .metadata_backend()
-            .unwrap()
+            .primary_store()
             .prepared_operation_record(&original.digest.operation_id)
             .unwrap()
             .unwrap();
@@ -11346,8 +11359,9 @@ mod tests {
         desired.replica_node_ids.push(added);
         desired.replica_node_ids.sort();
         desired.epoch += 1;
-        let gate = fixture
-            .service
+        // The shard fence guard belongs to the store-backed owning service.
+        let fence_owner = fixture.runtime.metadata_primary_service("/").unwrap();
+        let gate = fence_owner
             .metadata_shard_fence_guard(&fixture.shard.file_system_id, &fixture.shard.shard_id)
             .unwrap();
         let handoff = DfsControlPlaneStore::new(fixture.control.as_mut())
@@ -11356,7 +11370,7 @@ mod tests {
             .unwrap();
         assert_eq!(handoff.required_prepared_sequence, floor.prepared_sequence);
         let shard_id = crate::DfsMetadataShardId::new(fixture.shard.shard_id.clone());
-        let backend = fixture.service.metadata_backend().unwrap();
+        let backend = fence_owner.metadata_backend().unwrap();
         let sequence = backend
             .metadata_shard_statuses()
             .unwrap()
@@ -11379,6 +11393,7 @@ mod tests {
             .acknowledge_metadata_shard_membership_handoff_fence(&handoff, &stale_fence),
             Err(KvError::Serialization { detail }) if detail.contains("below required prepared floor")));
         drop(gate);
+        drop(fence_owner);
         fixture.runtime.clear_faults();
         let active = fixture
             .runtime

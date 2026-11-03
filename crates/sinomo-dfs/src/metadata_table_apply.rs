@@ -2679,6 +2679,11 @@ mod tests {
         let mut writer = native.client(&promoted).unwrap();
         let mut written = Vec::new();
         for index in 0..64 {
+            // Delegated writes resolve through Main; seal each bounded RPC
+            // observation window so close still verifies complete coverage.
+            if index % 16 == 0 {
+                native.checkpoint_rpc_observation_window().unwrap();
+            }
             written.push(
                 writer
                     .posix_write_file(
@@ -2779,10 +2784,13 @@ mod tests {
         service
             .posix_mkdir_all("/services/checkpoint-source")
             .unwrap();
-        let original_object = service
-            .lookup_sifs_path("/services/checkpoint-source")
-            .unwrap()
-            .unwrap();
+        let original_object = crate::DfsMetadataBackend::get_object_by_path(
+            &native.node_metadata(&config.primary_node_id).unwrap(),
+            &config.file_system_id,
+            "/services/checkpoint-source",
+        )
+        .unwrap()
+        .unwrap();
         let original_root =
             crate::default_dfs_metadata_shards_root(native.data_dir(&config.primary_node_id))
                 .join(&config.shard_id);

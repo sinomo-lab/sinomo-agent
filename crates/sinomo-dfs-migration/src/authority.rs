@@ -3702,7 +3702,7 @@ mod provider_lifecycle_tests {
         };
         let (positive, pending_opens) = open(true);
         let positive = match positive {
-            Ok(mut client) => client.posix_stat("/")
+            Ok(mut client) => client.posix_stat_distributed("/")
                 .map(|stat| stat.file_system_id).map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         };

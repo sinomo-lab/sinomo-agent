@@ -103,15 +103,9 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
             },
         )
         .unwrap();
-    let object = client
-        .metadata_backend()
-        .unwrap()
-        .get_object(&stat.object_id)
-        .unwrap()
-        .unwrap();
-    let intent = client
-        .metadata_backend()
-        .unwrap()
+    let node_store = native.node_metadata(&local).unwrap();
+    let object = node_store.get_object(&stat.object_id).unwrap().unwrap();
+    let intent = node_store
         .intents_for_object(&stat.object_id)
         .unwrap()
         .into_iter()
@@ -127,6 +121,7 @@ fn verified_blob_fetch_serves_while_global_maintenance_owns_metadata() {
         "native write retained its actual coordinator"
     );
     let forged_primary = NodeId::generate();
+    drop(node_store);
     drop(client);
     // Warm the actual global resident generation before maintenance takes it.
     handle_daemon_dfs_message_on_runtime(

@@ -3188,13 +3188,14 @@ mod filesystem_preparation_recovery_tests {
 
     #[test]
     fn native_filesystem_retry_rejects_ambiguous_bodies_and_recovers_each_original() {
-        let (mut native, mut requester, shard) =
+        let (mut native, requester, shard) =
             crate::test_support::current_native_metadata_service(
                 "native-filesystem-original-preparation-ambiguity",
                 3,
                 "/",
             )
             .unwrap();
+        drop(requester);
         assert_eq!(shard.replica_node_ids.len(), 2);
         let diagnostics = std::iter::once(&shard.primary_node_id)
             .chain(&shard.replica_node_ids)
@@ -3214,6 +3215,8 @@ mod filesystem_preparation_recovery_tests {
         drop(initial);
         let mut requested = original.clone();
         requested.display_name = "actual independent filesystem requests".into();
+        // Filesystem publication belongs to the store-backed owning service.
+        let mut requester = native.metadata_primary_service("/").unwrap();
         native.stop_node(&receiver).unwrap();
         let first = requester.add_file_system(requested.clone());
         assert!(matches!(
