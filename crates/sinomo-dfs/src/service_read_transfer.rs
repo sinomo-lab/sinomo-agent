@@ -190,7 +190,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None => {
                 let reader = match self.content.open_blob_stream(&content_hash) {
                     Ok(reader) => ObjectVersionReader::from_blob(reader),
-                    Err(_) => return Ok(Some((DfsReadResult::NotFound, false))),
+                    // A patched version has no whole blob; serve the object's
+                    // content for that identity, as ranged reads do.
+                    Err(_) => {
+                        let Some(size_bytes) = hinted_size else {
+                            return Ok(Some((DfsReadResult::NotFound, false)));
+                        };
+                        match self.content.open_object_content_range_stream(
+                            object_id.as_str(),
+                            &content_hash,
+                            size_bytes,
+                            0,
+                            dfs_byte_count_to_usize("DFS read response", size_bytes)?,
+                        )? {
+                            Some((_, reader)) => reader,
+                            None => return Ok(Some((DfsReadResult::NotFound, false))),
+                        }
+                    }
                 };
                 let total_size_bytes = reader.size_bytes();
                 if hinted_size.is_some_and(|expected| expected != total_size_bytes) {

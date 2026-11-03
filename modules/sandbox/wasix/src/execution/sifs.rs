@@ -279,7 +279,7 @@ impl SifsStagedSandboxCommandRunner {
         let effective_cwd = cwd_override.unwrap_or_else(|| manifest.cwd.clone());
         let mut sifs_fs = self.sifs_filesystem(sifs_store.into_inner(), &manifest);
         sifs_fs.ensure_workspace()?;
-        validate_sandbox_working_directory(&sifs_fs, &effective_cwd)?;
+        validate_sandbox_working_directory(&mut sifs_fs, &effective_cwd)?;
         let snapshot_roots = sandbox_snapshot_roots_for_manifest(&manifest);
         let before_snapshot =
             snapshot_sandbox_filesystem_with_roots(&mut sifs_fs, &snapshot_roots)?;

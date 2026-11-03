@@ -407,7 +407,8 @@ mod tests {
                 .any(|capability| capability.as_str() == "dfs.object.transfer")
         );
         for route in &registration.surfaces.object_rpc_routes {
-            let expected_exact = route.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+            let expected_exact = route.route == crate::DFS_CONTENT_ADVERTISEMENT_LIVE_ROUTE
+                || route.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
                 || route.route == crate::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
                 || route.route == crate::source_adoption::SOURCE_ADOPTION_ROUTE
                 || crate::dfs_route_is_message_data_plane(&route.route);

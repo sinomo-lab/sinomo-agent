@@ -50,11 +50,16 @@ module dfs_metadata_journal_source_safety {
     )
 
 
-  def configuredReplicaProcessorRequiresLocalReplica: bool =
+  def configuredShardIngestRequiresLocalReplica: bool =
     accepted.forall(case =>
       any {
         case.surface == ReplicationJournal and case.hasContext,
         case.surface == ReplicationSnapshot,
+        case.surface == ServiceJournal
+          and case.hasControlPlane
+          and case.batchHasFileSystem
+          and case.shardConfigured,
+        case.surface == ServiceSnapshot and case.hasControlPlane and case.shardConfigured,
       } implies case.localConfiguredReplica
     )
 
@@ -98,7 +103,7 @@ module dfs_metadata_journal_source_safety {
     replicationSnapshotUsesPrimarySource,
     serviceJournalWithConfiguredShardUsesPrimaryTransport,
     serviceSnapshotWithConfiguredShardUsesPrimaryTransport,
-    configuredReplicaProcessorRequiresLocalReplica,
+    configuredShardIngestRequiresLocalReplica,
     primaryDoesNotApplyReplicaFeedWhenConfigKnown,
     missingSourceRejectedWhenStandaloneContextRequiresIt,
     acceptedAndRejectedAreDisjoint,

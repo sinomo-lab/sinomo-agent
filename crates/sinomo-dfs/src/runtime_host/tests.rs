@@ -17063,6 +17063,7 @@ fn native_retained_shard_slot_keeps_the_actual_queued_checkout() {
             crate::default_dfs_metadata_shards_root(data_dir),
             configs,
             &local,
+            &BTreeSet::new(),
         )
         .unwrap();
     let next = current.scope_shard(&root.file_system_id, &root_id).unwrap();

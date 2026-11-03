@@ -436,7 +436,7 @@ where
                         SandboxAuditDurability::Buffered,
                     )?;
                 }
-                if let Some(record) = self.http_exchange_record_for_command(&fs, &command_id)? {
+                if let Some(record) = self.http_exchange_record_for_command(&mut fs, &command_id)? {
                     self.hooks.append_event(
                         sandbox_http_exchange_event(execution_node_id, &record),
                         SandboxAuditDurability::Buffered,
@@ -615,8 +615,8 @@ where
                 .with_replica_candidates(replica_candidates.clone());
         }
         if cwd_changed || mounts_reconciliation.replacement_requested {
-            let fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-            validate_sandbox_working_directory(&fs, &manifest.cwd)?;
+            let mut fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
+            validate_sandbox_working_directory(&mut fs, &manifest.cwd)?;
             store = SifsSandboxInstanceStore::new(fs.into_inner())
                 .with_replica_candidates(replica_candidates);
         }
@@ -871,8 +871,8 @@ where
         T: DfsMessageTransport,
     {
         let manifest = store.load(&request.sandbox_id)?;
-        let fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-        let entries = fs.list(&request.path)?;
+        let mut fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
+        let entries = fs.list_mut(&request.path)?;
         Ok(SandboxListResponse { entries })
     }
 
@@ -885,8 +885,8 @@ where
         T: DfsMessageTransport,
     {
         let manifest = store.load(&request.sandbox_id)?;
-        let fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-        let bytes = fs.read(&request.path, request.range)?;
+        let mut fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest);
+        let bytes = fs.read_mut(&request.path, request.range)?;
         Ok(SandboxReadResponse { bytes })
     }
 
@@ -905,10 +905,10 @@ where
         let node_id = store.dfs.node_id().clone();
         let manifest = store.load(&request.sandbox_id)?;
         self.validate_manifest_policy(&config.policy, &node_id, &manifest, "sandbox-write")?;
-        let fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest)
+        let mut fs = SifsSandboxFileSystem::new(store.into_inner(), &manifest)
             .with_replica_candidates(replica_candidates.clone());
         if let Err(error) = validate_sandbox_write_resource_limits(
-            &fs,
+            &mut fs,
             &request.path,
             request.bytes.len() as u64,
             &manifest.limits,
@@ -1149,21 +1149,21 @@ where
 
     fn http_exchange_record_for_command<F>(
         &mut self,
-        sandbox_fs: &F,
+        sandbox_fs: &mut F,
         command_id: &SandboxCommandId,
     ) -> Result<Option<SandboxHttpExchangeRecord>, H::Error>
     where
         F: SandboxFileSystem,
     {
         let logs_path = SandboxPath::new("/logs").expect("static logs path");
-        let mut entries = sandbox_fs.list(&logs_path)?;
+        let mut entries = sandbox_fs.list_mut(&logs_path)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let prefix = format!("/logs/{command_id}.");
         for entry in entries {
             let path = entry.path;
             let path_text = path.as_str();
             if path_text.starts_with(&prefix) && path_text.ends_with(".http.sobj") {
-                let bytes = sandbox_fs.read(&path, None)?;
+                let bytes = sandbox_fs.read_mut(&path, None)?;
                 return Ok(Some(decode_http_exchange_record(&bytes)?));
             }
         }

@@ -3524,8 +3524,8 @@ fn sifs_cluster_distributed_read_refreshes_metadata_after_local_location_prune()
 }
 
 #[test]
-fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
-    let cluster = sifs_outsider_cluster("sifs-outsider-sync-pull-reads");
+fn sifs_non_replica_node_reads_through_the_primary() {
+    let cluster = sifs_outsider_cluster("sifs-outsider-primary-reads");
     let SifsPosixCluster {
         _runtime,
         root,
@@ -3535,8 +3535,8 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
         ..
     } = cluster;
 
-    let path = "/users/sync-pull.txt";
-    let bytes = b"pulled through SyncPath".to_vec();
+    let path = "/users/primary-read.txt";
+    let bytes = b"read through the primary".to_vec();
     let mut primary = primary;
     primary
         .posix_write_file(
@@ -3546,11 +3546,11 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
         )
         .expect("primary local write");
 
-    // The outsider never received a journal push; the distributed stat must
-    // pull the shard journal from the primary and surface the file.
+    // The outsider keeps no copy of the shard; the distributed stat asks the
+    // primary and surfaces the file.
     let stat = observer
         .posix_stat_distributed(path)
-        .expect("outsider stat converges via sync pull");
+        .expect("outsider stat reads the primary");
     assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
 
     // Content reads fetch remotely as before.
@@ -3561,8 +3561,7 @@ fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
         bytes
     );
 
-    // A genuinely missing path stays NotFound: the pull catches the mirror up
-    // and then reports the authoritative miss instead of spinning.
+    // A genuinely missing path reports the primary's authoritative miss.
     assert!(matches!(
         observer.posix_stat_distributed("/users/never-created.txt"),
         Err(DfsPosixError::NotFound { .. })
@@ -3700,7 +3699,7 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
 
 // One foreground window only. A late completion constructed before this cursor
 // cannot stand in for the read's newly constructed native carrier invocation.
-fn assert_fresh_replica_lookup_without_sync_pull(
+fn assert_fresh_replica_lookup(
     runtime: &crate::test_runtime::DfsTestRuntime,
     capture: &crate::test_runtime::NativeNamespaceReadCapture,
     cursor: usize,
@@ -3720,12 +3719,6 @@ fn assert_fresh_replica_lookup_without_sync_pull(
                     && !request.include_metadata_journal_batches
                     && matches!(&request.operation, DfsNamespaceOperation::LookupPath { path: actual, .. } if actual == path))
     }), "the actual Main owner must receive this reader's exact path lookup");
-    assert!(!records.iter().any(|record| {
-        record.source_node_id == *source
-            && matches!(&record.message, DfsNetworkMessage::NamespaceRequest(request)
-                if request.file_system_id == sifs_file_system_id()
-                    && matches!(&request.operation, DfsNamespaceOperation::SyncPath { path: actual } if actual == path))
-    }), "this read must not request journal catch-up for its path");
 
     assert_eq!(runtime.observation_dropped_count(), 0);
     let observations = runtime.rpc_observations();
@@ -3851,7 +3844,7 @@ fn sifs_replica_distributed_read_prefers_primary_over_stale_local_hit() {
         read, new,
         "distributed/current reads must prefer the shard primary over a stale replica-local hit"
     );
-    assert_fresh_replica_lookup_without_sync_pull(
+    assert_fresh_replica_lookup(
         &cluster._runtime,
         &capture,
         cursor,
@@ -3941,7 +3934,7 @@ fn sifs_replica_read_miss_queries_primary_without_pulling_metadata() {
         serde_json::to_value(&before).expect("actual before held view"),
         "distributed reads must not replay metadata into the reader's backend"
     );
-    assert_fresh_replica_lookup_without_sync_pull(
+    assert_fresh_replica_lookup(
         &_runtime,
         &capture,
         cursor,
@@ -4161,24 +4154,6 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
         }),
     );
     assert!(dfs_message_is_read_only_request(&lookup_paths));
-
-    let sync = test_dfs_message_command_from_message(
-        &local,
-        &remote,
-        3,
-        DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
-            request_id: "sync-request".to_string(),
-            file_system_id: file_system_id.clone(),
-            requesting_node_id: local.clone(),
-            include_metadata_journal_batches: true,
-            metadata_journal_after_sequences: Vec::new(),
-            authority_shards: Vec::new(),
-            operation: DfsNamespaceOperation::SyncPath {
-                path: "/services/example.txt".to_string(),
-            },
-        }),
-    );
-    assert!(!dfs_message_is_read_only_request(&sync));
 
     let apply = test_dfs_message_command_from_message(
         &local,

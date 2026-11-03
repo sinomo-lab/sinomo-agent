@@ -1219,7 +1219,7 @@ impl SifsFileManagerBackend {
             // its mutex for one bounded metadata page, then release it before
             // resuming from the returned cursor.
             let page = {
-                let service = self.lock_service()?;
+                let mut service = self.lock_service()?;
                 service
                     .placement_impact_page_for_config_with_unavailable_nodes(
                         config,
@@ -5502,8 +5502,8 @@ fn sifs_write_options(
         candidates.insert(0, service.node_id().clone());
     }
     let object_policy = service
-        .posix_stat(path)
-        .map(|stat| stat.policy)
+        .posix_existing_object_policy(path)
+        .map_err(|error| error.to_string())?
         .unwrap_or(sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual);
     let (_, advertisements, policy) = service
         .managed_replication_policy_for_path(path, object_policy, candidates.len())

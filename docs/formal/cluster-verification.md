@@ -1316,7 +1316,8 @@ The `dfs_metadata_journal_source_safety.safety` invariant combines these propert
   when replica context is present;
 - service-level handlers with control-plane shard config accept only
   current-primary transport sources;
-- the standalone processor requires the local node to be a configured replica;
+- with known shard configuration, every surface requires the local node to be
+  a configured replica (including one a pending membership handoff is adding);
 - a configured primary does not apply its own replica feed;
 - missing source ids are rejected on strict standalone-context paths and service
   snapshot install.
@@ -1324,12 +1325,10 @@ The `dfs_metadata_journal_source_safety.safety` invariant combines these propert
 This maps to `validate_dfs_metadata_journal_batch_source`,
 `validate_dfs_metadata_snapshot_install_source`,
 `NetworkedDfsService::handle_metadata_journal_batch`, and
-`NetworkedDfsService::handle_metadata_snapshot_install`. The model deliberately
-captures the implementation distinction that service-level routed catch-up may
-accept primary-sourced data for non-replica mirrors, while the standalone
-replica processor requires configured replica membership. It also preserves the
-implementation's no-context/no-control-plane escape hatches instead of treating
-them as proof of configured cluster safety.
+`NetworkedDfsService::handle_metadata_snapshot_install`. Only a shard's
+replicas ingest its metadata; any other node reads the shard through its
+primary. The model preserves the implementation's no-context/no-control-plane
+escape hatches instead of treating them as proof of configured cluster safety.
 
 The `dfs_repair_authorization_safety.safety` invariant combines these properties:
 

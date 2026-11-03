@@ -101,6 +101,38 @@ pub(crate) fn remove_object_shard_index(root: &Path, object_id: &DfsObjectId) ->
     remove_file_if_exists(&object_shard_index_path(root, object_id))
 }
 
+/// Remove every index row that routes into one of `shard_ids`.
+pub(crate) fn remove_object_shard_index_rows_for_shards(
+    root: &Path,
+    shard_ids: &std::collections::BTreeSet<DfsMetadataShardId>,
+) -> Result<()> {
+    let directory = root.join("shard-index").join("objects");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(MetadataBackendError::Io {
+                path: directory,
+                source,
+            });
+        }
+    };
+    for entry in entries {
+        let path = entry
+            .map_err(|source| MetadataBackendError::Io {
+                path: directory.clone(),
+                source,
+            })?
+            .path();
+        if let Ok(record) = read_sobj::<DfsObjectShardIndexRecord>(&path)
+            && shard_ids.contains(&record.shard_id)
+        {
+            remove_file_if_exists(&path)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn object_shard_index_record(
     object: &DfsObjectMetadata,
     shard_id: &DfsMetadataShardId,

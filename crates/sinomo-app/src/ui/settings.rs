@@ -8971,21 +8971,20 @@ fn section_remote_management_body(shared: &Shared, reader: &ThemeReader) -> impl
         });
         devices = devices.row(
             SettingRow::new(label)
-                .control(synced_switch(
-                    Switch::new("")
-                        .semantic_name(format!("Share {label}"))
-                        .theme_when(clone_reader(reader))
-                        .on_change(move |enabled| {
-                            queue_settings_operation(
-                                &s,
-                                SettingsOperationScope::RemoteManagementPermission,
-                                SettingsOperation::SetDeviceExposure {
-                                    kind: kind.into(),
-                                    enabled,
-                                },
-                            );
-                        }),
+                .control(setting_switch_from(
+                    reader,
+                    &format!("Share {label}"),
                     checked,
+                    move |enabled| {
+                        queue_settings_operation(
+                            &s,
+                            SettingsOperationScope::RemoteManagementPermission,
+                            SettingsOperation::SetDeviceExposure {
+                                kind: kind.into(),
+                                enabled,
+                            },
+                        );
+                    },
                 ))
                 .build(shared),
         );
@@ -20751,6 +20750,71 @@ mod tests {
                 .as_deref()
                 .is_some_and(|status| status.contains("restart that node's daemon"))
         );
+    }
+
+    #[test]
+    fn device_sharing_switches_follow_refreshed_state_without_remounting() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared
+            .settings_mut()
+            .remote_management
+            .shared_devices
+            .clear();
+        let reader = shared_reader(&shared);
+        let runtime = sui::Application::new()
+            .window(sui::WindowBuilder::new().root(ScrollView::vertical(
+                section_remote_management_body(&shared, &reader),
+            )))
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let switches = || -> sui::Result<Vec<_>> {
+            Ok(window
+                .snapshot()?
+                .accessibility
+                .nodes
+                .into_iter()
+                .filter(|node| {
+                    node.name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("Share "))
+                })
+                .map(|node| (node.id, node.name.unwrap(), node.state.checked))
+                .collect())
+        };
+        let initial = switches()?;
+        assert_eq!(initial.len(), 4);
+        assert!(
+            initial
+                .iter()
+                .all(|(_, _, state)| *state == Some(sui::ToggleState::Unchecked))
+        );
+        for (devices, expected) in [
+            (vec!["microphone".to_string()], vec!["Share Microphone"]),
+            (
+                vec!["camera".to_string(), "speaker".to_string()],
+                vec!["Share Camera", "Share Speaker"],
+            ),
+            (Vec::new(), Vec::new()),
+        ] {
+            shared.settings_mut().remote_management.shared_devices = devices;
+            let current = switches()?;
+            assert_eq!(current.len(), initial.len());
+            for ((id, name, state), (original_id, original_name, _)) in current.iter().zip(&initial)
+            {
+                assert_eq!((id, name), (original_id, original_name));
+                assert_eq!(
+                    *state,
+                    Some(if expected.contains(&name.as_str()) {
+                        sui::ToggleState::Checked
+                    } else {
+                        sui::ToggleState::Unchecked
+                    })
+                );
+            }
+        }
+        assert!(!shared.settings().remote_management.permission_enabled);
+        Ok(())
     }
 
     #[test]

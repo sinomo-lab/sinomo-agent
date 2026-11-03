@@ -282,9 +282,9 @@ impl LocalStagedSandboxCommandRunner {
         let (manifest, layout) = store.load(sandbox_id)?;
         let limits = limits.unwrap_or_else(|| manifest.limits.clone());
         let effective_cwd = cwd_override.unwrap_or_else(|| manifest.cwd.clone());
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         sandbox_fs.validate_resource_limits(&limits)?;
-        validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
+        validate_sandbox_working_directory(&mut sandbox_fs, &effective_cwd)?;
         let before = sandbox_fs.snapshot()?;
         let started_at = OffsetDateTime::now_utc();
 

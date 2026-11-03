@@ -482,6 +482,32 @@ pub struct DfsMetadataReplicaShardContext {
     pub pending_membership_handoff: Option<DfsMetadataShardMembershipHandoff>,
 }
 
+impl DfsMetadataReplicaShardContext {
+    /// Whether the local node holds a copy of this shard.
+    pub fn local_node_holds_copy(&self) -> bool {
+        node_holds_metadata_shard_copy(
+            &self.shard,
+            self.pending_membership_handoff.as_ref(),
+            &self.local_node_id,
+        )
+    }
+}
+
+/// Whether `node_id` holds a copy of `shard`: it is the primary or a
+/// configured replica, or the pending membership handoff adds it. Only such a
+/// node ingests the shard's journal and snapshots; any other node discards its
+/// copy and reads the shard through the primary.
+pub fn node_holds_metadata_shard_copy(
+    shard: &DfsMetadataShardConfig,
+    pending_membership_handoff: Option<&DfsMetadataShardMembershipHandoff>,
+    node_id: &NodeId,
+) -> bool {
+    crate::service_routed_journal::shard_lists_node(shard, node_id)
+        || pending_membership_handoff.is_some_and(|handoff| {
+            crate::service_routed_journal::shard_lists_node(&handoff.desired_shard, node_id)
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DfsMetadataJournalReplicationOptions {
     pub batch_entry_limit: usize,

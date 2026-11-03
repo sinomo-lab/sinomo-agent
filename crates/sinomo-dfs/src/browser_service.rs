@@ -1948,7 +1948,7 @@ impl DfsBrowserBackend {
             // mutex for one bounded metadata page keeps large subtree previews
             // from starving unrelated reads and writes.
             let page = {
-                let service = self.lock_service_for_read()?;
+                let mut service = self.lock_service_for_read()?;
                 service
                     .placement_impact_page_for_config_with_snapshot_and_unavailable_nodes(
                         config,
@@ -3305,22 +3305,13 @@ fn sifs_browser_write_options_with_configuration<T: DfsMessageTransport>(
     configuration: Option<&crate::DfsWriteConfigurationProjection>,
 ) -> Result<crate::DfsWriteOptions, ServiceError> {
     let trace_started = crate::dfs_perf_trace_enabled().then(Instant::now);
-    let object_policy = if service.metadata_backend().is_none()
-        && service.transport.delegates_local_namespace_authority()
-    {
-        // A backendless requester must retain an existing object's policy
-        // through its authority rather than treating an empty local hint as
-        // a newly created eventual object.
-        match service.with_stat_deadline(|service| service.file_history_capture_object(path)) {
-            Ok(object) => object.policy,
-            Err(DfsPosixError::NotFound { .. }) => sinomo_core::DfsObjectPolicy::ReplicatedEventual,
-            Err(error) => return Err(dfs_browser_service_error(error)),
-        }
-    } else {
-        service
-            .posix_object_policy(path)
-            .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual)
-    };
+    // An existing object's policy comes from its authority; a node that does
+    // not replicate the path must not mistake its absence locally for a new
+    // eventual object.
+    let object_policy = service
+        .posix_existing_object_policy(path)
+        .map_err(dfs_browser_service_error)?
+        .unwrap_or(sinomo_core::DfsObjectPolicy::ReplicatedEventual);
     let object_policy_us = trace_started.map_or(0, |start| start.elapsed().as_micros());
     let policy_started = trace_started.map(|_| Instant::now());
     let policy = match configuration {

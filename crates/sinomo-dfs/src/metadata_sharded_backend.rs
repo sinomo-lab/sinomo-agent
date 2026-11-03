@@ -180,6 +180,26 @@ fn compile_routing_indexes(
         .collect()
 }
 
+/// Delete this node's local copies of `shard_ids` under the sharded metadata
+/// root, together with the object-shard index rows routing into them. Each
+/// shard root stays in place and its slot reopens empty; a node later added
+/// back as a replica receives the shard again from its primary.
+pub fn discard_local_metadata_shard_copies(
+    root: &Path,
+    shard_ids: &BTreeSet<DfsMetadataShardId>,
+) -> Result<()> {
+    for shard_id in shard_ids {
+        let shard_root = root.join(key_segment(&shard_id.0));
+        if shard_root.is_dir() {
+            crate::metadata_table_store::discard_metadata_backend_state(&shard_root)?;
+        }
+    }
+    if shard_ids.is_empty() {
+        return Ok(());
+    }
+    crate::metadata_shard_index::remove_object_shard_index_rows_for_shards(root, shard_ids)
+}
+
 fn load_routing_topology_history(
     root: &std::path::Path,
     active: &[DfsMetadataShardConfig],
@@ -1331,11 +1351,14 @@ impl ResidentLocalShardedMetadataBackend {
     /// Rebuild the normal router while retaining only identical physical
     /// shard slots. The caller's current authority generation still owns
     /// admission; this DATA comparison creates no writer capability.
+    /// Rebuild the router for `shards`. The local copies named by `discarded`
+    /// are deleted before the changed slots reopen.
     pub(crate) fn into_reconfigured_for_replica_repair(
         self,
         root: PathBuf,
         mut shards: Vec<DfsMetadataShardConfig>,
         local_node_id: &NodeId,
+        discarded: &BTreeSet<DfsMetadataShardId>,
     ) -> Result<Self> {
         canonicalize_routing_topology(&mut shards);
         let reusable = self.with_router(
@@ -1349,6 +1372,9 @@ impl ResidentLocalShardedMetadataBackend {
                         continue;
                     }
                     let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+                    if discarded.contains(&shard_id) {
+                        continue;
+                    }
                     let Some(slot) = self.inner.shards.get(&shard_id) else {
                         continue;
                     };
@@ -1397,6 +1423,7 @@ impl ResidentLocalShardedMetadataBackend {
         // normal current opening. Retained exact slots keep their one shared
         // checkout state, status and instance; no second pool is opened.
         drop(self);
+        discard_local_metadata_shard_copies(&root, discarded)?;
         let mut current = LocalShardedMetadataBackend::open_with_retained_shards_and_layout(
             root,
             shards,
@@ -2339,6 +2366,15 @@ impl LocalShardedMetadataBackend {
         }
     }
 
+    fn shard_is_locally_replicated(&self, shard_id: &DfsMetadataShardId) -> bool {
+        self.local_node_id.as_ref().is_none_or(|local_node_id| {
+            self.shard_configs.get(&shard_id.0).is_some_and(|config| {
+                config.primary_node_id == *local_node_id
+                    || config.replica_node_ids.contains(local_node_id)
+            })
+        })
+    }
+
     fn shard_is_local_authoritative_primary(&self, shard_id: &DfsMetadataShardId) -> bool {
         self.local_node_id.as_ref().is_none_or(|local_node_id| {
             self.shard_configs
@@ -2815,6 +2851,51 @@ impl LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
         self.object_is_visible_from_shard(object, shard_id)
+    }
+
+    /// One shard's objects under `subtree_path`, without rows another shard
+    /// now owns. Cursors stay local to the shard.
+    fn subtree_object_page_on_shard(
+        &self,
+        query: &crate::DfsMetadataShardQuery,
+        subtree_path: &str,
+        after: Option<&DfsObjectPageCursor>,
+        limit: usize,
+    ) -> Result<crate::DfsMetadataQueryResult> {
+        let subtree_path = crate::posix_path::normalize_posix_path(subtree_path)
+            .map_err(|error| MetadataBackendError::Serde(error.to_string()))?;
+        let limit = limit.min(crate::file_history_query::DFS_SUBTREE_OBJECT_PAGE_LIMIT);
+        let backend = self.shard_backend(&query.shard_id)?;
+        let mut objects = Vec::new();
+        let mut cursor = after.cloned();
+        while objects.len() < limit {
+            let page = backend.objects_for_subtree_page(
+                &query.file_system_id,
+                &subtree_path,
+                cursor.as_ref(),
+                limit - objects.len(),
+            )?;
+            for object in page.objects {
+                cursor = Some(DfsObjectPageCursor {
+                    path: object.path.clone(),
+                    object_id: object.object_id.clone(),
+                    shard_id: None,
+                });
+                if self.object_is_listable_from_shard(&object, &query.shard_id)? {
+                    objects.push(object);
+                }
+            }
+            if page.next_cursor.is_none() {
+                return Ok(crate::DfsMetadataQueryResult::SubtreeObjectPageV1 {
+                    objects,
+                    next_cursor: None,
+                });
+            }
+        }
+        Ok(crate::DfsMetadataQueryResult::SubtreeObjectPageV1 {
+            objects,
+            next_cursor: cursor,
+        })
     }
 
     fn intent_is_listable_from_shard(
@@ -5327,6 +5408,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         if query.shard_id.0.is_empty() {
             return crate::file_history_query::query_backend_metadata(self, query);
         }
+        if let crate::DfsMetadataSelection::SubtreeObjectPageV1 { path, after, limit } =
+            &query.selection
+        {
+            return self.subtree_object_page_on_shard(query, path, after.as_ref(), *limit);
+        }
         self.shard_backend(&query.shard_id)?
             .query_file_history_on_shard(query)
     }
@@ -5553,7 +5639,13 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     ) -> Result<crate::metadata_api::DfsMetadataHistoryEffectsPlan> {
         let mut report = DfsMetadataHistoryGcReport::for_options(&options);
         let mut effects_by_scope = BTreeMap::new();
-        let ids = self.shards.keys().cloned().collect::<Vec<_>>();
+        // Only a shard's primary applies its history effects.
+        let ids = self
+            .shards
+            .keys()
+            .filter(|shard_id| self.shard_is_local_authoritative_primary(shard_id))
+            .cloned()
+            .collect::<Vec<_>>();
         for shard in ids {
             let plan = self
                 .shard_backend_mut(&shard)?
@@ -6027,6 +6119,11 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut summary = DfsMetadataSummary::default();
         let mut file_system_ids = BTreeSet::new();
         for (shard_id, slot) in &self.shards {
+            // A slot of a shard this node does not replicate is not kept
+            // current and is not part of its inventory.
+            if !self.shard_is_locally_replicated(shard_id) {
+                continue;
+            }
             let backend = slot.backend()?;
             let tables = backend.current_tables_snapshot()?;
             file_system_ids.extend(tables.file_systems.keys().cloned());

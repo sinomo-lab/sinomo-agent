@@ -40,8 +40,8 @@ impl LocalStagedSandboxCommandRunner {
     ) -> Result<SandboxProcessPlanOutcome, SandboxCommandExecutionError> {
         validate_sandbox_process_plan(plan)?;
         let (manifest, layout) = store.load(sandbox_id)?;
-        let sandbox_fs = LocalSandboxFileSystem::new(layout);
-        validate_sandbox_process_plan_working_directories(plan, &sandbox_fs, &manifest.cwd)?;
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
+        validate_sandbox_process_plan_working_directories(plan, &mut sandbox_fs, &manifest.cwd)?;
         let (toolchain, _toolchain_layout) =
             toolchain_store.load_manifest(&manifest.toolchain_id)?;
         validate_sandbox_process_plan_invocations(
@@ -148,7 +148,7 @@ impl LocalStagedSandboxCommandRunner {
         }
 
         let (manifest, layout) = store.load(sandbox_id)?;
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         let before = sandbox_fs.snapshot()?;
         if process_plan_needs_sequential_piped_input_accounting(plan, toolchain, &manifest)? {
             return Ok(None);
@@ -183,7 +183,12 @@ impl LocalStagedSandboxCommandRunner {
             sandbox_fs.validate_resource_limits(&limits)?;
             let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
             let effective_cwd = step.cwd.clone().unwrap_or_else(|| manifest.cwd.clone());
-            validate_process_plan_cwd(&sandbox_fs, &artifact_preopens, step_index, &effective_cwd)?;
+            validate_process_plan_cwd(
+                &mut sandbox_fs,
+                &artifact_preopens,
+                step_index,
+                &effective_cwd,
+            )?;
             let module = toolchain_command_modules
                 .get(&step.command_name)
                 .cloned()
@@ -527,7 +532,7 @@ fn prepared_limit_for_step(
 
 #[cfg(feature = "wasix-runtime")]
 fn validate_process_plan_cwd(
-    sandbox_fs: &LocalSandboxFileSystem,
+    sandbox_fs: &mut LocalSandboxFileSystem,
     extra_preopens: &[SandboxWasiPreopen],
     step_index: usize,
     cwd: &SandboxPath,

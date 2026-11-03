@@ -518,8 +518,8 @@ impl SandboxExecutorCommandRunner {
             response: None,
             error: Some("sandbox host stopped while the local guest was active".to_string()),
         };
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+        validate_sandbox_working_directory(&mut sandbox_fs, &effective_cwd)?;
         let before = sandbox_fs
             .snapshot_with_checkpoints(|| cancellation_checkpoint(&cancellation_token))?;
         validate_workspace_usage(&before.workspace_usage(), &limits)?;
@@ -853,8 +853,8 @@ impl SandboxExecutorCommandRunner {
         let local_execution_lease = try_acquire_sandbox_local_execution_lease(store, sandbox_id)?;
         recover_pending_daemonless_execution(store, &local_execution_lease, sandbox_id)?;
         let (manifest, layout) = store.load(sandbox_id)?;
-        let sandbox_fs = LocalSandboxFileSystem::new(layout);
-        validate_sandbox_process_plan_working_directories(plan, &sandbox_fs, &manifest.cwd)?;
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout);
+        validate_sandbox_process_plan_working_directories(plan, &mut sandbox_fs, &manifest.cwd)?;
         let (toolchain, _toolchain_layout) =
             toolchain_store.load_manifest(&manifest.toolchain_id)?;
         validate_sandbox_process_plan_invocations(

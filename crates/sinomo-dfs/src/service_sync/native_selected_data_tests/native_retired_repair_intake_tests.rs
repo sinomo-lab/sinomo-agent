@@ -899,9 +899,9 @@ fn native_intake_refuses_weak_cap_foreign_queue_physical_copy_and_ambiguous_atte
             .retain_native_owned_repair_completion(&completion)
             .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("original attempt witness belongs to another resident queue owner"),
+            error.to_string().contains(
+                "original attempt witness belongs to another native/resident physical owner"
+            ),
             "{error}"
         );
         assert_eq!(other.view().unwrap(), other_before);

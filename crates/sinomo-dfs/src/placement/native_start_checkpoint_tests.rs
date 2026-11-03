@@ -120,18 +120,6 @@ async fn native_first_page_checkpoints_scanning_before_dispatch_and_survives_coa
     );
     drop(source);
     let mut service = runtime.client(&coordinator).unwrap();
-    let synced = service
-        .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-            crate::sifs_file_system_id(),
-            primary.clone(),
-            DfsNamespaceOperation::SyncPath { path: path.clone() },
-            crate::DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
-            true,
-            false,
-        )
-        .unwrap();
-    assert_eq!(synced.result, crate::DfsNamespaceResult::Applied);
-    assert!(!synced.metadata_journal_has_more);
     assert_eq!(
         service
             .metadata_backend()

@@ -19,12 +19,10 @@ use crate::{
     DfsReadRangeData, NetworkedDfsService, PendingRoutedNamespaceResult, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
-use std::time::Instant;
 
 /// Routed-operation attempts when authority rejections redirect to the
 /// current shard primary (a stale local shard view names a former primary).
 const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
-const POSIX_ROUTED_DEEP_SYNC_ROUNDS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RoutedNamespaceNetworkRecovery {
@@ -355,7 +353,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     /// Whether this service answers reads of `path` from its own metadata:
     /// the path's shard is one it replicates, or no shard covers the path.
-    pub(super) fn local_metadata_answers_path_from_snapshot(
+    pub(crate) fn local_metadata_answers_path_from_snapshot(
         &self,
         path: &str,
         shard_snapshot: Option<&[DfsMetadataShardConfig]>,
@@ -367,10 +365,21 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .is_none_or(|shard| self.reads_shard_from_local_metadata(&shard)))
     }
 
+    /// Whether a write to `path` plans against this service's own metadata.
+    /// Only a service that reads the path's shard locally does; any other
+    /// reads the current object and parent from the shard's authority.
+    pub(super) fn plans_write_from_local_metadata(&mut self, path: &str) -> Result<bool> {
+        if self.metadata_backend.is_none() && self.transport.delegates_local_namespace_authority() {
+            return Ok(self.control_plane.is_none());
+        }
+        let shards = self.refresh_sifs_metadata_shards()?;
+        self.local_metadata_answers_path_from_snapshot(path, shards.as_deref())
+    }
+
     /// Whether this service answers reads of `shard` from its own metadata.
     /// Only the primary and replicas follow the shard's journal; any other
     /// node, and a caller delegating to its Main, reads through the primary.
-    pub(super) fn reads_shard_from_local_metadata(&self, shard: &DfsMetadataShardConfig) -> bool {
+    pub(crate) fn reads_shard_from_local_metadata(&self, shard: &DfsMetadataShardConfig) -> bool {
         !self.transport.delegates_local_namespace_authority()
             && self.is_local_metadata_replica_for_shard(shard)
     }
@@ -787,7 +796,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         &operation,
                         self.metadata_backend.as_deref(),
                     )?;
-                    self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
                     return Ok(routed.posix_coordination_result);
                 }
                 DfsNamespaceResult::Rejected {
@@ -870,43 +878,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             )
             .map_err(DfsPosixError::Dfs)?;
         match routed.result.clone() {
-            DfsNamespaceResult::Applied => {
-                self.finish_routed_namespace_catch_up_if_needed(&operation, &routed)?;
-                match routed.posix_coordination_result {
-                    Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
-                    _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
-                        message: "bounded namespace job response omitted its typed receipt"
-                            .to_string(),
-                    })),
-                }
-            }
+            DfsNamespaceResult::Applied => match routed.posix_coordination_result {
+                Some(DfsPosixCoordinationResult::NamespaceJob(job)) => Ok(job),
+                _ => Err(DfsPosixError::Dfs(DfsError::Distributed {
+                    message: "bounded namespace job response omitted its typed receipt".to_string(),
+                })),
+            },
             DfsNamespaceResult::Rejected {
                 reason,
                 posix_error,
                 ..
             } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
         }
-    }
-
-    fn finish_routed_namespace_catch_up_if_needed(
-        &mut self,
-        operation: &DfsNamespaceOperation,
-        routed: &PendingRoutedNamespaceResult,
-    ) -> Result<()> {
-        if !routed.metadata_journal_has_more
-            || matches!(
-                operation,
-                DfsNamespaceOperation::SyncPath { .. }
-                    | DfsNamespaceOperation::LookupPath { .. }
-                    | DfsNamespaceOperation::LookupPaths { .. }
-            )
-        {
-            return Ok(());
-        }
-        let Some(path) = operation.routing_path() else {
-            return Ok(());
-        };
-        self.sync_remote_namespace_path_until_quiet(path)
     }
 
     pub(super) fn route_namespace_operation_without_local_replay(
@@ -1217,8 +1200,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::ClearDirRecursive { path } => {
                 self.posix_clear_dir_recursive_local(path)
             }
-            DfsNamespaceOperation::SyncPath { .. }
-            | DfsNamespaceOperation::MetadataQuery { .. }
+            DfsNamespaceOperation::MetadataQuery { .. }
             | DfsNamespaceOperation::LookupPath { .. }
             | DfsNamespaceOperation::LookupPaths { .. } => Ok(()),
             DfsNamespaceOperation::ContentReference { .. } => {
@@ -1344,98 +1326,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .lookup_sifs_path_direct_distributed_synced_from_snapshot(&resolved, Some(&shards))?
             .ok_or(DfsPosixError::NotFound { path: resolved })?;
         self.stat_object(&object)
-    }
-
-    /// Replays a foreign primary's shard journal for a path this node just
-    /// mutated through a coordinated cross-shard operation, restoring
-    /// read-your-write for the foreign half.
-    pub(super) fn sync_remote_namespace_path(&mut self, path: &str) -> Result<()> {
-        if let Some(primary) = self.routed_namespace_primary_for_path(path)? {
-            self.route_namespace_operation(
-                primary,
-                DfsNamespaceOperation::SyncPath {
-                    path: path.to_string(),
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn sync_remote_namespace_path_until_quiet(&mut self, path: &str) -> Result<()> {
-        let operation = DfsNamespaceOperation::SyncPath {
-            path: path.to_string(),
-        };
-        let file_system_id = sifs_file_system_id();
-        let mut primary = match self.routed_namespace_primary_for_path(path)? {
-            Some(primary) => primary,
-            None => return Ok(()),
-        };
-        let deadline = Instant::now() + POSIX_READ_FRESHNESS_SYNC_TIMEOUT;
-        for _ in 0..POSIX_ROUTED_DEEP_SYNC_ROUNDS {
-            self.check_cancelled("routed namespace sync")?;
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(DfsPosixError::Dfs(DfsError::Network {
-                    message: format!(
-                        "routed namespace sync for {path} did not settle within {}ms",
-                        POSIX_READ_FRESHNESS_SYNC_TIMEOUT.as_millis()
-                    ),
-                }));
-            }
-            let routed = self
-                .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
-                    file_system_id.clone(),
-                    primary.clone(),
-                    operation.clone(),
-                    deadline.saturating_duration_since(now),
-                    true,
-                    true,
-                )
-                .map_err(DfsPosixError::Dfs)?;
-            match routed.result {
-                DfsNamespaceResult::Applied => {
-                    if !routed.metadata_journal_has_more {
-                        return Ok(());
-                    }
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current != primary => {
-                    primary = self
-                        .refreshed_primary_after_authority_redirect(
-                            &file_system_id,
-                            &operation,
-                            &primary,
-                            current,
-                        )
-                        .map_err(DfsPosixError::Dfs)?;
-                    if primary == self.node_id
-                        && !self.transport.delegates_local_namespace_authority()
-                    {
-                        return self.execute_namespace_operation_local(&operation);
-                    }
-                }
-                DfsNamespaceResult::Rejected {
-                    current_primary_node_id: Some(current),
-                    ..
-                } if current == self.node_id
-                    && !self.transport.delegates_local_namespace_authority() =>
-                {
-                    return self.execute_namespace_operation_local(&operation);
-                }
-                DfsNamespaceResult::Rejected {
-                    reason,
-                    posix_error,
-                    ..
-                } => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
-            }
-        }
-        Err(DfsPosixError::Dfs(DfsError::Network {
-            message: format!(
-                "routed namespace sync for {path} reached {POSIX_ROUTED_DEEP_SYNC_ROUNDS} batches before the journal settled"
-            ),
-        }))
     }
 
     /// Touches the parent directory mtime when this node is the metadata

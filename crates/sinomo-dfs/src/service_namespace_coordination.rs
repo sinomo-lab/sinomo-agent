@@ -207,7 +207,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Self::normalized_namespace_paths([request.path.as_str()], false, "file history")?
             }
             DfsNamespaceOperation::LookupPath { path, .. }
-            | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AbortPendingWrite { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }

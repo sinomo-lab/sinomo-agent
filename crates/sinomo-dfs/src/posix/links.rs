@@ -64,14 +64,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let (link_path, requires_directory) =
             normalize_posix_path_with_trailing_directory(link_path)?;
         let link_path = self.resolve_posix_path_distributed(&link_path, false)?;
+        // A service that does not plan writes from its own metadata checks
+        // the entry and its parent at their authority.
+        let plans_locally = self.plans_write_from_local_metadata(&link_path)?;
         if requires_directory {
-            self.ensure_resolved_path_is_directory_no_follow(&link_path)?;
+            if plans_locally {
+                self.ensure_resolved_path_is_directory_no_follow(&link_path)?;
+            } else {
+                match self.lookup_sifs_path_direct_distributed_synced(&link_path)? {
+                    Some(object) if object.kind == DfsObjectKind::Directory => {}
+                    Some(object) if object.kind != DfsObjectKind::Tombstone => {
+                        return Err(DfsPosixError::NotDirectory { path: link_path });
+                    }
+                    _ => return Err(DfsPosixError::NotFound { path: link_path }),
+                }
+            }
             return Err(DfsPosixError::AlreadyExists { path: link_path });
         }
         if link_path == "/" {
             return Err(DfsPosixError::InvalidPath { path: link_path });
         }
-        self.ensure_parent_directory(&link_path)?;
+        if plans_locally {
+            self.ensure_parent_directory(&link_path)?;
+        } else {
+            self.posix_write_parent_from_main(&link_path)?;
+        }
         // Resolving parent links deliberately skips the final entry. Its local
         // replica may still precede an acknowledged unlink, so select that
         // exact entry from its authority without following a dangling target.
@@ -144,14 +161,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             outcome
         };
         match outcome {
-            NetworkedDfsWriteOutcome::Committed { .. } => {
-                let object =
-                    self.lookup_sifs_path(&link_path)?
-                        .ok_or_else(|| DfsPosixError::NotFound {
-                            path: link_path.clone(),
-                        })?;
-                self.stat_object(&object)
-            }
+            NetworkedDfsWriteOutcome::Committed { .. } => self.committed_write_stat(&link_path),
             NetworkedDfsWriteOutcome::Pending {
                 intent_id,
                 durable_receipts,

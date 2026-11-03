@@ -155,7 +155,6 @@ pub(crate) fn dfs_namespace_operation_trace_label(
         DfsNamespaceOperation::SetTimes { .. } => "set-times",
         DfsNamespaceOperation::TouchDirectoryModified { .. } => "touch-directory-modified",
         DfsNamespaceOperation::ClearDirRecursive { .. } => "clear-dir-recursive",
-        DfsNamespaceOperation::SyncPath { .. } => "sync-path",
         DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
         DfsNamespaceOperation::LookupPaths { .. } => "lookup-paths",
         DfsNamespaceOperation::CommitLocalEventualBatch { .. } => "commit-local-eventual-batch",

@@ -989,7 +989,7 @@ fn local_sandbox_filesystem_reports_usage_and_quota_violations() {
     };
     assert!(matches!(
         validate_sandbox_write_resource_limits(
-            &fs,
+            &mut fs,
             &SandboxPath::new("/work/c.txt").expect("c"),
             3,
             &write_limits,
@@ -1000,7 +1000,7 @@ fn local_sandbox_filesystem_reports_usage_and_quota_violations() {
     write_limits.max_written_bytes_per_command = 2;
     assert!(matches!(
         validate_sandbox_write_resource_limits(
-            &fs,
+            &mut fs,
             &SandboxPath::new("/work/a.txt").expect("a"),
             3,
             &write_limits,
@@ -1013,7 +1013,7 @@ fn local_sandbox_filesystem_reports_usage_and_quota_violations() {
     write_limits.max_file_count = 3;
     assert!(matches!(
         validate_sandbox_write_resource_limits(
-            &fs,
+            &mut fs,
             &SandboxPath::new("/work/a.txt").expect("a"),
             8,
             &write_limits,
@@ -1022,7 +1022,7 @@ fn local_sandbox_filesystem_reports_usage_and_quota_violations() {
         SandboxFsError::QuotaExceeded { ref kind, .. } if kind == "workspace-bytes"
     ));
     let usage = validate_sandbox_write_resource_limits(
-        &fs,
+        &mut fs,
         &SandboxPath::new("/work/a.txt").expect("a"),
         2,
         &write_limits,
@@ -1579,7 +1579,7 @@ fn sifs_sandbox_working_directory_validation_follows_symlink_targets() {
     )
     .expect("create cwd symlink");
     validate_sandbox_working_directory(
-        &fs,
+        &mut fs,
         &SandboxPath::new("/work/current").expect("cwd symlink path"),
     )
     .expect("cwd validation follows symlink to directory");
@@ -1591,7 +1591,7 @@ fn sifs_sandbox_working_directory_validation_follows_symlink_targets() {
     .expect("create broken cwd symlink");
     assert!(matches!(
         validate_sandbox_working_directory(
-            &fs,
+            &mut fs,
             &SandboxPath::new("/work/broken").expect("broken cwd symlink path")
         ),
         Err(SandboxFsError::NotFound { .. })

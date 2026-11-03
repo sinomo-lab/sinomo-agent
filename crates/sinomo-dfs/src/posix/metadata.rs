@@ -1372,12 +1372,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object: &DfsObjectMetadata,
         captured_catalog: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsObjectMetadata> {
-        if object.kind != DfsObjectKind::Hardlink
-            || self.metadata_backend.is_some()
-            || !self.transport.delegates_local_namespace_authority()
-            || self.control_plane.is_none()
-        {
+        if object.kind != DfsObjectKind::Hardlink || self.control_plane.is_none() {
             return self.resolve_hardlink_target(object);
+        }
+        if self.metadata_backend.is_some() || !self.transport.delegates_local_namespace_authority()
+        {
+            // A target in a shard this node replicates reads locally; any
+            // other target is read from its authority.
+            return resolve_hardlink_target_with(object, |target_id| {
+                match self.current_read_object_metadata_distributed(target_id) {
+                    Ok(target) => Ok(Some(target)),
+                    Err(DfsError::UnknownObject { .. }) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            });
         }
         let owned_catalog;
         let catalog = match captured_catalog {
@@ -1457,15 +1465,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// The object a committed write reports. A shard this service does not
     /// replicate is read from its primary; otherwise the local view answers,
     /// and the primary only when that view does not show the object yet.
-    pub(super) fn committed_write_stat_target(&mut self, path: &str) -> Result<DfsObjectMetadata> {
+    /// The stat a committed write, truncate or symlink returns for `path`. A
+    /// service that reads the path's shard locally stats its own record; any
+    /// other reads the committed head and its link count from the authorities.
+    pub(super) fn committed_write_stat(&mut self, path: &str) -> Result<DfsStat> {
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        if !self.local_metadata_answers_path_from_snapshot(path, shard_snapshot.as_deref())? {
-            return self.stat_target_from_authority(path);
+        if self.local_metadata_answers_path_from_snapshot(path, shard_snapshot.as_deref())? {
+            match self.stat_target_for_path(path) {
+                Ok(object) => return self.stat_object_for_path(&object, path),
+                Err(DfsPosixError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
-        match self.stat_target_for_path(path) {
-            Err(DfsPosixError::NotFound { .. }) => self.stat_target_from_authority(path),
-            result => result,
-        }
+        let object = self.stat_target_from_authority(path)?;
+        self.with_stat_deadline(|service| {
+            service.with_stat_read_rounds(|service| {
+                service.stat_object_from_authorities(&object, path, shard_snapshot.as_deref())
+            })
+        })
     }
 
     /// The committed head of `path` as its metadata authority reports it.
@@ -1476,7 +1493,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsPosixError::NotFound {
                 path: path.to_string(),
             })?;
-        self.resolve_hardlink_target(&object)
+        self.resolve_hardlink_target_distributed(&object, None)
     }
 
     pub(super) fn ensure_parent_directory(&self, path: &str) -> Result<()> {

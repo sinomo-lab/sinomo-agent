@@ -941,6 +941,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Some(shard) if shard.primary_node_id == self.node_id => shard,
             _ => return Ok(()),
         };
+        // Snapshot repair serves only nodes that hold a copy of the shard.
+        let pending_membership_handoff = self
+            .retained_metadata_replica_context(&shard.file_system_id, shard_id)?
+            .and_then(|context| context.pending_membership_handoff);
+        if !crate::metadata_replication::node_holds_metadata_shard_copy(
+            &shard,
+            pending_membership_handoff.as_ref(),
+            target_node_id,
+        ) {
+            return Ok(());
+        }
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
@@ -1094,10 +1105,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         "metadata primary must not install a replica snapshot".to_string(),
                     ))
                 }
-                // Non-replica metadata mirrors accept primary-sourced snapshot
-                // repair too; their journals are fed by routed-response and
-                // SyncPath batches and can need the same divergence repair as
-                // configured replicas.
+                Some(shard)
+                    if command.primary_handoff_id.is_none()
+                        && !retained_context
+                            .as_ref()
+                            .is_some_and(DfsMetadataReplicaShardContext::local_node_holds_copy) =>
+                {
+                    Err(DfsMetadataRejection::new(
+                        DfsMetadataRejectionCode::Other,
+                        format!(
+                            "local node {} is not a configured replica for metadata shard {}",
+                            self.node_id, shard.shard_id
+                        ),
+                    ))
+                }
                 Some(shard) => Ok(shard),
             }
         } else {
@@ -1845,9 +1866,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ("metadata primary must not apply a replica journal batch".to_string()).into(),
             ));
         }
-        // Routed operations still accept primary-sourced journal catch-up
-        // batches so requesters keep read-your-write even for custom shards
-        // where they are not durable replicas.
+        // Only nodes that hold a copy of the shard ingest its journal.
+        if !crate::metadata_replication::node_holds_metadata_shard_copy(
+            &shard,
+            pending_membership_handoff.as_ref(),
+            &self.node_id,
+        ) {
+            return Ok(Err((format!(
+                "local node {} is not a configured replica for metadata shard {}",
+                self.node_id, shard.shard_id
+            ))
+            .into()));
+        }
         Ok(Ok(ValidatedMetadataJournalBatchSource {
             permit: DfsMetadataReplicaIngestPermit::new_validated(
                 shard.file_system_id.clone(),

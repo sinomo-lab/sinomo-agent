@@ -112,7 +112,7 @@ pub trait SandboxFileSystem {
         self.stat_follow_unchecked(path)
     }
     fn path_for_open_identity(
-        &self,
+        &mut self,
         _identity: Option<&str>,
         _inode: u64,
     ) -> Result<Option<SandboxPath>, SandboxFsError> {
@@ -139,6 +139,15 @@ pub trait SandboxFileSystem {
     }
     fn read(&self, path: &SandboxPath, range: Option<ByteRange>)
     -> Result<Vec<u8>, SandboxFsError>;
+    /// Checked read that may consult remote authority; it does not update
+    /// access time.
+    fn read_mut(
+        &mut self,
+        path: &SandboxPath,
+        range: Option<ByteRange>,
+    ) -> Result<Vec<u8>, SandboxFsError> {
+        self.read(path, range)
+    }
     fn read_unchecked(
         &self,
         path: &SandboxPath,
@@ -218,6 +227,11 @@ pub trait SandboxFileSystem {
         self.stat_follow_unchecked(path)
     }
     fn list(&self, path: &SandboxPath) -> Result<Vec<SandboxDirEntry>, SandboxFsError>;
+    /// Checked listing that may consult remote authority; it does not update
+    /// access time.
+    fn list_mut(&mut self, path: &SandboxPath) -> Result<Vec<SandboxDirEntry>, SandboxFsError> {
+        self.list(path)
+    }
     fn list_update_access(
         &mut self,
         path: &SandboxPath,

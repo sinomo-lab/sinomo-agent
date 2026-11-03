@@ -1032,12 +1032,24 @@ fn try_open_daemon_dfs_resident_metadata_backend_from_authority_projection(
             None,
         )?;
     }
+    // A node keeps only the shard copies it holds. Opening for a new shard
+    // placement deletes every other copy, including copies left by an earlier
+    // placement, before the slots open.
+    let discarded = sinomo_dfs::metadata_shard_copies_to_discard(
+        projection,
+        local_node_id,
+        &sinomo_dfs::sifs_file_system_id(),
+    )?;
     let metadata_root = sinomo_dfs::default_dfs_metadata_shards_root(data_dir);
     let backend = match retained_backend {
-        Some(previous) => {
-            previous.into_reconfigured_for_replica_repair(metadata_root, shards, local_node_id)?
-        }
+        Some(previous) => previous.into_reconfigured_for_replica_repair(
+            metadata_root,
+            shards,
+            local_node_id,
+            &discarded,
+        )?,
         None => {
+            sinomo_dfs::discard_local_metadata_shard_copies(&metadata_root, &discarded)?;
             let selected = sinomo_dfs::runtime_host::publication_runtime_owner(&metadata_root)
                 .map_err(|error| sinomo_dfs::MetadataBackendError::Rejected {
                     code: sinomo_dfs::DfsMetadataRejectionCode::Other, message: error.to_string(),
@@ -3862,7 +3874,6 @@ fn daemon_dfs_genesis_ingress_scopes(
                     | Op::PollNamespaceChanges { .. }
                     | Op::LookupPath { .. }
                     | Op::LookupPaths { .. }
-                    | Op::SyncPath { .. }
                     | Op::FileSync { .. }
                     | Op::DirectorySync { .. }
                     | Op::AbortPendingWrite { .. }

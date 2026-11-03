@@ -32,6 +32,15 @@ pub(crate) fn remote_metadata_range_read_request_count() -> usize {
     REMOTE_METADATA_RANGE_READ_REQUEST_COUNT.get()
 }
 
+/// Where a service reads an object's current record.
+pub(crate) enum DfsObjectReadSource {
+    Local,
+    Authority {
+        file_system_id: DfsFileSystemId,
+        hinted_shard: Option<DfsMetadataShardConfig>,
+    },
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn ensure_standalone_local_object_publication(&self) -> Result<(), DfsError> {
         if self.control_plane.is_some() {
@@ -376,6 +385,139 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     && pending.cache_response == cache_response
             })
             .map(|(request_id, pending)| (request_id.clone(), pending.clone()))
+    }
+
+    /// The current object behind an object id or open handle, read locally
+    /// or from its authority as [`Self::object_read_source`] decides.
+    pub(crate) fn current_read_object_metadata_distributed(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<DfsObjectMetadata, DfsError> {
+        let source = self.object_read_source(object_id, None)?;
+        self.current_read_object_metadata_from_source(object_id, source)
+    }
+
+    /// Read `object_id` from the source [`Self::object_read_source`] chose.
+    pub(crate) fn current_read_object_metadata_from_source(
+        &mut self,
+        object_id: &DfsObjectId,
+        source: DfsObjectReadSource,
+    ) -> Result<DfsObjectMetadata, DfsError> {
+        let DfsObjectReadSource::Authority {
+            file_system_id,
+            hinted_shard,
+        } = source
+        else {
+            return self.current_read_object_metadata(object_id);
+        };
+        let object = self
+            .current_object_from_hinted_authority(&file_system_id, object_id, hinted_shard)?
+            .ok_or_else(|| DfsError::UnknownObject {
+                object_id: object_id.clone(),
+            })?;
+        Ok(self.observed_authority_read_object(object))
+    }
+
+    /// Where the current record of `object_id` is read. A service answers
+    /// from its own metadata only for objects whose path lies in a shard it
+    /// reads locally (see `reads_shard_from_local_metadata`); any other object
+    /// is read from its authority, starting with the shard its last known
+    /// path names.
+    pub(crate) fn object_read_source(
+        &mut self,
+        object_id: &DfsObjectId,
+        file_system_hint: Option<&DfsFileSystemId>,
+    ) -> Result<DfsObjectReadSource, DfsError> {
+        if self.control_plane.is_none() || self.transient_metadata_object_ids.contains(object_id) {
+            return Ok(DfsObjectReadSource::Local);
+        }
+        let local = match self.metadata.object(object_id) {
+            Some(object) => Some((object.file_system_id.clone(), object.path.clone())),
+            None => match self.metadata_backend.as_ref() {
+                Some(backend) => backend
+                    .get_object(object_id)?
+                    .map(|object| (object.file_system_id, object.path)),
+                None => None,
+            },
+        };
+        let file_system_id = match (&local, file_system_hint) {
+            (Some((file_system_id, _)), _) => file_system_id.clone(),
+            (None, Some(file_system_id)) => file_system_id.clone(),
+            (None, None) => crate::sifs_file_system_id(),
+        };
+        let shards = self
+            .metadata_shard_config_snapshot(&file_system_id)?
+            .filter(|shards| !shards.is_empty());
+        let Some(shards) = shards else {
+            return Ok(if self.transport.delegates_local_namespace_authority() {
+                DfsObjectReadSource::Authority {
+                    file_system_id,
+                    hinted_shard: None,
+                }
+            } else {
+                DfsObjectReadSource::Local
+            });
+        };
+        let Some((_, path)) = local else {
+            return Ok(DfsObjectReadSource::Authority {
+                file_system_id,
+                hinted_shard: None,
+            });
+        };
+        let hinted_shard = crate::control_plane::select_metadata_shard_config_for_path(
+            &file_system_id,
+            &shards,
+            &path,
+        )?;
+        Ok(match hinted_shard {
+            Some(shard) if !self.reads_shard_from_local_metadata(&shard) => {
+                DfsObjectReadSource::Authority {
+                    file_system_id,
+                    hinted_shard: Some(shard),
+                }
+            }
+            _ => DfsObjectReadSource::Local,
+        })
+    }
+
+    /// Read `object_id` from the hinted shard's authority, then from every
+    /// authority, since the object may have moved since the hint was taken.
+    pub(crate) fn current_object_from_hinted_authority(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        hinted_shard: Option<DfsMetadataShardConfig>,
+    ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        if let Some(shard) = hinted_shard
+            && let crate::DfsMetadataQueryResult::CurrentObject {
+                object: Some(current),
+            } = self.query_metadata_authority_impl(
+                &shard,
+                crate::DfsMetadataSelection::CurrentObject {
+                    object_id: object_id.clone(),
+                },
+            )?
+            && current.object_id == *object_id
+            && current.file_system_id == *file_system_id
+        {
+            return Ok(Some(*current));
+        }
+        self.current_object_from_authority(file_system_id, object_id)
+    }
+
+    fn observed_authority_read_object(&self, mut object: DfsObjectMetadata) -> DfsObjectMetadata {
+        self.apply_transient_remote_read_location_prunes(&mut object);
+        if !self
+            .transient_metadata_object_ids
+            .contains(&object.object_id)
+        {
+            self.namespace_execution.observe_path(
+                &object.file_system_id,
+                &object.path,
+                Some(&object),
+            );
+        }
+        object
     }
 
     pub(crate) fn current_read_object_metadata(

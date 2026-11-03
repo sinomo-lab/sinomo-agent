@@ -259,8 +259,8 @@ impl SandboxContainerCommandRunner {
             OffsetDateTime::now_utc(),
         )?;
         let (manifest, layout) = store.load(sandbox_id)?;
-        let fs = LocalSandboxFileSystem::new(layout.clone());
-        validate_sandbox_working_directory(&fs, &manifest.cwd)?;
+        let mut fs = LocalSandboxFileSystem::new(layout.clone());
+        validate_sandbox_working_directory(&mut fs, &manifest.cwd)?;
         let request = SandboxCommandRequest {
             sandbox_id: sandbox_id.clone(),
             argv,
@@ -316,8 +316,8 @@ impl SandboxContainerCommandRunner {
             OffsetDateTime::now_utc(),
         )?;
         let (manifest, layout) = store.load(sandbox_id)?;
-        let fs = LocalSandboxFileSystem::new(layout.clone());
-        validate_sandbox_process_plan_working_directories(plan, &fs, &manifest.cwd)?;
+        let mut fs = LocalSandboxFileSystem::new(layout.clone());
+        validate_sandbox_process_plan_working_directories(plan, &mut fs, &manifest.cwd)?;
 
         let mut step_outcomes = Vec::with_capacity(plan.steps.len());
         let mut piped_stdin: Option<Vec<u8>> = None;
@@ -431,8 +431,8 @@ impl SandboxContainerCommandRunner {
             return Err(error.into());
         }
 
-        let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
-        validate_sandbox_working_directory(&sandbox_fs, &request.cwd)?;
+        let mut sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
+        validate_sandbox_working_directory(&mut sandbox_fs, &request.cwd)?;
         let before = sandbox_fs.snapshot()?;
         let mut local_journal = begin_sandbox_local_execution_journal(
             store,

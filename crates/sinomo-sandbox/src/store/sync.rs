@@ -123,7 +123,7 @@ where
         return Ok(());
     }
 
-    let destination_metadata = match destination.stat(path) {
+    let destination_metadata = match destination.stat_mut(path) {
         Ok(destination_metadata) if destination_metadata.is_dir => {
             clear_sandbox_path_if_exists_with_checkpoints(destination, path, checkpoint)?;
             None
@@ -199,7 +199,7 @@ where
         .into_iter()
         .map(|entry| entry.path)
         .collect::<BTreeSet<_>>();
-    for entry in destination.list(path)? {
+    for entry in destination.list_mut(path)? {
         checkpoint()?;
         if !source_entries.contains(&entry.path) {
             clear_sandbox_path_if_exists_with_checkpoints(destination, &entry.path, checkpoint)?;
@@ -219,9 +219,9 @@ where
     C: FnMut() -> Result<(), SandboxCommandExecutionError>,
 {
     checkpoint()?;
-    match sandbox_fs.stat(path) {
+    match sandbox_fs.stat_mut(path) {
         Ok(metadata) if metadata.is_dir => {
-            for entry in sandbox_fs.list(path)? {
+            for entry in sandbox_fs.list_mut(path)? {
                 checkpoint()?;
                 clear_sandbox_path_if_exists_with_checkpoints(sandbox_fs, &entry.path, checkpoint)?;
             }
@@ -335,7 +335,7 @@ where
                 return Ok(());
             }
             let source_bytes = source.read_unchecked_mut(path, None)?;
-            match destination.stat(path) {
+            match destination.stat_mut(path) {
                 Ok(metadata) if metadata.is_dir => {
                     clear_sandbox_path_if_exists(destination, path)?;
                 }
@@ -370,12 +370,12 @@ where
         return Ok(());
     }
     let source_bytes = source.read_unchecked_mut(path, None)?;
-    match destination.stat(path) {
+    match destination.stat_mut(path) {
         Ok(metadata) if metadata.is_dir => {
             clear_sandbox_path_if_exists(destination, path)?;
         }
         Ok(destination_metadata) if destination_metadata.len == source_bytes.len() as u64 => {
-            if destination.read(path, None)? == source_bytes {
+            if destination.read_mut(path, None)? == source_bytes {
                 return sync_sandbox_metadata(destination, path, metadata);
             }
         }
@@ -403,9 +403,9 @@ where
     if sync_sandbox_hardlink_alias(destination, path, &metadata, context)? {
         return Ok(());
     }
-    match destination.stat(path) {
+    match destination.stat_mut(path) {
         Ok(destination_metadata) if destination_metadata.is_symlink => {
-            if destination.readlink(path)? == target {
+            if destination.readlink_mut(path)? == target {
                 return sync_sandbox_symlink_metadata(destination, path, &metadata);
             }
             destination.unlink(path)?;
@@ -441,7 +441,7 @@ where
     if &existing == path {
         return Ok(false);
     }
-    match destination.stat(path) {
+    match destination.stat_mut(path) {
         Ok(current)
             if current.inode == metadata.inode && current.link_count == metadata.link_count =>
         {
@@ -522,7 +522,7 @@ fn ensure_destination_directory<D>(
 where
     D: SandboxFileSystem,
 {
-    match destination.stat(path) {
+    match destination.stat_mut(path) {
         Ok(metadata) if metadata.is_dir => destination.create_dir_all(path),
         Ok(_) => {
             destination.unlink(path)?;
@@ -547,7 +547,7 @@ where
         .into_iter()
         .map(|entry| entry.path)
         .collect::<BTreeSet<_>>();
-    for entry in destination.list(path)? {
+    for entry in destination.list_mut(path)? {
         if !source_entries.contains(&entry.path) {
             clear_sandbox_path_if_exists(destination, &entry.path)?;
         }
@@ -607,9 +607,9 @@ pub fn clear_sandbox_directory<F>(
 where
     F: SandboxFileSystem,
 {
-    match sandbox_fs.stat(path) {
+    match sandbox_fs.stat_mut(path) {
         Ok(metadata) if metadata.is_dir => {
-            for entry in sandbox_fs.list(path)? {
+            for entry in sandbox_fs.list_mut(path)? {
                 clear_sandbox_path_if_exists(sandbox_fs, &entry.path)?;
             }
             Ok(())
@@ -630,7 +630,7 @@ fn clear_sandbox_path_if_exists<F>(
 where
     F: SandboxFileSystem,
 {
-    match sandbox_fs.stat(path) {
+    match sandbox_fs.stat_mut(path) {
         Ok(metadata) if metadata.is_dir => {
             clear_sandbox_directory(sandbox_fs, path)?;
             sandbox_fs.remove_dir(path)

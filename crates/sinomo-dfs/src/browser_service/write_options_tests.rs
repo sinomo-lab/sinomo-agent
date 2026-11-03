@@ -543,7 +543,9 @@ fn browser_policy_projection_preserves_links_dot_paths_and_namespace_errors() {
         );
     }
     assert_eq!(
-        dfs.posix_object_policy("/documents/hard").unwrap(),
+        dfs.posix_object_metadata_hint("/documents/hard")
+            .unwrap()
+            .policy,
         sinomo_core::DfsObjectPolicy::ReplicatedConfirmed
     );
     let parent = dfs.posix_stat("/documents/dir").unwrap();
@@ -663,7 +665,7 @@ fn browser_policy_projection_preserves_requested_and_resolved_flight_fences() {
         );
         registry.remove_job("policy-flight");
     }
-    assert!(dfs.posix_object_policy("/documents/link").is_ok());
+    assert!(dfs.posix_object_metadata_hint("/documents/link").is_ok());
     drop(dfs);
     runtime.close().unwrap();
 }
@@ -871,7 +873,7 @@ fn browser_options_preserve_local_one_replica_and_reject_local_constraints() {
     let mut service = runtime.client(&nodes[0]).unwrap();
     let path = crate::sifs_node_files_path(&nodes[0]);
     assert_eq!(
-        service.posix_object_policy(&path).unwrap(),
+        service.posix_object_metadata_hint(&path).unwrap().policy,
         sinomo_core::DfsObjectPolicy::LocalOwned
     );
     let observed_zones = native_browser_observed_zones(&service);

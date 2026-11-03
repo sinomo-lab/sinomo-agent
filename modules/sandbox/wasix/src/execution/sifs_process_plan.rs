@@ -43,8 +43,8 @@ impl SifsStagedSandboxCommandRunner {
         let mut dfs = dfs;
         let mut store = self.sifs_instance_store(dfs);
         let manifest = store.load(sandbox_id)?;
-        let sifs_fs = self.sifs_filesystem(store.into_inner(), &manifest);
-        validate_sandbox_process_plan_working_directories(plan, &sifs_fs, &manifest.cwd)?;
+        let mut sifs_fs = self.sifs_filesystem(store.into_inner(), &manifest);
+        validate_sandbox_process_plan_working_directories(plan, &mut sifs_fs, &manifest.cwd)?;
         dfs = sifs_fs.into_inner();
         let execution_node_id = dfs.node_id().clone();
         let mut toolchain_store = SifsSandboxToolchainStore::new(dfs);
@@ -209,7 +209,7 @@ impl SifsStagedSandboxCommandRunner {
                 effective_sandbox_command_limits(&manifest.limits, &command.default_limits);
             validate_workspace_usage(&before_snapshot.usage(), &limits)?;
             let effective_cwd = step.cwd.clone().unwrap_or_else(|| manifest.cwd.clone());
-            validate_sandbox_working_directory(&sifs_fs, &effective_cwd)?;
+            validate_sandbox_working_directory(&mut sifs_fs, &effective_cwd)?;
             let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
             let module = toolchain_command_modules
                 .get(&step.command_name)
