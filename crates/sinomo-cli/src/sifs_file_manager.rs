@@ -3451,17 +3451,15 @@ fn open_sifs_service_with_catalog_until(
         read_sifs_metadata_shard_configs(&cluster_paths)?
     };
     sifs_operation_remaining(operation_deadline, "opening DFS metadata shards")?;
-    let service = if let Some(metadata) = open_sifs_sharded_metadata_backend(
-        data_dir,
-        metadata_shards,
-        &local_node_id,
-        registered_main_namespace_dispatch,
-    )? {
-        if registered_main_namespace_dispatch {
-            service
-                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
-                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
-        } else if hydrate_metadata {
+    // A caller delegating to its Main keeps no local metadata store.
+    let service = if registered_main_namespace_dispatch {
+        service
+            .into_main_sifs_client()
+            .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
+    } else if let Some(metadata) =
+        open_sifs_sharded_metadata_backend(data_dir, metadata_shards, &local_node_id)?
+    {
+        if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open sharded SIFS metadata: {error}"))?
@@ -3476,11 +3474,7 @@ fn open_sifs_service_with_catalog_until(
             default_dfs_metadata_root(data_dir),
         )
         .map_err(|error| format!("cannot inspect local SIFS metadata: {error}"))?;
-        if registered_main_namespace_dispatch {
-            service
-                .with_boxed_metadata_backend_for_main_sifs_client(Box::new(metadata))
-                .map_err(|error| format!("cannot open Main SIFS client: {error}"))?
-        } else if hydrate_metadata {
+        if hydrate_metadata {
             service
                 .with_metadata_backend(metadata)
                 .map_err(|error| format!("cannot open local SIFS metadata: {error}"))?
@@ -5101,26 +5095,16 @@ fn open_sifs_sharded_metadata_backend(
     data_dir: &SinomoDataDir,
     shards: Vec<DfsMetadataShardConfig>,
     local_node_id: &NodeId,
-    registered_main_namespace_dispatch: bool,
 ) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, String> {
     if shards.is_empty() {
         return Ok(None);
     }
     let metadata_root = default_dfs_metadata_shards_root(data_dir);
-    let backend = if registered_main_namespace_dispatch {
-        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node_deferred(
-            metadata_root,
-            shards,
-            local_node_id,
-        )
-    } else {
-        sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
-            metadata_root,
-            shards,
-            local_node_id,
-        )
-    };
-    backend
+    sinomo_runtime::dfs::LocalShardedMetadataBackend::open_for_inspection_at_node(
+        metadata_root,
+        shards,
+        local_node_id,
+    )
         .map(Some)
         .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
 }

@@ -576,6 +576,26 @@ fn namespace_rename_shard_selection_uses_one_config_snapshot_for_both_paths() {
 }
 
 #[test]
+fn delegating_caller_on_a_replica_advertises_no_journal_position() {
+    let name = "native-delegating-caller-no-journal-position";
+    let (runtime, primary_service, config) =
+        crate::test_support::current_native_metadata_service(name, 3, "/services").unwrap();
+    drop(primary_service);
+    let replica = config.replica_node_ids[0].clone();
+    let mut delegating = runtime.client(&replica).unwrap();
+    assert!(delegating.transport.delegates_local_namespace_authority());
+    assert_eq!(
+        delegating
+            .local_metadata_journal_after_sequence_for_shard(&config)
+            .unwrap(),
+        None,
+        "only Main ingests response batches into the node's store"
+    );
+    drop(delegating);
+    runtime.close().unwrap();
+}
+
+#[test]
 fn delegating_client_truncates_right_after_its_own_write_at() {
     let name = "native-delegating-write-at-then-truncate";
     let (runtime, mut primary_service, config) =

@@ -4099,6 +4099,21 @@ impl DfsTestRuntime {
     pub fn file_system(&self) -> DfsFileSystem {
         default_cluster_sifs(&self.state)
     }
+    /// A read-only view of `node`'s local metadata store under the current
+    /// shard configuration. Clients delegate to Main and keep no store, so
+    /// tests inspect a node's durable metadata here.
+    pub fn node_metadata(
+        &self,
+        node: &NodeId,
+    ) -> Result<crate::LocalShardedMetadataBackend, String> {
+        crate::local_state::open_local_sharded_metadata_backend_for_inspection_at_node(
+            crate::default_dfs_metadata_shards_root(self.data_dir(node)),
+            self.metadata_shards()?,
+            node,
+        )
+        .map_err(|error| error.to_string())
+    }
+
     pub fn metadata_shards(&self) -> Result<Vec<DfsMetadataShardConfig>, String> {
         let paths = ClusterPaths::new(self.data_dir(&self.primary));
         let mut control = crate::runtime_host::DaemonDfsControlPlaneKvClient::new_on_runtime(

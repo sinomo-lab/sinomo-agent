@@ -531,6 +531,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file(&self, path: &str) -> Result<Vec<u8>> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let (path, object) = service.local_posix_file_content_object(path, true)?;
             match service.read_object_metadata_local_content_with_state(&object, false)? {
@@ -551,6 +552,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        self.ensure_local_view_readable(path)?;
         self.with_metadata_lookup_cache(|service| {
             let (path, object) = service.local_posix_file_content_object(path, true)?;
             match service
@@ -568,6 +570,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_open_file_stream(&self, path: &str) -> Result<DfsPosixFileReadStream> {
+        self.ensure_local_view_readable(path)?;
         let (path, object) = self.local_posix_file_content_object(path, true)?;
         self.open_local_posix_file_stream_for_object(path, object)
     }
@@ -610,6 +613,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<DfsPosixFileRangeReadStream> {
+        self.ensure_local_view_readable(path)?;
         let (path, object) = self.local_posix_file_content_object(path, true)?;
         match self.open_local_object_metadata_range_stream_with_state(&object, offset, max_bytes)? {
             NetworkedDfsRangeReadStreamOutcome::Found(stream) => Ok(DfsPosixFileRangeReadStream {
