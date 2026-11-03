@@ -5,6 +5,7 @@ pub(super) struct UsageKey {
     pub query: UsageQuery,
     pub section: usize,
     pub range: usize,
+    pub filters_open: bool,
     pub loading: bool,
     pub response: Option<UsageQueryResponse>,
     pub error: Option<String>,
@@ -149,6 +150,26 @@ pub(super) fn pump(shared: &Shared) -> bool {
     true
 }
 
+fn active_filter_count(query: &UsageQuery) -> usize {
+    let f = &query.filter;
+    [
+        &f.agent,
+        &f.chat,
+        &f.account,
+        &f.model,
+        &f.operation,
+        &f.provider,
+        &f.event_kind,
+        &f.tool,
+        &f.skill,
+        &f.purpose,
+    ]
+    .iter()
+    .filter(|v| v.is_some())
+    .count()
+        + usize::from(!query.nodes.is_empty())
+}
+
 fn label(text: impl Into<String>, reader: &ThemeReader) -> Label {
     let reader = reader.clone();
     Label::new(text).text_style_when(move || reader().body_text_style())
@@ -156,7 +177,8 @@ fn label(text: impl Into<String>, reader: &ThemeReader) -> Label {
 pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source = shared.signals().cluster_structure.clone();
     let action = shared.clone();
-    let refresh = Button::new("Refresh usage")
+    let refresh = Button::new("Refresh")
+        .semantic_name("Refresh usage")
         .theme_when(clone_reader(reader))
         .on_press_with_ctx(move |ctx| {
             request(&action, true);
@@ -203,6 +225,9 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             {
                 let mut cluster = action.cluster_mut();
                 cluster.usage.key.range = index;
+                if index == 5 {
+                    cluster.usage.key.filters_open = true;
+                }
                 if index != 5 {
                     cluster.usage.key.query.start_ms = now.saturating_sub(duration);
                     cluster.usage.key.query.end_ms = u64::MAX;
@@ -212,17 +237,48 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             request(&action, true);
             request_metric_explorer_relayout(ctx);
         });
-    let provider = filter(shared, reader, "Provider", 6);
+    let action = shared.clone();
+    let filter_state = shared.clone();
+    let toggle_filters = Button::new("Filters")
+        .label_when(move || {
+            let cluster = filter_state.cluster();
+            let key = &cluster;
+            let count = active_filter_count(&key.usage.key.query);
+            let action = if key.usage.key.filters_open {
+                "Hide filters"
+            } else {
+                "Filters"
+            };
+            if count == 0 {
+                action.into()
+            } else {
+                format!("{action} ({count})")
+            }
+        })
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            let mut c = action.cluster_mut();
+            c.usage.key.filters_open = !c.usage.key.filters_open;
+            drop(c);
+            request_metric_explorer_relayout(ctx);
+        });
     let controls = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(8.0)
-        .with_child(sections)
-        .with_child(ranges)
-        .with_child(provider)
+        .with_item(sections, FlexItem::fill().min_width(140.0))
+        .with_item(ranges, FlexItem::fill().min_width(140.0));
+    let actions = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .with_child(toggle_filters)
         .with_child(refresh);
     let filters = Flex::horizontal()
         .wrap(FlexWrap::Wrap)
         .gap(8.0)
+        .with_item(
+            filter(shared, reader, "Provider", 6),
+            FlexItem::fill().min_width(140.0),
+        )
         .with_item(
             filter(shared, reader, "Agent", 0),
             FlexItem::fill().min_width(140.0),
@@ -293,7 +349,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             .as_ref()
             .map(|r| {
                 format!(
-                    "{} · {} nodes answered · {} failed · {} omitted{}",
+                    "{} · {} nodes · {} failed{}{}",
                     if r.partial() {
                         "Partial results"
                     } else {
@@ -301,7 +357,11 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                     },
                     r.answered.len(),
                     r.failed.len(),
-                    r.omitted.len(),
+                    if r.omitted.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} omitted", r.omitted.len())
+                    },
                     if key.usage.loading {
                         " · refreshing"
                     } else {
@@ -311,17 +371,34 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
             })
             .unwrap_or_else(|| "Loading usage".into())
     }));
-    let toolbar = Flex::vertical()
+    let dates = Presence::new(dates)
+        .shown_from(source.select_named("usage custom dates", |key| key.usage.range == 5))
+        .collapse(Axis::Vertical);
+    let advanced = Flex::vertical()
+        .align_items(Alignment::Stretch)
         .gap(8.0)
-        .with_child(controls)
         .with_child(filters)
         .with_child(dates)
         .with_child(
             Flex::horizontal()
+                .wrap(FlexWrap::Wrap)
                 .gap(8.0)
                 .with_child(clear)
                 .with_child(active),
-        )
+        );
+    let advanced = Presence::new(
+        SizedBox::new()
+            .height(240.0)
+            .child(ScrollView::new(advanced)),
+    )
+    .shown_from(source.select_named("usage filters expanded", |key| key.usage.filters_open))
+    .collapse(Axis::Vertical);
+    let toolbar = Flex::vertical()
+        .align_items(Alignment::Stretch)
+        .gap(8.0)
+        .with_child(controls)
+        .with_child(actions)
+        .with_child(advanced)
         .with_child(status);
     let reader2 = reader.clone();
     let content_shared = shared.clone();
@@ -376,7 +453,8 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                     );
                     let action = row_shared.clone();
                     let record = data.get();
-                    let button = Button::new("Open activity evidence")
+                    let button = Button::new("View activity")
+                        .semantic_name("Open activity evidence")
                         .theme_when(clone_reader(&row_reader))
                         .on_press_with_ctx(move |ctx| {
                             request_evidence(&action, record.clone());
@@ -384,7 +462,8 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                         });
                     let action = row_shared.clone();
                     let chat = data.get().attribution.chat.clone();
-                    let open = Button::new("Open conversation")
+                    let open = Button::new("Open chat")
+                        .semantic_name("Open conversation")
                         .theme_when(clone_reader(&row_reader))
                         .on_press_with_ctx(move |ctx| {
                             if let Some(chat) = &chat {
@@ -403,6 +482,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                         .with_child(cost)
                         .with_child(
                             Flex::horizontal()
+                                .wrap(FlexWrap::Wrap)
                                 .gap(8.0)
                                 .with_child(button)
                                 .with_child(open),
@@ -488,6 +568,7 @@ pub(super) fn view(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
         .with_child(evidence);
     Surface::window(
         Flex::vertical()
+            .align_items(Alignment::Stretch)
             .with_child(
                 Surface::panel(toolbar)
                     .padding(Insets::all(10.0))
@@ -783,6 +864,105 @@ mod tests {
     use super::*;
     use crate::state::AppState;
     use sinomo_client::usage_contract::*;
+    #[test]
+    fn mobile_filters_collapse_without_losing_the_query() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared.cluster_mut().usage.key.query.filter.provider = Some("openai".into());
+        let reader = cluster_theme_reader(&shared);
+        let app = sui_testing::TestApp::from_runtime(
+            sui::Application::new()
+                .window(sui::WindowBuilder::new().root(view(&shared, &reader)))
+                .build()?,
+        )?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                360.0, 640.0,
+            ))))?;
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Usage Provider")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Filters (1)")
+            .click()?;
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Usage Provider")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Usage start")
+            .expect()
+            .to_be_hidden()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide filters (1)")
+            .click()?;
+        app.run_until_idle()?;
+        assert!(!shared.cluster().usage.key.filters_open);
+        assert_eq!(
+            shared.cluster().usage.key.query.filter.provider.as_deref(),
+            Some("openai")
+        );
+        window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("Usage Provider")
+            .expect()
+            .to_be_hidden()?;
+        Ok(())
+    }
+
+    #[test]
+    fn mobile_cluster_navigation_exposes_every_section() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let reader = cluster_theme_reader(&shared);
+        let selected = shared
+            .signals()
+            .cluster_structure
+            .select_named("test cluster selection", |key| Some(key.subview.index()));
+        let app = sui_testing::TestApp::from_runtime(
+            sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new()
+                        .root(build_cluster_section_bar(&shared, &reader, selected)),
+                )
+                .build()?,
+        )?;
+        let window = app.main_window()?;
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                360.0, 48.0,
+            ))))?;
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::ComboBox)
+            .with_name("Cluster view")
+            .expect()
+            .to_be_visible()?;
+        select_cluster_subview(&shared, 5);
+        assert_eq!(shared.cluster().subview, ClusterSubview::Usage);
+        window
+            .root()
+            .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                1000.0, 48.0,
+            ))))?;
+        app.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::ComboBox)
+            .with_name("Cluster view")
+            .expect()
+            .to_be_hidden()?;
+        Ok(())
+    }
+
     #[test]
     fn date_inputs_accept_advertised_date_and_explicit_time() {
         assert_eq!(
@@ -1087,7 +1267,7 @@ mod presentation_tests {
     #[test]
     fn populated_usage_charts_and_sections_render_at_desktop_and_narrow_widths() -> sui::Result<()>
     {
-        for width in [1280.0, 440.0] {
+        for width in [1280.0, 440.0, 360.0] {
             for section in 0..4 {
                 let shared = Shared::new(AppState::ready(Backend::local_fallback()));
                 {

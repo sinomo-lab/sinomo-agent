@@ -3,7 +3,7 @@ use super::*;
 use sinomo_client::usage_contract::*;
 
 pub(super) fn content(shared: &Shared, reader: &ThemeReader, key: &UsageKey) -> WidgetPod {
-    let mut rows = Flex::vertical().gap(16.0);
+    let mut rows = Flex::vertical().align_items(Alignment::Stretch).gap(16.0);
     let Some(response) = &key.response else {
         return WidgetPod::new(rows.with_child(label(
             if key.loading {
@@ -82,7 +82,7 @@ fn summary(shared: &Shared, r: &ThemeReader, response: &UsageQueryResponse, rows
             Some("skill.activated"),
         ),
         (
-            "Version publications",
+            "Publications",
             t.skill_publications.to_string(),
             3,
             Some("skill.version.published"),
@@ -90,7 +90,7 @@ fn summary(shared: &Shared, r: &ThemeReader, response: &UsageQueryResponse, rows
     ] {
         let action = shared.clone();
         let button = Button::new(format!("{title}\n{value}"))
-            .min_height(86.0)
+            .min_height(76.0)
             .appearance(ButtonAppearance::Tonal)
             .theme_when(clone_reader(r))
             .on_press_with_ctx(move |ctx| {
@@ -103,7 +103,7 @@ fn summary(shared: &Shared, r: &ThemeReader, response: &UsageQueryResponse, rows
                 request(&action, true);
                 request_metric_explorer_relayout(ctx);
             });
-        tiles.push_item(button, FlexItem::fill().min_width(170.0));
+        tiles.push_item(button, FlexItem::fill().min_width(148.0));
     }
     rows.push(tiles);
     rows.push(label(cost_text(&response.cost), r));
@@ -203,7 +203,7 @@ fn summary(shared: &Shared, r: &ThemeReader, response: &UsageQueryResponse, rows
         let max = bars.iter().map(|b| b.1).fold(0.0f64, f64::max).max(1.0);
         for (name, value, display, filter) in bars {
             let action = shared.clone();
-            let select = Button::new(format!("{name} · {display}"))
+            let select = Button::new(name.clone())
                 .appearance(ButtonAppearance::Ghost)
                 .theme_when(clone_reader(r))
                 .on_press_with_ctx(move |ctx| {
@@ -211,13 +211,18 @@ fn summary(shared: &Shared, r: &ThemeReader, response: &UsageQueryResponse, rows
                     request_metric_explorer_relayout(ctx);
                 });
             rows.push(
-                Flex::vertical().gap(4.0).with_child(select).with_child(
-                    sui::ProgressBar::new(name)
-                        .range(0.0, max)
-                        .value(value)
-                        .height(8.0)
-                        .theme_when(clone_reader(r)),
-                ),
+                Flex::vertical()
+                    .align_items(Alignment::Stretch)
+                    .gap(4.0)
+                    .with_child(select)
+                    .with_child(label(display, r))
+                    .with_child(
+                        sui::ProgressBar::new(name)
+                            .range(0.0, max)
+                            .value(value)
+                            .height(8.0)
+                            .theme_when(clone_reader(r)),
+                    ),
             );
         }
     }
@@ -703,14 +708,14 @@ struct UsagePlot {
 }
 impl Widget for UsagePlot {
     fn measure(&mut self, _: &mut MeasureCtx, c: Constraints) -> Size {
-        c.clamp(Size::new(
-            if c.max.width.is_finite() {
-                c.max.width
-            } else {
-                640.0
-            },
-            260.0,
-        ))
+        let width = if c.max.width.is_finite() {
+            c.max.width
+        } else {
+            640.0
+        };
+        let columns = ((width - 62.0) / 130.0).floor().max(1.0) as usize;
+        let extra_rows = self.series.len().div_ceil(columns).saturating_sub(1);
+        c.clamp(Size::new(width, 260.0 + extra_rows as f32 * 24.0))
     }
     fn paint(&self, ctx: &mut PaintCtx) {
         let bounds = ctx.bounds();
@@ -723,11 +728,14 @@ impl Widget for UsagePlot {
             &self.title,
             style.clone(),
         );
+        let legend_columns = ((bounds.width() - 62.0) / 130.0).floor().max(1.0) as usize;
+        let extra_legend_height =
+            self.series.len().div_ceil(legend_columns).saturating_sub(1) as f32 * 24.0;
         let plot = Rect::new(
             bounds.x() + 52.0,
             bounds.y() + 34.0,
             (bounds.width() - 62.0).max(1.0),
-            (bounds.height() - 110.0).max(1.0),
+            (bounds.height() - 110.0 - extra_legend_height).max(1.0),
         );
         let start = self
             .series
@@ -762,7 +770,12 @@ impl Widget for UsagePlot {
                 style.clone(),
             );
         }
-        for fraction in [0.0, 0.5, 1.0] {
+        let ticks: &[f64] = if plot.width() >= 360.0 {
+            &[0.0, 0.5, 1.0]
+        } else {
+            &[0.0, 1.0]
+        };
+        for &fraction in ticks {
             let value = start + ((end - start) as f64 * fraction) as u64;
             let text = OffsetDateTime::from_unix_timestamp((value / 1000) as i64)
                 .map(|t| {
@@ -805,8 +818,8 @@ impl Widget for UsagePlot {
             widgets::draw_text_in(
                 ctx,
                 Rect::new(
-                    plot.x() + index as f32 * 130.0,
-                    plot.max_y() + 38.0,
+                    plot.x() + (index % legend_columns) as f32 * 130.0,
+                    plot.max_y() + 38.0 + (index / legend_columns) as f32 * 24.0,
                     128.0,
                     24.0,
                 ),

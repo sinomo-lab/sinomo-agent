@@ -1210,33 +1210,44 @@ fn build_cluster_section_bar(
         .gap(0.0)
         .selected_from(selected)
         .theme_when(clone_reader(reader))
-        .on_change(move |index, _label| {
-            let Some(subview) = ClusterSubview::ALL.get(index).copied() else {
-                return;
-            };
-            if change_shared.cluster().subview == subview {
-                return;
-            }
-            change_shared.cluster_mut().subview = subview;
-            if subview == ClusterSubview::Usage {
-                usage::request(&change_shared, true);
-            } else if subview == ClusterSubview::Logs {
-                logs::request(&change_shared, true);
-                request_refresh(&change_shared);
-            } else if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
-                request_observation(&change_shared);
-            }
-        });
-    Surface::window(tabs)
-        .border(SurfaceBorder::Bottom)
-        .padding(Insets {
-            left: PAD,
-            right: PAD,
-            top: 5.0,
-            bottom: 5.0,
-        })
-        .fill()
+        .on_change(move |index, _label| select_cluster_subview(&change_shared, index));
+    let change_shared = shared.clone();
+    let selection_shared = shared.clone();
+    let compact = Select::new("Cluster view")
+        .options(ClusterSubview::ALL.into_iter().map(ClusterSubview::title))
+        .selected_when(move || Some(selection_shared.cluster().subview.index()))
         .theme_when(clone_reader(reader))
+        .on_change(move |index, _label| select_cluster_subview(&change_shared, index));
+    Surface::window(
+        ConstraintView::new(compact).when(ConstraintQuery::new().min_width(640.0), tabs),
+    )
+    .border(SurfaceBorder::Bottom)
+    .padding(Insets {
+        left: PAD,
+        right: PAD,
+        top: 5.0,
+        bottom: 5.0,
+    })
+    .fill()
+    .theme_when(clone_reader(reader))
+}
+
+fn select_cluster_subview(change_shared: &Shared, index: usize) {
+    let Some(subview) = ClusterSubview::ALL.get(index).copied() else {
+        return;
+    };
+    if change_shared.cluster().subview == subview {
+        return;
+    }
+    change_shared.cluster_mut().subview = subview;
+    if subview == ClusterSubview::Usage {
+        usage::request(&change_shared, true);
+    } else if subview == ClusterSubview::Logs {
+        logs::request(&change_shared, true);
+        request_refresh(&change_shared);
+    } else if matches!(subview, ClusterSubview::Overview | ClusterSubview::Explore) {
+        request_observation(&change_shared);
+    }
 }
 
 fn cluster_explorer_view(shared: &Shared, reader: &ThemeReader) -> MasterDetail {
