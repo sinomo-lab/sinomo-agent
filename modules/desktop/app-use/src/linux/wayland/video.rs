@@ -93,6 +93,7 @@ impl VideoState {
         self.last_timestamp = timestamp;
         let len = pixels.len();
         *self.latest.borrow_mut() = Some(NativeVideoSample {
+            native_dimensions: None,
             sequence: self.sequence,
             format: NativeVideoSampleFormat::Bgra8,
             width,

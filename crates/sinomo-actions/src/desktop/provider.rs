@@ -475,6 +475,9 @@ mod tests {
             sinomo_runtime::module_api::encode_sobj(&DesktopFrameDelivery {
                 capture_id: id.into(),
                 frame: DesktopRawFrame {
+                    pixel_format: sinomo_runtime::device::NativeVideoSampleFormat::Bgra8,
+                    native_width: 2,
+                    native_height: 1,
                     sequence,
                     width: 1,
                     height: 1,
@@ -482,7 +485,7 @@ mod tests {
                     timestamp_ns: 1,
                     duration_ns: 1,
                     captured_at_unix_ms: 1,
-                    pixels: vec![0; 4],
+                    pixels: vec![0; 4].into(),
                 },
             })
             .unwrap()
@@ -509,6 +512,9 @@ fn measure_native_frame_callback_latency() {
     let delivery = DesktopFrameDelivery {
         capture_id: "latency-control".into(),
         frame: DesktopRawFrame {
+            pixel_format: sinomo_runtime::device::NativeVideoSampleFormat::Bgra8,
+            native_width: 1080,
+            native_height: 2280,
             sequence: 1,
             width: 1080,
             height: 2280,
@@ -516,7 +522,7 @@ fn measure_native_frame_callback_latency() {
             timestamp_ns: 1,
             duration_ns: 100_000_000,
             captured_at_unix_ms: 1,
-            pixels: pixels.clone(),
+            pixels: pixels.clone().into(),
         },
     };
     let bytes = sinomo_runtime::module_api::encode_sobj(&delivery).unwrap();

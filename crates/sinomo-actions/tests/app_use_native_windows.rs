@@ -186,6 +186,8 @@ fn background_window_acceptance(dpi_unaware: bool) {
     store.save(&grants).unwrap();
     let capture = provider
         .capture(DesktopCaptureConfig {
+            resolution: None,
+            pixel_format: None,
             target: target.clone(),
             frames_per_second: 30,
             include_cursor: false,

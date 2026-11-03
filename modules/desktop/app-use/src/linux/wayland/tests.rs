@@ -94,6 +94,8 @@ async fn optional_gui_client_absence_preserves_portal_input() {
     let mut input = Input::new(&target.target, &store).unwrap();
     store.mutate(|p| p.expose_resource_operation(&target.resource_id, "capture")).unwrap();
     let config = DesktopCaptureConfig {
+        resolution: None,
+        pixel_format: None,
         target: target.target.clone(),
         frames_per_second: 10,
         include_cursor: false,
@@ -454,6 +456,8 @@ async fn wayland_pipewire_frames_and_revocation() {
         .mutate(|p| p.expose_resource_operation(&info.resource_id, "capture"))
         .unwrap();
     let config = DesktopCaptureConfig {
+        resolution: None,
+        pixel_format: None,
         target: info.target.clone(),
         frames_per_second: 10,
         include_cursor: false,

@@ -97,7 +97,7 @@ impl Bridge {
     }
 }
 pub fn capabilities() -> DesktopCapabilities {
-    let mut caps = DesktopCapabilities { platform: "android".into(), capture: false, keyboard_mouse: false, background_window_input: false, gamepad: "unsupported".into(), limitations: vec![
+    let mut caps = DesktopCapabilities { capture_formats: vec![], platform: "android".into(), capture: false, keyboard_mouse: false, background_window_input: false, gamepad: "unsupported".into(), limitations: vec![
         "Raw mode only: Android does not provide background window message injection".into(),
         "Screen capture requires a local MediaProjection grant; input requires a user-enabled AccessibilityService".into(),
         "Left-button down/move/up submits a finite touch gesture on release; release_all discards an unfinished gesture".into(),
@@ -105,7 +105,10 @@ pub fn capabilities() -> DesktopCapabilities {
     ] };
     match Bridge::connect().and_then(|mut b| b.call(json!({"op":"capabilities"}))) {
         Ok(value) => {
-            caps.capture = value["capture"].as_bool().unwrap_or(false);
+            caps.capture = value["capture"].as_bool().unwrap_or(false)
+                && value["capture_protocol"].as_u64() == Some(2);
+            caps.capture_formats =
+                serde_json::from_value(value["capture_formats"].clone()).unwrap_or_default();
             caps.keyboard_mouse = value["input"].as_bool().unwrap_or(false);
         }
         Err(error) => caps.limitations.push(error.to_string()),
@@ -171,7 +174,9 @@ pub fn capture(
     ready: mpsc::SyncSender<DesktopResult<()>>,
 ) -> DesktopResult<()> {
     let opened = Bridge::connect().and_then(|mut bridge| {
-        bridge.call(json!({"op":"open_capture", "target":config.target, "include_cursor":config.include_cursor}))?;
+        let negotiated=bridge.call(json!({"op":"open_capture", "capture_protocol":2, "target":config.target,
+            "include_cursor":config.include_cursor,"resolution":config.resolution,"pixel_format":config.pixel_format,"fps":config.frames_per_second}))?;
+        if negotiated["capture_protocol"].as_u64()!=Some(2) { return Err(platform("Android capture bridge v2 required; update the application")); }
         Ok(bridge)
     });
     let mut bridge = match opened {
@@ -187,13 +192,29 @@ pub fn capture(
     let deadline = started + Duration::from_millis(config.lease_ms.min(300_000));
     let mut after = 0;
     while Instant::now() < deadline {
+        if config.pixel_format == Some(NativeVideoSampleFormat::H264)
+            && !mailbox.wait_for_request(Duration::from_millis(100))
+        {
+            if stop.try_recv() != Err(mpsc::TryRecvError::Empty) {
+                return Ok(());
+            }
+            continue;
+        }
         let next_capture = Instant::now() + cadence;
         authorize(&permissions, &config.target, "capture")?;
         let value = bridge.call(json!({"op":"frame", "target":config.target, "after":after,
             "wait_ms":cadence.as_millis().clamp(1, 100)}))?;
         if value["available"].as_bool() == Some(true) {
-            if value["format"].as_str() != Some("rgba8") {
-                return Err(platform("unsupported Android frame format"));
+            let format: NativeVideoSampleFormat =
+                serde_json::from_value(value["format"].clone()).map_err(platform)?;
+            if !matches!(
+                format,
+                NativeVideoSampleFormat::Rgba8
+                    | NativeVideoSampleFormat::Bgra8
+                    | NativeVideoSampleFormat::H264
+            ) || config.pixel_format.is_some_and(|wanted| wanted != format)
+            {
+                return Err(platform("Android capture format negotiation mismatch"));
             }
             let number = |name: &str| {
                 value[name]
@@ -202,51 +223,68 @@ pub fn capture(
             };
             let width = u32::try_from(number("width")?).map_err(platform)?;
             let height = u32::try_from(number("height")?).map_err(platform)?;
-            let len = u64::from(width) * u64::from(height) * 4;
-            if width == 0 || height == 0 || len > MAX_FRAME_BYTES as u64 || number("bytes")? != len
+            let len = number("bytes")?;
+            let native_width = u32::try_from(number("native_width")?).map_err(platform)?;
+            let native_height = u32::try_from(number("native_height")?).map_err(platform)?;
+            if width == 0
+                || height == 0
+                || len == 0
+                || len > MAX_FRAME_BYTES as u64
+                || (format != NativeVideoSampleFormat::H264
+                    && len != u64::from(width) * u64::from(height) * 4)
             {
                 return Err(platform("invalid Android frame dimensions"));
+            }
+            if let Some(bounds) = config.resolution {
+                if width > bounds.width || height > bounds.height {
+                    return Err(platform("Android capture exceeded negotiated resolution"));
+                }
             }
             let sequence = number("sequence")?;
             if sequence <= after {
                 return Err(platform("non-monotonic Android frame"));
             }
             let read_started = Instant::now();
-            let mut bytes = vec![0; len as usize];
-            bridge.0.read_exact(&mut bytes).map_err(platform)?;
+            // Read into the final shared allocation: no Vec-to-Arc frame copy.
+            // Read's safe API requires initialized storage, even though this
+            // concrete socket reader only writes. Zero directly in the final
+            // allocation rather than introducing a temporary Vec.
+            // SAFETY: zero is a valid value for every u8 in this allocation.
+            let mut bytes = unsafe { Arc::<[u8]>::new_zeroed_slice(len as usize).assume_init() };
+            bridge
+                .0
+                .read_exact(Arc::get_mut(&mut bytes).expect("new capture allocation is unique"))
+                .map_err(platform)?;
             let read_us = read_started.elapsed().as_micros();
-            let normalize_started = Instant::now();
-            // Keep the shared native-media contract BGRA; swizzle after the
-            // bounded row copy rather than per-byte JNI/Java pixel operations.
-            for pixel in bytes.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-                pixel[3] = 255;
-            }
-            let normalize_us = normalize_started.elapsed().as_micros();
             let publish_started = Instant::now();
             authorize(&permissions, &config.target, "capture")?;
             after = sequence;
             mailbox.publish(NativeVideoSample {
+                native_dimensions: Some([native_width, native_height]),
                 sequence,
-                format: NativeVideoSampleFormat::Bgra8,
+                format,
                 width,
                 height,
                 timestamp_ns: number("timestamp_ns")?,
                 duration_ns: cadence.as_nanos() as u64,
                 captured_at_unix_ms: u128::from(number("captured_at_unix_ms")?),
-                data: bytes.into(),
+                data: bytes,
                 planes: Arc::from([NativeVideoPlane {
                     offset: 0,
                     len: len as usize,
                     width,
                     height,
-                    stride: width * 4,
+                    stride: if format == NativeVideoSampleFormat::H264 {
+                        0
+                    } else {
+                        width * 4
+                    },
                 }]),
             });
             if frame_trace_enabled() {
                 trace_frame(json!({"kind":"capture", "sequence":sequence,
                     "captured_at_unix_ms":number("captured_at_unix_ms")?,
-                    "read_us":read_us, "normalize_us":normalize_us,
+                    "read_us":read_us, "normalize_us":0,
                     "publish_us":publish_started.elapsed().as_micros()}));
             }
         }

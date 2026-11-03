@@ -108,7 +108,9 @@ impl Recording {
                 APP_CAPTURE_ROUTE,
                 MEDIA_CATEGORY,
                 &DesktopStreamRequest {
-        transport: sinomo_video::codec::VideoTransport::Image,
+                    resolution: None,
+                    capture_path: Default::default(),
+                    transport: sinomo_video::codec::VideoTransport::Image,
                     session_id: view.into(),
                     frames_per_second: 20,
                     include_cursor: false,

@@ -17,6 +17,9 @@ public final class SinomoVideoEncoder implements AutoCloseable {
     private boolean first=true;
     private final Thread owner=Thread.currentThread();
     public SinomoVideoEncoder(int width,int height,int fps) throws Exception {
+        this(width,height,fps,false);
+    }
+    public SinomoVideoEncoder(int width,int height,int fps,boolean surfaceOnly) throws Exception {
         try {
             String name=null; int level=0;
             for(MediaCodecInfo info:new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos()) {
@@ -46,7 +49,7 @@ public final class SinomoVideoEncoder implements AutoCloseable {
             format.setInteger("latency",0);
             codec.configure(format,null,null,MediaCodec.CONFIGURE_FLAG_ENCODE);
             surface=codec.createInputSurface();codec.start();
-            renderer=new Renderer(surface,width,height);
+            if(!surfaceOnly)renderer=new Renderer(surface,width,height);
         } catch(Exception error) { close(); throw error; }
     }
     public byte[] encode(ByteBuffer pixels,int width,int height,int format) throws Exception {
@@ -55,6 +58,11 @@ public final class SinomoVideoEncoder implements AutoCloseable {
         check(pixels.remaining()==(long)width*height*(format==0?3:4),"invalid source length");
         long pts=timestamp=Math.max(timestamp+1,System.nanoTime()/1000);
         renderer.draw(pixels,width,height,format,pts);
+        return readEncodedFrame(pts);
+    }
+    public Surface inputSurface() { return surface; }
+    public byte[] readEncodedFrame(long pts) throws Exception {
+        check(Thread.currentThread()==owner,"encoder changed worker thread");
         long deadline=System.nanoTime()+1000000000L;
         MediaCodec.BufferInfo info=new MediaCodec.BufferInfo();
         while(System.nanoTime()<deadline) {

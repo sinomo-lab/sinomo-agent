@@ -92,7 +92,7 @@ public final class AppUseAccessibilityService extends AccessibilityService {
             display.getRealMetrics(metrics);
             if (metrics.widthPixels != AppUseProjectionService.width || metrics.heightPixels != AppUseProjectionService.height
                     || display.getRotation() != AppUseProjectionService.rotation) {
-                AppUseProjectionService.target = null; AppUseProjectionService.latest = null;
+                AppUseProjectionService.target = null;
                 if (AppUseProjectionService.current != null) AppUseProjectionService.current.stopSelf();
                 throw unavailable();
             }
@@ -105,6 +105,7 @@ public final class AppUseAccessibilityService extends AccessibilityService {
     }
     private void serve(LocalSocket socket) {
         boolean capture = false;
+        AppUseGpuCapture.Client captureClient = null;
         AppUseProjectionService captureOwner = null;
         Input input = null;
         try (LocalSocket connection = socket;
@@ -121,7 +122,8 @@ public final class AppUseAccessibilityService extends AccessibilityService {
                     switch (op) {
                         case "capabilities":
                             synchronized (AppUseProjectionService.LOCK) { response.put("capture", AppUseProjectionService.target != null); }
-                            response.put("input", !stopped); break;
+                            response.put("input", !stopped).put("capture_protocol",2)
+                                .put("capture_formats",new JSONArray(AppUseProjectionService.hasEncoder()?new String[]{"rgba8","bgra8","h264"}:new String[]{"rgba8","bgra8"})); break;
                         case "targets": {
                             JSONArray targets = new JSONArray();
                             synchronized (AppUseProjectionService.LOCK) {
@@ -150,12 +152,16 @@ public final class AppUseAccessibilityService extends AccessibilityService {
                         case "release": if (input != null) input.release(); break;
                         case "open_capture":
                             if (capture) throw new Failure("invalid", "capture already open");
+                            if(request.optInt("capture_protocol")!=2)throw new Failure("unsupported","capture protocol v2 required");
                             validate(request.getJSONObject("target"));
                             synchronized (AppUseProjectionService.LOCK) {
                                 validate(request.getJSONObject("target"));
                                 captureOwner = AppUseProjectionService.current;
-                                AppUseProjectionService.clients++; AppUseProjectionService.frameRequested = true; capture = true;
+                                AppUseProjectionService.clients++; capture = true;
                             }
+                            captureClient=captureOwner.openCapture(request);
+                            response.put("capture_protocol",2).put("width",captureClient.width).put("height",captureClient.height)
+                                .put("format",captureClient.format).put("native_width",AppUseProjectionService.width).put("native_height",AppUseProjectionService.height);
                             break;
                         case "frame": {
                             if (!capture) throw new Failure("invalid", "capture is not open");
@@ -164,23 +170,18 @@ public final class AppUseAccessibilityService extends AccessibilityService {
                             long after = request.getLong("after");
                             long waitMs = Math.max(0, Math.min(100, request.optLong("wait_ms", 0)));
                             long deadline = android.os.SystemClock.elapsedRealtime() + waitMs;
-                            synchronized (AppUseProjectionService.LOCK) {
-                                validate(request.getJSONObject("target"));
-                                frame = AppUseProjectionService.latest;
-                                // Old clients retain their nonblocking prefetch behavior.
-                                // Waiting clients request a fresh frame only when needed.
-                                if (waitMs == 0 || frame == null || frame.sequence <= after)
-                                    AppUseProjectionService.frameRequested = true;
-                                while (waitMs > 0 && (frame == null || frame.sequence <= after)) {
-                                    long remaining = deadline - android.os.SystemClock.elapsedRealtime();
-                                    if (remaining <= 0) break;
-                                    AppUseProjectionService.LOCK.wait(remaining);
+                            frame=captureOwner.frame(captureClient,after);
+                            while(frame==null && android.os.SystemClock.elapsedRealtime()<deadline) {
+                                synchronized(AppUseProjectionService.LOCK) {
                                     validate(request.getJSONObject("target"));
-                                    frame = AppUseProjectionService.latest;
+                                    AppUseProjectionService.LOCK.wait(Math.max(1,Math.min(10,deadline-android.os.SystemClock.elapsedRealtime())));
                                 }
+                                frame=captureOwner.frame(captureClient,after);
                             }
+                            validate(request.getJSONObject("target"));
                             if (frame == null || frame.sequence <= after) { response.put("available", false); break; }
-                            response.put("available", true).put("format", "rgba8").put("width", frame.width).put("height", frame.height)
+                            response.put("available", true).put("format", frame.format).put("width", frame.width).put("height", frame.height)
+                                    .put("native_width",frame.nativeWidth).put("native_height",frame.nativeHeight)
                                     .put("sequence", frame.sequence).put("timestamp_ns", frame.timestamp)
                                     .put("captured_at_unix_ms", frame.capturedAt).put("bytes", frame.bytes.length);
                             long writeStartedNs = android.os.SystemClock.elapsedRealtimeNanos();
@@ -214,7 +215,7 @@ public final class AppUseAccessibilityService extends AccessibilityService {
             android.util.Log.w("SinomoAppUse", "Local OS bridge session failed", error);
         } finally {
             if (input != null) { input.release(); AppUseProjectionService.releaseInput(input.owner); }
-            if (capture) AppUseProjectionService.releaseCapture(captureOwner);
+            if (capture) { captureOwner.closeCapture(captureClient);AppUseProjectionService.releaseCapture(captureOwner); }
             connections.remove(socket); capacity.release();
         }
     }

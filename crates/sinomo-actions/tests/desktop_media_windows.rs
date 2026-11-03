@@ -198,6 +198,8 @@ async fn app_component_streams_live_video_over_the_shared_rpc_media_path() {
     };
     assert_eq!(stream.route, APP_CAPTURE_ROUTE);
     let request = DesktopStreamRequest {
+        resolution: None,
+        capture_path: Default::default(),
         transport: sinomo_video::codec::VideoTransport::Image,
         session_id: session_id.clone(),
         frames_per_second: 30,

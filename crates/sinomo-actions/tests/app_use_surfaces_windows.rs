@@ -144,6 +144,8 @@ fn application_grants_follow_new_windows_and_reject_stale_references() {
         .capture(
             &second.surface_id,
             DesktopCaptureConfig {
+                resolution: None,
+                pixel_format: None,
                 target: second.window.target.clone(),
                 frames_per_second: 20,
                 include_cursor: false,

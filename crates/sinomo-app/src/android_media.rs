@@ -118,6 +118,7 @@ impl AndroidCameraSession for Camera {
             return Err(camera_error("Invalid Android camera frame length"));
         }
         let sample = NativeVideoSample {
+            native_dimensions: None,
             sequence: self.sequence,
             format: NativeVideoSampleFormat::Nv12,
             width,

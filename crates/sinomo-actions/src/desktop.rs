@@ -212,9 +212,22 @@ pub enum DesktopControlResponse {
         error: DesktopError,
     },
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePath {
+    #[default]
+    Auto,
+    Pixels,
+    Surface,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopStreamRequest {
+    #[serde(default)]
+    pub resolution: Option<CaptureResolution>,
+    #[serde(default)]
+    pub capture_path: CapturePath,
     pub session_id: String,
     #[serde(default = "default_fps")]
     pub frames_per_second: u32,
@@ -618,7 +631,11 @@ impl Service for DesktopService {
                     sinomo_video::stream::VIDEO_STREAM_VERSION
                 };
                 let state = self.state.clone();
-                let capture_options = capture_request.clone();
+                let mut capture_options = capture_request.clone();
+                capture_options.transport = transport;
+                if let Some(resolution) = capture_request.resolution {
+                    resolution.validate().map_err(service_error)?;
+                }
                 let actor = owner.clone();
                 let (capture, cancelled, active_guard, duration) =
                     tokio::task::spawn_blocking(move || {
@@ -627,12 +644,13 @@ impl Service for DesktopService {
                     .await
                     .map_err(service_error)?
                     .map_err(service_error)?;
-                let (body, worker) = sinomo_video::stream::desktop_capture_body_with_transport(
+                let (body, worker) = sinomo_video::stream::desktop_capture_body_with_options(
                     capture,
                     capture_request.encoding,
                     duration,
                     cancelled,
                     transport,
+                    capture_request.resolution,
                 );
                 let worker = tokio::spawn(async move {
                     let _guard = active_guard;
