@@ -456,7 +456,7 @@ static void sample(U sequence, const char *nonce) {
 
 int main(int argc, char **argv) {
     if (argc != 3 || strcmp(argv[1], "--raw")) { fprintf(stderr, "usage: %s --raw NEW_LOCAL_NDJSON\n", argv[0]); return 2; }
-    int fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
     if (fd < 0 || !(raw = fdopen(fd, "w"))) { perror("new raw file"); return 2; }
     char *b = read_file("/proc/sys/kernel/random/boot_id", NULL); if (!b) return 2;
     b[strcspn(b, "\n")] = 0; snprintf(initial_boot, sizeof(initial_boot), "%s", b); free(b);

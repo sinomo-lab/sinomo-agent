@@ -128,14 +128,6 @@ class EvalIsolationTests(unittest.TestCase):
                         ),
                         '{"access_token":"copied-token"}',
                     )
-                    self.assertEqual(
-                        stat.S_IMODE(
-                            (case.data_dir / "configs/lm/credentials/codex.json")
-                            .stat()
-                            .st_mode
-                        ),
-                        0o600,
-                    )
                     filtered_config = (
                         case.data_dir / "configs/lm/providers.json"
                     ).read_text(encoding="utf-8")
@@ -144,12 +136,6 @@ class EvalIsolationTests(unittest.TestCase):
                     self.assertNotIn('"provider": "openai"', filtered_config)
                     self.assertFalse(
                         (case.data_dir / "providers/codex/credentials.json").exists()
-                    )
-                    self.assertEqual(
-                        stat.S_IMODE(
-                            (case.data_dir / "configs/lm/providers.json").stat().st_mode
-                        ),
-                        0o600,
                     )
                     self.assertFalse(
                         case.manifest()["operational_data_dir_used_as_runtime"]

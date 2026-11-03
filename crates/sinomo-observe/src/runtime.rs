@@ -3487,6 +3487,71 @@ mod tests {
             self.observed.fetch_add(1, Ordering::Relaxed);
         }
     }
+    #[test]
+    fn usage_events_feed_the_existing_observe_metrics_recorder_with_bounded_labels() {
+        use sinomo_api::app::usage::*;
+        let recorder = ObserveMetricsRecorder::default();
+        let event = UsageRecord {
+            id: "test".into(),
+            timestamp_ms: 0,
+            attribution: UsageAttribution {
+                agent: Some("high-cardinality-agent".into()),
+                chat: Some("private-conversation".into()),
+                ..Default::default()
+            },
+            event: UsageEvent::ModelRequest {
+                provider: "openai".into(),
+                account: "private-account".into(),
+                model: "high-cardinality-model".into(),
+                operation: "completion".into(),
+                status: UsageStatus::Succeeded,
+                error_class: None,
+                retry_count: Some(2),
+                duration_ms: Some(200),
+                first_output_ms: Some(20),
+                reported: true,
+                units: LanguageModelUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..Default::default()
+                },
+            },
+        };
+        ::metrics::with_local_recorder(&recorder, || {
+            crate::usage::metrics::record(&event);
+            crate::usage::metrics::record(&event);
+        });
+        let records = recorder.snapshot();
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r.name == "sinomo.usage.model.requests")
+                .unwrap()
+                .value,
+            Some(2.0)
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r.name == "sinomo.usage.model.retries")
+                .unwrap()
+                .value,
+            Some(4.0)
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|r| r.name == "sinomo.usage.model.duration_seconds")
+                .unwrap()
+                .count,
+            Some(2)
+        );
+        assert!(records.iter().all(|r| {
+            r.labels
+                .keys()
+                .all(|k| matches!(k.as_str(), "provider" | "status" | "unit"))
+        }));
+    }
 }
 
 #[cfg(test)]

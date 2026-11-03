@@ -1345,7 +1345,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_cancel_route_cancels_active_container_execution() {
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = sinomo_testdir::TestDir::new("sinomo-sandbox-service-cancel");
         let fake_runtime = dir.join("fake-container-runtime.sh");
@@ -1380,11 +1379,7 @@ exit 0
             ),
         )
         .expect("write fake runtime");
-        let mut permissions = std::fs::metadata(&fake_runtime)
-            .expect("metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+        sinomo_testdir::install_shell_fixture(&fake_runtime).expect("install shell fixture");
 
         let config = SandboxContainerBackendConfig::new(
             SandboxContainerRuntime::Command(fake_runtime),

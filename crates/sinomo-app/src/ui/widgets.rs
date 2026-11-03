@@ -217,6 +217,8 @@ pub struct Boxed {
 }
 
 impl Boxed {
+    pub fn child_id(&self) -> sui::WidgetId { self.child.id() }
+
     pub fn new(child: impl Widget + 'static) -> Self {
         Self {
             child: WidgetPod::new(child),

@@ -1238,7 +1238,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_runner_persists_outputs_and_command_history_with_fake_runtime() {
-        use std::os::unix::fs::PermissionsExt;
 
         let root = sinomo_testdir::TestDir::new("sinomo-container-runner-e2e");
         let fake_runtime = root.join("fake-container-runtime.sh");
@@ -1260,9 +1259,7 @@ exec "$@"
 "#,
         )
         .expect("write fake runtime");
-        let mut permissions = fs::metadata(&fake_runtime).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+        sinomo_testdir::install_shell_fixture(&fake_runtime).expect("install shell fixture");
 
         let store = LocalSandboxInstanceStore::new(&root);
         let sandbox_id = SandboxId::from_legacy_named("container_e2e").expect("sandbox");
@@ -1317,7 +1314,6 @@ exec "$@"
     #[cfg(unix)]
     #[test]
     fn container_runner_cancels_active_fake_runtime() {
-        use std::os::unix::fs::PermissionsExt;
 
         let root = sinomo_testdir::TestDir::new("sinomo-container-runner-cancel");
         let fake_runtime = root.join("fake-container-runtime.sh");
@@ -1358,9 +1354,7 @@ exit 0
             ),
         )
         .expect("write fake runtime");
-        let mut permissions = fs::metadata(&fake_runtime).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+        sinomo_testdir::install_shell_fixture(&fake_runtime).expect("install shell fixture");
 
         let store = LocalSandboxInstanceStore::new(&root);
         let toolchain_id =
@@ -1436,7 +1430,6 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn container_runner_stops_infinite_output_at_bounded_audit_limit() {
-        use std::os::unix::fs::PermissionsExt;
 
         let root = sinomo_testdir::TestDir::new("sinomo-container-runner-output-limit");
         let fake_runtime = root.join("fake-container-runtime.sh");
@@ -1470,9 +1463,7 @@ exit 0
             ),
         )
         .expect("write fake runtime");
-        let mut permissions = fs::metadata(&fake_runtime).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_runtime, permissions).expect("permissions");
+        sinomo_testdir::install_shell_fixture(&fake_runtime).expect("install shell fixture");
 
         let store = LocalSandboxInstanceStore::new(&root);
         let sandbox_id = SandboxId::from_legacy_named("container_output_limit").expect("sandbox");

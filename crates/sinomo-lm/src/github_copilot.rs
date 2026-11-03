@@ -82,6 +82,7 @@ impl GitHubCopilotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("github-copilot", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: self.config.default_model.clone(),
@@ -125,6 +126,7 @@ impl GitHubCopilotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("github-copilot", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: self.config.default_model.clone(),
@@ -195,6 +197,7 @@ impl GitHubCopilotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("github-copilot", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: self.config.default_model.clone(),
@@ -234,6 +237,7 @@ impl GitHubCopilotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("github-copilot", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: self.config.default_model.clone(),
@@ -351,6 +355,7 @@ impl LanguageModelProvider for GitHubCopilotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("github-copilot", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -429,6 +434,7 @@ impl LanguageModelProvider for GitHubCopilotProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().unwrap_or_default();
+            crate::usage::record_error_usage("github-copilot", &body);
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,

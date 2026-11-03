@@ -641,12 +641,6 @@ where
                 path: destination.display().to_string(),
                 detail: error.to_string(),
             })?;
-        fs::set_permissions(destination, metadata.permissions()).map_err(|error| {
-            SandboxStoreError::Io {
-                path: destination.display().to_string(),
-                detail: error.to_string(),
-            }
-        })?;
     } else {
         return Err(SandboxStoreError::Io {
             path: source.display().to_string(),

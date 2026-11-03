@@ -894,8 +894,7 @@ select_tests() {
 prepare_work_dir() {
   local base="$1"
   local work="$2"
-  mkdir -p "$base" "$work" || return 1
-  chmod 0777 "$base" "$work" || return 1
+  mkdir -p "$base" "$work"
 }
 
 run_prove_leg() {
@@ -1190,13 +1189,9 @@ run_self_test() {
     "$temp_root/tests/pass/00.t" \
     "$temp_root/tests/unsupported/00.t" \
     "$temp_root/tests/fail/00.t" > "$selected"
-  chmod +x \
-    "$temp_root/tests/pass/00.t" \
-    "$temp_root/tests/unsupported/00.t" \
-    "$temp_root/tests/fail/00.t"
   (
     cd "$temp_root" || exit 125
-    prove --norc --nocolor --timer -j1 -rv \
+    prove --exec /bin/sh --norc --nocolor --timer -j1 -rv \
       "$temp_root/tests/pass/00.t" \
       "$temp_root/tests/unsupported/00.t" \
       "$temp_root/tests/fail/00.t"
@@ -1317,9 +1312,11 @@ PERL
   [ "$(normalized_pjdfstest_result "" 1)" = command_failed_exit_1 ] || return 1
   [ "$(normalized_pjdfstest_result EEXIST 124)" = timed_out_exit_124 ] || return 1
   mkdir -p "$temp_root/fake-pjdfstest" || return 1
-  printf '#!/bin/sh\nprintf "EEXIST\\n"\nexit 1\n' \
-    >"$temp_root/fake-pjdfstest/pjdfstest"
-  chmod +x "$temp_root/fake-pjdfstest/pjdfstest"
+  local fixture="$PROFILE_DIR/fake-pjdfstest.sh"
+  if [ ! -f "$fixture" ]; then
+    fixture="$(dirname "${BASH_SOURCE[0]}")/pjdfstest/fake-pjdfstest.sh"
+  fi
+  cp "$fixture" "$temp_root/fake-pjdfstest/pjdfstest" || return 1
   PJDFSTEST_ROOT="$temp_root/fake-pjdfstest"
   captured_result="not_run"
   captured_exit=-1
@@ -1452,7 +1449,7 @@ preflight() {
     fail_reason "missing_perl_json_pp"
     return 1
   }
-  [ -x "$PJDFSTEST_ROOT/pjdfstest" ] || {
+  [ -f "$PJDFSTEST_ROOT/pjdfstest" ] || {
     fail_reason "missing_pjdfstest_binary"
     return 1
   }
@@ -1487,7 +1484,7 @@ preflight() {
       fail_reason "missing_dev_fuse"
       return 1
     }
-    [ -x "$SINOMO_BIN" ] || {
+    [ -f "$SINOMO_BIN" ] || {
       fail_reason "missing_sinomo_binary"
       return 1
     }

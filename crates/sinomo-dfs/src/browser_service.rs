@@ -35,10 +35,12 @@ pub const DFS_CORE_BROWSER_ROUTES: &[&str] = &[
     DAEMON_DFS_BROWSER_LIST_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
     DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
     DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
     DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+    DAEMON_DFS_BROWSER_DURABLE_REPLACE_ROUTE,
     DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE,
     DAEMON_DFS_BROWSER_RENAME_ROUTE,
     DAEMON_DFS_BROWSER_DELETE_ROUTE,
@@ -1287,6 +1289,30 @@ impl DfsBrowserBackend {
         Ok(crate::DaemonDfsBrowserReadObjectVersionResponse { bytes })
     }
 
+    fn read_object_range(
+        &self,
+        request: crate::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<crate::DaemonDfsBrowserReadObjectRangeResponse, ServiceError> {
+        let identity = crate::DfsFileVersionIdentity {
+            file_system_id: crate::sifs_file_system_id(),
+            object_id: crate::DfsObjectId::new(&request.object_id)
+                .map_err(dfs_browser_service_error)?,
+            version: crate::DfsVersion::new(&request.version).map_err(dfs_browser_service_error)?,
+        };
+        let mut service = self.lock_service_for_read()?;
+        self.refresh_peer_targets(&mut service);
+        let bytes = service
+            .read_sifs_version_range(
+                &identity,
+                &request.content_hash,
+                request.size_bytes,
+                request.offset,
+                request.length,
+            )
+            .map_err(dfs_browser_service_error)?;
+        Ok(crate::DaemonDfsBrowserReadObjectRangeResponse { request, bytes })
+    }
+
     fn read_file_prefix(
         &self,
         request: crate::DaemonDfsBrowserReadFilePrefixRequest,
@@ -1502,6 +1528,106 @@ impl DfsBrowserBackend {
                 receipt: daemon_dfs_browser_write_receipt(&stat),
                 maintenance_warning,
             },
+        })
+    }
+
+    fn durable_replace(
+        &self,
+        request: crate::DaemonDfsBrowserDurableReplaceRequest,
+        changed: &mut bool,
+    ) -> Result<crate::DaemonDfsBrowserDurableReplaceOutcome, ServiceError> {
+        use crate::DaemonDfsBrowserDurableReplaceOutcome as Outcome;
+        if self.node_id.to_string() != request.expected_node_id {
+            return Ok(Outcome::Unknown {detail:"The daemon identity changed; the original requester must reconcile this operation".into()});
+        }
+        let path = normalize_sifs_browser_path(&request.path)?;
+        let object_id = crate::DfsObjectId::new(&request.expected_object_id)
+            .map_err(dfs_browser_service_error)?;
+        let version =
+            crate::DfsVersion::new(&request.expected_version).map_err(dfs_browser_service_error)?;
+        if request.size_bytes > crate::DAEMON_DFS_BROWSER_DURABLE_REPLACE_MAX_BYTES
+            || request.operation_id.is_empty()
+        {
+            return Ok(Outcome::Conflict {
+                detail: "Invalid durable edit request or file exceeds 32 MiB".into(),
+            });
+        }
+        if let Some(bytes) = &request.bytes {
+            if bytes.len() as u64 != request.size_bytes
+                || format!("blake3:{}", blake3::hash(bytes).to_hex()) != request.content_hash
+            {
+                return Ok(Outcome::Conflict {
+                    detail: "Staged content does not match the durable request".into(),
+                });
+            }
+        }
+        let mut service = self.lock_mutation_for_paths(&[path.as_str()])?;
+        match service
+            .reconcile_stable_write_operation(
+                &path,
+                &object_id,
+                &request.operation_id,
+                &request.content_hash,
+                request.size_bytes,
+            )
+            .map_err(dfs_browser_service_error)?
+        {
+            crate::DfsStableWriteOperationReconciliation::Applied { receipt } => {
+                return Ok(Outcome::Applied {
+                    operation_id: receipt.operation_id,
+                    receipt: crate::DaemonDfsBrowserWriteReceipt {
+                        object_id: receipt.object_id.to_string(),
+                        version: receipt.target_version.to_string(),
+                        content_hash: receipt.content_hash,
+                        size_bytes: receipt.content_size_bytes,
+                    },
+                    maintenance_warning: None,
+                });
+            }
+            crate::DfsStableWriteOperationReconciliation::Conflict { reason } => {
+                return Ok(Outcome::Conflict { detail: reason });
+            }
+            crate::DfsStableWriteOperationReconciliation::AmbiguousOrExpired { reason } => {
+                return Ok(Outcome::Unknown { detail: reason });
+            }
+            crate::DfsStableWriteOperationReconciliation::NotApplied => {}
+        }
+        let Some(bytes) = request.bytes else {
+            return Ok(Outcome::NotApplied);
+        };
+        let candidates = self.content_replica_candidates()?;
+        let options = sifs_browser_write_options(&mut service, &path, &candidates)
+            .map_err(dfs_browser_service_error)?;
+        let stat = match service.posix_replace_file_if_version_from_reader_with_operation_id(
+            &path,
+            &object_id,
+            &version,
+            std::io::Cursor::new(bytes),
+            options,
+            &request.operation_id,
+        ) {
+            Ok(stat) => stat,
+            Err(error) => {
+                return Ok(match daemon_dfs_browser_conditional_write_error(error) {
+                    crate::DaemonDfsBrowserReplaceFileIfVersionOutcome::Conflict { detail }
+                    | crate::DaemonDfsBrowserReplaceFileIfVersionOutcome::NotFound { detail } => {
+                        Outcome::Conflict { detail }
+                    }
+                    other => Outcome::Unknown {
+                        detail: format!("{other:?}"),
+                    },
+                });
+            }
+        };
+        *changed = true;
+        let maintenance_warning = self
+            .flush_after_mutation(&mut service)
+            .err()
+            .map(|error| error.to_string());
+        Ok(Outcome::Applied {
+            operation_id: request.operation_id,
+            receipt: daemon_dfs_browser_write_receipt(&stat),
+            maintenance_warning,
         })
     }
 
@@ -2369,6 +2495,24 @@ impl Service for HostedDfsBrowserService {
                     .await?;
                     ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE, result)?;
                 }
+                DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE => {
+                    let payload = ctx.decode_request_body(&request).await?;
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS browser read object version range",
+                        move || {
+                            DfsBrowserBackend::for_data_dir(
+                                data_dir,
+                                &runtime,
+                                Arc::clone(&backend_host),
+                            )?
+                            .read_object_range(payload)
+                        },
+                    )
+                    .await?;
+                    ctx.respond_value(DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE, result)?;
+                }
                 DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;
                     let result = run_blocking_browser_task(
@@ -2534,6 +2678,45 @@ impl Service for HostedDfsBrowserService {
                         );
                     }
                     ctx.respond_value(DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE, result.0)?;
+                }
+                DAEMON_DFS_BROWSER_DURABLE_REPLACE_ROUTE => {
+                    let payload: crate::DaemonDfsBrowserDurableReplaceRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let changed_path = payload.path.clone();
+                    let backend_data_dir = Arc::clone(&data_dir);
+                    let backend_runtime = runtime.clone();
+                    let result = run_blocking_browser_task(
+                        Arc::clone(&data_dir),
+                        route.clone(),
+                        "DFS durable external edit",
+                        move || {
+                            let backend = DfsBrowserBackend::for_data_dir(
+                                backend_data_dir,
+                                &backend_runtime,
+                                Arc::clone(&backend_host),
+                            )?;
+                            let mut changed = false;
+                            Ok((
+                                backend.durable_replace(payload, &mut changed)?,
+                                backend.event_origin_node_id()?,
+                                changed,
+                            ))
+                        },
+                    )
+                    .await?;
+                    if result.2 {
+                        effect_host.schedule_metadata_publish(
+                            data_dir.as_ref(),
+                            &runtime,
+                            request_traceparent.as_deref(),
+                        );
+                        effect_host.publish_namespace_change(
+                            result.1,
+                            "durable-replace",
+                            vec![changed_path],
+                        );
+                    }
+                    ctx.respond_value(DAEMON_DFS_BROWSER_DURABLE_REPLACE_ROUTE, result.0)?;
                 }
                 DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE => {
                     let payload: crate::DaemonDfsBrowserCreateDirAllRequest =
@@ -2879,10 +3062,12 @@ pub fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
             | DAEMON_DFS_BROWSER_LIST_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
             | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
+            | DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE
             | DAEMON_DFS_BROWSER_READ_FILES_ROUTE
             | DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
             | DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE
+            | DAEMON_DFS_BROWSER_DURABLE_REPLACE_ROUTE
             | DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE
             | DAEMON_DFS_BROWSER_RENAME_ROUTE
             | DAEMON_DFS_BROWSER_DELETE_ROUTE

@@ -38,13 +38,7 @@ impl AgentProcessOutput {
     pub(crate) fn create(root: &Path, process_id: &str) -> io::Result<(Self, File, File)> {
         fs::create_dir_all(root)?;
         let directory = root.join(process_id);
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&directory)?;
+        fs::create_dir(&directory)?;
         let directory = CaptureDirectory(directory);
         let stdout_path = directory.0.join("stdout");
         let stderr_path = directory.0.join("stderr");
@@ -103,10 +97,5 @@ impl AgentProcessOutput {
 fn create_output_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.append(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     options.open(path)
 }

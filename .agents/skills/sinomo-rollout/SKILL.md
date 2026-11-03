@@ -135,3 +135,5 @@ Use it after independently establishing the real deployment is healthy. Retain
 the diagnostics, failing phase and remaining target states if recovery cannot
 complete. Do not report success for targets that were merely reachable, staged,
 or omitted after a failure.
+
+Installation configuration and host filesystem access belong to the operator. Assign executable modes when publishing binaries. Create ordinary deployment files and directories with inherited defaults. Never tighten existing permissions or use mode, ownership or ACL checks as rollout admission.

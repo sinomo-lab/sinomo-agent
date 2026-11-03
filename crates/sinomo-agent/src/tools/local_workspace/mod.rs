@@ -3203,17 +3203,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn git_helpers_auto_detect_and_honor_explicit_modes() {
-        use std::os::unix::fs::PermissionsExt;
 
         let root = sinomo_testdir::TestDir::new("sinomo-agent-optional-git-tools");
         fs::create_dir(root.join(".git")).expect("git metadata");
         let fake_git = root.join("fake-git");
         fs::write(&fake_git, "#!/bin/sh\nexit 0\n").expect("fake git");
-        let mut permissions = fs::metadata(&fake_git)
-            .expect("fake git metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+        sinomo_testdir::install_shell_fixture(&fake_git).expect("install shell fixture");
         let auto_config =
             LocalWorkspaceAgentConfig::new(&root).with_git_program(fake_git.display().to_string());
 

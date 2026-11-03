@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import shutil
 import importlib.util
 import json
 import os
@@ -112,8 +113,7 @@ class NetworkCounters(unittest.TestCase):
             (proc / 'net').mkdir()
             (proc / 'net/dev').write_text('Inter-| Receive | Transmit\nface | bytes | bytes\nlo: ' + ' '.join(['0']*16) + '\n')
             stat = root / 'stat'
-            stat.write_text('#!/bin/sh\ncat "$QUIET_TEST_STAT_ROWS"\n')
-            stat.chmod(0o755)
+            shutil.copy2(Path(__file__).with_name("fixtures") / "stat-rows.sh", stat)
             rows = root / 'rows'
             identity = dict(id='a'*64, project='test', running=True, started_at='start', network_mode='bridge', pid_mode='')
             def run(argv, **kwargs):

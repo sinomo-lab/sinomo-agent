@@ -399,18 +399,34 @@ impl SifsBrowser {
         })
     }
 
-    pub fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
-        let response: api::DaemonDfsBrowserStatOutcomeResponse = self.read_rpc(
+    fn stat_outcome(
+        &self,
+        path: &str,
+        max_staleness_millis: u64,
+    ) -> Result<api::DaemonDfsBrowserStatOutcomeResponse, String> {
+        self.read_rpc(
             api::DAEMON_DFS_BROWSER_STAT_ROUTE,
             &api::DaemonDfsBrowserStatRequest {
                 path: path.to_string(),
-                max_staleness_millis: 250,
+                max_staleness_millis,
             },
-        )?;
-        response
+        )
+    }
+
+    pub fn stat(&self, path: &str) -> Result<SifsObjectDetails, String> {
+        self.stat_outcome(path, 250)?
             .into_result()
             .map(details_from_rpc)
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Check the namespace without accepting a cached result or masking a failed read.
+    pub fn path_exists(&self, path: &str) -> Result<bool, String> {
+        match self.stat_outcome(path, 0)?.into_result() {
+            Ok(_) => Ok(true),
+            Err(api::DaemonDfsBrowserReadFileFailure::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -469,6 +485,27 @@ impl SifsBrowser {
         request: &dfs::DfsFileHistoryPinRequest,
     ) -> Result<dfs::DfsFileHistoryPinResponse, String> {
         self.rpc(api::DAEMON_DFS_BROWSER_FILE_HISTORY_PIN_ROUTE, request)
+    }
+
+    pub fn read_object_range(
+        &self,
+        request: &api::DaemonDfsBrowserReadObjectRangeRequest,
+    ) -> Result<Vec<u8>, String> {
+        if request.length == 0
+            || request.length > api::DFS_BROWSER_RANGE_LIMIT
+            || request.offset > request.size_bytes
+        {
+            return Err("Invalid immutable file range".into());
+        }
+        let reply: api::DaemonDfsBrowserReadObjectRangeResponse =
+            self.read_rpc(api::DAEMON_DFS_BROWSER_READ_OBJECT_RANGE_ROUTE, request)?;
+        if reply.request != *request
+            || reply.bytes.len() as u64
+                != (request.size_bytes - request.offset).min(u64::from(request.length))
+        {
+            return Err("SIFS returned a different version or range".into());
+        }
+        Ok(reply.bytes)
     }
 
     pub fn read_object_version(
@@ -531,6 +568,35 @@ impl SifsBrowser {
             },
         )?;
         Ok(())
+    }
+
+    pub fn durable_replace(
+        &self,
+        payload: &api::DaemonDfsBrowserDurableReplaceRequest,
+    ) -> Result<api::DaemonDfsBrowserDurableReplaceOutcome, String> {
+        let request = ObjectRpcRequest::encode_body(
+            api::DAEMON_DFS_BROWSER_DURABLE_REPLACE_ROUTE,
+            api::DAEMON_RPC_CATEGORY,
+            payload,
+        )
+        .map_err(|error| error.to_string())?;
+        let response = self.send(&request).map_err(|error| error.to_string())?;
+        response.error_detail().map_err(|error| error.to_string())?;
+        response.decode_body().map_err(|error| error.to_string())
+    }
+
+    pub fn live_mount_status(&self) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, String> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_runtime::dfs::SIFS_MOUNT_STATUS_ROUTE,
+            "sinomo.dfs.mount.status",
+            &sinomo_runtime::dfs::SifsMountStatusRequest,
+        )
+        .map_err(|error| error.to_string())?;
+        let response = self.send(&request).map_err(|error| error.to_string())?;
+        response.error_detail().map_err(|error| error.to_string())?;
+        let response: sinomo_runtime::dfs::SifsMountStatusResponse =
+            response.decode_body().map_err(|error| error.to_string())?;
+        Ok(response.status)
     }
 
     pub fn replace_file_if_version(

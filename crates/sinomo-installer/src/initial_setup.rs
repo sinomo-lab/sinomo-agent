@@ -448,7 +448,7 @@ fn install_inner(
         }
         fs::create_dir_all(data.join("bin"))?;
         if !data.join("bin").join(binary("sinomo")).exists() {
-            fs::copy(executable, data.join("bin").join(binary("sinomo")))?;
+            copy_executable(executable, &data.join("bin").join(binary("sinomo")))?;
         }
         if !existing {
             let files = installed_files()
@@ -493,7 +493,11 @@ fn install_inner(
                     let destination = data.join("bin").join(&file.path);
                     if !destination.exists() {
                         fs::create_dir_all(destination.parent().ok_or("no component parent")?)?;
-                        fs::copy(source.join(&file.path), destination)?;
+                        if file.executable {
+                            copy_executable(&source.join(&file.path), &destination)?;
+                        } else {
+                            fs::copy(source.join(&file.path), destination)?;
+                        }
                     }
                 }
                 if !data.join("bin/desktop-release.json").is_file() {
@@ -508,7 +512,7 @@ fn install_inner(
                     #[cfg(not(target_os = "linux"))]
                     let destination = root.join(binary("sinomo-setup"));
                     if !destination.is_file() {
-                        fs::copy(source.join(binary("sinomo-setup")), destination)?;
+                        copy_executable(&source.join(binary("sinomo-setup")), &destination)?;
                     }
                 }
                 let releases = desktop::DesktopReleases::new(&data);
@@ -637,6 +641,16 @@ pub fn home() -> Result<PathBuf> {
         .ok_or_else(|| "home directory is unavailable".into())
 }
 
+fn copy_executable(source: &Path, destination: &Path) -> Result<()> {
+    fs::copy(source, destination)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 pub fn binary(stem: &str) -> String {
     format!("{stem}{}", env::consts::EXE_SUFFIX)
 }
@@ -706,7 +720,11 @@ fn configure_from_guarded(root: &Path, data: &Path, source: &Path) -> Result<()>
     // executable installation; retained/evolved components always win.
     for name in payload_files() {
         if source.join(&name).is_file() && !bin.join(&name).exists() {
-            fs::copy(source.join(&name), bin.join(&name))?;
+            if ["sinomo", "sinomo-app", "sinomo-ui-extension-host"].iter().any(|stem| name == binary(stem)) {
+                copy_executable(&source.join(&name), &bin.join(&name))?;
+            } else {
+                fs::copy(source.join(&name), bin.join(&name))?;
+            }
         }
     }
     let files = installed_files()
@@ -1235,10 +1253,6 @@ pub fn linux_integration(root: &Path, path: bool, menu: bool, desktop: bool) -> 
     let mut active = Vec::new();
     for (file, content) in &wanted {
         write_if_changed(file, content.as_bytes())?;
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(file)?.permissions().mode() & 0o777 != 0o755 {
-            fs::set_permissions(file, fs::Permissions::from_mode(0o755))?;
-        }
         active.push(file.clone());
     }
     for file in &receipt.integrations {

@@ -17,6 +17,11 @@ pub const APP_UPDATE_EVENT: &str = "app.update.changed";
 pub const APP_BUNDLE_MANIFEST: &str = "desktop-release.json";
 pub const APP_SUPERVISED_ENV: &str = "SINOMO_APP_SUPERVISED";
 pub const APP_LAUNCH_TOKEN_ENV: &str = "SINOMO_APP_LAUNCH_TOKEN";
+/// The graphical bootstrap asks the supervisor to report terminal failures to the user.
+pub const APP_FATAL_DIALOG_ENV: &str = "SINOMO_APP_FATAL_DIALOG";
+pub const APP_FATAL_DIALOG_ARG: &str = "--show-fatal-error";
+/// The UI already presented its error. Preserve a failing exit without a second dialog.
+pub const APP_REPORTED_ERROR_EXIT_CODE: u8 = 70;
 pub const APP_RESTART_EXIT_CODE: i32 = 75;
 pub const APP_WORKSPACE_SNAPSHOT_PATH: &str = "configs/app/workspace.json";
 

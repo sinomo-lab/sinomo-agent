@@ -332,13 +332,7 @@ pub struct LanguageModelResponse {
     pub usage: Option<LanguageModelUsage>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct LanguageModelUsage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
-}
+pub use sinomo_runtime::api::app::usage::{ImageUsage, LanguageModelUsage, NamedUsageUnit};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2454,7 +2448,7 @@ pub fn collect_provider_model_catalogs(
     Ok(catalogs)
 }
 
-pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+fn read_provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, LanguageModelError> {
     match provider {
         CODEX_PROVIDER_ID => codex_provider_for_model(PROVIDER_DEFAULT_MODEL).usage(),
         ClaudeProvider::PROVIDER_ID => {
@@ -2473,13 +2467,31 @@ pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, Lang
     }
 }
 
+pub fn provider_usage(provider: &str) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+    match SinomoDataDir::from_env_or_home() {
+        Ok(data) => provider_usage_in_data_dir(&data, provider),
+        Err(_) => read_provider_usage(provider),
+    }
+}
+
 pub fn provider_usage_in_data_dir(
     data_dir: &SinomoDataDir,
     provider: &str,
 ) -> Result<LanguageModelProviderUsage, LanguageModelError> {
-    match provider {
+    provider_usage_for_account_in_data_dir(data_dir, provider, None)
+}
+
+pub fn provider_usage_for_account_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    account: Option<&ProviderAccountConfig>,
+) -> Result<LanguageModelProviderUsage, LanguageModelError> {
+    let result = match provider {
         CODEX_PROVIDER_ID => {
             let config = OpenAiResponsesCodexConfig {
+                api_base_url: account
+                    .and_then(|a| a.api_base_url.clone())
+                    .unwrap_or_else(|| OpenAiResponsesCodexConfig::default().api_base_url),
                 credentials_path: Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID)),
                 ..OpenAiResponsesCodexConfig::default()
             };
@@ -2487,6 +2499,9 @@ pub fn provider_usage_in_data_dir(
         }
         ClaudeProvider::PROVIDER_ID => {
             let config = ClaudeConfig {
+                api_base_url: account
+                    .and_then(|a| a.api_base_url.clone())
+                    .unwrap_or_else(|| ClaudeConfig::default().api_base_url),
                 credentials_path: Some(
                     data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID),
                 ),
@@ -2496,6 +2511,9 @@ pub fn provider_usage_in_data_dir(
         }
         GitHubCopilotProvider::PROVIDER_ID => {
             let config = GitHubCopilotConfig {
+                api_base_url: account
+                    .and_then(|a| a.api_base_url.clone())
+                    .unwrap_or_else(|| GitHubCopilotConfig::default().api_base_url),
                 token_store_path: Some(
                     data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID),
                 ),
@@ -2503,8 +2521,27 @@ pub fn provider_usage_in_data_dir(
             };
             GitHubCopilotProvider::new(config).usage()
         }
-        _ => provider_usage(provider),
+        _ => read_provider_usage(provider),
+    };
+    if let Ok(snapshot) = &result {
+        usage::submit_usage(
+            data_dir,
+            usage::record(
+                sinomo_runtime::api::app::usage::UsageAttribution {
+                    origin: "runtime".into(),
+                    purpose: "provider_quota".into(),
+                    ..Default::default()
+                },
+                sinomo_runtime::api::app::usage::UsageEvent::QuotaSampled {
+                    account: account
+                        .map(|a| a.account.clone())
+                        .unwrap_or_else(|| "default".into()),
+                    snapshot: snapshot.clone(),
+                },
+            ),
+        );
     }
+    result
 }
 
 pub fn collect_provider_usage(
@@ -2547,16 +2584,25 @@ pub fn complete_configured_model_request_with_account(
     working_dir: Option<PathBuf>,
     request: &LanguageModelRequest,
 ) -> Result<LanguageModelResponse, LanguageModelError> {
-    let request = LanguageModelRequest {
-        provider: provider.to_string(),
-        model: model.to_string(),
-        ..request.clone()
-    };
-    let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
-    #[cfg(feature = "scripted-provider")]
-    let provider = scripted::record_configured_provider(provider)?;
-    authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
-    provider.complete(&request)
+    let mut observation =
+        usage::RequestObservation::new(data_dir, provider, model, account, request);
+    let result = (|| {
+        let request = LanguageModelRequest {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            ..request.clone()
+        };
+        let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+        #[cfg(feature = "scripted-provider")]
+        let provider = scripted::record_configured_provider(provider)?;
+        if provider.info().invocation == LanguageModelInvocation::Process {
+            observation.unreported_retries();
+        }
+        authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
+        provider.complete(&request)
+    })();
+    observation.finish(&result, false, None, None);
+    result
 }
 
 pub fn complete_configured_model_request_streaming_events_with_account(
@@ -2591,16 +2637,46 @@ pub fn complete_configured_model_request_streaming_events_with_account_and_cance
     cancellation: &LanguageModelCancellation,
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<LanguageModelResponse, LanguageModelError> {
-    let request = LanguageModelRequest {
-        provider: provider.to_string(),
-        model: model.to_string(),
-        ..request.clone()
-    };
-    let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
-    #[cfg(feature = "scripted-provider")]
-    let provider = scripted::record_configured_provider(provider)?;
-    authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
-    provider.complete_streaming_events_with_cancellation(&request, cancellation, on_event)
+    let mut observation =
+        usage::RequestObservation::new(data_dir, provider, model, account, request);
+    let started = std::time::Instant::now();
+    let mut first_output_ms = None;
+    let mut streamed_usage = None;
+    let result = (|| {
+        let request = LanguageModelRequest {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            ..request.clone()
+        };
+        let provider = configured_model_provider(data_dir, provider, model, account, working_dir)?;
+        #[cfg(feature = "scripted-provider")]
+        let provider = scripted::record_configured_provider(provider)?;
+        if provider.info().invocation == LanguageModelInvocation::Process {
+            observation.unreported_retries();
+        }
+        authorize_configured_provider_host_access(data_dir, provider.as_ref(), model)?;
+        provider.complete_streaming_events_with_cancellation(&request, cancellation, &mut |event| {
+            if matches!(
+                &event,
+                LanguageModelStreamEvent::TextDelta { .. }
+                    | LanguageModelStreamEvent::ReasoningDelta { .. }
+            ) && first_output_ms.is_none()
+            {
+                first_output_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+            }
+            if let LanguageModelStreamEvent::Usage { usage } = &event {
+                streamed_usage = Some(usage.clone());
+            }
+            on_event(event);
+        })
+    })();
+    observation.finish(
+        &result,
+        cancellation.is_cancelled(),
+        first_output_ms,
+        streamed_usage,
+    );
+    result
 }
 
 fn authorize_configured_provider_host_access(
@@ -3176,16 +3252,7 @@ fn parse_streamed_tool_arguments(arguments: &str) -> serde_json::Value {
 }
 
 fn openai_chat_completion_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
-    value.get("usage").map(|usage| LanguageModelUsage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(serde_json::Value::as_u64),
-        output_tokens: usage
-            .get("completion_tokens")
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(serde_json::Value::as_u64),
-    })
+    crate::usage::openai(value)
 }
 
 pub fn model_or_default(model: &str, default_model: String) -> String {
@@ -3729,7 +3796,7 @@ pub fn test_provider_account_credentials_in_data_dir(
         temperature: None,
         max_output_tokens: Some(8),
         response_format: LanguageModelResponseFormat::Text,
-        metadata: serde_json::Value::Null,
+        metadata: serde_json::json!({"purpose":"provider_verification","loop":"provider_service"}),
     };
     complete_configured_model_request_with_account(
         data_dir, provider, model, account, None, &request,
@@ -5670,6 +5737,7 @@ data: third
             Some(LanguageModelUsage {
                 input_tokens: Some(3),
                 output_tokens: Some(4),
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -5685,6 +5753,7 @@ data: third
                     usage: LanguageModelUsage {
                         input_tokens: Some(3),
                         output_tokens: Some(4),
+                        ..Default::default()
                     }
                 },
                 LanguageModelStreamEvent::Finished {
@@ -5896,3 +5965,10 @@ data: third
         assert!(provider_capabilities("openai-api").mcp);
     }
 }
+
+pub mod usage;
+
+pub mod usage_pricing;
+
+mod usage_realtime;
+pub use usage_realtime::RealtimeUsageContext;

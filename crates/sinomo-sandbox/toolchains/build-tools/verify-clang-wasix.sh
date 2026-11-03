@@ -44,7 +44,6 @@ cleanup() {
         env "${RUN_ENV[@]}" "${SINOMO_CMD[@]}" sandbox destroy "${SANDBOX_ID}" >/dev/null 2>&1 || true
     fi
     if [ "${SINOMO_VERIFY_DATA_DIR_AUTO}" = "1" ] && [ "${KEEP_SANDBOX}" != "1" ]; then
-        chmod -R u+rwX "${SINOMO_VERIFY_DATA_DIR}" >/dev/null 2>&1 || true
         rm -rf "${SINOMO_VERIFY_DATA_DIR}"
     fi
 }

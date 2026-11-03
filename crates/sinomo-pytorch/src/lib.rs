@@ -525,6 +525,7 @@ impl ManagedPytorchServer {
                 self.last_error = Some(first.to_string());
                 self.restart()?;
                 self.authorize_unrestricted_host_access()?;
+                sinomo_lm::usage::record_retry("managed_runtime_restarted");
                 self.loopback_runtime().complete(request)
             }
         }
@@ -548,6 +549,7 @@ impl ManagedPytorchServer {
                 );
                 self.restart()?;
                 self.authorize_unrestricted_host_access()?;
+                sinomo_lm::usage::record_retry("managed_runtime_restarted");
                 self.loopback_runtime()
                     .complete_streaming(request, on_delta)
             }

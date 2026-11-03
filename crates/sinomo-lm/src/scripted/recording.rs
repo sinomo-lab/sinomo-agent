@@ -460,6 +460,7 @@ mod tests {
                 usage: Some(LanguageModelUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
+                    ..Default::default()
                 }),
             }),
             recorder.clone(),

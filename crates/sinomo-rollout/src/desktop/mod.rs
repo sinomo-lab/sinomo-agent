@@ -252,15 +252,7 @@ impl DesktopReleases {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(
-                            &to,
-                            fs::Permissions::from_mode(if entry.executable {
-                                0o755
-                            } else {
-                                0o644
-                            }),
-                        )
-                        .map_err(err)?;
+                        if entry.executable { fs::set_permissions(&to, fs::Permissions::from_mode(0o755)).map_err(err)?; }
                     }
                     output.sync_all().map_err(err)?;
                     sync_ancestors(to.parent().ok_or("missing artifact parent")?, &staging)?;

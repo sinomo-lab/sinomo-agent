@@ -9,6 +9,8 @@ mod markdown_attachments;
 mod module_widget;
 mod session_panels;
 mod tool_output;
+#[cfg(all(feature="desktop", any(target_os="linux",target_os="windows",target_os="macos")))]
+pub(crate) mod reports;
 
 pub mod chat;
 pub mod cluster;

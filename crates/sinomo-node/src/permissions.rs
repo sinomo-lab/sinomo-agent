@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -325,13 +325,6 @@ impl LocalNodePermissionStore {
                 path: lock_path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        #[cfg(unix)]
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            LocalNodePermissionError::Io {
-                path: lock_path.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
         FileExt::lock_exclusive(&lock).map_err(|source| LocalNodePermissionError::Io {
             path: lock_path.display().to_string(),
             detail: source.to_string(),
@@ -421,8 +414,6 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), LocalNodePermis
     let result = (|| {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
         let mut file = options
             .open(&temp_path)
             .map_err(|source| LocalNodePermissionError::Io {
@@ -443,13 +434,6 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), LocalNodePermis
 
         durable_file::replace_file(&temp_path, path)
             .map_err(|source| local_permission_io_error(path, source))?;
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            LocalNodePermissionError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -643,15 +627,6 @@ mod tests {
             vec![store.path().file_name().expect("file name").to_os_string()]
         );
 
-        #[cfg(unix)]
-        {
-            let mode = fs::metadata(store.path())
-                .expect("permission metadata")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
     }
 
     #[test]

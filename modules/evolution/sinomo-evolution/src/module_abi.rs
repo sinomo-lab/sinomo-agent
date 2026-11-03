@@ -91,6 +91,9 @@ pub extern "C" fn sinomo_module_invoke(
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
     if MODULE_LIFECYCLE.begin_shutdown() {
+        sinomo_runtime::api::observe::recording::shutdown_producers(
+            std::time::Duration::from_secs(5),
+        );
         SINOMO_MODULE_STATUS_OK
     } else {
         SINOMO_MODULE_STATUS_RUNTIME_ERROR

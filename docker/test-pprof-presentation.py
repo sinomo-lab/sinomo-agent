@@ -139,8 +139,7 @@ class PresentationTests(unittest.TestCase):
         bin_dir = self.root / "bin"
         bin_dir.mkdir(exist_ok=True)
         go = bin_dir / "go"
-        go.write_text('#!/bin/sh\ntouch "$GO_SENTINEL"\nexit 77\n')
-        go.chmod(0o700)
+        shutil.copy2(Path(__file__).with_name("fixtures") / "go-sentinel.sh", go)
         environment = dict(os.environ, **{ENV: "1", "SINOMO_ROOT": str(ROOT), "NODES": "node1 node2",
                            "CPU_PROFILE": cpu_profile, "GO_SENTINEL": str(sentinel),
                            "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]})

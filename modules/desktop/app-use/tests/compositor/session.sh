@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p "$XDG_RUNTIME_DIR" "$HOME/.config/xdg-desktop-portal" /out
-chmod 700 "$XDG_RUNTIME_DIR"
 cat > "$HOME/.config/xdg-desktop-portal/portals.conf" <<'EOF'
 [preferred]
 default=kde

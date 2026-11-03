@@ -94,3 +94,7 @@ Update architecture only when ownership, dependency or lifecycle guarantees
 change. Registration methods, cleanup ordering and validation results belong
 near their source/tests or in the relevant guide/artifact; use
 [sinomo-documentation](../sinomo-documentation/SKILL.md) to choose the destination.
+
+## Host filesystem policy
+
+Administrators own installation configuration and host filesystem permissions. Create ordinary files and directories with inherited defaults. Respect later user changes. Admit operations through Sinomo authority and report actual OS access errors. Never infer security or reject an operation from host modes, ownership, or ACLs. Initial creation defaults for special files such as locks and credentials are permitted. Install executable binaries and native modules with executable modes. Metadata-preserving copies are permitted. Scripts and tests may set permissions or ownership only when testing that behavior. DFS virtual permissions have their own authority.

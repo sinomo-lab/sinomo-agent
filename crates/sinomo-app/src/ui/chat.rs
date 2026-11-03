@@ -936,6 +936,7 @@ const REALTIME_BACKGROUND_AGENT_TOOL_DESCRIPTION: &str = "Send a user request to
 type StableRealtimeTurnWriter = Box<dyn FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send>;
 
 struct StableRealtimeChatProjection {
+    usage_attribution: sinomo_client::usage_contract::UsageAttribution,
     writer: Option<StableRealtimeTurnWriter>,
     text: StableRealtimeTextAccumulator,
 }
@@ -943,7 +944,15 @@ struct StableRealtimeChatProjection {
 impl StableRealtimeChatProjection {
     #[cfg(not(test))]
     fn new(client: sinomo_client::ChatHistoryClient, target: StableRealtimeChatTarget) -> Self {
-        Self::with_writer(move |turn| {
+        let usage_attribution = sinomo_client::usage_contract::UsageAttribution {
+            agent: Some(target.agent_key.clone()),
+            session: Some(target.agent_session_id.to_string()),
+            chat: Some(target.channel_id.to_string()),
+            origin: "app.realtime".into(),
+            purpose: "realtime_response".into(),
+            ..Default::default()
+        };
+        let mut projection = Self::with_writer(move |turn| {
             client
                 .append_agent(
                     sinomo_client::chat_contract::ChatHistoryAppendAgentRequest {
@@ -958,11 +967,14 @@ impl StableRealtimeChatProjection {
                     },
                 )
                 .map_err(|error| format!("persist realtime text to stable chat failed: {error}"))
-        })
+        });
+        projection.usage_attribution = usage_attribution;
+        projection
     }
 
     fn disabled() -> Self {
         Self {
+            usage_attribution: Default::default(),
             writer: None,
             text: StableRealtimeTextAccumulator::default(),
         }
@@ -972,6 +984,7 @@ impl StableRealtimeChatProjection {
         writer: impl FnMut(StableRealtimeTextTurn) -> Result<(), String> + Send + 'static,
     ) -> Self {
         Self {
+            usage_attribution: Default::default(),
             writer: Some(Box::new(writer)),
             text: StableRealtimeTextAccumulator::default(),
         }
@@ -1833,6 +1846,7 @@ pub struct ChatState {
     agent_list_rx: Option<Receiver<AgentListWorkerResult>>,
     agents_loading: bool,
     session_list_rx: Option<Receiver<SessionListWorkerResult>>,
+    usage_chat_rx: Option<Receiver<Result<SessionRef, String>>>,
     session_list_loading: bool,
     session_list_started_at: Option<Instant>,
     session_list_slow_notice_shown: bool,
@@ -2186,6 +2200,7 @@ struct ComposerBarStructure {
     context_label: String,
     activity_label: String,
     activity_description: String,
+    usage_label: String,
     voice_link_hint: Option<String>,
     can_reuse_latest_answer: bool,
 }
@@ -2361,6 +2376,7 @@ impl ChatStructureKey {
                 context_label: context_overview_summary(chat),
                 activity_label: activity_button_label(chat).to_string(),
                 activity_description: activity_button_description(chat),
+                usage_label: usage_summary(chat).unwrap_or_else(|| "Usage".into()),
                 voice_link_hint: voice_link_hint(chat),
                 can_reuse_latest_answer: chat.can_reuse_latest_answer(),
             },
@@ -2668,6 +2684,7 @@ impl ChatState {
             agent_list_rx: None,
             agents_loading: defer_agent_load,
             session_list_rx: None,
+            usage_chat_rx: None,
             session_list_loading: false,
             session_list_started_at: None,
             session_list_slow_notice_shown: false,
@@ -3560,8 +3577,9 @@ impl ChatState {
     }
 
     pub fn pump_activity_load(&mut self) -> bool {
+        let navigation_changed = self.pump_usage_chat();
         let Some(result) = self.activity_load_rx.as_ref().map(|rx| rx.try_recv()) else {
-            return false;
+            return navigation_changed;
         };
         let result = match result {
             Ok(result) => result,
@@ -4850,7 +4868,84 @@ impl ChatState {
 
     /// Open a stored chat/channel without blocking the UI thread. The transcript/timeline is read
     /// from SIFS on a worker thread, then applied by `pump_transcript_load`.
+    pub(crate) fn open_usage_chat(&mut self, id: &str) -> bool {
+        if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+            self.open_session(index);
+            return true;
+        }
+        let Some(daemon) = self.sifs_daemon.clone() else {
+            return false;
+        };
+        let id = id.to_string();
+        let waker = self.ui_waker.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("sinomo-usage-conversation".into())
+            .spawn(move || {
+                let result = daemon
+                    .history_client()
+                    .channel(&id)
+                    .map_err(|e| e.to_string())
+                    .and_then(|channel| {
+                        channel.ok_or_else(|| "Conversation is no longer retained".to_string())
+                    })
+                    .map(|channel| SessionRef {
+                        id: channel.id,
+                        title: channel.title,
+                        kind: match channel.kind {
+                            sinomo_client::chat_contract::ChatHistoryConversationKind::Chat => {
+                                ConversationKind::Chat
+                            }
+                            sinomo_client::chat_contract::ChatHistoryConversationKind::Channel => {
+                                ConversationKind::Channel
+                            }
+                        },
+                        updated_unix: 0,
+                        participant_count: channel.participants.len(),
+                        participant_names: channel
+                            .participants
+                            .into_iter()
+                            .map(|p| p.agent_name)
+                            .collect(),
+                    });
+                let _ = tx.send(result);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        if worker.is_ok() {
+            self.usage_chat_rx = Some(rx);
+            self.notice = Some("Opening conversation…".into());
+            true
+        } else {
+            false
+        }
+    }
+    fn pump_usage_chat(&mut self) -> bool {
+        let Some(result) = self.usage_chat_rx.as_ref().map(|rx| rx.try_recv()) else {
+            return false;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("Conversation loader stopped".into()),
+        };
+        self.usage_chat_rx = None;
+        match result {
+            Ok(session) => {
+                let id = session.id.clone();
+                self.upsert_session_ref(session);
+                if let Some(index) = self.sessions.iter().position(|s| s.id == id) {
+                    self.open_session(index);
+                }
+            }
+            Err(error) => self.notice = Some(error),
+        }
+        true
+    }
+
     fn open_session(&mut self, index: usize) {
+        self.usage_chat_rx = None;
         let Some(session) = self.sessions.get(index).cloned() else {
             return;
         };
@@ -6753,6 +6848,44 @@ impl ChatState {
             && !self.workspace_picker_lane_pending()
             && self.pending_workspace_update.is_none()
             && self.tool_runtime.workspaces.is_some()
+    }
+
+    fn html_asset_base(
+        &self,
+        producer: Option<&ChatActivityRef>,
+    ) -> (super::files::FilesSourceKind, String) {
+        use super::files::FilesSourceKind;
+        let first = match &self.tool_runtime.workspaces {
+            Some(workspaces) => workspaces.first().map(|w| w.path.clone()),
+            None => self
+                .tool_runtime
+                .workspace_root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        };
+        if let Some(first) = first {
+            return match first.strip_prefix("sifs:") {
+                Some(path) => (
+                    FilesSourceKind::Sifs,
+                    format!("/{}", path.trim_start_matches('/')),
+                ),
+                None => (FilesSourceKind::Local, first),
+            };
+        }
+        let agent = producer
+            .and_then(|p| {
+                self.cached_channel_agent_refs(&self.session_id)?
+                    .into_iter()
+                    .find(|a| a.participant_id == p.participant_id)
+                    .map(|a| a.agent_key)
+            })
+            .unwrap_or_else(|| self.active_agent_index().map(|i| self.agents[i].key.clone())
+                .or_else(|| (!self.info.agent.trim().is_empty()).then(||self.info.agent.clone()))
+                .unwrap_or_else(|| self.default_channel_agent().0));
+        (
+            FilesSourceKind::Sifs,
+            crate::backend::agents::agent_home_sifs_path_for_id(&agent),
+        )
     }
 
     fn attached_workspaces(&self) -> Vec<ChatWorkspace> {
@@ -9627,6 +9760,11 @@ async fn run_chat_media_call_async(
         ));
     }
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
+    config.usage_context = Some(sinomo_lm::RealtimeUsageContext {
+        data_dir: data_dir.as_ref().clone(),
+        attribution: stable_projection.usage_attribution.clone(),
+        account: "default".into(),
+    });
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
     authorize_chat_media_realtime_config(&data_dir, &mut config)?;
     if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
@@ -11134,7 +11272,6 @@ fn activity_button_description(chat: &ChatState) -> String {
     )
 }
 
-#[cfg(test)]
 fn usage_summary(chat: &ChatState) -> Option<String> {
     chat.usage.as_ref().map(|usage| {
         let output = usage
@@ -14221,7 +14358,6 @@ fn media_call_accessibility_summary(shared: &Shared) -> String {
     parts.join("; ")
 }
 
-#[cfg(test)]
 fn format_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}m", tokens as f32 / 1_000_000.0)
@@ -14299,9 +14435,23 @@ fn activity_close_button(shared: &Shared, reader: &ThemeReader) -> IconButton {
 }
 
 fn activity_popup_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let action = shared.clone();
+    let usage_button = sui::Button::new("Usage history")
+        .theme_when(clone_reader(reader))
+        .on_press(move || {
+            let chat = action.chat().session_id.clone();
+            crate::ui::cluster::open_usage(
+                &action,
+                sinomo_client::usage_contract::UsageFilter {
+                    chat: Some(chat),
+                    ..Default::default()
+                },
+            );
+        });
     Flex::horizontal()
         .align_items(Alignment::Center)
         .with_child(dialog_section_label(shared, "Activity"))
+        .with_child(usage_button)
         .spacer()
         .with_child(activity_close_button(shared, reader))
 }
@@ -14727,6 +14877,8 @@ struct TranscriptMessagePresentation {
 }
 
 struct RetainedTranscriptDocument {
+    html_report:bool,
+    producer:Option<ChatActivityRef>,
     source: String,
     model: RichDocumentModel,
     state: RichDocumentViewState,
@@ -14737,6 +14889,52 @@ struct RetainedTranscriptDocument {
     command_target: sui::WidgetId,
     selection_owner: Rc<Cell<Option<sui::WidgetId>>>,
     bounds: Rect,
+}
+
+fn html_fence(kind: &pulldown_cmark::CodeBlockKind<'_>) -> bool {
+    matches!(kind, pulldown_cmark::CodeBlockKind::Fenced(language)
+        if matches!(language.split_whitespace().next(), Some("html" | "svg")))
+}
+
+fn has_report_html(markdown: &str) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag};
+    (markdown.contains('<') || markdown.contains("```") || markdown.contains("~~~"))
+        && Parser::new(markdown).any(|event| match event {
+            Event::Html(_) | Event::InlineHtml(_) => true,
+            Event::Start(Tag::CodeBlock(kind)) => html_fence(&kind),
+            _ => false,
+        })
+}
+
+fn render_report_html(markdown: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    if markdown
+        .trim_start()
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("<html"))
+        || markdown
+            .trim_start()
+            .get(..14)
+            .is_some_and(|s| s.eq_ignore_ascii_case("<!doctype html"))
+    {
+        return markdown.into();
+    }
+    let mut html_block = false;
+    let events = Parser::new(markdown).filter_map(|event| match event {
+        Event::Start(Tag::CodeBlock(kind)) if html_fence(&kind) => {
+            html_block = true;
+            None
+        }
+        Event::Text(text) if html_block => Some(Event::Html(text)),
+        Event::End(TagEnd::CodeBlock) if html_block => {
+            html_block = false;
+            None
+        }
+        other => Some(other),
+    });
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, events);
+    html
 }
 
 struct ChatRichDocumentHost {
@@ -15095,6 +15293,8 @@ impl TranscriptView {
         shared: &Shared,
         presentation: TranscriptMessagePresentation,
         attachments: &[super::markdown_attachments::MarkdownAttachment],
+        html_report: bool,
+        producer: Option<&ChatActivityRef>,
     ) -> (WidgetPod, sui::WidgetId, Rc<Cell<Option<sui::WidgetId>>>) {
         let view = RichDocumentView::new(model.clone())
             .state(state.clone())
@@ -15112,6 +15312,21 @@ impl TranscriptView {
             .main_gap(8.0)
             .align_items(Alignment::Stretch)
             .with_child(host);
+        if html_report {
+            let shared = shared.clone();
+            let model = model.clone();
+            let producer = producer.cloned();
+            let theme = shared_reader(&shared);
+            body = body.with_child(
+                sui::Button::new("Preview HTML")
+                    .theme_when(clone_reader(&theme))
+                    .on_press(move || {
+                        let (source, base) = shared.chat().html_asset_base(producer.as_ref());
+                        let html = render_report_html(&model.markdown());
+                        shared.open_generated_report(source, base, html);
+                    }),
+            );
+        }
         for attachment in attachments {
             let chat = shared.chat();
             body = body.with_child(super::tool_output::reference_view(
@@ -15176,6 +15391,15 @@ impl TranscriptView {
             live.insert(key);
             order.push(key);
             if let Some(retained) = self.message_documents.get_mut(&key) {
+                let html_report = if retained.source == source {
+                    retained.html_report
+                } else {
+                    message.source == ChatMessageSource::Model && has_report_html(&source)
+                };
+                let report_changed =
+                    retained.html_report != html_report || retained.producer != message.produced_by;
+                retained.html_report = html_report;
+                retained.producer = message.produced_by.clone();
                 let attachments_changed =
                     if retained.source != source || retained.workspaces != workspaces {
                         let attachments = if message.source == ChatMessageSource::Model {
@@ -15200,7 +15424,7 @@ impl TranscriptView {
                     }
                     retained.source = source;
                 }
-                if retained.presentation != presentation || attachments_changed {
+                if retained.presentation != presentation || attachments_changed || report_changed {
                     if let Some(owner) = retained.selection_owner.get() {
                         self.selection_scope.clear_owner(owner);
                     }
@@ -15212,6 +15436,8 @@ impl TranscriptView {
                         &self.shared,
                         presentation,
                         &retained.attachments,
+                        retained.html_report,
+                        retained.producer.as_ref(),
                     );
                     retained.pod = pod;
                     retained.command_target = command_target;
@@ -15225,6 +15451,7 @@ impl TranscriptView {
             } else {
                 Vec::new()
             };
+            let html_report = message.source == ChatMessageSource::Model && has_report_html(&source);
             let model = RichDocumentModel::from_markdown(source.clone());
             let state = RichDocumentViewState::new();
             let (pod, command_target, selection_owner) = Self::rich_document_pod(
@@ -15234,10 +15461,14 @@ impl TranscriptView {
                 &self.shared,
                 presentation,
                 &attachments,
+                html_report,
+                message.produced_by.as_ref(),
             );
             self.message_documents.insert(
                 key,
                 RetainedTranscriptDocument {
+                    html_report,
+                    producer: message.produced_by.clone(),
                     source,
                     model,
                     state,
@@ -19382,6 +19613,35 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         },
     );
 
+    let usage = composer_tooltip_button(
+        shared,
+        reader,
+        "chat usage indicator",
+        |bar| {
+            (
+                "Open retained usage for this conversation".to_string(),
+                bar.usage_label.clone(),
+            )
+        },
+        |s, r, text| {
+            let action = s.clone();
+            widgets::Boxed::new(
+                sui::Button::new(text)
+                    .appearance(sui::ButtonAppearance::Ghost)
+                    .theme_when(small_control_reader(r))
+                    .on_press(move || {
+                        let chat = action.chat().session_id.clone();
+                        crate::ui::cluster::open_usage(
+                            &action,
+                            sinomo_client::usage_contract::UsageFilter {
+                                chat: Some(chat),
+                                ..Default::default()
+                            },
+                        );
+                    }),
+            )
+        },
+    );
     let hint = {
         let text = chat_projection(shared, "chat composer voice hint", |snapshot| {
             snapshot
@@ -19510,6 +19770,7 @@ fn composer_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         .with_child(hint)
         .with_child(context)
         .with_child(activity)
+        .with_child(usage)
         .with_child(use_answer)
         .with_child(action);
 
@@ -22535,6 +22796,52 @@ mod tests {
         assert!(chat.attached_workspaces().is_empty());
         assert!(chat.workspace_error.is_some());
         assert!(chat.pending_workspace_update.is_none());
+    }
+
+    #[test]
+    fn report_html_uses_the_first_session_workspace_or_agent_home() {
+        let shared = Shared::new(crate::state::AppState::ready(
+            crate::backend::Backend::local_fallback(),
+        ));
+        let mut chat = shared.chat_mut();
+        chat.tool_runtime.workspaces = Some(vec![
+            ChatWorkspace {
+                id: "one".into(),
+                path: "sifs:/projects/one".into(),
+            },
+            ChatWorkspace {
+                id: "two".into(),
+                path: "sifs:/projects/two".into(),
+            },
+        ]);
+        assert_eq!(
+            chat.html_asset_base(None),
+            (
+                super::super::files::FilesSourceKind::Sifs,
+                "/projects/one".into()
+            )
+        );
+        chat.tool_runtime.workspaces.as_mut().unwrap()[0].path =
+            std::env::temp_dir().display().to_string();
+        assert_eq!(
+            chat.html_asset_base(None).0,
+            super::super::files::FilesSourceKind::Local
+        );
+        chat.tool_runtime.workspaces = Some(Vec::new());
+        chat.agents.clear();
+        chat.info.agent = "report-agent".into();
+        assert_eq!(
+            chat.html_asset_base(None),
+            (
+                super::super::files::FilesSourceKind::Sifs,
+                "/sinomo/agents/report-agent/home".into()
+            )
+        );
+        assert!(has_report_html("See <img src='figures/test.svg'> here."));
+        assert!(!has_report_html("Example: `<img src='example.png'>`"));
+        let fenced = "Report\n\n```html\n<img src='plot.svg'>\n```";
+        assert!(has_report_html(fenced));
+        assert!(render_report_html(fenced).contains("<img src='plot.svg'>"));
     }
 
     #[test]
@@ -29548,6 +29855,50 @@ mod tests {
                 .with_name("Open file")
                 .count()?,
             2
+        );
+        assert_eq!(
+            serde_json::to_value(&shared.chat().messages).unwrap(),
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn report_button_opens_a_fileless_document_without_changing_the_chat() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            seed_default_provider(&mut chat);
+            chat.models_loading = false;
+            chat.messages = vec![
+                ChatMessage::user("<b>user text</b>"),
+                ChatMessage::model("Result: <img src='chart.svg'>"),
+            ];
+            chat.tool_runtime.workspaces = Some(vec![ChatWorkspace {
+                id: "w".into(),
+                path: "sifs:/team/work".into(),
+            }]);
+        }
+        let before = serde_json::to_value(&shared.chat().messages).unwrap();
+        let window = test_window("HTML report", view(shared.clone()), Size::new(1000., 950.))?;
+        let button = window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Preview HTML");
+        assert_eq!(button.count()?, 1);
+        button.click()?;
+        let scope = shared.active_scope();
+        assert_eq!(
+            scope.workspace_kind(),
+            Some(crate::state::WorkspaceTabKind::Document)
+        );
+        let snapshot = serde_json::to_value(scope.files().workspace_snapshot()).unwrap();
+        assert_eq!(snapshot["document"]["report_base"], "/team/work");
+        assert_eq!(snapshot["document"]["source"], "Sifs");
+        assert!(
+            snapshot["document"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<img src='chart.svg'>")
         );
         assert_eq!(
             serde_json::to_value(&shared.chat().messages).unwrap(),

@@ -1,0 +1,57 @@
+%YAML 1.2
+---
+name: PowerShell
+scope: source.powershell
+file_extensions: [ps1, psm1, psd1]
+contexts:
+  main:
+    - match: '<#'
+      push: block-comment
+    - match: '#.*$'
+      scope: comment.line.number-sign.powershell
+    - match: '@"$'
+      push: double-here
+    - match: "@'$"
+      push: single-here
+    - match: '"'
+      push: double-quoted
+    - match: "'"
+      push: single-quoted
+    - include: variable
+    - match: '(?i)\b(function|filter|class|param|begin|process|end|if|elseif|else|switch|foreach|for|in|while|do|try|catch|finally|throw|return|break|continue|using)\b'
+      scope: keyword.control.powershell
+    - match: '\b[A-Za-z]+-[A-Za-z][\w-]*'
+      scope: support.function.powershell
+    - match: '-[A-Za-z][\w-]*'
+      scope: variable.parameter.powershell
+    - match: '\b(?:0[xX][\da-fA-F]+|\d+(?:\.\d+)?)\b'
+      scope: constant.numeric.powershell
+  variable:
+    - match: '\$(?:\{[^}\n]+\}|[\w:]+|[?^$])'
+      scope: variable.other.powershell
+  single-quoted:
+    - meta_scope: string.quoted.single.powershell
+    - match: "''"
+      scope: constant.character.escape.powershell
+    - match: "'"
+      pop: true
+  double-quoted:
+    - meta_scope: string.quoted.double.powershell
+    - match: '\x60.'
+      scope: constant.character.escape.powershell
+    - include: variable
+    - match: '"'
+      pop: true
+  single-here:
+    - meta_scope: string.quoted.single.powershell
+    - match: "^'@"
+      pop: true
+  double-here:
+    - meta_scope: string.quoted.double.powershell
+    - include: variable
+    - match: '^"@'
+      pop: true
+  block-comment:
+    - meta_scope: comment.block.powershell
+    - match: '#>'
+      pop: true

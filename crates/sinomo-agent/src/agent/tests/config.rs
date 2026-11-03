@@ -734,7 +734,10 @@ fn skill_activation_loads_bundled_resources_on_demand() {
         .with_skill_catalog_resources([(key, vec![resource])]);
     let agent = Agent::new(SequencedModel::new(["{}"]), "fake", "fake").with_config(config);
     let skill_plan = agent.skill_plan();
+    let root = sinomo_testdir::TestDir::new("usage-skill-resource");
+    let probe = super::usage::Probe::new(SinomoDataDir::new(&root));
     let registry = AgentToolRegistry::new();
+    registry.set_usage_data_dir(probe.data.clone());
     let plan = AgentToolPlanner::plan(
         registry.descriptors(),
         &AgentModuleToolProjection::default(),
@@ -784,6 +787,24 @@ fn skill_activation_loads_bundled_resources_on_demand() {
             .and_then(serde_json::Value::as_str),
         Some("resource_read")
     );
+    let events = probe.records();
+    let activations = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                sinomo_runtime::api::app::usage::UsageEvent::SkillActivated { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(activations.len(), 1);
+    assert_eq!(
+        activations[0].attribution.tool_call.as_deref(),
+        Some(outcome.call_id.as_str())
+    );
+    assert!(
+        matches!(&activations[0].event,sinomo_runtime::api::app::usage::UsageEvent::SkillActivated{trigger,resource:Some(resource),..} if trigger=="resource_read"&&resource=="scripts/check.sh")
+    );
 }
 
 #[test]
@@ -813,6 +834,7 @@ fn agent_can_persist_learned_shortcut_as_skill_update() {
     store
         .write_skill_version(original_write)
         .expect("write original");
+    let probe = super::usage::Probe::new(data_dir.clone());
     let model = SequencedModel::new([
         r#"{
             "response_mode": "defer",
@@ -840,10 +862,11 @@ fn agent_can_persist_learned_shortcut_as_skill_update() {
             "next_state": "listening"
         }"#,
     ]);
-    let agent = Agent::new(model, "fake", "fake").with_tool_registry(crate::skill_registry(
-        crate::SkillAgentToolConfig::new(data_dir.clone()),
-    ));
+    let agent = Agent::new(probe.model(model), "fake", "fake").with_tool_registry(
+        crate::skill_registry(crate::SkillAgentToolConfig::new(data_dir.clone())),
+    );
 
+    agent.tool_registry().set_usage_data_dir(data_dir.clone());
     let run = agent
         .run(&agent_input("The shortcut is fast-run; update the skill."))
         .expect("run");
@@ -879,6 +902,43 @@ fn agent_can_persist_learned_shortcut_as_skill_update() {
         .expect("read updated")
         .expect("updated text");
     assert!(updated_text.contains("fast-run"));
+    let events = probe.records();
+    let publications = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                sinomo_runtime::api::app::usage::UsageEvent::SkillVersionPublished { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(
+        publications[0].attribution.tool_call.as_deref(),
+        Some(run.tool_results[0].call_id.as_str())
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e.event,
+                sinomo_runtime::api::app::usage::UsageEvent::ModelRequest { .. }
+            ))
+            .count(),
+        2
+    );
+    // Catalog activation is observed once for a real change; replay is idempotent.
+    store
+        .activate_skill_version(&original_entry, "cluster", "test", "restore")
+        .unwrap();
+    store
+        .activate_skill_version(&original_entry, "cluster", "test", "restore")
+        .unwrap();
+    let activations = probe.records();
+    assert_eq!(activations.len(), 1);
+    assert!(matches!(&activations[0].event,
+        sinomo_runtime::api::app::usage::UsageEvent::SkillVersionPublished { previous_version: Some(previous), version, .. }
+        if previous == "1.1.0" && version == "1.0.0"));
 }
 
 #[test]

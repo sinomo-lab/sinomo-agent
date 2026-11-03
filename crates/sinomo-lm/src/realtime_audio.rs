@@ -290,6 +290,8 @@ impl RealtimeAudioToolDefinition {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RealtimeAudioSessionConfig {
+    #[serde(skip)]
+    pub usage_context: Option<crate::RealtimeUsageContext>,
     pub provider: RealtimeAudioProvider,
     pub model: String,
     pub instructions: String,
@@ -365,6 +367,7 @@ impl RealtimeAudioSessionConfig {
                 ),
             };
         Self {
+            usage_context: None,
             provider,
             model,
             instructions: "You are Sinomo's realtime voice agent. Keep spoken responses concise."
@@ -1071,7 +1074,22 @@ pub trait RealtimeSession: Send {
 pub async fn connect_realtime_session(
     config: RealtimeAudioSessionConfig,
 ) -> Result<Box<dyn RealtimeSession>, RealtimeAudioError> {
-    Ok(Box::new(RealtimeAudioSession::connect(config).await?))
+    let mut observation = config.usage_context.clone().map(|context| {
+        crate::usage_realtime::RealtimeConnectionObservation::new(
+            context,
+            config.provider.provider_id().into(),
+            config.model.clone(),
+        )
+    });
+    let result = RealtimeAudioSession::connect(config).await;
+    if let Some(observation) = observation.as_mut() {
+        observation.finish(if result.is_ok() {
+            sinomo_runtime::api::app::usage::UsageStatus::Succeeded
+        } else {
+            sinomo_runtime::api::app::usage::UsageStatus::Failed
+        });
+    }
+    Ok(Box::new(result?))
 }
 
 pub struct RealtimeAudioSession {
@@ -1081,6 +1099,7 @@ pub struct RealtimeAudioSession {
     webrtc_call: Option<RealtimeWebrtcCall>,
     media: Option<Box<dyn RealtimeMediaTransport>>,
     server_event_observer: Option<Box<RealtimeServerEventObserver>>,
+    usage_recorder: Option<crate::usage_realtime::RealtimeUsageRecorder>,
 }
 
 type RealtimeServerEventObserver = dyn FnMut(&serde_json::Value) + Send;
@@ -1272,7 +1291,15 @@ impl RealtimeAudioSession {
             .map_err(|source| RealtimeAudioError::WebSocket {
                 detail: source.to_string(),
             })?;
+        let usage_recorder = config.usage_context.clone().map(|context| {
+            crate::usage_realtime::RealtimeUsageRecorder::new(
+                context,
+                config.provider.provider_id().into(),
+                config.model.clone(),
+            )
+        });
         let mut session = Self {
+            usage_recorder,
             config,
             ws,
             pending: VecDeque::new(),
@@ -1493,6 +1520,9 @@ impl RealtimeAudioSession {
     }
 
     pub async fn close(&mut self) -> Result<(), RealtimeAudioError> {
+        if let Some(recorder) = self.usage_recorder.as_mut() {
+            recorder.cancelled();
+        }
         // The media path is released first so the provider stops sending audio before the control
         // socket goes away.
         if let Some(mut media) = self.media.take() {
@@ -1605,6 +1635,9 @@ impl RealtimeAudioSession {
             serde_json::from_str(text).map_err(|source| RealtimeAudioError::Json {
                 detail: source.to_string(),
             })?;
+        if let Some(recorder) = self.usage_recorder.as_mut() {
+            recorder.observe(&value);
+        }
         if let Some(observer) = self.server_event_observer.as_mut() {
             observer(&value);
         }

@@ -88,17 +88,5 @@ if [[ "${status}" -eq 0 ]]; then
     --password-env "${password_var}" "${package_args[@]}" || status=$?
 fi
 
-if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]]; then
-  chown -R "${HOST_UID}:${HOST_GID}" \
-    "${target_dir}/android-debug.keystore" \
-    "${target_dir}/android-debug-small/apk" \
-    "${target_dir}/android-debug/apk" \
-    "${target_dir}/debug/apk" \
-    "${target_dir}/release/apk" \
-    "${target_dir}/aarch64-linux-android" \
-    "${target_dir}/x86_64-linux-android" \
-    "${target_dir}/cargo-apk-temp-extra-link-libraries" \
-    2>/dev/null || true
-fi
 
 exit "${status}"

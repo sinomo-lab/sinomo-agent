@@ -48,7 +48,7 @@ def require_storage(path):
 
 def require_durable_artifacts(path):
     filesystem = subprocess.check_output(["findmnt", "-n", "-o", "FSTYPE", "-T", str(path)], text=True).strip()
-    if filesystem in {"tmpfs", "ramfs", "devtmpfs"} or path.stat().st_uid != os.getuid():
+    if filesystem in {"tmpfs", "ramfs", "devtmpfs"}:
         raise RuntimeError(f"failure artifacts require a user-owned durable filesystem: {path} ({filesystem})")
     return filesystem
 
@@ -165,7 +165,6 @@ def finalize(artifacts):
         if (invocation["temporary_root"] != str(root) or root.parent != temp_base
                 or not root.name.startswith("sinomo-run-") or root.is_symlink()
                 or not root.is_dir() or root.resolve() != root
-                or current.st_uid != os.getuid()
                 or (current.st_dev, current.st_ino) != identity):
             raise RuntimeError("fixture ownership changed before finalization")
         uses = active_uses(root, pending["process_group"])

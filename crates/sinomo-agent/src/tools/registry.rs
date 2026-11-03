@@ -27,6 +27,7 @@ pub struct AgentToolRegistry {
     resources: Arc<RwLock<Vec<Arc<dyn Send + Sync>>>>,
     local_permission_checker: Arc<RwLock<Option<Arc<dyn AgentToolLocalPermissionChecker>>>>,
     generation: Arc<AtomicU64>,
+    usage_data_dir: Arc<RwLock<Option<sinomo_runtime::local::SinomoDataDir>>>,
 }
 
 /// Host-provided evaluator for node-local authority grants. The registry
@@ -56,6 +57,164 @@ impl AgentToolRegistry {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn submit_usage_record(&self, record: sinomo_runtime::api::app::usage::UsageRecord) {
+        let Ok(dir) = self.usage_data_dir.read() else {
+            sinomo_runtime::api::observe::recording::dropped("tool_context_poisoned");
+            return;
+        };
+        if let Some(dir) = dir.as_ref() {
+            sinomo_lm::usage::submit_usage(dir, record);
+        }
+    }
+    pub fn set_usage_data_dir(&self, data_dir: sinomo_runtime::local::SinomoDataDir) {
+        *self.usage_data_dir.write().unwrap() = Some(data_dir);
+    }
+    pub(crate) fn record_skill_usage(
+        &self,
+        session: &InteractionSession,
+        call_id: &TaskId,
+        skill: &crate::AgentSkillDescriptor,
+        resource: Option<String>,
+    ) {
+        use sinomo_runtime::api::app::usage::*;
+        let Ok(dir) = self.usage_data_dir.read() else {
+            sinomo_runtime::api::observe::recording::dropped("tool_context_poisoned");
+            return;
+        };
+        let Some(dir) = dir.as_ref() else {
+            return;
+        };
+        sinomo_lm::usage::submit_usage(
+            dir,
+            sinomo_lm::usage::record(
+                UsageAttribution {
+                    node: session.node_id.to_string(),
+                    session: sinomo_lm::usage::current_attribution()
+                        .session
+                        .or_else(|| Some(session.session_id.to_string())),
+                    chat: session.conversation_id.as_ref().map(ToString::to_string),
+                    tool_call: Some(call_id.to_string()),
+                    origin: sinomo_lm::usage::current_attribution().origin,
+                    purpose: "skill_activation".into(),
+                    ..sinomo_lm::usage::current_attribution()
+                },
+                UsageEvent::SkillActivated {
+                    skill: skill.id.clone(),
+                    version: skill.catalog_version.clone().unwrap_or_default(),
+                    content_hash: skill.catalog_content_hash.clone().unwrap_or_else(|| {
+                        blake3::hash(
+                            skill
+                                .embedded_text
+                                .as_deref()
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        )
+                        .to_hex()
+                        .to_string()
+                    }),
+                    trigger: if resource.is_some() {
+                        "resource_read"
+                    } else {
+                        "skill_activate"
+                    }
+                    .into(),
+                    resource,
+                },
+            ),
+        );
+    }
+    /// Record a terminal host rejection or an orchestrated completion without affecting execution.
+    pub fn record_usage(
+        &self,
+        session: &InteractionSession,
+        call_id: &TaskId,
+        outcome: &AgentToolOutcome,
+        duration_ms: u64,
+        detached: bool,
+    ) {
+        use sinomo_runtime::api::app::usage::*;
+        let Ok(dir) = self.usage_data_dir.read() else {
+            sinomo_runtime::api::observe::recording::dropped("tool_context_poisoned");
+            return;
+        };
+        let Some(dir) = dir.as_ref() else {
+            return;
+        };
+        let status = match outcome.status {
+            AgentToolStatus::Succeeded => UsageStatus::Succeeded,
+            AgentToolStatus::Failed => UsageStatus::Failed,
+            AgentToolStatus::Cancelled => UsageStatus::Cancelled,
+            AgentToolStatus::Blocked => UsageStatus::Denied,
+        };
+        let mut attribution = UsageAttribution {
+            node: session.node_id.to_string(),
+            session: sinomo_lm::usage::current_attribution()
+                .session
+                .or_else(|| Some(session.session_id.to_string())),
+            chat: session.conversation_id.as_ref().map(ToString::to_string),
+            tool_call: Some(call_id.to_string()),
+            origin: sinomo_lm::usage::current_attribution().origin,
+            purpose: "tool_call".into(),
+            ..Default::default()
+        };
+        attribution.inherit_from(&sinomo_lm::usage::current_attribution());
+        tracing::info!(target:"sinomo.agent.usage",tool=%outcome.call.tool,call_id=%call_id,status=?status,duration_ms,detached,session=%session.session_id,"tool call completed");
+        sinomo_lm::usage::submit_usage(
+            dir,
+            sinomo_lm::usage::record(
+                attribution,
+                UsageEvent::ToolCall {
+                    tool: if outcome.call.tool == "tool_call" {
+                        outcome
+                            .call
+                            .input
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("tool_call")
+                            .to_string()
+                    } else {
+                        outcome.call.tool.clone()
+                    },
+                    status,
+                    duration_ms,
+                    detached,
+                    runtime: outcome
+                        .evidence
+                        .metadata
+                        .get("runtime")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            outcome
+                                .evidence
+                                .execution
+                                .as_ref()
+                                .and_then(|execution| execution.environment.clone())
+                        })
+                        .unwrap_or_else(|| {
+                            if outcome.evidence.metadata.get("mcp_server").is_some() {
+                                "mcp"
+                            } else {
+                                "agent"
+                            }
+                            .into()
+                        }),
+                    executing_node: outcome
+                        .evidence
+                        .metadata
+                        .get("executing_node_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    mcp_server: outcome
+                        .evidence
+                        .metadata
+                        .get("mcp_server")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                },
+            ),
+        );
+    }
 
     /// Capture an independent executor/resource snapshot for transactional host
     /// reconfiguration. Unlike `Clone`, mutations to either registry do not
@@ -81,6 +240,7 @@ impl AgentToolRegistry {
             resources: Arc::new(RwLock::new(resources)),
             local_permission_checker: Arc::new(RwLock::new(local_permission_checker)),
             generation: Arc::new(AtomicU64::new(self.generation())),
+            usage_data_dir: Arc::new(RwLock::new(self.usage_data_dir.read().unwrap().clone())),
         }
     }
 
@@ -676,9 +836,12 @@ fn run_tool_until_cancelled(
     let worker_session = session.clone();
     let worker_call = call.clone();
     let worker_token = cancellation_token.clone();
+    let mut usage_attribution = sinomo_lm::usage::current_attribution();
+    usage_attribution.tool_call = Some(call_id.to_string());
     let spawned = std::thread::Builder::new()
         .name("sinomo-agent-tool".to_string())
         .spawn(move || {
+            let _usage_scope = sinomo_lm::usage::enter_attribution(usage_attribution);
             // Keep the registry resources this executor depends on alive for
             // as long as it runs, even after an abandoned call returns.
             let _resources = resources;

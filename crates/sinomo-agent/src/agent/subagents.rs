@@ -201,6 +201,10 @@ impl AgentSubagents {
                 &child_input.session,
                 "Continue with queued messages.",
             );
+            child_input.latest_event.payload["subagent"] = serde_json::json!({
+                "id": snapshot.id, "name": snapshot.name,
+                "parent_session_id": snapshot.parent_session_id,
+            });
             child_input.transient_system_context = None;
             child_input.async_update = None;
             let child = Arc::new(Child {
@@ -333,8 +337,12 @@ impl AgentSubagents {
             .links
             .caused_by
             .push(input.latest_event.event_id.clone());
-        event.payload["subagent"] =
-            serde_json::json!({"id": snapshot.id, "name": name, "parent_session_id": caller});
+        let attribution = sinomo_lm::usage::current_attribution();
+        event.payload["subagent"] = serde_json::json!({
+            "id": snapshot.id, "name": name, "parent_session_id": caller,
+            "parent_operation": attribution.operation,
+            "parent_tool_call": attribution.tool_call,
+        });
         input.latest_event = event;
         input.transient_system_context = None;
         input.async_update = None;
@@ -459,10 +467,14 @@ impl AgentSubagents {
                 let mut input = state.input.clone();
                 input.async_update = update;
                 state.input.async_update = None;
+                let delegation = state.input.latest_event.payload.get("subagent").cloned();
                 state.input.latest_event = crate::user_interaction_input_event(
                     &state.input.session,
                     "Continue with the queued messages and updates.",
                 );
+                if let Some(delegation) = delegation {
+                    state.input.latest_event.payload["subagent"] = delegation;
+                }
                 (
                     state.runtime.as_ref().unwrap().clone(),
                     input,

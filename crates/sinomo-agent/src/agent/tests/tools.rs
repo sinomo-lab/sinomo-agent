@@ -233,6 +233,7 @@ fn agent_records_provider_stream_reasoning_tool_usage_and_finish_events() {
                     usage: sinomo_lm::LanguageModelUsage {
                         input_tokens: Some(5),
                         output_tokens: Some(7),
+                        ..Default::default()
                     },
                 },
                 LanguageModelStreamEvent::Finished {
@@ -2442,13 +2443,15 @@ fn local_workspace_apply_patch_preserves_crlf_and_missing_final_newline() {
 
 #[cfg(unix)]
 #[test]
-fn local_workspace_apply_patch_preserves_existing_file_mode() {
+fn local_workspace_apply_patch_uses_ordinary_creation_mode() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = sinomo_testdir::TestDir::new("sinomo-agent-mode-patch");
     let script = root.join("script.sh");
     fs::write(&script, "old\n").expect("seed script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let control = root.join("control");
+    fs::write(&control, []).unwrap();
     let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
     let registry = AgentToolRegistry::local_workspace_with_config(config);
     let input = agent_input("mode patch");
@@ -2479,7 +2482,7 @@ fn local_workspace_apply_patch_preserves_existing_file_mode() {
             .permissions()
             .mode()
             & 0o777,
-        0o755
+        fs::metadata(control).unwrap().permissions().mode() & 0o777
     );
 }
 

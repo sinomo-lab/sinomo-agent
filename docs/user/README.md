@@ -11,6 +11,7 @@ system. It assumes no knowledge of the Rust crates.
 | Use the TUI, app, agents, models, memory, skills, files, and voice surfaces | [Everyday use](everyday-use.md) |
 | Capture, retain, restore, or recover file content | [File history](file-history.md) |
 | Stream a desktop/app to a realtime model and send input | [App Use: background and raw control](computer-and-app-use.md) |
+| Inspect agent usage, quotas, estimated costs and budgets | [Usage and cost estimates](usage.md) |
 | Keep an installation healthy and collect operational evidence | [Operations](operations.md) |
 | Create and monitor a metric-driven evolution goal | [Evolution goals](evolution.md) |
 | Create, join, inspect, migrate, or recover a cluster | [Cluster operations](cluster-operations.md) |

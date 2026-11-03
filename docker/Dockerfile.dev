@@ -27,7 +27,6 @@ RUN apt-get update \
 # Baked-in copy of the entrypoint; the dev compose additionally bind-mounts the
 # working-tree script over it so edits apply on container restart.
 COPY entrypoint.sh /usr/local/bin/sinomo-node-entrypoint
-RUN chmod +x /usr/local/bin/sinomo-node-entrypoint
 
 ENV SINOMO_DATA_DIR=/data
 ENTRYPOINT ["/usr/local/bin/sinomo-node-entrypoint"]

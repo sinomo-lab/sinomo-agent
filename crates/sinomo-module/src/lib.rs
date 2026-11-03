@@ -4516,7 +4516,7 @@ pub fn install_native_dylib_module_from_bytes(
     let _lock = acquire_native_dylib_module_state_lock(data_dir_root)?;
     recover_native_dylib_module_loader_state_transaction_unlocked(data_dir_root)?;
     let staging_path = native_dylib_module_staging_path(data_dir_root, &library_name);
-    write_native_dylib_module_file(&staging_path, bytes, None)?;
+    write_native_dylib_module_file(&staging_path, bytes)?;
     let result = install_native_dylib_module_from_path_and_bytes(
         data_dir_root,
         &staging_path,
@@ -4576,7 +4576,7 @@ fn install_native_dylib_module_from_path_and_bytes(
     let cache_key = validate_native_dylib_module_cache_key(&cache_key)?;
     let cache_path =
         native_module_cache_path(data_dir_root, &cache_key, &content_hash, &library_name);
-    write_native_dylib_module_file(&cache_path, bytes, Some(descriptor_path))?;
+    write_native_dylib_module_file(&cache_path, bytes)?;
 
     let previous_state_path = native_dylib_module_loader_state_path(data_dir_root, &module_id);
     let previous_state = if previous_state_path.exists() {
@@ -4713,7 +4713,6 @@ fn native_dylib_module_staging_path(data_dir_root: &Path, library_name: &str) ->
 fn write_native_dylib_module_file(
     path: &Path,
     bytes: &[u8],
-    permissions_source: Option<&Path>,
 ) -> Result<(), NativeDylibModuleInstallError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| NativeDylibModuleInstallError::Io {
@@ -4746,15 +4745,13 @@ fn write_native_dylib_module_file(
         path: tmp_path.display().to_string(),
         detail: source.to_string(),
     })?;
-    if let Some(source_path) = permissions_source
-        && let Ok(metadata) = fs::metadata(source_path)
-    {
-        let _ = fs::set_permissions(&tmp_path, metadata.permissions());
-    }
     #[cfg(unix)]
-    if permissions_source.is_none() {
+    {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755));
+        if let Err(source) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(NativeDylibModuleInstallError::Io { path: tmp_path.display().to_string(), detail: source.to_string() });
+        }
     }
     fs::rename(&tmp_path, path).map_err(|source| NativeDylibModuleInstallError::Io {
         path: path.display().to_string(),

@@ -127,10 +127,10 @@ pub(crate) fn response(value: &Value, provider: &str, model: &str) -> LanguageMo
         content: super::extract_anthropic_text(value),
         tool_calls: calls,
         items,
-        usage: value.get("usage").map(|u| LanguageModelUsage {
-            input_tokens: u["input_tokens"].as_u64(),
-            output_tokens: u["output_tokens"].as_u64(),
-        }),
+        usage: value
+            .get("usage")
+            .filter(|u| u.is_object())
+            .map(crate::usage::anthropic),
     }
 }
 

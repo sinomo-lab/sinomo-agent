@@ -223,7 +223,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn complete_uses_claude_code_print_mode_process() {
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = sinomo_testdir::TestDir::new("sinomo-claude-code-test");
         let script = dir.join("fake-claude");
@@ -235,9 +234,7 @@ mod tests {
             .expect("script write");
             file.sync_all().expect("script sync");
         }
-        let mut perms = fs::metadata(&script).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).expect("chmod");
+        sinomo_testdir::install_shell_fixture(&script).expect("install shell fixture");
 
         let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
             program: script.display().to_string(),

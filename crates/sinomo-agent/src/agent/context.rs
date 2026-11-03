@@ -69,6 +69,8 @@ pub struct AvailableAgentSkill {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ExplicitAgentSkillContext {
+    pub version: String,
+    pub content_hash: String,
     pub name: String,
     pub description: String,
     pub instructions: String,
@@ -1944,6 +1946,7 @@ impl<M: InteractionModel> Agent<M> {
                 .or(self.config.definition.max_output_tokens),
             response_format: turn_context.response_format.clone(),
             metadata: serde_json::json!({
+                "usage_attribution": self.usage_attribution(input),
                 "loop": "agent",
                 "agent_name": self.config.definition.name,
                 "agent_role": self.config.definition.role,
