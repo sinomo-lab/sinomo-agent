@@ -593,3 +593,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod latency_bench;

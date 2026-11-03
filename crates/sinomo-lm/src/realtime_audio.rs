@@ -3465,3 +3465,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "realtime_audio_latency_bench.rs"]
+mod latency_bench;
