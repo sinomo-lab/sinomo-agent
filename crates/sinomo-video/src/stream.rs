@@ -51,6 +51,8 @@ pub struct VideoFrameMetadata {
     pub format: RealtimeVideoFrameFormat,
     #[serde(default)]
     pub coordinate_grid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_format: Option<NativeVideoSampleFormat>,
     #[serde(default)]
     pub transport: VideoTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,28 +63,35 @@ pub struct VideoFrameMetadata {
 /// native sample formats use the existing video conversion path.
 pub fn realtime_frame(sample: &NativeVideoSample) -> Result<RealtimeVideoFrameInput, String> {
     sample.validate().map_err(|e| e.to_string())?;
-    let mut frame =
-        if sample.format == NativeVideoSampleFormat::Bgra8 && sample.planes[0].offset == 0 {
-            RealtimeVideoFrameInput::new(
-                sample.data.clone(),
-                RealtimeVideoPixelFormat::Bgra8,
-                sample.width,
-                sample.height,
-                sample.planes[0].stride as usize,
-                sample.sequence,
-            )
-        } else {
-            let surface =
-                crate::native_video_sample_to_surface_frame(sample).map_err(|e| e.to_string())?;
-            RealtimeVideoFrameInput::new(
-                surface.rgba,
-                RealtimeVideoPixelFormat::Rgba8,
-                surface.width,
-                surface.height,
-                surface.width as usize * 4,
-                surface.sequence,
-            )
-        };
+    let mut frame = if matches!(
+        sample.format,
+        NativeVideoSampleFormat::Bgra8 | NativeVideoSampleFormat::Rgba8
+    ) && sample.planes[0].offset == 0
+    {
+        RealtimeVideoFrameInput::new(
+            sample.data.clone(),
+            if sample.format == NativeVideoSampleFormat::Bgra8 {
+                RealtimeVideoPixelFormat::Bgra8
+            } else {
+                RealtimeVideoPixelFormat::Rgba8
+            },
+            sample.width,
+            sample.height,
+            sample.planes[0].stride as usize,
+            sample.sequence,
+        )
+    } else {
+        let surface =
+            crate::native_video_sample_to_surface_frame(sample).map_err(|e| e.to_string())?;
+        RealtimeVideoFrameInput::new(
+            surface.rgba,
+            RealtimeVideoPixelFormat::Rgba8,
+            surface.width,
+            surface.height,
+            surface.width as usize * 4,
+            surface.sequence,
+        )
+    };
     frame.timestamp_ms = Some(sample.timestamp_ns / 1_000_000);
     Ok(frame)
 }
@@ -105,10 +114,11 @@ pub fn encode_sample(
         captured_at_unix_ms: sample.captured_at_unix_ms,
         width: encoded.width.unwrap_or(sample.width),
         height: encoded.height.unwrap_or(sample.height),
-        source_width: sample.width,
-        source_height: sample.height,
+        source_width: sample.native_dimensions()[0],
+        source_height: sample.native_dimensions()[1],
         format: encoded.format,
         coordinate_grid: config.coordinate_grid,
+        capture_format: Some(sample.format),
         transport: VideoTransport::Image,
         packet_sequence: None,
     };
@@ -135,8 +145,11 @@ pub fn compose_desktop_overview(
     let mut captured_at = 0;
     for (index, (id, sample)) in samples.iter().enumerate() {
         sample.validate().map_err(|e| e.to_string())?;
-        if sample.format != NativeVideoSampleFormat::Bgra8 {
-            return Err("overview expects native BGRA samples".into());
+        if !matches!(
+            sample.format,
+            NativeVideoSampleFormat::Bgra8 | NativeVideoSampleFormat::Rgba8
+        ) {
+            return Err("overview expects native BGRA/RGBA samples".into());
         }
         let factor =
             (cell_w as f64 / sample.width as f64).min(cell_h as f64 / sample.height as f64);
@@ -154,18 +167,22 @@ pub fn compose_desktop_overview(
                     + source_x as usize * 4;
                 let dst = (((top + y) * width + left + x) * 4) as usize;
                 pixels[dst..dst + 4].copy_from_slice(&sample.data[src..src + 4]);
+                if sample.format == NativeVideoSampleFormat::Rgba8 {
+                    pixels.swap(dst, dst + 2);
+                }
             }
         }
         captured_at = captured_at.max(sample.captured_at_unix_ms);
         tiles.push(DesktopOverviewTile {
             surface_id: id.clone(),
             bounds: [left, top, left + w, top + h],
-            source_width: sample.width,
-            source_height: sample.height,
+            source_width: sample.native_dimensions()[0],
+            source_height: sample.native_dimensions()[1],
             captured_at_unix_ms: sample.captured_at_unix_ms.min(u64::MAX as u128) as u64,
         });
     }
     let sample = NativeVideoSample {
+        native_dimensions: None,
         sequence,
         format: NativeVideoSampleFormat::Bgra8,
         width,
@@ -221,6 +238,17 @@ pub fn desktop_capture_body_with_transport(
     cancelled: Arc<AtomicBool>,
     transport: VideoTransport,
 ) -> (ObjectRpcBodySource, tokio::task::JoinHandle<()>) {
+    desktop_capture_body_with_options(capture, encoding, duration, cancelled, transport, None)
+}
+
+pub fn desktop_capture_body_with_options(
+    capture: impl DesktopFrameSource + 'static,
+    encoding: RealtimeVideoInputConfig,
+    duration: Duration,
+    cancelled: Arc<AtomicBool>,
+    transport: VideoTransport,
+    resolution: Option<sinomo_runtime::device::desktop::CaptureResolution>,
+) -> (ObjectRpcBodySource, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let failure = Arc::new(Mutex::new(None));
     let terminal = failure.clone();
@@ -268,14 +296,62 @@ pub fn desktop_capture_body_with_transport(
                     outcome = tracing::field::Empty);
                 let encode_guard = encode_span.enter();
                 let frame_started = Instant::now();
-                let (mut metadata, bytes) = if transport == VideoTransport::H264 {
+                let mut frame_encoding = encoding.clone();
+                if let Some(bounds) = resolution {
+                    let size = bounds
+                        .fit(sample.width, sample.height, 1)
+                        .map_err(|e| e.to_string())?;
+                    frame_encoding.max_dimension = Some(size[0].max(size[1]));
+                }
+                let encoding = &frame_encoding;
+                let (mut metadata, bytes) = if sample.format == NativeVideoSampleFormat::H264 {
+                    if transport != VideoTransport::H264 || encoding.coordinate_grid {
+                        return Err(
+                            "native H264 capture requires H264 transport without an image grid"
+                                .into(),
+                        );
+                    }
+                    sample.validate().map_err(|e| e.to_string())?;
+                    crate::codec::dimensions(sample.width, sample.height)?;
+                    let size = (sample.width, sample.height);
+                    if output_size.is_some_and(|previous| previous != size) {
+                        return Err("native H264 source geometry changed; reopen stream".into());
+                    }
+                    output_size = Some(size);
+                    crate::codec::validate_access_unit(
+                        &sample.data,
+                        sample.width,
+                        sample.height,
+                        packet_sequence == 0,
+                    )?;
+                    (
+                        VideoFrameMetadata {
+                            identity: None,
+                            tiles: Vec::new(),
+                            sequence: sample.sequence,
+                            timestamp_ns: sample.timestamp_ns,
+                            duration_ns: sample.duration_ns,
+                            captured_at_unix_ms: sample.captured_at_unix_ms,
+                            width: sample.width,
+                            height: sample.height,
+                            source_width: sample.native_dimensions()[0],
+                            source_height: sample.native_dimensions()[1],
+                            format: encoding.frame_format,
+                            coordinate_grid: false,
+                            capture_format: Some(sample.format),
+                            transport,
+                            packet_sequence: Some(packet_sequence),
+                        },
+                        sample.data.clone(),
+                    )
+                } else if transport == VideoTransport::H264 {
                     let frame = realtime_frame(&sample)?;
                     let max = encoding.max_dimension.unwrap_or(1920).clamp(2, 1920);
                     let scale = f64::from(max)
                         / f64::from(frame.width.max(frame.height)).max(f64::from(max));
                     let size = (
-                        (((f64::from(frame.width) * scale).ceil() as u32 + 1) & !1).clamp(2, 1920),
-                        (((f64::from(frame.height) * scale).ceil() as u32 + 1) & !1).clamp(2, 1920),
+                        ((f64::from(frame.width) * scale) as u32 & !1).clamp(2, 1920),
+                        ((f64::from(frame.height) * scale) as u32 & !1).clamp(2, 1920),
                     );
                     crate::codec::dimensions(size.0, size.1)?;
                     if output_size != Some(size) {
@@ -303,10 +379,11 @@ pub fn desktop_capture_body_with_transport(
                             captured_at_unix_ms: sample.captured_at_unix_ms,
                             width: size.0,
                             height: size.1,
-                            source_width: sample.width,
-                            source_height: sample.height,
+                            source_width: sample.native_dimensions()[0],
+                            source_height: sample.native_dimensions()[1],
                             format: encoding.frame_format,
                             coordinate_grid: false,
+                            capture_format: Some(sample.format),
                             transport,
                             packet_sequence: Some(packet_sequence),
                         },
@@ -725,6 +802,7 @@ mod tests {
                 let bytes = encoder.encode(&yuv).unwrap().to_vec();
                 (
                     VideoFrameMetadata {
+                        capture_format: None,
                         identity: None,
                         tiles: Vec::new(),
                         sequence: index * 2 + 1,
@@ -744,6 +822,121 @@ mod tests {
                 )
             })
             .collect()
+    }
+    #[tokio::test]
+    async fn native_h264_capture_preserves_dependent_frames_and_native_geometry() {
+        struct Source(
+            Mutex<std::collections::VecDeque<NativeVideoSample>>,
+            Arc<AtomicBool>,
+        );
+        impl DesktopFrameSource for Source {
+            fn check_active(&self) -> sinomo_runtime::device::desktop::DesktopResult<()> {
+                Ok(())
+            }
+            fn next(
+                &self,
+                _: u64,
+                _: Duration,
+            ) -> sinomo_runtime::device::desktop::DesktopResult<Option<NativeVideoSample>>
+            {
+                let frame = self.0.lock().unwrap().pop_front();
+                if frame.is_none() {
+                    self.1.store(true, Ordering::Release);
+                }
+                Ok(frame)
+            }
+        }
+        let samples = h264_records()
+            .into_iter()
+            .map(|(metadata, bytes)| NativeVideoSample {
+                native_dimensions: Some([1080, 2280]),
+                sequence: metadata.sequence,
+                format: NativeVideoSampleFormat::H264,
+                width: 64,
+                height: 64,
+                timestamp_ns: metadata.timestamp_ns,
+                duration_ns: metadata.duration_ns,
+                captured_at_unix_ms: 1,
+                planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+                    offset: 0,
+                    len: bytes.len(),
+                    width: 64,
+                    height: 64,
+                    stride: 0,
+                }]),
+                data: bytes.into(),
+            })
+            .collect();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (body, worker) = desktop_capture_body_with_transport(
+            Source(Mutex::new(samples), cancelled.clone()),
+            RealtimeVideoInputConfig {
+                max_frame_rate_hz: None,
+                ..Default::default()
+            },
+            Duration::from_secs(5),
+            cancelled,
+            VideoTransport::H264,
+        );
+        let bytes = body.collect_to_vec(1024 * 1024).await.unwrap();
+        worker.await.unwrap();
+        let mut reader = bytes.as_slice();
+        let mut decoder = VideoStreamReader::default();
+        for index in 0..4 {
+            let (metadata, frame) = decoder.read_decoded(&mut reader).await.unwrap().unwrap();
+            assert_eq!(metadata.packet_sequence, Some(index));
+            assert_eq!(metadata.capture_format, Some(NativeVideoSampleFormat::H264));
+            assert_eq!(
+                (metadata.source_width, metadata.source_height),
+                (1080, 2280)
+            );
+            assert!(matches!(frame, ReceivedFrame::Pixels(_)));
+        }
+        assert!(decoder.read_decoded(&mut reader).await.unwrap().is_none());
+    }
+    #[test]
+    fn rgba_capture_keeps_channel_order_and_native_input_coordinates() {
+        let sample = NativeVideoSample {
+            native_dimensions: Some([1080, 2280]),
+            sequence: 1,
+            format: NativeVideoSampleFormat::Rgba8,
+            width: 2,
+            height: 1,
+            timestamp_ns: 1,
+            duration_ns: 1,
+            captured_at_unix_ms: 1,
+            data: Arc::from([255, 0, 0, 255, 0, 0, 255, 255]),
+            planes: Arc::from([sinomo_runtime::device::NativeVideoPlane {
+                offset: 0,
+                len: 8,
+                width: 2,
+                height: 1,
+                stride: 8,
+            }]),
+        };
+        assert!(Arc::ptr_eq(
+            &sample.data,
+            &realtime_frame(&sample).unwrap().pixels
+        ));
+        let (metadata, encoded) = encode_sample(
+            &sample,
+            &RealtimeVideoInputConfig {
+                frame_format: RealtimeVideoFrameFormat::Png,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (metadata.source_width, metadata.source_height),
+            (1080, 2280)
+        );
+        assert_eq!(
+            image::load_from_memory(&encoded.image)
+                .unwrap()
+                .to_rgba8()
+                .as_raw(),
+            &*sample.data
+        );
     }
     #[tokio::test]
     async fn h264_decodes_dependent_frames_before_latest_image_and_rejects_loss() {
@@ -800,6 +993,7 @@ mod tests {
     #[tokio::test]
     async fn remote_source_accepts_a_native_camera_starting_at_sequence_zero() {
         let sample = NativeVideoSample {
+            native_dimensions: None,
             sequence: 0,
             format: NativeVideoSampleFormat::Bgra8,
             width: 1,
@@ -838,6 +1032,7 @@ mod tests {
     #[test]
     fn overview_tiles_preserve_surface_identity_and_source_geometry() {
         let make = |color: [u8; 4], width, height, time| NativeVideoSample {
+            native_dimensions: None,
             sequence: 1,
             format: NativeVideoSampleFormat::Bgra8,
             width,
@@ -900,6 +1095,7 @@ mod tests {
             {
                 let sequence = self.0.fetch_add(1, Ordering::AcqRel) as u64 + 1;
                 Ok(Some(NativeVideoSample {
+                    native_dimensions: None,
                     sequence,
                     format: NativeVideoSampleFormat::Bgra8,
                     width: 1,
@@ -949,6 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn bgra_video_uses_the_shared_encoder_and_keeps_capture_metadata() {
         let sample = NativeVideoSample {
+            native_dimensions: None,
             sequence: 7,
             format: NativeVideoSampleFormat::Bgra8,
             width: 2,
@@ -989,6 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn continuous_records_preserve_sequence_and_reject_truncation() {
         let metadata = VideoFrameMetadata {
+            capture_format: None,
             identity: None,
             tiles: Vec::new(),
             sequence: 5,

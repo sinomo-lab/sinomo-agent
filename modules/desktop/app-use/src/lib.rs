@@ -66,7 +66,7 @@ pub fn descriptor() -> NativeModuleDescriptor {
         owner: "sinomo-app-use-module".into(),
         native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
         backend: NativeModuleBackend::NativeDylib,
-        interface_version: "sinomo.app-use.os.v1".into(),
+        interface_version: "sinomo.app-use.os.v2".into(),
         platform_triple: format!(
             "{}-{}-{}",
             std::env::consts::ARCH,
@@ -579,6 +579,9 @@ mod tests {
     #[test]
     fn raw_video_roundtrips_the_native_sobj_boundary() {
         let frame = DesktopRawFrame {
+            pixel_format: sinomo_device::NativeVideoSampleFormat::Bgra8,
+            native_width: 2048,
+            native_height: 1024,
             sequence: 7,
             width: 2048,
             height: 1024,
@@ -586,7 +589,7 @@ mod tests {
             timestamp_ns: 42,
             duration_ns: 30,
             captured_at_unix_ms: 123,
-            pixels: vec![15; 8 * 1024 * 1024],
+            pixels: vec![15; 8 * 1024 * 1024].into(),
         };
         let encoded = encode_sobj(&DesktopFrameDelivery {
             capture_id: "capture".into(),

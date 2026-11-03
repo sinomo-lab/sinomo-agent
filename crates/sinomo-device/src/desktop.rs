@@ -97,6 +97,8 @@ pub struct DesktopTargetInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopCapabilities {
+    #[serde(default)]
+    pub capture_formats: Vec<crate::NativeVideoSampleFormat>,
     pub platform: String,
     pub capture: bool,
     pub keyboard_mouse: bool,
@@ -335,6 +337,12 @@ pub fn frame_point_to_client(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesktopCaptureConfig {
+    /// An aspect-preserving output bounding box; native geometry remains unchanged.
+    #[serde(default)]
+    pub resolution: Option<CaptureResolution>,
+    /// None preserves the backend's native raw format. Encoded output is explicit.
+    #[serde(default)]
+    pub pixel_format: Option<crate::NativeVideoSampleFormat>,
     pub target: DesktopTarget,
     #[serde(default = "default_fps")]
     pub frames_per_second: u32,
@@ -504,3 +512,6 @@ mod tests {
         assert!(validate_inputs(&target, &[DesktopInput::Move { x: 32768, y: 0 }]).is_err());
     }
 }
+
+mod capture;
+pub use capture::{CaptureResolution, fit_capture_sample};

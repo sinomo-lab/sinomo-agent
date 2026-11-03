@@ -1,5 +1,5 @@
 //! Versioned OS boundary using the native module SOBJ ABI. Continuous capture
-//! returns raw BGRA samples for the common media encoder, never encoded images.
+//! preserves sample format and native geometry through an explicitly versioned contract.
 use super::surfaces::*;
 use super::*;
 use crate::{NativeVideoPlane, NativeVideoSampleFormat};
@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 pub const APP_USE_OS_MODULE_ID: &str = "module.app-use.os";
 pub const APP_USE_OS_INTERFACE: &str = "sinomo.app-use.os";
-pub const APP_USE_OS_VERSION: &str = "1.0.0";
+pub const APP_USE_OS_VERSION: &str = "2.0.0";
 pub const APP_USE_OS_OPERATION: &str = "app-use.os";
 pub const APP_USE_OS_SERVICE: &str = "app-use-os";
 pub const APP_USE_OS_CACHE_KEY: &str = "module/desktop/app-use";
@@ -140,6 +140,9 @@ pub enum DesktopProviderResponse {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DesktopRawFrame {
+    pub pixel_format: NativeVideoSampleFormat,
+    pub native_width: u32,
+    pub native_height: u32,
     pub sequence: u64,
     pub width: u32,
     pub height: u32,
@@ -147,8 +150,8 @@ pub struct DesktopRawFrame {
     pub timestamp_ns: u64,
     pub duration_ns: u64,
     pub captured_at_unix_ms: u64,
-    #[serde(with = "serde_bytes")]
-    pub pixels: Vec<u8>,
+    #[serde(with = "shared_bytes")]
+    pub pixels: Arc<[u8]>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DesktopFrameDelivery {
@@ -160,16 +163,24 @@ impl DesktopRawFrame {
         sample
             .validate()
             .map_err(|e| DesktopError::Platform(e.to_string()))?;
-        if sample.format != NativeVideoSampleFormat::Bgra8
-            || sample.planes.len() != 1
+        if !matches!(
+            sample.format,
+            NativeVideoSampleFormat::Bgra8
+                | NativeVideoSampleFormat::Rgba8
+                | NativeVideoSampleFormat::H264
+        ) || sample.planes.len() != 1
             || sample.planes[0].offset != 0
             || sample.data.len() > MAX_FRAME_BYTES
         {
             return Err(DesktopError::Invalid(
-                "OS provider requires one bounded BGRA plane".into(),
+                "OS provider requires one bounded BGRA, RGBA or H264 plane".into(),
             ));
         }
+        let [native_width, native_height] = sample.native_dimensions();
         Ok(Self {
+            pixel_format: sample.format,
+            native_width,
+            native_height,
             sequence: sample.sequence,
             width: sample.width,
             height: sample.height,
@@ -179,7 +190,7 @@ impl DesktopRawFrame {
             captured_at_unix_ms: u64::try_from(sample.captured_at_unix_ms).map_err(|_| {
                 DesktopError::Invalid("capture timestamp exceeds the native wire range".into())
             })?,
-            pixels: sample.data.to_vec(),
+            pixels: sample.data,
         })
     }
     pub fn into_sample(self) -> DesktopResult<NativeVideoSample> {
@@ -187,8 +198,9 @@ impl DesktopRawFrame {
             return Err(DesktopError::Invalid("OS frame exceeds limit".into()));
         }
         let sample = NativeVideoSample {
+            native_dimensions: Some([self.native_width, self.native_height]),
             sequence: self.sequence,
-            format: NativeVideoSampleFormat::Bgra8,
+            format: self.pixel_format,
             width: self.width,
             height: self.height,
             timestamp_ns: self.timestamp_ns,
@@ -201,11 +213,83 @@ impl DesktopRawFrame {
                 height: self.height,
                 stride: self.stride,
             }]),
-            data: self.pixels.into(),
+            data: self.pixels,
         };
         sample
             .validate()
             .map_err(|e| DesktopError::Invalid(e.to_string()))?;
         Ok(sample)
+    }
+}
+
+// Decode directly into host-owned shared storage; do not allocate an intermediate
+// Vec and copy it again when handing the frame to the video pipeline.
+mod shared_bytes {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        bytes: &Arc<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<[u8]>, D::Error> {
+        struct Bytes;
+        impl<'de> serde::de::Visitor<'de> for Bytes {
+            type Value = Arc<[u8]>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("bounded native frame bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+                if bytes.len() > MAX_FRAME_BYTES {
+                    return Err(E::custom("native frame exceeds limit"));
+                }
+                Ok(Arc::from(bytes))
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+                self.visit_bytes(&bytes)
+            }
+        }
+        deserializer.deserialize_bytes(Bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_frame_handoff_preserves_shared_storage_format_and_geometry() {
+        for format in [
+            NativeVideoSampleFormat::Rgba8,
+            NativeVideoSampleFormat::Bgra8,
+            NativeVideoSampleFormat::H264,
+        ] {
+            let data: Arc<[u8]> = Arc::from([1, 2, 3, 4, 5, 6, 7, 8]);
+            let frame = DesktopRawFrame {
+                pixel_format: format,
+                native_width: 1080,
+                native_height: 2280,
+                sequence: 4,
+                width: 2,
+                height: 1,
+                stride: if format == NativeVideoSampleFormat::H264 {
+                    0
+                } else {
+                    8
+                },
+                timestamp_ns: 5,
+                duration_ns: 6,
+                captured_at_unix_ms: 7,
+                pixels: data.clone(),
+            };
+            let sample = frame.into_sample().unwrap();
+            assert!(Arc::ptr_eq(&data, &sample.data));
+            assert_eq!(sample.native_dimensions(), [1080, 2280]);
+            assert_eq!(sample.format, format);
+            let frame = DesktopRawFrame::from_sample(sample).unwrap();
+            assert!(Arc::ptr_eq(&data, &frame.pixels));
+            assert_eq!((frame.width, frame.height), (2, 1));
+        }
     }
 }

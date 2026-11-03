@@ -1,8 +1,8 @@
 # App Use OS provider
 
 `sinomo-app-use-module` is an independently built native dylib under the generic
-Sinomo module ABI. It provides `module.app-use.os` / `sinomo.app-use.os.v1`, with
-the typed `sinomo.app-use.os` service interface version `1.0.0`.
+Sinomo module ABI. It provides `module.app-use.os` / `sinomo.app-use.os.v2`, with
+the typed `sinomo.app-use.os` service interface version `2.0.0`.
 
 The module owns native target enumeration, identity checks, capture and input.
 Windows uses WGC/D3D11, background window messages, SendInput and conditional
@@ -21,7 +21,7 @@ Build explicitly (native modules are not default workspace members):
 
 ```powershell
 cargo build -p sinomo-app-use-module
-sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v1 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
+sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v2 --cache-key module/desktop/app-use target/debug/sinomo_app_use_module.dll
 ```
 
 Installation does not grant input or capture consent. The provider requires a
@@ -29,9 +29,17 @@ host-bound permission-store identity and rechecks node-local grants for each OS
 effect. Background mode is default; raw mode must be explicitly selected on a
 monitor with its own exposure grants. No implicit escalation or input replay.
 
-Native capture runs continuously in a bounded latest-frame mailbox. Raw samples
-cross the stable ABI output callback as a single bounded SOBJ byte blob and enter
-the host's shared media encoder. The generic invocation response carries only a
+Pixel capture uses a bounded latest-frame mailbox. Capture requests accept an
+optional `resolution: {width, height}` bounding box and `pixel_format`. Outputs
+preserve aspect ratio, never upscale, and report actual and native dimensions
+separately. Native dimensions remain the coordinate space for input. An omitted
+pixel format selects the backend's native format; capabilities enumerate supported
+formats. Version 2 requires explicit format and native geometry so an older host
+cannot interpret RGBA bytes as BGRA. Update the host and provider together.
+
+Samples cross the ABI output callback as a single bounded SOBJ byte blob. Shared
+storage is retained through provider and host frame wrappers. Pixel samples enter
+the host's media encoder; native encoded samples enter the ordered video transport. The generic invocation response carries only a
 small acknowledgement, avoiding nested byte-sequence serialization. Invocation
 callbacks are serialized and never retained by OS workers. Shutdown releases
 held input, closes capture and joins workers before releasing code mappings.
@@ -50,6 +58,26 @@ cleanup without foreground/pointer changes. `SINOMO_APP_USE_MODULE` can select a
 specific built DLL; test installation is confined to temporary data directories.
 See the [desktop agent harness](../../../docs/developer/testing.md#live-desktop-agent-verification-windows)
 for recorded real-agent tests of both modes through the same tools.
+
+## Capture output selection
+
+The `/app-use/capture` request accepts `resolution: {width, height}` and
+`capture_path: "auto" | "pixels" | "surface"`. Without explicit bounds,
+`encoding.max_dimension` supplies square bounds. Explicit bounds take precedence.
+H264 output uses even dimensions and the transport's 1920-pixel edge limit.
+`auto` uses native encoded capture when supported for H264; `pixels` keeps the
+raw capture and media-encoder path; `surface` requires native encoded capture.
+Application overview composition requires pixels. Frame metadata includes
+`capture_format`, actual `width`/`height`, and native `source_width`/`source_height`.
+
+Android captures into one GPU texture and renders per-consumer output surfaces,
+so concurrent consumers can request different resolutions. Raw RGBA is scaled
+before CPU readback. H264 renders directly into a Surface supplied by the app's
+media encoder adapter; the OS bridge owns capture and scaling, while the media
+adapter owns codec configuration and draining. Encoded output is demand-driven
+and ordered: a latest-frame replacement must never discard a reference frame.
+The same local consent, target validation, lease and revocation checks apply to
+both paths. A display geometry change ends the share and requires fresh consent.
 
 ## Windows application and shell surfaces
 
@@ -101,7 +129,7 @@ including those with an Xwayland `DISPLAY`, select the portal backend below.
 
 ```sh
 cargo build -p sinomo-app-use-module
-sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v1 --cache-key module/desktop/app-use target/debug/libsinomo_app_use_module.so
+sinomo module native-dylib activate --module module.app-use.os --interface sinomo.app-use.os.v2 --cache-key module/desktop/app-use target/debug/libsinomo_app_use_module.so
 cargo test -p sinomo-actions --test app_use_native_provider -- --ignored
 xvfb-run cargo test -p sinomo-app-use-module x11_background_pixels_input_revocation_and_cleanup -- --ignored
 ```

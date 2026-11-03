@@ -192,6 +192,8 @@ fn x11_background_pixels_input_revocation_and_cleanup() {
     );
     let capture = DesktopCapture::start(
         DesktopCaptureConfig {
+            resolution: None,
+            pixel_format: None,
             target: target.clone(),
             frames_per_second: 30,
             include_cursor: false,

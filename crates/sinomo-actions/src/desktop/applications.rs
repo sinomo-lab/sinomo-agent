@@ -99,12 +99,26 @@ impl Runtime {
                     ));
                 }
                 let guard = CaptureActive(view.active.clone());
+                if request.capture_path == CapturePath::Surface {
+                    return Err(DesktopError::Unsupported(
+                        "overview composition requires pixel capture".into(),
+                    ));
+                }
                 return Ok((
                     Box::new(ApplicationOverviewSource::new(
                         view.application.clone(),
                         view.max_windows,
                         request.frames_per_second,
                         view.selected.clone(),
+                        request.resolution.or_else(|| {
+                            request
+                                .encoding
+                                .max_dimension
+                                .map(|edge| CaptureResolution {
+                                    width: edge,
+                                    height: edge,
+                                })
+                        }),
                     )),
                     view.cancelled.clone(),
                     guard,
@@ -134,7 +148,40 @@ impl Runtime {
             )
         };
         let guard = CaptureActive(active);
+        let provider = self.provider()?;
+        let surface_available = request.transport == sinomo_video::codec::VideoTransport::H264
+            && provider
+                .capabilities()?
+                .capture_formats
+                .contains(&sinomo_runtime::device::NativeVideoSampleFormat::H264);
+        if request.capture_path == CapturePath::Surface && !surface_available {
+            return Err(DesktopError::Unsupported(
+                "native encoded capture is unavailable for this transport/backend".into(),
+            ));
+        }
+        let mut resolution = request.resolution.or_else(|| {
+            request
+                .encoding
+                .max_dimension
+                .map(|edge| CaptureResolution {
+                    width: edge,
+                    height: edge,
+                })
+        });
+        if request.transport == sinomo_video::codec::VideoTransport::H264 {
+            let bounds = resolution.unwrap_or(CaptureResolution {
+                width: 1920,
+                height: 1920,
+            });
+            resolution = Some(CaptureResolution {
+                width: bounds.width.min(1920),
+                height: bounds.height.min(1920),
+            });
+        }
         let config = DesktopCaptureConfig {
+            resolution,
+            pixel_format: (surface_available && request.capture_path != CapturePath::Pixels)
+                .then_some(sinomo_runtime::device::NativeVideoSampleFormat::H264),
             target,
             frames_per_second: request.frames_per_second,
             include_cursor: request.include_cursor,
@@ -519,6 +566,7 @@ pub(super) struct ApplicationOverviewSource {
     app: Arc<ApplicationSession>,
     max_windows: usize,
     fps: u32,
+    resolution: Option<CaptureResolution>,
     started: Instant,
     state: Mutex<OverviewState>,
     selected: Arc<Mutex<Option<String>>>,
@@ -539,11 +587,13 @@ impl ApplicationOverviewSource {
         max_windows: usize,
         fps: u32,
         selected: Arc<Mutex<Option<String>>>,
+        resolution: Option<CaptureResolution>,
     ) -> Self {
         Self {
             app,
             max_windows,
             fps,
+            resolution,
             started: Instant::now(),
             state: Mutex::new(OverviewState::default()),
             selected,
@@ -611,6 +661,8 @@ impl DesktopFrameSource for ApplicationOverviewSource {
             }
             if !state.captures.contains_key(&window.surface_id) {
                 let config = DesktopCaptureConfig {
+                    resolution: self.resolution,
+                    pixel_format: None,
                     target: window.window.target.clone(),
                     frames_per_second: self.fps,
                     include_cursor: false,
@@ -676,6 +728,7 @@ impl DesktopFrameSource for ApplicationOverviewSource {
             state.tiles.clear();
             state.sequence += 1;
             return Ok(Some(NativeVideoSample {
+                native_dimensions: None,
                 sequence: state.sequence,
                 format: sinomo_runtime::device::NativeVideoSampleFormat::Bgra8,
                 width: 32,

@@ -175,7 +175,7 @@ fn process_start(stat: &str) -> DesktopResult<u64> {
 }
 
 pub fn capabilities() -> DesktopCapabilities {
-    let mut caps = DesktopCapabilities {
+    let mut caps = DesktopCapabilities { capture_formats: vec![sinomo_device::NativeVideoSampleFormat::Bgra8],
         platform: "linux".into(), capture: false, keyboard_mouse: false,
         background_window_input: false, gamepad: "unsupported".into(),
         limitations: vec![
@@ -851,6 +851,7 @@ impl Capture {
         }
         let len = pixels.len();
         Ok(NativeVideoSample {
+            native_dimensions: None,
             sequence: 0,
             format: NativeVideoSampleFormat::Bgra8,
             width,

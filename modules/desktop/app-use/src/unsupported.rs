@@ -7,6 +7,7 @@ fn unsupported() -> DesktopError {
 }
 pub fn capabilities() -> DesktopCapabilities {
     DesktopCapabilities {
+        capture_formats: vec![],
         platform: std::env::consts::OS.into(),
         capture: false,
         keyboard_mouse: false,
