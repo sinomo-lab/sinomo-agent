@@ -175,6 +175,18 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
         .submit_op(AgentOp::start_turn(parent_input.clone()))
         .unwrap();
     runtime.join_active_turn().unwrap();
+    let descriptor = registry
+        .descriptors()
+        .into_iter()
+        .find(|tool| tool.spec.name == "subagents")
+        .unwrap();
+    assert_eq!(descriptor.spec.kind, AgentToolKind::ModuleService);
+    assert!(
+        descriptor
+            .capabilities
+            .contains(&AgentToolCapability::CallModule)
+    );
+    assert_eq!(descriptor.toolsets, ["core", "module", "delegation"]);
     let spawned = execute(
         &registry,
         &parent_input,
@@ -319,6 +331,48 @@ fn native_module_load_reload_catalog_and_durable_reusable_sessions() {
         &data_dir,
     );
     assert!(!no_module_tools.contains("subagents"));
+    let unavailable_call = no_module_tools.execute(
+        &parent_input.session,
+        0,
+        0,
+        &AgentToolCall {
+            call_id: None,
+            tool: "subagents".into(),
+            input: serde_json::json!({"action":"spawn","task":"must not run"}),
+            r#async: false,
+            summary: "no module".into(),
+        },
+    );
+    assert_ne!(unavailable_call.status, AgentToolStatus::Succeeded);
+    assert!(
+        plain
+            .subagents()
+            .list(&plain.session_snapshot().unwrap().session_id)
+            .is_empty()
+    );
+    for tools in [
+        default_main_agent_tools(),
+        default_coding_agent_tools(),
+        default_background_agent_tools(),
+    ] {
+        assert!(tools.iter().all(|tool| tool.name != "subagents"));
+    }
+    // Old saved kinds remain readable as metadata; they supply no built-in
+    // category or executor when the module is absent.
+    let legacy_kind: AgentToolKind = serde_json::from_str("\"subagents\"").unwrap();
+    assert_eq!(legacy_kind, AgentToolKind::ModuleService);
+    assert_eq!(
+        serde_json::to_value(&legacy_kind).unwrap(),
+        "module_service"
+    );
+    let legacy = AgentToolDescriptor::new(AgentToolSpec::new(
+        legacy_kind,
+        "subagents",
+        "old saved specification",
+        false,
+    ));
+    assert_eq!(legacy.toolsets, ["module"]);
+
     plain
         .submit_op(AgentOp::start_turn(input(
             plain.session_snapshot().unwrap().session_id,

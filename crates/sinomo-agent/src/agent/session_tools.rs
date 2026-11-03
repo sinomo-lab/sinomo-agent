@@ -8,20 +8,11 @@ pub trait AgentSessionToolProvider: Send + Sync {
     fn provenance(&self) -> Option<(String, String)> {
         None
     }
-    fn translate(&self, input: serde_json::Value) -> Result<SessionCommand, AgentError>;
     fn execute(
         &self,
         input: serde_json::Value,
         sessions: Arc<dyn sinomo_runtime::module::sessions::SessionAccess>,
-    ) -> Result<serde_json::Value, AgentError> {
-        sessions
-            .request(
-                sinomo_runtime::module_api::sessions::SessionRequest::Command {
-                    command: self.translate(input)?,
-                },
-            )
-            .map_err(error)
-    }
+    ) -> Result<serde_json::Value, AgentError>;
 }
 
 pub struct NativeAgentSessionTools {
@@ -34,7 +25,6 @@ impl NativeAgentSessionTools {
     pub fn requirement() -> ServiceRequirement {
         ServiceRequirement::new(SESSION_TOOLS_INTERFACE, SESSION_TOOLS_VERSION)
             .with_operation(SESSION_TOOLS_DESCRIBE)
-            .with_operation(SESSION_TOOLS_TRANSLATE)
             .with_operation(SESSION_TOOLS_EXECUTE)
     }
     pub fn from_component(provider: ActiveNativeComponent) -> Result<Self, AgentError> {
@@ -122,33 +112,6 @@ impl AgentSessionToolProvider for NativeAgentSessionTools {
             ActiveNativeComponentResponse::Error(e) => Err(error(e.detail)),
         }
     }
-    fn translate(&self, input: serde_json::Value) -> Result<SessionCommand, AgentError> {
-        let bound = self
-            .provider
-            .lock()
-            .map_err(|_| error("session tool provider lock poisoned"))?;
-        let active;
-        let provider = if let Some(data_dir) = &self.data_dir {
-            // Resolve current activation on every invocation. Cached tool
-            // metadata cannot authorize calls after module withdrawal.
-            active = unsafe {
-                ActiveNativeComponent::resolve_shared(data_dir.root(), &Self::requirement())
-            }
-            .map_err(|e| error(e.to_string()))?;
-            &active
-        } else {
-            bound
-                .as_ref()
-                .ok_or_else(|| error("session tool provider unavailable"))?
-        };
-        match provider
-            .invoke_sobj(SESSION_TOOLS_TRANSLATE, &input, None)
-            .map_err(|e| error(e.to_string()))?
-        {
-            ActiveNativeComponentResponse::Value(command) => Ok(command),
-            ActiveNativeComponentResponse::Error(e) => Err(error(e.detail)),
-        }
-    }
 }
 fn error(detail: impl Into<String>) -> AgentError {
     AgentError::Runtime {
@@ -195,5 +158,71 @@ impl<M: InteractionModel> Agent<M> {
             .expect("valid native skill activation");
         self.session_tools = Some(provider);
         self
+    }
+}
+
+type SessionAccessFactory = dyn Fn(
+        &SessionId,
+        AgentCancellationToken,
+    ) -> Result<Arc<dyn sinomo_runtime::module::sessions::SessionAccess>, AgentError>
+    + Send
+    + Sync;
+
+/// Generic module adapter: schemas, discovery groups and execution come from
+/// the provider. The host supplies only the caller's scoped session access.
+pub(super) struct SessionProviderTool {
+    provider: Arc<dyn AgentSessionToolProvider>,
+    sessions: Arc<SessionAccessFactory>,
+}
+impl SessionProviderTool {
+    pub(super) fn new(
+        provider: Arc<dyn AgentSessionToolProvider>,
+        sessions: impl Fn(
+            &SessionId,
+            AgentCancellationToken,
+        ) -> Result<
+            Arc<dyn sinomo_runtime::module::sessions::SessionAccess>,
+            AgentError,
+        > + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            provider,
+            sessions: Arc::new(sessions),
+        }
+    }
+}
+impl AgentTool for SessionProviderTool {
+    fn descriptor(&self) -> AgentToolDescriptor {
+        let definition = self.provider.definition();
+        let mut descriptor = AgentToolDescriptor::new(crate::AgentToolSpec::new(
+            crate::AgentToolKind::ModuleService,
+            definition.name,
+            definition.description,
+            false,
+        ))
+        .with_input_schema(definition.input_schema)
+        .with_capabilities([AgentToolCapability::CallModule]);
+        if !definition.toolsets.is_empty() {
+            descriptor = descriptor.with_toolsets(definition.toolsets);
+        }
+        descriptor
+    }
+    fn execute(&self, request: crate::AgentToolRequest<'_>) -> crate::AgentToolResult {
+        let result = (self.sessions)(
+            &request.session.session_id,
+            request.cancellation_token.clone(),
+        )
+        .and_then(|sessions| self.provider.execute(request.call.input.clone(), sessions));
+        match result {
+            Ok(value) => {
+                crate::AgentToolResult::succeeded("module session operation completed", value)
+            }
+            Err(error) => crate::AgentToolResult::failed(
+                error.to_string(),
+                serde_json::json!({"error": error.to_string()}),
+            ),
+        }
     }
 }

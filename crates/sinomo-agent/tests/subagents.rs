@@ -29,10 +29,11 @@ impl AgentSessionToolProvider for Provider {
     fn definition(&self) -> sinomo_runtime::module_api::agent::SessionToolDefinition {
         sinomo_subagents::definition()
     }
-    fn translate(
+    fn execute(
         &self,
         input: serde_json::Value,
-    ) -> Result<sinomo_runtime::module_api::agent::SessionCommand, AgentError> {
+        sessions: Arc<dyn sinomo_runtime::module::sessions::SessionAccess>,
+    ) -> Result<serde_json::Value, AgentError> {
         let mut command =
             sinomo_subagents::translate(input).map_err(|detail| AgentError::Runtime { detail })?;
         if let sinomo_runtime::module_api::agent::SessionCommand::Create {
@@ -44,7 +45,9 @@ impl AgentSessionToolProvider for Provider {
         {
             *idle_timeout_secs = 1;
         }
-        Ok(command)
+        sessions
+            .request(sinomo_runtime::module_api::sessions::SessionRequest::Command { command })
+            .map_err(|detail| AgentError::Runtime { detail })
     }
 }
 struct Model {
@@ -1012,4 +1015,25 @@ fn child_runtime_continues_after_its_detached_tool_finishes() {
         .subagents()
         .dispose(&h.input.session.session_id, &child.id)
         .unwrap();
+}
+
+#[test]
+fn module_capability_denial_blocks_subagent_tool_execution() {
+    let h = harness(
+        Behavior::Quick,
+        true,
+        AgentToolRegistry::new(),
+        AgentToolSurface::default_for_role(AgentRole::Main)
+            .with_denied_capabilities([AgentToolCapability::CallModule]),
+    );
+    assert!(
+        h.runtime
+            .subagents()
+            .list(&h.input.session.session_id)
+            .is_empty()
+    );
+    assert!(h.runtime.session_snapshot().unwrap().raw_transcript.items.iter().any(|item| matches!(
+        item, AgentItem::ToolResult { tool_name: Some(name), status: AgentToolStatus::Blocked, .. }
+            if name == "subagents"
+    )));
 }

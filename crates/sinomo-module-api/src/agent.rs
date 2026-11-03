@@ -12,6 +12,10 @@ pub struct SessionToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Discovery groups are owned by the provider. Empty uses the generic
+    /// module group; hosts do not infer feature-specific built-in categories.
+    #[serde(default)]
+    pub toolsets: Vec<String>,
     pub skill_id: String,
     pub skill: String,
 }

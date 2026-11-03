@@ -484,7 +484,6 @@ impl AgentToolSpec {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolKind {
-    Subagents,
     StartAsyncTask,
     InspectAsyncTask,
     CancelAsyncTask,
@@ -513,6 +512,10 @@ pub enum AgentToolKind {
     SkillActivate,
     SkillUpdate,
     ModuleObjectRpc,
+    /// Native module service tool. The alias only reads older saved tool specs;
+    /// execution still requires a registered module provider.
+    #[serde(alias = "subagents")]
+    ModuleService,
     McpCall,
     WebSearch,
     ImageGeneration,

@@ -8,6 +8,7 @@ static LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 pub fn definition() -> SessionToolDefinition {
     SessionToolDefinition {
         name: "subagents".into(),
+        toolsets: vec!["core".into(), "module".into(), "delegation".into()],
         description: "Spawn reusable subagents with inherited configuration, message agents, inspect sessions, wait, cancel, or discard. Completion notifies the parent. Idle children archive after 24 hours.".into(),
         input_schema: serde_json::json!({
             "type":"object", "properties": {

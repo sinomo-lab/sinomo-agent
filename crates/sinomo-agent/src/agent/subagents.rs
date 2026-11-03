@@ -1,9 +1,6 @@
 //! Host-owned child sessions. Native providers supply tool policy, never a model loop.
 use super::*;
-use crate::{
-    AgentToolKind, AgentToolRequest, AgentToolResult, AgentToolSpec, AsyncTaskNextAction,
-    AsyncTaskStatus, AsyncTaskUpdate,
-};
+use crate::{AsyncTaskNextAction, AsyncTaskStatus, AsyncTaskUpdate};
 use sinomo_runtime::module_api::agent::SessionCommand;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Weak};
@@ -985,10 +982,17 @@ impl<M: InteractionModel + Send + Sync + 'static> Agent<M> {
             },
         );
         if let Some(provider) = &self.session_tools {
-            self.tools.register(SessionProviderTool {
-                manager: Arc::downgrade(&manager),
-                provider: provider.clone(),
-            });
+            let sessions = Arc::downgrade(&manager);
+            self.tools
+                .register(super::session_tools::SessionProviderTool::new(
+                    provider.clone(),
+                    move |caller, cancellation| {
+                        sessions
+                            .upgrade()
+                            .ok_or_else(|| subagent_error("session runtime released"))?
+                            .tool_session_access(caller, cancellation)
+                    },
+                ));
         }
         let id = session.session_id.clone();
         {
@@ -1052,56 +1056,29 @@ impl<M: InteractionModel + Send + Sync + 'static> AgentSessionRuntime<M> {
         }
     }
 }
-struct SessionProviderTool {
-    manager: Weak<AgentSubagents>,
-    provider: Arc<dyn AgentSessionToolProvider>,
-}
-impl AgentTool for SessionProviderTool {
-    fn descriptor(&self) -> AgentToolDescriptor {
-        let definition = self.provider.definition();
-        AgentToolDescriptor::new(AgentToolSpec::new(
-            AgentToolKind::Subagents,
-            definition.name,
-            definition.description,
-            false,
-        ))
-        .with_input_schema(definition.input_schema)
-    }
-    fn execute(&self, request: AgentToolRequest<'_>) -> AgentToolResult {
-        let result = (|| {
-            let manager = self
-                .manager
-                .upgrade()
-                .ok_or_else(|| subagent_error("session runtime released"))?;
-            let caller = &request.session.session_id;
-            let caller = caller.clone();
-            let root = manager.root(&caller)?;
-            let store = manager.store.clone();
-            let cancellation = request.cancellation_token.clone();
-            let access = crate::session_access::AgentSessionAccess::new(
-                store,
-                [(root.to_string(), "Agent".into())].into_iter().collect(),
-            )
-            .with_cancellation(request.cancellation_token.clone())
-            .with_commands(move |command| {
-                manager
-                    .execute_command(&caller, command, &cancellation)
-                    .map_err(|e| e.to_string())
-            });
-            self.provider
-                .execute(request.call.input.clone(), Arc::new(access))
-        })();
-        match result {
-            Ok(value) => AgentToolResult::succeeded("session operation completed", value),
-            Err(error) => AgentToolResult::failed(
-                error.to_string(),
-                serde_json::json!({"error":error.to_string()}),
-            ),
-        }
-    }
-}
 
 impl AgentSubagents {
+    fn tool_session_access(
+        self: &Arc<Self>,
+        caller: &SessionId,
+        cancellation: AgentCancellationToken,
+    ) -> Result<Arc<dyn sinomo_runtime::module::sessions::SessionAccess>, AgentError> {
+        let caller = caller.clone();
+        let root = self.root(&caller)?;
+        let manager = self.clone();
+        let access = crate::session_access::AgentSessionAccess::new(
+            self.store.clone(),
+            [(root.to_string(), "Agent".into())].into_iter().collect(),
+        )
+        .with_cancellation(cancellation.clone())
+        .with_commands(move |command| {
+            manager
+                .execute_command(&caller, command, &cancellation)
+                .map_err(|e| e.to_string())
+        });
+        Ok(Arc::new(access))
+    }
+
     fn execute_command(
         self: &Arc<Self>,
         caller: &SessionId,
