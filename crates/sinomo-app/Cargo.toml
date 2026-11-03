@@ -40,7 +40,7 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 rfd = { workspace = true, optional = true }
 syntect = { workspace = true }
-image = { workspace = true, features = ["jpeg", "png", "webp"] }
+image = { workspace = true, features = ["jpeg", "png", "webp", "gif", "bmp", "ico", "tiff"] }
 pulldown-cmark.workspace = true
 percent-encoding.workspace = true
 

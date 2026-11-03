@@ -20,6 +20,9 @@
 //! under strict limits, and keep decoded pixels plus renderer registrations bounded. Sorting and
 //! pagination are requested through worker/daemon boundaries instead of doing heavy work on the UI path.
 
+mod formats;
+use formats::DocumentFormat;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -155,7 +158,7 @@ const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
 /// into the extension host.
 const CUSTOM_FILE_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
-/// The text surface keeps the entire accepted document resident. Reject larger files explicitly
+/// The text/hex surface keeps the entire accepted document resident. Reject larger files explicitly
 /// instead of silently presenting a partial document that could be saved over the original.
 const FILE_DOCUMENT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Chat attachments may be binary, but still need a bounded read on the Files worker lane.
@@ -935,6 +938,7 @@ enum FilePlaceAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesPreview {
+    native_preview: Option<(DocumentFormat, String)>,
     title: String,
     lines: Vec<String>,
     truncated: bool,
@@ -971,6 +975,7 @@ struct SifsFileFingerprint {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesDocumentLoad {
+    format: DocumentFormat,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -995,6 +1000,10 @@ enum FilesDocumentSave {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FilesDocument {
+    #[serde(default)]
+    format: DocumentFormat,
+    #[serde(default)]
+    preview_open: bool,
     source: FilesSourceKind,
     path: String,
     title: String,
@@ -1020,6 +1029,8 @@ pub(crate) struct FilesWorkspaceSnapshot {
 impl FilesDocument {
     fn loading(source: FilesSourceKind, path: String, title: String) -> Self {
         Self {
+            format: DocumentFormat::Text,
+            preview_open: false,
             source,
             path,
             title,
@@ -3173,6 +3184,8 @@ impl FilesState {
                 match result {
                     Ok(load) => {
                         self.document = Some(FilesDocument {
+                            format: load.format,
+                            preview_open: load.format.has_preview(),
                             source: load.source,
                             path: load.path,
                             title: load.title,
@@ -4368,6 +4381,7 @@ impl FilesState {
         }
         document.text = value;
         document.save_error = None;
+        self.attachment_error = None;
     }
 
     fn save_document(&mut self, waker: Option<sui::UiHandle>) {
@@ -4380,6 +4394,13 @@ impl FilesState {
         if !document.editable() || !document.dirty() || document.saving {
             return;
         }
+        let bytes = match formats::document_bytes(document.format, &document.text) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                document.save_error = Some(error);
+                return;
+            }
+        };
         let Some(tx) = self.worker_tx.clone() else {
             document.save_error = Some("The Files background worker is not available.".to_string());
             return;
@@ -4406,7 +4427,7 @@ impl FilesState {
                     request_id,
                     path: document.path.clone(),
                     expected,
-                    text: document.text.clone(),
+                    bytes,
                 }
             }
             FilesSourceKind::Sifs => {
@@ -4423,7 +4444,7 @@ impl FilesState {
                     request_id,
                     path: document.path.clone(),
                     expected,
-                    text: document.text.clone(),
+                    bytes,
                 }
             }
         };
@@ -4488,6 +4509,15 @@ impl FilesState {
         let Some(document) = self.document.as_ref() else {
             return;
         };
+        if document.loading || document.load_error.is_some() { return; }
+        self.attachment_error = None;
+        let bytes = match formats::document_bytes(document.format, &document.text) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.attachment_error = Some(error);
+                return;
+            }
+        };
         let provenance = match document.source {
             FilesSourceKind::Local => {
                 let Some(fingerprint) = document.local_fingerprint.as_ref() else {
@@ -4522,7 +4552,7 @@ impl FilesState {
         };
         self.ready_attachment_intent = Some(FilesAttachmentIntent {
             file_name: document.title.clone(),
-            bytes: document.text.as_bytes().to_vec(),
+            bytes,
             provenance,
             is_unsaved_editor_buffer: document.dirty(),
         });
@@ -7247,13 +7277,13 @@ enum FilesWorkerCommand {
         request_id: u64,
         path: String,
         expected: LocalFileFingerprint,
-        text: String,
+        bytes: Vec<u8>,
     },
     SaveSifsDocument {
         request_id: u64,
         path: String,
         expected: SifsFileFingerprint,
-        text: String,
+        bytes: Vec<u8>,
     },
     ReadAttachment {
         request_id: u64,
@@ -7811,9 +7841,9 @@ fn files_worker_loop(
                 request_id,
                 path,
                 expected,
-                text,
+                bytes,
             } => {
-                let result = save_local_text_document(&path, &expected, text.as_bytes());
+                let result = save_local_text_document(&path, &expected, &bytes);
                 let _ = result_tx.send(FilesWorkerResult::DocumentSaved {
                     request_id,
                     source: FilesSourceKind::Local,
@@ -7825,7 +7855,7 @@ fn files_worker_loop(
                 request_id,
                 path,
                 expected,
-                text,
+                bytes,
             } => {
                 if browser.is_none() && open_error.is_none() {
                     match daemon_address.as_deref() {
@@ -7843,7 +7873,7 @@ fn files_worker_loop(
                 }
                 let result = match (&browser, &open_error) {
                     (Some(browser), _) => {
-                        save_sifs_text_document(browser, &path, &expected, text.as_bytes())
+                        save_sifs_text_document(browser, &path, &expected, &bytes)
                     }
                     (None, Some(error)) => Err(error.clone()),
                     (None, None) => Err("SIFS browser did not start".to_string()),
@@ -9380,22 +9410,14 @@ fn local_document_read_only_reason(fingerprint: &LocalFileFingerprint) -> Option
 
 fn load_local_text_document(path: &str, max_bytes: u64) -> Result<FilesDocumentLoad, String> {
     let (bytes, fingerprint) = read_local_file_snapshot(path, max_bytes)?;
-    if !preview_bytes_are_text(&bytes) {
-        return Err(
-            "This file contains binary control bytes and cannot be opened in the text editor. It can still be attached to chat."
-                .to_string(),
-        );
-    }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        "This file is not valid UTF-8 and cannot be opened in the text editor. It can still be attached to chat."
-            .to_string()
-    })?;
+    let (format, text) = formats::document_from_bytes(path, &bytes);
     let title = Path::new(path)
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string());
     let read_only_reason = local_document_read_only_reason(&fingerprint);
     Ok(FilesDocumentLoad {
+        format,
         source: FilesSourceKind::Local,
         path: path.to_string(),
         title,
@@ -9466,16 +9488,7 @@ fn load_sifs_text_document(
     max_bytes: u64,
 ) -> Result<FilesDocumentLoad, String> {
     let (bytes, fingerprint, mode) = read_sifs_file_snapshot(browser, path, max_bytes)?;
-    if !preview_bytes_are_text(&bytes) {
-        return Err(
-            "This SIFS object contains binary control bytes and cannot be opened in the text editor. It can still be attached to chat."
-                .to_string(),
-        );
-    }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        "This SIFS object is not valid UTF-8 and cannot be opened in the text editor. It can still be attached to chat."
-            .to_string()
-    })?;
+    let (format, text) = formats::document_from_bytes(path, &bytes);
     let title = path
         .rsplit('/')
         .find(|part| !part.is_empty())
@@ -9488,6 +9501,7 @@ fn load_sifs_text_document(
         )
     });
     Ok(FilesDocumentLoad {
+        format,
         source: FilesSourceKind::Sifs,
         path: path.to_string(),
         title,
@@ -12602,8 +12616,13 @@ fn preview_from_read_with_line_limit(
     read: SifsFileRead,
     max_lines: usize,
 ) -> FilesPreview {
+    let native_preview = if !read.truncated && read.bytes.len() as u64 <= FILE_DOCUMENT_MAX_BYTES {
+        let (format, text) = formats::document_from_bytes(name, &read.bytes);
+        format.has_preview().then_some((format, text))
+    } else { None };
     if read.bytes.is_empty() {
         return FilesPreview {
+            native_preview,
             title: format!("Preview {}", name),
             lines: vec!["Empty file".to_string()],
             truncated: read.truncated,
@@ -12613,6 +12632,7 @@ fn preview_from_read_with_line_limit(
     }
     if !preview_bytes_are_text(&read.bytes) {
         return FilesPreview {
+            native_preview,
             title: format!("Binary preview {}", name),
             lines: binary_preview_lines(&read.bytes),
             truncated: read.truncated,
@@ -12637,6 +12657,7 @@ fn preview_from_read_with_line_limit(
     }
     let line_truncated = text.lines().nth(max_lines).is_some();
     FilesPreview {
+        native_preview,
         title: format!("Preview {}", name),
         lines,
         truncated: read.truncated || line_truncated,
@@ -18111,6 +18132,15 @@ fn preview_card(
             );
         return inspector_card("Preview", body, reader, None);
     }
+    if !loading && error.is_none() {
+        if let Some((format, text)) = preview.and_then(|preview| preview.native_preview.as_ref()) {
+            if let Some(widget) = formats::preview_widget(*format, text, reader) {
+                return inspector_card("Preview", SizedBox::new().height(260.0).child(
+                    ScrollView::vertical(widget).viewport_width_hint(true)
+                        .theme_when(clone_gray_scrollbar_reader(reader))), reader, None);
+            }
+        }
+    }
     let (badge, badge_tone, text, muted) = if loading {
         (
             "Reading preview",
@@ -21805,6 +21835,9 @@ fn document_detail_text(shared: &Shared) -> String {
     if let Some(error) = &document.load_error {
         return error.clone();
     }
+    if let Some(error) = &files.attachment_error {
+        return format!("Attachment unavailable: {error}");
+    }
     if let Some(error) = &document.save_error {
         return error.clone();
     }
@@ -21820,6 +21853,9 @@ fn document_detail_text(shared: &Shared) -> String {
     }
     if let Some(reason) = &document.read_only_reason {
         return reason.clone();
+    }
+    if matches!(document.format, DocumentFormat::Hex | DocumentFormat::Image) && !document.preview_open {
+        return format!("{} · Hex editor: enter two hexadecimal digits per byte, separated by spaces or newlines. Save writes decoded bytes with conflict protection.", document.path);
     }
     if cfg!(target_os = "android") {
         return if document.dirty() {
@@ -21874,6 +21910,14 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
             let Some(document) = s.files().document.clone() else {
                 return WidgetPod::new(SizedBox::new());
             };
+            if document.preview_open {
+                if let Some(preview) = formats::preview_widget(document.format, &document.text, &r) {
+                    return WidgetPod::new(ScrollView::vertical(preview)
+                        .name("File format preview")
+                        .viewport_width_hint(true)
+                        .theme_when(clone_gray_scrollbar_reader(&r)));
+                }
+            }
             let editor_shared = s.clone();
             let mut editor = TextSurface::new(format!("files-document:{}", document.path))
                 .theme_when(clone_reader(&r))
@@ -21928,7 +21972,33 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         bottom: 8.0,
     })
     .fill_width(true);
+    let modes = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::key_from(revision("document format controls"), move |_| {
+            let Some(document) = s.files().document.clone() else { return WidgetPod::new(SizedBox::new()); };
+            let mut row = Flex::horizontal().gap(8.0).align_items(Alignment::Center)
+                .with_child(Label::new(document.format.label()).theme_when(clone_reader(&r)));
+            if document.format.has_preview() {
+                let change = s.clone();
+                row = row.with_child(SegmentedControl::new("Document view")
+                    .items([SegmentedControlItem::new("Preview"), SegmentedControlItem::new(
+                        if matches!(document.format, DocumentFormat::Image | DocumentFormat::Hex) { "Hex editor" } else { "Source" })])
+                    .selected(if document.preview_open { 0 } else { 1 })
+                    .theme_when(clone_reader(&r))
+                    .on_change_with_ctx(move |ctx, index, _| {
+                        let mut files = change.files_mut();
+                        if let Some(document) = files.document.as_mut() { document.preview_open = index == 0; }
+                        files.document_revision = files.document_revision.wrapping_add(1);
+                        drop(files);
+                        request_files_overlay_rebuild(ctx);
+                    }));
+            }
+            WidgetPod::new(row)
+        })
+    };
     let editor_body = Dock::new(editor)
+        .top(42.0, modes)
         .bottom(
             74.0,
             ScrollView::vertical(status)
@@ -22071,7 +22141,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
         SideSheet::new(document.title.clone(), body)
             .theme_when(clone_reader(reader))
             .description(format!(
-                "Complete {} text document - {}",
+                "Complete {} document - {}",
                 document.source.label(),
                 document.path
             ))
@@ -37331,6 +37401,146 @@ mod tests {
         Ok(())
     }
 
+    fn hex_document_fixture() -> FilesDocument {
+        let mut document = FilesDocument::loading(FilesSourceKind::Sifs, "/data/unknown.bin".into(), "unknown.bin".into());
+        document.loading = false;
+        document.format = DocumentFormat::Hex;
+        document.text = "00 FF 80 41".into();
+        document.saved_text = "00 FF".into();
+        document.sifs_fingerprint = Some(SifsFileFingerprint {
+            object_id: "object-hex".into(), version: "version-before".into(),
+            content_hash: Some("hash-before".into()), size_bytes: Some(2), policy: "replicated-eventual".into(),
+        });
+        document
+    }
+
+    #[test]
+    fn hex_document_saves_and_attaches_decoded_bytes_with_version_protection() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.document = Some(hex_document_fixture());
+        let (tx, rx) = mpsc::channel();
+        files.worker_tx = Some(tx);
+        files.save_document(None);
+        let FilesWorkerCommand::SaveSifsDocument { request_id, path, bytes, expected } = rx.try_recv().unwrap() else {
+            panic!("expected conditional SIFS save");
+        };
+        assert_eq!(bytes, vec![0, 255, 128, 65]);
+        assert_eq!(expected.object_id, "object-hex");
+        assert_eq!(expected.version, "version-before");
+        files.start_attach_document(None);
+        let attachment = files.take_ready_attachment_intent().unwrap();
+        assert_eq!(attachment.bytes, bytes);
+        assert!(attachment.is_unsaved_editor_buffer);
+        files.apply_worker_result(FilesWorkerResult::DocumentSaved {
+            request_id, source: FilesSourceKind::Sifs, path,
+            result: Err("Save conflict: expected version-before".into()),
+        });
+        let document = files.document.as_ref().unwrap();
+        assert_eq!(document.text, "00 FF 80 41");
+        assert_eq!(document.saved_text, "00 FF");
+        assert!(document.dirty());
+        assert!(document.save_error.as_ref().unwrap().contains("conflict"));
+        let restored: FilesDocument = serde_json::from_str(&serde_json::to_string(document).unwrap()).unwrap();
+        assert_eq!(restored.format, DocumentFormat::Hex);
+        assert_eq!(formats::document_bytes(restored.format, &restored.text).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_hex_never_queues_save_or_attachment_and_keeps_edits() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        let mut document = hex_document_fixture();
+        document.text = "00 FG 1".into();
+        files.document = Some(document);
+        let (tx, rx) = mpsc::channel();
+        files.worker_tx = Some(tx);
+        files.save_document(None);
+        assert!(rx.try_recv().is_err());
+        assert!(files.document.as_ref().unwrap().save_error.is_some());
+        assert!(!files.document.as_ref().unwrap().saving);
+        assert_eq!(files.document.as_ref().unwrap().text, "00 FG 1");
+        files.start_attach_document(None);
+        assert!(files.take_ready_attachment_intent().is_none());
+        assert!(files.attachment_error.is_some());
+    }
+
+    #[test]
+    fn binary_document_load_and_local_save_round_trip() {
+        let root = files_test_temp_dir("hex-round-trip");
+        let path = root.join("unknown.bin");
+        let original: Vec<u8> = (0..=255).collect();
+        fs::write(&path, &original).unwrap();
+        let loaded = load_local_text_document(path.to_str().unwrap(), FILE_DOCUMENT_MAX_BYTES).unwrap();
+        assert_eq!(loaded.format, DocumentFormat::Hex);
+        assert_eq!(formats::document_bytes(loaded.format, &loaded.text).unwrap(), original);
+        let bytes = formats::document_bytes(loaded.format, "00 FF 7F 80").unwrap();
+        save_local_text_document(path.to_str().unwrap(), loaded.local_fingerprint.as_ref().unwrap(), &bytes).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hex_document_renders_editor_without_load_error() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        shared.files_mut().document = Some(hex_document_fixture());
+        let reader: ThemeReader = { let shared = shared.clone(); Rc::new(move || shared.theme()) };
+        let runtime = sui::Application::new().window(sui::WindowBuilder::new()
+            .title("Hex editor").root(FilesDialogHost::new(SizedBox::new().width(1100.0).height(760.0), shared, reader))).build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+        assert!(window.get_by_text("Hex").count()? > 0);
+        assert_eq!(window.get_by_text("Document unavailable").count()?, 0);
+        window.capture_screenshot()?.write_png(std::env::temp_dir().join("sinomo-files-hex-editor.png"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn common_document_previews_render_and_keep_exact_source() -> sui::Result<()> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(640, 400, image::Rgba([40, 120, 210, 255])))
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let cases = [
+            ("notes.md", b"# Project notes\n\n**Ready** for review.\n\n- First item\n- Second item\n".to_vec()),
+            ("data.json", br#"{"project":"Sinomo","ready":true,"count":3}"#.to_vec()),
+            ("table.csv", b"name,description\nalpha,\"one,two\"\nbeta,three\n".to_vec()),
+            ("image.png", png.into_inner()),
+        ];
+        for width in [560.0, 1100.0] {
+            for (name, bytes) in &cases {
+                let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+                let (format, text) = formats::document_from_bytes(name, bytes);
+                let mut document = FilesDocument::loading(FilesSourceKind::Local, (*name).into(), (*name).into());
+                document.loading = false;
+                document.format = format;
+                document.preview_open = true;
+                document.text = text.clone();
+                document.saved_text = text.clone();
+                shared.files_mut().document = Some(document);
+                let reader: ThemeReader = { let shared = shared.clone(); Rc::new(move || shared.theme()) };
+                let runtime = sui::Application::new().window(sui::WindowBuilder::new()
+                    .title("Common document preview").root(FilesDialogHost::new(SizedBox::new(), shared.clone(), reader))).build()?;
+                let app = sui_testing::TestApp::from_runtime(runtime)?;
+                let window = app.main_window()?;
+                window.root().dispatch_event(Event::Window(WindowEvent::Resized(Size::new(width, 760.0))))?;
+                app.run_until_idle()?;
+                window.advance_time(1.0)?;
+                app.run_until_idle()?;
+                assert_eq!(window.get_by_text("Document unavailable").count()?, 0);
+                window.capture_screenshot()?.write_png(std::env::temp_dir().join(format!("sinomo-format-{name}-{width:.0}.png")))?;
+                let source_name = if format == DocumentFormat::Image { "Hex editor" } else { "Source" };
+                window.get_by_role(SemanticsRole::RadioButton).with_name(source_name).click()?;
+                app.run_until_idle()?;
+                assert!(!shared.files().document.as_ref().unwrap().preview_open);
+                assert_eq!(shared.files().document.as_ref().unwrap().text, text);
+                assert_eq!(formats::document_bytes(format, &text).unwrap(), *bytes);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn local_document_load_is_complete_beyond_preview_limit() {
         let root = files_test_temp_dir("complete-document");
@@ -37375,7 +37585,7 @@ mod tests {
     }
 
     #[test]
-    fn local_document_rejects_oversize_and_binary_content_explicitly() {
+    fn local_document_rejects_oversize_and_opens_binary_as_hex() {
         let root = files_test_temp_dir("document-bounds");
         let oversize = root.join("oversize.txt");
         fs::write(&oversize, vec![b'x'; FILE_DOCUMENT_MAX_BYTES as usize + 1])
@@ -37387,10 +37597,10 @@ mod tests {
 
         let binary = root.join("binary.dat");
         fs::write(&binary, b"text\0binary").expect("write binary document");
-        let error =
-            load_local_text_document(binary.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
-                .expect_err("binary document must be rejected");
-        assert!(error.contains("binary control bytes"));
+        let loaded = load_local_text_document(binary.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
+            .expect("binary document opens as hex");
+        assert_eq!(loaded.format, DocumentFormat::Hex);
+        assert_eq!(formats::document_bytes(loaded.format, &loaded.text).unwrap(), b"text\0binary");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -37469,6 +37679,8 @@ mod tests {
             load_local_text_document(path.to_string_lossy().as_ref(), FILE_DOCUMENT_MAX_BYTES)
                 .expect("load document");
         files.document = Some(FilesDocument {
+            format: DocumentFormat::Text,
+            preview_open: false,
             source: loaded.source,
             path: loaded.path,
             title: loaded.title,
@@ -37523,6 +37735,8 @@ mod tests {
                     let saved_text =
                         "pub fn handle_request() {\n    tracing::info!(\"ready\");\n}\n";
                     files.document = Some(FilesDocument {
+                        format: DocumentFormat::Text,
+                        preview_open: false,
                         source: FilesSourceKind::Local,
                         path: document_path.clone(),
                         title: "service_handler.rs".to_string(),
